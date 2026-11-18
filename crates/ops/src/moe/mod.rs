@@ -11,8 +11,6 @@
 //! exchange routes with other expert ranks  → expert_exchange   (expert parallel only)
 //! ```
 //!
-//! The top-k also counts, into execution's expert load ([`load`]), the tokens each expert takes.
-//!
 //! The shapes are the ones a checkpoint states (e.g. 128 experts, top-k 8, hidden 2048,
 //! expert width 768); every operator takes its compiled shapes from its descriptor and every runtime
 //! extent — the token count, the offsets — from its arguments. The metadata operators are exact;
@@ -35,14 +33,12 @@
 pub mod combine;
 pub mod exchange;
 pub mod grouped;
-pub mod load;
 pub mod routing;
 pub mod sort;
 
 pub use combine::{MoeUnpermute, UnpermuteArgs};
 pub use exchange::{ExchangeArgs, ExchangeTransport, ExpertExchange};
 pub use grouped::{GatherGemm, GatherGemmArgs, RouteGemm, RouteGemmArgs};
-pub use load::{ExpertLoad, layer_load};
 pub use routing::{TopkArgs, TopkSoftmax};
 pub use sort::{MoeSort, SortArgs};
 

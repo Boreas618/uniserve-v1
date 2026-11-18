@@ -7,8 +7,7 @@ device) is held to its own build: the compile constants the metadata records
 iterations and its butterfly from) are the descriptor's, and the twelve words
 of its signature are the operator's, in order and by kind; the fourth pointer
 is the scale, which a ``scale_none`` module still declares as one, and the
-last three the expert map, the live count and the expert load, which the
-operator passes null without them. A module
+last the expert map, which the operator passes null without one. A module
 built for another descriptor fails here, the observable form of the kernel's
 `__trap()`.
 
@@ -30,11 +29,6 @@ padding row of NaN scores, as a captured bucket's rows past the batch hold.
 The mapped ids must be the map's entries of the same picks, and the padding
 row must keep an id that names no expert: it picks none, and a read of the map
 at that id is an illegal address.
-
-**The expert load.** Launched twice into the same counters with the map
-reversed and a live count below the rows, the counters must hold, per logical
-expert, twice the picks of the live rows: the count is by the expert's own id,
-whatever slot the map names, and a row past the live count adds nothing.
 
 The module half and the launch need a module built for a device; the pinned
 reference's own tie rule is checked on the host.
@@ -78,8 +72,6 @@ SIGNATURE = (
     ("ids", "pointer"),
     ("weights", "pointer"),
     ("map", "pointer"),
-    ("live", "pointer"),
-    ("load", "pointer"),
 )
 
 TORCH_TYPES = {
@@ -219,18 +211,14 @@ def test_the_modules_signature_is_the_operators(metadata):
     )
 
 
-def launch(
-    module, metadata, device, scores, mapping=None, live=None, load=None
-):
+def launch(module, metadata, device, scores, mapping=None):
     """Launch the module's cubin on `scores`; answers the ids and the weights
     it wrote, on the host.
 
     The cubin is loaded into the context torch made current and launched on
     torch's current stream, one token per warp of the block the metadata
     states. `mapping`, when given, is the device's logical-to-physical expert
-    map; `live` the count of leading live rows; `load` the device's int64
-    counters the live routes add into. The operator passes a null pointer for
-    each it is not given.
+    map; the operator passes a null pointer without one.
     """  # noqa: D205
     from cuda.bindings import driver
 
@@ -248,11 +236,6 @@ def launch(
     weights = torch.zeros((rows, TOP), dtype=torch.float32, device=device)
     scale = torch.zeros(16, dtype=torch.float32, device=device)
     device_map = None if mapping is None else mapping.to(device)
-    device_live = (
-        None
-        if live is None
-        else torch.tensor([live], dtype=torch.int32, device=device)
-    )
     torch.cuda.synchronize(device)
 
     loaded = checked(
@@ -275,8 +258,6 @@ def launch(
             ids.data_ptr(),
             weights.data_ptr(),
             0 if device_map is None else device_map.data_ptr(),
-            0 if device_live is None else device_live.data_ptr(),
-            0 if load is None else load.data_ptr(),
         )
         kinds = (
             ctypes.c_void_p,
@@ -288,8 +269,6 @@ def launch(
             ctypes.c_int32,
             ctypes.c_void_p,
             ctypes.c_int32,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
@@ -376,39 +355,4 @@ def test_a_mapped_launch_names_slots_and_a_padding_row_none(
     padding = got_ids[-1].long()
     assert not bool(((padding >= 0) & (padding < EXPERTS)).any()), (
         f"the padding row names a slot: {padding.tolist()}"
-    )
-
-
-@pytest.mark.gpu
-def test_the_load_counts_each_live_route_by_its_logical_expert(
-    module, metadata, torch_device
-):
-    scores, ids, _ = pinned()
-    reversed_map = torch.arange(EXPERTS - 1, -1, -1, dtype=torch.int32)
-    live = ROWS - 1
-    load = torch.zeros(EXPERTS, dtype=torch.int64, device=torch_device)
-
-    # Two steps add into the same counters, as two replays of one graph do.
-    for _ in range(2):
-        launch(
-            module,
-            metadata,
-            torch_device,
-            scores,
-            reversed_map,
-            live=live,
-            load=load,
-        )
-
-    expected = 2 * torch.bincount(ids[:live].flatten(), minlength=EXPERTS)
-    counted = load.cpu()
-    wrong = (counted != expected).nonzero().flatten()[:3].tolist()
-    assert not wrong, (
-        f"{len(wrong)} or more experts hold another count than twice the live "
-        "rows' picks; first "
-        + ", ".join(
-            f"expert {expert}: {counted[expert].item()} for "
-            f"{expected[expert].item()}"
-            for expert in wrong
-        )
     )

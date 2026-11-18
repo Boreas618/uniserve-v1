@@ -306,7 +306,7 @@ fn joined_outcome(
                     let fault: Arc<Fault> = Arc::new(error);
                     return Outcome::Failed(fault);
                 }
-                join_output(&mut output, theirs);
+                join_calls(&mut output, theirs);
             }
             failed => return failed,
         }
@@ -316,24 +316,8 @@ fn joined_outcome(
 
 /// Joins `other`, another rank's output of the same batch, into `output`: each call `other`
 /// answered as failed where `output` answered it as performed takes `other`'s answer. A rank
-/// that passed the batch answers no call, and leaves `output`'s calls as they are.
-///
-/// The expert tokens `other` states join `output`'s: the ranks of a group count the routes of
-/// distinct tokens or layers (pipeline stages, sequence members, a tensor group's first rank),
-/// so the group's count of a layer is the sum of its ranks'. The rest of a rank's counters are
-/// its own and stay with it.
-fn join_output(output: &mut BatchOutput, other: BatchOutput) {
-    if let Some(experts) = other
-        .forward_stats
-        .as_ref()
-        .map(|stats| &stats.expert_tokens)
-        .filter(|tokens| !tokens.is_empty())
-    {
-        output
-            .forward_stats
-            .get_or_insert_with(Default::default)
-            .add_expert_tokens(experts);
-    }
+/// that passed the batch answers no call, and leaves `output` as it is.
+fn join_calls(output: &mut BatchOutput, other: BatchOutput) {
     if other.calls.len() != output.calls.len() {
         return;
     }

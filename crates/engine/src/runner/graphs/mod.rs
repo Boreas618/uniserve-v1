@@ -76,7 +76,6 @@
 
 mod capture;
 mod input_buffer;
-mod load;
 mod shadow;
 
 use std::cell::{Cell, RefCell};
@@ -97,7 +96,6 @@ use tensor::{DType, Device, Shape, Tensor};
 
 use self::capture::{Executable, Recording, kernels_of, take_break};
 use self::input_buffer::InputBuffer;
-use self::load::Counters;
 use self::shadow::Shadow;
 use crate::runner::Forward;
 use crate::runner::buckets::Bucket;
@@ -184,9 +182,6 @@ struct Cuda {
     /// The device memory of a rehearsal's graphs, while a generation is rehearsed: a region as
     /// large as the runner's.
     rehearsal: RefCell<Option<DeviceAllocation>>,
-    /// The runner's expert load, which the launching context lends its forwards, once it was
-    /// given its routed layers ([`Graphs::set_expert_load`]).
-    load: RefCell<Option<Counters>>,
 }
 
 /// What changes while a runner serves.
@@ -353,7 +348,6 @@ impl Graphs {
             region,
             done: Event::new(EventFlags::default()),
             rehearsal: RefCell::new(None),
-            load: RefCell::new(None),
         };
 
         Ok(Self {
@@ -402,7 +396,6 @@ impl Graphs {
                 region: cuda.region,
                 done: Event::new(EventFlags::default()),
                 rehearsal: RefCell::new(None),
-                load: RefCell::new(None),
             }),
             profile: Context::meta(None),
             preparing: Context::meta(Some(allocator)),
@@ -447,7 +440,6 @@ impl Graphs {
                 region: cuda.region,
                 done: Event::new(EventFlags::default()),
                 rehearsal: RefCell::new(None),
-                load: RefCell::new(None),
             }),
             profile: Context::meta(None),
             preparing: Context::meta(None),
@@ -621,50 +613,6 @@ impl Graphs {
     pub(crate) fn set_exchange(&self, transport: Option<ExchangeTransport>, meet: Option<Meet>) {
         if let Some(cuda) = &self.device {
             cuda.launching.set_exchange(transport, meet);
-        }
-    }
-
-    /// Counts the tokens each expert of `layers`, the model's routed layers by module path with
-    /// their expert counts, takes in the serving forwards of these graphs: zeroed counters on
-    /// the device, which the launching context lends the forwards as their expert load
-    /// (`ops::moe::ExpertLoad`) and [`Graphs::take_expert_tokens`] reads. Graphs that hold no
-    /// device count nothing.
-    ///
-    /// Set it before graphs beside these are made ([`Graphs::beside`]): their context lends the
-    /// load as it stands, so the graphs they capture count into the same counters. A rehearsal
-    /// and a paired forward count nothing.
-    ///
-    /// # Errors
-    ///
-    /// The driver's refusal of the counters' memory, or a layer of no expert.
-    pub fn set_expert_load(&self, layers: &BTreeMap<String, u32>) -> Result<()> {
-        let Some(cuda) = &self.device else {
-            return Ok(());
-        };
-
-        let (counters, load) = Counters::new(layers, &cuda.stream)?;
-        cuda.launching.set_expert_load(Some(load));
-        *cuda.load.borrow_mut() = Some(counters);
-        Ok(())
-    }
-
-    /// The tokens each routed layer's experts took in the serving forwards these graphs issued
-    /// up to the previous take, since the take before it, by layer module path and the model's
-    /// own expert id, of the layers whose experts took any. The device is not waited for: the
-    /// counts of a take's own period are read behind the stream and stated by the next one.
-    /// Empty for graphs that count no expert load.
-    ///
-    /// # Errors
-    ///
-    /// The driver's refusal of the read.
-    pub fn take_expert_tokens(&self) -> Result<BTreeMap<String, Vec<u64>>> {
-        let Some(cuda) = &self.device else {
-            return Ok(BTreeMap::new());
-        };
-
-        match cuda.load.borrow_mut().as_mut() {
-            Some(counters) => counters.take(),
-            None => Ok(BTreeMap::new()),
         }
     }
 
@@ -1514,10 +1462,6 @@ impl Graphs {
         })?;
         self.lend_values(&cuda.launching, slot)?;
 
-        // A paired forward runs a batch the runner served already, so it counts no expert's
-        // tokens again.
-        let load = cuda.launching.expert_load();
-        cuda.launching.set_expert_load(None);
         cuda.launching.set_kernels(next);
         cuda.launching.set_route(Some(
             Arc::clone(&pairing) as Arc<dyn ops::Route + Send + Sync>
@@ -1529,7 +1473,6 @@ impl Graphs {
         };
         cuda.launching.set_route(None);
         cuda.launching.set_kernels(serving);
-        cuda.launching.set_expert_load(load);
 
         self.with_buffer(|buffer| buffer.release(slot, &cuda.stream))?;
         cuda.done.record(&cuda.stream)?;
@@ -1814,10 +1757,7 @@ impl State {
     fn settle(&mut self) {
         for ((bucket, generation), forwards) in self.pending.drain() {
             let table = match generation {
-                Some(generation) => self
-                    .graphs
-                    .get(&(bucket, generation))
-                    .map(|graph| &graph.table),
+                Some(generation) => self.graphs.get(&(bucket, generation)).map(|graph| &graph.table),
                 None => self.profiles.get(&bucket),
             };
             for (operator, key, _) in table.into_iter().flatten() {

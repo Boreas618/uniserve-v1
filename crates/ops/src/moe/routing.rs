@@ -16,13 +16,6 @@
 //! null pointer without one, so a captured graph reads whatever the table at its address says.
 //! The arithmetic and its order are those of PyTorch's warp softmax and row-sum composition.
 //!
-//! With an expert load ([`TopkArgs::load`]), each route of a live token adds one to its logical
-//! expert's 64-bit counter, before the map: the counters hold the tokens each expert took, which
-//! do not depend on where the experts lie. A token is live when its row lies below the `[1]` U32
-//! live count ([`TopkArgs::live`]), or always without one, so a captured bucket's rows past its
-//! batch count nothing. Both are launch values, so a graph captured with them adds into the
-//! counters on every replay; counting adds no kernel and changes no descriptor.
-//!
 //! The bound between two implementations: the probabilities are a scale of positive terms, so the
 //! weights carry the `rounding` bound with the reduction length of the softmax, `experts`, and the
 //! FP32 accumulation and output; the expert ids are exact — the descending-then-ascending order is
@@ -95,12 +88,6 @@ pub struct TopkArgs {
     /// `[experts]` u32 weight row of each logical expert, when the block's experts are not in
     /// logical order: `ids` then holds rows.
     pub map: Option<Operand>,
-    /// `[1]` u32: the leading token rows the batch fills, whose routes the load counts; every
-    /// row counts without it.
-    pub live: Option<Operand>,
-    /// `[experts]` i64 counters, by logical expert, to which each counted route adds one in
-    /// place: execution's expert load of the block. Nothing is counted without it.
-    pub load: Option<Operand>,
 }
 
 /// The router's softmax top-k.
@@ -213,27 +200,6 @@ impl Op for TopkSoftmax {
                 ));
             }
         }
-        if let Some(live) = &args.live {
-            live.require_shape(Self::NAME, &[1])?;
-            if live.dtype != DType::U32 {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!("expected a u32 live count, found {}", abi::name(live.dtype)),
-                ));
-            }
-        }
-        if let Some(load) = &args.load {
-            load.require_shape(Self::NAME, &[experts])?;
-            if load.dtype != DType::I64 {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!(
-                        "expected i64 expert load counters, found {}",
-                        abi::name(load.dtype)
-                    ),
-                ));
-            }
-        }
         Ok(())
     }
 
@@ -289,24 +255,17 @@ impl Op for TopkSoftmax {
         arguments
             .view("ids", &args.ids)
             .view("weights", &args.weights);
-        // Each optional table is a null pointer without one, which the program reads as absent.
-        let pointer = |operand: Option<Operand>| {
-            operand.map_or(DevicePtr::from_address(0), |operand| operand.ptr)
-        };
-        arguments
-            .pointer("map", pointer(args.map))
-            .pointer("live", pointer(args.live))
-            .pointer("load", pointer(args.load));
+        arguments.pointer(
+            "map",
+            args.map.map_or(DevicePtr::from_address(0), |map| map.ptr),
+        );
         kernel.launch(grid, &mut arguments, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
-        // The paired kernel routes the same tokens, so it counts nothing: the serving kernel's
-        // launch adds each route to the load once.
         TopkArgs {
             ids: twins.shadow_of(args.ids),
             weights: twins.shadow_of(args.weights),
-            load: None,
             ..args
         }
     }

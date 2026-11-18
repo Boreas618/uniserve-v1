@@ -108,8 +108,6 @@ fn topk_softmax_keeps_the_most_probable_experts_and_renormalizes_them() {
         true,
         None,
         None,
-        None,
-        None,
     )
     .unwrap();
     assert_eq!((ids.dims(), ids.dtype()), (&[tokens, top][..], DType::U32));
@@ -121,8 +119,6 @@ fn topk_softmax_keeps_the_most_probable_experts_and_renormalizes_them() {
         &tensor(&scores, (tokens, experts), DType::F32),
         top as u32,
         false,
-        None,
-        None,
         None,
         None,
     )
@@ -152,8 +148,6 @@ fn topk_softmax_routes_ten_of_five_hundred_and_twelve_experts() {
         true,
         None,
         None,
-        None,
-        None,
     )
     .unwrap();
     assert_eq!(entries(&ids), expected_ids);
@@ -164,8 +158,6 @@ fn topk_softmax_routes_ten_of_five_hundred_and_twelve_experts() {
             &meta((tokens, experts), DType::BF16),
             top as u32,
             true,
-            None,
-            None,
             None,
             None,
         )
@@ -194,8 +186,6 @@ fn topk_softmax_scales_by_the_expert_and_writes_each_route_s_slot() {
         true,
         Some(&tensor(&scale, experts, DType::F32)),
         Some(&indices(&map, experts)),
-        None,
-        None,
     )
     .unwrap();
 
@@ -211,9 +201,8 @@ fn topk_softmax_scales_by_the_expert_and_writes_each_route_s_slot() {
 
     // A top beyond the experts, and a map of another length, are refused.
     let scores = tensor(&scores, (tokens, experts), DType::F32);
-    assert!(functional::topk_softmax(&scores, 6, true, None, None, None, None).is_err());
-    let short = indices(&[0, 1], 2);
-    assert!(functional::topk_softmax(&scores, 2, true, None, Some(&short), None, None).is_err());
+    assert!(functional::topk_softmax(&scores, 6, true, None, None).is_err());
+    assert!(functional::topk_softmax(&scores, 2, true, None, Some(&indices(&[0, 1], 2))).is_err());
 }
 
 // ---- The sort ---------------------------------------------------------------------------------
@@ -987,7 +976,6 @@ fn dense_config() -> MoEConfig {
         split: Split::WHOLE,
         tensor_experts: false,
         exchange: Split::WHOLE,
-        name: None,
     }
 }
 

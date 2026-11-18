@@ -96,13 +96,6 @@ pub struct ForwardStats {
     /// forward run eagerly. A rank states them about once a second rather than with every
     /// batch, and a report holds what accumulated since the rank last stated them.
     pub kernel_launches: BTreeMap<KernelLaunch, u64>,
-    /// The tokens each routed layer's experts processed, by the layer's module path (the name
-    /// `moe_config.expert_order` states it by): entry `e` of a layer's counts is the tokens the
-    /// router sent to the model's own expert `e`, whatever slot holds it. A rank states them
-    /// about once a second, and a report holds what accumulated since the rank last stated
-    /// them. The ranks of a tensor-parallel group route the same tokens, and only its first rank
-    /// counts them, so the ranks' counts of one batch add up to the batch's.
-    pub expert_tokens: BTreeMap<String, Vec<u64>>,
     /// Each profiling session's progress on the rank, by session.
     pub profile: BTreeMap<u64, ProfileProgress>,
     /// Attention kernel launch count.
@@ -175,7 +168,6 @@ impl ForwardStats {
         add_counts(&mut self.stream_us, &other.stream_us);
         add_counts(&mut self.blocking_calls, &other.blocking_calls);
         add_counts(&mut self.kernel_launches, &other.kernel_launches);
-        self.add_expert_tokens(&other.expert_tokens);
         for (target, values) in [
             (&mut self.mode_counts, &other.mode_counts),
             (&mut self.mode_tokens, &other.mode_tokens),
@@ -259,20 +251,6 @@ impl ForwardStats {
         }
     }
 
-    /// Adds `tokens`, counts of [`ForwardStats::expert_tokens`]'s form, expert by expert; a
-    /// layer's counts extend to the longer of the two, so no expert's count is dropped.
-    pub fn add_expert_tokens(&mut self, tokens: &BTreeMap<String, Vec<u64>>) {
-        for (layer, counts) in tokens {
-            let held = self.expert_tokens.entry(layer.clone()).or_default();
-            if held.len() < counts.len() {
-                held.resize(counts.len(), 0);
-            }
-            for (held, &count) in held.iter_mut().zip(counts) {
-                *held = held.saturating_add(count);
-            }
-        }
-    }
-
     /// Returns whether every worker counter and breakdown is empty or zero.
     ///
     /// The engine reports an interval's worker counters as `None` when their
@@ -286,7 +264,6 @@ impl ForwardStats {
             && self.blocking_calls.is_empty()
             && self.fence_seconds.is_empty()
             && self.kernel_launches.is_empty()
-            && self.expert_tokens.is_empty()
             && self.fence_records_lost == 0
             && self.profile.is_empty()
             && self.attention_launches == 0
@@ -354,29 +331,5 @@ mod tests {
         assert_eq!(merged.count(), 3);
         assert!((merged.sum() - 0.012).abs() < 1e-12);
         assert_eq!(merged.max(), Some(0.006));
-    }
-
-    /// Merging two ranks' expert counts adds them expert by expert in each layer, keeps a layer
-    /// only one of them counted, and a span with only expert counts is not empty.
-    #[test]
-    fn merged_spans_add_each_expert_s_tokens() {
-        let span = |layers: &[(&str, &[u64])]| ForwardStats {
-            expert_tokens: layers
-                .iter()
-                .map(|(layer, tokens)| ((*layer).to_owned(), tokens.to_vec()))
-                .collect(),
-            ..ForwardStats::default()
-        };
-
-        let mut stats = ForwardStats::default();
-        stats.merge(&span(&[("layers.0.mlp.experts", &[3, 0, 1, 4])]));
-        assert!(!stats.is_empty());
-        stats.merge(&span(&[
-            ("layers.0.mlp.experts", &[1, 2, 0, 0]),
-            ("layers.1.mlp.experts", &[0, 0, 5, 3]),
-        ]));
-
-        assert_eq!(stats.expert_tokens["layers.0.mlp.experts"], [4, 2, 1, 4]);
-        assert_eq!(stats.expert_tokens["layers.1.mlp.experts"], [0, 0, 5, 3]);
     }
 }

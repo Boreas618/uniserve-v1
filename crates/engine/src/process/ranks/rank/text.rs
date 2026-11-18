@@ -111,8 +111,7 @@ impl ModelRunner {
     /// (steps 7 and 22).
     ///
     /// The runner issues its page work through the cache, its forwards split over its worker
-    /// group's communicator `group` at this rank's position, a runner on a device counts its
-    /// routed layers' expert load (`Graphs::set_expert_load`), and `member` makes it the rank's
+    /// group's communicator `group` at this rank's position, and `member` makes it the rank's
     /// member of the node's
     /// expert union: on a device its transport is created first, with `kernels`, on the stream
     /// the runner's worker issues on.
@@ -161,19 +160,6 @@ impl ModelRunner {
         // collective.
         let (rank, ranks) = super::split(self.mapping.position as usize, self.world_size);
         crate::runner::Forward::graphs(&runner).set_group(group, rank, ranks)?;
-
-        // A serving runner counts the tokens each routed layer's experts take. The ranks of a
-        // tensor group route the same tokens, so its first rank counts them for the group;
-        // pipeline stages and sequence members route tokens or layers of their own and each
-        // counts its own.
-        if stream.is_some() && self.text_placement()?.tensor.rank() == 0 {
-            let layers = self.expert_layers();
-            if !layers.is_empty() {
-                crate::runner::Forward::graphs(&runner)
-                    .set_expert_load(&layers)
-                    .context("allocating the rank's expert load")?;
-            }
-        }
 
         if let Some(mut member) = member {
             if let Some(stream) = &stream {

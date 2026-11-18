@@ -6,12 +6,11 @@
 # top-k width rounded up to a power of two); one warp routes one token, so a
 # block of `warps` warps routes as many, which the operator reads from the
 # module's metadata for its grid. The scores' and the optional scale's storage
-# kinds are launch values, and so are the live count and the expert load a
-# serving forward counts its routes into, null pointers without them.
+# kinds are launch values.
 
 op = "topk_softmax"
 backend = "nvcc"
-interface_version = 2
+interface_version = 1
 
 [module]
 form = "cubin"
@@ -30,8 +29,7 @@ UNISERVE_WARPS = { parameter = "warps" }
 
 # The parameters in the operator's packed order. The scale is a pointer even when the call has
 # none: the operator passes a null one, and a pointer slot filled with a scalar is what `ops`
-# refuses by name. The map, the live count and the expert load are pointers the operator passes
-# null without them.
+# refuses by name. The map is a pointer the operator passes null without one.
 [compile.kernel]
 name = "uniserve_topk_softmax"
 warps = { parameter = "warps" }
@@ -48,8 +46,6 @@ signature = [
     ["ids", "*i32"],
     ["weights", "*fp32"],
     ["map", "*i32"],
-    ["live", "*u32"],
-    ["load", "*i64"],
 ]
 
 # `scores_bf16_experts_128_top_8_renormalize_true_scale_none`.

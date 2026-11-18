@@ -28,6 +28,7 @@
 //! one position per token, read on every axis, and a batch that holds image rows states three
 //! ([`TokenBatch::rope_positions`]).
 
+use nn::causal_lm::expert_module;
 use nn::family::{
     CacheShape, ExpertOrder, ExpertShape, IndexKeys, StateShape, TextModel, TextPlacement,
     TokenHistory,
@@ -260,7 +261,7 @@ impl Qwen4ExpForCausalLm {
                     text.linear_layers[layer as usize],
                     config.ple(layer).is_some(),
                     placement,
-                    Some((layer, order)),
+                    order.get(&expert_module(layer)),
                 )
             })
             .collect::<Result<Vec<_>>>()?;

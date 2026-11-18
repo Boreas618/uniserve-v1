@@ -103,28 +103,16 @@ const NOT_LIVE: u32 = u32::MAX - 1;
 /// experts are not stacked in their own order. The selection is over the experts' own ids, so
 /// which experts a token picks, and the order of equal scores, do not depend on the map.
 ///
-/// `load`, when given, is the `[experts]` I64 counters of an expert load
-/// ([`ops::moe::ExpertLoad`]), device memory execution lends: each route of a live token adds one
-/// to its expert's own entry, in place, whatever slot the map names. `live_tokens` is the `[1]`
-/// U32 count of leading token rows the batch fills; without it every row is live.
-///
-/// ```text
-/// load[e] += |{ (t, k) : t < live, ids_before_map[t, k] = e }|
-/// ```
-///
 /// # Errors
 ///
-/// When `scores` is not a matrix, `top` is not between one and the expert count, the scale, the
-/// map or the load is not one entry per expert, a load is given for CPU scores (the counters are
-/// device memory a launch adds into), or the operator refuses its arguments.
+/// When `scores` is not a matrix, `top` is not between one and the expert count, the scale or
+/// the map is not one entry per expert, or the operator refuses its arguments.
 pub fn topk_softmax(
     scores: &Tensor,
     top: u32,
     renormalize: bool,
     scale: Option<&Tensor>,
     map: Option<&Tensor>,
-    live_tokens: Option<&Tensor>,
-    load: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
     const OWNER: &str = TopkSoftmaxCall::OWNER;
 
@@ -140,7 +128,7 @@ pub fn topk_softmax(
             format!("a top of {top} is outside 1..={experts}"),
         ));
     }
-    for (name, table) in [("scale", scale), ("map", map), ("load", load)] {
+    for (name, table) in [("scale", scale), ("map", map)] {
         if let Some(table) = table
             && table.dims() != [experts]
         {
@@ -161,8 +149,6 @@ pub fn topk_softmax(
         renormalize,
         scale,
         map,
-        live_tokens,
-        load,
         tokens,
         experts,
         kept,
@@ -176,8 +162,6 @@ struct TopkSoftmaxCall<'t> {
     renormalize: bool,
     scale: Option<&'t Tensor>,
     map: Option<&'t Tensor>,
-    live_tokens: Option<&'t Tensor>,
-    load: Option<&'t Tensor>,
     tokens: usize,
     experts: usize,
     kept: usize,
@@ -200,19 +184,11 @@ impl Fused for TopkSoftmaxCall<'_> {
             renormalize,
             scale,
             map,
-            load,
             tokens,
             experts,
             kept,
             ..
         } = self;
-        if load.is_some() {
-            return Err(Error::Unsupported(
-                "topk_softmax: an expert load is device memory a launch adds into, and the CPU \
-                 formula keeps none"
-                    .to_owned(),
-            ));
-        }
         let logits = scores.to_dtype(ACCUMULATE)?;
         let shifted = logits
             .broadcast_sub(&logits.max_keepdim(D::Minus1)?)?
@@ -268,8 +244,6 @@ impl Fused for TopkSoftmaxCall<'_> {
             renormalize,
             scale,
             map,
-            live_tokens,
-            load,
             tokens,
             experts,
             kept,
@@ -291,8 +265,6 @@ impl Fused for TopkSoftmaxCall<'_> {
                 ids: ops::operand(&ids)?,
                 weights: ops::operand(&weights)?,
                 map: map.map(ops::operand).transpose()?,
-                live: live_tokens.map(ops::operand).transpose()?,
-                load: load.map(ops::operand).transpose()?,
             },
         )?;
         Ok((ids, weights))

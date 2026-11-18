@@ -261,22 +261,6 @@ mod tests {
         assert!(matches!(first.claim(&[2]), Err(Refusal::Held(_))));
     }
 
-    /// A claim ends with the process that holds it: once its descriptor is closed, as a
-    /// process's exit closes it, another deployment claims the GPU.
-    #[test]
-    fn a_claim_ends_with_its_holder() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(NODE);
-        let mut first = Gpus::open(&path, "first").unwrap();
-        first.claim(&[3]).unwrap();
-        let mut second = Gpus::open(&path, "second").unwrap();
-        assert!(second.claim(&[3]).is_err());
-
-        drop(first);
-        second.claim(&[3]).unwrap();
-        assert_eq!(second.held(), &BTreeSet::from([3]));
-    }
-
     /// A claim held by another process is refused, and ends when that process exits.
     #[test]
     fn a_claim_of_another_process_ends_with_its_exit() {
@@ -320,7 +304,10 @@ mod tests {
     }
 
     /// A hot restart's successor holds the claims of the descriptor it was handed: the claims
-    /// outlive the predecessor's own descriptor.
+    /// outlive the predecessor's own descriptor. (They end with the successor's process, as
+    /// every claim ends with its holder's exit; a descriptor closed inside a process that forks
+    /// may still be held by a child between its fork and its exec, so a release is observed at a
+    /// process's exit, not at a drop.)
     #[test]
     fn a_successor_goes_on_with_the_claims() {
         let directory = tempfile::tempdir().unwrap();
@@ -334,8 +321,6 @@ mod tests {
 
         let mut other = Gpus::open(&path, "second").unwrap();
         assert!(other.claim(&[0]).is_err());
-        drop(successor);
-        other.claim(&[0]).unwrap();
     }
 
     /// A launch's ordinal names the device the daemon's visible devices list at it.

@@ -203,14 +203,6 @@ impl From<&ForwardStats> for wire::ForwardStats {
                     count,
                 })
                 .collect(),
-            expert_tokens: stats
-                .expert_tokens
-                .iter()
-                .map(|(layer, tokens)| wire::ExpertTokens {
-                    layer: layer.clone(),
-                    tokens: tokens.clone(),
-                })
-                .collect(),
             profile: stats
                 .profile
                 .iter()
@@ -289,11 +281,6 @@ impl From<wire::ForwardStats> for ForwardStats {
                     };
                     (key, launch.count)
                 })
-                .collect(),
-            expert_tokens: stats
-                .expert_tokens
-                .into_iter()
-                .map(|layer| (layer.layer, layer.tokens))
                 .collect(),
             fence_records_lost: stats.fence_records_lost,
             profile: stats
@@ -392,11 +379,6 @@ mod tests {
                 },
                 9,
             )]
-            .into(),
-            expert_tokens: [
-                ("layers.0.mlp.experts".to_owned(), vec![4, 0, 7]),
-                ("layers.1.mlp.experts".to_owned(), vec![0, 11, 0]),
-            ]
             .into(),
             spec_verify_accepted_tokens: 3,
             ..ForwardStats::default()

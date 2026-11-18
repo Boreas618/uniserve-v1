@@ -1,5 +1,5 @@
-//! The execution context: which stream, kernels, allocator, input buffer, group, expert exchange,
-//! expert load and profiler a device operation uses.
+//! The execution context: which stream, kernels, allocator, input buffer, group, expert exchange
+//! and profiler a device operation uses.
 //!
 //! Execution builds one context per runner and installs it on its thread around a model call
 //! ([`Context::enter`]), as PyTorch's current stream and graph memory pool are the thread's. A
@@ -35,7 +35,7 @@ use platform::{DeviceRange, Stream};
 use crate::allocator::{ALIGNMENT, Allocator};
 use crate::breaks::HostWork;
 use crate::collective::{Group, Meet};
-use crate::moe::{ExchangeTransport, ExpertLoad};
+use crate::moe::ExchangeTransport;
 use crate::profiler::Profiler;
 use crate::{Error, Result};
 use crate::{Generation, Route};
@@ -85,9 +85,6 @@ pub(crate) struct State {
     pub(crate) meet: Option<Meet>,
     /// What launches the range markers of the modules a forward enters.
     pub(crate) profiler: Option<Arc<dyn Profiler>>,
-    /// The counters the forwards' routed layers add their routes into ([`ExpertLoad`]),
-    /// borrowed from execution, which keeps their memory for as long as they are set.
-    pub(crate) load: Option<ExpertLoad>,
     /// What takes the graph breaks of a forward execution captures ([`Context::set_breaks`]).
     pub(crate) breaks: Option<Arc<dyn Fn(HostWork) -> Result<()> + Send + Sync>>,
 
@@ -146,11 +143,11 @@ impl Context {
     }
 
     /// A launching context beside this one, for a capture on another thread: the same GPU,
-    /// kernels, axes, expert exchange and expert load, each group's collectives issued through a
-    /// group beside it ([`Group::beside`]), on `stream`, and an allocator of its own over this
-    /// context's region, which hands out the addresses this one's does for the same forward. It
-    /// holds no route, break taker, profiler, meeting or input buffer: whoever captures under it
-    /// sets those it needs.
+    /// kernels, axes and expert exchange, each group's collectives issued through a group beside
+    /// it ([`Group::beside`]), on `stream`, and an allocator of its own over this context's
+    /// region, which hands out the addresses this one's does for the same forward. It holds no
+    /// route, break taker, profiler, meeting or input buffer: whoever captures under it sets
+    /// those it needs.
     ///
     /// Nothing is shared with this context but the kernels, the communicators and the region's
     /// addresses, so the two may run forwards on two threads at once. A forward captured under
@@ -188,7 +185,6 @@ impl Context {
             (state.group, state.split) = beside.first().cloned().unwrap_or((None, None));
             state.axes = beside;
             state.exchange = held.exchange;
-            state.load = held.load.clone();
             state
         };
 
@@ -201,12 +197,11 @@ impl Context {
     }
 
     /// A rehearsal of this launching context: the same GPU, kernels and splits, launching on
-    /// `stream` and allocating in `region`, with no group, no expert exchange and no expert load,
-    /// so its idle forwards count no route. Its collectives check their buffers against the split
-    /// and issue nothing, as a meta context's do, and so does its expert exchange: a forward run
-    /// under it computes this rank's share of each launch alone, so the first use of a kernel
-    /// happens there, on a stream no serving forward uses, without any rank's device waiting for
-    /// another.
+    /// `stream` and allocating in `region`, with no group and no expert exchange. Its
+    /// collectives check their buffers against the split and issue nothing, as a meta context's
+    /// do, and so does its expert exchange: a forward run under it computes this rank's share of
+    /// each launch alone, so the first use of a kernel happens there, on a stream no serving
+    /// forward uses, without any rank's device waiting for another.
     ///
     /// The caller keeps `region` mapped for as long as a tensor of the rehearsal is in use.
     ///
@@ -524,7 +519,6 @@ impl State {
             exchange: None,
             meet: None,
             profiler: None,
-            load: None,
             breaks: None,
             launches: None,
             paths: Vec::new(),
