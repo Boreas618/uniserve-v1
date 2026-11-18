@@ -1,25 +1,13 @@
-//! One node's admin API, as the manager calls it: typed requests and responses of the interface
-//! crate's schema (`proto::admin`), and the node's event log read by long poll.
+//! One node's admin API, as the manager calls it: the deployment's policy package
+//! (`/admin/policy`) and SQL over its observation store (`/admin/query`), whose `events` table
+//! the manager also follows as a server-sent event stream.
 
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use proto::admin::{EventsPage, EventsQuery, Status};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde_json::Value;
 
-/// How the manager reads a node's event log.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Polling {
-    /// How long one request of the event log waits for an event before the manager asks
-    /// again; the node waits at most its `admin_config.event_log.longest_wait`.
-    pub(crate) wait: Duration,
-    /// How long the manager waits before it asks again a node it could not reach.
-    pub(crate) retry: Duration,
-}
-
-/// Why a request to a node failed: the node was not reached, or it answered with an error or
-/// with what does not read as the route's response.
+/// Why a request to a node failed: the node was not reached, or it answered with an error.
 #[derive(Debug)]
 pub(crate) enum Failure {
     Unreached(anyhow::Error),
@@ -71,12 +59,12 @@ impl Node {
         })
     }
 
-    /// Sends `request` to `path` and reads its successful response as `T`.
-    async fn exchange<T: DeserializeOwned>(
+    /// Sends `request` to `path` and reads its successful response's body.
+    async fn exchange(
         &self,
         request: reqwest::RequestBuilder,
         path: &str,
-    ) -> Result<T, Failure> {
+    ) -> Result<bytes::Bytes, Failure> {
         let unreached = |error: reqwest::Error| {
             Failure::Unreached(anyhow::Error::new(error).context(format!("reaching {}", self.base)))
         };
@@ -90,46 +78,25 @@ impl Node {
                 String::from_utf8_lossy(&body)
             )));
         }
-        serde_json::from_slice(&body).map_err(|error| {
-            Failure::Answered(
-                anyhow::Error::new(error).context(format!("reading {}{path}", self.base)),
-            )
-        })
+        Ok(body)
     }
 
-    /// `GET path`, read as `T`.
-    pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let request = self.http.get(format!("{}{path}", self.url));
-        Ok(self.exchange(request, path).await?)
-    }
-
-    /// `method path` with the JSON body `body`, its response read as `T`.
-    pub(crate) async fn send<B: Serialize, T: DeserializeOwned>(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        body: &B,
-    ) -> Result<T> {
+    /// The rows of the SQL statement `sql` over the node's observation store, each a JSON
+    /// object of its columns (`POST /admin/query`).
+    pub(crate) async fn query(&self, sql: &str) -> Result<Vec<Value>> {
         let request = self
             .http
-            .request(method, format!("{}{path}", self.url))
-            .json(body);
-        Ok(self.exchange(request, path).await?)
-    }
-
-    /// `GET /admin/status`: what the node serves.
-    pub(crate) async fn status(&self) -> Result<Status> {
-        self.get("/admin/status").await
+            .post(format!("{}/admin/query", self.url))
+            .form(&[("q", sql)]);
+        let body = self.exchange(request, "/admin/query").await?;
+        serde_json::from_slice(&body)
+            .with_context(|| format!("reading {}/admin/query's rows", self.base))
     }
 
     /// `PUT /admin/policy` of the package `archive` (a tar archive of its directory), forcing a
     /// target a rollback marked unavailable when `force`: the revision's record as the node
     /// answers it once the change converged, or why it did not.
-    pub(crate) async fn put_policy(
-        &self,
-        archive: Vec<u8>,
-        force: bool,
-    ) -> Result<serde_json::Value> {
+    pub(crate) async fn put_policy(&self, archive: Vec<u8>, force: bool) -> Result<Value> {
         let path = if force {
             "/admin/policy?force=true"
         } else {
@@ -140,39 +107,96 @@ impl Node {
             .put(format!("{}{path}", self.url))
             .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
             .body(archive);
-        Ok(self.exchange(request, path).await?)
+        let body = self.exchange(request, path).await?;
+        serde_json::from_slice(&body).with_context(|| format!("reading {}{path}", self.base))
     }
 
-    /// The sequence number of the node's last event: a reader from it reads what happens from
-    /// now on.
-    pub(crate) async fn last_event(&self) -> Result<u64> {
-        Ok(self.status().await?.next_event.saturating_sub(1))
+    /// The node's clock, in nanoseconds since the Unix epoch: where a statement over the rows
+    /// appended from now on starts.
+    pub(crate) async fn now(&self) -> Result<i64> {
+        let rows = self.query("SELECT CAST(now() AS BIGINT) AS now").await?;
+        rows.first()
+            .and_then(|row| row["now"].as_i64())
+            .with_context(|| format!("{} answered no clock", self.base))
     }
 
-    /// The node's events after `after`, waiting for one as `polling` states. A node the manager
-    /// cannot reach is asked again every `polling.retry`, each failure printed, until it
-    /// answers.
-    pub(crate) async fn events(&self, after: u64, polling: Polling) -> Result<EventsPage> {
-        let query = EventsQuery {
-            after,
-            wait: polling.wait.as_secs_f64(),
-        };
+    /// Follows the rows of the SQL statement `sql` over every `events` row the node keeps and
+    /// appends, as its server-sent event stream delivers them: each row is handed to `row` as it
+    /// arrives. A stream that ends or a node that cannot be reached is asked again every
+    /// `retry`, each failure printed, resuming after the last message's id (`Last-Event-ID`), so
+    /// no row is read twice.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the node refuses the statement.
+    pub(crate) async fn follow(
+        &self,
+        sql: &str,
+        retry: Duration,
+        mut row: impl FnMut(&Value),
+    ) -> Result<()> {
+        let mut last: Option<u64> = None;
         loop {
-            let request = self
+            let mut request = self
                 .http
-                .get(format!("{}/admin/events", self.url))
-                .query(&query);
-            match self.exchange(request, "/admin/events").await {
-                Ok(page) => return Ok(page),
+                .post(format!("{}/admin/query", self.url))
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .form(&[("q", sql)]);
+            if let Some(id) = last {
+                request = request.header("last-event-id", id.to_string());
+            }
+            match self.stream(request, &mut last, &mut row).await {
+                Ok(()) => println!("{}: the event stream ended; following again", self.base),
                 Err(Failure::Unreached(error)) => {
-                    println!(
-                        "{}: {error:#}; asking again in {:?}",
-                        self.base, polling.retry
-                    );
-                    tokio::time::sleep(polling.retry).await;
+                    println!("{}: {error:#}; asking again in {retry:?}", self.base);
+                    tokio::time::sleep(retry).await;
                 }
                 Err(Failure::Answered(error)) => return Err(error),
             }
         }
+    }
+
+    /// Reads one server-sent event stream to its end: every `data:` line's rows go to `row`, and
+    /// every `id:` line is the position a reconnection resumes after.
+    async fn stream(
+        &self,
+        request: reqwest::RequestBuilder,
+        last: &mut Option<u64>,
+        row: &mut impl FnMut(&Value),
+    ) -> Result<(), Failure> {
+        let unreached = |error: reqwest::Error| {
+            Failure::Unreached(anyhow::Error::new(error).context(format!("reaching {}", self.base)))
+        };
+        let mut response = request.send().await.map_err(unreached)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.bytes().await.map_err(unreached)?;
+            return Err(Failure::Answered(anyhow::anyhow!(
+                "{}/admin/query responded {status}: {}",
+                self.base,
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        let mut pending = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(unreached)? {
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = pending.drain(..=end).collect();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim_end();
+                if let Some(id) = line.strip_prefix("id:") {
+                    *last = id.trim().parse().ok().or(*last);
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    let rows: Vec<Value> = serde_json::from_str(data.trim()).map_err(|error| {
+                        Failure::Answered(
+                            anyhow::Error::new(error)
+                                .context(format!("reading {}'s event stream", self.base)),
+                        )
+                    })?;
+                    rows.iter().for_each(&mut *row);
+                }
+            }
+        }
+        Ok(())
     }
 }

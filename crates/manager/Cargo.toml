@@ -6,17 +6,16 @@ license.workspace = true
 publish = false
 
 # `uniserve-manager`: the optional external manager of deployments. It knows
-# the daemons only through their HTTP admin API, whose schema it reads from
-# the interface crate the daemons serve it from (`proto::admin`).
+# the daemons only through their HTTP admin API: the policy package
+# (`/admin/policy`) and SQL over the observation store (`/admin/query`).
 [[bin]]
 name = "uniserve-manager"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 clap.workspace = true
-# The admin API's schema (`proto::admin`).
-proto.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true

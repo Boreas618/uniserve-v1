@@ -3,41 +3,35 @@
 //!
 //! The manager is a client of each node's admin API (`/admin`) and nothing
 //! else: no daemon, engine, worker or Storage Server waits for it or keeps
-//! state of it. It reads and writes the interface crate's admin schema
-//! (`proto::admin`), the one the daemons serve. A node's admin API listens on a Unix socket
-//! whose file permissions are its access (`unix:<path>`); an `http://` address names an
-//! admin socket forwarded from another host. It attaches to a node by reading its status
-//! (`GET /admin/status`, which states whether the node is idle, starting, serving or stopping)
-//! and its event log, and detaches by stopping; a write it sends is carried out by the
-//! node whether the manager stays or not. Every command acts on the nodes
-//! `--node` names, in the order given:
+//! state of it. A node's admin API listens on a Unix socket whose file permissions are its
+//! access (`unix:<path>`); an `http://` address names an admin socket forwarded from another
+//! host. The API has two endpoints: `/admin/policy`, the deployment's policy package, the one
+//! way it changes, and `/admin/query`, SQL over its observation store (`stats` and `events`),
+//! the one way its state is read. Every command acts on the nodes `--node` names, in the order
+//! given:
 //!
-//! - `status`: what each node serves.
-//! - `watch`: follows each node's event log until interrupted (attach and
-//!   detach).
+//! - `status`: what each node serves, from its latest `node` event and its replicas' sampled
+//!   state.
+//! - `watch`: follows each node's `events` until interrupted (attach and detach), from the
+//!   events it keeps or from now.
 //! - `apply`: applies a policy package to each node's deployment (`PUT /admin/policy`), one
 //!   node after another, stopping at the first whose change does not converge. Each node is
 //!   one deployment's leader, and a GPU belongs to one deployment, so the changes of several
 //!   deployments never contend for a device.
-//! - `shutdown`: brings each node's deployment down, releasing its storage
-//!   unless `--keep-storage`.
-//! - `restart`: a rolling hot restart of each node's daemon, one node after
-//!   another, stopping at the first that fails.
-//! - `pause`, `continue`, `flush-cache`: the generation and cache operations
-//!   of each node.
 //!
-//! A node answers an apply once its change converged or did not; what else the manager
-//! follows it reads from the node's event log by long poll (`GET /admin/events`).
+//! What an operator does to a deployment is an option of its package: holding new requests
+//! (`paused`), sleeping (`asleep`), flushing the prefix cache (`flush`), releasing its storage
+//! when it comes down (`retire`), and a hot restart of its daemon (any daemon option). A node
+//! comes down at its process's stop signal.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use proto::admin::{NodeState, OperationResponse, Paused, Restart, Restarted, Shutdown};
-use serde::de::DeserializeOwned;
+use serde_json::Value;
 
-use node::{Node, Polling};
+use node::Node;
 
 mod node;
 
@@ -54,10 +48,6 @@ struct Cli {
     /// before the command.
     #[arg(long = "node", required = true)]
     nodes: Vec<String>,
-    /// Seconds one request of a node's event log waits for an event before the manager asks
-    /// again; the node waits at most its `admin_config.event_log.longest_wait`.
-    #[arg(long, default_value_t = 30)]
-    event_wait: u64,
     /// Seconds the manager waits before it asks again a node it could not reach.
     #[arg(long, default_value_t = 5)]
     retry_interval: u64,
@@ -69,7 +59,7 @@ struct Cli {
 enum Command {
     /// What each node serves.
     Status,
-    /// Follow each node's event log until interrupted.
+    /// Follow each node's events until interrupted.
     Watch {
         /// Start from the events the node still keeps instead of new ones.
         #[arg(long)]
@@ -85,22 +75,6 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Bring each node's deployment down.
-    Shutdown {
-        /// Keep the deployment's weights and caches retained for a restart
-        /// of the same deployment.
-        #[arg(long)]
-        keep_storage: bool,
-    },
-    /// A rolling hot restart of each node's daemon, which re-executes its own image: each node
-    /// in turn, stopping at the first that fails.
-    Restart,
-    /// Hold new requests on each node; the requests in flight go on.
-    Pause,
-    /// Let new requests through again on each node.
-    Continue,
-    /// Revoke each node's cached prefix pages.
-    FlushCache,
 }
 
 #[tokio::main]
@@ -111,13 +85,10 @@ async fn main() -> Result<()> {
         .iter()
         .map(|address| Node::new(address))
         .collect::<Result<_>>()?;
-    let polling = Polling {
-        wait: Duration::from_secs(cli.event_wait),
-        retry: Duration::from_secs(cli.retry_interval),
-    };
+    let retry = Duration::from_secs(cli.retry_interval);
     match cli.command {
         Command::Status => status(&nodes).await,
-        Command::Watch { from_start } => watch(nodes, from_start, polling).await,
+        Command::Watch { from_start } => watch(nodes, from_start, retry).await,
         Command::Apply { package, force } => {
             let archive = archive(&package)?;
             for node in &nodes {
@@ -131,41 +102,6 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Shutdown { keep_storage } => {
-            let request = Shutdown {
-                retire: !keep_storage,
-            };
-            for node in &nodes {
-                let _: OperationResponse<Shutdown> = node
-                    .send(reqwest::Method::POST, "/admin/shutdown", &request)
-                    .await?;
-                println!("{}: shutting down", node.base);
-            }
-            Ok(())
-        }
-        Command::Restart => {
-            for node in &nodes {
-                println!("{}: restarting", node.base);
-                let response: OperationResponse<Restarted> = node
-                    .send(
-                        reqwest::Method::POST,
-                        "/admin/restart",
-                        &Restart { wait: true },
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("{} did not restart; later nodes are untouched", node.base)
-                    })?;
-                let restarted = response
-                    .result
-                    .with_context(|| format!("{} answered no successor", node.base))?;
-                println!("{}: the daemon {} serves", node.base, restarted.pid);
-            }
-            Ok(())
-        }
-        Command::Pause => each::<Paused>(&nodes, "/admin/pause_generation").await,
-        Command::Continue => each::<()>(&nodes, "/admin/continue_generation").await,
-        Command::FlushCache => each::<()>(&nodes, "/admin/flush_cache").await,
     }
 }
 
@@ -187,67 +123,70 @@ fn archive(directory: &std::path::Path) -> Result<Vec<u8>> {
         .context("finishing the package archive")
 }
 
-/// Posts `path`, an operation whose result is `R`, to every node.
-async fn each<R: DeserializeOwned>(nodes: &[Node], path: &str) -> Result<()> {
-    for node in nodes {
-        let response: OperationResponse<R> = node.send(reqwest::Method::POST, path, &()).await?;
-        let operation = response.operation;
-        println!("{}: {} {}", node.base, operation.kind, operation.state);
-    }
-    Ok(())
-}
+/// The latest `node` event of a node: where its deployment is in its life.
+const NODE: &str = "SELECT fields['state'] AS state, fields['deployment'] AS deployment, \
+                    fields['error'] AS error FROM events \
+                    WHERE kind = 'log' AND labels['source'] = 'node' ORDER BY time DESC LIMIT 1";
 
-/// Prints what each node serves.
+/// Each replica's state and the requests the deployment holds, as the leader last sampled them.
+const REPLICAS: &str = "SELECT name, labels['replica'] AS replica, labels['state'] AS state, \
+                        value FROM stats \
+                        WHERE name IN ('uniserve_replica_state', 'uniserve_requests_held', \
+                        'uniserve_requests_in_flight') \
+                        AND time = (SELECT max(time) FROM stats \
+                        WHERE name = 'uniserve_requests_held') ORDER BY replica";
+
+/// Prints what each node serves: its deployment's state, each replica's engine, and the
+/// requests in flight and held.
 async fn status(nodes: &[Node]) -> Result<()> {
     for node in nodes {
-        let status = node.status().await?;
-        let operation = status
-            .operation
-            .map_or_else(|| "none".to_owned(), |operation| operation.kind.to_string());
-        let line = match status.node {
-            NodeState::Idle { last_error } => format!(
-                "idle{}",
-                last_error
-                    .map(|error| format!(" (last error: {error})"))
-                    .unwrap_or_default()
-            ),
-            NodeState::Starting { name } => format!("starting {name}"),
-            NodeState::Serving { deployment, .. } => format!(
-                "{} engine {}{} in flight {} operation {operation}",
-                deployment.deployment,
-                deployment.engine,
-                if deployment.paused { " (paused)" } else { "" },
-                deployment.in_flight,
-            ),
-            NodeState::Stopping { name } => format!("stopping {name}"),
+        let latest = node.query(NODE).await?;
+        let Some(latest) = latest.first() else {
+            println!("{}: idle", node.base);
+            continue;
         };
+        let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
+        let mut line = format!("{} {}", text(&latest["state"]), text(&latest["deployment"]));
+        if let Some(error) = latest["error"].as_str() {
+            line.push_str(&format!(" (error: {error})"));
+        }
+        let (mut held, mut in_flight, mut replicas) = (0.0, 0.0, Vec::new());
+        for row in node.query(REPLICAS).await? {
+            match row["name"].as_str() {
+                Some("uniserve_requests_held") => held = row["value"].as_f64().unwrap_or(0.0),
+                Some("uniserve_requests_in_flight") => {
+                    in_flight += row["value"].as_f64().unwrap_or(0.0);
+                }
+                _ => replicas.push(format!("{} {}", text(&row["replica"]), text(&row["state"]))),
+            }
+        }
+        if !replicas.is_empty() {
+            line.push_str(&format!(
+                " replicas [{}] in flight {in_flight} held {held}",
+                replicas.join(", ")
+            ));
+        }
         println!("{}: {line}", node.base);
     }
     Ok(())
 }
 
-/// Follows every node's event log until interrupted, from the events each still keeps or from
-/// now. A node that cannot be reached is asked again (`--retry-interval`); one whose log moved
-/// past what was read says so.
-async fn watch(nodes: Vec<Node>, from_start: bool, polling: Polling) -> Result<()> {
+/// Follows every node's events until interrupted, from the events each still keeps or from
+/// now. A node that cannot be reached is asked again (`--retry-interval`).
+async fn watch(nodes: Vec<Node>, from_start: bool, retry: Duration) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for node in nodes {
         tasks.spawn(async move {
-            let mut after = if from_start {
-                0
+            let since = if from_start {
+                String::new()
             } else {
-                node.last_event().await?
+                format!(" WHERE CAST(time AS BIGINT) > {}", node.now().await?)
             };
-            loop {
-                let page = node.events(after, polling).await?;
-                if page.gap {
-                    println!("{}: events were lost; read its status again", node.base);
-                }
-                for event in &page.events {
-                    println!("{}: {}", node.base, serde_json::to_string(event)?);
-                }
-                after = page.next;
-            }
+            let sql = format!("SELECT time, kind, labels, fields, revision FROM events{since}");
+            node.follow(&sql, retry, |row| {
+                println!("{}: {row}", node.base);
+            })
+            .await
         });
     }
     tokio::select! {

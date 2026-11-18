@@ -3793,8 +3793,8 @@ name = "manager"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
- "proto",
  "reqwest",
  "serde",
  "serde_json",
