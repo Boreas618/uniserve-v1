@@ -1496,7 +1496,7 @@ impl Harness {
         let (reply, replied) = crossbeam_channel::bounded(1);
         self.apply(Message::Drain(
             MigrationCause::Drain,
-            deadline,
+            Some(deadline),
             shrink,
             reply,
         ));

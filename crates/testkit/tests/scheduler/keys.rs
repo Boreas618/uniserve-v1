@@ -129,7 +129,7 @@ fn migrate(harness: &mut Harness, id: RequestId, tokens: usize) -> (OwnerId, Vec
     let deadline = std::time::Instant::now();
     harness.apply(Message::Drain(
         MigrationCause::Drain,
-        deadline,
+        Some(deadline),
         false,
         reply,
     ));

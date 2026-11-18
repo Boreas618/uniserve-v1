@@ -457,7 +457,7 @@ fn left_with_a_tail() -> (Harness, proto::request::GenerationRequest, Key) {
     let (reply, _replied) = crossbeam_channel::bounded(1);
     harness.apply(Message::Drain(
         MigrationCause::Drain,
-        std::time::Instant::now(),
+        Some(std::time::Instant::now()),
         false,
         reply,
     ));

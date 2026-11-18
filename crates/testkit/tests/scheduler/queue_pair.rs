@@ -939,7 +939,7 @@ fn a_refused_key_of_a_clone_is_taken_as_a_miss() {
     let (reply, _replied) = crossbeam_channel::bounded(1);
     harness.apply(Message::Drain(
         MigrationCause::Drain,
-        std::time::Instant::now(),
+        Some(std::time::Instant::now()),
         false,
         reply,
     ));
@@ -1193,7 +1193,7 @@ fn a_full_to_a_save_ends_the_video_with_no_stored_step() {
     let (reply, _replied) = crossbeam_channel::bounded(1);
     harness.apply(Message::Drain(
         MigrationCause::Drain,
-        std::time::Instant::now(),
+        Some(std::time::Instant::now()),
         false,
         reply,
     ));
