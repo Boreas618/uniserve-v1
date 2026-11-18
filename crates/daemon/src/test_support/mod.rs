@@ -576,6 +576,8 @@ pub(crate) struct Engines {
     reports: std::sync::mpsc::Sender<(u64, proto::process::Report)>,
     exits: std::sync::mpsc::Sender<proto::process::Exit>,
     greetings: std::sync::mpsc::Sender<(u64, String)>,
+    /// The engines the leader's service started for the daemon's engine control.
+    controlled: std::sync::mpsc::Sender<crate::supervision::processes::Started>,
     /// The fake engines by launch generation.
     engines: std::collections::BTreeMap<u64, testkit::process::Engine>,
     /// How many of the recorded spawns were started as engines.
@@ -594,6 +596,7 @@ impl Engines {
         let (requests, asked) = std::sync::mpsc::channel::<Asked>();
         let (exits, exited) = std::sync::mpsc::channel();
         let (greetings, greeted) = std::sync::mpsc::channel();
+        let (controlled, started) = std::sync::mpsc::channel();
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&log);
         // The leader waits for each reply, so a request is recorded before the
@@ -613,6 +616,7 @@ impl Engines {
             requests: crate::supervision::ToService::new(requests, waker.wake()),
             greetings: greeted,
             exits: exited,
+            started,
             commands: crate::supervision::ProcessCommands {
                 commands: crate::supervision::ToService::new(commands, waker.wake()),
                 reports: Arc::new(std::sync::Mutex::new(reported)),
@@ -624,6 +628,7 @@ impl Engines {
             reports,
             exits,
             greetings,
+            controlled,
             engines: std::collections::BTreeMap::new(),
             started: 0,
             _waker: waker,
@@ -637,6 +642,25 @@ impl Engines {
     pub(crate) fn serve(&mut self, generation: u64) {
         self.engines
             .insert(generation, testkit::process::Engine::serving(generation));
+    }
+
+    /// Starts the serving engine of launch generation `generation` on `host` as the leader's
+    /// service starts one for the daemon's engine control: the service tells of its start, and
+    /// the engine greets with `build` and reports that it serves.
+    pub(crate) fn start_controlled(&mut self, host: &str, generation: u64, build: &str) {
+        let _ = self
+            .controlled
+            .send(crate::supervision::processes::Started {
+                host: host.to_owned(),
+                group: "engine".to_owned(),
+                rank: 0,
+                generation,
+                pid: testkit::process::pid(generation),
+            });
+        let engine = testkit::process::Engine::serving(generation);
+        let _ = self.greetings.send((generation, build.to_owned()));
+        let _ = self.reports.send((generation, engine.started()));
+        self.engines.insert(generation, engine);
     }
 
     /// Starts every engine the leader spawned since the last call: each

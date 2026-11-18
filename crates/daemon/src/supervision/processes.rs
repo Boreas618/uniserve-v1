@@ -37,8 +37,28 @@ pub(crate) struct ProcessLink {
     pub(crate) greetings: Receiver<(u64, String)>,
     /// Every supervised process that exited.
     pub(crate) exits: Receiver<Exit>,
+    /// Every engine the service started for another asker than the updater.
+    pub(crate) started: Receiver<Started>,
     /// Commands to a connected peer and the reports it sends.
     pub(crate) commands: ProcessCommands,
+}
+
+/// An engine process the leader's service started for another asker than the updater: the
+/// daemon's engine control, which starts a deployment's first epoch, relaunches a lost engine
+/// and starts a standby. The updater records it as it records the launches it starts itself, so
+/// every engine of the deployment is a row of the process table and its states are `process`
+/// events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Started {
+    /// The node it runs on.
+    pub(crate) host: String,
+    /// The worker group and rank it is one process of.
+    pub(crate) group: String,
+    pub(crate) rank: u32,
+    /// Its launch generation.
+    pub(crate) generation: u64,
+    /// Its process id on its node.
+    pub(crate) pid: u32,
 }
 
 /// What the deployment's engines tell an update.
@@ -429,9 +449,38 @@ impl Processes {
         }
     }
 
+    /// Records the engine `started` describes, which the service started for the daemon's engine
+    /// control: from its row's `Starting` on, its reports and its exit write its row and its
+    /// `process` events as those of a launch started here do. A launch [`Self::adopt`] named
+    /// before the notice arrived only takes its process id.
+    fn started(&mut self, started: Started) {
+        if let Some(launch) = self.launches.get_mut(&started.generation) {
+            launch.pid.get_or_insert(started.pid);
+            return;
+        }
+        self.launches.insert(
+            started.generation,
+            Launch {
+                host: started.host,
+                group: started.group,
+                rank: u64::from(started.rank),
+                epoch: None,
+                pid: Some(started.pid),
+            },
+        );
+        self.row(started.generation, ProcessState::Starting);
+    }
+
     /// Takes the events that arrived since the last call, oldest first, each
     /// launch's `Hello` before the report that named it.
+    ///
+    /// The engines the service started for the engine control are recorded first: the service
+    /// told of each one's start before it read anything the engine sent, so its reports find its
+    /// launch.
     pub(crate) fn events(&mut self) -> Vec<Event> {
+        while let Ok(started) = self.link.started.try_recv() {
+            self.started(started);
+        }
         while let Ok((generation, build)) = self.link.greetings.try_recv() {
             self.greeted(generation, build);
         }
@@ -609,6 +658,62 @@ mod tests {
             ]
         );
         assert_eq!(events[3]["reason"], "signal: 11");
+    }
+
+    /// An engine the daemon's engine control started, which the service told of, is a launch
+    /// as one started here is: its row and `process` events follow it from its start, with its
+    /// process id, to its serving and its exit.
+    #[tokio::test]
+    async fn an_engine_the_engine_control_started_is_recorded_from_its_start() {
+        let (epochs, mut engines, mut processes, recorder) = recorded();
+        engines.start_controlled("n0", 1, BUILD);
+        let events = processes.events();
+        assert_eq!(
+            events[0],
+            Event::Hello {
+                host: "n0".to_owned(),
+                generation: 1,
+                build: BUILD.to_owned(),
+            }
+        );
+        let rows = epochs.processes();
+        assert_eq!(
+            (rows[0].generation, rows[0].pid, &rows[0].state),
+            (1, Some(testkit::process::pid(1)), &ProcessState::Serving)
+        );
+        engines.exit("n0", 1, "signal: 9");
+        processes.events();
+
+        let events = recorder
+            .store()
+            .query(
+                "SELECT fields['pid'] AS pid, fields['state'] AS state FROM events \
+                 WHERE kind = 'process' AND labels['host'] = 'n0' AND labels['group'] = 'engine' \
+                 AND fields['generation'] = '1' ORDER BY time",
+            )
+            .await
+            .unwrap();
+        let events: serde_json::Value = serde_json::from_slice(&events.json().unwrap()).unwrap();
+        let pid = testkit::process::pid(1).to_string();
+        let states: Vec<(&str, &str)> = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["pid"].as_str().unwrap_or("null"),
+                    row["state"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (pid.as_str(), "starting"),
+                (pid.as_str(), "serving"),
+                (pid.as_str(), "failed")
+            ]
+        );
     }
 
     /// A claim names the deployment, the epoch, its scopes and what it

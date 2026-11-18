@@ -48,6 +48,7 @@ use proto::process::{
 use service::{Connection, Handed, Listener, Waker};
 
 use crate::supervision::claims::{self, ClaimHolder};
+use crate::supervision::processes::Started;
 use crate::supervision::supervisor::{Asker, Owner, ProcessesHandoff, Supervisor};
 
 /// What the service thread reads its stop from, and the waker every other thread fires once it
@@ -661,6 +662,9 @@ pub(crate) struct Updater {
     pub(crate) greetings: Sender<(u64, String)>,
     /// Every supervised process that exited, for the updater's switch.
     pub(crate) exits: Sender<Exit>,
+    /// Every engine a node started for another asker than the updater (the daemon's engine
+    /// control), which the updater records beside its own launches.
+    pub(crate) started: Sender<Started>,
     /// A token per thing the updater has to read: a greeting, a report or an exit wakes the
     /// thread that advances the switch.
     pub(crate) wake: Sender<()>,
@@ -703,6 +707,7 @@ pub(crate) fn serve_leader(
             links: Links::default(),
             stops: HashMap::new(),
             pending: HashMap::new(),
+            spawning: HashMap::new(),
             updater,
         },
         stop,
@@ -730,6 +735,10 @@ pub(crate) struct LeaderService {
     stops: HashMap<(Asker, u64), PendingStop>,
     /// The updater's requests a node has not replied to yet, by request id.
     pending: HashMap<u64, Sender<Reply>>,
+    /// The spawns connections asked of a member, by asker and request id, awaiting the member's
+    /// reply, which names the process the updater is told of ([`LeaderService::follow_spawn`]).
+    /// The launch they carry is left out.
+    spawning: HashMap<(Asker, u64), process::Spawn>,
     updater: Updater,
 }
 
@@ -871,8 +880,10 @@ impl LeaderService {
                 Ok(Some(Upstream {
                     kind: Some(upstream::Kind::Request(request)),
                 })) => {
-                    if let Some(reply) =
-                        self.route(role.owner(), Asker::Connection(connection), &request)
+                    let asker = Asker::Connection(connection);
+                    let reply = self.route(role.owner(), asker, &request);
+                    self.follow_spawn(asker, &request, reply.as_ref());
+                    if let Some(reply) = reply
                         && let Some(peer) = self.peers.get_mut(&connection)
                         && peer.connection.deliver(&downstream_reply(reply)).is_err()
                     {
@@ -943,6 +954,8 @@ impl LeaderService {
         tracing::info!(connection, role = ?peer.role, "a connection of the process socket closed");
         self.stops
             .retain(|&(asker, _), _| asker != Asker::Connection(connection));
+        self.spawning
+            .retain(|&(asker, _), _| asker != Asker::Connection(connection));
         self.local.supervisor.release(connection, engine);
         for member in &mut self.members {
             let _ = member.connection.deliver(&ToMember {
@@ -993,6 +1006,9 @@ impl LeaderService {
         }
         for (node_rank, asker, reply) in replies {
             let key = (asker, reply.id);
+            if let Some(spawn) = self.spawning.remove(&key) {
+                self.started(&spawn, &reply);
+            }
             let Some(stop) = self.stops.get_mut(&key) else {
                 self.deliver(asker, reply);
                 continue;
@@ -1045,6 +1061,7 @@ impl LeaderService {
             }
         }
         for (asker, failure) in failures {
+            self.spawning.remove(&(asker, failure.id));
             self.deliver(asker, failure);
         }
         self.members
@@ -1086,6 +1103,43 @@ impl LeaderService {
         service::wait_ready(&mut descriptors, None)?;
         stop.waker.drain();
         Ok(())
+    }
+
+    /// Follows a spawn connection `asker` asked for, `reply` being its answer when a node
+    /// answered at once, to the process it started: the daemon's engine control starts a
+    /// deployment's first epoch, its relaunches and its standbys over its own connections, and
+    /// the updater, which records every engine of the deployment, is told of each such start
+    /// ([`Self::started`]). A spawn a member serves is told once the member's reply arrives.
+    fn follow_spawn(&mut self, asker: Asker, request: &Request, reply: Option<&Reply>) {
+        let Some(request::Kind::Spawn(spawn)) = &request.kind else {
+            return;
+        };
+        let spawn = process::Spawn {
+            launch: Vec::new(),
+            inherit: Vec::new(),
+            ..spawn.clone()
+        };
+        match reply {
+            Some(reply) => self.started(&spawn, reply),
+            None => {
+                self.spawning.insert((asker, request.id), spawn);
+            }
+        }
+    }
+
+    /// Tells the updater of the process `spawn` started, when `reply` states one.
+    fn started(&self, spawn: &process::Spawn, reply: &Reply) {
+        let Some(reply::Kind::Spawned(Spawned { pid })) = &reply.kind else {
+            return;
+        };
+        let _ = self.updater.started.send(Started {
+            host: spawn.host.clone(),
+            group: spawn.group.clone(),
+            rank: spawn.rank,
+            generation: spawn.generation,
+            pid: *pid,
+        });
+        let _ = self.updater.wake.send(());
     }
 
     /// Delivers one reply: to the updater when it asked, otherwise down the connection that
@@ -1440,6 +1494,9 @@ impl LeaderService {
             links: _,
             stops,
             pending: _,
+            // A spawn in flight is the successor's to learn of: the updater it serves records the
+            // engines its predecessor's daemon adopted.
+            spawning: _,
             // The updater's ends are the daemon's, not the service's: the successor makes its own
             // when it resumes (`ProcessCommands`).
             updater: _,
@@ -1589,6 +1646,7 @@ pub(crate) fn resume(
                     links,
                     stops,
                     pending: HashMap::new(),
+                    spawning: HashMap::new(),
                     updater,
                 },
                 stop,

@@ -215,6 +215,7 @@ impl LeaderEnds {
         let (requests, requests_rx) = std::sync::mpsc::channel();
         let (greetings, greetings_rx) = std::sync::mpsc::channel();
         let (exits, exits_rx) = std::sync::mpsc::channel();
+        let (started, started_rx) = std::sync::mpsc::channel();
         let (activity, awake) = std::sync::mpsc::channel();
         let table: service::ProcessTable = Default::default();
         Self {
@@ -224,6 +225,7 @@ impl LeaderEnds {
                 requests: requests_rx,
                 greetings,
                 exits,
+                started,
                 wake: activity,
                 processes: Arc::clone(&table),
             },
@@ -231,6 +233,7 @@ impl LeaderEnds {
                 requests: ToService::new(requests, wake.clone()),
                 greetings: greetings_rx,
                 exits: exits_rx,
+                started: started_rx,
                 commands: ProcessCommands {
                     commands: ToService::new(commands, wake.clone()),
                     reports: Arc::new(std::sync::Mutex::new(reports_rx)),
