@@ -277,9 +277,10 @@ def _reapply(server: Server) -> httpx.Response:
     return admin.change(server, {})
 
 
-def _update(server: Server) -> None:
+def _update(server: Server) -> int:
     """Apply the newly installed revisions as a generation update, answered
-    once it stood its trial and committed.
+    once it stood its trial and committed, and return when the store
+    recorded its commit (the daemon's clock, an event's time).
     """  # noqa: D205
     before = admin.now(server)
     admin.revision(_reapply(server))
@@ -288,8 +289,9 @@ def _update(server: Server) -> None:
         "update",
         after=before,
         phase=("committed", "abandoned", "rolled_back"),
-    ).fields
-    assert update["phase"] == "committed", update
+    )
+    assert update.fields["phase"] == "committed", update.fields
+    return update.time
 
 
 #: The interfaces of a module set that are no kernel package: the engine and
@@ -307,12 +309,16 @@ class Modules(NamedTuple):
     policy: frozenset[tuple[str, str, str]]
 
 
-def epoch_record(server: Server) -> Modules:
+def epoch_record(server: Server, after: int = 0) -> Modules:
     """The modules the deployment's serving replica runs, as the leader
     recorded them when the deployment last converged: the series of
     ``uniserve_replica_module`` at 1 for replica 0. The leader states the
     gauge at each convergence alone, a module no longer run at 0, so it is
-    read over the store's whole retention (``after=0``).
+    read over the store's whole retention by default (``after=0``).
+
+    The leader records a change's modules once the change converged, which
+    is after its update committed: the record of an update is read with
+    `after` the time of its commit (:func:`_update`), which waits for it.
     """  # noqa: D205
     running = {
         (
@@ -321,7 +327,7 @@ def epoch_record(server: Server) -> Modules:
             sample.labels["revision"],
         )
         for sample in admin.gauge(
-            server, "uniserve_replica_module", after=0, replica="0"
+            server, "uniserve_replica_module", after=after, replica="0"
         )
         if sample.value == 1
     }
@@ -368,8 +374,8 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
     before = epoch_record(server)
     revision = server.build_server.install(package).revision
 
-    _update(server)
-    after = epoch_record(server)
+    committed = _update(server)
+    after = epoch_record(server, after=committed)
     assert after.kernels != before.kernels, (
         "the generation update did not change the recorded kernel packages"
     )
@@ -401,12 +407,12 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
     # update that compared nothing.
     resident = _resident(server.base_url, PROMPTS[0])
     try:
-        _update(server)
+        committed = _update(server)
     finally:
         # Closed after the update answered and before any failure is read: a
         # request in flight here would race `assert_no_failures` below.
         resident.close()
-    after = epoch_record(server)
+    after = epoch_record(server, after=committed)
     assert after.kernels != before.kernels, (
         "the recapture swap did not change the recorded kernel packages"
     )
