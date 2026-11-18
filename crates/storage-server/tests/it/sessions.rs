@@ -601,9 +601,10 @@ pub(crate) fn plane(heads: u32) -> u64 {
     u64::from(PAGE * heads * HEAD_BYTES)
 }
 
-/// Where a rank holding `heads` heads keeps every unit's fields in the host tensor `key`: the
-/// keys' planes, the values' planes, then the two planes' written flags, nine units each.
-pub(crate) fn kv_runs(key: Key, heads: u32) -> Vec<UnitRun> {
+/// Where a rank holding `heads` heads keeps every unit's fields in the tensor `key` at
+/// `location`: the keys' planes, the values' planes, then the two planes' written flags, nine
+/// units each.
+pub(crate) fn kv_runs(key: Key, heads: u32, location: Location) -> Vec<UnitRun> {
     let plane = plane(heads);
     let fields = [
         (planes::VALUES[0], 0, plane),
@@ -620,7 +621,7 @@ pub(crate) fn kv_runs(key: Key, heads: u32) -> Vec<UnitRun> {
         .map(|(name, offset, bytes)| UnitRun {
             field: planes::field(name, 0),
             key,
-            location: Location::Host { numa_node: None },
+            location,
             first: 0,
             count: CELLS,
             offset,
@@ -678,7 +679,7 @@ pub(crate) fn handoff_ranks(socket: &Path, claim: Claim) -> [(Client, OwnedFd); 
                 "units".into(),
                 memory.into(),
                 part,
-                kv_runs(key(name), heads),
+                kv_runs(key(name), heads, Location::Host { numa_node: None }),
                 layout,
             )
             .unwrap();
@@ -691,12 +692,12 @@ pub(crate) fn handoff_ranks(socket: &Path, claim: Claim) -> [(Client, OwnedFd); 
     ]
 }
 
-/// Lends owner 1 of the prefill scheduler, which wrote two pages into its units, and attaches
-/// owner 2 of the decode scheduler. Returns the lender.
+/// Lends owner 1 of the prefill scheduler, whose rank wrote two pages into its units (`write`,
+/// given the units), and attaches owner 2 of the decode scheduler. Returns the lender.
 pub(crate) fn lend_two_pages(
     schedulers: &mut [Scheduler],
     opened: &Opened,
-    prefill: &OwnedFd,
+    write: impl FnOnce(&[u32]),
 ) -> Lender {
     let attach = |scheduler: &mut Scheduler, owner: u64, group| {
         let attach = Request::Attach {
@@ -717,8 +718,7 @@ pub(crate) fn lend_two_pages(
         panic!("no units");
     };
     let lent: Vec<u32> = runs.into_iter().map(|(_, first, _)| first).collect();
-    let prefill = std::fs::File::from(prefill.try_clone().unwrap());
-    write_pages(&prefill, &lent, (0, HEADS));
+    write(&lent);
     let lend = Request::Lend {
         owner: OwnerId(1),
         lease: 60_000_000_000,
@@ -776,7 +776,13 @@ fn an_import_reshards_a_lent_owner_s_pages_into_its_owner_s_ranks_through_the_tr
     let mut engine = engine_head(&server.socket, 0);
     let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
     let mut schedulers = Scheduler::all(&opened, descriptors);
-    let lender = lend_two_pages(&mut schedulers, &opened, &lent);
+    let lender = lend_two_pages(&mut schedulers, &opened, |units| {
+        write_pages(
+            &std::fs::File::from(lent.try_clone().unwrap()),
+            units,
+            (0, HEADS),
+        );
+    });
     let import = Request::Import {
         owner: OwnerId(2),
         tables: vec![(KV, 0, 2)],

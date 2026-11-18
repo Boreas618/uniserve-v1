@@ -1023,6 +1023,11 @@ impl Server {
             }
             (Owner::Move { number, index }, Some(end)) => self.moved(number, index, &end),
             (Owner::Pool { number }, Some(end)) => {
+                // A buffer pool's task answers its request complete or failed alone: the reason
+                // of a failure is the server's record.
+                if let TaskStatus::Failed { failure, message } = &end {
+                    tracing::warn!(task, ?failure, %message, "a buffer pool's transfer task failed");
+                }
                 self.end_pool_task(number, end == TaskStatus::Complete);
             }
             (Owner::Move { .. } | Owner::Pool { .. }, None) => {}

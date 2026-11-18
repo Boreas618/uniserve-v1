@@ -24,8 +24,8 @@ use ::storage::{Access, Claimant, Key, Location};
 
 use crate::server::{Running, engine_head, head, host, key, memfd, scope, tensor, transfer_child};
 use crate::sessions::{
-    HOST, KV, PREFILL, Scheduler, assert_imported, handoff_ranks, host_copy, host_parts,
-    imported_units, layout, lend_two_pages, rank, split_host_region, store_on_host,
+    HEADS, HOST, KV, PREFILL, Scheduler, assert_imported, handoff_ranks, host_copy, host_parts,
+    imported_units, layout, lend_two_pages, rank, split_host_region, store_on_host, write_pages,
 };
 use crate::transfer::{Paths, calibration, pattern, read, transfer_pid};
 
@@ -297,7 +297,9 @@ fn two_hosts(
     let mut decode_schedulers = Scheduler::all(&decode_opened, descriptors);
 
     let mut both = [prefill_schedulers.remove(0), decode_schedulers.remove(1)];
-    let mut lender_owner = lend_two_pages(&mut both, &prefill_opened, &lent);
+    let mut lender_owner = lend_two_pages(&mut both, &prefill_opened, |units| {
+        write_pages(&File::from(lent.try_clone().unwrap()), units, (0, HEADS));
+    });
     lender_owner.endpoint = Some(lender.tcp.clone());
     let [_, decode] = both;
     // The engines, ranks and schedulers serve on while the test holds them.

@@ -3,6 +3,7 @@
 #![cfg(test)]
 
 mod claim;
+mod handoff;
 mod hosts;
 mod programs;
 mod remote;

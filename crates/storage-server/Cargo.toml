@@ -43,6 +43,8 @@ tracing.workspace = true
 # The integration tests replay the traces their servers record (`buffer_pool::replay`).
 storage-server = { path = ".", features = ["verification"] }
 tempfile.workspace = true
+# The device cases write the servers' records to their output (`RUST_LOG`).
+tracing-subscriber.workspace = true
 
 [features]
 # The checks of the buffer pool against its design model (`buffer_pool::replay`,
