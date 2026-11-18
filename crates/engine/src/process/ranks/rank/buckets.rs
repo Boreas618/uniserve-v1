@@ -1,9 +1,4 @@
-//! The buckets a rank captures and the phases they serve, as the scheduler names them in a
-//! batch.
-
-use crate::batch::Phase;
-use crate::batch::capacity::variants;
-use crate::runner::buckets::Buckets;
+//! The graph tiers a rank captures: which stated sizes a deployment's bounds refuse.
 
 /// The refusal a stated graph tier earns, if any.
 ///
@@ -41,55 +36,9 @@ pub(super) fn tier_refusal(
     ))
 }
 
-/// The phases a runner over `buckets` serves: every phase a batch of which may be launched as the
-/// variant of one of the buckets (`crate::batch::capacity::variants`, the scheduler's own rule), in
-/// the order of [`Phase::ALL`].
-///
-/// The rule is read from the scheduler's side so the two cannot disagree: a prefill bucket
-/// serves `Prefill` and `Refill` (a refill chunk is a prefill-class chunk of a decoding request),
-/// a decode bucket `Decode`, a verification bucket `Verify` (a speculating deployment's decode
-/// steps are verifications, [`Buckets::with_drafts`]), and a host bucket the host phase of its
-/// variant. The drafter's bucket and an expert join serve no phase: the worker issues the first
-/// behind the batch it follows, and a union member's join batch states the phase of the member
-/// that asks for it.
-pub(crate) fn served_phases(buckets: &Buckets) -> Vec<Phase> {
-    Phase::ALL
-        .into_iter()
-        .filter(|phase| {
-            buckets
-                .iter()
-                .any(|bucket| variants(*phase).contains(&bucket.variant))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A rank serves the phases its buckets are launched as, and no phase it does not run.
-    #[test]
-    fn a_model_runner_serves_the_phases_its_buckets_are_planned_as() {
-        let buckets = Buckets::causal_lm(&[8], &[64], true);
-
-        assert_eq!(
-            served_phases(&buckets),
-            vec![Phase::Prefill, Phase::Decode, Phase::Refill],
-            "a prefill and a decode batch route to the rank, and a refill chunk runs as a prefill"
-        );
-    }
-
-    /// A speculating rank's decode steps are verifications: it serves `Verify` and no `Decode`,
-    /// and the drafter's buckets, which no batch states, serve no phase.
-    #[test]
-    fn a_speculating_rank_verifies_and_its_drafter_serves_no_phase() {
-        let buckets = Buckets::causal_lm(&[8], &[64], true).with_drafts(3);
-
-        assert_eq!(
-            served_phases(&buckets),
-            vec![Phase::Prefill, Phase::Verify, Phase::Refill]
-        );
-    }
 
     /// A deployment whose stated token tier is longer than its model is refused before weights,
     /// and the refusal names all three figures: the option, the size it states and the bound.

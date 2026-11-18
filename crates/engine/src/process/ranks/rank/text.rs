@@ -23,7 +23,7 @@
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use crate::batch::{Phase, Stage};
+use crate::batch::Stage;
 use crate::memory::buffers::BufferMemory;
 use crate::memory::cache::{CacheLayout, KvCacheMemory};
 use crate::memory::state::StateMemory;
@@ -40,7 +40,6 @@ use platform::Stream;
 use proto::config::WorkerGroupRole;
 
 use super::ModelRunner;
-use super::buckets::served_phases;
 
 /// The kernels a rank's runner and owners launch, as `(operator, key)`: what the engine resolves
 /// the rank's serving generation for.
@@ -48,10 +47,11 @@ pub(crate) type Keys = std::collections::BTreeSet<(&'static str, String)>;
 
 impl ModelRunner {
     /// The config of the rank's runner of `model` over a cache of `layout` with `units` units
-    /// (step 7): the phases its buckets serve (no refill for a model whose layers or drafter keep
-    /// a recurrent state), the rank's request slots, pages and longest sequence, the
-    /// candidates a scored row reports, the scratch page set of its paired forwards, and a
-    /// speculating deployment's drafts and draft pool.
+    /// (step 7): the phases its buckets serve (`CausalLmRunner::served_phases`), the rank's
+    /// request slots, pages and longest sequence, the candidates a scored row reports, the
+    /// scratch page set of its paired forwards, a speculating deployment's drafts, and the draft
+    /// pool of a cache that lays the draft cache out, which a kernel generation of other drafts
+    /// verifies over whether or not the epoch speculates.
     ///
     /// The scratch page set is one set the rows of a paired forward share,
     /// `ceil(T / page) + R` pages for the `T` tokens and `R` rows of the largest bucket
@@ -74,27 +74,13 @@ impl ModelRunner {
         } else {
             0
         };
-        let draft_pool = if drafts > 0 {
-            Some(DraftPool::of(layout, units)?)
-        } else {
-            None
+        let draft_pool = match (drafts, layout.draft_group()) {
+            (0, None) => None,
+            _ => Some(DraftPool::of(layout, units)?),
         };
 
-        // A refill evaluates positions behind its slot's own from a state of their own, which
-        // the runner has none of for a model whose layers or drafter keep a recurrent state, and
-        // refuses: such a rank serves no refill, and a request whose draft cache lags verifies
-        // without drafts.
-        let stateless = model.state_layers().is_empty()
-            && model
-                .drafter()
-                .is_none_or(|drafter| drafter.state_layers().is_empty());
-        let phases = served_phases(&self.buckets)
-            .into_iter()
-            .filter(|phase| *phase != Phase::Refill || stateless)
-            .collect();
-
         Ok(CausalLmConfig {
-            phases,
+            phases: CausalLmRunner::served_phases(&self.buckets, model),
             buckets: self.buckets.clone(),
             slots: self.slots(),
             page_size: self.page_tokens(),

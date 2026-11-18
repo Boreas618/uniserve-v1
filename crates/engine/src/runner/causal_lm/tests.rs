@@ -2467,13 +2467,14 @@ fn reshaped(
 ) {
     use testkit::LONG;
 
-    let measured = worker.measure(options).unwrap();
+    let measured = worker.measure(options, None).unwrap();
     let shape = measured[0]
         .clone()
         .expect("a causal runner takes graph options");
     let next = Arc::new(serving.replace(number, entries(&shape.keys, &unlaunched_kernel())));
     let reshape = Arc::new(crate::worker::Reshape {
         options: options.clone(),
+        model: None,
         regions: vec![(None, shape.values)],
         recapture: false,
     });
@@ -2565,16 +2566,138 @@ fn options_the_runner_cannot_serve_in_place_prepare_nothing() {
     ));
     let (worker, _) = serving_worker(&cache);
 
-    // A runner that speculates nothing takes no drafts in place: its cache lays out no draft
-    // cache.
+    // A runner over a cache that lays out no draft cache verifies no drafts.
     let drafting = crate::runner::GraphOptions {
         buckets: Buckets::causal_lm(&[2, 4], &[8, 80], true),
         candidates: CANDIDATES,
         drafts: 2,
     };
-    let refused = worker.measure(&drafting).unwrap_err().to_string();
-    assert!(refused.contains("in place"), "{refused}");
+    let model: Arc<dyn TextModel> = Arc::new(Tiny::drafting(false));
+    let refused = worker
+        .measure(&drafting, Some(model))
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("lays no draft cache out"), "{refused}");
     worker.close().unwrap();
+}
+
+/// A runner that speculates nothing over a cache that lays the draft cache out: the draft cache
+/// is lent to it, kept for a shape that verifies drafts.
+fn unspeculating() -> CausalLmRunner {
+    let config = CausalLmConfig {
+        draft_pool: Some(POOL),
+        ..config()
+    };
+    let graphs = Graphs::meta(
+        Arc::new(Generation::new(0, [])),
+        CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap(),
+    );
+    let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
+
+    let mut runner = CausalLmRunner::new(
+        Arc::new(Tiny::new(false)),
+        config,
+        graphs,
+        None,
+        vec![group(PAGES, pooled)],
+        None,
+    )
+    .unwrap();
+    runner.set_draft_cache(draft_cache(), None, None).unwrap();
+    runner
+}
+
+/// A generation whose drafts start speculating serves verifications with the model it loaded
+/// for them, over the draft cache the runner kept, from its switch on; one whose drafts stop
+/// serves decodes again. Each refuses the serving model where it loads no drafter.
+#[test]
+fn a_generation_of_drafts_from_or_to_none_switches_between_decodes_and_verifications() {
+    let catalog = Buckets::causal_lm(&[2, 4], &[8, 80], true);
+    let options = |drafts: u32| crate::runner::GraphOptions {
+        buckets: catalog.clone(),
+        candidates: CANDIDATES,
+        drafts,
+    };
+    let kernels = Arc::new(Generation::new(2, []));
+
+    // Lent no trail and no drafter's state while it speculates nothing.
+    let buffers = vec![vec![meta((12, HIDDEN), DType::BF16)]];
+    assert!(
+        unspeculating()
+            .set_draft_cache(draft_cache(), Some(buffers), None)
+            .is_err()
+    );
+
+    // Drafts need the drafter: the serving model loaded none.
+    let mut runner = unspeculating();
+    let refused = runner.measure(&options(DRAFTS), None).err().unwrap();
+    assert!(refused.to_string().contains("no drafter"), "{refused}");
+
+    let drafter: Arc<dyn TextModel> = Arc::new(Tiny::drafting(false));
+    let measured = runner
+        .measure(&options(DRAFTS), Some(&drafter))
+        .unwrap()
+        .unwrap();
+    assert!(measured.storage > 0, "a verifying shape keeps its outputs");
+    let values = CausalLmRunner::input_bytes(&speculating_config(), &*drafter).unwrap();
+    assert!(
+        runner
+            .reshape(
+                2,
+                (&options(DRAFTS), Some(&drafter)),
+                Arc::clone(&kernels),
+                (None, values),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        runner.reshaped_phases(),
+        [Phase::Prefill, Phase::Verify, Phase::Refill]
+    );
+    assert_eq!(runner.phases(), [Phase::Prefill, Phase::Decode]);
+
+    assert!(runner.switch_shape(2).unwrap());
+    assert_eq!(
+        runner.phases(),
+        [Phase::Prefill, Phase::Verify, Phase::Refill]
+    );
+    assert!(
+        runner
+            .buckets()
+            .iter()
+            .any(|bucket| super::verifies(bucket.variant))
+    );
+
+    // Rolled back, the runner decodes again with the serving model.
+    assert!(runner.rollback_shape(2).unwrap());
+    assert_eq!(runner.phases(), [Phase::Prefill, Phase::Decode]);
+    assert!(
+        !runner
+            .buckets()
+            .iter()
+            .any(|bucket| super::verifies(bucket.variant))
+    );
+
+    // A speculating runner's generation of no drafts decodes with the model that released the
+    // drafter, and its commit releases the verifying shape.
+    let mut speculating = speculating(false);
+    let released: Arc<dyn TextModel> = Arc::new(Tiny::new(false));
+    let values = CausalLmRunner::input_bytes(&config(), &*released).unwrap();
+    assert!(
+        speculating
+            .reshape(3, (&options(0), Some(&released)), kernels, (None, values))
+            .unwrap()
+    );
+    assert!(speculating.switch_shape(3).unwrap());
+    assert_eq!(
+        speculating.phases(),
+        [Phase::Prefill, Phase::Decode, Phase::Refill]
+    );
+    assert!(speculating.commit_shape(3).unwrap());
+    assert_eq!(
+        speculating.phases(),
+        [Phase::Prefill, Phase::Decode, Phase::Refill]
+    );
 }
 
 #[test]

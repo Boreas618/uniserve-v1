@@ -505,6 +505,29 @@ impl WeightStore {
         Ok(released.len())
     }
 
+    /// The device bytes a load of `weights`, `(key, writable, length)` of weights this rank
+    /// maps none of, takes on the device: a weight of its own allocation its length rounded up
+    /// to the granularity, the packed weights the allocations of the granularity their aligned
+    /// lengths fill, and a table the model writes its length. A weight another rank of the GPU
+    /// published is mapped and takes nothing more, which this figure does not know: it bounds
+    /// what the load takes from above.
+    pub(crate) fn added_bytes(&self, weights: &[(WeightKey, bool, u64)]) -> u64 {
+        let granularity = self.granularity as u64;
+        let alignment = ops::allocator::ALIGNMENT;
+        let (mut own, mut packed) = (0_u64, 0_u64);
+        for (_, writable, length) in weights {
+            if *writable {
+                own = own.saturating_add(length.next_multiple_of(alignment));
+            } else if self.packs(*length) {
+                packed = packed.saturating_add(length.next_multiple_of(alignment));
+            } else {
+                own = own.saturating_add(length.div_ceil(granularity).saturating_mul(granularity));
+            }
+        }
+        let packs = packed.div_ceil(granularity).saturating_mul(granularity);
+        own.saturating_add(packs)
+    }
+
     /// Unmaps the weights of `keys` and ends the rank's retention of them: a load that will
     /// not serve leaves no storage behind. The caller holds no tensor over them that a kernel
     /// may still read.

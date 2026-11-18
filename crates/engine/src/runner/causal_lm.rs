@@ -320,6 +320,10 @@ pub struct CausalLmRunner {
     /// What a runner that speculates holds beside its sampler: the draft cache it is lent,
     /// the selection of its verifications and what its forwards keep.
     speculation: Option<Speculation>,
+    /// The draft cache as the rank's cache lends it, for a cache that lays one out
+    /// ([`CausalLmRunner::set_draft_cache`]): what a shape that verifies drafts computes its
+    /// drafter's forwards over, whether or not the serving shape speculates.
+    draft_cache: Option<KvCache>,
     /// The stream the graphs replay on; `None` for graphs that hold no device.
     stream: Option<Stream>,
     /// The feature buffer of prefills with image rows, for a runner lent one.
@@ -349,6 +353,7 @@ pub struct CausalLmRunner {
 /// for them (module documentation, "Shapes"), as the fields of [`CausalLmRunner`] of the same
 /// names, which a switch exchanges whole.
 struct Form {
+    model: Arc<dyn TextModel>,
     config: CausalLmConfig,
     graphs: Graphs,
     layout: Layout,
@@ -373,6 +378,9 @@ struct Flight {
     pending: Pending,
     /// How many of the read tensors are the drafter's proposals, the last ones.
     proposals: usize,
+    /// Whether the shape that launched the step speculates, so its calls carry the drafter's
+    /// proposals: a switch between its launch and its landing does not change it.
+    speculates: bool,
     /// The candidates each scored row of the step reports: the shape's that launched it, which a
     /// switch between its launch and its landing does not change.
     candidates: u32,
@@ -441,6 +449,26 @@ impl CausalLmRunner {
     /// [`Error::Invalid`] for a config with no bucket.
     pub fn input_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
         Ok(stated(config, model)?.1.bytes())
+    }
+
+    /// The phases a runner of `model` over `buckets`, the catalog with its drafts
+    /// (`Buckets::with_drafts`), serves: those its buckets are launched as (`Buckets::phases`),
+    /// with no refill for a model whose layers or drafter keep a recurrent state.
+    pub(crate) fn served_phases(buckets: &Buckets, model: &dyn TextModel) -> Vec<Phase> {
+        // A refill evaluates positions behind its slot's own from a state of their own, which
+        // the runner has none of for a model whose layers or drafter keep a recurrent state, and
+        // refuses: such a runner serves no refill, and a request whose draft cache lags verifies
+        // without drafts.
+        let stateless = model.state_layers().is_empty()
+            && model
+                .drafter()
+                .is_none_or(|drafter| drafter.state_layers().is_empty());
+
+        buckets
+            .phases()
+            .into_iter()
+            .filter(|phase| *phase != Phase::Refill || stateless)
+            .collect()
     }
 
     /// The pages of the scratch page set paired forwards of a runner of `buckets` compute over,
@@ -636,6 +664,7 @@ impl CausalLmRunner {
         let runner = Self {
             buckets,
             speculation,
+            draft_cache: None,
             model,
             config,
             graphs,
@@ -671,9 +700,11 @@ impl CausalLmRunner {
         Ok(runner)
     }
 
-    /// Lends a runner that speculates the draft cache its drafter's forwards compute over,
-    /// the trail of the recurrent state when its model keeps one and its forwards lend no
-    /// verify slots, and the drafter's state when the drafter keeps one.
+    /// Lends the runner the draft cache its drafter's forwards compute over, and a runner that
+    /// speculates the trail of the recurrent state when its model keeps one and its forwards
+    /// lend no verify slots, and the drafter's state when the drafter keeps one. A runner whose
+    /// config states no drafts keeps the draft cache for the shape of a kernel generation that
+    /// verifies drafts ([`Runner::reshape`]), and is lent neither of the others.
     ///
     /// - `draft` is the draft group as the rank's cache lends it: the drafter's planes, pages
     ///   of the draft pool's page size, and the workspace. Its `block_tables` is not read: a
@@ -691,35 +722,45 @@ impl CausalLmRunner {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for a runner that speculates nothing, a draft cache that is not the
-    /// drafter's layers over the draft pool's pages, a trail that is not the model's
-    /// recurrent state over the tokens of a verification, or that the runner keeps none of,
-    /// or a drafter's state that is not the drafter's fields over the config's request slots.
+    /// [`Error::Invalid`] for a runner whose config states no draft pool, a draft cache that
+    /// is not over the draft pool's pages or not the drafter's layers, a trail that is not the
+    /// model's recurrent state over the tokens of a verification, or that the runner keeps none
+    /// of, or a drafter's state that is not the drafter's fields over the config's request
+    /// slots.
     pub fn set_draft_cache(
         &mut self,
         draft: KvCache,
         trail: Option<StateBuffers>,
         drafter: Option<StateBuffers>,
     ) -> Result<()> {
-        let (layers, drafter_runs) = match self.model.drafter() {
-            Some(drafter) => (Some(drafter.cache().layers), drafter.state_layers()),
-            None => (None, Vec::new()),
-        };
-        let Some(speculation) = self.speculation.as_mut() else {
+        let Some(pool) = self.config.draft_pool else {
             return Err(Error::Invalid(
-                "a draft cache lent to a runner whose config states no drafts".into(),
+                "a draft cache lent to a runner whose config states no draft pool".into(),
             ));
         };
-
-        if Some(draft.layers.len() as u32) != layers || draft.page_size != speculation.pool.page {
+        if draft.page_size != pool.page {
             return Err(Error::Invalid(format!(
-                "a draft cache of {} layers over pages of {} tokens, and the drafter's {layers:?} \
-                 layers read pages of {}",
-                draft.layers.len(),
-                draft.page_size,
-                speculation.pool.page
+                "a draft cache over pages of {} tokens, and the draft pool's are of {}",
+                draft.page_size, pool.page
             )));
         }
+        if self.speculation.is_none() {
+            if trail.is_some() || drafter.is_some() {
+                return Err(Error::Invalid(
+                    "a runner that speculates nothing is lent no trail and no drafter's state"
+                        .into(),
+                ));
+            }
+            self.draft_cache = Some(draft);
+            return Ok(());
+        }
+
+        check_draft_cache(&*self.model, &draft)?;
+        let drafter_runs = self
+            .model
+            .drafter()
+            .map(|drafter| drafter.state_layers())
+            .unwrap_or_default();
 
         // The trail holds the state after every token of the largest verification.
         let tokens = self
@@ -755,9 +796,12 @@ impl CausalLmRunner {
         }
         check_drafter_state(&drafter_runs, self.config.slots, drafter.as_ref())?;
 
-        speculation.draft = Some(draft);
-        speculation.trail = trail;
-        speculation.state = drafter;
+        if let Some(speculation) = self.speculation.as_mut() {
+            speculation.draft = Some(draft.clone());
+            speculation.trail = trail;
+            speculation.state = drafter;
+        }
+        self.draft_cache = Some(draft);
         Ok(())
     }
 
@@ -926,27 +970,35 @@ impl CausalLmRunner {
         Ok(())
     }
 
-    /// The shape of `options` (module documentation, "Shapes"), over the graphs `graphs` makes
-    /// for the bytes of its input tensors: its config, its buckets (their capacity classes for a
-    /// member of an expert union), its input layout, its ban masks, its samplers, a speculating
-    /// runner's kept outputs and the feature buffer, each of the serving shape's that the
-    /// options leave as they are shared. On the `device`, what differs is allocated on the
-    /// runner's stream; otherwise it is made of meta tensors, for a measurement.
+    /// The shape of `options` (module documentation, "Shapes") computing with `model`, over the
+    /// graphs `graphs` makes for the bytes of its input tensors: its config with the phases its
+    /// buckets serve, its buckets (their capacity classes for a member of an expert union), its
+    /// input layout, its ban masks, its samplers, a speculating shape's kept outputs and the
+    /// feature buffer, each of the serving shape's that the options leave as they are shared. A
+    /// shape that verifies drafts where the serving one speculates nothing does so over the
+    /// draft cache the runner keeps ([`CausalLmRunner::set_draft_cache`]). On the `device`,
+    /// what differs is allocated on the runner's stream; otherwise it is made of meta tensors,
+    /// for a measurement.
+    ///
+    /// `model` is the serving model, or the model a generation of other drafts loads: one that
+    /// loaded the drafter for a shape that verifies drafts, or released it for one that
+    /// verifies none.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a catalog of a bucket that is no causal forward, of more tokens
     /// than a member of an expert union sends, or a verification longer than the recurrent
-    /// state's trail; [`Error::Unsupported`] for drafts where the runner speculates nothing or
-    /// none where it does, and for other drafts of a model whose state keeps a slot per
-    /// verified token; what `graphs` and the allocations refuse.
+    /// state's trail, for drafts of a model that loaded no drafter or over a cache that lays no
+    /// draft cache out; [`Error::Unsupported`] for other drafts of a model whose layers or
+    /// drafter keep a recurrent state; what `graphs` and the allocations refuse.
     fn shape(
         &self,
         options: &GraphOptions,
+        model: &Arc<dyn TextModel>,
         device: bool,
         graphs: impl FnOnce(u64) -> Result<Graphs>,
     ) -> Result<Form> {
-        let config = CausalLmConfig {
+        let mut config = CausalLmConfig {
             buckets: options.buckets.clone(),
             candidates: options.candidates,
             drafts: options.drafts,
@@ -955,23 +1007,24 @@ impl CausalLmRunner {
         for bucket in config.buckets.iter() {
             bucket.causal_lm()?;
         }
-        if (config.drafts == 0) != (self.config.drafts == 0) {
+        let stateful = !model.state_layers().is_empty()
+            || model
+                .drafter()
+                .is_some_and(|drafter| !drafter.state_layers().is_empty());
+        if config.drafts != self.config.drafts && stateful {
             return Err(Error::Unsupported(format!(
-                "a runner that verifies {} drafts takes {} in place: its cache lays the draft \
-                 cache out with the drafter's weights, which only an epoch loads or releases",
+                "a model whose layers or drafter keep a recurrent state verifies {} drafts, and \
+                 {} drafts lay its state out otherwise",
                 self.config.drafts, config.drafts
             )));
         }
-        if config.drafts != self.config.drafts && owned_slots(&*self.model, &self.config)?.is_some()
-        {
-            return Err(Error::Unsupported(format!(
-                "a model whose state keeps a slot per verified token holds {} rows a slot, and \
-                 {} drafts take another state region",
-                self.config.drafts + 1,
-                config.drafts
-            )));
+        if config.drafts > 0 && config.draft_pool.is_none() {
+            return Err(Error::Invalid(
+                "a shape that verifies drafts over a cache that lays no draft cache out".into(),
+            ));
         }
-        let (mut buckets, layout) = stated(&config, &*self.model)?;
+        config.phases = Self::served_phases(&config.buckets.with_drafts(config.drafts), &**model);
+        let (mut buckets, layout) = stated(&config, &**model)?;
 
         // A member of an expert union captures every bucket at each capacity class, which bound
         // what the member sends a step.
@@ -1026,17 +1079,39 @@ impl CausalLmRunner {
             slots.counts().clone(),
             slots.bias().clone(),
         )?;
-        let speculation = match &self.speculation {
-            Some(serving) => Some(Speculation {
+        // A shape that verifies drafts keeps its own outputs for its drafter and selects with a
+        // verifier of its drafts; one that starts verifying lends its drafter the draft cache
+        // the runner keeps, and its model's drafter must read it.
+        let speculation = if config.drafts == 0 {
+            None
+        } else {
+            let pool = config.draft_pool.ok_or_else(|| {
+                Error::Invalid(
+                    "a shape that verifies drafts over a cache that lays no draft cache out".into(),
+                )
+            })?;
+            let draft = match &self.speculation {
+                Some(serving) => serving.draft.clone(),
+                None => self.draft_cache.clone(),
+            };
+            if model.drafter().is_none() {
+                return Err(Error::Invalid(
+                    "a shape that verifies drafts with a model that loaded no drafter".into(),
+                ));
+            }
+            if let Some(draft) = &draft {
+                check_draft_cache(&**model, draft)?;
+            }
+            Some(Speculation {
                 drafts: config.drafts,
-                pool: serving.pool,
+                pool,
                 kept: Kept::new(
                     stream,
                     layout.rows(),
                     layout.tokens(),
                     config.candidates,
-                    self.model.stream_width(),
-                    self.model.dtype(),
+                    model.stream_width(),
+                    model.dtype(),
                 )?,
                 verifier: Sampler::new(
                     SamplerConfig {
@@ -1046,14 +1121,21 @@ impl CausalLmRunner {
                     slots.counts().clone(),
                     slots.bias().clone(),
                 )?,
-                ..serving.clone()
-            }),
-            None => None,
+                draft,
+                trail: self
+                    .speculation
+                    .as_ref()
+                    .and_then(|serving| serving.trail.clone()),
+                state: self
+                    .speculation
+                    .as_ref()
+                    .and_then(|serving| serving.state.clone()),
+            })
         };
         let features = self
             .features
             .as_ref()
-            .map(|features| features.with_tokens(&*self.model, layout.tokens(), stream))
+            .map(|features| features.with_tokens(&**model, layout.tokens(), stream))
             .transpose()?;
 
         let graphs = graphs(layout.bytes())?;
@@ -1066,6 +1148,7 @@ impl CausalLmRunner {
         }
 
         Ok(Form {
+            model: Arc::clone(model),
             config,
             graphs,
             layout,
@@ -1088,10 +1171,10 @@ impl CausalLmRunner {
         } else {
             Slots::ban_bytes(vocabulary, rows)
         };
-        let kept = Self::kept_bytes(&shape.config, &*self.model)?;
+        let kept = Self::kept_bytes(&shape.config, &*shape.model)?;
         let features = match &self.features {
             Some(_) if shape.layout.tokens() > self.layout.tokens() => {
-                Features::bytes(&*self.model, shape.layout.tokens())?
+                Features::bytes(&*shape.model, shape.layout.tokens())?
             }
             _ => 0,
         };
@@ -1105,6 +1188,7 @@ impl CausalLmRunner {
     /// union member, readback or lander).
     fn instance(&self, shape: Form) -> Self {
         let Form {
+            model,
             config,
             graphs,
             layout,
@@ -1116,7 +1200,7 @@ impl CausalLmRunner {
         } = shape;
 
         Self {
-            model: Arc::clone(&self.model),
+            model,
             config,
             graphs,
             layout,
@@ -1131,6 +1215,7 @@ impl CausalLmRunner {
             union: None,
             regions: self.regions.clone(),
             speculation,
+            draft_cache: self.draft_cache.clone(),
             stream: None,
             features,
             staged: Vec::new(),
@@ -1146,6 +1231,7 @@ impl CausalLmRunner {
     /// Exchanges the serving shape's fields with `shape`'s: the runner serves `shape` from its
     /// next step on, and `shape` holds what served.
     fn exchange(&mut self, shape: &mut Form) {
+        std::mem::swap(&mut self.model, &mut shape.model);
         std::mem::swap(&mut self.config, &mut shape.config);
         std::mem::swap(&mut self.graphs, &mut shape.graphs);
         std::mem::swap(&mut self.layout, &mut shape.layout);
@@ -1627,6 +1713,7 @@ impl CausalLmRunner {
             refused,
             pending,
             proposals: proposals.len(),
+            speculates: self.speculation.is_some(),
             candidates: self.config.candidates,
             started,
             launched,
@@ -1644,6 +1731,7 @@ impl CausalLmRunner {
             refused,
             pending,
             proposals,
+            speculates,
             candidates,
             started,
             launched,
@@ -1675,7 +1763,7 @@ impl CausalLmRunner {
         } else {
             output::calls_output(&batch.columns, &bucket, vocabulary, candidates, &outputs)?
         };
-        if self.speculation.is_some() {
+        if speculates {
             speculation::propose(batch, vocabulary, &proposals, &mut calls)?;
         }
         output::refuse(&mut calls, &refused);
@@ -2103,6 +2191,7 @@ impl Runner for CausalLmRunner {
     fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
         let speculation = instance_speculation(self.speculation.as_ref(), &graphs)?;
         let shape = Form {
+            model: Arc::clone(&self.model),
             config: self.config.clone(),
             graphs,
             layout: self.layout.clone(),
@@ -2119,13 +2208,19 @@ impl Runner for CausalLmRunner {
     /// The forward of a shape of `options` over graphs that hold no device, for the profile run
     /// that measures it before anything of it is allocated: its peak, its input values and its
     /// kernels. Every shape of options the runner serves is measured so (module documentation,
-    /// "Shapes"), and so is one of options it serves now.
+    /// "Shapes"), and so is one of options it serves now. A shape of `model`, the model a
+    /// generation of other drafts loads, is measured over it, a load over meta weights.
     ///
     /// # Errors
     ///
     /// As [`CausalLmRunner::shape`].
-    fn measure(&self, options: &GraphOptions) -> Result<Option<Measure>> {
-        let shape = self.shape(options, false, |inputs| {
+    fn measure(
+        &self,
+        options: &GraphOptions,
+        model: Option<&Arc<dyn TextModel>>,
+    ) -> Result<Option<Measure>> {
+        let model = model.unwrap_or(&self.model);
+        let shape = self.shape(options, model, false, |inputs| {
             self.graphs.measuring(self.graphs.kernels(), inputs)
         })?;
         let storage = self.shape_bytes(&shape)?;
@@ -2139,7 +2234,8 @@ impl Runner for CausalLmRunner {
     /// Prepares the shape of `options` for generation `number`, whose kernels are `kernels`,
     /// beside the serving one: its graphs over `region` (the runner's own when `None`) with an
     /// input buffer of `values` bytes a slot ([`Graphs::over`]), and every storage of the shape
-    /// that differs from the serving one's allocated on the runner's device.
+    /// that differs from the serving one's allocated on the runner's device. The shape computes
+    /// with `model` when the generation loads one, else with the serving model.
     ///
     /// # Errors
     ///
@@ -2147,7 +2243,7 @@ impl Runner for CausalLmRunner {
     fn reshape(
         &mut self,
         number: u64,
-        options: &GraphOptions,
+        (options, model): (&GraphOptions, Option<&Arc<dyn TextModel>>),
         kernels: Arc<ops::Generation>,
         (region, values): (Option<platform::DeviceRange>, u64),
     ) -> Result<bool> {
@@ -2157,7 +2253,8 @@ impl Runner for CausalLmRunner {
             ));
         }
 
-        let shape = self.shape(options, true, |inputs| {
+        let model = Arc::clone(model.unwrap_or(&self.model));
+        let shape = self.shape(options, &model, true, |inputs| {
             self.graphs.over(kernels, region, inputs, values)
         })?;
         self.prepared = Some((number, shape));
@@ -2170,6 +2267,12 @@ impl Runner for CausalLmRunner {
             .map(|(number, shape)| (*number, &shape.graphs))
     }
 
+    fn reshaped_phases(&self) -> &[Phase] {
+        self.prepared
+            .as_ref()
+            .map_or(&[], |(_, shape)| shape.config.phases.as_slice())
+    }
+
     /// The forward of the prepared shape over `graphs`, as [`Runner::capturer`] makes the
     /// serving shape's.
     fn reshaped_capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
@@ -2178,6 +2281,7 @@ impl Runner for CausalLmRunner {
         };
         let speculation = instance_speculation(prepared.speculation.as_ref(), &graphs)?;
         let shape = Form {
+            model: Arc::clone(&prepared.model),
             config: prepared.config.clone(),
             graphs,
             layout: prepared.layout.clone(),
@@ -2685,6 +2789,19 @@ fn check_state(
         }
     })?;
     check_buffers("checkpoint", checkpoint, &layers, |_| slots)
+}
+
+/// Refuses `draft`, a draft cache a runner of `model` verifies over, when it is not the
+/// drafter's layers: a model that loaded no drafter reads none.
+fn check_draft_cache(model: &dyn TextModel, draft: &KvCache) -> Result<()> {
+    let layers = model.drafter().map(|drafter| drafter.cache().layers);
+    if Some(draft.layers.len() as u32) != layers {
+        return Err(Error::Invalid(format!(
+            "a draft cache of {} layers, and the drafter's {layers:?} layers read it",
+            draft.layers.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Refuses the live buffers of a drafter's state that are not those of `runs`, the drafter's

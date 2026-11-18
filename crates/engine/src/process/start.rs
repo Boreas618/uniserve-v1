@@ -1135,6 +1135,7 @@ fn weight_binding(
     let target = LoadTarget {
         checkpoint: PathBuf::from(&launch.engine_config.model.model),
         experts: model_runner.experts(),
+        drafts: launch.engine_config.speculative.num_draft_tokens,
     };
     Ok(Arc::new(WeightBinding::new(served, target, remotes)))
 }

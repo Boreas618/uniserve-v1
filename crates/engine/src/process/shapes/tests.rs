@@ -8,7 +8,7 @@ use proto::config::{CudaGraphConfig, EngineConfig, GraphOptions, SchedulerConfig
 use proto::request::GenerationLimits;
 use storage::runtime::GroupId;
 
-use super::{Bounds, checked_options, runner_options};
+use super::{Bounds, runner_options};
 use crate::batch::capacity::variants;
 use crate::batch::{Capacity, Phase, Shape, Variant};
 use crate::scheduler::policy::ceilings;
@@ -48,6 +48,11 @@ fn serving(config: &EngineConfig) -> Bounds {
         .map(|bucket| bucket.shape())
         .chain([Shape::prefill(1, 64, Variant::ConditionEncode)])
         .collect();
+    capacity.phases = options
+        .buckets
+        .phases()
+        .iter()
+        .fold(0, |phases, phase| phases | 1 << phase.index());
     let capacities = vec![(GroupId(0), capacity)];
     let budget = config.scheduler.policy_budget;
     let ceilings = ceilings(capacities.iter().map(|(_, capacity)| capacity), &budget);
@@ -123,37 +128,47 @@ fn a_generation_s_catalog_bounds_the_groups_steps_and_requests() {
 }
 
 #[test]
-fn options_the_engine_does_not_serve_in_place_are_refused_by_what_they_change() {
+fn a_catalog_above_the_longest_sequence_is_refused() {
     let config = config();
-    let serving = config.graph_options();
 
     // A token tier above the longest sequence is captured and never filled.
     let long = catalog(&config, &[1, 2], &[128]);
-    let refused = format!(
-        "{:#}",
-        checked_options(&config, &serving, &long).unwrap_err()
-    );
+    let refused = format!("{:#}", runner_options(&config, &long).unwrap_err());
     assert!(refused.contains("max_model_len"), "{refused}");
+}
 
-    // Drafts where none were make the decode buckets verifications, a phase the workers'
-    // queues do not route.
-    let drafting = GraphOptions {
-        num_draft_tokens: 2,
-        ..serving.clone()
-    };
-    let refused = format!(
-        "{:#}",
-        checked_options(&config, &serving, &drafting).unwrap_err()
+/// Drafts where none were make a group's decodes verifications, whose draft caches it refills,
+/// and none again make them decodes: the bounds state the phases the group serves under them.
+#[test]
+fn drafts_from_or_to_none_change_the_token_phases_a_group_serves() {
+    let config = config();
+    let bounds = serving(&config);
+    let bit = |phase: Phase| 1_u32 << phase.index();
+    let serves = |phases: u32, phase: Phase| phases & bit(phase) != 0;
+
+    let mut drafting = config.graph_options();
+    drafting.num_draft_tokens = 2;
+    let runners = runner_options(&config, &drafting).unwrap();
+    let under = bounds.under(&config, &runners, drafting.max_logprobs);
+    let (_, capacity) = &under.capacities[0];
+    assert!(serves(capacity.phases, Phase::Verify));
+    assert!(!serves(capacity.phases, Phase::Decode));
+    assert!(serves(capacity.phases, Phase::Prefill));
+    assert!(serves(capacity.phases, Phase::Refill));
+    assert_eq!(under.scheduling.phases, vec![(GroupId(0), capacity.phases)]);
+    assert!(
+        capacity
+            .buckets
+            .iter()
+            .any(|shape| variants(Phase::Verify).contains(&shape.variant))
     );
-    assert!(refused.contains("Verify"), "{refused}");
 
-    // Other sizes within the bounds are served in place, and so is CUPTI's other mode, whose
-    // graphs are captured again.
-    let other = catalog(&config, &[1, 2, 4], &[8, 32]);
-    assert!(checked_options(&config, &serving, &other).is_ok());
-    let sampling = GraphOptions {
-        graph_pc_sampling: true,
-        ..serving.clone()
-    };
-    assert!(checked_options(&config, &serving, &sampling).is_ok());
+    let decoding = under.under(
+        &config,
+        &runner_options(&config, &config.graph_options()).unwrap(),
+        0,
+    );
+    let (_, capacity) = &decoding.capacities[0];
+    assert!(serves(capacity.phases, Phase::Decode));
+    assert!(!serves(capacity.phases, Phase::Verify));
 }

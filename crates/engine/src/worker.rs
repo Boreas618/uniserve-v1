@@ -222,6 +222,10 @@ const COUNT_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 /// computation no option shapes takes the generation in its graphs.
 pub(crate) struct Reshape {
     pub(crate) options: GraphOptions,
+    /// The causal model the generation loaded for its shapes: the serving checkpoint with its
+    /// drafter loaded or released, for options of other drafts that do so; `None` for shapes
+    /// of the serving model.
+    pub(crate) model: Option<Arc<dyn nn::family::TextModel>>,
     pub(crate) regions: Vec<(Option<platform::DeviceRange>, u64)>,
     /// Whether every bucket of the runners the options shape nothing of is captured again as
     /// well: CUPTI samples the graphs' program counters otherwise than for the serving ones.
@@ -670,8 +674,9 @@ impl Worker {
         &self.queue
     }
 
-    /// The phases the runners serve, in the runners' order.
-    pub(crate) fn phases(&self) -> &[Phase] {
+    /// The phases the runners serve, in the runners' order: during a kernel generation whose
+    /// shapes serve other phases, those of both shapes.
+    pub(crate) fn phases(&self) -> Vec<Phase> {
         self.queue.phases()
     }
 
@@ -810,12 +815,18 @@ impl Worker {
     /// its forward over graphs that hold no device on the calling thread, so the worker thread
     /// only builds the forwards (`Runner::measure`); `None` for a runner whose computation no
     /// option shapes. Nothing is allocated. A work thread's call, never the control thread's.
+    /// `model` is the model the generation loads for the shapes, loaded over meta weights
+    /// ([`Runner::measure`]).
     ///
     /// # Errors
     ///
     /// Options a runner cannot serve in place, a profile run that fails, or the close of the
     /// queue.
-    pub(crate) fn measure(&self, options: &GraphOptions) -> Result<Vec<Option<Measured>>> {
+    pub(crate) fn measure(
+        &self,
+        options: &GraphOptions,
+        model: Option<Arc<dyn nn::family::TextModel>>,
+    ) -> Result<Vec<Option<Measured>>> {
         let asked = options.clone();
         let measures = self.call("measuring the runners' shapes", move |runners| {
             runners
@@ -823,7 +834,7 @@ impl Worker {
                 .map(|runner| {
                     let graphs = runner.graphs();
                     Ok(runner
-                        .measure(&asked)?
+                        .measure(&asked, model.as_ref())?
                         .map(|measure| (measure, graphs.region_bytes(), graphs.graph_bytes())))
                 })
                 .collect::<Result<Vec<_>>>()
@@ -1941,6 +1952,18 @@ impl Thread {
             }
         }
 
+        // The batches of the phases the shapes serve reach the worker from the switch on, beside
+        // those of the shapes that serve until then.
+        let mut phases = self.queue.phases();
+        for runner in &self.runners {
+            for phase in runner.reshaped_phases() {
+                if !phases.contains(phase) {
+                    phases.push(*phase);
+                }
+            }
+        }
+        self.queue.set_phases(phases);
+
         // The update's evidence starts empty, but for the kernels it adds: nothing serving
         // computes them, so no paired forward will compare them.
         self.unmeasured = added_kernels(&serving, next);
@@ -1990,9 +2013,12 @@ impl Thread {
 
         let region = reshape.map(|reshape| reshape.regions.get(index).copied().unwrap_or_default());
         let shaped = match (reshape, region) {
-            (Some(reshape), Some(region)) => {
-                runner.reshape(number, &reshape.options, Arc::clone(next), region)?
-            }
+            (Some(reshape), Some(region)) => runner.reshape(
+                number,
+                (&reshape.options, reshape.model.as_ref()),
+                Arc::clone(next),
+                region,
+            )?,
             _ => false,
         };
         if !shaped {
@@ -2153,7 +2179,16 @@ impl Thread {
             self.cancelled.retain(|held, _| *held > number);
             self.readiness.forget(number);
         }
+        self.queue.set_phases(self.served_phases());
         committed
+    }
+
+    /// The phases the runners' serving shapes serve, in the runners' order.
+    fn served_phases(&self) -> Vec<Phase> {
+        self.runners
+            .iter()
+            .flat_map(|runner| runner.phases().iter().copied())
+            .collect()
     }
 
     /// Commits generation `number` on runner `index` ([`Thread::commit`]).
@@ -2215,6 +2250,7 @@ impl Thread {
             self.publish_uncompared();
             self.readiness.forget(number);
         }
+        self.queue.set_phases(self.served_phases());
         rolled_back
     }
 

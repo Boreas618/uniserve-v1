@@ -608,7 +608,7 @@ fn route_refusal(group: &Group, phase: Phase) -> Error {
     let served: Vec<Phase> = group
         .workers
         .iter()
-        .flat_map(|worker| worker.phases().iter().copied())
+        .flat_map(|worker| worker.phases())
         .collect();
 
     Error::Invalid(format!(

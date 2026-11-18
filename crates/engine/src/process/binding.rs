@@ -83,6 +83,8 @@
 //! as the daemon's operations reach it ([`WeightBinding::on_peers`]), each keeping its own
 //! replacement; its commit acts on every rank.
 
+mod models;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -119,7 +121,8 @@ use crate::worker::{Error, Result, Worker};
 /// value and state planes, with the flags, scales and index keys beside them.
 pub(crate) const KV_POOL: &str = "kv";
 
-/// What a load of the served model reads: which checkpoint, and which expert sits in which slot.
+/// What a load of the served model reads: which checkpoint, which expert sits in which slot, and
+/// the drafts it serves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Target {
     /// The checkpoint's directory.
@@ -127,6 +130,10 @@ pub(crate) struct Target {
     /// Each routed expert layer's logical expert ids in physical slot order, by module path. A
     /// layer this map does not name keeps the checkpoint's order.
     pub experts: BTreeMap<String, Vec<u32>>,
+    /// The tokens a step drafts (`speculative_config.num_draft_tokens`): the model loads its
+    /// drafter for drafts above zero, and a model whose state holds a window per request sizes
+    /// it by them.
+    pub drafts: u32,
 }
 
 /// How a rank loads its model: the model crates are the executable's, so this crate reaches them
@@ -144,6 +151,18 @@ pub(crate) trait ModelLoad: Send + Sync {
         target: &Target,
         weights: &dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String>;
+
+    /// The causal language model of `target`, loaded through `weights` as [`ModelLoad::load`]
+    /// loads it: what a kernel generation of other drafts serves its shapes with.
+    ///
+    /// # Errors
+    ///
+    /// Why the checkpoint cannot be this model's, as a sentence; a media rank loads none.
+    fn text(
+        &self,
+        target: &Target,
+        weights: &dyn nn::RetainedWeights,
+    ) -> std::result::Result<Arc<dyn nn::family::TextModel>, String>;
 
     /// The routed expert layers this rank's model holds, by module path, each with the experts its
     /// router names. A model without routed experts states none.
@@ -346,6 +365,9 @@ pub(crate) struct WeightBinding {
     remotes: Vec<(Vec<GroupId>, Arc<Remote>)>,
     /// What the ranks serve now.
     target: Mutex<Target>,
+    /// The models a kernel generation of other drafts loaded on the ranks, until its commit or
+    /// its release ([`models`]).
+    models: Mutex<Option<models::Drafting>>,
     experts: Mutex<Option<Experts>>,
     /// Signalled when copies that ran leave [`Experts::Copying`], which an abort waits on: the
     /// copies own their storage until they end.
@@ -611,6 +633,7 @@ impl WeightBinding {
             ranks: ranks.into_iter().map(Mutex::new).collect(),
             remotes,
             target: Mutex::new(target),
+            models: Mutex::new(None),
             experts: Mutex::new(None),
             experts_copied: Condvar::new(),
             adapters: Mutex::new(BTreeMap::new()),

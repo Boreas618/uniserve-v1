@@ -146,10 +146,13 @@ pub(crate) fn kernels(
     binding
         .release_regions_before(generation)
         .context("giving back the regions of earlier generations")?;
+    binding
+        .release_models_before(generation)
+        .context("giving back the models of earlier generations")?;
     let held = serving_kernels(workers)?;
     let serving_keys = launched_keys(&held);
     let shapes = match options {
-        Some(options) => measure(workers, &options.runners)?,
+        Some(options) => measure(workers, binding, &options.runners)?,
         None => Shapes::new(),
     };
     let keys = shaped_keys(&serving_keys, &shapes);
@@ -199,7 +202,20 @@ pub(crate) fn kernels(
     drop(client);
     room(&recaptured, &shapes).context("making the room the generation's graphs take")?;
     let reshapes = match options {
-        Some(options) if reshaping => regions(workers, binding, generation, options, &shapes)?,
+        Some(options) if reshaping => {
+            // The model a generation of other drafts serves its shapes with loads into the room
+            // made for it, before any region is mapped.
+            let models = binding
+                .load_models(workers, generation, options.runners.drafts)
+                .context("loading the model the generation's drafts serve with")?;
+            let reshapes = regions(workers, binding, generation, options, (&shapes, models));
+            if reshapes.is_err()
+                && let Err(error) = binding.release_models(generation)
+            {
+                tracing::warn!(%error, generation, "a generation's models were not given back");
+            }
+            reshapes?
+        }
         _ => vec![None; workers.len()],
     };
 
@@ -232,18 +248,38 @@ pub(crate) fn kernels(
 }
 
 /// Every worker's runners' shapes under `options`, in the workers' order ([`Worker::measure`]).
+/// Options of drafts that start or stop speculating are measured with the model they load
+/// (`WeightBinding::meta_models`), and the device bytes of the weights that load adds count in
+/// the extra of the worker's first shape, its causal runner's.
 ///
 /// # Errors
 ///
-/// Options a runner cannot serve in place, or a worker that closed.
-pub(crate) fn measure(workers: &[Arc<Worker>], options: &GraphOptions) -> Result<Shapes> {
+/// Options a runner cannot serve in place, a model the drafts cannot load, or a worker that
+/// closed.
+pub(crate) fn measure(
+    workers: &[Arc<Worker>],
+    binding: &WeightBinding,
+    options: &GraphOptions,
+) -> Result<Shapes> {
+    let models = binding
+        .meta_models(workers, options.drafts)
+        .context("loading the model the generation's drafts serve with over meta weights")?;
     workers
         .iter()
+        .zip(models)
         .enumerate()
-        .map(|(rank, worker)| {
-            worker
-                .measure(options)
-                .with_context(|| format!("measuring the shapes of worker {rank}'s runners"))
+        .map(|(rank, (worker, model))| {
+            let (model, weights) = match model {
+                Some((model, weights)) => (Some(model), weights),
+                None => (None, 0),
+            };
+            let mut shapes = worker
+                .measure(options, model)
+                .with_context(|| format!("measuring the shapes of worker {rank}'s runners"))?;
+            if let Some(Some(causal)) = shapes.first_mut() {
+                causal.extra = causal.extra.saturating_add(weights);
+            }
+            Ok(shapes)
         })
         .collect()
 }
@@ -295,10 +331,10 @@ fn regions(
     binding: &WeightBinding,
     generation: u64,
     options: &Options,
-    shapes: &Shapes,
+    (shapes, models): (&Shapes, Vec<Option<Arc<dyn nn::family::TextModel>>>),
 ) -> Result<Vec<Option<Arc<Reshape>>>> {
     let mut reshapes = Vec::with_capacity(workers.len());
-    for (worker, measured) in workers.iter().zip(shapes) {
+    for ((worker, measured), model) in workers.iter().zip(shapes).zip(models) {
         let mut regions = Vec::with_capacity(measured.len());
         for (index, shape) in measured.iter().enumerate() {
             let Some(shape) = shape else {
@@ -326,6 +362,7 @@ fn regions(
         }
         reshapes.push(Some(Arc::new(Reshape {
             options: options.runners.clone(),
+            model,
             regions,
             recapture: options.recapture,
         })));
@@ -373,7 +410,7 @@ pub(crate) fn room(
     let (client, targets) = build;
     let keys = launched_keys(&serving_kernels(workers)?);
     let shapes = match options {
-        Some(options) => measure(workers, &options.runners)?,
+        Some(options) => measure(workers, binding, &options.runners)?,
         None => Shapes::new(),
     };
     let stated = options.map(|options| &options.stated);
@@ -898,6 +935,9 @@ pub(crate) fn commit(
     binding
         .commit_regions(generation)
         .with_context(|| format!("giving back the regions generation {generation} replaced"))?;
+    binding
+        .commit_models(generation)
+        .with_context(|| format!("releasing the weights generation {generation} replaced"))?;
 
     for (index, inbox) in schedulers.iter().enumerate() {
         inbox
@@ -952,7 +992,15 @@ pub(crate) fn rollback(
         let regions = binding
             .release_regions(generation)
             .with_context(|| format!("giving back the regions of generation {generation}"));
-        devices.and(memories).and(shaped).and(policies).and(regions)
+        let models = binding
+            .release_models(generation)
+            .with_context(|| format!("giving back the models of generation {generation}"));
+        devices
+            .and(memories)
+            .and(shaped)
+            .and(policies)
+            .and(regions)
+            .and(models)
     })
 }
 
@@ -985,7 +1033,10 @@ pub(crate) fn discard(
     let regions = binding
         .release_regions(generation)
         .with_context(|| format!("giving back the regions of generation {generation}"));
-    released.and(regions)
+    let models = binding
+        .release_models(generation)
+        .with_context(|| format!("giving back the models of generation {generation}"));
+    released.and(regions).and(models)
 }
 
 /// The submission of `job` on every rank of `route`, this node's and its peers' (`Route::switch`);

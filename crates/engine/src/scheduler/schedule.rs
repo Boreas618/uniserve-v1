@@ -1959,6 +1959,73 @@ mod tests {
         assert_eq!(stamps, [(A, release(OWNER_A, 3))]);
     }
 
+    /// A kernel generation of no drafts gives up every request's draft table at its boundary
+    /// and runs the requests' next steps as decodes on the group whose verifications held them;
+    /// one of drafts runs them as verifications and refills again, on the same group.
+    #[test]
+    fn a_generation_of_no_drafts_gives_up_the_draft_tables_and_decodes() {
+        let bit = |phase: Phase| 1_u32 << phase.index();
+        let verifying = bit(Phase::Prefill) | bit(Phase::Verify) | bit(Phase::Refill);
+        let decoding = bit(Phase::Prefill) | bit(Phase::Decode) | bit(Phase::Refill);
+        let limits = |draft_tokens, phases| super::super::GraphLimits {
+            config: proto::config::SchedulerConfig {
+                draft_tokens,
+                ..proto::config::SchedulerConfig::default()
+            },
+            buckets: Vec::new(),
+            phases: vec![(A, phases)],
+            max_logprobs: 0,
+        };
+
+        let mut bench = bench(1024);
+        bench.scheduler.groups[0].capacity.cache_groups = vec![(CacheGroupKind::Draft, 16)];
+        bench.scheduler.groups[0].capacity.phases = verifying;
+        bench.scheduler.config.draft_tokens = 2;
+        let id = running(&mut bench);
+        let request = bench.scheduler.requests.get_mut(&id).unwrap();
+        request.placement[Phase::Verify.index()] = Some(A);
+        request.placement[Phase::Refill.index()] = Some(A);
+        request.blocks[usize::from(KV)] = Blocks {
+            first: 0,
+            shared: 0,
+            end: 3,
+            asked: 3,
+        };
+        request.num_draft_tokens = 32;
+
+        bench.scheduler.set_graphs(&limits(0, decoding));
+        let scheduler = &bench.scheduler;
+        assert_eq!(scheduler.config.draft_tokens, 0);
+        assert!(scheduler.groups[0].serves(Phase::Decode));
+        assert!(!scheduler.groups[0].serves(Phase::Verify));
+        let request = &scheduler.requests[&id];
+        assert_eq!(request.blocks[usize::from(KV)], Blocks::default());
+        assert_eq!(request.num_draft_tokens, 0);
+        assert_eq!(request.placement[Phase::Decode.index()], Some(A));
+        assert_eq!(request.placement[Phase::Verify.index()], None);
+        let release = runtime::Request::Release {
+            owner: OWNER_A,
+            class: KV,
+            at: 0,
+            count: 3,
+            after: Vec::new(),
+        };
+        let stamps: Vec<_> = bench
+            .stamps()
+            .into_iter()
+            .filter(|(group, _)| *group == A)
+            .collect();
+        assert_eq!(stamps, [(A, release)]);
+
+        // Drafts again: the request verifies and refills on the same group.
+        bench.scheduler.set_graphs(&limits(2, verifying));
+        let request = &bench.scheduler.requests[&id];
+        assert_eq!(request.placement[Phase::Verify.index()], Some(A));
+        assert_eq!(request.placement[Phase::Decode.index()], None);
+        assert_eq!(request.placement[Phase::Refill.index()], Some(A));
+        assert_eq!(bench.scheduler.config.draft_tokens, 2);
+    }
+
     /// The low watermark and the draft cache take only the units the regions have free, and the
     /// units a short request waits for are not: a request visited first that would only grow its
     /// headroom leaves them, and the short request asks for the block its next call writes (SD

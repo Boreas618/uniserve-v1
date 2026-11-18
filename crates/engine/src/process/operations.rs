@@ -510,6 +510,7 @@ fn operate(
             let shapes = match &options {
                 Some(options) => super::generation::measure(
                     workers,
+                    binding,
                     &super::shapes::runner_options(config, options)?,
                 )?,
                 None => super::generation::Shapes::new(),

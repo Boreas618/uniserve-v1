@@ -154,6 +154,13 @@ pub trait TextCheckpoint: Send + Sync {
     /// model. An expert redistribution orders these layers' experts ([`ExpertOrder`]).
     fn expert_layers(&self) -> BTreeMap<String, u32>;
 
+    /// Whether the checkpoint carries a drafter for speculative decoding that a placement may
+    /// load ([`TextPlacement::drafter`], [`TextModel::drafter`]); a checkpoint that states
+    /// none carries none.
+    fn drafter(&self) -> bool {
+        false
+    }
+
     /// Loads the model's share of `checkpoint`, the checkpoint [`TextFamily::open`] read, for
     /// `placement`, its weights reached through `loader` (whose root builder the model's modules
     /// load from), its routed experts in the slots `experts` states.

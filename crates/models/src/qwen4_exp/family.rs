@@ -45,6 +45,11 @@ impl CausalLmConfig for Config {
         self.text.num_hidden_layers
     }
 
+    /// The multi-token-prediction layers the checkpoint states, its drafter.
+    fn drafter(&self) -> bool {
+        self.mtp_num_hidden_layers > 0
+    }
+
     /// Every layer routes.
     fn experts(&self) -> Option<&MoeConfig> {
         Some(&self.moe)

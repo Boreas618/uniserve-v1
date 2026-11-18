@@ -229,11 +229,19 @@ pub trait Runner: Forward {
     /// of it is made (`Runner::reshape`). `None` for a runner whose computation no option of a
     /// generation shapes: it takes a generation's kernels in its graphs as they are.
     ///
+    /// `model` is the model a generation of other drafts loads for the shape, loaded over meta
+    /// weights: the causal model with its drafter loaded or released (`None` for the serving
+    /// one).
+    ///
     /// # Errors
     ///
     /// Options the runner cannot serve in place. The default measures nothing.
-    fn measure(&self, options: &GraphOptions) -> Result<Option<Measure>> {
-        let _ = options;
+    fn measure(
+        &self,
+        options: &GraphOptions,
+        model: Option<&std::sync::Arc<dyn nn::family::TextModel>>,
+    ) -> Result<Option<Measure>> {
+        let _ = (options, model);
         Ok(None)
     }
 
@@ -243,7 +251,9 @@ pub trait Runner: Forward {
     /// ([`Graphs::over`]), and what else of it differs, allocated. Every bucket of the shape is
     /// then captured for its graphs ([`Runner::reshaped`], [`Runner::reshaped_capturer`]).
     /// Returns whether the runner prepared a shape: `false` for one whose computation no option
-    /// shapes, which takes the generation in its graphs ([`Graphs::prepare`]).
+    /// shapes, which takes the generation in its graphs ([`Graphs::prepare`]). The options come
+    /// with the model a generation of other drafts loaded for the shape, as
+    /// [`Runner::measure`] takes it.
     ///
     /// # Errors
     ///
@@ -252,7 +262,10 @@ pub trait Runner: Forward {
     fn reshape(
         &mut self,
         number: u64,
-        options: &GraphOptions,
+        options: (
+            &GraphOptions,
+            Option<&std::sync::Arc<dyn nn::family::TextModel>>,
+        ),
         kernels: std::sync::Arc<ops::Generation>,
         region: (Option<platform::DeviceRange>, u64),
     ) -> Result<bool> {
@@ -264,6 +277,12 @@ pub trait Runner: Forward {
     /// graphs, which its captures are installed in; `None` while none is prepared.
     fn reshaped(&self) -> Option<(u64, &Graphs)> {
         None
+    }
+
+    /// The phases the prepared shape serves, which batches name from its switch on; none while
+    /// no shape is prepared.
+    fn reshaped_phases(&self) -> &[Phase] {
+        &[]
     }
 
     /// A forward instance of the prepared shape over `graphs`, as [`Runner::capturer`] makes the

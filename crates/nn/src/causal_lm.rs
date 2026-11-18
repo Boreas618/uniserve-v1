@@ -57,6 +57,13 @@ pub trait CausalLmConfig: Send + Sync + Sized + 'static {
     /// The routed experts of the decoder stack, `None` for a dense stack.
     fn experts(&self) -> Option<&MoeConfig>;
 
+    /// Whether the checkpoint carries a drafter for speculative decoding (multi-token
+    /// prediction layers) that a placement may load ([`TextPlacement::drafter`]). A family whose
+    /// checkpoints carry none states none.
+    fn drafter(&self) -> bool {
+        false
+    }
+
     /// Builds the family's model of this configuration, the configuration of `checkpoint`, its
     /// modules read under `vb` (the checkpoint's root), at the ranks `placement` states, its
     /// routed experts in the slots `order` states.
@@ -147,6 +154,10 @@ struct Opened<C>(C);
 impl<C: CausalLmConfig> TextCheckpoint for Opened<C> {
     fn expert_layers(&self) -> BTreeMap<String, u32> {
         self.0.expert_layers()
+    }
+
+    fn drafter(&self) -> bool {
+        self.0.drafter()
     }
 
     fn load(

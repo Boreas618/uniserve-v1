@@ -1428,6 +1428,7 @@ fn a_generation_s_graphs_bound_the_steps_from_the_next_one_on() {
     let serving = Arc::new(super::GraphLimits {
         config: SchedulerConfig::default(),
         buckets: vec![(A, scheduler.groups[0].capacity.buckets.clone())],
+        phases: Vec::new(),
         max_logprobs: 0,
     });
     let asking = |logprobs: u32| {
@@ -1476,6 +1477,7 @@ fn a_generation_s_graphs_bound_the_steps_from_the_next_one_on() {
                 Shape::prefill(4, 128, Variant::PrefillGreedy),
             ],
         )],
+        phases: Vec::new(),
         max_logprobs: 3,
     });
     take(scheduler, &next);

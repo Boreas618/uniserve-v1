@@ -1083,8 +1083,8 @@ impl MainProcess {
     ///
     /// # Errors
     ///
-    /// Options of a catalog of a size of zero, options the engine does not serve in place
-    /// (`shapes::checked_options`), or an engine that has not started.
+    /// Options of a catalog of a size of zero or one the deployment's bounds refuse
+    /// (`shapes::runner_options`), or an engine that has not started.
     fn shaped(
         &self,
         stated: Option<proto::process::GraphOptions>,
@@ -1102,7 +1102,7 @@ impl MainProcess {
             .as_ref()
             .ok_or_else(|| format!("{:#}", starting()))?;
         let config = &self.launch.engine_config;
-        let runners = shapes::checked_options(config, &self.options, &stated)
+        let runners = shapes::runner_options(config, &stated)
             .map_err(|error| format!("the generation's graph options: {error:#}"))?;
         let bounds = engine.bounds().under(config, &runners, stated.max_logprobs);
         let recapture = stated.graph_pc_sampling != self.options.graph_pc_sampling;
@@ -1304,6 +1304,7 @@ impl MainProcess {
             return self.serial(Box::new(move || {
                 let committed = binding
                     .commit_regions(generation)
+                    .and_then(|()| binding.commit_models(generation))
                     .map_err(anyhow::Error::from);
                 done(move |main| main.committed(generation, committed))
             }));
@@ -1817,8 +1818,7 @@ impl MainProcess {
             .map_err(|error| anyhow::anyhow!("the generation's graph options: {error}"));
         let options = stated.and_then(|stated| match stated {
             Some(stated) if stated != self.options => {
-                let runners =
-                    shapes::checked_options(&self.launch.engine_config, &self.options, &stated)?;
+                let runners = shapes::runner_options(&self.launch.engine_config, &stated)?;
                 let recapture = stated.graph_pc_sampling != self.options.graph_pc_sampling;
                 Ok(Some(generation::Options {
                     stated,

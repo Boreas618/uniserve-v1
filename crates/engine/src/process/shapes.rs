@@ -7,19 +7,19 @@
 //! Every rank of a deployment captures one catalog (`crate::process::ranks::rank::catalog`), so
 //! what a group's workers capture under other options follows from the options alone, on the
 //! scheduler node as on every peer: a group that serves token phases states the catalog's
-//! shapes, with a speculating deployment's verifications, beside the shapes of whatever else it
-//! serves (its vision encodings), and a group of no token phase states what it stated. A
+//! shapes, with a speculating generation's verifications, and the token phases they serve, beside
+//! the shapes of whatever else it serves (its vision encodings), and a group of no token phase
+//! states what it stated. A
 //! generation of other options switches every scheduler to its bounds and a rollback back to
 //! the serving ones (`crate::process::generation`); the control thread's copy follows each.
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use proto::config::{EngineConfig, SchedulerConfig};
 use proto::request::GenerationLimits;
 use storage::runtime::GroupId;
 
-use super::ranks::rank::buckets::served_phases;
 use super::ranks::rank::catalog;
 use super::start::{lowered, step_budget};
 use crate::batch::capacity::variants;
@@ -44,32 +44,6 @@ pub(crate) fn runner_options(
         candidates: options.max_logprobs,
         drafts: options.num_draft_tokens,
     })
-}
-
-/// [`runner_options`] of `options`, a generation's graph options other than `serving`, the ones
-/// the engine of `config` serves, once they are checked against what the engine serves in
-/// place.
-///
-/// # Errors
-///
-/// A catalog the deployment's bounds refuse, or one whose buckets serve other phases than the
-/// serving catalog's, since every worker's queue routes the phases it started with.
-pub(crate) fn checked_options(
-    config: &EngineConfig,
-    serving: &proto::config::GraphOptions,
-    options: &proto::config::GraphOptions,
-) -> Result<GraphOptions> {
-    let runners = runner_options(config, options)?;
-    let phases = served_phases(&runners.buckets.with_drafts(runners.drafts));
-    let served =
-        served_phases(&catalog(config, &serving.cuda_graph)?.with_drafts(serving.num_draft_tokens));
-    if phases != served {
-        bail!(
-            "a catalog whose buckets serve {phases:?} for workers that serve {served:?}: a \
-             worker routes the phases it started with"
-        );
-    }
-    Ok(runners)
 }
 
 /// What the engine holds its steps and its requests to under one kernel generation's graph
@@ -97,6 +71,10 @@ impl Bounds {
             .iter()
             .map(|(group, capacity)| (*group, capacity.buckets.clone()))
             .collect();
+        let phases = capacities
+            .iter()
+            .map(|(group, capacity)| (*group, capacity.phases))
+            .collect();
         let max_logprobs = limits.max_logprobs;
         Self {
             capacities,
@@ -105,6 +83,7 @@ impl Bounds {
             scheduling: Arc::new(GraphLimits {
                 config: scheduling,
                 buckets,
+                phases,
                 max_logprobs,
             }),
         }
@@ -122,9 +101,9 @@ impl Bounds {
         options: &GraphOptions,
         max_logprobs: u32,
     ) -> Self {
-        let shapes: Vec<Shape> = options
-            .buckets
-            .with_drafts(options.drafts)
+        let drafted = options.buckets.with_drafts(options.drafts);
+        let phases = drafted.phases();
+        let shapes: Vec<Shape> = drafted
             .iter()
             .filter(|bucket| batched(bucket))
             .map(|bucket| bucket.shape())
@@ -135,6 +114,7 @@ impl Bounds {
             .map(|(group, capacity)| {
                 let mut capacity = capacity.clone();
                 if capacity.buckets.iter().any(token_shape) {
+                    capacity.phases = token_phases(capacity.phases, &phases);
                     let mut buckets = shapes.clone();
                     buckets.extend(
                         capacity
@@ -183,6 +163,10 @@ impl Bounds {
                     .iter()
                     .map(|(group, capacity)| (*group, capacity.buckets.clone()))
                     .collect(),
+                phases: capacities
+                    .iter()
+                    .map(|(group, capacity)| (*group, capacity.phases))
+                    .collect(),
                 max_logprobs,
             }),
             capacities,
@@ -190,6 +174,27 @@ impl Bounds {
             limits,
         }
     }
+}
+
+/// The phases a group that served `served` (bit [`Phase::index`] per phase) serves once its
+/// token phases are those its workers' buckets under a generation's options serve, `phases`
+/// (`Buckets::phases`): drafts make its decodes verifications and none make them decodes again,
+/// a group whose runners refill serves refills under any drafts, and one whose model keeps a
+/// recurrent state serves none (`CausalLmRunner::served_phases`), and every other phase stays.
+fn token_phases(served: u32, phases: &[Phase]) -> u32 {
+    let bit = |phase: Phase| 1_u32 << phase.index();
+    let tokens = [Phase::Prefill, Phase::Decode, Phase::Verify, Phase::Refill];
+    let refills = served & bit(Phase::Refill) != 0;
+
+    let mut stated = tokens
+        .iter()
+        .fold(served, |stated, phase| stated & !bit(*phase));
+    for phase in phases {
+        if tokens.contains(phase) && (*phase != Phase::Refill || refills) {
+            stated |= bit(*phase);
+        }
+    }
+    stated
 }
 
 /// Whether a batch of a token phase is formed against `shape`: a prefill's, a decode's or a

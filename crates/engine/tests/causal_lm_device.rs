@@ -3,8 +3,9 @@
 //! slot whose first step is a decode starts from its batch's row;
 //! a batch's page work is issued around the replay; a runner that speculates commits the
 //! prefix a verification's samples agree with and proposes the drafts after it; a kernel
-//! generation of other graph options (candidates, buckets, drafts) serves its shape from its
-//! switch on, the slots' state carried across, and the kept shape again after a rollback.
+//! generation of other graph options (candidates, buckets, drafts, drafts from or to none with
+//! the model that loaded or released its drafter) serves its shape from its switch on, the
+//! slots' state carried across, and the kept shape again after a rollback.
 //!
 //! Every case needs GPU 0 and this host's Build Server (`uniserve build-server serve`). Run them
 //! on a GPU host:
@@ -243,7 +244,8 @@ const POOL: DraftPool = DraftPool {
 };
 
 /// Decode buckets of two and four rows and prefill buckets of four rows over eight tokens,
-/// for a runner that verifies at most `drafts` drafts a row.
+/// for a runner that verifies at most `drafts` drafts a row, over a cache that lays the draft
+/// cache out when it does.
 fn config(drafts: u32) -> CausalLmConfig {
     CausalLmConfig {
         phases: vec![Phase::Prefill, Phase::Decode, Phase::Verify],
@@ -261,6 +263,8 @@ fn config(drafts: u32) -> CausalLmConfig {
 /// A runner on the device with every bucket captured, and the memory its graphs address.
 struct Bench {
     runner: CausalLmRunner,
+    /// The stream the runner's graphs replay on.
+    stream: Stream,
     kernels: Kernels,
     region: DeviceAllocation,
     /// The memory of the tensors the runner was lent, and the regions of the shapes it was
@@ -277,7 +281,22 @@ impl Bench {
     /// A runner that verifies at most `drafts` drafts a row with the model's drafter, and
     /// none for zero.
     fn speculating(drafts: u32) -> Outcome<Self> {
-        let config = config(drafts);
+        Self::over(config(drafts))
+    }
+
+    /// A runner that speculates nothing over a cache that lays the draft cache out, which it
+    /// keeps for a generation of drafts.
+    fn drafting_later() -> Outcome<Self> {
+        Self::over(CausalLmConfig {
+            draft_pool: Some(POOL),
+            ..config(0)
+        })
+    }
+
+    /// A runner of `config` with the model's drafter when it states drafts, lent the draft
+    /// cache when it states a draft pool.
+    fn over(config: CausalLmConfig) -> Outcome<Self> {
+        let drafts = config.drafts;
         let inputs = CausalLmRunner::input_bytes(&config, &Tiny::meta(drafts > 0)?)?;
 
         // The draft cache of a drafter that reads none: no layer, and tensors nothing reads.
@@ -297,7 +316,7 @@ impl Bench {
             Vec::new(),
             None,
         )?;
-        if drafts > 0 {
+        if config.draft_pool.is_some() {
             let unread = ops::retained(0x5_0000, &[4], DType::F32, &ops::meta())?;
             profiled.set_draft_cache(draft(unread), None, None)?;
         }
@@ -322,6 +341,7 @@ impl Bench {
         )?;
 
         let mut memory = Vec::new();
+        let runner_pooled = config.draft_pool.is_some();
         let mut runner = CausalLmRunner::new(
             Arc::new(Tiny::on_device(&stream, drafts > 0)?),
             config,
@@ -330,7 +350,7 @@ impl Bench {
             Vec::new(),
             None,
         )?;
-        if drafts > 0 {
+        if runner_pooled {
             let (unread_memory, unread) = device::weight(&stream, &[0.0; 4], &[4])?;
             memory.push(unread_memory);
             runner.set_draft_cache(draft(unread), None, None)?;
@@ -359,6 +379,7 @@ impl Bench {
 
         Ok(Self {
             runner,
+            stream,
             kernels,
             region,
             memory,
@@ -372,9 +393,31 @@ impl Bench {
     /// its own otherwise, and every bucket of it is captured beside the serving graphs and
     /// installed in its graphs. Nothing switches.
     fn reshape(&mut self, number: u64, options: &GraphOptions) -> Outcome {
+        self.reshape_with(number, options, None)
+    }
+
+    /// [`Bench::reshape`] with the model a generation of drafts from or to none loads, with
+    /// its drafter for drafts and without for none: measured over its meta form and prepared
+    /// over its form on the device.
+    fn reshape_with(
+        &mut self,
+        number: u64,
+        options: &GraphOptions,
+        loaded: Option<bool>,
+    ) -> Outcome {
+        let models: Option<(Arc<dyn TextModel>, Arc<dyn TextModel>)> = match loaded {
+            Some(drafter) => {
+                let stream = &self.stream;
+                Some((
+                    Arc::new(Tiny::meta(drafter)?),
+                    Arc::new(Tiny::on_device(stream, drafter)?),
+                ))
+            }
+            None => None,
+        };
         let measure = self
             .runner
-            .measure(options)?
+            .measure(options, models.as_ref().map(|(meta, _)| meta))?
             .ok_or("a causal runner takes graph options")?;
         let instance = &*measure.instance;
         instance.graphs().profile_run(instance)?;
@@ -392,7 +435,7 @@ impl Bench {
         };
         self.runner.reshape(
             number,
-            options,
+            (options, models.as_ref().map(|(_, device)| device)),
             Arc::clone(&next),
             (region, values.max(256)),
         )?;
@@ -853,5 +896,78 @@ fn a_generation_of_other_drafts_verifies_them_from_its_switch_on() -> Outcome {
         .runner
         .execute(&verification(4, &[7, 6, 5], 3), &tables())?;
     assert_eq!(output.calls[0].tokens, [next(7), next(6), next(5)]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_generation_of_drafts_where_none_were_verifies_them_from_its_switch_on() -> Outcome {
+    let mut bench = Bench::drafting_later()?;
+    let output = bench.runner.execute(&prompt(2, &[5, 6, 7]), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(7)]);
+
+    // A runner that speculates nothing serves no verification.
+    assert!(
+        bench
+            .runner
+            .execute(&verification(3, &[7, 6, 5], 3), &tables())
+            .is_err()
+    );
+
+    // Prepared with the model that loaded its drafter, the shape of two drafts verifies from its
+    // switch on, over the draft cache the runner kept, and proposes what follows.
+    bench.reshape_with(2, &options(&[2, 4], &[8], 2, 2), Some(true))?;
+    let output = bench.runner.execute(&step(2, 0, 3), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(next(7))]);
+    assert!(bench.runner.switch_shape(2)?);
+    let output = bench
+        .runner
+        .execute(&verification(3, &[7, 6, 5], 3), &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(7), next(6), next(5)]);
+    assert_eq!(call.draft_token_ids, [next(next(5)), next(next(next(5)))]);
+    assert_eq!((call.cache_computed_len, call.step_index), (6, 6));
+
+    // Rolled back, the runner decodes with its own model again and verifies nothing.
+    assert!(bench.runner.rollback_shape(2)?);
+    let output = bench.runner.execute(&step(2, 0, 4), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(next(next(7)))]);
+    assert!(
+        bench
+            .runner
+            .execute(&verification(4, &[7, 6, 5], 3), &tables())
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_generation_of_no_drafts_decodes_from_its_switch_on() -> Outcome {
+    let mut bench = Bench::speculating(2)?;
+    let output = bench
+        .runner
+        .execute(&verification(2, &[7, 6, 5], 3), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(7), next(6), next(5)]);
+
+    // Prepared with the model that released its drafter, the shape of no drafts decodes from
+    // its switch on, continuing the slot the verification committed into.
+    bench.reshape_with(2, &options(&[2, 4], &[8], 2, 0), Some(false))?;
+    assert!(bench.runner.switch_shape(2)?);
+    let output = bench.runner.execute(&step(2, 0, 6), &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(next(5))]);
+    assert!(call.draft_token_ids.is_empty());
+    assert!(
+        bench
+            .runner
+            .execute(&verification(3, &[7, 6, 5], 3), &tables())
+            .is_err()
+    );
+
+    // Committed, the shape of no drafts serves on alone.
+    assert!(bench.runner.commit_shape(2)?);
+    let output = bench.runner.execute(&step(2, 0, 7), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(next(next(5)))]);
     Ok(())
 }

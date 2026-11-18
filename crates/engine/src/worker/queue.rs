@@ -36,8 +36,12 @@ use service::lock;
 
 /// The jobs of one worker, in submission order.
 pub(crate) struct Queue {
-    /// The phases the worker's runners serve: what a submitted batch is checked against.
-    phases: Vec<Phase>,
+    /// The phases the worker's runners serve: what a submitted batch is checked against. A
+    /// kernel generation whose shapes serve other phases adds theirs from its preparation until
+    /// its commit or rollback leaves the phases of the shapes that serve
+    /// ([`Queue::set_phases`]): the batches of either shape reach the worker in order around
+    /// the switch.
+    phases: Mutex<Vec<Phase>>,
     state: Mutex<State>,
     /// Signalled when a job is queued or the queue closes: what an idle worker blocks on.
     ready: Condvar,
@@ -79,7 +83,7 @@ impl Queue {
     /// An open queue for a worker whose runners serve `phases`.
     pub(super) fn new(phases: Vec<Phase>) -> Arc<Self> {
         Arc::new(Self {
-            phases,
+            phases: Mutex::new(phases),
             state: Mutex::new(State {
                 next: 0,
                 pending: VecDeque::new(),
@@ -93,8 +97,14 @@ impl Queue {
     }
 
     /// The phases the worker's runners serve, in the runners' order.
-    pub(crate) fn phases(&self) -> &[Phase] {
-        &self.phases
+    pub(crate) fn phases(&self) -> Vec<Phase> {
+        lock(&self.phases).clone()
+    }
+
+    /// States the phases the worker's runners serve from here on: what a batch submitted after
+    /// this returns is checked against.
+    pub(super) fn set_phases(&self, phases: Vec<Phase>) {
+        *lock(&self.phases) = phases;
     }
 
     /// Queues `job` behind every job submitted before it and returns the submission that
@@ -106,13 +116,15 @@ impl Queue {
     /// [`Error::Invalid`] for a batch whose phase no runner of the worker serves, and
     /// [`Error::State`] once the queue is closed.
     pub(super) fn submit(&self, job: Job) -> Result<Submission> {
-        if let Some(batch) = job.batch()
-            && !self.phases.contains(&batch.phase)
-        {
-            return Err(Error::Invalid(format!(
-                "no runner of this worker serves phase {:?} of batch {}; its runners serve {:?}",
-                batch.phase, batch.id.0, self.phases
-            )));
+        if let Some(batch) = job.batch() {
+            let phases = lock(&self.phases);
+            if !phases.contains(&batch.phase) {
+                return Err(Error::Invalid(format!(
+                    "no runner of this worker serves phase {:?} of batch {}; its runners serve \
+                     {:?}",
+                    batch.phase, batch.id.0, *phases
+                )));
+            }
         }
 
         let mut state = lock(&self.state);

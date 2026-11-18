@@ -76,16 +76,18 @@ impl CausalLmRunner {
         if cache.scratch_capacity() > 0 && runner.config.scratch_pages > 0 {
             runner.lend_scratch(cache)?;
         }
-        if runner.config.drafts > 0 {
+        // A runner over a cache that lays the draft cache out keeps it, whether or not it
+        // speculates now: a kernel generation of other drafts verifies over it.
+        if runner.config.drafts > 0 || cache.layout().draft_group().is_some() {
             runner.lend_draft(cache, state)?;
         }
         Ok(runner)
     }
 
-    /// Lends a runner that speculates the draft cache of `cache`, the trail of `state` for a
-    /// model that keeps a recurrent state, and the drafter's state that `state` keeps
-    /// ([`CausalLmRunner::set_draft_cache`]); a state whose requests own a slot per verified
-    /// token keeps no trail.
+    /// Lends the runner the draft cache of `cache`, and a runner that speculates the trail of
+    /// `state` for a model that keeps a recurrent state and the drafter's state that `state`
+    /// keeps ([`CausalLmRunner::set_draft_cache`]); a state whose requests own a slot per
+    /// verified token keeps no trail.
     ///
     /// # Errors
     ///
@@ -115,8 +117,8 @@ impl CausalLmRunner {
         let draft = cache.lend_draft(cache.page_table(unread)?)?;
 
         let (trail, drafter) = match state {
-            Some(state) => (state.trail()?, state.drafter()?),
-            None => (None, None),
+            Some(state) if self.config.drafts > 0 => (state.trail()?, state.drafter()?),
+            _ => (None, None),
         };
         self.set_draft_cache(draft, trail, drafter)
     }

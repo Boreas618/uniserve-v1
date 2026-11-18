@@ -84,8 +84,9 @@ impl ModelRunner {
 
     /// The layout of the rank's cache for `model` (step 5): one attention group of the model's
     /// layers, the state group of a model that keeps a recurrent state, the index keys its
-    /// attention reads when it states them, the drafter's draft group when the deployment
-    /// speculates, and converted loads of peers' dense pages into an FP8 cache.
+    /// attention reads when it states them, the draft group of the drafter the checkpoint
+    /// carries and the rank's placement loads ([`ModelRunner::drafter_cache`]), and converted
+    /// loads of peers' dense pages into an FP8 cache.
     ///
     /// # Errors
     ///
@@ -128,16 +129,34 @@ impl ModelRunner {
             None => layout,
         };
 
-        // A deployment that speculates keeps its drafter's draft cache in the same pool.
-        let drafts = self.engine_config().speculative.num_draft_tokens;
-        let layout = match model.drafter().filter(|_| drafts > 0) {
+        // The drafter's draft cache lies in the same pool. It is laid out for every drafter the
+        // deployment may speculate with, whether or not it speculates now: the session's classes
+        // are fixed when it opens, and a kernel generation of other drafts verifies over it in
+        // place, its blocks taken only while the deployment speculates.
+        // A drafter the deployment does not load now whose cache the pool cannot hold is one no
+        // generation speculates with: the pool lays out none for it.
+        let layout = match model.drafter() {
             Some(drafter) => {
                 let shape = drafter.cache();
                 layout
                     .with_draft(shape.layers, shape.kv_heads, shape.head_dim)
                     .context("describing the drafter's draft cache")?
             }
-            None => layout,
+            None => match self.drafter_cache()? {
+                Some(shape) => {
+                    match layout
+                        .clone()
+                        .with_draft(shape.layers, shape.kv_heads, shape.head_dim)
+                    {
+                        Ok(drafting) => drafting,
+                        Err(why) => {
+                            tracing::info!(%why, "the KV cache lays out no draft cache");
+                            layout
+                        }
+                    }
+                }
+                None => layout,
+            },
         };
 
         // A deployment that reads other hosts' host KV cache pages (`kv_cache_config.peers`) into

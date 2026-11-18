@@ -233,7 +233,8 @@ pub enum Output {
 /// What a kernel generation's graphs bound a scheduler's steps to (`Message::SetGraphs`): the
 /// configuration a scheduler resolves against its groups, of the generation's batched tokens,
 /// drafts and graph tiers ([`SchedulerConfig::of`]); each group's captured shapes under the
-/// generation, by the group's number; and the candidates a request may ask for at a position.
+/// generation and the phases they serve, by the group's number; and the candidates a request may
+/// ask for at a position.
 /// A generation of other graph options switches every scheduler to its own, and a rollback to
 /// the one the kept generation captured.
 #[derive(Clone, Debug, PartialEq)]
@@ -242,6 +243,10 @@ pub struct GraphLimits {
     pub config: SchedulerConfig,
     /// The shapes each group's workers captured, which replace its capacity's.
     pub buckets: Vec<(GroupId, Vec<crate::batch::Shape>)>,
+    /// The phases each group's workers serve under the generation (`Capacity::phases`, bit
+    /// `Phase::index` per phase), which replace its capacity's: a generation of drafts serves
+    /// verifications where one of none serves decodes.
+    pub phases: Vec<(GroupId, u32)>,
     /// The most likely tokens a request may ask for at a position (`max_logprobs`).
     pub max_logprobs: u32,
 }
@@ -905,10 +910,16 @@ impl Scheduler {
     /// the step's tokens and calls and the graph tiers are the generation's, and so are the
     /// drafts of a verification, which no request held here exceeds from now on; the ceilings
     /// follow the shapes; and a request may ask for the generation's candidates at a position.
-    /// A configuration the groups refuse leaves the one that served, which the generation's
-    /// preparation checked.
+    /// Each group serves the phases the limits state for it, so its decode steps are
+    /// verifications under drafts and decodes under none; a generation of no drafts gives up
+    /// every request's draft cache, which no step reads from then on. A configuration the
+    /// groups refuse leaves the one that served, which the generation's preparation checked.
     fn set_graphs(&mut self, limits: &GraphLimits) {
+        let speculated = self.config.draft_tokens > 0;
         for group in &mut self.groups {
+            if let Some((_, phases)) = limits.phases.iter().find(|(id, _)| *id == group.layout.id) {
+                group.capacity.phases = *phases;
+            }
             let Some((_, buckets)) = limits.buckets.iter().find(|(id, _)| *id == group.layout.id)
             else {
                 continue;
@@ -945,6 +956,62 @@ impl Scheduler {
         let drafts = u32::try_from(self.config.draft_tokens).unwrap_or(u32::MAX);
         for request in self.requests.values_mut() {
             request.draft_limit = request.draft_limit.min(drafts);
+        }
+        self.replace_steps();
+
+        // The boundary holds no call in flight, so a draft table no step reads any more is
+        // released whole; a later generation of drafts refills the cache from its first block.
+        if speculated && drafts == 0 {
+            let drafting: Vec<RequestId> = self
+                .requests
+                .values()
+                .filter(|request| {
+                    kv::draft_class(request, &self.groups)
+                        .and_then(|(class, _)| request.blocks.get(class))
+                        .is_some_and(|table| table.first < table.end)
+                })
+                .map(|request| request.id)
+                .collect();
+            for id in drafting {
+                self.give_up_draft(id);
+            }
+        }
+    }
+
+    /// Places every request whose decode steps ran on a group that now serves them as the other
+    /// phase on that phase of the same group, which holds its slot and its cache: a group whose
+    /// decodes became verifications runs its requests' next steps as verifications and the
+    /// refills of their draft caches, and one whose verifications became decodes runs decodes.
+    fn replace_steps(&mut self) {
+        let groups = &self.groups;
+        let serves = |id: GroupId, phase: Phase| {
+            groups
+                .iter()
+                .any(|group| group.id() == id && group.serves(phase))
+        };
+
+        for request in self.requests.values_mut() {
+            let placement = &mut request.placement;
+            for (from, to) in [
+                (Phase::Decode, Phase::Verify),
+                (Phase::Verify, Phase::Decode),
+            ] {
+                let Some(group) = placement[from.index()] else {
+                    continue;
+                };
+                if serves(group, from) || !serves(group, to) {
+                    continue;
+                }
+                placement[from.index()] = None;
+                placement[to.index()] = Some(group);
+                let refill = Phase::Refill.index();
+                if to == Phase::Verify
+                    && placement[refill].is_none()
+                    && serves(group, Phase::Refill)
+                {
+                    placement[refill] = Some(group);
+                }
+            }
         }
     }
 

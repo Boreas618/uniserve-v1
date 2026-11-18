@@ -65,22 +65,39 @@ impl RankModel {
     }
 }
 
+impl RankModel {
+    /// The rank's model runner pointed at `target`'s checkpoint and drafts.
+    fn aimed(&self, target: &crate::process::binding::Target) -> ModelRunner {
+        let mut model_runner = self.model_runner.clone();
+        let config = &mut Arc::make_mut(&mut model_runner.launch).engine_config;
+        config.model.model = target.checkpoint.to_string_lossy().into_owned();
+        config.speculative.num_draft_tokens = target.drafts;
+        model_runner
+    }
+}
+
 impl crate::process::binding::ModelLoad for RankModel {
     fn load(
         &self,
         target: &crate::process::binding::Target,
         weights: &dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String> {
-        let mut model_runner = self.model_runner.clone();
-        Arc::make_mut(&mut model_runner.launch)
-            .engine_config
-            .model
-            .model = target.checkpoint.to_string_lossy().into_owned();
+        let model_runner = self.aimed(target);
         let loaded = match model_runner.family.model {
             Model::Text(_) => model_runner.load_text(weights, &target.experts).map(drop),
             Model::Video(_) => model_runner.load_video(weights).map(drop),
         };
         loaded.map_err(|error| format!("{error:#}"))
+    }
+
+    fn text(
+        &self,
+        target: &crate::process::binding::Target,
+        weights: &dyn nn::RetainedWeights,
+    ) -> std::result::Result<Arc<dyn TextModel>, String> {
+        self.aimed(target)
+            .load_text(weights, &target.experts)
+            .map_err(|error| format!("{error:#}"))
     }
 
     fn expert_layers(&self) -> BTreeMap<String, u32> {
@@ -776,6 +793,24 @@ impl ModelRunner {
         weights: &dyn nn::RetainedWeights,
         experts: &ExpertOrder,
     ) -> Result<Arc<dyn TextModel>> {
+        let drafts = self.engine_config().speculative.num_draft_tokens;
+        self.load_drafting(weights, experts, drafts)
+    }
+
+    /// [`ModelRunner::load_text`] for a deployment that drafts `drafts` tokens a step: the model
+    /// with its drafter for drafts above zero, and its state sized by them
+    /// ([`ModelRunner::text_placement`]). What a kernel generation of other drafts loads beside
+    /// the serving model.
+    ///
+    /// # Errors
+    ///
+    /// As [`ModelRunner::load_text`].
+    pub(crate) fn load_drafting(
+        &self,
+        weights: &dyn nn::RetainedWeights,
+        experts: &ExpertOrder,
+        drafts: u32,
+    ) -> Result<Arc<dyn TextModel>> {
         let Model::Text(family) = self.family.model else {
             bail!(
                 "{} is a media model, which a text rank does not load",
@@ -785,7 +820,44 @@ impl ModelRunner {
         let opened = nn::Checkpoint::open(self.checkpoint())?;
         let checkpoint = family.open(&opened, &self.engine_config().model.quantization)?;
         let mut loader = nn::WeightLoader::new(&opened, weights, None);
-        Ok(checkpoint.load(&opened, &mut loader, &self.text_placement()?, experts)?)
+        let placement = self.mapping.text_placement(drafts)?;
+        Ok(checkpoint.load(&opened, &mut loader, &placement, experts)?)
+    }
+
+    /// The draft cache of the drafter this rank's checkpoint carries, as a placement that loads
+    /// it holds it (`nn::Drafter::cache`): what the rank's cache lays out whether or not the
+    /// deployment speculates, so a kernel generation of other drafts verifies over it in place.
+    /// `None` for a checkpoint that carries no drafter, and for one whose drafter this rank's
+    /// placement does not load, which no generation speculates with either.
+    ///
+    /// # Errors
+    ///
+    /// A checkpoint that cannot be read, or a media checkpoint.
+    pub(crate) fn drafter_cache(&self) -> Result<Option<nn::family::CacheShape>> {
+        let Model::Text(family) = self.family.model else {
+            bail!(
+                "{} is a media model, which keeps no draft cache",
+                self.checkpoint().display()
+            );
+        };
+        let opened = nn::Checkpoint::open(self.checkpoint())?;
+        let checkpoint = family.open(&opened, &self.engine_config().model.quantization)?;
+        if !checkpoint.drafter() {
+            return Ok(None);
+        }
+
+        // The placement of one draft states the drafter's layers as any count of drafts does.
+        let drafts = self.engine_config().speculative.num_draft_tokens.max(1);
+        match self.load_drafting(&nn::MetaWeights::new(), &self.experts(), drafts) {
+            Ok(model) => Ok(model.drafter().map(|drafter| drafter.cache())),
+            Err(why) => {
+                tracing::info!(
+                    why = format!("{why:#}"),
+                    "the rank's placement loads no drafter: its cache lays out no draft cache"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// The routed expert layers of this rank's checkpoint, by module path, each with the experts

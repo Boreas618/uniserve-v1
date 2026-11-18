@@ -36,6 +36,8 @@ pub struct MetaWeights {
     /// The weights the load reached, in its order, each with whether the model writes it after
     /// the load.
     order: RefCell<Vec<(WeightKey, bool)>>,
+    /// The bytes of each weight of `order`, in its order.
+    lengths: RefCell<Vec<u64>>,
     /// The address the next tensor is stated at.
     next: Cell<u64>,
 }
@@ -51,6 +53,7 @@ impl MetaWeights {
     pub fn new() -> Self {
         Self {
             order: RefCell::new(Vec::new()),
+            lengths: RefCell::new(Vec::new()),
             next: Cell::new(META_BASE),
         }
     }
@@ -61,16 +64,28 @@ impl MetaWeights {
         self.order.into_inner()
     }
 
+    /// The weights the load reached, in its order, each with whether the model writes it after
+    /// the load and its bytes: what a load of them on a device would take.
+    pub fn into_loads(self) -> Vec<(WeightKey, bool, u64)> {
+        self.order
+            .into_inner()
+            .into_iter()
+            .zip(self.lengths.into_inner())
+            .map(|((key, writable), length)| (key, writable, length))
+            .collect()
+    }
+
     /// Records `key` and states its tensor of `shape` elements at an address of its own.
     fn tensor(&self, key: &WeightKey, shape: &Shape, writable: bool) -> nn::Result<Tensor> {
         self.order.borrow_mut().push((key.clone(), writable));
 
         // Every tensor takes at least one aligned block, so no two share an address.
-        let bytes = key
+        let length = key
             .dtype
             .storage_bytes(shape.elem_count())
-            .map_or(u64::MAX, |bytes| bytes as u64)
-            .max(1);
+            .map_or(u64::MAX, |bytes| bytes as u64);
+        self.lengths.borrow_mut().push(length);
+        let bytes = length.max(1);
         let address = self.next.get();
         self.next.set(
             address.saturating_add(
