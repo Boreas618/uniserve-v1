@@ -325,7 +325,11 @@ fn storage(node: &NodeUsage, set: &impl Fn(&str, &Labels, f64)) {
             labels.insert("item".to_owned(), name_of(&reservation.item));
             labels.insert(
                 "scope".to_owned(),
-                reservation.scope.as_ref().map(name_of).unwrap_or_default(),
+                reservation
+                    .scope
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
             );
             labels.insert(
                 "epochs".to_owned(),
@@ -422,8 +426,9 @@ mod tests {
     }
 
     /// A node's storage report becomes one gauge per GPU total, quota and reservation series,
-    /// reservations of one item, scope and epochs adding into one series, and one per host
-    /// storage figure.
+    /// labelled by the reservation's item, scope and epochs, reservations of one item, scope and
+    /// epochs adding into one series, and one per host storage figure. A worker's process item
+    /// is its own series, by its item and its worker's scope.
     #[test]
     fn a_storage_report_becomes_gauges() {
         use storage::protocol::{HostStorage, Item, Quota, Reservation};
@@ -434,6 +439,11 @@ mod tests {
             epochs,
             segment: None,
             bytes,
+        };
+        let worker = storage::protocol::Scope {
+            deployment: "model".to_owned(),
+            group: "engine".to_owned(),
+            rank: 0,
         };
         let node = NodeUsage {
             host: "rank-0".to_owned(),
@@ -446,6 +456,13 @@ mod tests {
                     reservation(vec![1, 2], 10),
                     reservation(vec![1, 2], 5),
                     reservation(vec![2], 7),
+                    Reservation {
+                        item: Item::Process,
+                        scope: Some(worker.clone()),
+                        epochs: vec![2],
+                        segment: None,
+                        bytes: 3,
+                    },
                 ],
                 host_link_bytes_per_second: None,
                 transfer_context: 0,
@@ -459,20 +476,46 @@ mod tests {
         };
         let written = std::sync::Mutex::new(Vec::new());
         storage(&node, &|name: &str, labels: &Labels, value: f64| {
-            let epochs = labels.get("epochs").cloned().unwrap_or_default();
-            service::lock(&written).push((name.to_owned(), epochs, value));
+            let label = |key: &str| labels.get(key).cloned().unwrap_or_default();
+            service::lock(&written).push((
+                name.to_owned(),
+                label("item"),
+                label("scope"),
+                label("epochs"),
+                value,
+            ));
         });
-        let written = written.into_inner().unwrap();
+        // The series are compared whatever order they are written in.
+        let mut written = written.into_inner().unwrap();
+        written.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let scope = worker.to_string();
         let expected = [
-            ("uniserve_gpu_total_bytes", "", 100.0),
-            ("uniserve_gpu_quota_bytes", "", 80.0),
-            ("uniserve_gpu_reserved_bytes", "1,2", 15.0),
-            ("uniserve_gpu_reserved_bytes", "2", 7.0),
-            ("uniserve_host_available_bytes", "", 1000.0),
-            ("uniserve_host_reserve_bytes", "", 100.0),
-            ("uniserve_host_unallocated_bytes", "", 50.0),
+            ("uniserve_gpu_total_bytes", "", "", "", 100.0),
+            ("uniserve_gpu_quota_bytes", "", "", "", 80.0),
+            (
+                "uniserve_gpu_reserved_bytes",
+                "process",
+                scope.as_str(),
+                "2",
+                3.0,
+            ),
+            ("uniserve_gpu_reserved_bytes", "weights", "", "1,2", 15.0),
+            ("uniserve_gpu_reserved_bytes", "weights", "", "2", 7.0),
+            ("uniserve_host_available_bytes", "", "", "", 1000.0),
+            ("uniserve_host_reserve_bytes", "", "", "", 100.0),
+            ("uniserve_host_unallocated_bytes", "", "", "", 50.0),
         ]
-        .map(|(name, epochs, value)| (name.to_owned(), epochs.to_owned(), value));
+        .map(|(name, item, scope, epochs, value)| {
+            (
+                name.to_owned(),
+                item.to_owned(),
+                scope.to_owned(),
+                epochs.to_owned(),
+                value,
+            )
+        });
+        let mut expected = expected.to_vec();
+        expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(written, expected);
     }
 }

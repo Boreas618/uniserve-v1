@@ -265,7 +265,8 @@ def test_a_range_metrics_session_books_its_pass_while_it_runs(
     assert _process_bytes(served, after=started.time) == before + held
     stopped = profiling.stop(served, started)
     assert stopped["state"] == "ended", stopped
-    assert stopped["end_reason"] == "operator", stopped
+    # The change that removed the session from the package ended it.
+    assert stopped["end_reason"] == "changed", stopped
     assert _process_bytes(served, after=admin.now(served)) == before
 
 
@@ -362,12 +363,12 @@ def test_the_guard_releases_collectors_then_ends_the_session(
     print(json.dumps(ended, indent=2))
     taken = actions()
     # Costliest first; a slowdown left without a collector ends the
-    # session, else the operator ended it.
+    # session, else the change that removed it from the package did.
     assert taken[:2] == [
         ("release", "pc_sampling"),
         ("release", "timeline"),
     ], taken
-    assert ended["end_reason"] in ("quality of service", "operator"), ended
+    assert ended["end_reason"] in ("quality of service", "changed"), ended
     assert (taken[2:] == [("end", None)]) == (
         ended["end_reason"] == "quality of service"
     ), taken

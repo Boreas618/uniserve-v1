@@ -64,6 +64,11 @@ SPAN_S = 3.0
 #: a worker reports its own once a report period (a second unless stated).
 SAMPLED_S = 30.0
 
+#: The gauge the leader states in every second it samples, whatever the
+#: deployment serves: a whole second holding it is a second the leader's
+#: status gauges were sampled in (``crates/daemon/src/status.rs``).
+SAMPLED = "uniserve_requests_held"
+
 #: The states of a process that no longer runs (``process`` events).
 ENDED = ("stopped", "failed")
 
@@ -284,8 +289,11 @@ def gauge(
     state an event announced: the read waits, within :data:`SAMPLED_S`
     seconds (scaled), until a whole second after `after` holds a value of
     the gauge, whatever its labels, and a series no longer stated by then
-    is none of them. A gauge stated only when what it states changes is
-    read with ``after=0``, over the store's whole retention.
+    is none of them. Without it, the read waits the same way until a whole
+    second of the span holds the leader's sampling (:data:`SAMPLED`), so a
+    deployment that just began to serve is read once its first second was
+    sampled. A gauge stated only when what it states changes is read with
+    ``after=0``, over the store's whole retention.
 
     Raises:
         TimeoutError: When no whole second after `after` was recorded in
@@ -300,13 +308,25 @@ def gauge(
         f"name = {literal(name)} AND CAST(time AS BIGINT) > {lower} "
         "AND time < date_trunc('second', now())"
     )
+    # The second that must be whole before the gauge is read: one holding
+    # the gauge after `after`, or one of the span holding the leader's
+    # sampling.
+    awaited = (
+        window
+        if after is not None
+        else (
+            f"name = {literal(SAMPLED)} AND CAST(time AS BIGINT) > {lower} "
+            "AND time < date_trunc('second', now())"
+        )
+    )
     deadline = time.monotonic() + server.scaled(SAMPLED_S)
-    while after is not None and not query(
-        server, f"SELECT 1 AS stated FROM stats WHERE {window} LIMIT 1"
+    while not query(
+        server, f"SELECT 1 AS stated FROM stats WHERE {awaited} LIMIT 1"
     ):
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                f"no value of {name} was recorded after {after} within "
+                f"no value of {name if after is not None else SAMPLED} was "
+                f"recorded after {lower} within "
                 f"{server.scaled(SAMPLED_S):.0f} s"
             )
         time.sleep(POLL_S)

@@ -99,8 +99,9 @@ pub struct Session {
     /// When it ended, in seconds since the Unix epoch.
     #[serde(serialize_with = "optional_unix_seconds")]
     pub ended: Option<SystemTime>,
-    /// Why it ended: `window`, `seconds`, `operator`, `epoch change`,
-    /// `rollback`, `quality of service`, or a failure.
+    /// Why it ended: `window`, `seconds`, `changed` (a change of the deployment stated another
+    /// session or none, whoever wrote it), `epoch change`, `rollback`, `quality of service`, or a
+    /// failure.
     pub end_reason: Option<String>,
     pub request: SessionRequest,
     /// Each worker's answer to the start: its rank, whether the session
