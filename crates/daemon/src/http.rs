@@ -204,6 +204,11 @@ pub async fn serve(
         options: package.config.clone(),
         deployment,
         revisions,
+        store: crate::observation::Store::new(
+            Arc::new(crate::observation::System),
+            crate::observation::Retention::default(),
+        )
+        .context("creating the observation store")?,
         instance,
         ready,
         shutdown,
@@ -1109,6 +1114,10 @@ mod tests {
                 options: config,
                 deployment: "sim".to_owned(),
                 revisions,
+                store: crate::observation::Store::new(
+                    Arc::new(crate::observation::System),
+                    crate::observation::Retention::default(),
+                )?,
                 instance,
                 ready,
                 shutdown,

@@ -52,6 +52,7 @@ use crate::api::openai::ApiError;
 use crate::api::openai::video_jobs::VideoJobs;
 use crate::config::{Config, ServerConfig, Stated};
 use crate::leader::Leader;
+use crate::observation::{Format, Kind, Store};
 use crate::policy::Package;
 use crate::policy::revision::{KEPT, Outcome, Record, Revisions};
 use crate::restart::Restarter;
@@ -127,8 +128,9 @@ pub(crate) struct Brought {
     /// The deployment's end: the node's stop.
     pub(crate) token: CancellationToken,
     /// The revision a hot restart's predecessor converged to when it handed the deployment
-    /// over for the daemon's own options: this daemon converges the rest of it.
-    pub(crate) then: Option<u64>,
+    /// over for the daemon's own options, and whether its writer forced it: this daemon
+    /// converges the rest of it.
+    pub(crate) then: Option<crate::restart::Then>,
 }
 
 /// What a node serves first.
@@ -155,6 +157,8 @@ pub(crate) struct Start {
     pub(crate) deployment: String,
     /// The deployment's revisions on this node.
     pub(crate) revisions: Arc<Revisions>,
+    /// The deployment's observation store, which `/admin/query` reads.
+    pub(crate) store: Store,
     pub(crate) instance: service::Instance,
     pub(crate) ready: Ready,
     pub(crate) shutdown: CancellationToken,
@@ -174,6 +178,7 @@ pub(crate) struct Node {
     server: ServerConfig,
     deployment: String,
     revisions: Arc<Revisions>,
+    store: Store,
     instance: PathBuf,
     ready: Mutex<Ready>,
     /// The responses in flight a hot restart pauses and hands over, and the gate that admits
@@ -248,6 +253,7 @@ pub(crate) async fn run(
         options,
         deployment,
         revisions,
+        store,
         instance,
         ready,
         shutdown,
@@ -263,6 +269,7 @@ pub(crate) async fn run(
         server: options.server_config.clone(),
         deployment,
         revisions,
+        store,
         instance: instance.path().to_owned(),
         ready: Mutex::new(ready),
         handoff: Arc::new(Handoff::new()),
@@ -412,7 +419,12 @@ impl Node {
                 "the package is the current revision, which starts as its apply fixed it"
             );
             return match self
-                .bring(&stored.package, stored.record.revision, join, stored.lock.clone())
+                .bring(
+                    &stored.package,
+                    stored.record.revision,
+                    join,
+                    stored.lock.clone(),
+                )
                 .await?
             {
                 Some(brought) => self.serve(brought).await,
@@ -435,6 +447,7 @@ impl Node {
                 }
                 self.revisions
                     .converged(number, began.elapsed().as_secs_f64(), KEPT)?;
+                self.observe_revision(number);
                 self.serve(brought).await
             }
             Ok(None) => {
@@ -453,6 +466,7 @@ impl Node {
                     format!("{error:#}"),
                     began.elapsed().as_secs_f64(),
                 )?;
+                self.observe_revision(number);
                 let Some(stored) = stored else {
                     return Err(error);
                 };
@@ -461,7 +475,12 @@ impl Node {
                     "the package did not come up ({error:#}); the current revision starts"
                 );
                 match self
-                    .bring(&stored.package, stored.record.revision, None, stored.lock.clone())
+                    .bring(
+                        &stored.package,
+                        stored.record.revision,
+                        None,
+                        stored.lock.clone(),
+                    )
                     .await?
                 {
                     Some(brought) => self.serve(brought).await,
@@ -684,9 +703,9 @@ impl Node {
                 admitting: self.handoff.admissions(),
             },
         );
-        if let Some(number) = then {
+        if let Some(then) = then {
             let node = Arc::clone(&self);
-            tokio::spawn(async move { Box::pin(node.resume(number)).await });
+            tokio::spawn(async move { Box::pin(node.resume(then)).await });
         }
 
         tokio::select! {
@@ -779,10 +798,24 @@ impl Node {
             .map(|number| self.revisions.load(number))
             .transpose()
             .map_err(Refused::state)?;
+        // The current package again changes nothing unless `latest` now resolves to another
+        // revision: every write resolves it anew, and a restart never does.
         if let Some(stored) = &stored
             && stored.package == package
         {
-            return Ok(stored.record.clone());
+            let reselects = routes
+                .leader
+                .reselects(&package.config)
+                .await
+                .map_err(|error| {
+                    Refused::new(
+                        super::admin::update_status(&error),
+                        format!("{:#}", anyhow::Error::from(error)),
+                    )
+                })?;
+            if !reselects {
+                return Ok(stored.record.clone());
+            }
         }
         let previous = stored.as_ref().map(|stored| &stored.package);
         let changes =
@@ -882,7 +915,10 @@ impl Node {
                 .restarter
                 .restart(
                     Some(*config),
-                    Some(number),
+                    Some(crate::restart::Then {
+                        revision: number,
+                        force,
+                    }),
                     leader,
                     &routes.deployment,
                     &routes.jobs,
@@ -944,9 +980,13 @@ impl Node {
         self.revisions.record(number).map_err(Refused::state)
     }
 
-    /// Converges revision `number`, the change whose daemon options a hot restart applied
-    /// before it handed the deployment to this daemon.
-    async fn resume(&self, number: u64) {
+    /// Converges the change whose daemon options a hot restart applied before it handed the
+    /// deployment to this daemon: its revision, forced as its writer forced it.
+    async fn resume(&self, then: crate::restart::Then) {
+        let crate::restart::Then {
+            revision: number,
+            force,
+        } = then;
         let _turn = self.applying.lock().await;
         let resumed = async {
             let routes = self.routes().ok_or_else(|| {
@@ -956,7 +996,7 @@ impl Node {
                 )
             })?;
             let stored = self.revisions.load(number).map_err(Refused::state)?;
-            Box::pin(self.converge(&routes, number, stored.package, false)).await
+            Box::pin(self.converge(&routes, number, stored.package, force)).await
         };
         match resumed.await {
             Ok(record) => {
@@ -967,6 +1007,28 @@ impl Node {
                 "the change after the hot restart did not converge: {}", refused.message
             ),
         }
+    }
+
+    /// Records how revision `number`'s change ended as a `revision` event of the observation
+    /// store: its writer as a label, and its record's fields (the changed options, their effect,
+    /// its result, reason and duration), so a program reads whether its write held.
+    fn observe_revision(&self, number: u64) {
+        let record = match self.revisions.record(number) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(
+                    revision = number,
+                    "reading the revision's record failed: {error:#}"
+                );
+                return;
+            }
+        };
+        let fields = match serde_json::to_value(&record) {
+            Ok(serde_json::Value::Object(fields)) => fields,
+            _ => serde_json::Map::new(),
+        };
+        let labels = [(crate::observation::WRITER.to_owned(), record.writer.clone())].into();
+        self.store.append(Kind::Revision, labels, fields, number);
     }
 
     /// The client API: the serving deployment's routes, or `503` while none serves.
@@ -997,6 +1059,7 @@ impl Node {
                 get(move |State(node), request| events(node, socket, request)),
             )
             .route("/admin/policy", get(get_policy).put(put_policy))
+            .route("/admin/query", get(query).post(query))
             .fallback(move |State(node): State<Arc<Node>>, request| async move {
                 let routes = node.routes().map(|routes| routes.admin(socket));
                 serve_routes(routes, request).await
@@ -1110,6 +1173,79 @@ async fn put_policy(State(node): State<Arc<Node>>, request: Request) -> Response
                 .into_response()
         }
         Err(refused) => refused.into_response(),
+    }
+}
+
+/// `/admin/query`'s parameters: the SQL statement, over the tables `stats` and `events`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryParameters {
+    q: String,
+}
+
+/// `GET /admin/query?q=<SQL>`, or `POST` with the same parameter form-encoded in the body (as the
+/// Prometheus HTTP API takes a long query): the statement's rows over the observation store,
+/// as JSON by default, as an Arrow IPC stream for `Accept: application/vnd.apache.arrow.stream`,
+/// or, for `Accept: text/event-stream`, as a stream of the statement's rows over every `events`
+/// row appended from now on, resumed after `Last-Event-ID`. A statement that does not plan is
+/// answered `400`.
+async fn query(State(node): State<Arc<Node>>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let accept = parts
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok());
+    let format = Format::negotiate(accept);
+    let after = parts
+        .headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let parameters = if parts.method == axum::http::Method::POST {
+        let body = match axum::body::to_bytes(body, node.server.max_request_body).await {
+            Ok(body) => body,
+            Err(error) => {
+                return Refused::new(StatusCode::BAD_REQUEST, error.to_string()).into_response();
+            }
+        };
+        serde_urlencoded::from_bytes::<QueryParameters>(&body).map_err(|error| error.to_string())
+    } else {
+        serde_urlencoded::from_str::<QueryParameters>(parts.uri.query().unwrap_or_default())
+            .map_err(|error| error.to_string())
+    };
+    let sql = match parameters {
+        Ok(parameters) => parameters.q,
+        Err(error) => {
+            return Refused::new(
+                StatusCode::BAD_REQUEST,
+                format!("`/admin/query` takes the statement as `q`: {error}"),
+            )
+            .into_response();
+        }
+    };
+    let content = [(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(format.media()),
+    )];
+    match format {
+        Format::Sse => match node.store.subscribe(&sql, after).await {
+            Ok(stream) => (content, axum::body::Body::from_stream(stream)).into_response(),
+            Err(error) => Refused::new(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        },
+        Format::Json | Format::Ipc => {
+            let encoded = match node.store.query(&sql).await {
+                Ok(rows) if format == Format::Json => rows.json(),
+                Ok(rows) => rows.ipc(),
+                Err(error) => {
+                    return Refused::new(StatusCode::BAD_REQUEST, error.to_string())
+                        .into_response();
+                }
+            };
+            match encoded {
+                Ok(bytes) => (content, bytes).into_response(),
+                Err(error) => Refused::state(anyhow::Error::new(error)).into_response(),
+            }
+        }
     }
 }
 
@@ -1280,9 +1416,9 @@ mod tests {
     }
 
     /// The deployment's policy is its current revision: `GET /admin/policy` answers it as a
-    /// package with the revision as its tag; a `PUT` of the same package changes nothing and
-    /// answers the current record; a `PUT` that states another revision than the current one in
-    /// `If-Match`, or a package a start would refuse, is refused and writes no revision.
+    /// package with the revision as its tag; a `PUT` that states another revision than the
+    /// current one in `If-Match`, or a package a start would refuse, is refused and writes no
+    /// revision.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_policy_is_the_current_revision() {
         let leader = Arc::new(crate::test_support::served_engine(
@@ -1333,6 +1469,11 @@ mod tests {
             options: config.clone(),
             deployment: "sim".to_owned(),
             revisions: Arc::clone(&revisions),
+            store: Store::new(
+                Arc::new(crate::observation::System),
+                crate::observation::Retention::default(),
+            )
+            .unwrap(),
             ready: Ready::new(None, instance.path()),
             instance,
             shutdown: shutdown.clone(),
@@ -1361,14 +1502,6 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert!(head.to_lowercase().contains("etag: \"1\""), "{head}");
         assert_eq!(Package::unpack(&body).unwrap(), package);
-
-        // The same package again changes nothing.
-        let archive = package.archive().unwrap();
-        let (head, body) = exchange(connect().await, &put(&archive, ""), &archive).await;
-        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        let record: Record = serde_json::from_slice(&body).unwrap();
-        assert_eq!((record.revision, record.result), (1, Outcome::Converged));
-
         // A writer that read another revision is refused.
         let mut other = config.clone();
         other.max_logprobs = 5;
@@ -1391,6 +1524,39 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 400"), "{head}");
         assert!(String::from_utf8_lossy(&body).contains("mem_fraction_static"));
         assert_eq!(revisions.current().unwrap(), Some(1));
+
+        // The observation store answers SQL over its two tables, in a GET's query or a POST's
+        // form; a statement that does not plan is refused.
+        let (head, body) = exchange(
+            connect().await,
+            "GET /admin/query?q=SELECT%20count(*)%20AS%20n%20FROM%20events HTTP/1.1\r\n\
+             host: node\r\nconnection: close\r\n\r\n",
+            b"",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows[0]["n"], 0, "{rows}");
+        let form = b"q=SELECT+name+FROM+stats";
+        let (head, _) = exchange(
+            connect().await,
+            &format!(
+                "POST /admin/query HTTP/1.1\r\nhost: node\r\nconnection: close\r\n\
+                 content-type: application/x-www-form-urlencoded\r\ncontent-length: {}\r\n\r\n",
+                form.len()
+            ),
+            form,
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let (head, _) = exchange(
+            connect().await,
+            "GET /admin/query?q=SELECT%20nothing%20FROM%20nowhere HTTP/1.1\r\n\
+             host: node\r\nconnection: close\r\n\r\n",
+            b"",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{head}");
 
         shutdown.cancel();
         let ended = node.await.unwrap().unwrap();

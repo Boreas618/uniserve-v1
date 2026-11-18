@@ -102,6 +102,14 @@ enum Message {
     Failed { reason: String },
 }
 
+/// A change a hot restart hands its successor to converge: the revision it converges to, and
+/// whether its writer forced a target a rollback marked unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Then {
+    pub(crate) revision: u64,
+    pub(crate) force: bool,
+}
+
 /// The options a daemon serves with.
 #[derive(Debug, Serialize, Deserialize)]
 struct Prepare {
@@ -143,9 +151,8 @@ struct Takeover {
     service_descriptors: usize,
     journal: JournalHandoff,
     jobs: Vec<(VideoJob, Option<u64>)>,
-    /// The revision the change that restarted the daemon converges to: the successor
-    /// converges the rest of it.
-    then: Option<u64>,
+    /// The change that restarted the daemon: the successor converges the rest of it.
+    then: Option<Then>,
     /// Whether the leader's admissions were paused (new requests waited) when the predecessor
     /// handed over: the successor's admissions start as the predecessor's ended, so a hot
     /// restart never reopens them.
@@ -264,7 +271,7 @@ impl Restarter {
     pub(crate) async fn restart(
         &self,
         config: Option<crate::config::Config>,
-        then: Option<u64>,
+        then: Option<Then>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -297,7 +304,7 @@ impl Restarter {
     async fn hand_over(
         &self,
         config: Option<crate::config::Config>,
-        then: Option<u64>,
+        then: Option<Then>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -1083,6 +1090,11 @@ async fn prepared_successor(
         options: config.clone(),
         deployment: prepare.deployment.clone(),
         revisions,
+        store: crate::observation::Store::new(
+            Arc::new(crate::observation::System),
+            crate::observation::Retention::default(),
+        )
+        .context("creating the observation store")?,
         instance,
         ready,
         shutdown,

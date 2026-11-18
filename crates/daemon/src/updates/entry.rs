@@ -175,6 +175,24 @@ impl Leader {
         }
     }
 
+    /// Whether `target`, the current configuration again, selects other module revisions than
+    /// the serving epoch runs: a `latest` the Build Servers resolve to a revision installed since
+    /// the serving epoch's apply. Such a target is a change though no option changed
+    /// (`specs/configuration.md` §8).
+    ///
+    /// # Errors
+    ///
+    /// As [`Leader::apply`] when the module set cannot be fixed.
+    pub(crate) async fn reselects(&self, target: &Config) -> Result<bool, UpdateError> {
+        let modules = self.fix_modules(target).await?;
+        let Some((_, record)) = self.updates.epochs().serving() else {
+            return Ok(false);
+        };
+        Ok(record.engine != modules.engine
+            || record.kernels != modules.kernels
+            || record.policy != modules.policy)
+    }
+
     /// The per-replica path of a change that starts no update: the daemon's own options (a
     /// hot restart), the options the engines take at their next step, or nothing.
     async fn apply_in_place(

@@ -1360,6 +1360,7 @@ dependencies = [
  "serde-json-fmt",
  "serde_json",
  "serde_path_to_error",
+ "serde_urlencoded",
  "serde_with",
  "service",
  "sha2",

@@ -74,6 +74,8 @@ serde-aux.workspace = true
 serde_json.workspace = true
 serde-json-fmt.workspace = true
 serde_path_to_error.workspace = true
+# The form-encoded parameters of `/admin/query`.
+serde_urlencoded.workspace = true
 # The archive a policy package travels in (`PUT /admin/policy`, `GET /admin/policy`).
 tar.workspace = true
 serde_with.workspace = true
