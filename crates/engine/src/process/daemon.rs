@@ -483,6 +483,7 @@ mod tests {
                 conditions: vec![wire::ConditionExtent::default(); conditions],
                 ..wire::DiffusionRequest::default()
             })),
+            scheduler: None,
         };
         wire::ToEngine {
             kind: Some(wire::to_engine::Kind::Submit(wire::Submit {

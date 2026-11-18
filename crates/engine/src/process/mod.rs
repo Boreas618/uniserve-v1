@@ -42,7 +42,6 @@ mod generation;
 mod lifecycle;
 mod operations;
 pub(crate) mod ranks;
-pub(crate) mod record;
 mod reports;
 mod requests;
 mod start;
@@ -66,7 +65,6 @@ use proto::request::wire::{self, engine_command, from_engine};
 use proto::request::{ArtifactMedia, RequestId};
 use scheduling::Parameters;
 
-use scheduling::view::Snapshot;
 use service::Connection;
 
 pub use daemon::connect;
@@ -553,7 +551,7 @@ impl MainProcess {
             Output::Events(events) => self.events(events),
             Output::Stats(stats) => self.stats(scheduler, stats),
             Output::PolicyRolledBack(reason) => {
-                self.policy_rolled_back(Some(scheduler), reason, false);
+                self.policy_rolled_back(scheduler, reason);
             }
             Output::NumericalFault(batch, requests) => self.numerical_fault(batch, requests),
             Output::Shrunk(region, units) => self.shrunk(region, units),
@@ -993,7 +991,7 @@ impl MainProcess {
     /// `Switch`: the prepared generation's policy executes from one batch boundary of every
     /// scheduler and its kernels bucket by bucket as every rank captured them, the previous
     /// generation kept; `Switched` is reported once the last bucket switched, which begins the
-    /// trial. The route instance switches with it.
+    /// trial.
     fn switch(&mut self, generation: u64) {
         if let Err(report) = lifecycle::switch(self.lifecycle, &mut self.update, generation) {
             return self.report(report);
@@ -1010,7 +1008,7 @@ impl MainProcess {
         // daemon's command is acknowledged at once.
         let policy = (module, parameters);
         if engine.upstream.is_some() {
-            return self.switched(generation, packages, policy, Ok(()));
+            return self.switched(generation, packages, Ok(()));
         }
         let schedulers = engine.inboxes();
         let route = engine.groups.clone();
@@ -1027,17 +1025,11 @@ impl MainProcess {
                 generation,
                 &policy,
             );
-            done(move |main| main.switched(generation, packages, policy, switched))
+            done(move |main| main.switched(generation, packages, switched))
         }));
     }
 
-    fn switched(
-        &mut self,
-        generation: u64,
-        packages: Packages,
-        (module, parameters): (Arc<wasmtime::Module>, Parameters),
-        switched: Result<()>,
-    ) {
+    fn switched(&mut self, generation: u64, packages: Packages, switched: Result<()>) {
         if let Err(error) = switched {
             if lifecycle::switch_failed(&mut self.update, generation) {
                 let reason = format!("the switch to generation {generation} failed: {error:#}");
@@ -1048,32 +1040,9 @@ impl MainProcess {
 
         self.kept = Some(std::mem::replace(&mut self.serving, packages));
         self.generation = generation;
-        let snapshot = self.snapshot();
-        if let Some(Err(error)) = self.engine.as_mut().and_then(|engine| {
-            let ceilings = engine.ceilings.limits;
-            let route = engine.route.as_mut()?;
-            Some(route.switch(module, parameters, snapshot, &ceilings))
-        }) {
-            // The workers execute the generation and the route instance cannot: the route
-            // keeps the policy it served, and the whole generation goes back as on any fault on
-            // trial.
-            let reason = format!("the route instance of generation {generation} failed: {error}");
-            self.policy_rolled_back(None, reason, false);
-            if self.update != Update::Trial(generation) {
-                return;
-            }
-        }
         self.report(lifecycle::report(proto::process::report::Kind::Switched(
             proto::process::Switched { generation },
         )));
-    }
-
-    /// The snapshot a route instance starts from: the schedulers and their requests in flight.
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            ranks: self.ranks(),
-            ..Snapshot::default()
-        }
     }
 
     /// `Commit`: the generation on trial stays, and the kept one is released after its last
@@ -1108,13 +1077,6 @@ impl MainProcess {
             );
         }
         self.kept = None;
-        if let Some(route) = self
-            .engine
-            .as_mut()
-            .and_then(|engine| engine.route.as_mut())
-        {
-            route.commit();
-        }
         self.grow_after_update();
         self.report(lifecycle::committed());
     }
@@ -1192,15 +1154,6 @@ impl MainProcess {
         if let Some(packages) = self.kept.take() {
             self.serving = packages;
             self.generation = kept;
-            let snapshot = self.snapshot();
-            if let Some(Err(error)) = self
-                .engine
-                .as_mut()
-                .and_then(|engine| engine.route.as_mut())
-                .map(|route| route.rollback(snapshot))
-            {
-                tracing::warn!(%error, "the route instance kept no policy to roll back to");
-            }
         }
         self.grow_after_update();
         self.report(lifecycle::rolled_back(reason));

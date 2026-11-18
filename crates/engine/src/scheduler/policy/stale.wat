@@ -15,6 +15,5 @@
   (func (export "sched_observe") (param i32 i32) (result i64) (i64.const 0))
   (func (export "sched_dispatch") (param i32 i32) (result i64) (i64.const 279275953455177))
   (func (export "sched_preempt") (param i32 i32) (result i64) (i64.const 0))
-  (func (export "sched_route") (param i32 i32) (result i32) (i32.const 0))
   (func (export "sched_place") (param i32 i32) (result i32) (i32.const 0))
   (func (export "sched_limits") (result i64) (i64.const 278176441827377)))

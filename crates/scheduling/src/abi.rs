@@ -12,9 +12,8 @@
 //! that [`sched_init`] fills. wasm32 without threads runs one export at a
 //! time, and the mechanism calls `init` once before any other export, which is
 //! what makes the single mutable slot sound. A second instance in the same
-//! process (the route instance on the control thread, or a trial instance
-//! during precopy) is a second wasmtime instance with its own memory, so the
-//! slots are unrelated.
+//! process (a trial instance during a switch) is a second wasmtime instance
+//! with its own memory, so the slots are unrelated.
 //!
 //! # Failure
 //!
@@ -28,7 +27,7 @@ use crate::decision::{DispatchOutput, Room, Shortage, Victim};
 use crate::event::Event;
 use crate::limits::Limits;
 use crate::policy::Instantiation;
-use crate::view::{CallView, RankView, ReplicaView, RequestView};
+use crate::view::{CallView, ReplicaView};
 use crate::wire::{decode, encode, pack};
 
 /// A buffer of `len` bytes in this module's memory, which the mechanism
@@ -217,14 +216,6 @@ macro_rules! export_policy {
         }
 
         #[unsafe(no_mangle)]
-        extern "C" fn sched_route(ptr: u32, len: u32) -> u32 {
-            // SAFETY: the mechanism's message buffer lives for this call.
-            let bytes = unsafe { $crate::abi::message(ptr, len) };
-            let (request, ranks) = $crate::abi::route_message(bytes);
-            policy(|policy| <$policy as $crate::Policy>::route(policy, &request, &ranks)) as u32
-        }
-
-        #[unsafe(no_mangle)]
         extern "C" fn sched_place(ptr: u32, len: u32) -> u32 {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
@@ -263,12 +254,6 @@ pub fn room_message(bytes: &[u8]) -> Room {
 /// Decodes the message of `sched_preempt`.
 pub fn shortage_message(bytes: &[u8]) -> Shortage {
     read(bytes, "preempt")
-}
-
-/// Decodes the message of `sched_route`, a `(RequestView, [RankView])` tuple
-/// as design §4.4's signature gives it.
-pub fn route_message(bytes: &[u8]) -> (RequestView, Vec<RankView>) {
-    read(bytes, "route")
 }
 
 /// Decodes the message of `sched_place`, a `(CallView, [ReplicaView])` tuple.

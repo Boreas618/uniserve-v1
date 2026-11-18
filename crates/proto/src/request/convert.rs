@@ -47,18 +47,21 @@ fn count(value: u64, field: &str) -> Result<usize, WireError> {
 // ----------------------------------------------------------------- requests
 
 impl Request {
-    /// The request's message.
+    /// The request's message, which names no scheduler: the submitter states the one the
+    /// leader's routing program chose (`wire::Request::scheduler`).
     pub fn to_wire(&self) -> wire::Request {
         match self {
             Self::Generation(request) => wire::Request {
                 id: request.request_id.0,
                 priority: request.priority,
                 kind: Some(wire::request::Kind::Generation(request.as_ref().into())),
+                scheduler: None,
             },
             Self::Diffusion(request) => wire::Request {
                 id: request.request_id.0,
                 priority: request.priority,
                 kind: Some(wire::request::Kind::Diffusion(request.into())),
+                scheduler: None,
             },
         }
     }

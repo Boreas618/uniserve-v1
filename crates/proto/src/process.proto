@@ -730,13 +730,13 @@ message Drained {
 // failure; with `fatal` set no previous policy module is left and the daemon
 // treats it as the engine's failure.
 message PolicyRolledBack {
-  // The scheduler thread whose policy call failed; absent for the route
-  // instance the engine's control thread runs.
-  optional uint32 scheduler = 1;
+  reserved 5;
+  reserved "fatal";
+  // The scheduler thread whose policy call failed.
+  uint32 scheduler = 1;
   string backend = 2;
   uint32 revision = 3;
   string reason = 4;
-  bool fatal = 5;
 }
 
 // A job ran past half the watchdog timeout in a worker: the generation it
@@ -756,13 +756,13 @@ message Stalled {
 // process's failure domain unusable, the others fail the operation or the
 // engine they were observed in.
 enum FaultKind {
+  reserved 3;
+  reserved "FAULT_KIND_POLICY";
   FAULT_KIND_UNSPECIFIED = 0;
   // A device's context holds a sticky error: nothing more runs on it.
   FAULT_KIND_DEVICE = 1;
   // A change of the ranks' weights failed part of the way.
   FAULT_KIND_WEIGHTS = 2;
-  // The scheduling policy failed with no previous module to return to.
-  FAULT_KIND_POLICY = 3;
   // A process of the engine exited.
   FAULT_KIND_PROCESS_EXIT = 4;
   // A scheduler thread failed or ended.

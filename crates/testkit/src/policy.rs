@@ -61,8 +61,7 @@ pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
 }
 
 /// [`packaged_module`] loaded for a scheduler's policy engine, with [`packaged_arguments`] of
-/// `ceilings`: the policy `engine::Engine::new` instantiates on every scheduler and, with several,
-/// the route.
+/// `ceilings`: the policy `engine::Engine::new` instantiates on every scheduler.
 ///
 /// The module is compiled once per test process and shared: compiling it is the costly step (a
 /// debug build takes seconds of a core), and an engine instantiates the module it is given on

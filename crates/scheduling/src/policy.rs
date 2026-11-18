@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::decision::{DispatchOutput, Room, Shortage, Victim};
 use crate::event::Event;
 use crate::limits::{Limits, Parameters};
-use crate::view::{CallView, RankView, ReplicaView, RequestView, Snapshot};
+use crate::view::{CallView, ReplicaView, Snapshot};
 
 /// The message the mechanism hands a policy module at instantiation: the
 /// package's arguments (design §5.1) and the state of everything already
@@ -50,9 +50,6 @@ pub trait Policy {
     /// When device KV units, the host KV page pool or the encoder cache is
     /// short: which objects to free, in order.
     fn preempt(&mut self, shortage: &Shortage) -> Vec<Victim>;
-
-    /// When a request reaches the main process: which DP rank serves it.
-    fn route(&mut self, request: &RequestView, ranks: &[RankView]) -> usize;
 
     /// When a request is first called on a block: which replica runs it.
     fn place(&mut self, call: &CallView, replicas: &[ReplicaView]) -> usize;

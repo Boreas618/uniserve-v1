@@ -1,11 +1,11 @@
 //! The scheduling policy's host (`specs/scheduler-design.md` §5): [`Policy`], a WASM module's
-//! instance with the seven calls of the policy interface, its switch and rollback (§3.9), the
+//! instance with the six calls of the policy interface, its switch and rollback (§3.9), the
 //! check of the limits it declares, and [`PolicyError`], the faults of a policy.
 //!
 //! The interface is the `scheduling` crate's: every message is JSON of one of its types
 //! written into the module's memory through `sched_alloc`, and a reply is a buffer the module
-//! allocated, packed as `ptr << 32 | len` (`0` for none), or for `route` and `place` the chosen
-//! index itself (`scheduling::wire`). Every export the host enters, the two buffer exports
+//! allocated, packed as `ptr << 32 | len` (`0` for none), or for `place` the chosen index
+//! itself (`scheduling::wire`). Every export the host enters, the two buffer exports
 //! included, starts with a fuel budget of its own, so a policy that loops ends its call instead
 //! of the step; a call's budget grows with the message it decodes.
 //!
@@ -35,9 +35,7 @@ use scheduling::ids::RequestId as PolicyRequestId;
 use scheduling::limits::{Limits, Parameters};
 use scheduling::policy::Instantiation;
 use scheduling::time::Nanos;
-use scheduling::view::{
-    CallView, RankView, ReplicaView, RequestStatus as Standing, RequestView, Snapshot,
-};
+use scheduling::view::{CallView, ReplicaView, RequestStatus as Standing, RequestView, Snapshot};
 use scheduling::wire::{self, Call};
 use wasmtime::{Config, Memory, Module, OptLevel, Store, Trap, TypedFunc, WasmParams, WasmResults};
 
@@ -113,8 +111,7 @@ pub(crate) struct Policy {
     /// once the switch is committed.
     pub previous: Option<(Arc<Module>, Parameters)>,
     /// Whether the serving instance was made by [`Policy::recover`] and has not completed a
-    /// decision since (a scheduler's `dispatch`, the routing instance's `route`): a fault of it
-    /// then ends the scheduler, or the engine (SD §5.2 "Faults").
+    /// decision since (a `dispatch`): a fault of it then ends the scheduler (SD §5.2 "Faults").
     recovering: bool,
     /// The limits the serving policy declared: the step's token and call budgets, the chunk limit,
     /// the queue bound, the prefetch threshold and the starvation bound the scheduler enforces.
@@ -281,8 +278,8 @@ impl Policy {
 
     /// Whether a fault of the serving instance can be recovered from by [`Policy::recover`]:
     /// unless that instance was made by a recovery and has not completed a decision since (a
-    /// `dispatch`, or the routing instance's `route`), since a fault that a fresh instance meets
-    /// again before it decides is not one a recovery cures.
+    /// `dispatch`), since a fault that a fresh instance meets again before it decides is not one
+    /// a recovery cures.
     pub(crate) fn recoverable(&self) -> bool {
         !self.recovering
     }
@@ -381,24 +378,6 @@ impl Policy {
             Some(reply) => decoded(Call::Preempt, wire::decode(&reply)),
             None => Ok(Vec::new()),
         }
-    }
-
-    /// The index in `ranks` of the data-parallel rank that serves a new request: the engine's
-    /// routing policy's call, never a scheduler's. A route the policy completes is the routing
-    /// instance's decision, as a `dispatch` is a scheduler's: an instance [`Policy::recover`] made
-    /// is recoverable again once it has routed a request.
-    ///
-    /// # Errors
-    ///
-    /// The fault of `route`.
-    pub(crate) fn route(
-        &mut self,
-        request: &RequestView,
-        ranks: &[RankView],
-    ) -> Result<usize, PolicyError> {
-        let index = self.index(Call::Route, wire::encode(&(request, ranks)))?;
-        self.recovering = false;
-        Ok(index)
     }
 
     /// The index in `replicas` of the group a request's first call of a phase runs on. The
@@ -500,7 +479,6 @@ struct Instance {
     observe: TypedFunc<(u32, u32), u64>,
     dispatch: TypedFunc<(u32, u32), u64>,
     preempt: TypedFunc<(u32, u32), u64>,
-    route: TypedFunc<(u32, u32), u32>,
     place: TypedFunc<(u32, u32), u32>,
     limits: TypedFunc<(), u64>,
 }
@@ -548,7 +526,6 @@ impl Instance {
             observe: bind(&mut store, &instance, Call::Observe.export())?,
             dispatch: bind(&mut store, &instance, Call::Dispatch.export())?,
             preempt: bind(&mut store, &instance, Call::Preempt.export())?,
-            route: bind(&mut store, &instance, Call::Route.export())?,
             place: bind(&mut store, &instance, Call::Place.export())?,
             limits: bind(&mut store, &instance, Call::Limits.export())?,
             store,
@@ -558,8 +535,7 @@ impl Instance {
     }
 
     /// Writes `message` into a buffer of the module's memory, enters the export of `call` with
-    /// it and frees it. Returns the export's result: a packed reply, or for `route` and `place`
-    /// the index. `fuel` gathers what every entry consumed.
+    /// it and frees it. Returns the export's result: a packed reply, or for `place` the index. `fuel` gathers what every entry consumed.
     fn exchange(&mut self, call: Call, message: &[u8], fuel: &mut u64) -> Result<u64, PolicyError> {
         let len = u32::try_from(message.len())
             .map_err(|_| malformed(call, "the message is larger than wasm32 addresses"))?;
@@ -580,7 +556,6 @@ impl Instance {
             Call::Observe => enter(store, call, &self.observe, buffer, budget, fuel)?,
             Call::Dispatch => enter(store, call, &self.dispatch, buffer, budget, fuel)?,
             Call::Preempt => enter(store, call, &self.preempt, buffer, budget, fuel)?,
-            Call::Route => u64::from(enter(store, call, &self.route, buffer, budget, fuel)?),
             Call::Place => u64::from(enter(store, call, &self.place, buffer, budget, fuel)?),
             Call::Limits => return Err(malformed(call, "this call takes no message")),
         };
@@ -907,13 +882,13 @@ pub(crate) mod tests {
     /// The policy modules of the policy host's own tests, each a module of the interface's
     /// exports in a `.wat` file beside this module (`policy/`), assembled by `wat`: one that
     /// decides nothing, and modules that fault in a stated way. Each states the interface version
-    /// it implements, which is this release's (`scheduling::INTERFACE_VERSION`, 6) for all but
+    /// it implements, which is this release's (`scheduling::INTERFACE_VERSION`, 7) for all but
     /// [`Fixture::Stale`]: a module of another release is refused at instantiation, so a fixture
     /// of a stale version fails every case that instantiates it.
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum Fixture {
-        /// Initializes, declares the limits of [`idle_limits`], admits nothing, routes and places
-        /// on the first candidate (`policy/idle.wat`).
+        /// Initializes, declares the limits of [`idle_limits`], admits nothing, and places on the
+        /// first candidate (`policy/idle.wat`).
         Idle,
         /// Traps in `init` (`policy/trap.wat`).
         Trap,
@@ -921,16 +896,10 @@ pub(crate) mod tests {
         Spin,
         /// Replies to `init` with a buffer outside its memory (`policy/stray.wat`).
         Stray,
-        /// Routes a message of at most [`ROUTER_LONGEST`] bytes to the first rank and traps on a
-        /// longer one (`policy/router.wat`).
-        Router,
         /// [`Fixture::Idle`] compiled against interface version 0, which no release speaks
         /// (`policy/stale.wat`).
         Stale,
     }
-
-    /// The longest route message [`Fixture::Router`] routes.
-    pub(crate) const ROUTER_LONGEST: usize = 4096;
 
     /// The module of `fixture`, compiled by [`load`] as a policy package's is.
     pub(crate) fn fixture(fixture: Fixture) -> Arc<Module> {
@@ -939,7 +908,6 @@ pub(crate) mod tests {
             Fixture::Trap => include_str!("policy/trap.wat"),
             Fixture::Spin => include_str!("policy/spin.wat"),
             Fixture::Stray => include_str!("policy/stray.wat"),
-            Fixture::Router => include_str!("policy/router.wat"),
             Fixture::Stale => include_str!("policy/stale.wat"),
         };
         let binary = wat::parse_str(text).unwrap();
@@ -952,7 +920,7 @@ pub(crate) mod tests {
         crate::modules::load::parameters(&testkit::serving::policy_revision(stated)).unwrap()
     }
 
-    /// The limits [`Fixture::Idle`] and [`Fixture::Router`] declare: a 256-token prefetch
+    /// The limits [`Fixture::Idle`] declares: a 256-token prefetch
     /// threshold and a 30 s starvation bound, which the default policy budget holds.
     pub(crate) fn idle_limits() -> Limits {
         Limits {
@@ -1258,7 +1226,6 @@ pub(crate) mod tests {
             refill_tokens: None,
             remaining_tokens: 1024 - generated,
             migratable: true,
-            cache_rank: None,
         }
     }
 

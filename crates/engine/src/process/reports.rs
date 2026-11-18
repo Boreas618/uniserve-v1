@@ -288,26 +288,19 @@ impl MainProcess {
         }
     }
 
-    /// The scheduling policy of scheduler `scheduler` (the route instance for `None`) faulted:
-    /// the previous policy serves again unless `fatal`, when none is left. Reported with the
-    /// serving policy package; a generation on trial rolls back by itself, and a fatal fault
-    /// outside a trial fails the epoch.
-    pub(super) fn policy_rolled_back(
-        &mut self,
-        scheduler: Option<usize>,
-        reason: String,
-        fatal: bool,
-    ) {
+    /// The scheduling policy of scheduler `scheduler` faulted and the previous policy serves
+    /// again. Reported with the serving policy package; a generation on trial rolls back by
+    /// itself.
+    pub(super) fn policy_rolled_back(&mut self, scheduler: usize, reason: String) {
         let policy = self.serving.get(&super::policy_slot());
         let report = lifecycle::report(report::Kind::PolicyRolledBack(
             proto::process::PolicyRolledBack {
-                scheduler: scheduler.map(|index| u32::try_from(index).unwrap_or(u32::MAX)),
+                scheduler: u32::try_from(scheduler).unwrap_or(u32::MAX),
                 backend: policy
                     .map(|package| package.backend.clone())
                     .unwrap_or_default(),
                 revision: policy.map_or(0, |package| package.revision),
                 reason: reason.clone(),
-                fatal,
             },
         ));
         self.report(report);
@@ -315,13 +308,6 @@ impl MainProcess {
         if let Some(generation) = lifecycle::fault_on_trial(self.lifecycle, &mut self.update) {
             let reason = format!("the policy of generation {generation} faulted: {reason}");
             self.roll_back(generation, true, reason);
-        } else if fatal {
-            let reason =
-                format!("the scheduling policy faulted with none to roll back to: {reason}");
-            self.fail(
-                reason.clone(),
-                lifecycle::fault(proto::process::FaultKind::Policy, reason, None),
-            );
         }
     }
 

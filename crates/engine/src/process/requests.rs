@@ -5,12 +5,12 @@
 //! A submitted request is refused at once with a `Rejected` event while the engine does not
 //! serve; while admissions are paused (`Pause`, the operator's `pause_generation`) it waits,
 //! with every request that arrived after it, in arrival order, and is submitted when the gate
-//! opens. A request that passes is routed to a scheduler: with one scheduler to it, with several
-//! to the one the route instance of the epoch's policy names (`Policy::route`); an index that
-//! names no candidate is replaced by the least loaded candidate, and a fault of the route
-//! instance is recovered from as a scheduler recovers from its policy's ([`routed`]). The engine
-//! answers `Accepted`, naming the scheduler, and hands the request to it as
-//! `Message::AddRequest`.
+//! opens. A request that passes goes to the scheduler it names: the leader's routing program
+//! chose it among the deployment's replicas, each scheduler being one, so the engine makes no
+//! choice of its own. A request that names none, or names no scheduler of this engine (a
+//! request resubmitted to another epoch), goes to the scheduler with the fewest requests in
+//! flight ([`candidate`]). The engine answers `Accepted`, naming the scheduler, and hands the
+//! request to it as `Message::AddRequest`.
 //!
 //! Each front numbers its own requests. The engine gives every request it admits an identity of
 //! its own, which its schedulers, its caches and a takeover name, and states it in the request's
@@ -27,9 +27,7 @@
 //! as a stream with a hole in it.
 
 use std::collections::VecDeque;
-use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use proto::MappedMedia;
@@ -38,12 +36,10 @@ use proto::request::{
     ArtifactMedia, CachePolicy, Event, FinishReason, GenerationRequest, MigrationCause,
     RejectionKind, RequestId, SamplingParams,
 };
-use scheduling::view::{RankView, RequestView, Snapshot};
 
 use super::MainProcess;
 use super::lifecycle::Lifecycle;
-use crate::scheduler::policy::Policy;
-use crate::scheduler::{Message, Request, view_of};
+use crate::scheduler::Message;
 
 /// The artifact bytes an event travels with, which a replay writes again with it.
 type Media = Option<Arc<dyn ArtifactMedia>>;
@@ -119,51 +115,20 @@ impl RequestStream {
     }
 }
 
-/// The scheduler of `ranks` a request goes to when the route instance chose `index`: that rank
-/// when it is a live candidate, and the least loaded live candidate otherwise (SD §5.2,
-/// "Clamping"); the first rank when none lives.
-pub(crate) fn candidate(index: usize, ranks: &[RankView]) -> usize {
-    if ranks.get(index).is_some_and(|rank| rank.alive) {
+/// The scheduler a request that names `named` goes to, of schedulers holding `in_flight`
+/// requests each: the named one when it is one of them, and otherwise the one with the fewest
+/// requests in flight, the lowest index of those; the first when there is none.
+pub(crate) fn candidate(named: Option<u32>, in_flight: &[u32]) -> usize {
+    if let Some(index) = named.and_then(|named| usize::try_from(named).ok())
+        && index < in_flight.len()
+    {
         return index;
     }
-    ranks
+    in_flight
         .iter()
-        .filter(|rank| rank.alive)
-        .min_by_key(|rank| (rank.in_flight, rank.index))
-        .map_or(0, |rank| rank.index)
-}
-
-/// The index the routing instance `route` chooses for `arrival` among `ranks`, or, after a fault
-/// of it, the reason and whether the fault ends the engine; [`candidate`] then sends the request
-/// to the least loaded rank.
-///
-/// A fault is recovered from by the scheduler's rule (SD §5.2 "Faults", `Policy::recover`): the
-/// policy the last switch replaced, or with none a fresh instance of the serving module, starts
-/// on a snapshot of `ranks` and routes from the next request on. The fault is fatal when that
-/// instantiation faults, or when the faulted instance was itself so made and had not routed a
-/// request since.
-fn routed(
-    route: &mut Policy,
-    arrival: &RequestView,
-    ranks: &[RankView],
-) -> Result<usize, (String, bool)> {
-    let fault = match route.route(arrival, ranks) {
-        Ok(index) => return Ok(index),
-        Err(fault) => fault,
-    };
-    let reason = format!("the route instance faulted: {fault}");
-    if !route.recoverable() {
-        return Err((reason, true));
-    }
-
-    let snapshot = Snapshot {
-        ranks: ranks.to_vec(),
-        ..Snapshot::default()
-    };
-    match route.recover(snapshot) {
-        Ok(()) => Err((reason, false)),
-        Err(restart) => Err((format!("{reason}; its restart faulted: {restart}"), true)),
-    }
+        .enumerate()
+        .min_by_key(|(index, held)| (**held, *index))
+        .map_or(0, |(index, _)| index)
 }
 
 impl MainProcess {
@@ -221,6 +186,7 @@ impl MainProcess {
     /// accepted, and handed to its scheduler.
     fn admit(&mut self, front: usize, request: wire::Request, media: Vec<Arc<MappedMedia>>) {
         let id = request.id;
+        let named = request.scheduler;
         if let Some(refusal) = self.lifecycle.refusal() {
             return self.reject(front, id, RejectionKind::Overloaded, refusal.to_owned());
         }
@@ -274,16 +240,14 @@ impl MainProcess {
         }
 
         let window = self.windows[front];
-        let Some(scheduler) = self.route(&input, window) else {
+        let loads = self.loads();
+        if loads.is_empty() {
             let message = "this process holds no scheduler: requests go to the epoch's scheduler \
                            node"
                 .to_owned();
             return self.reject(front, id, RejectionKind::Invalid, message);
-        };
-        // A route instance whose fault could not be recovered from failed the engine.
-        if let Some(refusal) = self.lifecycle.refusal() {
-            return self.reject(front, id, RejectionKind::Overloaded, refusal.to_owned());
         }
+        let scheduler = candidate(named, &loads);
         let Some(inbox) = self.inbox_of(scheduler) else {
             let message = format!("scheduler {scheduler} is gone");
             return self.reject(front, id, RejectionKind::Overloaded, message);
@@ -311,41 +275,9 @@ impl MainProcess {
         self.send(front, from_engine::Kind::Accepted(accepted), None);
     }
 
-    /// The scheduler that serves `input`; `None` when this process holds none (a peer).
-    fn route(&mut self, input: &proto::request::Request, window: NonZeroU32) -> Option<usize> {
-        let ranks = self.ranks();
-        let engine = self.engine.as_mut()?;
-        if ranks.len() <= 1 {
-            return (!ranks.is_empty()).then_some(0);
-        }
-        let Some(route) = engine.route.as_mut() else {
-            return Some(candidate(usize::MAX, &ranks));
-        };
-
-        // The arrival as the policy reads a request no scheduler took yet: waiting, with no
-        // group and no phase ready.
-        let drafts = self.launch.engine_config.speculative.num_draft_tokens;
-        let arrival = Request::new(
-            input.clone(),
-            self.launch.epoch,
-            Instant::now(),
-            window,
-            drafts,
-        );
-        let index = match routed(route, &view_of(&arrival, &[]), &ranks) {
-            Ok(index) => index,
-            // This request goes to the least loaded scheduler.
-            Err((reason, fatal)) => {
-                self.policy_rolled_back(None, reason, fatal);
-                usize::MAX
-            }
-        };
-        Some(candidate(index, &ranks))
-    }
-
-    /// The schedulers a request may be routed to, each with the requests routed to it that are
-    /// still in flight. A scheduler that stopped fails the process, so every one lives.
-    pub(super) fn ranks(&self) -> Vec<RankView> {
+    /// The requests in flight on each scheduler of this process, by its index; empty when it
+    /// holds none (a peer). A scheduler that stopped fails the process, so every one lives.
+    pub(super) fn loads(&self) -> Vec<u32> {
         let count = self
             .engine
             .as_ref()
@@ -357,14 +289,6 @@ impl MainProcess {
             }
         }
         in_flight
-            .into_iter()
-            .enumerate()
-            .map(|(index, in_flight)| RankView {
-                index,
-                in_flight,
-                alive: true,
-            })
-            .collect()
     }
 
     /// The inbox of scheduler `scheduler`.
@@ -629,7 +553,6 @@ impl MainProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::policy::tests::{Fixture, ROUTER_LONGEST, fixture};
 
     /// An event of request 9, distinct by its message.
     fn event(message: &str) -> wire::Event {
@@ -700,114 +623,21 @@ mod tests {
         assert!(stream.replay(4).is_err());
     }
 
-    fn ranks(in_flight: &[u32]) -> Vec<RankView> {
-        in_flight
-            .iter()
-            .enumerate()
-            .map(|(index, &in_flight)| RankView {
-                index,
-                in_flight,
-                alive: true,
-            })
-            .collect()
+    /// A request that names a scheduler of the engine goes to it, whatever the load.
+    #[test]
+    fn a_request_goes_to_the_scheduler_it_names() {
+        assert_eq!(candidate(Some(2), &[0, 1, 5]), 2);
+        assert_eq!(candidate(Some(0), &[7]), 0);
     }
 
-    /// A fault of the routing instance is recovered from by the scheduler's rule (SD §5.2
-    /// "Faults"): with no policy kept, a fresh instance of the serving module routes from the
-    /// next request on, and the request that met the fault goes to the least loaded rank. The
-    /// engine fails only when the instance a recovery made faults before it has routed a request;
-    /// one that routed a request recovers again.
+    /// A request that names no scheduler, or one the engine does not have, goes to the
+    /// scheduler with the fewest requests in flight, the lowest index of equals.
     #[test]
-    fn a_fault_of_the_routing_instance_restarts_it_and_a_second_before_it_routes_is_fatal() {
-        // A token request that just arrived, with nothing of it computed yet.
-        let arrival = RequestView {
-            id: scheduling::RequestId(7),
-            state: scheduling::RequestStatus::Waiting,
-            phase: None,
-            priority: 0,
-            arrived_at: scheduling::Nanos(0),
-            admitted_at: None,
-            prompt_tokens: 0,
-            prefill_tokens: 0,
-            generated_tokens: 0,
-            cached_prefix_tokens: 0,
-            prefilled_tokens: 0,
-            cached_pages: 0,
-            last_emitted_at: None,
-            class: scheduling::RequestClass::Token,
-            waiting_transfer: false,
-            next_tokens: 0,
-            reservation_units: 0,
-            prefetch_tokens: 0,
-            refill_tokens: None,
-            remaining_tokens: 0,
-            migratable: false,
-            cache_rank: None,
-        };
-        // A load the instance routes, and one stated over so many ranks that its message is
-        // longer than the instance routes, which it traps on; rank 1 is the least loaded of both.
-        let calm = ranks(&[3, 1]);
-        let mut loads = vec![3, 1];
-        loads.resize(256, 9);
-        let busy = ranks(&loads);
-        let length = |load: &[RankView]| scheduling::wire::encode(&(&arrival, load)).unwrap().len();
-        assert!(length(&calm) <= ROUTER_LONGEST && length(&busy) > ROUTER_LONGEST);
-        let module = fixture(Fixture::Router);
-        let start = || {
-            let snapshot = Snapshot {
-                ranks: calm.clone(),
-                ..Snapshot::default()
-            };
-            let budget = proto::config::PolicyBudget::default();
-            let ceilings = crate::scheduler::policy::ceilings([], &budget);
-            Policy::new(
-                Arc::clone(&module),
-                Default::default(),
-                snapshot,
-                &ceilings.limits,
-                &budget,
-            )
-            .unwrap()
-        };
-
-        let mut route = start();
-        assert_eq!(routed(&mut route, &arrival, &calm), Ok(0));
-        let Err((reason, fatal)) = routed(&mut route, &arrival, &busy) else {
-            panic!("the instance traps on the longer message");
-        };
-        assert!(!fatal, "the first fault restarts the instance: {reason}");
-        assert_eq!(candidate(usize::MAX, &busy), 1);
-        assert!(matches!(
-            routed(&mut route, &arrival, &busy),
-            Err((_, true))
-        ));
-
-        let mut route = start();
-        assert!(matches!(
-            routed(&mut route, &arrival, &busy),
-            Err((_, false))
-        ));
-        assert_eq!(routed(&mut route, &arrival, &calm), Ok(0));
-        assert!(matches!(
-            routed(&mut route, &arrival, &busy),
-            Err((_, false))
-        ));
-    }
-
-    #[test]
-    fn a_route_index_naming_a_candidate_is_taken() {
-        assert_eq!(candidate(2, &ranks(&[0, 1, 5])), 2);
-    }
-
-    #[test]
-    fn a_route_index_naming_no_candidate_goes_to_the_least_loaded() {
-        let ranks = ranks(&[4, 1, 3, 1]);
-        assert_eq!(candidate(4, &ranks), 1);
-        assert_eq!(candidate(usize::MAX, &ranks), 1);
-
-        // A rank that does not live is no candidate.
-        let mut ranks = ranks;
-        ranks[1].alive = false;
-        assert_eq!(candidate(1, &ranks), 3);
+    fn a_request_naming_no_scheduler_of_the_engine_goes_to_the_least_loaded() {
+        let in_flight = [4, 1, 3, 1];
+        assert_eq!(candidate(None, &in_flight), 1);
+        assert_eq!(candidate(Some(4), &in_flight), 1);
+        assert_eq!(candidate(Some(u32::MAX), &in_flight), 1);
+        assert_eq!(candidate(None, &[]), 0);
     }
 }

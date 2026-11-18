@@ -72,10 +72,11 @@ impl Migrator {
         }
     }
 
-    /// Submits `request` through the hold and returns its events and the
-    /// scheduler serving it, as `RequestHold::submit` does. A token request
-    /// that resumes from its tokens, and a video request, are kept for a
-    /// later migration, a token request with the seed it carries from entry
+    /// Submits `request` through the hold to the engine's scheduler
+    /// `scheduler`, the one the leader's routing program chose, and returns
+    /// its events and the scheduler serving it, as `RequestHold::submit`
+    /// does. A token request that resumes from its tokens, and a video
+    /// request, are kept for a later migration, a token request with the seed it carries from entry
     /// (`api::input::request_seed`), so that its draws repeat on the engine
     /// that serves it next, and a video request with its trajectories'
     /// identity.
@@ -86,6 +87,7 @@ impl Migrator {
     pub async fn submit(
         &self,
         mut request: Request,
+        scheduler: Option<u32>,
     ) -> Result<(RequestEvents, Option<u32>), SubmitError> {
         let resumable = match &mut request {
             Request::Generation(generation) => Resumable::Generation(generation.clone()),
@@ -96,7 +98,7 @@ impl Migrator {
                 Resumable::Diffusion(diffusion.clone())
             }
         };
-        let (stream, scheduler) = self.hold.submit(request).await?;
+        let (stream, scheduler) = self.hold.submit(request, scheduler).await?;
         let events = RequestEvents {
             stream,
             request: Some(resumable),
@@ -436,8 +438,10 @@ impl RequestEvents {
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         let continuation = request.resume(&migration, kept, self.stream.cache_resume());
+        // The continuation names no scheduler: the next engine's are of another epoch, not the
+        // ones the routing program chose among, and its least loaded takes it.
         let (stream, _scheduler) = client
-            .submit(continuation)
+            .submit(continuation, None)
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         // The previous engine's stream ended with its migratable event.
@@ -643,7 +647,7 @@ mod tests {
         hold.serve(Arc::clone(&first));
         let migrator = Migrator::new(Arc::clone(&hold), 0);
         let (mut events, _) = migrator
-            .submit(Request::Generation(Box::new(request(200))))
+            .submit(Request::Generation(Box::new(request(200))), None)
             .await
             .unwrap();
 
@@ -703,7 +707,7 @@ mod tests {
         hold.serve(migrating(1, MigrationCause::Loss));
         let migrator = Migrator::new(Arc::clone(&hold), 1);
         let (mut events, _) = migrator
-            .submit(Request::Generation(Box::new(request(1))))
+            .submit(Request::Generation(Box::new(request(1))), None)
             .await
             .unwrap();
 
@@ -742,7 +746,7 @@ mod tests {
         hold.serve(migrating(1, MigrationCause::Loss));
         let migrator = Migrator::new(Arc::clone(&hold), 3);
         let (mut events, _) = migrator
-            .submit(Request::Generation(Box::new(request(8))))
+            .submit(Request::Generation(Box::new(request(8))), None)
             .await
             .unwrap();
         hold.hold();
@@ -795,7 +799,7 @@ mod tests {
             hold.serve(migrating(1, cause));
             let migrator = Migrator::new(Arc::clone(&hold), 0);
             let (mut events, _) = migrator
-                .submit(Request::Generation(Box::new(request(8))))
+                .submit(Request::Generation(Box::new(request(8))), None)
                 .await
                 .unwrap();
             match events.recv().await {
@@ -823,7 +827,7 @@ mod tests {
         }
         let migrator = Migrator::new(Arc::clone(&hold), 1);
         let (mut events, _) = migrator
-            .submit(Request::Diffusion(video(trajectory)))
+            .submit(Request::Diffusion(video(trajectory)), None)
             .await
             .unwrap();
 

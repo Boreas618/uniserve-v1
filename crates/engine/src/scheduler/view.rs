@@ -40,10 +40,9 @@ use super::{Request, RequestStatus, Scheduler, WorkerGroup, monotonic_nanos};
 ///   tokens at most sizes its next chunk by; with `tokens` `None` no refill is offered.
 /// - `admitted_at` is the request's arrival once it is admitted: the row keeps no admission
 ///   instant, and arrival orders admitted requests as admission does but where the queue put a
-///   resumed request first. `last_emitted_at`, `prefetch_tokens`, `reservation_units` and
-///   `cache_rank` are empty: the policy learns emissions from `Emitted`, the scheduler applies
-///   its own prefetch threshold and capacity rejection at admission (SD §3.5, §4.4), and a
-///   scheduler is never asked to route.
+///   resumed request first. `last_emitted_at`, `prefetch_tokens` and `reservation_units` are
+///   empty: the policy learns emissions from `Emitted`, and the scheduler applies its own
+///   prefetch threshold and capacity rejection at admission (SD §3.5, §4.4).
 /// - A token request may be preempted as migratable until it finishes; a media request is not.
 pub(super) fn view(request: &Request, groups: &[WorkerGroup], tokens: Option<u32>) -> RequestView {
     let (class, prompt, max_tokens) = match &request.input {
@@ -133,14 +132,12 @@ pub(super) fn view(request: &Request, groups: &[WorkerGroup], tokens: Option<u32
             .map(|_| refill),
         remaining_tokens: max_tokens.saturating_sub(generated),
         migratable: token && request.status != RequestStatus::Finished,
-        cache_rank: None,
     }
 }
 
 /// The view of a request no step of a scheduler sizes a refill for ([`view`] with no refill
-/// offered): an arrival the engine routes before a scheduler takes it, which is viewed with no
-/// groups and so waits with no phase ready, and an arrival a scheduler tells its policy.
-pub(crate) fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
+/// offered): an arrival a scheduler tells its policy.
+pub(super) fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
     view(request, groups, None)
 }
 
@@ -228,7 +225,7 @@ fn replica_view(index: usize, group: &WorkerGroup, request: Option<&Request>) ->
 /// The snapshot of a scheduler of `groups` that holds no request and knows no cached block, as
 /// its policy starts from at the scheduler's construction (SD §5.2): the groups that serve
 /// phases, which a request may be placed on, and the phases they serve, each named with the
-/// first group that serves it. A scheduler states no ranks: routing is the engine's.
+/// first group that serves it.
 pub(super) fn snapshot_of(groups: &[WorkerGroup]) -> Snapshot {
     let serving: Vec<&WorkerGroup> = groups
         .iter()

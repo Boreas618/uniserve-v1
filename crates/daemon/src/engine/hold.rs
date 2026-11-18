@@ -227,8 +227,9 @@ impl RequestHold {
             )
     }
 
-    /// Submits `request` to the engine that serves, once one is ready, and
-    /// returns what `EngineClient::submit` returns.
+    /// Submits `request` to the engine that serves, once one is ready, naming
+    /// its scheduler `scheduler`, and returns what `EngineClient::submit`
+    /// returns.
     ///
     /// Waits while no engine is ready: while the hold holds submissions, and
     /// while its engine is not ready, until the hold changes.
@@ -240,8 +241,9 @@ impl RequestHold {
     pub async fn submit(
         &self,
         request: Request,
+        scheduler: Option<u32>,
     ) -> Result<(EventStream, Option<u32>), SubmitError> {
-        self.ready(None).await?.0.submit(request).await
+        self.ready(None).await?.0.submit(request, scheduler).await
     }
 
     /// Waits for this replica to accept new requests. The deployment router
@@ -378,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn a_held_request_is_served_once_an_engine_is_ready() {
         let hold = RequestHold::new();
-        let submission = hold.submit(request());
+        let submission = hold.submit(request(), None);
         tokio::pin!(submission);
         assert!(
             futures::poll!(&mut submission).is_pending(),
@@ -400,14 +402,14 @@ mod tests {
     #[tokio::test]
     async fn closing_the_hold_fails_held_and_later_requests() {
         let hold = RequestHold::new();
-        let submission = hold.submit(request());
+        let submission = hold.submit(request(), None);
         tokio::pin!(submission);
         assert!(futures::poll!(&mut submission).is_pending());
 
         hold.close("no engine serves");
         let expected = SubmitError::Unavailable("no engine serves".to_owned());
         assert_eq!(submission.await.err(), Some(expected.clone()));
-        assert_eq!(hold.submit(request()).await.err(), Some(expected));
+        assert_eq!(hold.submit(request(), None).await.err(), Some(expected));
     }
 
     /// Requests submitted while the engine is withdrawn wait for the engine
@@ -419,7 +421,7 @@ mod tests {
         assert!(hold.is_serving());
 
         hold.hold();
-        let submission = hold.submit(request());
+        let submission = hold.submit(request(), None);
         tokio::pin!(submission);
         assert!(
             futures::poll!(&mut submission).is_pending(),
@@ -441,7 +443,7 @@ mod tests {
         assert!(!hold.is_serving());
         assert_eq!(hold.state(), HoldState::Engine(EngineState::Serving));
 
-        let submission = hold.submit(request());
+        let submission = hold.submit(request(), None);
         tokio::pin!(submission);
         assert!(
             futures::poll!(&mut submission).is_pending(),

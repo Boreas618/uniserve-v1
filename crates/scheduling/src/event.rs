@@ -40,7 +40,7 @@ pub enum End {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
-    /// A request reached the main process, before `route` decides its rank.
+    /// A request reached its scheduler, which the leader's routing program chose.
     Arrived { request: RequestView },
     /// The mechanism admitted a waiting request.
     Admitted { request: RequestId },
@@ -49,7 +49,7 @@ pub enum Event {
     /// changed. Emitted before the `dispatch` of the step the change belongs
     /// to, and always after the event that caused it.
     ///
-    /// `next_tokens`, `cached_pages`, `cache_rank` and `waiting_transfer` move
+    /// `next_tokens`, `cached_pages` and `waiting_transfer` move
     /// without any other event carrying them, and a policy cannot derive
     /// them. The event is emitted only when the view differs from the one the
     /// policy holds by the events before it (the last view stated, advanced
@@ -138,7 +138,6 @@ mod tests {
             refill_tokens: Some(7),
             remaining_tokens: 1015,
             migratable: true,
-            cache_rank: Some(1),
         }
     }
 

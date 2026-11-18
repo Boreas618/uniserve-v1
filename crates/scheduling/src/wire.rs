@@ -18,8 +18,7 @@
 //!   `sched_dispatch(ptr, len) -> u64`, `sched_preempt(ptr, len) -> u64`:
 //!   the reply is `ptr << 32 | len` of a buffer the module allocated and the
 //!   mechanism frees with `sched_free`, or `0` for an empty reply.
-//! - `sched_route(ptr, len) -> u32`, `sched_place(ptr, len) -> u32`: the
-//!   chosen index directly.
+//! - `sched_place(ptr, len) -> u32`: the chosen index directly.
 //! - `sched_limits() -> u64`: the reply buffer.
 //!
 //! A trap, including an exhausted fuel budget, is a policy failure. A reply
@@ -39,9 +38,6 @@ pub const EXPORT_OBSERVE: &str = "sched_observe";
 pub const EXPORT_DISPATCH: &str = "sched_dispatch";
 /// The export that preempts: its message is [`crate::decision::Shortage`].
 pub const EXPORT_PREEMPT: &str = "sched_preempt";
-/// The export that routes: its message is `(&RequestView, &[RankView])` as a
-/// two-element tuple.
-pub const EXPORT_ROUTE: &str = "sched_route";
 /// The export that places: its message is `(&CallView, &[ReplicaView])`.
 pub const EXPORT_PLACE: &str = "sched_place";
 /// The export that reads the limits, with no message.
@@ -55,19 +51,17 @@ pub enum Call {
     Observe,
     Dispatch,
     Preempt,
-    Route,
     Place,
     Limits,
 }
 
 impl Call {
     /// Every call, in the order a policy's life makes them.
-    pub const ALL: [Call; 7] = [
+    pub const ALL: [Call; 6] = [
         Call::Init,
         Call::Observe,
         Call::Dispatch,
         Call::Preempt,
-        Call::Route,
         Call::Place,
         Call::Limits,
     ];
@@ -79,7 +73,6 @@ impl Call {
             Call::Observe => EXPORT_OBSERVE,
             Call::Dispatch => EXPORT_DISPATCH,
             Call::Preempt => EXPORT_PREEMPT,
-            Call::Route => EXPORT_ROUTE,
             Call::Place => EXPORT_PLACE,
             Call::Limits => EXPORT_LIMITS,
         }
@@ -92,7 +85,6 @@ impl Call {
             Call::Observe => "observe",
             Call::Dispatch => "dispatch",
             Call::Preempt => "preempt",
-            Call::Route => "route",
             Call::Place => "place",
             Call::Limits => "limits",
         }
@@ -100,7 +92,7 @@ impl Call {
 
     /// Whether the reply is the chosen index itself, not a buffer.
     pub fn replies_with_index(self) -> bool {
-        matches!(self, Call::Route | Call::Place)
+        matches!(self, Call::Place)
     }
 }
 

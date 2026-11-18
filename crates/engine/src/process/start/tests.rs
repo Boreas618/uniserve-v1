@@ -303,12 +303,11 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
         parameters,
     );
 
-    // One scheduler over the one group of the one rank, which no routing policy chooses among,
-    // assembling batches for the start's generation.
+    // One scheduler over the one group of the one rank, assembling batches for the start's
+    // generation.
     let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
     assert_eq!(engine.served.kernels(), FIRST_GENERATION);
     assert_eq!(engine.schedulers.len(), 1);
-    assert!(engine.route.is_none());
     assert_eq!(engine.workers.len(), 1);
     assert_eq!(engine.capacities.len(), 1);
     // The launch's model states no feature; the engine serves what its group's phases do.

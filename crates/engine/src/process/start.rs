@@ -76,7 +76,6 @@ use proto::config::{
 };
 use proto::request::{GenerationFeatures, GenerationLimits};
 use scheduling::limits::Parameters;
-use scheduling::view::{RankView, Snapshot};
 use storage::QueuePair;
 use storage::runtime::{GroupId, Open, Opened, Segments};
 
@@ -92,16 +91,13 @@ use crate::parallel::Rendezvous;
 use crate::process::binding::{Target as LoadTarget, WeightBinding};
 use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
-use crate::scheduler::policy::{self, Ceilings, Policy};
+use crate::scheduler::policy::{self, Ceilings};
 use crate::scheduler::{Message, Output, Scheduler};
 
 /// The started epoch: its schedulers and the ranks they drive (module documentation).
 pub struct Engine {
     /// One per data-parallel rank, in the order of the session's schedulers.
     pub(crate) schedulers: Vec<SchedulerThread>,
-    /// The routing policy's instance, which chooses a new request's scheduler; `None` with one
-    /// scheduler, which every request goes to.
-    pub(crate) route: Option<Policy>,
     /// The generation limits requests are checked against, as the schedulers took them.
     pub(crate) limits: GenerationLimits,
     /// What each worker group of the session serves, by its number.
@@ -191,8 +187,8 @@ impl Engine {
     /// `pairs` and the executor `executor_of(index, groups, inbox)` gives it: the executor of
     /// its worker groups `groups`, which sends to its channel `inbox`, and the shadow pass over
     /// its batches. `capacities` is what each worker group of the session serves, by its number;
-    /// `policy` the module set's policy module and its parameters, which every scheduler and, with
-    /// several, the routing policy instantiate; `session` what ends the session.
+    /// `policy` the module set's policy module and its parameters, which every scheduler
+    /// instantiates; `session` what ends the session.
     ///
     /// Each scheduler's policy is instantiated on the scheduler's own state, so the replicas and
     /// the phases its groups serve are what it starts from. The generation batches are assembled
@@ -327,34 +323,8 @@ impl Engine {
 
         limits.features = features;
 
-        // With several schedulers the routing policy chooses each new request's, from every
-        // scheduler as a rank of its own.
-        let route = if schedulers.len() > 1 {
-            let ranks = (0..schedulers.len())
-                .map(|index| RankView {
-                    index,
-                    in_flight: 0,
-                    alive: true,
-                })
-                .collect();
-            let snapshot = Snapshot {
-                ranks,
-                ..Snapshot::default()
-            };
-            Some(Policy::new(
-                module,
-                parameters,
-                snapshot,
-                &ceilings.limits,
-                budget,
-            )?)
-        } else {
-            None
-        };
-
         Ok(Self {
             schedulers,
-            route,
             limits,
             capacities,
             ceilings,
@@ -406,7 +376,6 @@ impl Engine {
     pub fn close(self, mut forward: impl FnMut(usize, Output)) -> Result<()> {
         let Self {
             schedulers,
-            route,
             workers,
             groups,
             binding,
@@ -435,7 +404,6 @@ impl Engine {
                 outcome = outcome.and(Err(anyhow::anyhow!("scheduler {index} panicked")));
             }
         }
-        drop(route);
         // The counters record the streams the workers issue on, and stop before they close.
         drop(counters);
 
@@ -930,7 +898,6 @@ fn start_peer(
     );
     Ok(Engine {
         schedulers: Vec::new(),
-        route: None,
         limits: launch.engine_config.model.generation_limits.clone(),
         capacities,
         ceilings,

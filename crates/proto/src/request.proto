@@ -287,6 +287,11 @@ message Request {
     GenerationRequest generation = 3;
     DiffusionRequest diffusion = 4;
   }
+  // The engine's scheduler that serves the request, by its index: the one
+  // the leader's routing program chose among the deployment's replicas. Absent,
+  // or naming no scheduler of the engine (a request resubmitted to another
+  // epoch), the scheduler with the fewest requests in flight serves it.
+  optional uint32 scheduler = 5;
 }
 
 // A command for one request.

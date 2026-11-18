@@ -71,8 +71,7 @@ enum Dispatch {
 /// A policy module a case states: it declares `limits`, does what `init` and `dispatch` say, and
 /// replies its `n`-th `dispatch` with the `n`-th of `replies` (the last for every later call).
 /// `observe` traps once a message names its needle the stated number of times. `place` names the
-/// first candidate, or with `alternate` the first and the second in turn. It names no victim and
-/// routes to the first rank.
+/// first candidate, or with `alternate` the first and the second in turn. It names no victim.
 struct Script {
     limits: Limits,
     init: Init,
@@ -180,7 +179,6 @@ impl Script {
                     {observe})
                 (func (export "sched_dispatch") (param i32 i32) (result i64) {dispatch})
                 (func (export "sched_preempt") (param i32 i32) (result i64) (i64.const 0))
-                (func (export "sched_route") (param i32 i32) (result i32) (i32.const 0))
                 (func (export "sched_place") (param i32 i32) (result i32) {place})
                 (func (export "sched_limits") (result i64) (i64.const {limits_reply})))"#
         );

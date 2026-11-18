@@ -1453,7 +1453,7 @@ impl Leader {
         request: Request,
     ) -> Result<(RequestEvents, Placement), SubmitError> {
         let replica = self.replica_for_request().await?;
-        let (events, scheduler) = replica.migrator.submit(request).await?;
+        let (events, scheduler) = replica.migrator.submit(request, None).await?;
         let placement = Placement {
             replica: replica.ordinal as u32,
             scheduler,

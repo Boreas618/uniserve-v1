@@ -31,8 +31,8 @@
 //! A policy module exports the functions named in [`wire`]: `sched_alloc` and
 //! `sched_free` for the linear-memory buffers, and one function per decision
 //! with its input as `(ptr, len)` and its reply packed into a `u64`
-//! (`ptr << 32 | len`, `0` for an empty reply) or, for [`wire::Call::Route`] and
-//! [`wire::Call::Place`], the chosen index directly. The mechanism resets the fuel
+//! (`ptr << 32 | len`, `0` for an empty reply) or, for [`wire::Call::Place`], the
+//! chosen index directly. The mechanism resets the fuel
 //! budget before every call and treats a trap or an exhausted budget as a
 //! policy failure (design §4.4).
 //!
@@ -43,7 +43,7 @@
 /// The version of the scheduling policy interface: the calls of [`wire`] and
 /// what their messages mean. Every change to a call, a message or what one of
 /// its fields means raises it.
-pub const INTERFACE_VERSION: u32 = 6;
+pub const INTERFACE_VERSION: u32 = 7;
 
 pub mod abi;
 pub mod control;
@@ -68,6 +68,6 @@ pub use limits::{Limits, Parameters, QueueOrder, Unstated, stated};
 pub use policy::{Instantiation, Policy};
 pub use time::{Duration, Nanos};
 pub use view::{
-    CallView, EncodingView, PageView, Phase, PhaseClass, PhaseView, RankView, ReplicaView,
-    RequestClass, RequestStatus, RequestView, Snapshot,
+    CallView, EncodingView, PageView, Phase, PhaseClass, PhaseView, ReplicaView, RequestClass,
+    RequestStatus, RequestView, Snapshot,
 };

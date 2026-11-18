@@ -301,10 +301,9 @@ pub enum FailureKind {
 impl FailureKind {
     /// Every kind, each of which has a name of its own: what reading a kind by its name
     /// searches.
-    const ALL: [Self; 29] = [
+    const ALL: [Self; 28] = [
         Self::Fault(FaultKind::Device),
         Self::Fault(FaultKind::Weights),
-        Self::Fault(FaultKind::Policy),
         Self::Fault(FaultKind::ProcessExit),
         Self::Fault(FaultKind::Scheduler),
         Self::Fault(FaultKind::Operations),
@@ -341,7 +340,6 @@ impl FailureKind {
             Self::Fault(fault) => match fault {
                 FaultKind::Device => "device_fault",
                 FaultKind::Weights => "weights_fault",
-                FaultKind::Policy => "policy_fault",
                 FaultKind::ProcessExit => "process_exit_fault",
                 FaultKind::Scheduler => "scheduler_fault",
                 FaultKind::Operations => "operations_fault",
@@ -458,26 +456,13 @@ impl Failure {
                 FailureKind::NonFiniteLogits,
                 format!("non-finite logits for request {}", logits.request),
             )),
-            Kind::PolicyRolledBack(policy) => {
-                // Absent is the route instance the engine's control
-                // thread runs, a value one scheduler thread's policy.
-                let instance = match policy.scheduler {
-                    Some(scheduler) => format!("scheduler {scheduler}"),
-                    None => "the engine's control thread".to_owned(),
-                };
-                let fatal = if policy.fatal {
-                    ", and no previous policy module is left"
-                } else {
-                    ""
-                };
-                Some(Self::new(
-                    FailureKind::PolicyRolledBack,
-                    format!(
-                        "the policy of {instance} (backend {} revision {}) failed: {}{fatal}",
-                        policy.backend, policy.revision, policy.reason
-                    ),
-                ))
-            }
+            Kind::PolicyRolledBack(policy) => Some(Self::new(
+                FailureKind::PolicyRolledBack,
+                format!(
+                    "the policy of scheduler {} (backend {} revision {}) failed: {}",
+                    policy.scheduler, policy.backend, policy.revision, policy.reason
+                ),
+            )),
             Kind::Parked(_)
             | Kind::Serving(_)
             | Kind::Prepared(_)
@@ -547,15 +532,14 @@ mod tests {
             Some(FailureKind::Stalled)
         );
 
-        // The policy's failure names the instance, the backend and the
-        // revision, and whether no previous module is left.
+        // The policy's failure names the scheduler, the backend and the
+        // revision.
         let rolled_back = crate::process::Report {
             kind: Some(Kind::PolicyRolledBack(crate::process::PolicyRolledBack {
-                scheduler: Some(2),
+                scheduler: 2,
                 backend: "attention-c".to_owned(),
                 revision: 7,
                 reason: "the fuel budget is exhausted".to_owned(),
-                fatal: false,
             })),
         };
         let failure = Failure::of_report(&rolled_back).expect("a policy rollback fails the update");
@@ -568,27 +552,6 @@ mod tests {
             "{}",
             failure.reason
         );
-        let route = crate::process::Report {
-            kind: Some(Kind::PolicyRolledBack(crate::process::PolicyRolledBack {
-                scheduler: None,
-                backend: "fcfs".to_owned(),
-                revision: 1,
-                reason: "a decision was refused".to_owned(),
-                fatal: true,
-            })),
-        };
-        let failure = Failure::of_report(&route).expect("a fatal policy rollback fails the update");
-        assert!(
-            failure.reason.contains("the engine's control thread"),
-            "{}",
-            failure.reason
-        );
-        assert!(
-            failure.reason.contains("no previous policy module is left"),
-            "{}",
-            failure.reason
-        );
-
         for acknowledged in [
             crate::process::Report {
                 kind: Some(Kind::Prepared(crate::process::Prepared {

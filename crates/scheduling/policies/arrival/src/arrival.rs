@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use scheduling::{
     CallView, DispatchOutput, EncodingId, Event, Limits, PageId, PageView, Parameters, Phase,
-    PhaseClass, Policy, RankView, ReplicaView, RequestClass, RequestId, RequestStatus, RequestView,
-    Room, Shortage, Snapshot, Storage, Unstated, Victim, stated,
+    PhaseClass, Policy, ReplicaView, RequestClass, RequestId, RequestStatus, RequestView, Room,
+    Shortage, Snapshot, Storage, Unstated, Victim, stated,
 };
 
 use crate::budget::{Shares, Step, prefill_chunk, work_tokens};
@@ -39,7 +39,6 @@ struct Refill {
 /// | `prefetch` | the requests whose host hit deepens by at least `Limits::prefetch_min_tokens` |
 /// | `refill` | the requests whose draft cache has a gap, when the refill is worth its cost (`Arrival::refill_due`) |
 /// | `preempt` | the least recently used page of the short storage, then the lowest-priority last-admitted request |
-/// | `route` | the recorded cache rank, else the live rank with the fewest requests in flight, from a rotating cursor |
 /// | `place` | the replica that already holds the request; else the one with the fewest running requests among those with capacity; a decode-stage call never lands on a prefill-only replica |
 #[derive(Clone, Debug)]
 pub struct Arrival {
@@ -70,8 +69,6 @@ pub struct Arrival {
     offers: Vec<PageId>,
     /// The encoder cache entries, least recently used first.
     encodings: Lru<EncodingId>,
-    /// The rank the last `route` picked, so that ranks of equal load take new requests in turn.
-    route_cursor: usize,
     /// Whether the next step puts the media path's work first: the media path and the token path
     /// alternate their precedence from step to step.
     media_first: bool,
@@ -105,7 +102,6 @@ impl TryFrom<Parameters> for Arrival {
             pages: Lru::new(),
             offers: Vec::new(),
             encodings: Lru::new(),
-            route_cursor: 0,
             media_first: false,
         })
     }
@@ -613,31 +609,6 @@ impl Policy for Arrival {
         victims
     }
 
-    fn route(&mut self, request: &RequestView, ranks: &[RankView]) -> usize {
-        // A request resuming a stored cache goes back to the rank recorded for
-        // it; the mechanism asks no routing decision for it.
-        if let Some(rank) = request.cache_rank {
-            return rank;
-        }
-        let count = ranks.len();
-        if count == 0 {
-            return 0;
-        }
-        let start = self.route_cursor % count;
-        self.route_cursor = (start + 1) % count;
-        // The live rank with the fewest requests in flight, from the cursor, so
-        // ranks of equal load take new requests in turn.
-        let chosen = (0..count)
-            .map(|offset| (start + offset) % count)
-            .filter(|index| ranks[*index].alive)
-            .min_by_key(|index| ranks[*index].in_flight)
-            .or_else(|| (0..count).map(|offset| (start + offset) % count).next());
-        match chosen {
-            Some(index) => ranks[index].index,
-            None => 0,
-        }
-    }
-
     fn place(&mut self, call: &CallView, replicas: &[ReplicaView]) -> usize {
         // A decode-stage call never lands on a replica that only prefills.
         let decode_stage = matches!(call.kind, Phase::Decode | Phase::Verify);
@@ -773,7 +744,6 @@ mod tests {
             refill_tokens: None,
             remaining_tokens: 0,
             migratable: true,
-            cache_rank: None,
         }
     }
 
@@ -1128,58 +1098,6 @@ mod tests {
             need: 1,
         });
         assert_eq!(victims, vec![Victim::Request(RequestId(2))]);
-    }
-
-    #[test]
-    fn routing_takes_the_least_loaded_live_rank_from_the_cursor() {
-        let mut policy = policy();
-        let ranks = [
-            RankView {
-                index: 0,
-                in_flight: 3,
-                alive: true,
-            },
-            RankView {
-                index: 1,
-                in_flight: 1,
-                alive: true,
-            },
-            RankView {
-                index: 2,
-                in_flight: 1,
-                alive: false,
-            },
-        ];
-        assert_eq!(policy.route(&view(1, 0, 0), &ranks), 1);
-        // The cursor advances by one per pick, not to one past the rank it
-        // chose: the second pick starts at 1, so with two ranks the rotation
-        // is [1, 0] and equal load keeps rank 1.
-        let ranks = [
-            RankView {
-                index: 0,
-                in_flight: 1,
-                alive: true,
-            },
-            RankView {
-                index: 1,
-                in_flight: 1,
-                alive: true,
-            },
-        ];
-        assert_eq!(policy.route(&view(2, 0, 0), &ranks), 1);
-    }
-
-    #[test]
-    fn a_resuming_request_keeps_its_recorded_rank() {
-        let mut policy = policy();
-        let mut request = view(1, 0, 0);
-        request.cache_rank = Some(3);
-        let ranks = [RankView {
-            index: 0,
-            in_flight: 0,
-            alive: true,
-        }];
-        assert_eq!(policy.route(&request, &ranks), 3);
     }
 
     #[test]

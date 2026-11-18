@@ -21,9 +21,6 @@
 //! - **Trial**: [`commit`] releases the kept generation after its last batch; [`rollback`] serves
 //!   the kept generation again from one boundary.
 //!
-//! The route instance of an engine of several schedulers switches, commits and rolls back on the
-//! control thread, which holds it.
-//!
 //! The ranks of the epoch's peers switch, commit and roll back with this process's, in the order
 //! of every group's jobs, through the node's route (`Route::switch`); each peer prepares from its
 //! own daemon's command and its own host's Build Server, and a shadow pass waits for every
@@ -526,7 +523,7 @@ fn switch_kernels(
 
 /// Ends the trial of generation `generation` in its favour (`Commit`): every worker releases the
 /// generation it kept, behind the batches it holds and so after the kept generation's last one,
-/// and every scheduler drops the policy it kept. The control thread's route instance commits too.
+/// and every scheduler drops the policy it kept.
 ///
 /// # Errors
 ///
@@ -559,8 +556,7 @@ pub(crate) fn commit(
 /// Ends the trial of generation `generation` against it (`Rollback`): at one batch boundary every
 /// worker serves `kept`, the generation the trial kept, again and releases `generation`'s
 /// graphs, the batches formed from here on carry `kept`, every rank's cache and state launch
-/// their own work from it, and every scheduler serves the policy it kept again. The control
-/// thread's route instance rolls back too.
+/// their own work from it, and every scheduler serves the policy it kept again.
 ///
 /// # Errors
 ///

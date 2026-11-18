@@ -132,7 +132,6 @@ mod tests {
             refill_tokens: None,
             remaining_tokens: 0,
             migratable: true,
-            cache_rank: None,
         }
     }
 

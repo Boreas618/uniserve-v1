@@ -86,7 +86,6 @@ pub(crate) use group::WorkerGroup;
 use policy::{Ceilings, Policy, PolicyError, ceilings};
 pub(crate) use request::{Blocks, Request, RequestStatus};
 use schedule::Deferred;
-pub(crate) use view::view_of;
 
 /// The bytes of a record's length word in a ring of a queue pair (`storage::queue`): a ring of
 /// `max_record()` bytes of record holds that many more.

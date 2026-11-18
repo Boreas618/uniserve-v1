@@ -30,8 +30,6 @@ pub struct Snapshot {
     pub replicas: Vec<ReplicaView>,
     /// Every phase of this epoch, so a policy can read a request's phase.
     pub phases: Vec<PhaseView>,
-    /// The DP ranks a `route` decision may choose, in scheduler-index order.
-    pub ranks: Vec<RankView>,
 }
 
 /// Where a request stands.
@@ -121,10 +119,6 @@ pub struct RequestView {
     /// preempted request), so ending it as migratable and resubmitting it
     /// loses nothing. Only such a request may be a `Victim::Request`.
     pub migratable: bool,
-    /// The rank recorded for the request's cache resume, when it resumes a
-    /// stored cache. `route` returns this rank when it is set, and the
-    /// mechanism asks no routing decision for such a request.
-    pub cache_rank: Option<usize>,
 }
 
 /// One phase of the epoch: a block's computation for one kind of call.
@@ -276,17 +270,6 @@ pub struct EncodingView {
     pub id: EncodingId,
     /// When it was last used; larger is more recent.
     pub last_used: Nanos,
-}
-
-/// One DP rank, as a `route` decision sees it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RankView {
-    /// The scheduler index of the rank; `route` returns this index.
-    pub index: usize,
-    /// Requests the rank holds in flight or running.
-    pub in_flight: u32,
-    /// Whether the rank's scheduler is alive.
-    pub alive: bool,
 }
 
 /// One replica of a block, as a `place` decision sees it.

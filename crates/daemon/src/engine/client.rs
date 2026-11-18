@@ -229,15 +229,19 @@ impl Shared {
     /// descriptors ride the `Submit` frame itself in condition order. An
     /// engine on another host takes each medium as bounded parts ahead of the
     /// frame, each part written whole before the next is encoded, so a medium
-    /// is never held twice.
-    fn submit(&self, request: &Request) {
+    /// is never held twice. `scheduler` is the engine's scheduler the request
+    /// names, the one the leader's routing program chose.
+    fn submit(&self, request: &Request, scheduler: Option<u32>) {
         let media = match request {
             Request::Diffusion(diffusion) => diffusion.media.as_slice(),
             Request::Generation(_) => &[],
         };
         let frame = wire::ToEngine {
             kind: Some(to_engine::Kind::Submit(wire::Submit {
-                requests: vec![request.to_wire()],
+                requests: vec![wire::Request {
+                    scheduler,
+                    ..request.to_wire()
+                }],
             })),
         };
 
@@ -415,10 +419,12 @@ impl EngineClient {
     }
 
     /// Submits `request` under an identity of the client's choosing, which
-    /// this connection's requests alone are numbered in, and returns its
-    /// events and the scheduler serving it; the scheduler is `None` when the
-    /// engine ended the request at submission, whose terminal event the
-    /// stream holds.
+    /// this connection's requests alone are numbered in, to the engine's
+    /// scheduler `scheduler` (the one the leader's routing program chose; the
+    /// engine's least loaded when `None` or when it has no such scheduler),
+    /// and returns its events and the scheduler serving it; the scheduler is
+    /// `None` when the engine ended the request at submission, whose terminal
+    /// event the stream holds.
     ///
     /// # Errors
     ///
@@ -426,6 +432,7 @@ impl EngineClient {
     pub async fn submit(
         &self,
         mut request: Request,
+        scheduler: Option<u32>,
     ) -> Result<(EventStream, Option<u32>), SubmitError> {
         if let EngineState::Failed(reason) = self.state() {
             return Err(SubmitError::Unavailable(reason));
@@ -467,7 +474,7 @@ impl EngineClient {
             reported: 0,
             open: true,
         };
-        self.shared.submit(&request);
+        self.shared.submit(&request, scheduler);
         // A closed connection drops the acceptance with the request, whose
         // stream then holds the connection's error event.
         let admission = match acceptance.await {
@@ -1522,7 +1529,7 @@ mod tests {
     async fn a_stream_reports_its_position_every_half_window_and_at_its_end() {
         let (client, engine) = generating();
         let tokens = EVENT_WINDOW as usize;
-        let (mut stream, scheduler) = client.submit(request(tokens)).await.unwrap();
+        let (mut stream, scheduler) = client.submit(request(tokens), None).await.unwrap();
         assert_eq!(scheduler, Some(0));
         while stream.recv().await.is_some() {}
         drop(stream);
@@ -1540,7 +1547,7 @@ mod tests {
     async fn a_cancelled_stream_still_reports_its_position() {
         let (client, engine) = generating();
         let tokens = EVENT_WINDOW as usize;
-        let (mut stream, _) = client.submit(request(tokens)).await.unwrap();
+        let (mut stream, _) = client.submit(request(tokens), None).await.unwrap();
         assert!(stream.recv().await.is_some());
         stream.cancel();
         while stream.recv().await.is_some() {}
@@ -1588,7 +1595,7 @@ mod tests {
         ));
 
         // The scripted engine states the connection's own identity as its own.
-        let (submitted, _) = client.submit(request(0)).await.unwrap();
+        let (submitted, _) = client.submit(request(0), None).await.unwrap();
         assert_eq!(submitted.engine_id(), Some(submitted.id()));
         assert_ne!(submitted.id(), stream.id());
     }
