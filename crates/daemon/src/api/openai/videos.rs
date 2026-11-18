@@ -95,7 +95,7 @@ async fn videos_sync(
     let started_at = Instant::now();
     let request_id = format!("vid-{base_id}");
 
-    if let Err(error) = check_model_served(&body.model, served.leader.served_model_name()) {
+    if let Err(error) = check_model_served(&body.model, &served.leader.served_model_name()) {
         return error.into_response();
     }
     let (processed, mut stream) = match served.leader.generate_video(request_id, body).await {
@@ -258,7 +258,7 @@ async fn videos_create(
     VideoBody(body): VideoBody,
 ) -> Response {
     let request_id = format!("vid-{base_id}");
-    if let Err(error) = check_model_served(&body.model, served.leader.served_model_name()) {
+    if let Err(error) = check_model_served(&body.model, &served.leader.served_model_name()) {
         return error.into_response();
     }
     let (prepared, mut stream) = match served.leader.generate_video(request_id, body).await {
@@ -272,7 +272,7 @@ async fn videos_create(
     let record = VideoJob {
         id: id.clone(),
         object: "video".to_owned(),
-        model: served.leader.served_model_name().to_owned(),
+        model: served.leader.served_model_name().to_string(),
         created_at: crate::api::since_epoch().as_secs(),
         completed_at: None,
         expires_at: None,
@@ -432,7 +432,7 @@ fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
 async fn capabilities(State(state): State<JobState>) -> Json<Value> {
     let settings = state.jobs.settings();
     Json(json!({
-        "model": state.served.leader.served_model_name(),
+        "model": state.served.leader.served_model_name().to_string(),
         "video": state.served.leader.processor().video_capabilities(),
         "video_jobs": {
             "max_retained_bytes": settings.max_bytes,

@@ -209,7 +209,7 @@ impl Trial {
         None
     }
 
-    /// The trial as `GET /admin/config` reports it: its thresholds and its
+    /// The trial as an update's report states it: its thresholds and its
     /// latest reading, each replica's rates beside its baseline.
     pub(crate) fn report(&self) -> TrialReport {
         let (requests_ended, requests_failed) = self

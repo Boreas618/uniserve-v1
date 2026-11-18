@@ -38,10 +38,8 @@ pub enum State {
 pub struct Endpoints {
     /// The client API (a daemon's HTTP server).
     pub client: Option<Endpoint>,
-    /// The operator's admin API (a daemon's Unix socket).
+    /// The admin API (a daemon's Unix socket): its policy and its observation store.
     pub admin: Option<Endpoint>,
-    /// The harness's subset of the admin API (a daemon's Unix socket).
-    pub harness: Option<Endpoint>,
     /// Where a deployment's other nodes join its leader (TCP).
     pub join: Option<Endpoint>,
     /// A Storage Server's socket on its host, or the one a daemon's deployment uses.

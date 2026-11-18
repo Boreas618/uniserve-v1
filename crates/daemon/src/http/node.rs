@@ -3,11 +3,11 @@
 //! predecessor handed it.
 //!
 //! The node binds its listeners when it starts ([`super::serve`]): the client API's address and
-//! the admin API's two Unix sockets in its instance directory. It serves them for its whole life,
-//! dispatching every request to the deployment that serves: the client API to its routes, `503`
-//! while none serves; the admin sockets to its admin routes. The node itself answers its status
-//! (`GET /admin/status`: starting, serving or stopping), its event log and the deployment's
-//! policy (`/admin/policy`).
+//! the admin API's Unix socket in its instance directory. It serves them for its whole life,
+//! dispatching every client request to the deployment that serves, `503` while none serves. The
+//! node itself answers the admin API's two endpoints: the deployment's policy
+//! (`/admin/policy`), the one way it changes, and its observation store (`/admin/query`), the
+//! one way its state is read.
 //!
 //! Every change of the deployment goes through one entry, [`Node::apply`]: a package, compared
 //! option by option with the current revision ([`proto::reload`]), written as the next revision
@@ -16,18 +16,19 @@
 //! ([`Node::start`]); a node that starts with the package its current revision holds starts
 //! that revision as its apply fixed it. `PUT /admin/policy` is every later one.
 //!
-//! The event log and the operations' record are the node's ([`Journal`]), which every
-//! deployment it serves writes.
+//! Where the deployment is in its life (coming up, serving, coming down, failed) is a `log`
+//! event of source `node` of the observation store (`crate::status`), and what it executes and
+//! owns the gauges its leader samples.
 //!
 //! A deployment, however it came up, is served the same way ([`Node::serve`]): its routes, its
-//! readiness, its restarts, and its end, which drains its requests within the shutdown budget,
-//! shuts its engines down, stops its daemon and, when its `POST /admin/shutdown` asked for it,
-//! releases its storage at the host's Storage Server; or, once a successor serves it, detaches.
-//! The node ends with its deployment.
+//! readiness, its restarts, and its end at the node's stop signal, which drains its requests
+//! within the shutdown budget, shuts its engines down, stops its daemon and, when its package
+//! states `retire`, releases its storage at the host's Storage Server; or, once a successor
+//! serves it, detaches. The node ends with its deployment.
 
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -38,13 +39,12 @@ use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use proto::admin::{EventBody, EventsQuery, NodeState, OperationKind, Phase};
+use proto::admin::Phase;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 use tracing::{info, warn};
 
-use super::admin::{Admin, AdminState, Journal};
 use super::handoff::Handoff;
 use super::listener::{Listener, ListenerHandoff};
 use super::{Ready, middleware, retire_deployment, router, video_body_limit};
@@ -58,6 +58,7 @@ use crate::policy::Package;
 use crate::policy::revision::{KEPT, Outcome, Record, Revisions};
 use crate::programs::{Current, Output, Programs, States};
 use crate::restart::Restarter;
+use crate::status::{self, NodeState};
 use crate::supervision::Daemon;
 use crate::updates::change::Applied;
 
@@ -75,42 +76,21 @@ enum Serving {
     /// No deployment: before the first comes up, and after it came down.
     Idle,
     /// A deployment is coming up.
-    Starting(String),
+    Starting,
     /// A deployment serves through its routes.
     Deployment(Arc<Routes>),
     /// A deployment is coming down.
-    Stopping(String),
+    Stopping,
 }
 
-/// A serving deployment: its client API's routes, the operator's and the harness's admin
-/// routes, and what applies a change to it.
+/// A serving deployment: its client API's routes and what applies a change to it.
 struct Routes {
     client: Router,
-    admin: Router,
-    harness: Router,
     leader: Arc<Leader>,
-    deployment: Arc<Admin>,
     jobs: Arc<VideoJobs>,
     restarter: Arc<Restarter>,
     /// The policy package's programs the leader runs.
     programs: Arc<Programs>,
-}
-
-/// Which admin socket a request came on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Socket {
-    Operator,
-    Harness,
-}
-
-impl Routes {
-    /// The deployment's admin routes `socket` serves.
-    fn admin(&self, socket: Socket) -> Router {
-        match socket {
-            Socket::Operator => self.admin.clone(),
-            Socket::Harness => self.harness.clone(),
-        }
-    }
 }
 
 /// A deployment brought up and not yet served: what [`Node::serve`] serves, whether the node's
@@ -120,8 +100,6 @@ pub(crate) struct Brought {
     pub(crate) config: Config,
     pub(crate) stated: Stated,
     pub(crate) leader: Arc<Leader>,
-    /// The deployment's admin state, whose shutdown cancels `token`.
-    pub(crate) admin: Arc<Admin>,
     pub(crate) jobs: Arc<VideoJobs>,
     /// The responses a hot restart's predecessor handed over, which the deployment goes on
     /// with; none for a deployment the node brought up.
@@ -129,9 +107,6 @@ pub(crate) struct Brought {
     /// The deployment's daemon service; `None` for a deployment served without one (the tests'
     /// in-process engines).
     pub(crate) daemon: Option<Daemon>,
-    /// Set by the deployment's `POST /admin/shutdown`: its storage is released once its
-    /// processes are down.
-    pub(crate) retire: Arc<AtomicBool>,
     /// The deployment's end: the node's stop.
     pub(crate) token: CancellationToken,
     /// The revision a hot restart's predecessor converged to when it handed the deployment
@@ -200,10 +175,6 @@ pub(crate) struct Node {
     /// Cancelled when the node ends.
     shutdown: CancellationToken,
     serving: Mutex<Serving>,
-    /// The node's event log and operations' record, which every deployment it serves writes.
-    journal: Arc<Journal>,
-    /// Why the last deployment failed to start or to stop.
-    last_error: Mutex<Option<String>>,
     /// Held by the change that converges: changes converge one after another, a change that
     /// arrives meanwhile converging once the one before it ended.
     applying: tokio::sync::Mutex<()>,
@@ -239,7 +210,7 @@ impl IntoResponse for Refused {
     }
 }
 
-/// Runs a node started with `start` on `listener` and `admins`, serving `first`, until it ends:
+/// Runs a node started with `start` on `listener` and `admin`, serving `first`, until it ends:
 /// at its stop signal, with its deployment, or once a hot restart's successor serves it.
 ///
 /// At a stop, the node stops accepting connections, its deployment drains its requests within
@@ -254,7 +225,7 @@ impl IntoResponse for Refused {
 pub(crate) async fn run(
     start: Start,
     mut listener: Listener,
-    admins: super::admin::Listeners,
+    admin: super::admin::Listener,
     first: First,
 ) -> Result<Ended> {
     let Start {
@@ -267,12 +238,6 @@ pub(crate) async fn run(
         ready,
         shutdown,
     } = start;
-    // A hot restart's successor goes on with its predecessor's journal, which the adopted
-    // deployment writes; a node started otherwise starts one.
-    let journal = match &first {
-        First::Serving(brought) => Arc::clone(&brought.admin.journal),
-        First::Package { .. } => Journal::new(options.admin_config.event_log),
-    };
     let node = Arc::new(Node {
         families,
         server: options.server_config.clone(),
@@ -288,18 +253,11 @@ pub(crate) async fn run(
         accepting: CancellationToken::new(),
         shutdown,
         serving: Mutex::new(Serving::Idle),
-        journal,
-        last_error: Mutex::new(None),
         applying: tokio::sync::Mutex::new(()),
         origins: Arc::default(),
     });
 
-    super::admin::serve_routes(
-        admins,
-        node.admin_routes(Socket::Operator),
-        node.admin_routes(Socket::Harness),
-        &node.shutdown,
-    );
+    super::admin::serve(admin, node.admin_routes(), &node.shutdown);
     // The push of the observation store to a collector, for the node's life: the options a
     // daemon starts with are its `export_config`, which a change takes at a restart.
     tokio::spawn(crate::observation::export::run(
@@ -401,7 +359,7 @@ impl Node {
     fn routes(&self) -> Option<Arc<Routes>> {
         match &*service::lock(&self.serving) {
             Serving::Deployment(routes) => Some(Arc::clone(routes)),
-            Serving::Idle | Serving::Starting(_) | Serving::Stopping(_) => None,
+            Serving::Idle | Serving::Starting | Serving::Stopping => None,
         }
     }
 
@@ -528,9 +486,8 @@ impl Node {
         let config = package.config.clone();
         let stated = package.stated.clone();
         let name = config.served_model_name().to_owned();
-        self.set(Serving::Starting(name.clone()));
-        self.journal
-            .record(EventBody::Deployment, format!("{name} comes up"));
+        self.set(Serving::Starting);
+        status::node(&self.recorder, NodeState::Starting, &name, None);
         let brought = async {
             // The package's programs are fixed before the rest of the module set, of which the
             // scheduling program is the engines' policy.
@@ -542,9 +499,11 @@ impl Node {
             Ok(Some(_)) => {}
             Ok(None) => {
                 self.set(Serving::Idle);
-                self.journal.record(
-                    EventBody::Deployment,
-                    format!("the node stopped before {name} came up"),
+                status::node(
+                    &self.recorder,
+                    NodeState::Idle,
+                    &name,
+                    Some("the node stopped before it came up"),
                 );
             }
             Err(error) => {
@@ -552,11 +511,12 @@ impl Node {
                     deployment = name,
                     "the deployment did not come up: {error:#}"
                 );
-                *service::lock(&self.last_error) = Some(format!("{error:#}"));
                 self.set(Serving::Idle);
-                self.journal.record(
-                    EventBody::Deployment,
-                    format!("{name} did not come up: {error:#}"),
+                status::node(
+                    &self.recorder,
+                    NodeState::Idle,
+                    &name,
+                    Some(&format!("it did not come up: {error:#}")),
                 );
             }
         }
@@ -675,12 +635,16 @@ impl Node {
                 return Err(error);
             }
         };
-        let retire = Arc::new(AtomicBool::new(false));
-        let admin = Admin::new(
-            token.clone(),
-            Arc::clone(&retire),
-            Arc::clone(&self.journal),
-        );
+        // What the daemon itself executes of the package comes up with the engines.
+        if let Err(error) = Box::pin(leader.take_start(&config)).await {
+            let error = anyhow::Error::from(error)
+                .context("taking the package's own options at the deployment's start");
+            let stopped = leader.shutdown().await.and(stop_daemon(Some(daemon)).await);
+            if let Err(stopped) = stopped {
+                warn!("the deployment did not come down after its start failed: {stopped:#}");
+            }
+            return Err(error);
+        }
         let jobs = Arc::new(VideoJobs::new(
             config.video_job_config.clone(),
             token.child_token(),
@@ -689,11 +653,9 @@ impl Node {
             config,
             stated,
             leader,
-            admin,
             jobs,
             adopted: Vec::new(),
             daemon: Some(daemon),
-            retire,
             token,
             then: None,
         }))
@@ -714,15 +676,13 @@ impl Node {
             config,
             stated,
             leader,
-            admin,
             jobs,
             adopted,
             daemon,
-            retire,
             token,
             then,
         } = brought;
-        let name = leader.served_model_name().to_owned();
+        let name = leader.served_model_name().to_string();
         let programs = Arc::clone(&self).run_programs(&leader);
         let daemon = Arc::new(Mutex::new(daemon));
         let (listener, descriptors) = &self.listener;
@@ -742,7 +702,7 @@ impl Node {
         restarter.attach_handoff(Arc::clone(&self.handoff));
         let restarting = restarter.restarting();
         let mut decided = restarter.decide();
-        admin.watch(&leader);
+        status::watch(&leader, &token);
         let client = router(
             Arc::clone(&leader),
             Arc::clone(&jobs),
@@ -750,18 +710,9 @@ impl Node {
             video_body_limit(&config.media_config, &config.server_config),
             Arc::clone(&self.handoff),
         );
-        let state = AdminState {
-            leader: Arc::clone(&leader),
-            admin: Arc::clone(&admin),
-            jobs: Arc::clone(&jobs),
-            restarter: Some(Arc::clone(&restarter)),
-        };
         self.set(Serving::Deployment(Arc::new(Routes {
             client: client.clone(),
-            admin: super::admin::router(state.clone()),
-            harness: super::admin::harness_router(state),
             leader: Arc::clone(&leader),
-            deployment: Arc::clone(&admin),
             jobs: Arc::clone(&jobs),
             restarter: Arc::clone(&restarter),
             programs: Arc::clone(&programs),
@@ -769,11 +720,10 @@ impl Node {
         {
             let mut ready = service::lock(&self.ready);
             ready.add_storage(&self.deployment);
-            admin.set_readiness(ready.record(service::State::Serving));
             ready.report(service::State::Serving);
         }
         info!(deployment = name, "the node serves the deployment");
-        admin.record(format!("serving {name}"));
+        status::node(&self.recorder, NodeState::Serving, &name, None);
         adopt_streams(
             adopted,
             &super::conn::Server {
@@ -797,7 +747,8 @@ impl Node {
             jobs.wait().await;
         } else {
             // New requests find no deployment; the requests in flight end within the budget.
-            self.set(Serving::Stopping(name.clone()));
+            self.set(Serving::Stopping);
+            status::node(&self.recorder, NodeState::Stopping, &name, None);
             let drained =
                 tokio::time::timeout(config.server_config.shutdown_timeout, leader.drained()).await;
             if drained.is_err() {
@@ -817,23 +768,20 @@ impl Node {
             let _ = decided.wait_for(Option::is_some).await;
         }
         let handed_over = restarter.handoff_sent.load(Ordering::Acquire);
-        let ended = finish(&self.deployment, &leader, daemon, retire, handed_over).await;
+        let ended = finish(&self.deployment, &leader, daemon, handed_over).await;
         // The programs end with their states saved, which a successor's or the next start's
         // instances restore.
         programs.stop().await;
         match &ended {
-            // A successor's journal records what the deployment does from now on.
+            // A successor's store records what the deployment does from now on.
             Ok(()) if handed_over => {}
-            Ok(()) => self
-                .journal
-                .record(EventBody::Deployment, format!("{name} came down")),
-            Err(error) => {
-                *service::lock(&self.last_error) = Some(format!("{error:#}"));
-                self.journal.record(
-                    EventBody::Deployment,
-                    format!("{name} did not come down cleanly: {error:#}"),
-                );
-            }
+            Ok(()) => status::node(&self.recorder, NodeState::Idle, &name, None),
+            Err(error) => status::node(
+                &self.recorder,
+                NodeState::Idle,
+                &name,
+                Some(&format!("it did not come down cleanly: {error:#}")),
+            ),
         }
         self.set(Serving::Idle);
         info!(deployment = name, "the node serves no deployment");
@@ -926,23 +874,9 @@ impl Node {
         force: bool,
     ) -> Result<Record, Refused> {
         let began = Instant::now();
-        let operation = self
-            .journal
-            .begin(OperationKind::Config)
-            .map_err(|refusal| {
-                Refused::new(
-                    StatusCode::CONFLICT,
-                    match refusal {
-                        super::admin::Refusal::Running(other) => {
-                            format!("operation {} ({}) runs", other.id, other.kind)
-                        }
-                        super::admin::Refusal::HandedOver => {
-                            "the node was handed to a successor".to_owned()
-                        }
-                    },
-                )
-            })?;
-        let id = operation.id;
+        // The update a change starts is numbered by its revision, which its `log` events of
+        // source `update` are labelled by.
+        let id = number;
         let leader = &routes.leader;
         let mut phases = leader.updates.watch();
         // The deployment's Storage Servers take a change of their settings before the engines
@@ -981,7 +915,7 @@ impl Node {
             Err(error) => Err(crate::leader::UpdateError::Refused(error.to_string())),
         };
         let ended = match applied {
-            Ok(Applied::Unchanged | Applied::InPlace(_)) => Ok(true),
+            Ok(Applied::Unchanged | Applied::InPlace) => Ok(true),
             Ok(Applied::Update(_)) => {
                 // The update runs on by itself and commits at its trial's end, or rolls back.
                 loop {
@@ -1019,7 +953,6 @@ impl Node {
                         force,
                     }),
                     leader,
-                    &routes.deployment,
                     &routes.jobs,
                 )
                 .await
@@ -1077,13 +1010,6 @@ impl Node {
                 seconds,
             ),
         };
-        self.journal.end(
-            operation,
-            ended
-                .as_ref()
-                .map(drop)
-                .map_err(|refused| refused.message.clone()),
-        );
         recorded.map_err(Refused::state)?;
         match &ended {
             Ok(true) => {
@@ -1354,24 +1280,12 @@ impl Node {
         routes
     }
 
-    /// The admin socket `socket`: the node's status, event log and policy, and once the
-    /// deployment serves, its admin routes.
-    fn admin_routes(self: &Arc<Self>, socket: Socket) -> Router {
+    /// The admin socket's two endpoints: the deployment's policy, and its observation store.
+    /// Any other path is not found.
+    fn admin_routes(self: &Arc<Self>) -> Router {
         Router::new()
-            .route(
-                "/admin/status",
-                get(move |State(node), request| status(node, socket, request)),
-            )
-            .route(
-                "/admin/events",
-                get(move |State(node), request| events(node, socket, request)),
-            )
             .route("/admin/policy", get(get_policy).put(put_policy))
             .route("/admin/query", get(query).post(query))
-            .fallback(move |State(node): State<Arc<Node>>, request| async move {
-                let routes = node.routes().map(|routes| routes.admin(socket));
-                serve_routes(routes, request).await
-            })
             .with_state(Arc::clone(self))
     }
 }
@@ -1595,9 +1509,9 @@ fn adopt_streams(adopted: Vec<crate::restart::streams::Adopted>, server: &super:
 }
 
 /// Ends the serving of the deployment `deployment`: shuts its engines down, stops its daemon
-/// and, when `retire` was set, stops its Storage Server on this node, which releases its storage;
-/// or, when the deployment was handed to a hot restart's successor, lets go of the engines and
-/// leaves the service and the storage to the successor.
+/// and, when its configuration states `retire`, stops its Storage Server on this node, which
+/// releases its storage; or, when the deployment was handed to a hot restart's successor, lets
+/// go of the engines and leaves the service and the storage to the successor.
 ///
 /// # Errors
 ///
@@ -1606,7 +1520,6 @@ async fn finish(
     deployment: &str,
     leader: &Arc<Leader>,
     daemon: Arc<Mutex<Option<Daemon>>>,
-    retire: Arc<AtomicBool>,
     handed_over: bool,
 ) -> Result<()> {
     if handed_over {
@@ -1616,7 +1529,7 @@ async fn finish(
     let stopped = leader.shutdown().await;
     let daemon = service::lock(&daemon).take();
     let stopped = stopped.and(stop_daemon(daemon).await);
-    if retire.load(Ordering::Acquire) {
+    if leader.retires() {
         let deployment = deployment.to_owned();
         let retired = tokio::task::spawn_blocking(move || retire_deployment(&deployment))
             .await
@@ -1634,36 +1547,6 @@ async fn stop_daemon(daemon: Option<Daemon>) -> Result<()> {
     })
     .await
     .context("the daemon's stop did not complete")?
-}
-
-/// `GET /admin/status` on `socket`: the serving deployment's, or, while none serves, the node's
-/// own: idle with its last deployment's error, starting or stopping, beside the node's
-/// operations and the next event's sequence number.
-async fn status(node: Arc<Node>, socket: Socket, request: Request) -> Response {
-    let own = match &*service::lock(&node.serving) {
-        Serving::Deployment(routes) => Err(routes.admin(socket)),
-        Serving::Idle => Ok(NodeState::Idle {
-            last_error: service::lock(&node.last_error).clone(),
-        }),
-        Serving::Starting(name) => Ok(NodeState::Starting { name: name.clone() }),
-        Serving::Stopping(name) => Ok(NodeState::Stopping { name: name.clone() }),
-    };
-    match own {
-        Ok(state) => Json(node.journal.status(state)).into_response(),
-        Err(routes) => serve_routes(Some(routes), request).await,
-    }
-}
-
-/// `GET /admin/events` on `socket`: the serving deployment's, or, while none serves, the node's
-/// journal itself, which the deployments write.
-async fn events(node: Arc<Node>, socket: Socket, request: Request) -> Response {
-    if let Some(routes) = node.routes() {
-        return serve_routes(Some(routes.admin(socket)), request).await;
-    }
-    match Query::<EventsQuery>::try_from_uri(request.uri()) {
-        Ok(Query(query)) => super::admin::events(&node.journal, query).await,
-        Err(rejection) => rejection.into_response(),
-    }
 }
 
 /// The client API: the serving deployment's routes, or `503` while none serves.
@@ -1747,15 +1630,9 @@ mod tests {
         let listener = Listener::bind(&crate::config::AdminConfig::default())
             .await
             .unwrap();
-        let admins = super::super::admin::Listeners::bind(instance.path()).unwrap();
+        let admin = super::super::admin::Listener::bind(instance.path()).unwrap();
         let socket = instance.path().join("admin.sock");
         let shutdown = CancellationToken::new();
-        let retire = Arc::new(AtomicBool::new(false));
-        let admin = Admin::new(
-            shutdown.clone(),
-            Arc::clone(&retire),
-            Journal::new(config.admin_config.event_log),
-        );
         let jobs = Arc::new(VideoJobs::new(
             config.video_job_config.clone(),
             shutdown.child_token(),
@@ -1765,11 +1642,9 @@ mod tests {
             config: config.clone(),
             stated: package.stated.clone(),
             leader,
-            admin,
             jobs,
             adopted: Vec::new(),
             daemon: None,
-            retire,
             token: shutdown.clone(),
             then: None,
         };
@@ -1786,7 +1661,7 @@ mod tests {
         let node = tokio::spawn(run(
             start,
             listener,
-            admins,
+            admin,
             First::Serving(Box::new(brought)),
         ));
         let connect = || async {
@@ -1797,6 +1672,26 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         };
+
+        // The node's deployment serving is a `log` event of the node's, which the observation
+        // store answers once the deployment serves.
+        loop {
+            let (head, body) = exchange(
+                connect().await,
+                "GET /admin/query?q=SELECT%20fields%5B'state'%5D%20AS%20state%20FROM%20events%20\
+                 WHERE%20kind%20%3D%20'log'%20AND%20labels%5B'source'%5D%20%3D%20'node' \
+                 HTTP/1.1\r\nhost: node\r\nconnection: close\r\n\r\n",
+                b"",
+            )
+            .await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if rows == serde_json::json!([{ "state": "serving" }]) {
+                break;
+            }
+            assert_eq!(rows, serde_json::json!([]), "{rows}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         let (head, body) = exchange(
             connect().await,
@@ -1832,16 +1727,6 @@ mod tests {
 
         // The observation store answers SQL over its two tables, in a GET's query or a POST's
         // form; a statement that does not plan is refused.
-        let (head, body) = exchange(
-            connect().await,
-            "GET /admin/query?q=SELECT%20count(*)%20AS%20n%20FROM%20events HTTP/1.1\r\n\
-             host: node\r\nconnection: close\r\n\r\n",
-            b"",
-        )
-        .await;
-        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(rows[0]["n"], 0, "{rows}");
         let form = b"q=SELECT+name+FROM+stats";
         let (head, _) = exchange(
             connect().await,
@@ -1862,6 +1747,25 @@ mod tests {
         )
         .await;
         assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+
+        // The admin socket serves those two endpoints alone: the routes they replace are not
+        // found, the deployment serving or not.
+        for route in [
+            "GET /admin/status",
+            "GET /admin/events",
+            "POST /admin/pause_generation",
+            "POST /admin/restart",
+            "POST /admin/profile",
+            "GET /metrics",
+        ] {
+            let (head, _) = exchange(
+                connect().await,
+                &format!("{route} HTTP/1.1\r\nhost: node\r\nconnection: close\r\n\r\n"),
+                b"",
+            )
+            .await;
+            assert!(head.starts_with("HTTP/1.1 404"), "{route}: {head}");
+        }
 
         shutdown.cancel();
         let ended = node.await.unwrap().unwrap();

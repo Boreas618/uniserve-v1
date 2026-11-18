@@ -182,7 +182,7 @@ pub struct Daemon {
     /// themselves `Sync`.
     link: std::sync::Mutex<Option<processes::ProcessLink>>,
     /// The processes this node supervises, which the service keeps current:
-    /// the updater and `GET /admin/config` read them.
+    /// the updater and the deployment's status rows read them.
     table: Option<service::ProcessTable>,
     /// One token per thing the updater has to read, so the thread that
     /// advances the update waits instead of polling.

@@ -607,7 +607,7 @@ message Command {
     // A parked engine opens admission and serves. Acknowledged with
     // `Serving`.
     Promote promote = 6;
-    // Hold or release admissions, the `/admin/pause_generation` gate, without
+    // Hold or release admissions, the `paused` gate, without
     // ending any request.
     Pause pause = 7;
     // A serving engine gave device memory back on a host this engine has

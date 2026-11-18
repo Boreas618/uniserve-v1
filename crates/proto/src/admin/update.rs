@@ -1,5 +1,5 @@
-//! An update as the admin API reports it: its phase, its form, what its trial read and why it
-//! did not stand, and the update options it reports with it.
+//! An update as its `log` events of source `update` report it: its phase, its form, what its
+//! trial read and why it did not stand, and the update options it reports with it.
 
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// The phase as the status and the event log name it.
+    /// The phase as the update's `log` events name it.
     pub fn name(self) -> &'static str {
         match self {
             Self::Preparing => "preparing",
@@ -105,12 +105,12 @@ pub struct EpochSwitchReport {
     pub moved_to_host_bytes: u64,
 }
 
-/// An update as the operator reads it: `GET /admin/config`'s `update`, an apply's, commit's
-/// or rollback's answer, and the data of the event log's update events.
+/// An update as the operator reads it: the fields of its `log` events of source `update`, one
+/// for each phase it enters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateReport {
     pub change: ChangeForm,
-    /// The update's number: the admin operation that applied it.
+    /// The update's number: the revision of the change that started it.
     pub update: u64,
     pub phase: Phase,
     /// The epoch the update's side executes in.
@@ -209,8 +209,8 @@ pub struct Throttled {
 }
 
 /// The serving epoch's steps against their baseline while a successor
-/// prepares, as the daemon's control last read them, which `GET /admin/config`
-/// reports of the change in progress.
+/// prepares, as the daemon's control last read them, which the update's report states of the
+/// change in progress.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StepTime {
     /// The largest ratio of a scheduler's step time to its baseline of the
@@ -332,7 +332,7 @@ impl FailureKind {
         Self::Decision,
     ];
 
-    /// The stable short name the admin API and the event log state: one per kind, so a
+    /// The stable short name the update's `log` events state: one per kind, so a
     /// reader reads back the kind the daemon stated. An engine's own report of a process's
     /// exit is `process_exit_fault`, its daemon's observation of one `process_exit`.
     pub fn name(self) -> &'static str {

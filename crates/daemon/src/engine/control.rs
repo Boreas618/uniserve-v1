@@ -340,6 +340,11 @@ impl EngineControl {
         Ok((reader, writer))
     }
 
+    /// The deployment the engines serve, which names its storage at the Storage Servers.
+    pub(crate) fn deployment(&self) -> &str {
+        &self.deployment
+    }
+
     /// The request socket's address, which an engine attaches to
     /// (`EngineClient::attach`).
     /// The host this control's engines run on.

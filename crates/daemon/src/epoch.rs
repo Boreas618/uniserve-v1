@@ -80,8 +80,8 @@ impl Recorded {
 }
 
 /// The epochs a deployment's daemon keeps and the processes it manages on
-/// its node: the state `GET /admin/config` reports and a change is routed
-/// by.
+/// its node: the state its sampled gauges (`uniserve_epoch_state`) and `process` events
+/// report and a change is routed by.
 #[derive(Debug, Default)]
 pub struct Epochs {
     records: Mutex<BTreeMap<u64, EpochRecord>>,
@@ -251,7 +251,7 @@ impl Epochs {
         service::lock(&self.processes).clone()
     }
 
-    /// Every epoch's record as `GET /admin/config` reports it (`epochs`), ascending by number.
+    /// Every epoch's record, ascending by number, whose state `uniserve_epoch_state` samples.
     pub fn statuses(&self) -> Vec<EpochStatus> {
         service::lock(&self.records)
             .iter()

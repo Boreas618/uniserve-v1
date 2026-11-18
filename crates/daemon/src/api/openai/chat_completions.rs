@@ -83,7 +83,7 @@ async fn chat_completions(
     // then computes with and its response names.
     let adapter = served.leader.adapter(&body.model);
     if adapter.is_none()
-        && let Err(error) = check_model_served(&body.model, served.leader.served_model_name())
+        && let Err(error) = check_model_served(&body.model, &served.leader.served_model_name())
     {
         return error.into_response();
     }

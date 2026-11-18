@@ -23,45 +23,18 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use proto::admin::{
-    ConfigStatus, Executing, ExecutingState, Gpu, GpuShare, GpuUuid, InFlight, InPlaceChange,
-    NodeUsage, Quotas, ReplicaStatus, Switched,
-};
+use proto::admin::InFlight;
 use proto::config::EngineConfig;
 use proto::reload::{Effect, Effects, Reload as _};
 use tracing::info;
 
 use crate::config::{Config, Stated};
-use crate::engine::client::EngineState;
-use crate::engine::hold::HoldState;
 use crate::epoch::{Change, Epoch};
 use crate::leader::{Leader, Replica, UpdateError};
 use crate::updates::change::Applied;
 use crate::updates::update::{EpochSwitch, Node, Update};
-
-/// The GPUs the deployment's epochs hold storage on, from every node's storage report.
-fn deployment_gpus(nodes: &[NodeUsage]) -> Vec<GpuShare> {
-    nodes
-        .iter()
-        .flat_map(|node| {
-            node.quotas
-                .iter()
-                .filter(|quota| quota.deployment.is_some())
-                .map(|quota| GpuShare {
-                    gpu: Gpu {
-                        host: node.host.clone(),
-                        gpu: GpuUuid(quota.gpu),
-                    },
-                    total: quota.total,
-                    quota: quota.limit,
-                    used: quota.usage(),
-                })
-        })
-        .collect()
-}
 
 /// The options the workers switch in place, at the engine's next step boundary: the fence
 /// probes' switch and the classes whose probes stay off. Every other profiling option shapes the
@@ -71,12 +44,34 @@ const FENCE_SWITCHES: [&str; 2] = [
     "profiling_config.fence_probes_off",
 ];
 
-/// Whether `changes` are the fence probes' switches alone.
-fn switches_probes_only(changes: &[proto::reload::Change]) -> bool {
-    !changes.is_empty()
-        && changes
-            .iter()
-            .all(|change| FENCE_SWITCHES.contains(&change.path.as_str()))
+/// The options that take effect at a step which the daemon applies itself, rather than the
+/// schedulers reading them from their next step's snapshot: the deployment's name, admission and
+/// sleep, its prefix cache's flush, its adapters, its profiling session, and what it does to its
+/// storage when it comes down.
+const DAEMON_STEPS: [&str; 7] = [
+    "served_model_name",
+    "paused",
+    "asleep",
+    "flush",
+    "retire",
+    "adapters",
+    "profiling_config.session",
+];
+
+/// Whether `changes` switch the fence probes.
+fn switches_probes(changes: &[proto::reload::Change]) -> bool {
+    changes
+        .iter()
+        .any(|change| FENCE_SWITCHES.contains(&change.path.as_str()))
+}
+
+/// Whether `changes` move a step value the schedulers read from their next step's snapshot.
+fn tunes(changes: &[proto::reload::Change]) -> bool {
+    changes.iter().any(|change| {
+        change.effect == Effect::Step
+            && !FENCE_SWITCHES.contains(&change.path.as_str())
+            && !DAEMON_STEPS.contains(&change.path.as_str())
+    })
 }
 
 /// Keeps an existing replica's assigned devices when an update changes its
@@ -104,8 +99,8 @@ impl Leader {
     /// engines' policy; a change of the others' alone moves no engine.
     ///
     /// An update it starts runs on after this returns: its phases end on the engines'
-    /// acknowledgements, it commits by itself at its trial's end, and `GET /admin/status` and
-    /// the events report it.
+    /// acknowledgements, it commits by itself at its trial's end, and its `log` events of
+    /// source `update` report each phase it enters.
     ///
     /// # Errors
     ///
@@ -131,13 +126,6 @@ impl Leader {
             return Err(UpdateError::InProgress);
         }
         let current = service::lock(&replicas[0].config).clone();
-        if target.served_model_name() != current.served_model_name() {
-            return Err(UpdateError::Refused(
-                "the served model name names the deployment's storage: serve another package \
-                 instead"
-                    .into(),
-            ));
-        }
         // The one selection of an apply: every interface's revision is fixed at the Build
         // Servers before anything is compared, so a revision installed since the serving epoch
         // was applied is a change. The daemon's own options change first, by a hot restart whose
@@ -202,25 +190,35 @@ impl Leader {
     }
 
     /// The per-replica path of a change that starts no update: the daemon's own options (a
-    /// hot restart), the options the engines take at their next step, or nothing.
+    /// hot restart), the options the replicas take in place, or nothing. The deployment's own
+    /// in-place options follow once every replica took its own: its served name, which every
+    /// replica's requests are named by, and its adapters, which every replica's workers hold in
+    /// one slot each.
     async fn apply_in_place(
         &self,
         target: Config,
         stated: Stated,
         revision: u64,
     ) -> Result<Applied, UpdateError> {
-        let mut changed = Vec::new();
+        let current = service::lock(&self.replicas()[0].config).clone();
+        let mut changed = false;
         for replica in self.replicas() {
             match Box::pin(replica.apply(target.clone(), stated.clone(), revision)).await? {
                 applied @ (Applied::Daemon { .. } | Applied::Update(_)) => return Ok(applied),
-                Applied::InPlace(changes) => changed.extend(changes),
+                Applied::InPlace => changed = true,
                 Applied::Unchanged => {}
             }
         }
-        Ok(if changed.is_empty() {
-            Applied::Unchanged
+        if target.served_model_name() != current.served_model_name() {
+            self.rename(target.served_model_name());
+        }
+        if target.adapters != current.adapters {
+            self.hold_adapters(&target.adapters).await?;
+        }
+        Ok(if changed {
+            Applied::InPlace
         } else {
-            Applied::InPlace(changed)
+            Applied::Unchanged
         })
     }
 
@@ -538,6 +536,37 @@ impl Leader {
         Ok(Applied::Update(Box::new(report)))
     }
 
+    /// Takes at a start what of `config` the daemon executes itself rather than the engines'
+    /// launch: a start is a change from nothing, so the deployment comes up holding new requests
+    /// (`paused`), with its adapters (`adapters`) and profiling session
+    /// (`profiling_config.session`), and asleep (`asleep`) last, as a change to `config` would
+    /// leave it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Replica::take`] and [`Leader::hold_adapters`].
+    pub(crate) async fn take_start(&self, config: &Config) -> Result<(), UpdateError> {
+        for replica in self.replicas() {
+            if config.paused {
+                replica.pause();
+            }
+            if let Some(session) = &config.profiling_config.session {
+                let client = replica.hold().client().ok_or(UpdateError::NoEngine)?;
+                replica.profile(&client, Some(session.clone())).await?;
+            }
+        }
+        if !config.adapters.is_empty() {
+            self.hold_adapters(&config.adapters).await?;
+        }
+        if config.asleep {
+            for replica in self.replicas() {
+                let client = replica.hold().client().ok_or(UpdateError::NoEngine)?;
+                replica.sleep(&client).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Ends every replica's running profiling session, because its epoch stops executing.
     async fn end_profiles(&self, reason: &str) {
         for replica in self.replicas() {
@@ -545,131 +574,20 @@ impl Leader {
             crate::profiling::end_for_epoch(&replica, client.as_deref(), reason).await;
         }
     }
-
-    /// Reports the configuration and resource ownership of the replicas.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a replica's configuration cannot be printed.
-    pub(crate) async fn config_status(&self) -> anyhow::Result<ConfigStatus> {
-        let replicas = self.replicas();
-        let client = replicas
-            .iter()
-            .filter_map(|replica| replica.hold().client())
-            .find(|client| matches!(client.state(), EngineState::Serving | EngineState::Parked));
-        // Each node's daemon reads its quotas over its claim.
-        let control = replicas
-            .iter()
-            .find_map(|replica| replica.control.get().cloned());
-        let quotas = match (client, control) {
-            (Some(_), Some(control)) => {
-                let read = async {
-                    tokio::task::spawn_blocking(move || control.storage_reports())
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .map_err(|error| format!("{error:#}"))
-                };
-                // Each node's daemon answers within the process interface's own bound.
-                Some(match read.await {
-                    Ok(nodes) => Quotas::Read(nodes),
-                    Err(error) => Quotas::Unread { error },
-                })
-            }
-            _ => None,
-        };
-        // The bytes a change in progress moved: what every node's Transfer
-        // Server copied for the deployment since it began, read with the
-        // quotas. One change runs at a time, so every transfer since is
-        // the change's.
-        let replicas = replicas
-            .into_iter()
-            .map(|replica| replica.config_status())
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let gpus = match &quotas {
-            Some(Quotas::Read(nodes)) => Some(deployment_gpus(nodes)),
-            Some(Quotas::Unread { .. }) | None => None,
-        };
-        Ok(ConfigStatus {
-            first: replicas.first().cloned(),
-            replicas,
-            gpus,
-            quotas,
-            // The update in flight, or the one that ended last, with its trial.
-            update: self.updates.status(),
-            unavailable: self.updates.unavailable_marks(),
-            // The epochs and the processes this daemon manages sit beside the configuration:
-            // `EpochRecord`s are the daemon's record of what it executes, not the engine's
-            // (`crate::epoch`).
-            epochs: self.updates.epochs().statuses(),
-            processes: self.updates.epochs().processes(),
-        })
-    }
 }
 
 impl Replica {
-    /// Reports what the replica executes and what its configuration is: the
-    /// engine that takes requests with its state, and the digest of the
-    /// configuration.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the configuration cannot be printed.
-    pub(crate) fn config_status(&self) -> anyhow::Result<ReplicaStatus> {
-        let config = service::lock(&self.config).clone();
-        let printed = crate::config::printed(&config)?;
-        let digest = crate::updates::digest_of(&printed);
-        let hold = self.hold();
-        let slot = |epoch: u64, state: ExecutingState| Executing {
-            epoch,
-            state,
-            reason: None,
-        };
-        let unavailable = |epoch: u64, reason: &str| Executing {
-            epoch,
-            state: ExecutingState::Unavailable,
-            reason: Some(reason.to_owned()),
-        };
-        // The epoch a replica without an engine last executed is the one its
-        // served arguments name.
-        let served_epoch = service::lock(&self.served)
-            .as_ref()
-            .map_or(0, |args| args.epoch);
-        let executing = match hold.client() {
-            Some(client) => {
-                let epoch = client.epoch();
-                match client.state() {
-                    EngineState::Starting => slot(epoch, ExecutingState::Starting),
-                    EngineState::Parked => slot(epoch, ExecutingState::Parked),
-                    EngineState::Serving => slot(epoch, ExecutingState::Serving),
-                    EngineState::Draining => slot(epoch, ExecutingState::Draining),
-                    EngineState::Failed(reason) => unavailable(epoch, &reason),
-                    EngineState::Stopped => unavailable(epoch, "its engine process ended"),
-                }
-            }
-            // A hold that closed names why it closed, and it names it to the
-            // requests it fails: the status states the same reason rather
-            // than that requests merely wait for an engine that will not come.
-            None => match hold.state() {
-                HoldState::Closed(reason) => unavailable(served_epoch, &reason),
-                _ => unavailable(served_epoch, "requests wait for its engine"),
-            },
-        };
-        Ok(ReplicaStatus {
-            config: printed,
-            digest,
-            executing,
-        })
-    }
-
     /// Applies what of `target` no update moves: nothing for the current configuration; the
-    /// daemon's own options, by a hot restart; the fence probes' switch, which the workers make
-    /// at their next step; and the record of the other options that take effect at a step, which
-    /// the engines' scheduling module received with its generation.
+    /// daemon's own options, by a hot restart; and, in place, the replica's step and order
+    /// options: its admission (`paused`) and sleep (`asleep`), the fence probes' switch, the
+    /// experts' order, the prefix cache's flush, the profiling session, and the step values the
+    /// schedulers read from their next step's snapshot. An engine that wakes does so before
+    /// anything else of the change reaches it, and one that falls asleep does so last.
     ///
     /// # Errors
     ///
-    /// Refuses another change in progress (`409`), and a target whose model files process
-    /// requests otherwise than the served ones.
+    /// Refuses another change in progress (`409`) and a change no in-place effect moves; fails
+    /// with the reason the engine did not take a change.
     pub(crate) async fn apply(
         self: &Arc<Self>,
         target: Config,
@@ -680,11 +598,6 @@ impl Replica {
             .replacing
             .try_lock()
             .map_err(|_| UpdateError::InProgress)?;
-        if self.asleep.load(Ordering::Acquire) {
-            return Err(UpdateError::Refused(
-                "the engine sleeps: wake it (/admin/wake_up) before updating it".to_owned(),
-            ));
-        }
         let current = service::lock(&self.config).clone();
         // The programs are replaced by their hosts between two calls: the leader's by the node,
         // the scheduling program by a generation of its module, the KV program by the Storage
@@ -732,10 +645,66 @@ impl Replica {
         {
             retain_devices(&served.engine_config, &mut target_engine);
         }
+        self.take(
+            &current,
+            target,
+            &changes,
+            target_engine,
+            Some(served),
+            revision,
+        )
+        .await
+    }
+
+    /// Takes in place the changes `changes` of `current` that `target` makes, `target_engine`
+    /// being the engine configuration it resolves to and `served` the launch the serving engine
+    /// serves with: the replica's admission (`paused`) and sleep (`asleep`), the fence probes'
+    /// switch, the experts' order, the prefix cache's flush, the profiling session, and the step
+    /// values the schedulers read from their next step's snapshot. An engine that wakes does so
+    /// before anything else of the change reaches it, and one that falls asleep does so last.
+    /// The replica then serves `target`, and a relaunch or a standby starts from the launch with
+    /// `target_engine` of revision `revision`. The caller holds the replica while no engine
+    /// replaces it.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a change no in-place effect moves; fails when no engine serves, or with the
+    /// reason the engine did not take a change.
+    pub(crate) async fn take(
+        self: &Arc<Self>,
+        current: &Config,
+        target: Config,
+        changes: &[proto::reload::Change],
+        target_engine: EngineConfig,
+        served: Option<proto::config::EngineArgs>,
+        revision: u64,
+    ) -> Result<Applied, UpdateError> {
+        // Every change an update moves was decided before this path.
+        let unmoved: Vec<_> = changes
+            .iter()
+            .filter(|change| !matches!(change.effect, Effect::Step | Effect::Order))
+            .map(|change| change.path.as_str())
+            .collect();
+        if !unmoved.is_empty() {
+            return Err(UpdateError::Refused(format!(
+                "no form of update moves the change of {}",
+                unmoved.join(", ")
+            )));
+        }
         let running = self.hold().client().ok_or(UpdateError::NoEngine)?;
-        // The fence probes' switch changes in place: every worker writes its device switch at
-        // the engine's next step boundary, and the graphs that captured the probes stay.
-        let switched = if switches_probes_only(&changes) {
+        if current.asleep && !target.asleep {
+            self.wake(&running).await?;
+        }
+        if current.paused != target.paused {
+            if target.paused {
+                self.pause();
+            } else {
+                self.resume();
+            }
+        }
+        // The fence probes' switch: every worker writes its device switch at the engine's next
+        // step boundary, and the graphs that captured the probes stay.
+        if switches_probes(changes) {
             let enabled = target_engine.profiling.fence_probes;
             let off = target_engine.profiling.fence_probes_off.clone();
             running
@@ -749,10 +718,26 @@ impl Replica {
                 ?off,
                 "the workers switched the fence probes in place"
             );
-            Switched::FenceProbes
-        } else if changes.iter().all(|change| change.effect == Effect::Step) {
-            // The step values: every scheduler reads them from its next step on, and its
-            // batches name the revision they are of.
+        }
+        if current.moe_config.expert_order != target.moe_config.expert_order {
+            crate::experts::reorder(
+                self,
+                &running,
+                &current.moe_config.expert_order,
+                &target.moe_config.expert_order,
+            )
+            .await?;
+        }
+        if current.flush != target.flush {
+            self.flush_cache(&running);
+        }
+        if current.profiling_config.session != target.profiling_config.session {
+            self.profile(&running, target.profiling_config.session.clone())
+                .await?;
+        }
+        // The step values: every scheduler reads them from its next step on, and its batches
+        // name the revision they are of.
+        if tunes(changes) {
             let tuning = proto::config::Tuning::of(&target_engine, revision);
             running.tune(&tuning).await.map_err(|error| {
                 anyhow::anyhow!("the engine did not take the step values: {error}")
@@ -761,25 +746,18 @@ impl Replica {
                 revision,
                 "the schedulers take the step values at their next step"
             );
-            Switched::SchedulingLimits
-        } else {
-            // Every change an update moves was decided before this path.
-            let paths: Vec<_> = changes.iter().map(|change| change.path.as_str()).collect();
-            return Err(UpdateError::Refused(format!(
-                "no form of update moves the change of {}",
-                paths.join(", ")
-            )));
-        };
+        }
+        if !current.asleep && target.asleep {
+            self.sleep(&running).await?;
+        }
         // A relaunch and a standby start from what serves now, of this revision.
-        let mut args = served;
-        args.engine_config = target_engine;
-        args.revision = revision;
-        *service::lock(&self.served) = Some(args);
+        if let Some(mut args) = served {
+            args.engine_config = target_engine;
+            args.revision = revision;
+            *service::lock(&self.served) = Some(args);
+        }
         *service::lock(&self.config) = target;
-        Ok(Applied::InPlace(vec![InPlaceChange {
-            replica: self.ordinal,
-            switched,
-        }]))
+        Ok(Applied::InPlace)
     }
 }
 
@@ -798,22 +776,21 @@ mod tests {
         let served = profiled(proto::config::ProfilingConfig {
             fence_probes: true,
             fence_modules: Some(vec!["*.Transformer".to_owned()]),
-            fence_probes_off: Vec::new(),
-            graph_pc_sampling: false,
-            nvtx_ranges: false,
+            ..proto::config::ProfilingConfig::default()
         });
         let changed = |target: &Config| proto::reload::changes(Some(&served), target);
         let switched = profiled(proto::config::ProfilingConfig {
             fence_probes: false,
             ..served.profiling_config.clone()
         });
-        assert!(switches_probes_only(&changed(&switched)));
+        assert!(switches_probes(&changed(&switched)));
+        assert!(!tunes(&changed(&switched)));
         // A module's probes switch off in place too.
         let thinned = profiled(proto::config::ProfilingConfig {
             fence_probes_off: vec!["*.Attention".to_owned()],
             ..served.profiling_config.clone()
         });
-        assert!(switches_probes_only(&changed(&thinned)));
+        assert!(switches_probes(&changed(&thinned)));
         for epoch in [
             proto::config::ProfilingConfig {
                 graph_pc_sampling: true,
@@ -825,10 +802,55 @@ mod tests {
             },
         ] {
             let changes = changed(&profiled(epoch));
-            assert!(!switches_probes_only(&changes));
+            assert!(!switches_probes(&changes));
             assert_eq!(Effects::of(&changes).heaviest(), Some(Effect::Epoch));
         }
-        assert!(!switches_probes_only(&[]));
+        assert!(!switches_probes(&[]));
+    }
+
+    /// The options the daemon applies itself take effect at a step and send the schedulers no
+    /// step values; a scheduling limit does, and the experts' order is its own effect.
+    #[test]
+    fn the_daemons_own_step_options_send_no_step_values() {
+        let served = Config::default();
+        let changed = |change: &dyn Fn(&mut Config)| {
+            let mut target = served.clone();
+            change(&mut target);
+            proto::reload::changes(Some(&served), &target)
+        };
+        for daemon in [
+            changed(&|target| target.paused = true),
+            changed(&|target| target.asleep = true),
+            changed(&|target| target.flush = 1),
+            changed(&|target| target.retire = true),
+            changed(&|target| target.served_model_name = Some("renamed".to_owned())),
+            changed(&|target| {
+                target
+                    .adapters
+                    .insert("sql".to_owned(), "/adapters/sql".to_owned());
+            }),
+            changed(&|target| {
+                target.profiling_config.session = Some(proto::profile::SessionRequest::default());
+            }),
+        ] {
+            assert_eq!(
+                Effects::of(&daemon).heaviest(),
+                Some(Effect::Step),
+                "{daemon:?}"
+            );
+            assert!(!tunes(&daemon), "{daemon:?}");
+        }
+        let limits =
+            changed(&|target| target.max_num_batched_tokens = std::num::NonZeroUsize::new(4096));
+        assert!(tunes(&limits));
+        let order = changed(&|target| {
+            target
+                .moe_config
+                .expert_order
+                .insert("model.layers.0.mlp".to_owned(), vec![1, 0]);
+        });
+        assert_eq!(Effects::of(&order).heaviest(), Some(Effect::Order));
+        assert!(!tunes(&order));
     }
 
     /// The target's layout differs from the serving one's in its parallel
@@ -864,45 +886,5 @@ mod tests {
             target.cuda_graph.decode_batch_sizes =
                 Some(vec![std::num::NonZeroU32::new(2).unwrap()]);
         }));
-    }
-
-    /// The status names the epoch that executes; the engine reads no storage
-    /// quotas (each node's daemon reads them over its claim), so it reserves no
-    /// GPUs; and an epoch whose engine is gone is unavailable.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_status_reports_the_executing_engine_and_one_that_is_gone() {
-        let leader = crate::test_support::served_engine(crate::test_support::CHAT);
-        let replica = Arc::clone(&leader.replicas()[0]);
-        let client = replica.hold().client().expect("the replica serves");
-        let epoch = client.epoch();
-        // The replica serves the arguments its engine was launched with, as a deployment's
-        // start records them.
-        *service::lock(&replica.served) = Some(testkit::args(crate::test_support::SERVED_MODEL));
-
-        let status = leader.config_status().await.unwrap();
-        let executing = |status: &ConfigStatus| status.first.as_ref().unwrap().executing.clone();
-        assert_eq!(
-            executing(&status),
-            Executing {
-                epoch,
-                state: ExecutingState::Serving,
-                reason: None,
-            }
-        );
-        // The engine refuses the quota read, so the status states no GPUs.
-        assert_eq!(status.gpus, None);
-
-        // An epoch whose engine no longer serves is unavailable.
-        replica.hold().close("the engine process ended");
-        let status = leader.config_status().await.unwrap();
-        assert_eq!(
-            executing(&status),
-            Executing {
-                epoch,
-                state: ExecutingState::Unavailable,
-                reason: Some("the engine process ended".to_owned()),
-            }
-        );
-        client.shutdown();
     }
 }

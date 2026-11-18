@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use futures::StreamExt as _;
-use proto::admin::{DeploymentStatus, Phase, ServingState, UpdateStatus};
+use proto::admin::{Phase, ServingState};
 use proto::request::Request;
 use proto::request::wire;
 use tokio::sync::watch;
@@ -64,17 +64,16 @@ pub struct Leader {
     /// The model families the executable serves, which every preparation of an epoch resolves
     /// its checkpoint with.
     pub(crate) families: processing::Registry,
-    /// The single model name the API serves.
-    served_model_name: String,
-    /// The model the request and scheduler metrics are labelled with.
-    model_name: String,
+    /// The single model name the API serves, which a change of `served_model_name` renames from
+    /// the next request on.
+    served_model_name: std::sync::Mutex<Arc<str>>,
     processor: Arc<Processor>,
     /// Independent replica epochs behind the public request entry point.
     pub(crate) replicas: Arc<Replicas>,
     images: MediaConnector,
     /// The updater: the epoch records, the update in flight and the engine
-    /// processes it commands. It shares the records with the admin's
-    /// `GET /admin/config`.
+    /// processes it commands, whose states the deployment's status rows sample
+    /// (`crate::status`).
     pub(crate) updates: Arc<crate::updates::Updater>,
     /// Whether every request logs a summary line when it ends.
     log_requests: bool,
@@ -546,87 +545,22 @@ impl Leader {
         }
     }
 
-    /// The deployment's aggregate serving state.
-    pub fn status(&self) -> DeploymentStatus {
-        let replicas: Vec<ReplicaStatus> = self
-            .replicas()
-            .iter()
-            .map(|replica| replica.status())
-            .collect();
-        // The deployment serves while any replica does; otherwise its state is its first
-        // replica's, which the generation and the standby name as well.
-        let first = replicas.first();
-        let (engine, reason) = if replicas
-            .iter()
-            .any(|replica| replica.engine == ServingState::Serving)
-        {
-            (ServingState::Serving, None)
-        } else {
-            first.map_or((ServingState::Closed, None), |replica| {
-                (replica.engine, replica.reason.clone())
-            })
-        };
-        DeploymentStatus {
-            deployment: self.served_model_name.clone(),
-            model: self.model_name.clone(),
-            engine,
-            reason,
-            paused: replicas.iter().all(|replica| replica.paused),
-            asleep: replicas.iter().all(|replica| replica.asleep),
-            replacing: self.replicas.replacing.try_lock().is_err()
-                || replicas.iter().any(|replica| replica.replacing),
-            in_flight: replicas.iter().map(|replica| replica.in_flight).sum(),
-            held: self.replicas.held.load(Ordering::Relaxed),
-            generation: first.and_then(|replica| replica.generation),
-            standby: first
-                .map(|replica| replica.standby.clone())
-                .unwrap_or_default(),
-            update: self
-                .updates
-                .in_flight()
-                .map(|(number, phase)| UpdateStatus { number, phase }),
-        }
+    /// The new requests the daemon holds before a replica takes them: while generation is
+    /// paused, the engines sleep, or no engine is ready.
+    pub(crate) fn held(&self) -> usize {
+        self.replicas.held.load(Ordering::Relaxed)
     }
 
-    /// Holds new requests across all replicas.
-    pub fn pause(&self) -> bool {
+    /// Whether every replica holds new requests (`paused`, or an engine that sleeps).
+    pub(crate) fn paused(&self) -> bool {
         self.replicas()
             .iter()
-            .map(|replica| replica.pause())
-            .fold(true, |all, paused| all & paused)
+            .all(|replica| replica.hold().is_paused())
     }
 
-    /// Lets new requests reach every ready replica.
-    pub fn resume(&self) {
-        for replica in self.replicas() {
-            replica.resume();
-        }
-    }
-
-    /// Has every replica's engine sleep ([`Replica::sleep`]).
-    ///
-    /// # Errors
-    ///
-    /// The first replica's failure.
-    pub async fn sleep(&self) -> Result<(), UpdateError> {
-        let _replacing = self.replicas.replacing.lock().await;
-        for replica in self.replicas() {
-            replica.sleep().await?;
-        }
-        Ok(())
-    }
-
-    /// Has every replica's engine wake ([`Replica::wake`]).
-    ///
-    /// # Errors
-    ///
-    /// The first replica's failure.
-    pub async fn wake(&self) -> Result<(), UpdateError> {
-        let _replacing = self.replicas.replacing.lock().await;
-        for replica in self.replicas() {
-            replica.wake().await?;
-        }
-        Ok(())
+    /// Whether the deployment's storage is released once it comes down (`retire`).
+    pub(crate) fn retires(&self) -> bool {
+        service::lock(&self.replicas()[0].config).retire
     }
 
     /// The LoRA adapter named `name` the workers hold, which a request
@@ -648,38 +582,25 @@ impl Leader {
             .collect()
     }
 
-    /// Loads the LoRA adapter `body` names (`lora_name`, and its `lora_path`)
-    /// into a free slot, as vLLM's `load_lora_adapter` does: every rank
-    /// publishes its tensors at the Storage Server under the slot (`adapter`).
-    /// A new engine, after a hot update or a relaunch, loads it again before
-    /// it serves. What computes with an adapter is a kernel package, so a
-    /// request naming it is refused until one serves (`docs/admin.md`).
+    /// Makes the LoRA adapters every replica's workers hold `target`'s (`adapters`, name to
+    /// directory): an adapter `target` no longer states, or states with another directory, is
+    /// unloaded, requests naming it refused at once; one it states that is not held is loaded
+    /// into a free slot of the workers' adapter pool, every rank publishing its tensors at the
+    /// Storage Server under the slot, and requests naming it compute with it once every replica
+    /// loaded it. A new engine, after an update or a relaunch, loads them again before it serves.
+    /// What computes with an adapter is a kernel package, so a request naming one is refused
+    /// until one serves (`docs/admin.md`). The caller holds the deployment while no change
+    /// replaces its engines.
     ///
     /// # Errors
     ///
-    /// Refuses a body without a name, the served model's name and an
-    /// adapter loaded already; fails when no engine serves, or with the
-    /// reason a worker gave.
-    pub async fn load_adapter(
+    /// Fails when no engine serves, when every adapter slot is taken, or with the reason a
+    /// worker gave; an adapter that did not load is not held, and one that did not unload stays
+    /// unavailable to requests.
+    pub(crate) async fn hold_adapters(
         &self,
-        body: serde_json::Value,
-    ) -> Result<Vec<serde_json::Value>, UpdateError> {
-        let name = body["lora_name"]
-            .as_str()
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| UpdateError::Refused("load_lora_adapter names no lora_name".to_owned()))?
-            .to_owned();
-        let path = body["lora_path"]
-            .as_str()
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| UpdateError::Refused("load_lora_adapter names no lora_path".to_owned()))?
-            .to_owned();
-        if name == self.served_model_name {
-            return Err(UpdateError::Refused(format!(
-                "{name} is the served model's name"
-            )));
-        }
-        let _deployment = self.replicas.replacing.lock().await;
+        target: &BTreeMap<String, String>,
+    ) -> Result<(), UpdateError> {
         let replicas = self.replicas();
         let mut owners = Vec::with_capacity(replicas.len());
         let mut clients = Vec::with_capacity(replicas.len());
@@ -687,91 +608,72 @@ impl Leader {
             owners.push(Arc::clone(&replica.replacing).lock_owned().await);
             clients.push(replica.hold.client().ok_or(UpdateError::NoEngine)?);
         }
-        let slot = {
-            let adapters = service::lock(&self.replicas.adapters);
-            if adapters.contains_key(&name) {
-                return Err(UpdateError::Refused(format!(
-                    "the adapter {name} is loaded already"
+        let held: Vec<(String, Adapter)> = service::lock(&self.replicas.adapters)
+            .iter()
+            .map(|(name, adapter)| (name.clone(), adapter.clone()))
+            .collect();
+        for (name, adapter) in held {
+            if target.get(&name) == Some(&adapter.path) {
+                continue;
+            }
+            // Requests stop naming it before its slot is released.
+            service::lock(&self.replicas.adapters).remove(&name);
+            let mut failures = Vec::new();
+            for client in &clients {
+                if let Err(error) = client.unload_adapter(adapter.slot).await {
+                    failures.push(error);
+                }
+            }
+            if !failures.is_empty() {
+                return Err(UpdateError::Failed(anyhow::anyhow!(
+                    "unloading the adapter {name}: {}",
+                    failures.join("; ")
                 )));
             }
-            // Slot 0 is the base model's; a request names its adapter's slot.
-            (1..=u32::MAX)
-                .find(|slot| adapters.values().all(|adapter| adapter.slot != *slot))
-                .ok_or_else(|| {
-                    UpdateError::Refused("every adapter slot of the workers is taken".to_owned())
-                })?
-        };
-        let mut results = Vec::new();
-        for client in &clients {
-            match client.load_adapter(slot, &path).await {
-                Ok(loaded) => results.extend(loaded.iter().map(adapter_report)),
-                Err(error) => {
-                    // The name becomes public only after every replica loads.
-                    // Release any partial loads before returning the failure.
+            info!(adapter = name, slot = adapter.slot, "unloaded the adapter");
+        }
+        for (name, path) in target {
+            if service::lock(&self.replicas.adapters).contains_key(name) {
+                continue;
+            }
+            let slot = {
+                let adapters = service::lock(&self.replicas.adapters);
+                // Slot 0 is the base model's; a request names its adapter's slot.
+                (1..=u32::MAX)
+                    .find(|slot| adapters.values().all(|adapter| adapter.slot != *slot))
+                    .ok_or_else(|| {
+                        UpdateError::Refused(
+                            "every adapter slot of the workers is taken".to_owned(),
+                        )
+                    })?
+            };
+            for client in &clients {
+                if let Err(error) = client.load_adapter(slot, path).await {
+                    // The name becomes public only after every replica loads: the partial loads
+                    // are released before the failure returns.
                     for client in &clients {
                         if let Err(cleanup) = client.unload_adapter(slot).await {
                             warn!(%cleanup, adapter = name, "could not release a partial adapter load");
                         }
                     }
                     return Err(UpdateError::Failed(anyhow::anyhow!(
-                        "load_lora_adapter: {error}"
+                        "loading the adapter {name}: {error}"
                     )));
                 }
             }
+            let identity = format!("{name}#{}", uuid::Uuid::new_v4().simple());
+            service::lock(&self.replicas.adapters).insert(
+                name.clone(),
+                Adapter {
+                    slot,
+                    identity,
+                    path: path.clone(),
+                },
+            );
+            info!(adapter = name, slot, "loaded the adapter");
         }
-        let identity = format!("{name}#{}", uuid::Uuid::new_v4().simple());
-        service::lock(&self.replicas.adapters).insert(
-            name.clone(),
-            Adapter {
-                slot,
-                identity,
-                path,
-            },
-        );
-        info!(adapter = name, slot, "loaded the adapter");
-        Ok(results)
-    }
-
-    /// Unloads the LoRA adapter `body` names (`lora_name`): requests stop
-    /// naming it at once, and every rank releases the adapter's slot.
-    ///
-    /// # Errors
-    ///
-    /// Refuses a name no loaded adapter has; fails when no engine serves, or
-    /// with the reason a worker gave, after which the adapter remains unavailable to requests.
-    pub async fn unload_adapter(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<Vec<serde_json::Value>, UpdateError> {
-        let name = body["lora_name"].as_str().unwrap_or_default().to_owned();
-        let _deployment = self.replicas.replacing.lock().await;
-        let replicas = self.replicas();
-        let mut owners = Vec::with_capacity(replicas.len());
-        let mut clients = Vec::with_capacity(replicas.len());
-        for replica in &replicas {
-            owners.push(Arc::clone(&replica.replacing).lock_owned().await);
-            clients.push(replica.hold.client().ok_or(UpdateError::NoEngine)?);
-        }
-        let adapter = service::lock(&self.replicas.adapters)
-            .remove(&name)
-            .ok_or_else(|| UpdateError::Refused(format!("no adapter {name:?} is loaded")))?;
-        let mut results = Vec::new();
-        let mut failures = Vec::new();
-        for client in clients {
-            match client.unload_adapter(adapter.slot).await {
-                Ok(unloaded) => results.extend(unloaded.iter().map(adapter_report)),
-                Err(error) => failures.push(error),
-            }
-        }
-        // A partially unloaded adapter must remain unavailable to requests.
-        if !failures.is_empty() {
-            return Err(UpdateError::Failed(anyhow::anyhow!(
-                "unload_lora_adapter: {}",
-                failures.join("; ")
-            )));
-        }
-        info!(adapter = name, slot = adapter.slot, "unloaded the adapter");
-        Ok(results)
+        drop(owners);
+        Ok(())
     }
 
     /// The settings of the deployment's Storage Servers as the serving configuration states
@@ -849,13 +751,6 @@ impl Leader {
         tokio::task::spawn_blocking(move || control.program_records())
             .await
             .context("reading the KV program's records did not complete")?
-    }
-
-    pub fn flush_cache(&self) -> Result<(), UpdateError> {
-        for replica in self.replicas() {
-            replica.flush_cache()?;
-        }
-        Ok(())
     }
 
     /// Loads the configured model and starts the engine process that serves
@@ -998,12 +893,12 @@ impl Leader {
 
         // The daemon's record of what executes: the epoch's build
         // configuration and the module set its launch files stated, which
-        // `GET /admin/config` reports and a later change is compared with.
+        // the status rows report and a later change is compared with.
         let deployment = crate::epoch::Epoch::with_modules(config.clone(), modules)?;
         leader.epochs().install(epoch, &deployment, &[]);
         // The process table names every engine this daemon manages, and the
         // serving one is the first: an update addresses the engine it drains
-        // by this launch generation, and `GET /admin/config` lists it.
+        // by this launch generation, and its `process` events name it.
         if let Some(engine) = leader
             .replicas
             .serving
@@ -1283,8 +1178,7 @@ impl Leader {
         }
         Ok(Self {
             families,
-            served_model_name,
-            model_name,
+            served_model_name: std::sync::Mutex::new(Arc::from(served_model_name)),
             processor: Arc::new(processor),
             replicas,
             images,
@@ -1312,8 +1206,15 @@ impl Leader {
     }
 
     /// The single model name the API serves.
-    pub fn served_model_name(&self) -> &str {
-        &self.served_model_name
+    pub fn served_model_name(&self) -> Arc<str> {
+        Arc::clone(&service::lock(&self.served_model_name))
+    }
+
+    /// Serves the API under `name` from the next request on: a request that names the former
+    /// name is refused, and the requests in flight under it end as they would have.
+    pub(crate) fn rename(&self, name: &str) {
+        let former = std::mem::replace(&mut *service::lock(&self.served_model_name), name.into());
+        info!(%former, name, "the deployment serves under its new name");
     }
 
     /// The video service of this deployment; `None` for a model that
@@ -1571,14 +1472,21 @@ pub(crate) struct EngineHandoff {
 
 /// What one replica serves, of which the deployment's status ([`DeploymentStatus`]) is made.
 pub(crate) struct ReplicaStatus {
-    engine: ServingState,
-    reason: Option<String>,
-    paused: bool,
-    asleep: bool,
-    replacing: bool,
-    in_flight: usize,
-    generation: Option<u64>,
-    standby: Vec<u64>,
+    /// The lifecycle state of the engine the replica's requests go to.
+    pub(crate) engine: ServingState,
+    /// Why the engine failed or no engine will serve.
+    pub(crate) reason: Option<String>,
+    /// The epoch the replica executes, or last executed while no engine serves it.
+    pub(crate) epoch: u64,
+    /// The requests the serving engine has in flight.
+    pub(crate) in_flight: usize,
+    /// The launch generation of the engine that serves (the scheduler node's, for a world
+    /// over several hosts); `None` while none serves, or for an engine this daemon did not
+    /// start.
+    pub(crate) generation: Option<u64>,
+    /// The launch generation of each member of the parked standby beside the serving engine, in
+    /// the world's order: the serving generation a promotion leaves is its first.
+    pub(crate) standby: Vec<u64>,
 }
 
 /// The changes of a deployment's serving state ([`Leader::status_changes`]): its set of
@@ -1659,7 +1567,7 @@ pub(crate) fn deployment(config: &Config) -> Result<crate::epoch::Epoch, UpdateE
 
 /// Why a change of the deployment did not happen or did not complete.
 #[derive(Debug, thiserror::Error)]
-pub enum UpdateError {
+pub(crate) enum UpdateError {
     /// Another change is in progress.
     #[error("a change of the deployment is in progress")]
     InProgress,
@@ -1864,7 +1772,6 @@ pub(crate) struct Replica {
     pub(crate) families: processing::Registry,
     pub(crate) registry: std::sync::Weak<Replicas>,
     pub(crate) ordinal: usize,
-    served_model_name: String,
     pub(crate) migrator: Migrator,
     /// The hold every request passes.
     pub(crate) hold: Arc<RequestHold>,
@@ -1942,7 +1849,6 @@ impl Replica {
             families,
             registry,
             ordinal,
-            served_model_name: options.served_model_name().to_owned(),
             migrator: Migrator::new(Arc::clone(&hold), options.migration_config.max_migrations),
             hold: Arc::clone(&hold),
             control: std::sync::OnceLock::new(),
@@ -2818,7 +2724,7 @@ impl Replica {
     ) -> BTreeMap<String, crate::standby::StandbyRoom> {
         let reading = Arc::clone(control);
         let reports = tokio::task::spawn_blocking(move || reading.storage_reports()).await;
-        let deployment = self.served_model_name.clone();
+        let deployment = control.deployment().to_owned();
         match reports {
             Ok(Ok(reports)) => crate::standby::rooms(&reports, &deployment),
             Ok(Err(error)) => {
@@ -3278,12 +3184,20 @@ impl Replica {
             HoldState::HandedOver => (ServingState::HandedOver, None),
             HoldState::Closed(reason) => (ServingState::Closed, Some(reason)),
         };
+        // The epoch a replica without an engine last executed is the one its served arguments
+        // name.
+        let epoch = hold.client().map_or_else(
+            || {
+                service::lock(&self.served)
+                    .as_ref()
+                    .map_or(0, |args| args.epoch)
+            },
+            |client| client.epoch(),
+        );
         ReplicaStatus {
             engine,
             reason,
-            paused: hold.is_paused(),
-            asleep: self.asleep.load(Ordering::Acquire),
-            replacing: self.replacing.try_lock().is_err(),
+            epoch,
             in_flight: hold.client().map_or(0, |client| client.in_flight()),
             generation: hold.client().and_then(|client| client.engine()),
             standby: service::lock(&self.standby)
@@ -3315,24 +3229,21 @@ impl Replica {
         info!("generation continues");
     }
 
-    /// Has the serving engine give back its KV cache and CUDA graph storage
-    /// and keep its weights, as vLLM's `sleep` does: new requests wait, the
-    /// token requests in flight, image-generating ones included, are
-    /// recomputed once it wakes, and the video requests in flight continue
-    /// from their stored step. Returns what each worker reported.
+    /// Has the serving engine `client` give back its KV cache and CUDA graph storage and keep
+    /// its weights, as vLLM's `sleep` does: new requests wait, the token requests in flight,
+    /// image-generating ones included, are recomputed once it wakes, and the video requests in
+    /// flight continue from their stored step (`asleep`). The caller holds the replica while no
+    /// engine replaces it.
     ///
     /// # Errors
     ///
-    /// Fails when no engine serves, or with the reason the engine did not
-    /// sleep; requests wait until a wake all the same.
-    pub(crate) async fn sleep(&self) -> Result<(), UpdateError> {
-        let _replacing = self.replacing.lock().await;
-        let hold = self.hold();
-        let client = hold.client().ok_or(UpdateError::NoEngine)?;
+    /// Fails with the reason the engine did not sleep; requests wait until it wakes all the
+    /// same.
+    pub(crate) async fn sleep(&self, client: &EngineClient) -> Result<(), UpdateError> {
         if self.asleep.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        if !hold.pause() {
+        if !self.hold().pause() {
             self.sleep_paused.store(true, Ordering::Release);
         }
         client
@@ -3340,24 +3251,20 @@ impl Replica {
             .await
             .map_err(|error| {
                 UpdateError::Failed(anyhow::anyhow!(
-                    "the engine did not sleep, and requests wait until /admin/wake_up: {error}"
+                    "the engine did not sleep, and requests wait until it wakes: {error}"
                 ))
             })?;
         info!("the engine sleeps: its KV cache and graph storage are given back");
         Ok(())
     }
 
-    /// Restores what [`Self::sleep`] gave back, and lets the requests it
-    /// held through. Returns what each worker reported.
+    /// Has the serving engine `client` restore what [`Self::sleep`] gave back, and lets the
+    /// requests it held through. The caller holds the replica while no engine replaces it.
     ///
     /// # Errors
     ///
-    /// Fails when no engine serves, or with the reason the engine did not
-    /// wake; requests keep waiting then.
-    pub(crate) async fn wake(&self) -> Result<(), UpdateError> {
-        let _replacing = self.replacing.lock().await;
-        let hold = self.hold();
-        let client = hold.client().ok_or(UpdateError::NoEngine)?;
+    /// Fails with the reason the engine did not wake; requests keep waiting then.
+    pub(crate) async fn wake(&self, client: &EngineClient) -> Result<(), UpdateError> {
         client
             .resize_cache(wire::CacheChange::Wake)
             .await
@@ -3366,45 +3273,17 @@ impl Replica {
             })?;
         self.asleep.store(false, Ordering::Release);
         if self.sleep_paused.swap(false, Ordering::AcqRel) {
-            hold.resume();
+            self.hold().resume();
         }
         info!("the engine woke");
         Ok(())
     }
 
-    /// Runs `operation`, `what` for its failure, on the serving engine's client while no engine
-    /// replaces it.
-    ///
-    /// # Errors
-    ///
-    /// Fails when no engine serves, or with the reason the engine gave.
-    pub(crate) async fn operate<T, F, Done>(
-        &self,
-        what: &str,
-        operation: F,
-    ) -> Result<T, UpdateError>
-    where
-        F: FnOnce(Arc<EngineClient>) -> Done,
-        Done: std::future::Future<Output = Result<T, String>>,
-    {
-        let _replacing = self.replacing.lock().await;
-        let client = self.hold().client().ok_or(UpdateError::NoEngine)?;
-        operation(client)
-            .await
-            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("{what}: {error}")))
-    }
-
-    /// Has the serving engine revoke every cached prefix page; the
-    /// requests in flight keep theirs.
-    ///
-    /// # Errors
-    ///
-    /// Fails when no engine serves.
-    pub(crate) fn flush_cache(&self) -> Result<(), UpdateError> {
-        let client = self.hold().client().ok_or(UpdateError::NoEngine)?;
+    /// Has the serving engine `client` revoke every cached prefix page; the requests in flight
+    /// keep theirs (`flush`).
+    pub(crate) fn flush_cache(&self, client: &EngineClient) {
         client.flush_cache();
         info!("flushed the prefix cache");
-        Ok(())
     }
 }
 
@@ -3419,15 +3298,6 @@ pub(crate) struct Adapter {
     pub(crate) identity: String,
     /// The adapter's directory (`lora_path`), from which a new engine's workers load it again.
     pub(crate) path: String,
-}
-
-/// One rank's report of an adapter's slot, as the admin API answers it: the slot, and the tensors
-/// a load mapped there.
-fn adapter_report(report: &wire::AdapterReport) -> serde_json::Value {
-    match report.tensors {
-        Some(tensors) => serde_json::json!({ "adapter": report.slot, "tensors": tensors }),
-        None => serde_json::json!({ "adapter": report.slot }),
-    }
 }
 
 /// Loads every adapter of `replica` into `client`'s workers, as an engine

@@ -70,45 +70,6 @@ pub(crate) fn router_with(engine: impl Into<Arc<Leader>>, server: &ServerConfig)
     )
 }
 
-/// The state of the admin routes over `engine`, with a new event log.
-fn admin_state(engine: impl Into<Arc<Leader>>) -> crate::http::admin::AdminState {
-    let leader = engine.into();
-    let admin = crate::http::admin::Admin::new(
-        CancellationToken::new(),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        crate::http::admin::Journal::new(crate::config::EventLog::default()),
-    );
-    admin.watch(&leader);
-    crate::http::admin::AdminState {
-        leader,
-        admin,
-        jobs: Arc::new(VideoJobs::new(
-            VideoJobConfig::default(),
-            CancellationToken::new(),
-        )),
-        restarter: None,
-    }
-}
-
-/// The operator's admin routes over `engine`, as the admin listener serves
-/// them.
-pub(crate) fn admin_router(engine: impl Into<Arc<Leader>>) -> Router {
-    crate::http::admin::router(admin_state(engine))
-}
-
-/// The client API and the operator's admin routes over one `engine`, for a
-/// test that needs both: a daemon serves them on two listeners.
-pub(crate) fn daemon_routers(engine: impl Into<Arc<Leader>>) -> Router {
-    let engine = engine.into();
-    router(Arc::clone(&engine)).merge(admin_router(engine))
-}
-
-/// The harness's admin routes over `engine`, as the harness listener serves
-/// them.
-pub(crate) fn harness_router(engine: impl Into<Arc<Leader>>) -> Router {
-    crate::http::admin::harness_router(admin_state(engine))
-}
-
 /// Builds an engine for a model of `family` over the default fake
 /// ([`text_fake`]) of one scheduler.
 ///

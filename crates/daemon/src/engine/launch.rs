@@ -88,25 +88,22 @@ mod tests {
     use crate::config::Config;
 
     /// The launch of a standby (engine 7) of epoch 12 beside the process of epoch 11 it succeeds,
-    /// with a rebalanced expert order.
+    /// with the expert order its configuration states.
     fn launch() -> EngineArgs {
-        use proto::request::wire::{ExpertOrder, Predecessor};
+        use proto::request::wire::Predecessor;
+        let mut engine_config = Config::default()
+            .engine_config()
+            .expect("the configuration resolves");
+        engine_config
+            .moe
+            .expert_order
+            .insert("model.layers.0.mlp".to_owned(), vec![1, 0]);
         EngineArgs {
-            engine_config: Config::default()
-                .engine_config()
-                .expect("the configuration resolves"),
+            engine_config,
             deployment: "model".to_owned(),
             epoch: 12,
             revision: 3,
             predecessor: Some(Predecessor { epoch: 11 }),
-            expert_order: [(
-                "model.layers.0.mlp".to_owned(),
-                ExpertOrder {
-                    experts: vec![1, 0],
-                },
-            )]
-            .into_iter()
-            .collect(),
             host: "rank-0".to_owned(),
             // The interfaces are data the engine reads; no socket is opened here.
             requests: "unix:requests.sock".to_owned(),
@@ -147,7 +144,6 @@ mod tests {
             "epoch",
             "revision",
             "predecessor",
-            "expert_order",
             "deployment",
             "host",
             "requests",
@@ -176,7 +172,7 @@ mod tests {
         assert_eq!(value["world_size"], json!(1));
         assert_eq!(value["predecessor"]["epoch"], json!(11));
         assert_eq!(
-            value["expert_order"]["model.layers.0.mlp"]["experts"],
+            value["engine_config"]["moe"]["expert_order"]["model.layers.0.mlp"],
             json!([1, 0])
         );
         assert!(value["engine_config"].is_object());

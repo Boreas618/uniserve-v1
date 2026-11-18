@@ -2,7 +2,8 @@
 //! deployment over while the daemon it replaces finishes the requests it took, as Envoy's hot
 //! restart does.
 //!
-//! `POST /admin/restart` starts the successor by re-executing the daemon's own image
+//! A change of the daemon's own options (`proto::reload::Effect::Daemon`) starts the successor
+//! by re-executing the daemon's own image
 //! (`/proc/self/exe serve --predecessor FD`), which inherits one end of a socket pair at the
 //! descriptor the argument names. They talk over it:
 //!
@@ -13,8 +14,8 @@
 //!    socket of its own, which it responds with (`Prepared`).
 //! 2. The daemon stops its service thread between two rounds and sends what
 //!    the thread served, its HTTP listener and the connection its engine's
-//!    process lives under, with the arguments the engine serves with, the node's journal
-//!    and the video jobs (`Takeover`), and commands the engine to attach to
+//!    process lives under, with the arguments the engine serves with and the video jobs
+//!    (`Takeover`), and commands the engine to attach to
 //!    the successor's request socket (`EngineCommand::Attach`).
 //! 3. The successor goes on with the service, adopts the engine once it
 //!    attaches, and accepts on the HTTP listener (`Serving`).
@@ -51,7 +52,6 @@ use tracing::{info, warn};
 use crate::api::openai::video_jobs::{VideoJob, VideoJobs};
 use crate::config::Stated;
 use crate::engine::control::EngineControl;
-use crate::http::admin::{Admin, Journal, JournalHandoff};
 use crate::http::listener::{Listener, ListenerHandoff};
 use crate::leader::{Leader, stats_sink};
 use crate::supervision::{Daemon, ServiceHandoff};
@@ -113,8 +113,7 @@ pub(crate) struct Then {
 /// The options a daemon serves with.
 #[derive(Debug, Serialize, Deserialize)]
 struct Prepare {
-    /// The configuration as TOML, as `GET /admin/config` prints
-    /// it.
+    /// The configuration as TOML, as the revision's `config.toml` prints it.
     config: String,
     stated: Vec<String>,
     /// The API key, which printing leaves out.
@@ -149,7 +148,6 @@ struct Takeover {
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
     service: ServiceHandoff,
     service_descriptors: usize,
-    journal: JournalHandoff,
     jobs: Vec<(VideoJob, Option<u64>)>,
     /// The change that restarted the daemon: the successor converges the rest of it.
     then: Option<Then>,
@@ -180,7 +178,7 @@ struct ReplicaHandoff {
     unavailable: Vec<proto::admin::Unavailable>,
 }
 
-/// What `POST /admin/restart` needs of the daemon it restarts.
+/// What a hot restart needs of the daemon it restarts.
 pub(crate) struct Restarter {
     /// The daemon's service, which `serve` stops once the restart handed it
     /// over.
@@ -273,11 +271,10 @@ impl Restarter {
         config: Option<crate::config::Config>,
         then: Option<Then>,
         leader: &Arc<Leader>,
-        admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
     ) -> anyhow::Result<u32> {
         self.in_flight.store(true, Ordering::Release);
-        let result = self.hand_over(config, then, leader, admin, jobs).await;
+        let result = self.hand_over(config, then, leader, jobs).await;
         // The restart is concluded however it ended: a daemon waiting to exit
         // stops waiting here, and a successor that adopted the deployment is the
         // only case in which this one may let go of it. The decision is stated
@@ -306,7 +303,6 @@ impl Restarter {
         config: Option<crate::config::Config>,
         then: Option<Then>,
         leader: &Arc<Leader>,
-        admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
     ) -> anyhow::Result<u32> {
         // No epoch change, rollback or relaunch replaces the engine meanwhile.
@@ -439,10 +435,9 @@ impl Restarter {
                     adapters: service::lock(&leader.replicas.adapters).clone(),
                     service,
                     service_descriptors: service_count,
-                    journal: admin.journal.hand_over(),
                     jobs: job_records,
                     then,
-                    admissions_paused: leader.status().paused,
+                    admissions_paused: leader.paused(),
                     modules: leader.epochs().serving().map(|(_, record)| {
                         proto::module::ModuleSet {
                             engine: record.engine,
@@ -793,7 +788,6 @@ async fn prepared_successor(
         adapters,
         service,
         service_descriptors,
-        journal,
         jobs,
         then,
         admissions_paused,
@@ -918,6 +912,9 @@ async fn prepared_successor(
     {
         let (record, process) = adopted_epoch(served_epoch, handoff.engine, &options, modules)?;
         epoch_records.record(served_epoch, record);
+        // The successor's observation store starts empty: the process it adopted is its first
+        // `process` event.
+        recorder.process(&options.leader_host(), &process);
         epoch_records.adopt_process(process);
     }
     if admissions_paused {
@@ -926,7 +923,9 @@ async fn prepared_successor(
         // `adopt_pause` already carried the per-replica state, and this is the
         // one place that states the deployment's), and the frontend's gate,
         // once a frontend process holds one, is closed at the same point.
-        leader.pause();
+        for replica in leader.replicas() {
+            replica.pause();
+        }
         info!("the successor continues gated: admissions stay closed across the handoff");
     }
     let first = Arc::clone(&leader.replicas()[0]);
@@ -959,28 +958,17 @@ async fn prepared_successor(
     }
 
     *service::lock(&leader.replicas.adapters) = adapters;
-    let retire = Arc::new(AtomicBool::new(false));
     // The deployment's end is its node's as the predecessor's node lived.
     let token = shutdown.clone();
-    // The node's journal goes on in the successor, which the adopted deployment writes.
-    let admin = Admin::new(
-        token.clone(),
-        Arc::clone(&retire),
-        Journal::resume(journal, config.admin_config.event_log),
-    );
-    admin.record(format!(
-        "serving {} after a hot restart",
-        leader.served_model_name()
-    ));
     // The handover completed: the predecessor's instance directory is this daemon's now, and
-    // its admin sockets are bound over in it.
+    // its admin socket is bound over in it.
     let instance = service::Instance::resume(prepare.instance.clone());
-    let admins = crate::http::admin::Listeners::bind(instance.path())?;
+    let admin = crate::http::admin::Listener::bind(instance.path())?;
     let mut ready = crate::http::Ready::new(None, instance.path());
     {
         let endpoints = ready.endpoints();
         endpoints.client = Some(listener.endpoint()?);
-        (endpoints.admin, endpoints.harness) = admins.endpoints();
+        endpoints.admin = Some(admin.endpoint());
     }
     let video_jobs = Arc::new(VideoJobs::new(
         config.video_job_config.clone(),
@@ -1106,18 +1094,16 @@ async fn prepared_successor(
         config,
         stated,
         leader,
-        admin,
         jobs: video_jobs,
         adopted,
         daemon: Some(daemon),
-        retire,
         token,
         then,
     };
     let ended = crate::http::node::run(
         start,
         listener,
-        admins,
+        admin,
         crate::http::node::First::Serving(Box::new(brought)),
     )
     .await;

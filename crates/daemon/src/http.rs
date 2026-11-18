@@ -1,10 +1,10 @@
 //! The HTTP server: router assembly, the listeners, and the node that serves them.
 //!
 //! [`serve`] creates this daemon's instance directory, binds every listener
-//! the node has (the leader's client API, admin sockets and join listener),
+//! the node has (the leader's client API, admin socket and join listener),
 //! reports them in its readiness record, and serves as the node (`node`): the
-//! deployment it was started for, or the deployments `PUT /admin/config` brings
-//! up. Each API module builds its own routes over the engine
+//! deployment of the package it was started with, changed by each
+//! `PUT /admin/policy`. Each API module builds its own routes over the engine
 //! (`crate::api::openai`); this module registers them by task, as vLLM registers
 //! its routers by `supported_tasks`, and wraps them in the middleware of
 //! `middleware`.
@@ -143,8 +143,8 @@ pub(crate) fn create_instance() -> Result<service::Instance> {
 /// is cancelled, or with its deployment.
 ///
 /// The node finds its place in the package's `hosts` by its host name. The leader first creates
-/// its instance directory and binds every listener it has: the client API, the two admin
-/// sockets and, for a deployment of several nodes, the join listener (`admin_config.join`). It
+/// its instance directory and binds every listener it has: the client API, the admin socket
+/// and, for a deployment of several nodes, the join listener (`admin_config.join`). It
 /// reports them in its readiness record (`ready`, [`service::State::Listening`]), so a caller
 /// learns the endpoints before the slow start, and then serves as its node ([`node::run`]): it
 /// applies the package as the deployment's start, from nothing or from the deployment's current
@@ -185,12 +185,12 @@ pub async fn serve(
     let listener = Listener::bind(&package.config.admin_config)
         .await
         .context("failed to bind the daemon's listener")?;
-    let admins = admin::Listeners::bind(instance.path())?;
+    let admin = admin::Listener::bind(instance.path())?;
     let join = identity.join.as_ref().map(Daemon::bind_join).transpose()?;
     {
         let endpoints = ready.endpoints();
         endpoints.client = Some(listener.endpoint()?);
-        (endpoints.admin, endpoints.harness) = admins.endpoints();
+        endpoints.admin = Some(admin.endpoint());
         endpoints.join = join.as_ref().map(|(_, endpoint)| endpoint.clone());
     }
     ready.report(service::State::Listening);
@@ -216,7 +216,7 @@ pub async fn serve(
         package: Box::new(package),
         join,
     };
-    node::run(start, listener, admins, first).await.map(drop)
+    node::run(start, listener, admin, first).await.map(drop)
 }
 
 /// Runs a node other than the leader: its daemon joins the leader's and supervises this node's
@@ -414,22 +414,12 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        SERVED_MODEL, admin_router, daemon_routers, engine_of, harness_router, post_json, router,
-        router_with, send, served_engine, text_fake,
+        SERVED_MODEL, engine_of, post_json, router, router_with, send, served_engine, text_fake,
     };
 
     /// A `GET` request to `path`.
     fn get_request(path: &str) -> Request<Body> {
         Request::builder().uri(path).body(Body::empty()).unwrap()
-    }
-
-    /// A `DELETE` request to `path`.
-    fn delete_request(path: &str) -> Request<Body> {
-        Request::builder()
-            .method("DELETE")
-            .uri(path)
-            .body(Body::empty())
-            .unwrap()
     }
 
     /// A chat completion of `tokens` tokens, streamed when `stream` is set.
@@ -444,30 +434,35 @@ mod tests {
         })
     }
 
-    /// The admin API reports the deployment, holds new requests while
-    /// generation is paused, and logs what it did.
+    /// Takes in place on `leader`'s first replica the change `change` makes to its
+    /// configuration, as an apply of a package that states it does once it found no update
+    /// moves it ([`crate::leader::Replica::take`]). The test engine serves no launch of its own,
+    /// so the change commits to none.
+    async fn take(
+        leader: &Leader,
+        change: impl FnOnce(&mut Config),
+    ) -> Result<(), crate::leader::UpdateError> {
+        let replica = Arc::clone(&leader.replicas()[0]);
+        let current = service::lock(&replica.config).clone();
+        let mut target = current.clone();
+        change(&mut target);
+        let changes = proto::reload::changes(Some(&current), &target);
+        let engine = Config::default()
+            .engine_config()
+            .expect("the configuration resolves");
+        Box::pin(replica.take(&current, target, &changes, engine, None, 2))
+            .await
+            .map(drop)
+    }
+
+    /// `paused` holds the new requests in the daemon from the change on, and the requests it
+    /// holds are served once a change clears it.
     #[tokio::test]
-    async fn the_admin_api_pauses_generation_and_logs_it() {
-        let app = daemon_routers(served_engine(crate::test_support::CHAT));
-        let (status, _, body) = send(&app, get_request("/admin/status")).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["deployment"]["deployment"], json!(SERVED_MODEL));
-        assert_eq!(body["deployment"]["engine"], json!("serving"));
-        assert_eq!(body["deployment"]["paused"], json!(false));
-        assert_eq!(body["deployment"]["held"], json!(0));
-        assert_eq!(body["deployment"]["standby"], json!([]));
-        assert_eq!(body["deployment"]["update"], json!(null));
+    async fn paused_holds_new_requests_until_a_change_clears_it() {
+        let leader = Arc::new(served_engine(crate::test_support::CHAT));
+        let app = router(Arc::clone(&leader));
+        take(&leader, |config| config.paused = true).await.unwrap();
 
-        let (status, _, body) = send(&app, post_json("/admin/pause_generation", &json!({}))).await;
-        assert_eq!(
-            (status, &body["state"]),
-            (StatusCode::OK, &json!("succeeded"))
-        );
-        let (_, _, body) = send(&app, get_request("/admin/status")).await;
-        assert_eq!(body["deployment"]["paused"], json!(true));
-
-        // A chat completion waits while generation is paused, and is served
-        // once it continues.
         let waiting = tokio::spawn({
             let app = app.clone();
             async move {
@@ -478,159 +473,35 @@ mod tests {
                 .await
             }
         });
-        // The status counts the request the daemon holds.
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let (_, _, body) = send(&app, get_request("/admin/status")).await;
-            if body["deployment"]["held"] == json!(1) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the held request is not reported: {body}"
-            );
+        while leader.held() != 1 {
+            assert!(Instant::now() < deadline, "the held request is not counted");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!waiting.is_finished(), "a paused deployment holds requests");
-        let (status, _, _) = send(&app, post_json("/admin/continue_generation", &json!({}))).await;
-        assert_eq!(status, StatusCode::OK);
+
+        take(&leader, |config| config.paused = false).await.unwrap();
         let (status, _, _) = waiting.await.unwrap();
         assert_eq!(status, StatusCode::OK);
-        let (_, _, body) = send(&app, get_request("/admin/status")).await;
-        assert_eq!(body["deployment"]["held"], json!(0));
+        assert_eq!(leader.held(), 0);
+    }
 
-        // Each operation started and succeeded in the log, and the leader's pause and
-        // continuation, which it publishes, follow each.
-        let (_, _, body) = send(&app, get_request("/admin/events?after=0")).await;
-        let messages: Vec<&str> = body["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|event| event["message"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            messages,
-            vec![
-                "pause_generation 1 started",
-                "pause_generation 1 succeeded",
-                "new requests wait",
-                "continue_generation 2 started",
-                "continue_generation 2 succeeded",
-                "new requests are served",
-            ]
-        );
-        // The status reports what the deployment executes: its first replica's configuration,
-        // and no update.
-        let (status, _, body) = send(&app, get_request("/admin/status")).await;
-        assert_eq!(status, StatusCode::OK);
+    /// `asleep` holds new requests from the change on; an engine that does not take the sleep
+    /// fails the change by name, and one that does not wake fails it the same way while the
+    /// requests keep waiting. The test engine takes neither: it holds no session with a Storage
+    /// Server whose KV cache segments a sleep gives back and a wake creates again.
+    #[tokio::test]
+    async fn asleep_holds_requests_and_an_engine_that_does_not_sleep_fails_by_name() {
+        let leader = Arc::new(served_engine(crate::test_support::CHAT));
+        let app = router(Arc::clone(&leader));
+        let error = take(&leader, |config| config.asleep = true)
+            .await
+            .unwrap_err();
         assert!(
-            body["report"]["config"]
-                .as_str()
-                .is_some_and(|config| !config.is_empty()),
-            "{body}"
+            format!("{:#}", anyhow::Error::from(error)).contains("the engine did not sleep"),
+            "the refusal names the sleep"
         );
-        assert!(body["report"]["update"].is_null());
-    }
-
-    /// A path of `method` and `uri` with an empty JSON body.
-    fn request(method: &str, uri: &str) -> Request<Body> {
-        Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
-            .unwrap()
-    }
-
-    /// The admin API is not served with the client API; the operator's
-    /// listener serves every admin route of the deployment, and the harness's
-    /// what a harness reads to decide a change, never the operator's
-    /// operations.
-    #[tokio::test]
-    async fn each_listener_serves_its_own_routes() {
-        let update_routes = [("GET", "/admin/status"), ("GET", "/admin/events")];
-        let operator_routes = [
-            ("POST", "/admin/pause_generation"),
-            ("POST", "/admin/continue_generation"),
-            ("POST", "/admin/flush_cache"),
-            ("POST", "/admin/shutdown"),
-            ("POST", "/admin/restart"),
-            ("POST", "/admin/rebalance_experts"),
-            ("POST", "/admin/sleep"),
-            ("POST", "/admin/wake_up"),
-            ("POST", "/admin/load_lora_adapter"),
-            ("POST", "/admin/unload_lora_adapter"),
-            ("GET", "/admin/profile"),
-        ];
-
-        // Whether a router serves a route: an unserved path is its 404, and
-        // an unserved method of a served path its 405.
-        async fn serves(app: &Router, method: &str, uri: &str) -> bool {
-            let response = app.clone().oneshot(request(method, uri)).await.unwrap();
-            !matches!(
-                response.status(),
-                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-            )
-        }
-
-        let client = router(served_engine(crate::test_support::CHAT));
-        let admin = admin_router(served_engine(crate::test_support::CHAT));
-        let harness = harness_router(served_engine(crate::test_support::CHAT));
-        for (method, uri) in update_routes {
-            assert!(
-                !serves(&client, method, uri).await,
-                "{method} {uri} on the client API"
-            );
-            assert!(
-                serves(&admin, method, uri).await,
-                "{method} {uri} on the admin listener"
-            );
-            assert!(
-                serves(&harness, method, uri).await,
-                "{method} {uri} on the harness listener"
-            );
-        }
-        for (method, uri) in operator_routes {
-            assert!(
-                !serves(&client, method, uri).await,
-                "{method} {uri} on the client API"
-            );
-            assert!(
-                serves(&admin, method, uri).await,
-                "{method} {uri} on the admin listener"
-            );
-            assert!(
-                !serves(&harness, method, uri).await,
-                "{method} {uri} on the harness listener"
-            );
-        }
-        // The client API is not an admin route of either listener.
-        assert!(!serves(&admin, "POST", "/v1/chat/completions").await);
-        assert!(!serves(&harness, "GET", "/v1/models").await);
-    }
-
-    /// A sleep the engine does not take fails by name, and the deployment
-    /// holds new requests from the sleep on, as it does while the engine
-    /// sleeps; a wake the engine does not take fails the same way, and the
-    /// requests keep waiting. The test engine takes neither: it holds no
-    /// session with a Storage Server whose KV cache segments a sleep gives
-    /// back and a wake creates again.
-    #[tokio::test]
-    async fn a_sleep_the_engine_does_not_take_fails_and_holds_requests() {
-        let app = daemon_routers(served_engine(crate::test_support::CHAT));
-        let (status, _, body) = send(&app, post_json("/admin/sleep", &json!({}))).await;
-        assert_eq!(
-            (status, &body["state"]),
-            (StatusCode::INTERNAL_SERVER_ERROR, &json!("failed")),
-            "{body}"
-        );
-        let error = body["error"].as_str().unwrap_or_default();
-        assert!(error.contains("the engine did not sleep"), "{body}");
-        let (_, _, body) = send(&app, get_request("/admin/status")).await;
-        assert_eq!(
-            (&body["deployment"]["asleep"], &body["deployment"]["paused"]),
-            (&json!(true), &json!(true))
-        );
+        assert!(leader.paused(), "a deployment put to sleep holds requests");
 
         let waiting = tokio::spawn({
             let app = app.clone();
@@ -647,14 +518,21 @@ mod tests {
             !waiting.is_finished(),
             "a deployment put to sleep holds requests"
         );
-        let (status, _, body) = send(&app, post_json("/admin/wake_up", &json!({}))).await;
-        assert_eq!(
-            (status, &body["state"]),
-            (StatusCode::INTERNAL_SERVER_ERROR, &json!("failed")),
-            "{body}"
+
+        // The failed change left the replica's configuration awake: a change that sleeps and a
+        // change that wakes again are both changes of it.
+        let replica = Arc::clone(&leader.replicas()[0]);
+        let current = service::lock(&replica.config).clone();
+        let mut asleep = current.clone();
+        asleep.asleep = true;
+        *service::lock(&replica.config) = asleep;
+        let error = take(&leader, |config| config.asleep = false)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{:#}", anyhow::Error::from(error)).contains("the engine did not wake"),
+            "the refusal names the wake"
         );
-        let error = body["error"].as_str().unwrap_or_default();
-        assert!(error.contains("the engine did not wake"), "{body}");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !waiting.is_finished(),
@@ -663,80 +541,113 @@ mod tests {
         waiting.abort();
     }
 
-    /// A profiling session runs on every worker until the operator ends it,
-    /// one at a time; its status reports each worker's collectors and, once
-    /// it ended, why and each worker's file. The test engine holds no rank:
-    /// no worker runs a collector or writes a file.
+    /// A change of `served_model_name` renames the API from the next request on: a request
+    /// naming the former name is refused as naming no model, and the models listed are the new
+    /// name's.
     #[tokio::test]
-    async fn a_profiling_session_runs_until_the_operator_ends_it() {
-        let app = daemon_routers(served_engine(crate::test_support::CHAT));
-        let (status, _, body) = send(&app, get_request("/admin/profile")).await;
-        assert_eq!((status, &body["session"]), (StatusCode::OK, &json!(null)));
+    async fn the_api_is_renamed_from_the_next_request_on() {
+        let leader = Arc::new(served_engine(crate::test_support::CHAT));
+        let app = router(Arc::clone(&leader));
+        leader.rename("renamed");
 
-        let output = tempfile::tempdir().expect("a profile directory");
-        let request = json!({
-            "collectors": ["timeline", "pm_sampling"],
-            "stages": ["decode"],
-            "output_dir": output.path(),
-        });
-        let (status, _, body) = send(&app, post_json("/admin/profile", &request)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let session = &body["result"];
-        assert_eq!(session["state"], json!("running"), "{body}");
-        assert_eq!(session["workers"], json!([]));
-        assert_eq!(session["collectors"], json!([]));
-
-        // One session at a time.
-        let (status, _, body) = send(&app, post_json("/admin/profile", &request)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        let (_, _, body) = send(&app, get_request("/admin/profile")).await;
-        assert_eq!(body["session"]["state"], json!("running"));
-
-        let (status, _, body) = send(&app, delete_request("/admin/profile")).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let ended = &body["result"];
-        assert_eq!(
-            (&ended["state"], &ended["end_reason"]),
-            (&json!("ended"), &json!("operator")),
-            "{body}"
-        );
-        assert_eq!(ended["files"], json!([]));
-        let (status, _, _) = send(&app, delete_request("/admin/profile")).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    /// A session of a window of seconds ends by itself once they passed; a
-    /// request that runs no collector or names an unknown option is refused.
-    #[tokio::test]
-    async fn a_session_ends_after_its_seconds_and_a_faulty_request_is_refused() {
-        let app = daemon_routers(served_engine(crate::test_support::CHAT));
-        let output = tempfile::tempdir().expect("a profile directory");
-        let (status, _, body) = send(
+        let (status, _, _) = send(
             &app,
-            post_json(
-                "/admin/profile",
-                &json!({"collectors": ["pm_sampling"], "seconds": 0.5, "output_dir": output.path()}),
-            ),
+            post_json("/v1/chat/completions", &chat_body(2, false)),
         )
         .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let mut request = chat_body(2, false);
+        request["model"] = json!("renamed");
+        let (status, _, body) = send(&app, post_json("/v1/chat/completions", &request)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (_, _, body) = send(&app, get_request("/v1/models")).await;
+        assert_eq!(body["data"][0]["id"], json!("renamed"), "{body}");
+    }
+
+    /// A profiling session runs on every worker while the configuration states it, and a
+    /// change that states none ends it; each state it enters is a `log` event of source
+    /// `profile`. The test engine holds no rank: no worker runs a collector or writes a file.
+    #[tokio::test]
+    async fn a_profiling_session_runs_while_the_configuration_states_it() {
+        let leader = Arc::new(served_engine(crate::test_support::CHAT));
+        let output = tempfile::tempdir().expect("a profile directory");
+        let session = proto::profile::SessionRequest {
+            collectors: vec![
+                proto::profile::Collector::Timeline,
+                proto::profile::Collector::PmSampling,
+            ],
+            stages: vec!["decode".to_owned()],
+            output_dir: output.path().to_owned(),
+            ..proto::profile::SessionRequest::default()
+        };
+        take(&leader, |config| {
+            config.profiling_config.session = Some(session);
+        })
+        .await
+        .unwrap();
+        take(&leader, |config| config.profiling_config.session = None)
+            .await
+            .unwrap();
+
+        let rows = leader
+            .recorder()
+            .store()
+            .query(
+                "SELECT fields['state'] AS state, fields['end_reason'] AS reason FROM events \
+                 WHERE kind = 'log' AND labels['source'] = 'profile' ORDER BY time",
+            )
+            .await
+            .unwrap()
+            .json()
+            .unwrap();
+        let rows: Value = serde_json::from_slice(&rows).unwrap();
+        assert_eq!(
+            rows,
+            json!([
+                {"state": "running", "reason": null},
+                {"state": "ended", "reason": "changed"},
+            ])
+        );
+    }
+
+    /// A session of a window of seconds ends by itself once they passed.
+    #[tokio::test]
+    async fn a_session_ends_after_its_seconds() {
+        let leader = Arc::new(served_engine(crate::test_support::CHAT));
+        let output = tempfile::tempdir().expect("a profile directory");
+        take(&leader, |config| {
+            config.profiling_config.session = Some(proto::profile::SessionRequest {
+                collectors: vec![proto::profile::Collector::PmSampling],
+                seconds: Some(0.5),
+                output_dir: output.path().to_owned(),
+                ..proto::profile::SessionRequest::default()
+            });
+        })
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let (_, _, body) = send(&app, get_request("/admin/profile")).await;
-            if body["session"]["state"] == json!("ended") {
-                assert_eq!(body["session"]["end_reason"], json!("seconds"));
+            let rows = leader
+                .recorder()
+                .store()
+                .query(
+                    "SELECT fields['end_reason'] AS reason FROM events WHERE kind = 'log' \
+                     AND labels['source'] = 'profile' AND fields['state'] = 'ended'",
+                )
+                .await
+                .unwrap()
+                .json()
+                .unwrap();
+            let rows: Value = serde_json::from_slice(&rows).unwrap();
+            if rows != json!([]) {
+                assert_eq!(rows, json!([{"reason": "seconds"}]));
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "{body}");
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        for faulty in [
-            json!({"collectors": [], "output_dir": output.path()}),
-            json!({"collectors": ["timeline"], "output_dir": output.path(), "window": 3}),
-        ] {
-            let (status, _, body) = send(&app, post_json("/admin/profile", &faulty)).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session runs on"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -758,34 +669,20 @@ mod tests {
         directory
     }
 
-    /// A loaded LoRA adapter is listed under its name until it is unloaded; a
-    /// name is loaded once, and the served model's name is no adapter's. A
-    /// request that names a loaded adapter is refused rather than answered by
-    /// the base model, since no kernel package computes with an adapter
-    /// (`docs/admin.md`, "LoRA adapters"), and one that names an unloaded
-    /// adapter names no model. The test engine holds no rank, which loads it.
+    /// An adapter of `adapters` is listed under its name until a change removes it. A request
+    /// that names a held adapter is refused rather than answered by the base model, since no
+    /// kernel package computes with an adapter (`docs/admin.md`, "LoRA adapters"), and one that
+    /// names a removed adapter names no model. The test engine holds no rank, which loads it.
     #[tokio::test]
-    async fn a_loaded_adapter_is_served_under_its_name_until_unloaded() {
-        let app = daemon_routers(served_engine(crate::test_support::CHAT));
+    async fn held_adapters_are_served_under_their_names_until_removed() {
+        let leader = Arc::new(served_engine(crate::test_support::CHAT));
+        let app = router(Arc::clone(&leader));
         let checkpoint = adapter_checkpoint();
-        let adapter = json!({"lora_name": "tuned", "lora_path": checkpoint.path()});
-        let (status, _, body) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
-        assert_eq!(
-            (status, &body["state"]),
-            (StatusCode::OK, &json!("succeeded")),
-            "{body}"
-        );
-        let (status, _, _) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let (status, _, _) = send(
-            &app,
-            post_json(
-                "/admin/load_lora_adapter",
-                &json!({"lora_name": SERVED_MODEL}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let path = checkpoint.path().to_str().unwrap().to_owned();
+        let adapters = std::collections::BTreeMap::from([("tuned".to_owned(), path)]);
+        leader.hold_adapters(&adapters).await.unwrap();
+        // The same set again changes nothing.
+        leader.hold_adapters(&adapters).await.unwrap();
 
         let (_, _, body) = send(&app, get_request("/v1/models")).await;
         let names: Vec<&str> = body["data"]
@@ -805,20 +702,48 @@ mod tests {
             "{body}"
         );
 
-        let (status, _, body) = send(
-            &app,
-            post_json("/admin/unload_lora_adapter", &json!({"lora_name": "tuned"})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        leader
+            .hold_adapters(&std::collections::BTreeMap::new())
+            .await
+            .unwrap();
         let (status, _, _) = send(&app, post_json("/v1/chat/completions", &request)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _, _) = send(
-            &app,
-            post_json("/admin/unload_lora_adapter", &json!({"lora_name": "tuned"})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A configuration whose adapter takes the served model's name, or whose profiling session
+    /// runs no collector, is refused as a start refuses it.
+    #[test]
+    fn a_faulty_adapter_or_session_is_refused() {
+        let mut named = Config {
+            model: Some("org/model".to_owned()),
+            ..Config::default()
+        };
+        named
+            .adapters
+            .insert("org/model".to_owned(), "/adapters/tuned".to_owned());
+        let error = named
+            .validate(&crate::config::Stated::default())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("adapters.org/model"),
+            "{error:#}"
+        );
+
+        let session = Config {
+            model: Some("org/model".to_owned()),
+            profiling_config: proto::config::ProfilingConfig {
+                session: Some(proto::profile::SessionRequest::default()),
+                ..proto::config::ProfilingConfig::default()
+            },
+            ..Config::default()
+        };
+        let error = session
+            .validate(&crate::config::Stated::default())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("profiling_config.session"),
+            "{error:#}"
+        );
     }
 
     /// A token model serves chat completions and no video route; a video
@@ -1036,15 +961,9 @@ mod tests {
         let runtime = service::RuntimeDirectory::within(runtime).unwrap();
         tokio::spawn(async move {
             let instance = service::Instance::create(&runtime, "daemon")?;
-            let admins = admin::Listeners::bind(instance.path())?;
+            let admin = admin::Listener::bind(instance.path())?;
             let ready = Ready::new(None, instance.path());
             let token = shutdown.clone();
-            let retire = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let admin = admin::Admin::new(
-                token.clone(),
-                Arc::clone(&retire),
-                admin::Journal::new(config.admin_config.event_log),
-            );
             let jobs = Arc::new(VideoJobs::new(
                 config.video_job_config.clone(),
                 token.child_token(),
@@ -1054,11 +973,9 @@ mod tests {
                 config: config.clone(),
                 stated: crate::config::Stated::default(),
                 leader: engine,
-                admin,
                 jobs,
                 adopted: Vec::new(),
                 daemon: None,
-                retire,
                 token,
                 then: None,
             };
@@ -1079,7 +996,7 @@ mod tests {
             node::run(
                 start,
                 listener,
-                admins,
+                admin,
                 node::First::Serving(Box::new(brought)),
             )
             .await

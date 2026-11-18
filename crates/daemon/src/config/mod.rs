@@ -157,6 +157,11 @@ impl Config {
             media_config: Of(Kind::Video),
             video_job_config: Of(Kind::Video),
             programs: Every,
+            paused: Every,
+            asleep: Every,
+            flush: Every,
+            retire: Every,
+            adapters: Of(Kind::Chat),
         });
         let scheduler = classified!(SchedulerConfig, "scheduler_config.", {
             max_queued_requests: Every,
@@ -252,8 +257,10 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[reload(epoch)]
     pub model_dir: Option<PathBuf>,
-    /// The single model name the API serves; `model` when unset.
-    #[reload(epoch)]
+    /// The single model name the API serves; `model` when unset. A change renames the
+    /// deployment's API from the next request on: a request naming the former name is refused,
+    /// and the requests in flight under it end as they would have.
+    #[reload(step)]
     pub served_model_name: Option<String>,
     /// Longest sequence a request may reach, in tokens. Unset, a checkpoint
     /// with a root `config.json` uses its `max_position_embeddings` (8192
@@ -404,6 +411,33 @@ pub struct Config {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[reload(program)]
     pub programs: std::collections::BTreeMap<String, program::Program>,
+    /// Whether new requests wait in the daemon instead of reaching an engine; the requests in
+    /// flight go on. A change takes effect from the next request on.
+    #[reload(step)]
+    pub paused: bool,
+    /// Whether the engines give back their KV cache and CUDA graph storage and keep their
+    /// weights. While asleep new requests wait; once awake again, the token requests that were
+    /// in flight are recomputed and the video requests continue from their stored step. A
+    /// change takes effect at the engines' next step boundary.
+    #[reload(step)]
+    pub asleep: bool,
+    /// How many times the prefix cache was flushed: each change of the number revokes every
+    /// cached prefix page at the engines' next step boundary, the requests in flight keeping
+    /// the pages they hold.
+    #[reload(step)]
+    pub flush: u64,
+    /// Whether the deployment's storage (its weights and caches) is released at its Storage
+    /// Servers once it comes down at its stop signal; otherwise it stays retained for a start
+    /// of the same deployment. Read when the deployment comes down.
+    #[reload(step)]
+    pub retire: bool,
+    /// The LoRA adapters the workers hold (`[adapters]`), each the directory of an adapter
+    /// under the name a request states as its model to compute with it. A change loads the
+    /// adapters it adds into free slots of the workers' adapter pool and unloads the ones it
+    /// removes, from the next request on; an engine that starts later loads every one of them.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[reload(step)]
+    pub adapters: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -453,17 +487,21 @@ impl Default for Config {
             media_config: MediaConfig::default(),
             video_job_config: VideoJobConfig::default(),
             programs: std::collections::BTreeMap::new(),
+            paused: false,
+            asleep: false,
+            flush: 0,
+            retire: false,
+            adapters: std::collections::BTreeMap::new(),
         }
     }
 }
 
-/// The daemon's listeners (`admin_config`): the address its HTTP server
-/// serves the client API on, and how the admin API, which two Unix sockets of
-/// the daemon's instance directory serve apart from it (`admin.sock` for the
-/// operator, `harness.sock` for a harness), answers. Access to the admin API
-/// is those sockets' file permissions. The daemon binds every listener when it
-/// starts and states their endpoints in its readiness record, which is where a
-/// caller finds them.
+/// The daemon's listeners (`admin_config`): the address its HTTP server serves the client API
+/// on and the port the leader joins the deployment's other nodes at. The admin API is served
+/// apart from them, on the Unix socket `admin.sock` of the daemon's instance directory, whose
+/// file permissions (its owner alone) are its access. The daemon binds every listener when it
+/// starts and states their endpoints in its readiness record, which is where a caller finds
+/// them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
@@ -478,8 +516,6 @@ pub struct AdminConfig {
     /// and the port they join it at on the first host of `hosts`; bound only by a deployment
     /// of several nodes.
     pub join: u16,
-    /// The admin API's event log (`GET /admin/events`).
-    pub event_log: EventLog,
 }
 
 impl Default for AdminConfig {
@@ -489,7 +525,6 @@ impl Default for AdminConfig {
             port: 0,
             uds: None,
             join: JOIN_PORT,
-            event_log: EventLog::default(),
         }
     }
 }
@@ -526,38 +561,6 @@ impl Default for ExportConfig {
 /// The default `admin_config.join`: a fixed port, since the other nodes of a deployment reach the
 /// leader at it before they can read anything the leader reports.
 pub const JOIN_PORT: u16 = 29700;
-
-/// The admin API's event log (`admin_config.event_log`): what it keeps and how long a reader
-/// waits for the next event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EventLog {
-    /// The events the log keeps, the newest; an older one leaves it, and a reader that asks for
-    /// it learns that events were lost (`gap`).
-    pub capacity: NonZeroUsize,
-    /// The longest a `GET /admin/events?wait=S` request waits for a new event; a longer `wait`
-    /// waits this long. It bounds how long a long-polling reader holds a connection.
-    #[serde(with = "values::duration")]
-    pub longest_wait: Duration,
-}
-
-/// The default `admin_config.event_log.capacity`: the events of many updates, each of which
-/// records a few phases and operations, so that a manager that reads after a pause still finds
-/// the events of what it waited on.
-pub const EVENT_LOG_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
-
-/// The default `admin_config.event_log.longest_wait`: a minute, under the idle timeouts of
-/// common HTTP proxies a reader may reach the socket through.
-pub const EVENT_LOG_LONGEST_WAIT: Duration = Duration::from_secs(60);
-
-impl Default for EventLog {
-    fn default() -> Self {
-        Self {
-            capacity: EVENT_LOG_CAPACITY,
-            longest_wait: EVENT_LOG_LONGEST_WAIT,
-        }
-    }
-}
 
 /// How the deployment moves to a new configuration in a generation or another epoch
 /// (`update_config`): how long the trial lasts before it commits, what of the previous epoch it
@@ -793,6 +796,26 @@ impl Config {
                     pin.backend
                 );
             }
+        }
+        // An adapter is named as a request's model, which the served model's name already is.
+        for (name, path) in &self.adapters {
+            anyhow::ensure!(
+                !name.is_empty(),
+                "`adapters` names an adapter by an empty name"
+            );
+            anyhow::ensure!(
+                name != self.served_model_name(),
+                "`adapters.{name}` is the served model's name: name the adapter otherwise"
+            );
+            anyhow::ensure!(
+                !path.is_empty(),
+                "`adapters.{name}` states no directory of the adapter"
+            );
+        }
+        if let Some(session) = &self.profiling_config.session {
+            session
+                .validate()
+                .map_err(|error| anyhow::anyhow!("`profiling_config.session`: {error}"))?;
         }
         // A program's name names its saved state's file and the revisions it writes.
         for (name, program) in &self.programs {

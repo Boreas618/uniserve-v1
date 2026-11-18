@@ -586,7 +586,7 @@ fn report_exit(
 }
 
 /// The daemon's process table: the processes this node supervises, which
-/// `GET /admin/config` reports and which a successor daemon keeps.
+/// `process` events report and which a successor daemon keeps.
 pub(crate) type ProcessTable = std::sync::Arc<std::sync::Mutex<Vec<proto::admin::ManagedProcess>>>;
 
 /// Publishes the node's live processes into `table`, keeping what the
@@ -725,8 +725,8 @@ pub(crate) fn run_leader(
 ) -> anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>> {
     loop {
         // What this node supervises now, for the daemon's process table: the
-        // loop turns on events, so a reader of `GET /admin/config` sees the
-        // processes that started and ended.
+        // loop turns on events, so a reader of the table sees the processes
+        // that started and ended.
         publish(&service.local, &service.updater.processes);
         if stop.handoff() {
             return service.hand_over().map(Some);

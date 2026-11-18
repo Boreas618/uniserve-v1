@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::request::wire::{ExpertOrder, Predecessor};
+use crate::request::wire::Predecessor;
 use crate::request::{PrefixCacheDtype, StandbyStorage};
 pub use block::{
     BlockConfig, BlockConfigError, BlockDistribution, BlockWeights, HeadProjection, Partition,
@@ -785,6 +785,14 @@ pub struct MoeConfig {
     /// ([`DEFAULT_BESIDE_ROWS`] unless stated).
     #[reload(epoch)]
     pub beside_rows: NonZeroU32,
+    /// The experts' order: for each routed expert layer, by its module path, the logical expert
+    /// ids in the order of the physical slots that hold them, across the layer's expert ranks; a
+    /// layer it does not name keeps the checkpoint's order. A change is prepared on the copy
+    /// stream beside the batches and committed at one computation boundary: the epoch, the
+    /// graphs' addresses and the requests stay. An epoch starts with the order stated.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[reload(order)]
+    pub expert_order: BTreeMap<String, Vec<u32>>,
 }
 
 impl Default for MoeConfig {
@@ -793,6 +801,7 @@ impl Default for MoeConfig {
             expert_parallel: false,
             microbatches: NonZeroU32::MIN,
             beside_rows: DEFAULT_BESIDE_ROWS,
+            expert_order: BTreeMap::new(),
         }
     }
 }
@@ -1305,6 +1314,15 @@ pub struct ProfilingConfig {
     /// records either way. A change takes a new epoch.
     #[reload(epoch)]
     pub nvtx_ranges: bool,
+    /// A profiling session the serving epoch's workers run (`docs/profiling.md`): its
+    /// collectors, its window and its output directory. While it is stated, the session starts
+    /// at the engine's next step boundary and records until its window ends, its guard ends it,
+    /// or its epoch stops executing; a change ends the running session, every worker writing its
+    /// file, and starts the new one, and removing it ends the running one. Each state the
+    /// session enters is a `log` event of source `profile`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[reload(step)]
+    pub session: Option<crate::profile::SessionRequest>,
 }
 
 impl Default for ProfilingConfig {
@@ -1315,6 +1333,7 @@ impl Default for ProfilingConfig {
             fence_probes_off: Vec::new(),
             graph_pc_sampling: false,
             nvtx_ranges: false,
+            session: None,
         }
     }
 }
@@ -1720,6 +1739,7 @@ impl EngineConfig {
             expert_parallel,
             microbatches,
             beside_rows,
+            expert_order: _,
         } = moe;
         let SpeculativeConfig {
             num_draft_tokens,
@@ -1732,6 +1752,7 @@ impl EngineConfig {
             fence_probes_off: _,
             graph_pc_sampling,
             nvtx_ranges,
+            session: _,
         } = profiling;
         BuildPart {
             executable,
@@ -1860,9 +1881,6 @@ pub struct EngineArgs {
     /// promoted. It maps nothing of its predecessor: both open sessions with the host's buffer
     /// pool, which keeps two epochs from writing one block.
     pub predecessor: Option<Predecessor>,
-    /// The expert order each MoE module loads, keyed by module, once the daemon has rebalanced the
-    /// experts; empty for the checkpoint's own order.
-    pub expert_order: BTreeMap<String, ExpertOrder>,
     /// The configuration revision the process starts with: its schedulers' first snapshot of
     /// the step values ([`Tuning`]), which every batch they assemble names until another
     /// revision's values arrive.
@@ -1957,13 +1975,12 @@ pub struct Inherited {
 impl EngineArgs {
     /// The arguments of an engine process of `engine_config` that runs `modules`, before the
     /// daemon's engine control states the process's place and interfaces: a new epoch, succeeding
-    /// no process, with the checkpoint's expert order.
+    /// no process, with the expert order its configuration states (`moe.expert_order`).
     pub fn new(engine_config: EngineConfig, modules: crate::module::ModuleSet) -> Self {
         Self {
             engine_config,
             epoch: 0,
             predecessor: None,
-            expert_order: BTreeMap::new(),
             revision: 0,
             deployment: String::new(),
             host: String::new(),

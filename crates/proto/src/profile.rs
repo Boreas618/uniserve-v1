@@ -1,4 +1,4 @@
-//! The vocabulary of profiling sessions (`POST /admin/profile`) between the
+//! The vocabulary of profiling sessions (`profiling_config.session`) between the
 //! leader daemon and the workers of the epoch that executes.
 //!
 //! The daemon validates a session's request, gives it an identity and starts
@@ -211,7 +211,7 @@ impl Default for PcSamplingOptions {
 /// the default interval, and seldom enough that the reads cost the rank's host little.
 pub const DEFAULT_SAMPLER_READ_MS: u64 = 100;
 
-/// A session's request, as `POST /admin/profile` takes it.
+/// A session's request, as `profiling_config.session` states it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionRequest {

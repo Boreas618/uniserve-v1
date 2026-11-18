@@ -1,15 +1,16 @@
-//! Profiling sessions of the epoch that executes (`/admin/profile`,
-//! `specs/online-operations.md` section 11).
+//! Profiling sessions of the epoch that executes (`profiling_config.session`,
+//! `docs/profiling.md`).
 //!
-//! A session starts on every worker of the executing epoch at the engine's
-//! next step boundary (the engine command `StartProfile`), records within
-//! each worker's window of steps (`docs/profiling.md`) and ends, with every
-//! worker's file written (`StopProfile`), when the first of these happens:
+//! A change of the deployment that states a session starts it on every worker of each
+//! replica's executing epoch at the engine's next step boundary (the engine command
+//! `StartProfile`), under one identity on every replica; it records within each worker's window
+//! of steps and ends, with every worker's file written (`StopProfile`), when the first of these
+//! happens:
 //!
 //! - every selected worker's window of steps ended, as the workers report
 //!   with their batch results (`ForwardStats::profile`);
 //! - its window of seconds passed;
-//! - the operator ends it (`DELETE /admin/profile`);
+//! - a change of the deployment states another session, or none;
 //! - its epoch stops executing: an epoch change promotes a successor, or a
 //!   trial rolls back. Neither carries a session into the next epoch;
 //! - the quality-of-service guard ends it.
@@ -23,8 +24,8 @@
 //! than that fraction turns off the session's costliest collector still
 //! running (`ReleaseProfile`, in `Collector::COSTLIEST_FIRST` order), at most
 //! once a guard window so that each change is measured; a slowdown that
-//! remains with no collector left ends the session. Every action is in the
-//! session's status.
+//! remains with no collector left ends the session. Every state the session enters, and every
+//! action of its guard, is a `log` event of source `profile` (`crate::status::profile`).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineState};
-use crate::leader::{Leader, Replica, UpdateError};
+use crate::leader::{Replica, UpdateError};
 
 /// Where a session is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -125,81 +126,6 @@ pub struct Session {
     pub device_storage: u64,
 }
 
-/// The deployment's session: one identity on every replica, each replica's session, and what
-/// they hold together.
-#[derive(Debug, Clone, Serialize)]
-pub struct ProfileReport {
-    pub id: u64,
-    /// `running` while a replica's session records, `ending` while one writes its files and
-    /// none records, `ended` once every one ended.
-    pub state: SessionState,
-    /// The reasons the replicas' sessions ended, each once, in replica order; `None` while
-    /// none ended.
-    pub end_reason: Option<String>,
-    /// Every replica's workers' answers to the start, replica by replica.
-    pub workers: Vec<RankStart>,
-    /// Every replica's workers' answers to the end, replica by replica.
-    pub files: Vec<RankStop>,
-    /// The steps every worker's window took.
-    pub steps: u64,
-    /// The bytes every worker's file holds.
-    pub bytes_written: u64,
-    /// The workers whose window ended.
-    pub windows_ended: u64,
-    /// The collectors still running on any replica.
-    pub collectors: Vec<Collector>,
-    /// Each replica's session, in replica order.
-    pub replicas: Vec<Session>,
-}
-
-impl ProfileReport {
-    /// The deployment's session `id` made of its replicas' `sessions`; `None` without any.
-    fn of(id: u64, sessions: Vec<Session>) -> Option<Self> {
-        let state =
-            sessions
-                .iter()
-                .map(|session| session.state)
-                .min_by_key(|state| match state {
-                    SessionState::Running => 0,
-                    SessionState::Ending => 1,
-                    SessionState::Ended => 2,
-                })?;
-        let mut reasons: Vec<&str> = Vec::new();
-        for reason in sessions
-            .iter()
-            .filter_map(|session| session.end_reason.as_deref())
-        {
-            if !reasons.contains(&reason) {
-                reasons.push(reason);
-            }
-        }
-        let end_reason = (!reasons.is_empty()).then(|| reasons.join("; "));
-        Some(Self {
-            id,
-            state,
-            end_reason,
-            workers: sessions
-                .iter()
-                .flat_map(|session| session.workers.clone())
-                .collect(),
-            files: sessions
-                .iter()
-                .flat_map(|session| session.files.clone())
-                .collect(),
-            steps: sessions.iter().map(|session| session.steps).sum(),
-            bytes_written: sessions.iter().map(|session| session.bytes_written).sum(),
-            windows_ended: sessions.iter().map(|session| session.windows_ended).sum(),
-            collectors: sessions
-                .iter()
-                .flat_map(|session| session.collectors.iter().copied())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-            replicas: sessions,
-        })
-    }
-}
-
 /// A replica's sessions: the one that runs or the last that ended.
 #[derive(Default)]
 pub(crate) struct Profiles {
@@ -233,85 +159,34 @@ fn optional_unix_seconds<S: serde::Serializer>(
     }
 }
 
-/// The deployment's report as the admin API answers it.
-///
-/// # Errors
-///
-/// When the report does not serialize: a session time before the Unix epoch.
-fn answer(report: Option<ProfileReport>) -> Result<serde_json::Value, UpdateError> {
-    serde_json::to_value(report).map_err(|error| UpdateError::Failed(error.into()))
-}
-
-impl Leader {
-    /// Starts a session of `request` on every replica's executing epoch, under one identity.
-    ///
-    /// # Errors
-    ///
-    /// As [`Replica::start_profile`], for the first replica that refuses or fails; the
-    /// replicas that started end their session.
-    pub async fn start_profile(
-        self: &Arc<Self>,
-        request: SessionRequest,
-    ) -> Result<serde_json::Value, UpdateError> {
-        let id = self.replicas.next_profile();
-        let mut sessions = Vec::new();
-        for replica in self.replicas() {
-            match replica.start_profile(id, request.clone()).await {
-                Ok(session) => sessions.push(session),
-                Err(error) => {
-                    for started in self.replicas() {
-                        if started.profile_running() == Some(id) {
-                            let client = started.hold().client();
-                            end(&started, client.as_deref(), id, "not started", true).await;
-                        }
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        answer(ProfileReport::of(id, sessions))
-    }
-
-    /// The deployment's session that runs, or the last that ended; `None` before any.
-    pub fn profile_status(&self) -> Option<ProfileReport> {
-        let sessions: Vec<Session> = self
-            .replicas()
-            .iter()
-            .filter_map(|replica| replica.profile_status())
-            .collect();
-        let id = sessions.iter().map(|session| session.id).max()?;
-        ProfileReport::of(
-            id,
-            sessions
-                .into_iter()
-                .filter(|session| session.id == id)
-                .collect(),
-        )
-    }
-
-    /// Ends the running session for `reason` on every replica.
-    ///
-    /// # Errors
-    ///
-    /// Refuses when no session runs.
-    pub async fn stop_profile(&self, reason: &str) -> Result<serde_json::Value, UpdateError> {
-        let mut running = None;
-        for replica in self.replicas() {
-            if let Some(id) = replica.profile_running() {
-                let client = replica.hold().client();
-                end(&replica, client.as_deref(), id, reason, true).await;
-                running = Some(id);
-            }
-        }
-        if running.is_none() {
-            return Err(UpdateError::Refused("no profiling session runs".to_owned()));
-        }
-        answer(self.profile_status())
-    }
-}
-
 impl Replica {
-    /// Starts session `id` of `request` on the executing epoch, and returns it.
+    /// Makes the replica's session `target`'s (`profiling_config.session`) on the engine
+    /// `client` serves with: ends the running session, every worker writing its file, and starts
+    /// `target` under the deployment's next session identity, when it states one. The caller
+    /// holds the replica while no engine replaces it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Replica::start_profile`].
+    pub(crate) async fn profile(
+        self: &Arc<Self>,
+        client: &EngineClient,
+        target: Option<SessionRequest>,
+    ) -> Result<(), UpdateError> {
+        if let Some(id) = self.profile_running() {
+            end(self, Some(client), id, "changed", true).await;
+        }
+        let Some(request) = target else {
+            return Ok(());
+        };
+        let id = self
+            .registry
+            .upgrade()
+            .map_or(1, |replicas| replicas.next_profile());
+        self.start_profile(client, id, request).await.map(drop)
+    }
+
+    /// Starts session `id` of `request` on the executing epoch of `client`, and returns it.
     ///
     /// # Errors
     ///
@@ -319,8 +194,9 @@ impl Replica {
     /// its statistics for, and a session while one runs; fails when no engine serves or a
     /// worker cannot start it. A worker refuses what it cannot run: its GPU's quota cannot fit
     /// the session's storage, or a collector CUPTI cannot run beside its graphs' PC sampling.
-    pub(crate) async fn start_profile(
+    async fn start_profile(
         self: &Arc<Self>,
+        client: &EngineClient,
         id: u64,
         request: SessionRequest,
     ) -> Result<Session, UpdateError> {
@@ -337,10 +213,9 @@ impl Replica {
         }
         if let Some(running) = self.profile_running() {
             return Err(UpdateError::Refused(format!(
-                "profiling session {running} runs: end it first (DELETE /admin/profile)"
+                "profiling session {running} runs"
             )));
         }
-        let client = self.hold().client().ok_or(UpdateError::NoEngine)?;
         let epoch = client.epoch();
         let started_at = Instant::now();
         let baseline = self.observer.rates(
@@ -362,23 +237,19 @@ impl Replica {
         // more, its storage now known. Any other refusal ends the start.
         let mut room = 0;
         let workers = loop {
-            let started = self
-                .operate("profile_start", |client| {
-                    let start = start.clone();
-                    async move { client.start_profile(&start).await }
-                })
-                .await;
-            let workers = match started {
+            let workers = match client.start_profile(&start).await {
                 Ok(workers) => workers,
                 Err(error) => {
-                    self.abandon_profile(id, room, &client).await;
-                    return Err(error);
+                    self.abandon_profile(id, room, client).await;
+                    return Err(UpdateError::Failed(anyhow::anyhow!(
+                        "profile_start: {error}"
+                    )));
                 }
             };
             let Some(refusal) = workers.iter().find_map(|worker| worker.refused.clone()) else {
                 break workers;
             };
-            self.abandon_profile(id, room, &client).await;
+            self.abandon_profile(id, room, client).await;
             let needed = workers
                 .iter()
                 .filter(|worker| worker.refused.is_some())
@@ -447,6 +318,7 @@ impl Replica {
         *service::lock(&self.profiles.acted) = None;
         *service::lock(&self.profiles.ending) = ending.clone();
         info!(session = id, epoch, "a profiling session started");
+        crate::status::profile(&self.recorder, self.ordinal, &session);
         tokio::spawn(watch(Arc::clone(self), id, started_at, ending));
         Ok(session)
     }
@@ -459,27 +331,13 @@ impl Replica {
             .map(|session| session.id)
     }
 
-    /// The running session, or the last that ended; `None` before any.
-    pub(crate) fn profile_status(&self) -> Option<Session> {
-        let mut session = service::lock(&self.profiles.session).clone()?;
-        if session.state == SessionState::Running {
-            self.profiles.progress(&mut session, &self.observer);
-        }
-        Some(session)
-    }
-
     /// End session `id` on the workers that started it after another
     /// worker refused or failed to: the session never ran, and each worker
     /// that started it closes its file and releases its collectors and
     /// their reserved storage. The KV cache grows back into the room it made
     /// for the session's `device_storage`.
     async fn abandon_profile(&self, id: u64, device_storage: u64, client: &EngineClient) {
-        let stopped = self
-            .operate("profile_stop", |client| async move {
-                client.stop_profile(id, "not started").await
-            })
-            .await;
-        if let Err(error) = stopped {
+        if let Err(error) = client.stop_profile(id, "not started").await {
             warn!(
                 session = id,
                 "ending a session other workers did not start failed: {error}"
@@ -584,6 +442,7 @@ pub(crate) async fn end(
             warn!(session = id, %failure, "a profiling session ended without every file");
         }
         info!(session = id, reason, "a profiling session ended");
+        crate::status::profile(&replica.recorder, replica.ordinal, ended);
     }
 }
 
@@ -733,5 +592,6 @@ fn record(
         if let Some(collector) = collector {
             running.collectors.retain(|running| *running != collector);
         }
+        crate::status::profile(&replica.recorder, replica.ordinal, running);
     }
 }

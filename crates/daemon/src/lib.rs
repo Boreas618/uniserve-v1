@@ -47,6 +47,7 @@ pub mod profiling;
 pub(crate) mod programs;
 pub mod restart;
 pub mod standby;
+pub(crate) mod status;
 pub mod supervision;
 #[cfg(test)]
 pub(crate) mod test_support;

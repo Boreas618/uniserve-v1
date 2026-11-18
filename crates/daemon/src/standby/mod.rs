@@ -749,7 +749,7 @@ pub struct DomainState<'a> {
 }
 
 impl Phase {
-    /// The name `GET /admin/config` reports.
+    /// The phase's name, as the reports state it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Absent => "absent",

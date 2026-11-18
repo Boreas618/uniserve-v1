@@ -714,13 +714,16 @@ impl ModelRunner {
         self.world_size
     }
 
-    /// The routed experts' distribution this epoch loads: what a redistribution committed, which
-    /// a relaunch and a standby load again; empty for the checkpoint's own order.
+    /// The routed experts' distribution this epoch loads: the order its configuration states
+    /// (`moe_config.expert_order`), which an in-place change of the order also writes into the
+    /// launch a relaunch and a standby load again; empty for the checkpoint's own order.
     pub(crate) fn experts(&self) -> ExpertOrder {
         self.launch
+            .engine_config
+            .moe
             .expert_order
             .iter()
-            .map(|(module, order)| (module.clone(), order.experts.clone()))
+            .map(|(module, experts)| (module.clone(), experts.clone()))
             .collect()
     }
 
