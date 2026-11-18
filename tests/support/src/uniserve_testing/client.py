@@ -67,7 +67,9 @@ def layout(groups: list[Mapping[str, Any]]) -> dict[str, Any]:
 def dedicated_experts() -> dict[str, Any]:
     """The options of an expert epoch of two worker groups on a case's two
     GPUs: attention on the first and the routed experts on the second,
-    exchanging tokens through DeepEP.
+    exchanging tokens through the package that fills the ``expert_exchange``
+    operator's keys, the Build Server's selection by manifest priority
+    (``docs/configuration.md``, the ``[kernels]`` table).
     """  # noqa: D205
     groups = [
         {
@@ -83,4 +85,4 @@ def dedicated_experts() -> dict[str, Any]:
             "queue_depth": 2,
         },
     ]
-    return {**layout(groups), "moe_config": {"exchange": "deepep"}}
+    return layout(groups)
