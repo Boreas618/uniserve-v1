@@ -3,17 +3,17 @@
 Qwen3 serves on the GPU the module's lease holds:
 
 - The fence probes are always on: every decode step's span and its
-  transformer layers' time reach the Prometheus histogram, and switching
-  the probes off through ``PUT /admin/policy`` is a change at the next step
-  that stops them, until they are switched on again.
-- Sessions record their windows of decode steps into one file per
-  worker, together running every collector: CUPTI's activity records and
-  API calls with the fence records and PC sampling's counts (its records
-  of graph kernels need ``profiling_config.graph_pc_sampling``), PM
-  samples, and range metrics, each in its table of the file's schema
-  (``crates/engine/src/profiling/schema.sql``). One session runs at a time,
-  and one naming two collectors of the device's performance monitors is
-  refused.
+  transformer layers' time reach the observation store's histogram, and
+  switching the probes off through ``PUT /admin/policy`` is a change at the
+  next step that stops them, until they are switched on again.
+- Sessions, which the package states (``[profiling_config.session]``),
+  record their windows of decode steps into one file per worker, together
+  running every collector: CUPTI's activity records and API calls with the
+  fence records and PC sampling's counts (its records of graph kernels need
+  ``profiling_config.graph_pc_sampling``), PM samples, and range metrics,
+  each in its table of the file's schema
+  (``crates/engine/src/profiling/schema.sql``). A session naming two
+  collectors of the device's performance monitors is refused.
 - A range_metrics session reserves its range profiler pass's device storage,
   which its worker measures and reports, with the worker's process item in
   the GPU's quota until it ends.
@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from uniserve_testing import admin, chat, client, profiling
+from uniserve_testing import admin, chat, profiling
 from uniserve_testing.deployments import Deployments
 from uniserve_testing.profiling import Load
 from uniserve_testing.servers import Server
@@ -84,17 +84,16 @@ def _change(server: Server, changes: dict[str, Any]) -> dict[str, Any]:
 
 def _forwards(server: Server) -> float:
     """The forwards the workers reported so far, which their reports carry
-    beside the fence histogram's steps
-    (``uniserve:worker_forward_mode_counts``).
+    beside the fence histogram's steps (``uniserve_forwards_total``).
     """  # noqa: D205
-    return client.metric(server.base_url, "uniserve:worker_forward_mode_counts")
+    return admin.counter(server, "uniserve_forwards_total")
 
 
 def _forwards_reported(server: Server) -> None:
     """Return once the workers reported forwards they ran from now on.
 
-    The counts reach ``/metrics`` with the workers' reports, which no event
-    of the node's log announces, so they are read every second.
+    The counts reach the observation store with the workers' reports, once a
+    report period, so they are read every second.
     """
     forwards = _forwards(server)
     server.wait_until(
@@ -118,8 +117,8 @@ def test_fence_probes_report_steps_and_switch_in_place(served: Server):
         ),
     )
     with Load(served, streams=1):
-        # The counts reach /metrics with the workers' reports, which no event
-        # of the node's log announces.
+        # The counts reach the observation store with the workers' reports,
+        # once a report period.
         served.wait_until(
             lambda: steps() > 0 and layer_steps() > 0,
             REPORTED_S,
@@ -183,21 +182,20 @@ def test_a_session_records_its_collectors_into_its_file(
     }
     # Two collectors of the performance monitors are refused together.
     conflicting = {**request, "collectors": ["pm_sampling", "pc_sampling"]}
-    refused = admin.request(served, "POST", profiling.PROFILE, body=conflicting)
+    refused = admin.change(
+        served, {"profiling_config": {"session": conflicting}}
+    )
     assert refused.status_code == 400, refused.text
     assert "performance monitors" in refused.text, refused.text
 
     with Load(served):
-        session = profiling.start(served, request)
-        worker = session["workers"][0]
+        started = profiling.start(served, request)
+        worker = started.fields["workers"][0]
         assert worker["selected"], worker
         assert all(
             state == "prepared" for state in worker["collectors"].values()
         ), worker
-        # One session at a time.
-        refused = admin.request(served, "POST", profiling.PROFILE, body=request)
-        assert refused.status_code == 400, refused.text
-        ended = profiling.ended(served)
+        ended = profiling.ended(served, started)
     print(json.dumps(ended, indent=2))
     assert ended["end_reason"] == "window", ended
     assert ended["steps"] == 40, ended
@@ -236,22 +234,22 @@ def test_a_session_records_its_collectors_into_its_file(
         assert all(fnmatchcase(module, LAYERS) for module in modules), modules
 
 
-def _process_bytes(server: Server) -> int:
-    """The bytes the worker's process item reserves in its GPU's quota."""
-    entries = [
-        entry
-        for entry in admin.reservations(server)
-        if entry["item"] == "process"
-    ]
+def _process_bytes(server: Server, after: int | None = None) -> int:
+    """The bytes the worker's process item reserves in its GPU's quota (in
+    a second after the moment `after`, when stated).
+    """  # noqa: D205
+    entries = admin.gauge(
+        server, "uniserve_gpu_reserved_bytes", after=after, item="process"
+    )
     assert len(entries) == 1, entries
-    return entries[0]["bytes"]
+    return int(entries[0].value)
 
 
 def test_a_range_metrics_session_books_its_pass_while_it_runs(
     served: Server, tmp_path: Path
 ):
     before = _process_bytes(served)
-    session = profiling.start(
+    started = profiling.start(
         served,
         {
             "collectors": ["range_metrics"],
@@ -261,21 +259,21 @@ def test_a_range_metrics_session_books_its_pass_while_it_runs(
     )
     # The pass's device storage, as the worker measured it when the session
     # started.
-    [worker] = session["workers"]
+    [worker] = started.fields["workers"]
     held = worker["device_storage"]
     assert held > 0, worker
-    assert _process_bytes(served) == before + held
-    stopped = profiling.stop(served)
+    assert _process_bytes(served, after=started.time) == before + held
+    stopped = profiling.stop(served, started)
     assert stopped["state"] == "ended", stopped
     assert stopped["end_reason"] == "operator", stopped
-    assert _process_bytes(served) == before
+    assert _process_bytes(served, after=admin.now(served)) == before
 
 
 def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
     served: Server, tmp_path: Path
 ):
     with Load(served, streams=1):
-        profiling.start(
+        started = profiling.start(
             served,
             {
                 "collectors": ["timeline"],
@@ -290,12 +288,14 @@ def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
             {"cuda_graph_config": {"decode_batch_sizes": [1, 2, 4, 8, 16]}},
         )
         assert changed["effect"] == "epoch", changed
-        session = profiling.session(served)
+        session = profiling.latest(served, started)
         assert session["state"] == "ended", session
         assert session["end_reason"] == "epoch change", session
         # A rank's file is `written` with its rows by table, or `failed`.
         file = session["files"][0]["file"]["written"]
         assert file["rows"]["kernel"] > 0, session
+    # The package states no session for the cases after this one.
+    admin.revision(admin.change(served, {}, removed=(profiling.SESSION,)))
 
 
 #: The span before a guarded session whose average step time its guard
@@ -317,12 +317,13 @@ GUARD_ACTIONS_S = 6 * GUARD_WINDOW_S
 def test_the_guard_releases_collectors_then_ends_the_session(
     served: Server, tmp_path: Path
 ):
+    started: admin.Event | None = None
+
     def actions() -> list[tuple[str, str | None]]:
-        current = profiling.session(served) or {}
+        current = profiling.latest(served, started) if started else {}
         return [
             (action["action"], action["collector"])
-            for replica in current.get("replicas", [])
-            for action in replica["guard"]
+            for action in current.get("guard") or []
         ]
 
     with Load(served) as load:
@@ -331,7 +332,7 @@ def test_the_guard_releases_collectors_then_ends_the_session(
         # of time by definition, not a state to wait for.
         load.decoding()
         time.sleep(BASELINE_S)
-        profiling.start(
+        started = profiling.start(
             served,
             {
                 "collectors": ["timeline", "pc_sampling"],
@@ -342,21 +343,21 @@ def test_the_guard_releases_collectors_then_ends_the_session(
                 "guard_window_s": GUARD_WINDOW_S,
             },
         )
-        # The guard's actions are in the session's state, which no event of
-        # the node's log announces.
+        # Each guard action is a state of the session, a `profile` event
+        # whose `guard` lists the actions so far.
         served.wait_until(
             lambda: (
                 len(actions()) >= 2
-                or (profiling.session(served) or {}).get("state") == "ended"
+                or profiling.latest(served, started)["state"] == "ended"
             ),
             GUARD_ACTIONS_S,
             "the guard did not act twice",
         )
-        current = profiling.session(served)
+        current = profiling.latest(served, started)
         ended = (
-            profiling.stop(served)
+            profiling.stop(served, started)
             if current["state"] == "running"
-            else profiling.ended(served)
+            else profiling.ended(served, started)
         )
     print(json.dumps(ended, indent=2))
     taken = actions()

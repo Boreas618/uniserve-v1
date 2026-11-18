@@ -31,12 +31,13 @@ them and captures the graphs that run expert steps again). Killing the
 serving main process promotes the standby in place of a relaunch, and the
 request continues on it.
 
-Which main process serves before and after a kill is what ``GET
-/admin/status`` reports: the serving process's launch generation
-(``generation``) and the parked standby's (``standby``), which a promotion
-makes the serving one; the status's ``report`` names the process of each
-launch generation (``processes``). Each test's deployment runs a Storage
-Server of its own.
+Which main process serves before and after a kill is what the leader states
+of the replica each second (:func:`uniserve_testing.admin.replica`): the
+serving process's launch generation (``uniserve_replica_generation``) and
+the parked standby's (``uniserve_replica_standby_generation``), which a
+promotion makes the serving one; the ``process`` events name the process of
+each launch generation. Each test's deployment runs a Storage Server of its
+own.
 """
 
 from __future__ import annotations
@@ -102,16 +103,16 @@ class Killed:
 
     `streamed` and `usage` are the stream's tokens and usage, `reference`
     and `reference_usage` those of the count asked again afterwards.
-    `before` and `after` are the deployment of ``GET /admin/status`` before
-    the kill and once the count was asked again.
+    `before` and `after` are replica 0 as the leader stated it before the
+    kill and once the count was asked again.
     """
 
     streamed: list[str]
     usage: dict[str, Any] | None
     reference: list[str]
     reference_usage: dict[str, Any]
-    before: dict[str, Any]
-    after: dict[str, Any]
+    before: admin.Replica
+    after: admin.Replica
 
 
 def _stream_through_a_kill(
@@ -128,14 +129,14 @@ def _stream_through_a_kill(
     usage = None
     with deployments.serve(merged(OPTIONS, options)) as server:
         if standby:
-            # No event of the node's log announces a standby that parks: the
-            # status states it once it parked.
+            # The leader states a standby's launch generations once it
+            # parked.
             server.wait_until(
-                lambda: admin.status(server)["deployment"]["standby"],
+                lambda: admin.replica(server).standby,
                 STANDBY_S,
                 "the deployment reported no parked standby",
             )
-        before = admin.status(server)["deployment"]
+        before = admin.replica(server)
         engine = admin.serving_engine(server)["pid"]
         with httpx.stream(
             "POST",
@@ -157,7 +158,7 @@ def _stream_through_a_kill(
         answer = chat.complete(
             server.base_url, COUNT, server.scaled(chat.COMPLETION_S)
         )
-        after = admin.status(server)["deployment"]
+        after = admin.replica(server, after=admin.now(server))
     return Killed(
         streamed=streamed,
         usage=usage,
@@ -178,7 +179,7 @@ def _continued(killed: Killed) -> None:
     """  # noqa: D205
     assert killed.streamed == killed.reference
     assert killed.usage == killed.reference_usage
-    assert killed.after["engine"] == "serving", killed.after
+    assert killed.after.state == "serving", killed.after
 
 
 def test_a_request_continues_after_its_engine_process_is_lost(
@@ -187,9 +188,9 @@ def test_a_request_continues_after_its_engine_process_is_lost(
     killed = _stream_through_a_kill(deployments, {})
     _continued(killed)
     # The daemon started another engine process, which serves.
-    assert killed.after["generation"] not in (
+    assert killed.after.generation not in (
         None,
-        killed.before["generation"],
+        killed.before.generation,
     ), (killed.before, killed.after)
 
 
@@ -227,8 +228,8 @@ def test_an_expert_epoch_promotes_its_standby_when_its_engine_is_lost(
     killed = _stream_through_a_kill(deployments, options, standby=True)
     _continued(killed)
     # The parked standby serves now, rather than an engine launched anew.
-    standby = killed.before["standby"]
-    assert killed.after["generation"] == standby[0], (
+    standby = killed.before.standby
+    assert killed.after.generation == standby[0], (
         killed.before,
         killed.after,
     )

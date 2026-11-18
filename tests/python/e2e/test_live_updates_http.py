@@ -5,28 +5,31 @@ modules serve (:data:`uniserve_testing.updates.PROFILE`), with a Storage
 Server of the case's own: a case that reads or restarts it names the runtime
 directory it serves under (the ``runtime`` fixture).
 
-- A deployment's storage belongs to it: once the deployment comes down
-  (``POST /admin/shutdown``), its Storage Server holds nothing of it, and a
-  deployment whose host regions the host's available storage cannot hold
-  does not come up, with the sizes that decided it.
-- A serving deployment answers its admin API, on the daemon's operator
-  socket: new requests wait while generation is paused and are served once
-  it continues; a flush evicts the device copies of the cached blocks;
-  scheduling limits change at the next step while a request streams, and a
-  change of the decode batch sizes is an epoch change under the same
-  stream, which commits once its trial (``update_config.trial``) passed;
-  the manager applies a package to the node, follows its events and
-  detaches while it serves.
-- A hot restart hands the deployment and its responses in flight to a
-  successor daemon, and a Storage Server restart keeps it serving.
+- A deployment's storage belongs to it: once a deployment whose package
+  states ``retire = true`` comes down (its daemon ends on SIGTERM), its
+  Storage Server holds nothing of it, and a deployment whose host regions
+  the host's available storage cannot hold does not come up, with the
+  sizes that decided it.
+- A serving deployment answers its admin API, on the daemon's admin socket:
+  new requests wait while the package states ``paused`` and are served once
+  it no longer does; a change of ``flush`` evicts the device copies of the
+  cached blocks; scheduling limits change at the next step while a request
+  streams, and a change of the decode batch sizes is an epoch change under
+  the same stream, which commits once its trial (``update_config.trial``)
+  passed; the manager applies a package to the node.
+- A hot restart, which a change of the daemon's own options starts, hands
+  the deployment and its responses in flight to a successor daemon, and a
+  Storage Server restart keeps it serving.
 - A target that finds no storage, a lost main process, a fault on trial and
   a regression on trial leave the requests in flight whole.
 
 Every change is a policy package ``PUT /admin/policy`` applies
 (:mod:`uniserve_testing.admin`): the options a case changes over the
-deployment's current package. The options of how an update proceeds
-(``update_config``) are the daemon's own, so a case states them in the
-package it starts with.
+deployment's current package. What the deployment executes and owns a case
+reads from its observation store (``/admin/query``): the leader's gauges of
+each replica and GPU quota, and the ``log`` events of each update phase.
+The options of how an update proceeds (``update_config``) are the daemon's
+own, so a case states them in the package it starts with.
 - A sleeping deployment gives back its KV cache, holds new requests and
   recomputes the ones it ran once it wakes, and answers as before.
 - The host tier keeps a prompt's blocks across flushes, devices, cache
@@ -40,7 +43,6 @@ import signal
 import subprocess
 import threading
 import time
-import tomllib
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -52,11 +54,11 @@ from uniserve_testing import admin, builds, chat, packages, updates
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.builds import BuildServer
 from uniserve_testing.caching import cached_tokens
-from uniserve_testing.client import metric
 from uniserve_testing.deployments import (
     HOST_CACHE_GIB,
     Deployments,
     Settings,
+    free_port,
     runtime_directory,
     storage_status,
 )
@@ -148,19 +150,15 @@ RECOVERY_TOKENS = 256
 TRIAL_WINDOW_S = 5
 
 #: How long a request a case sends to an idle deployment takes to be held or
-#: admitted and to appear in what the daemon reports, in seconds: the daemon
-#: takes it within a step and its schedulers report once a second. No event
-#: states a single request.
+#: admitted and to appear in the deployment's gauges, in seconds: the daemon
+#: takes it within a step, the leader samples its gauges every second and
+#: its schedulers report once a second. No event states a single request
+#: before it ends.
 ADMITTED_S = 60
 
-#: How long a node's deployment takes to come down after its shutdown, in
-#: seconds: its requests drain within the shutdown timeout (30 s unless
-#: stated), its engines then end and its storage is released.
-DOWN_S = 120
-
-#: How long a hot restart's successor takes to state its readiness record in
-#: the status once it answered the handover, in seconds: it states it as it
-#: begins to serve.
+#: How long a hot restart's successor takes to serve the admin socket and
+#: record that it serves (a ``node`` log of state ``serving``) once the
+#: change that restarted the daemon answered, in seconds.
 TAKEOVER_S = 120
 
 #: How long a Storage Server's successor takes to serve the socket after the
@@ -170,7 +168,7 @@ HANDOVER_S = 120
 
 #: How long a standby takes to park, in seconds: it starts as an update's
 #: target does, and the bound is the one a target's preparation has
-#: (:func:`uniserve_testing.admin.wait_for_phase`).
+#: (:func:`uniserve_testing.admin.wait_for_log`).
 STANDBY_S = 900
 
 #: How long the copies of a request's blocks to the host tier take to
@@ -318,42 +316,13 @@ def _apply(server: Server, changes: Config) -> dict:
 
 def _change_epoch(server: Server, changes: Config) -> dict:
     """Apply `changes` as an epoch switch, which commits once its trial
-    passed; the update as the report states it then.
+    passed; the update as its last phase's ``update`` log states it then.
     """  # noqa: D205
     record = _apply(server, changes)
     assert record["effect"] == "epoch", record
-    update = admin.report(server)["update"]
+    update = admin.logs(server, "update")[-1].fields
     assert update["phase"] == "committed", update
     return update
-
-
-def _successor(server: Server, previous: int) -> int:
-    """The daemon that took the deployment over from daemon `previous` in a
-    hot restart a change of the daemon's own options started, once its
-    readiness record in the status names it.
-
-    The change answers ``202`` as soon as the restart began, and the
-    successor states its record as it begins to serve; no event carries the
-    record, so the status is read until it names another daemon.
-    """  # noqa: D205
-
-    def serving() -> int | None:
-        try:
-            readiness = admin.status(server).get("readiness")
-        except (httpx.HTTPError, OSError):
-            return None
-        if not readiness or readiness["pid"] == previous:
-            return None
-        return int(readiness["pid"])
-
-    server.wait_until(
-        lambda: serving() is not None,
-        TAKEOVER_S,
-        f"no daemon took the deployment over from {previous}",
-    )
-    pid = serving()
-    assert pid is not None
-    return pid
 
 
 def _restarted(response: httpx.Response) -> dict:
@@ -368,31 +337,125 @@ def _restarted(response: httpx.Response) -> dict:
     return record
 
 
+def _successor(
+    server: Server, previous: int, after: int, successors: list[int]
+) -> int:
+    """The daemon that took the deployment over from daemon `previous` in a
+    hot restart a change applied after the moment `after` started, once it
+    serves; appended to `successors` as soon as it serves the admin socket.
+
+    The change answers ``202`` as soon as the restart began. The successor
+    binds the admin socket over its predecessor's, which names it
+    (:func:`uniserve_testing.admin.daemon_pid`), and records that it serves
+    the deployment as it begins to serve (a ``node`` log of state
+    ``serving``).
+    """  # noqa: D205
+
+    def bound() -> int | None:
+        try:
+            pid = admin.daemon_pid(server)
+        except OSError:
+            return None
+        return None if pid == previous else pid
+
+    server.wait_until(
+        lambda: bound() is not None,
+        TAKEOVER_S,
+        f"no daemon took the admin socket over from {previous}",
+    )
+    pid = bound()
+    assert pid is not None
+    successors.append(pid)
+    admin.wait_for_log(
+        server,
+        "node",
+        after=after,
+        timeout_s=TAKEOVER_S,
+        what=f"daemon {pid} did not serve the deployment",
+        state="serving",
+    )
+    return pid
+
+
+def _restart(server: Server, successors: list[int]) -> tuple[int, dict]:
+    """Restart the daemon in place: a change of one of its own options
+    (``logging_config.log_requests``, turned over), answered ``202``; the
+    successor once it serves (:func:`_successor`) and the change's record.
+    """  # noqa: D205
+    previous = admin.daemon_pid(server)
+    after = admin.now(server)
+    logging = admin.policy(server).config.get("logging_config", {})
+    stated = logging.get("log_requests", False)
+    record = _restarted(
+        admin.change(server, {"logging_config": {"log_requests": not stated}})
+    )
+    return _successor(server, previous, after, successors), record
+
+
 def _held_requests(server: Server) -> int:
     """The new requests the daemon holds before an engine takes them."""
-    return admin.status(server)["deployment"]["held"]
-
-
-def _bytes_of(server: Server, item: str, epoch: int | None = None) -> int:
-    """The bytes the deployment's quotas reserve for `item` (of `epoch`'s
-    reservations, when stated).
-    """  # noqa: D205
-    return sum(
-        entry["bytes"]
-        for entry in admin.reservations(server)
-        if entry["item"] == item and (epoch is None or epoch in entry["epochs"])
+    return int(
+        sum(
+            sample.value
+            for sample in admin.gauge(server, "uniserve_requests_held")
+        )
     )
 
 
-def _failed_requests(base_url: str) -> float:
+def _epochs(sample: admin.Sample) -> set[int]:
+    """The epochs a reservation's gauge names (its ``epochs`` label, the
+    epoch numbers joined by commas).
+    """  # noqa: D205
+    return {int(epoch) for epoch in sample.labels["epochs"].split(",") if epoch}
+
+
+def _reservations(
+    server: Server, after: int | None = None
+) -> list[admin.Sample]:
+    """Every reservation of every GPU quota of the deployment, as the leader
+    last sampled them (in a second that began after the moment `after`,
+    when stated).
+    """  # noqa: D205
+    return admin.gauge(server, "uniserve_gpu_reserved_bytes", after=after)
+
+
+def _bytes_of(
+    server: Server,
+    item: str,
+    epoch: int | None = None,
+    after: int | None = None,
+) -> int:
+    """The bytes the deployment's quotas reserve for `item` (of `epoch`'s
+    reservations, when stated), sampled after the moment `after` when
+    stated.
+    """  # noqa: D205
+    return int(
+        sum(
+            sample.value
+            for sample in _reservations(server, after)
+            if sample.labels["item"] == item
+            and (epoch is None or epoch in _epochs(sample))
+        )
+    )
+
+
+def _engine_pids(server: Server) -> set[int]:
+    """The process ids of the deployment's main processes that run."""
+    return {
+        process["pid"]
+        for process in admin.processes(server, group="engine")
+        if process["state"] not in admin.ENDED
+    }
+
+
+def _failed_requests(server: Server) -> float:
     """The requests that ended in an error so far."""
-    return metric(base_url, "uniserve:request_outcomes", outcome="error")
+    return admin.counter(server, "uniserve_requests_total", outcome="error")
 
 
 def _flush(server: Server) -> None:
     """Evict the device copies of every cached block."""
-    flushed = admin.operation(server, "flush_cache")
-    assert flushed.status_code == 200, flushed.text
+    admin.flush(server)
 
 
 def _held_of(listing: dict[str, Any], name: str) -> dict[str, list]:
@@ -439,14 +502,16 @@ def test_a_deployment_releases_its_storage_and_one_too_large_does_not_come_up(
         }
         assert "weights" in reserved, held
         # The host's available storage, as the Storage Server reads it.
-        (usage,) = admin.report(server)["quotas"]
-        available = usage["host_storage"]["available"]
+        (usage,) = admin.gauge(server, "uniserve_host_available_bytes")
+        available = int(usage.value)
 
-        # The shutdown answers at once, and the deployment comes down after
-        # it: the daemon, whose node serves this deployment alone, ends
-        # with it, having released what the deployment held.
-        down = admin.operation(server, "shutdown")
-        assert down.status_code == 202, down.text
+        # A deployment that retires releases its storage at its Storage
+        # Server as it comes down, which its daemon does on SIGTERM: the
+        # daemon, whose node serves this deployment alone, ends with it,
+        # having released what the deployment held.
+        retiring = admin.revision(admin.change(server, {"retire": True}))
+        assert retiring["effect"] == "step", retiring
+        server.process.send_signal(signal.SIGTERM)
         assert server.process.wait() == 0, "the daemon ended in an error"
     released = _held_of(updates.listing(uniserve, runtime), name)
     assert not any(released.values()), released
@@ -482,13 +547,16 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
     # evicted.
     options = merged(OPTIONS, {"kv_cache_config": {"host_tier": False}})
     with _serve(deployments, name, options=options) as server:
-        status = admin.status(server)
-        assert status["deployment"]["deployment"] == name, status
-        assert status["deployment"]["engine"] == "serving", status
+        node = admin.wait_for_log(
+            server, "node", after=0, timeout_s=ADMITTED_S, state="serving"
+        )
+        assert node.fields["deployment"] == name, node
+        replica = admin.replica(server)
+        assert replica.state == "serving", replica
 
-        # New requests wait while generation is paused.
-        paused = admin.operation(server, "pause_generation")
-        assert paused.status_code == 200, paused.text
+        # New requests wait while the package states generation paused.
+        paused = admin.revision(admin.change(server, {"paused": True}))
+        assert paused["effect"] == "step", paused
         answered: list[str] = []
         waiting = threading.Thread(
             target=lambda: answered.append(
@@ -502,8 +570,7 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
             "the daemon reported no held request while generation paused",
         )
         assert not answered, "a request was served while generation paused"
-        resumed = admin.operation(server, "continue_generation")
-        assert resumed.status_code == 200, resumed.text
+        admin.revision(admin.change(server, {"paused": False}))
         waiting.join()
         assert answered and answered[0], answered
 
@@ -531,10 +598,10 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
             "the stream ended before the update"
         )
 
-        # The manager attaches to the node by its operator socket, applies a
-        # package directory to it, follows its events and detaches. It names
-        # the node by its address at the head of each line it prints, and
-        # prints what the node answers as JSON after it.
+        # The manager attaches to the node by its admin socket and applies a
+        # package directory to it. It names the node by its address at the
+        # head of each line it prints, and prints what the node answers as
+        # JSON after it.
         manager = str(environment_program("uniserve-manager"))
         node = server.endpoint("admin")
         current = admin.policy(server)
@@ -557,33 +624,14 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
         assert served.config["scheduler_config"]["max_batch"] == 8, served
         assert served.config["served_model_name"] == name, served
 
-        # The watch replays the events from the start, the config operations
-        # among them, and detaches at an interrupt.
-        with subprocess.Popen(
-            [manager, "--node", node, "watch", "--from-start"],
-            env=environment(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        ) as watching:
-            assert watching.stdout is not None
-            for line in watching.stdout:
-                event = json.loads(line.removeprefix(f"{node}: "))
-                if (
-                    event["kind"] == "operation"
-                    and event["data"]["kind"] == "config"
-                ):
-                    break
-            else:
-                pytest.fail("the manager's watch ended before a config event")
-            watching.send_signal(signal.SIGINT)
-            _, errors = watching.communicate()
-        assert watching.returncode == 0, errors
+        # The deployment's revision events record the change the manager
+        # applied.
+        recorded = [
+            event.fields.get("revision")
+            for event in admin.events(server, "revision")
+        ]
+        assert record["revision"] in recorded, recorded
         assert _ask(server.base_url, name, "Say hello.")
-
-        log = admin.events(server, 0, 0)
-        kinds = [event["kind"] for event in log["events"]]
-        assert "operation" in kinds, log
 
 
 #: The streams a hot restart hands over: three counts of different lengths,
@@ -629,45 +677,12 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
     ):
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         _change_epoch(server, revisions[0])
-        restarted = admin.operation(server, "restart")
-        assert restarted.status_code == 200, restarted.text
-        successors.append(restarted.json()["result"]["pid"])
+        _restart(server, successors)
         _ask(server.base_url, name, RECOVERY_PROMPT, tokens=8)
         _change_epoch(server, revisions[1])
         assert _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32) == (
             answer
         )
-
-
-def _taken_over(server: Server, pid: int) -> str:
-    """The base URL of the client API the daemon `pid` serves once it took
-    `server`'s deployment over in a hot restart, as its readiness record in
-    the status states it.
-
-    A successor goes on in its predecessor's instance directory and binds the
-    admin sockets over its predecessor's, so `server`'s admin socket answers
-    for it. It states its record once it begins to serve, after it answered
-    the handover, so the change that restarted the daemon may answer first;
-    no event carries the record, so the status is read until it names the
-    successor.
-    """  # noqa: D205
-
-    def record() -> dict | None:
-        try:
-            readiness = admin.status(server).get("readiness")
-        except (httpx.HTTPError, OSError):
-            return None
-        return readiness if readiness and readiness["pid"] == pid else None
-
-    server.wait_until(
-        lambda: record() is not None,
-        TAKEOVER_S,
-        f"daemon {pid} did not take the deployment over",
-    )
-    stated = record()
-    assert stated is not None
-    host, _, port = stated["endpoints"]["client"].rpartition(":")
-    return f"http://{host}:{port}"
 
 
 def _restart_while_streaming(
@@ -676,10 +691,10 @@ def _restart_while_streaming(
     build_server: BuildServer | None,
     successors: list[int],
 ) -> None:
-    engines_before = admin.engine_pids(server)
-    status = admin.status(server)
-    assert status["deployment"]["engine"] == "serving", status
-    first_event = admin.next_event(server)
+    engines_before = _engine_pids(server)
+    replica = admin.replica(server)
+    assert replica.state == "serving", replica
+    first = admin.now(server)
 
     # Three streams in flight at the restart, of different lengths so their
     # boundaries fall at different events of different requests.
@@ -692,19 +707,16 @@ def _restart_while_streaming(
             lambda streamed: len(streamed.deltas) >= 32,
             "the counts did not stream",
         )
-    restarted = admin.operation(server, "restart")
-    assert restarted.status_code == 200, restarted.text
-    successor = restarted.json()["result"]["pid"]
-    successors.append(successor)
+    successor, _ = _restart(server, successors)
     assert successor != server.pid
     before_restart = [len(stream.deltas) for stream in streams]
 
     # The successor serves the same deployment, so it holds the same modules'
     # server: a deployment reaches its scheduling policy only through it, and
-    # the successor reads the configuration the old process served rather than
-    # a command line of its own (design 7.5).
+    # the successor serves the package the old process served rather than a
+    # command line of its own (design 7.5).
     assert build_server is not None
-    inherited = tomllib.loads(admin.report(server)["config"])
+    inherited = admin.policy(server).config
     assert inherited["build_config"]["socket"] == str(build_server.socket), (
         f"the successor did not inherit the modules' server: {inherited}"
     )
@@ -746,33 +758,38 @@ def _restart_while_streaming(
 
     # A one-body chat response in flight at a further restart is written by
     # its successor too, whole (design 7.5.1: every response in flight moves).
-    _restart_with_a_json_body(server, name, successors)
+    restarted = _restart_with_a_json_body(server, name, successors)
 
     # The daemon the case started exits once its requests ended; the engine
-    # and its workers are the same processes throughout.
+    # and its workers are the same processes throughout. The one-body
+    # restart replaced `successor` in turn, so the daemon that serves now is
+    # the last of them, on the same address.
     server.process.wait()
-    # The one-body restart replaced `successor` in turn, so the daemon that
-    # serves now is the last of them, on the same address.
-    assert _taken_over(server, successors[-1]) == server.base_url
-    status = admin.status(server)
-    assert status["deployment"]["engine"] == "serving", status
-    assert admin.engine_pids(server) == engines_before
-    # The node's event log goes on in each successor: the restart its
-    # predecessor recorded the start of is still in it, beside the
-    # successor's own record of the deployment it serves.
-    log = admin.events(server, first_event - 1, 0)
-    assert not log["gap"], log
-    recorded = [
-        (event["kind"], (event.get("data") or {}).get("kind"))
-        for event in log["events"]
-    ]
-    assert ("operation", "restart") in recorded, recorded
-    assert ("deployment", None) in recorded, recorded
+    assert admin.daemon_pid(server) == successors[-1]
+    assert _ask(server.base_url, name, "Say hello.")
+    replica = admin.replica(server)
+    assert replica.state == "serving", replica
+    assert _engine_pids(server) == engines_before
+    # Each successor records the deployment it serves and how the change
+    # that restarted its predecessor ended: the revision converged.
+    serving = admin.logs(server, "node", after=first)
+    assert any(event.fields.get("state") == "serving" for event in serving), (
+        serving
+    )
+    admin.wait_for(
+        server,
+        "revision",
+        lambda event: (
+            event.fields.get("revision") == restarted["revision"]
+            and event.fields.get("result") == "converged"
+        ),
+        after=first,
+        timeout_s=TAKEOVER_S,
+        what="the successor did not record the restart's revision converged",
+    )
 
     # The successor restarts in turn, and takes a change at the next step.
-    again = admin.operation(server, "restart")
-    assert again.status_code == 200, again.text
-    successors.append(again.json()["result"]["pid"])
+    _restart(server, successors)
     updates.wait_for_end(successor)
     assert _ask(server.base_url, name, "Say hello.")
     # A scheduling limit takes effect at a scheduler's next step;
@@ -784,18 +801,22 @@ def _restart_while_streaming(
     # A change of the listening address restarts the daemon on it: the new
     # address serves, and the old one closes once the replaced daemon exits.
     previous = successors[-1]
+    after = admin.now(server)
+    port = free_port()
     moved = _restarted(
-        admin.change(server, {"admin_config": {"host": "localhost"}})
+        admin.change(
+            server, {"admin_config": {"host": "localhost", "port": port}}
+        )
     )
-    successors.append(_successor(server, previous))
-    # The successor binds the new address, on a port it picks, once it holds
-    # the deployment, and records the revision converged.
-    moved_url = _taken_over(server, successors[-1])
+    _successor(server, previous, after, successors)
+    # The successor binds the new address once it holds the deployment, and
+    # records the revision converged.
+    moved_url = f"http://localhost:{port}"
     assert _ask(moved_url, name, "Say hello.")
     updates.wait_for_end(previous)
     with pytest.raises(httpx.ConnectError):
         httpx.get(f"{server.base_url}/health", timeout=5)
-    served = tomllib.loads(admin.report(server)["config"])["admin_config"]
+    served = admin.policy(server).config["admin_config"]
     assert served["host"] == "localhost", served
     server.wait_until(
         lambda: admin.policy(server).revision == moved["revision"],
@@ -805,52 +826,68 @@ def _restart_while_streaming(
 
     # A change of both the daemon's options and what an epoch executes
     # restarts the daemon on its new options first, and its successor then
-    # changes the epoch in an operation of its own, which commits once its
+    # changes the epoch in an update of its own, which commits once its
     # trial passed.
     previous = successors[-1]
-    before = admin.next_event(server)
+    before = admin.now(server)
+    port = free_port()
     both = _restarted(
         admin.change(
-            server, merged({"admin_config": {"host": "127.0.0.1"}}, CHANGE)
+            server,
+            merged(
+                {"admin_config": {"host": "127.0.0.1", "port": port}}, CHANGE
+            ),
         )
     )
-    successors.append(_successor(server, previous))
-    both_url = _taken_over(server, successors[-1])
-    update = admin.wait_for_phase(
-        server, "committed", "abandoned", "rolled_back", after=before
+    _successor(server, previous, before, successors)
+    both_url = f"http://127.0.0.1:{port}"
+    ended = admin.wait_for_log(
+        server,
+        "update",
+        after=before,
+        phase=("committed", "abandoned", "rolled_back"),
     )
+    update = ended.fields
     assert update["phase"] == "committed", update
     assert update["change"] == "epoch", update
     # The revision becomes current once the deployment converged to it, and
-    # the update the successor's operation started is numbered by it.
+    # the update the successor started is numbered by it.
     server.wait_until(
         lambda: admin.policy(server).revision == both["revision"],
         TAKEOVER_S,
         "the successor did not record the change's revision converged",
     )
-    last = admin.status(server)["last_operation"]
-    assert last["kind"] == "config" and last["state"] == "succeeded", last
-    assert update["update"] == last["id"], (update, last)
+    admin.wait_for(
+        server,
+        "revision",
+        lambda event: (
+            event.fields.get("revision") == both["revision"]
+            and event.fields.get("result") == "converged"
+        ),
+        after=before,
+        timeout_s=TAKEOVER_S,
+        what="the successor recorded no converged revision of the change",
+    )
+    assert ended.labels["update"] == str(both["revision"]), (ended, both)
     # The configuration is the target's from then on.
-    served = tomllib.loads(admin.report(server)["config"])
+    served = admin.policy(server).config
     assert served["cuda_graph_config"]["decode_batch_sizes"] == [1, 2, 8]
-    # `127.0.0.1` is the host's default, which the configuration, stating only
-    # what differs from the defaults, leaves out.
-    assert "host" not in served.get("admin_config", {}), served
+    assert served["admin_config"]["host"] == "127.0.0.1", served
     assert _ask(both_url, name, "Say hello.")
     updates.wait_for_end(previous)
 
 
 def _restart_with_a_json_body(
     server: Server, name: str, successors: list[int]
-) -> None:
-    """A non-streaming chat body in flight across a restart is written whole.
+) -> dict:
+    """A non-streaming chat body in flight across a restart is written whole;
+    the record of the change that restarted the daemon.
 
     The body is one response built from a collector's state, so a field lost in
     the crossing is silent: the request still answers 200 with a response that
     parses. What catches it is a body that finished, whose text is a contiguous
     count and whose usage adds up.
-    """
+    """  # noqa: D205
     bodies: list[dict] = []
     failures: list[BaseException] = []
 
@@ -868,15 +905,21 @@ def _restart_with_a_json_body(
     request.start()
     # The restart pauses what the engine serves, so it is issued only once the
     # one-body request is being served: the schedulers' gauge says so, and no
-    # event states a single request.
+    # event states a single request before it ends.
     server.wait_until(
-        lambda: metric(server.base_url, "uniserve:scheduler_running") >= 1,
+        lambda: (
+            sum(
+                sample.value
+                for sample in admin.gauge(
+                    server, "uniserve_scheduler_running_requests"
+                )
+            )
+            >= 1
+        ),
         ADMITTED_S,
         "the one-body request was never served",
     )
-    restarted = admin.operation(server, "restart")
-    assert restarted.status_code == 200, restarted.text
-    successors.append(restarted.json()["result"]["pid"])
+    _, restarted = _restart(server, successors)
     request.join()
     assert not failures, failures
     assert bodies, "the one-body request answered nothing"
@@ -893,6 +936,7 @@ def _restart_with_a_json_body(
         usage["total_tokens"]
         == usage["prompt_tokens"] + usage["completion_tokens"]
     ), usage
+    return restarted
 
 
 def _storage_pid(uniserve: Path, runtime: Path) -> int | None:
@@ -968,11 +1012,12 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         _assert_counts_from_one(stream, 200)
         weights = _bytes_of(server, "weights")
         _change_epoch(server, CHANGE)
+        committed = admin.now(server)
         assert _ask(server.base_url, name, "Say hello.")
         # The quota reserves a storage once however many epochs map it, so a
         # target that read the checkpoint again would reserve its weights
         # beside these.
-        assert _bytes_of(server, "weights") == weights
+        assert _bytes_of(server, "weights", after=committed) == weights
 
 
 #: The bytes the ballast of a full GPU leaves free: room for a target's CUDA
@@ -990,16 +1035,16 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
     process holding all of it but ``TARGET_ROOM``, room for the target's CUDA
     context and no more, the target finds no room for its graph pool, so its
     start fails, the update is abandoned before any
-    switch (the ``PUT`` answers ``409`` with the reason, the report states
-    the abandoned update and the revision stays the current one,
-    ``docs/admin.md``), and the stream goes on with the serving epoch's
+    switch (the ``PUT`` answers ``409`` with the reason, the update's last
+    ``update`` log states it abandoned and the revision stays the current
+    one, ``docs/admin.md``), and the stream goes on with the serving epoch's
     regions as they were.
     """  # noqa: E501
     name = "qwen3-live-pressure"
     prompt = "Describe the sea in one sentence."
     with _serve(deployments, name, options=SIZED_OPTIONS) as server:
         before = _ask(server.base_url, name, prompt, 32)
-        serving = admin.report(server)["executing"]["epoch"]
+        serving = admin.replica(server).epoch
         current = admin.policy(server).revision
         cache = _bytes_of(server, "cache_segment", serving)
         stream = _streaming(server, name)
@@ -1009,7 +1054,7 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
             # and its reason.
             response = admin.change(server, CHANGE)
             assert response.status_code == 409, response.text
-            update = admin.report(server)["update"]
+            update = admin.logs(server, "update")[-1].fields
             print("epoch switch under pressure:", json.dumps(update))
             # The target's start failed before it joined: a failed
             # preparation, whose reason names the storage it did not find.
@@ -1019,9 +1064,10 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
         _assert_counts_from_one(stream, 200)
         # The serving epoch's quota reserves at least the KV cache it held,
         # and its revision is still the current one.
-        assert admin.report(server)["executing"]["epoch"] == serving
+        ended = admin.now(server)
+        assert admin.replica(server).epoch == serving
         assert admin.policy(server).revision == current
-        assert _bytes_of(server, "cache_segment", serving) >= cache, (
+        assert _bytes_of(server, "cache_segment", serving, ended) >= cache, (
             "the abandoned update shrank the serving epoch's KV regions"
         )
         assert _ask(server.base_url, name, prompt, 32) == before
@@ -1034,19 +1080,19 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
     prompt = "Describe the sea in one sentence."
     with _serve(deployments, name, options=SIZED_OPTIONS) as server:
         before = _ask(server.base_url, name, prompt, 32)
-        epoch = admin.report(server)["executing"]["epoch"]
+        epoch = admin.replica(server).epoch
         awake = _bytes_of(server, "cache_segment", epoch)
-        assert awake > 0, admin.reservations(server)
+        assert awake > 0, _reservations(server)
         stream = _streaming(server, name)
 
-        slept = admin.operation(server, "sleep")
-        assert slept.status_code == 200, slept.text
-        status = admin.status(server)
-        assert status["deployment"]["asleep"] is True, status
+        slept = admin.revision(admin.change(server, {"asleep": True}))
+        assert slept["effect"] == "step", slept
+        assert admin.policy(server).config["asleep"] is True
         # The workers give back every segment of the KV cache, which the
         # GPU's quota reserves no more.
-        asleep = _bytes_of(server, "cache_segment", epoch)
-        assert asleep == 0, admin.reservations(server)
+        asleep_at = admin.now(server)
+        asleep = _bytes_of(server, "cache_segment", epoch, asleep_at)
+        assert asleep == 0, _reservations(server)
         answered: list[str] = []
         waiting = threading.Thread(
             target=lambda: answered.append(
@@ -1061,29 +1107,29 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
         )
         assert not answered, "a sleeping deployment served a request"
 
-        woke = admin.operation(server, "wake_up")
-        assert woke.status_code == 200, woke.text
+        admin.revision(admin.change(server, {"asleep": False}))
+        woke_at = admin.now(server)
         waiting.join()
         assert answered and answered[0], answered
         _assert_counts_from_one(stream, 200)
         # The wake creates the KV cache again, as large as it was.
-        woken = _bytes_of(server, "cache_segment", epoch)
+        woken = _bytes_of(server, "cache_segment", epoch, woke_at)
         print(f"KV cache: awake {awake} B, asleep {asleep} B, woken {woken} B")
         assert woken == awake, (awake, woken)
         # Alone, as before the sleep, the deployment answers as it did: the
         # request that waited ran beside the recomputed count, whose batch
         # changes the numerics.
         assert _ask(server.base_url, name, prompt, 32) == before
-        status = admin.status(server)
-        assert status["deployment"]["asleep"] is False, status
-        assert status["deployment"]["paused"] is False, status
+        config = admin.policy(server).config
+        assert config["asleep"] is False, config
+        assert config.get("paused", False) is False, config
 
 
 def _prepared_standby(server: Server) -> list[int]:
     """The launch generations of the parked standby, which parks once it
     captured its graphs; empty while there is none.
     """  # noqa: D205
-    return admin.status(server)["deployment"]["standby"]
+    return admin.replica(server).standby
 
 
 def _wait_for_standby(
@@ -1092,9 +1138,9 @@ def _wait_for_standby(
     """Wait until a standby parked, other than `replaced`; its launch
     generations.
 
-    No event announces a standby's parking (the event log states operations,
-    the serving engine's lifecycle, update phases and deployment changes), and
-    the status states its launch generations once it parked.
+    The leader's gauges state the standby's launch generations once it
+    parked (``uniserve_replica_standby_generation``), which are read every
+    second.
     """  # noqa: D205
     server.wait_until(
         lambda: _prepared_standby(server) not in ([], replaced),
@@ -1139,8 +1185,8 @@ def _lose_the_serving_engine(
         "the count did not stream",
     )
     before = len(numbers(stream.text))
-    serving = admin.status(server)["deployment"]
-    standby_generations = serving["standby"]
+    serving = admin.replica(server)
+    standby_generations = serving.standby
     killed = admin.serving_engine(server)["pid"]
     started = time.monotonic()
     updates.terminate(killed)
@@ -1180,13 +1226,13 @@ def _lose_the_serving_engine(
 
     # The main process that serves now: the standby's, promoted, or one
     # launched anew.
-    generation = admin.status(server)["deployment"]["generation"]
+    generation = admin.replica(server).generation
     promoted = bool(standby_generations) and (
         generation == standby_generations[0]
     )
     relaunched = generation not in (
         None,
-        serving["generation"],
+        serving.generation,
         *standby_generations,
     )
     assert promoted or relaunched, "no engine took the lost one's place"
@@ -1272,11 +1318,13 @@ def _fail_the_target(server: Server, after: int) -> dict:
     """End the update on trial by a fault: the target's serving main process
     ends, which rolls a trial back whatever its thresholds; the update once
     it entered ``rolled_back``, which serves its kept side again. `after` is
-    the event the case read before it applied the change.
+    the daemon's clock the case read before it applied the change.
     """  # noqa: D205
-    admin.wait_for_phase(server, "trial", after=after)
+    admin.wait_for_log(server, "update", after=after, phase="trial")
     updates.terminate(admin.serving_engine(server)["pid"])
-    return admin.wait_for_phase(server, "rolled_back", after=after)
+    return admin.wait_for_log(
+        server, "update", after=after, phase="rolled_back"
+    ).fields
 
 
 def _rolled_back(response: httpx.Response) -> None:
@@ -1312,7 +1360,7 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
         _lose_the_serving_engine(
             server, name, "relaunched-after-a-switch", standby=False
         )
-        before = admin.next_event(server)
+        before = admin.now(server)
         with admin.changing(server, revisions[1]) as applied:
             _fail_the_target(server, before)
         _rolled_back(applied.result())
@@ -1337,8 +1385,8 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
     name = "qwen3-live-executable"
     revision = updates.engine_revision(deployments.build_server, repository)
     with _serve(deployments, name) as server:
-        before = admin.engine_pids(server)
-        failed = _failed_requests(server.base_url)
+        before = _engine_pids(server)
+        failed = _failed_requests(server)
         baseline = _ask(server.base_url, name, RECOVERY_PROMPT, RECOVERY_TOKENS)
 
         stream = _count(server.base_url, name, RECOVERY_PROMPT)
@@ -1366,7 +1414,7 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
             "the new executable answers differently from the one it replaced: "
             f"{after[:200]}"
         )
-        assert _failed_requests(server.base_url) == failed, "a request failed"
+        assert _failed_requests(server) == failed, "a request failed"
 
 
 def _repeated_attention(
@@ -1456,13 +1504,15 @@ def test_a_fault_on_trial_returns_to_the_previous_epoch_under_a_request(
         },
     )
     with _serve(deployments, name, options=options) as server:
-        before = admin.engine_pids(server)
-        previous = admin.report(server)["executing"]["epoch"]
+        before = _engine_pids(server)
+        previous = admin.replica(server).epoch
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         stream = _start_count(server, name)
-        applying = admin.next_event(server)
+        applying = admin.now(server)
         with admin.changing(server, revision) as applied:
-            trial = admin.wait_for_phase(server, "trial", after=applying)
+            trial = admin.wait_for_log(
+                server, "update", after=applying, phase="trial"
+            ).fields
             assert trial["change"] == "epoch", trial
             if previous_epoch != "parked":
                 # The previous epoch's processes end.
@@ -1471,24 +1521,18 @@ def test_a_fault_on_trial_returns_to_the_previous_epoch_under_a_request(
             else:
                 assert all(updates.running(pid) for pid in before)
 
-            # A node that cannot move the weights keeps them on its GPUs, and
-            # says why.
-            trial = admin.report(server)["update"]
-            print("kept:", json.dumps(trial))
-            if not trial["host_refused"]:
-                assert trial["previous_epoch_kept"] == previous_epoch, trial
             if previous_epoch == "weights":
                 # The previous epoch keeps its weights alone: each GPU's
                 # quota reserves nothing else of it once its processes
                 # exited, the segments the target maps being the target's.
                 # The Storage Server releases a process's reservations once
-                # it saw the process end, and no event states a quota's
-                # change.
+                # it saw the process end, and the leader's gauges state the
+                # quotas every second.
                 def kept() -> set[str]:
                     return {
-                        entry["item"]
-                        for entry in admin.reservations(server)
-                        if previous in entry["epochs"]
+                        sample.labels["item"]
+                        for sample in _reservations(server)
+                        if previous in _epochs(sample)
                     }
 
                 try:
@@ -1499,18 +1543,22 @@ def test_a_fault_on_trial_returns_to_the_previous_epoch_under_a_request(
                     )
                 except TimeoutError as timeout:
                     held = [
-                        entry
-                        for entry in admin.reservations(server)
-                        if previous in entry["epochs"]
+                        sample
+                        for sample in _reservations(server)
+                        if previous in _epochs(sample)
                     ]
                     raise AssertionError(
-                        f"the previous epoch keeps {json.dumps(held)}"
+                        f"the previous epoch keeps {held}"
                     ) from timeout
             # The previous epoch serves again once its processes stopped for
             # the trial started again; the target serves until it is lost.
             update = _fail_the_target(server, applying)
             print("rolled back:", json.dumps(update))
         _rolled_back(applied.result())
+        # A node that cannot move the weights keeps them on its GPUs, and
+        # says why: the update states what the previous epoch kept.
+        if not update["host_refused"]:
+            assert update["previous_epoch_kept"] == previous_epoch, update
         _assert_whole(stream)
         assert _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32) == (
             answer
@@ -1525,10 +1573,11 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
     The target's decode attention runs its kernel several times per call
     (:func:`_slower_target`), so the same stream steps slower on it with no
     fault. The stream crosses the switch and the rollback whole, the update
-    ends unavailable with the threshold's reason, the status states the rates
-    that decided it, and applying it again needs ``force``. A deployment
-    without the threshold takes the same slower target through a trial of
-    several windows: the threshold, and nothing else, rolled it back.
+    ends unavailable with the threshold's reason, its ``update`` log states
+    the rates that decided it, and applying it again needs ``force``. A
+    deployment without the threshold takes the same slower target through a
+    trial of several windows: the threshold, and nothing else, rolled it
+    back.
     """
     name = "qwen3-live-regression"
     # The step time past which the trial rolls back, as a fraction of the
@@ -1558,11 +1607,11 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
         # the baseline its window.
         stream = _start_count(server, name)
         _rolled_back(admin.change(server, slower))
-        update = admin.report(server)["update"]
+        update = admin.logs(server, "update")[-1].fields
         assert update["phase"] == "rolled_back", update
         assert update["failure"]["kind"] == "step_time_regression", update
         print("rolled back:", json.dumps(update))
-        # The status states the rates the decision read.
+        # The update states the rates the decision read.
         (replica,) = update["trial"]["replicas"]
         assert replica["baseline"]["tokens_per_second"] > 0, update
         baseline = replica["baseline"]["step_us"]
@@ -1573,12 +1622,11 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
         )
         assert admin.policy(server).revision == current
 
-        # The rollback marked the target unavailable, the deployment's only
-        # one: applying it again is refused without `force`.
+        # The rollback marked the target unavailable: applying it again is
+        # refused without `force`, as a target a rollback marked unavailable
+        # is (``400``).
         again = admin.change(server, slower)
-        assert again.status_code != 200, again.text
-        unavailable = admin.report(server)["unavailable"]
-        assert len(unavailable) == 1, unavailable
+        assert again.status_code == 400, again.text
 
     # Without the threshold, the same target stands a trial of three windows
     # under a stream and commits.
@@ -1622,7 +1670,7 @@ def test_a_package_update_past_a_threshold_rolls_back_in_its_epoch(
         repeated = _repeated_attention(
             deployments.build_server, repository, tmp_path
         )
-        engines = admin.engine_pids(server)
+        engines = _engine_pids(server)
         stream = _start_count(server, name)
         # The baseline is the window of steps before the switch: the count's
         # own deltas say when it has streamed for one.
@@ -1632,13 +1680,12 @@ def test_a_package_update_past_a_threshold_rolls_back_in_its_epoch(
             ),
             "the count did not stream for a window",
         )
-        before = admin.next_event(server)
+        before = admin.now(server)
         with admin.changing(server, repeated) as applied:
             _assert_whole(stream)
 
             # A trickle of small requests keeps the trial reading steps, one
-            # between two reads of the event log, which end at the update's
-            # end.
+            # each pause, until the update's ``update`` log states its end.
             deadline = time.monotonic() + server.scaled(ROLLBACK_S)
             update = None
             while update is None:
@@ -1646,22 +1693,22 @@ def test_a_package_update_past_a_threshold_rolls_back_in_its_epoch(
                     "the update was not rolled back"
                 )
                 _ask(server.base_url, name, RECOVERY_PROMPT, tokens=2)
-                page = admin.events(server, before, TRICKLE_S)
-                assert not page["gap"], page
-                for event in page["events"]:
-                    if event["kind"] == "update" and event["data"]["phase"] in (
-                        "committed",
-                        "rolled_back",
-                    ):
-                        update = event["data"]
-                before = page["next"]
+                ends = [
+                    event.fields
+                    for event in admin.logs(server, "update", after=before)
+                    if event.fields.get("phase") in ("committed", "rolled_back")
+                ]
+                if ends:
+                    update = ends[0]
+                else:
+                    time.sleep(TRICKLE_S)
         _rolled_back(applied.result())
         print("rolled back:", json.dumps(update))
         assert update["change"] == "generation", update
         assert update["phase"] == "rolled_back", update
         assert update["failure"]["kind"] == "throughput_regression", update
         # The update ran in the serving main processes.
-        assert admin.engine_pids(server) == engines
+        assert _engine_pids(server) == engines
 
 
 def test_a_request_that_ends_at_once_leaves_its_blocks_in_the_host_tier(
@@ -1686,8 +1733,8 @@ def test_a_request_that_ends_at_once_leaves_its_blocks_in_the_host_tier(
         print("host tokens of a request of one token:", found)
         assert found > 0, found
         # What moved the blocks is on the report beside what computed them.
-        copied = metric(
-            server.base_url, "uniserve:worker_stream_us", stream="copy"
+        copied = admin.counter(
+            server, "uniserve_stream_seconds_total", stream="copy"
         )
         print("copy stream:", copied)
         assert copied > 0, copied
@@ -1872,11 +1919,9 @@ def test_a_weight_update_leaves_the_blocks_of_the_old_weights_unread(
         old_weights = found_in_the_host_cache(server)
         print("host tokens of the first weights:", old_weights)
         assert old_weights > 0, old_weights
-        updated = admin.operation(
-            server, "update_weights", {"model_path": other}
-        )
-        assert updated.status_code == 200, updated.text
-        print("updated:", updated.text[:400])
+        updated = admin.revision(admin.change(server, {"model": other}))
+        assert updated["effect"] == "epoch", updated
+        print("updated:", json.dumps(updated)[:400])
         # The blocks of the old weights are found in no tier.
         second = chat.complete(server.base_url, _request(name, prompt, 16))
         stale = cached_tokens(second)
@@ -1894,28 +1939,20 @@ def test_a_weight_update_keeps_the_stream_in_flight_going(
 ):
     """A weight update never holds the stream in flight as long as it takes.
 
-    With ``in_flight = keep`` the batches go on while the new checkpoint loads
-    beside the KV cache, and the weights are put in place at one batch boundary
-    (``docs/admin.md``, the KV cache's storage and the weights), so the
+    A change of the model files starts a new epoch beside the serving one
+    (``docs/admin.md``, Updates): the batches go on while the new checkpoint
+    loads, and the stream moves to the new epoch at its switch, so the
     stream's longest silence from its last token before the update to its end
     stays below the update's duration, and the stream is whole.
-
-    The weights put in place are mapped at the addresses the captured graphs
-    read, which a process subscribed to CUPTI follows by instantiating each
-    graph's executable again (``profiling::storage_remapped``); that renewal
-    belongs to each graph's next replay and never holds a batch for every
-    bucket the runner captured.
     """
     other = CHECKPOINTS["qwen3-other-weights"].model
     name = "qwen3-live-weights-stream"
     with _serve(deployments, name) as server:
         stream = _start_count(server, name)
         started = time.monotonic()
-        updated = admin.operation(
-            server, "update_weights", {"model_path": other}
-        )
+        updated = admin.change(server, {"model": other})
         took = time.monotonic() - started
-        assert updated.status_code == 200, updated.text
+        assert admin.revision(updated)["effect"] == "epoch", updated.text
         stream.join()
 
     # The stream's silences from its last token before the update on, each
@@ -1963,31 +2000,38 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
     with _serve(deployments, name, options=options) as server:
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         stream = _start_count(server, name)
-        before = admin.next_event(server)
+        previous = admin.replica(server).epoch
+        before = admin.now(server)
         with admin.changing(server, {"model": other}) as applied:
-            trial = admin.wait_for_phase(server, "trial", after=before)
+            trial = admin.wait_for_log(
+                server, "update", after=before, phase="trial"
+            ).fields
             assert trial["change"] == "epoch", trial
 
-            def moved_or_refused() -> bool:
-                report = admin.report(server)["update"]
-                return report["moved_to_host_bytes"] > 0 or bool(
-                    report["host_refused"]
+            def moved() -> bool:
+                return not any(
+                    sample.labels["item"] == "weights"
+                    and _epochs(sample) == {previous}
+                    for sample in _reservations(server)
                 )
 
             # The weights move once the previous epoch's processes exited,
-            # during the trial; its report states the bytes moved, and no
-            # event states the move.
+            # during the trial: its GPUs' quotas then reserve no weights of
+            # the previous epoch alone, which the leader's gauges state every
+            # second.
             server.wait_until(
-                moved_or_refused,
+                moved,
                 ADMITTED_S,
                 "the previous epoch's weights did not move",
             )
-            trial = admin.report(server)["update"]
-            print("kept:", json.dumps(trial))
-            assert not trial["host_refused"], trial
-            assert trial["previous_epoch_kept"] == "host", trial
             update = _fail_the_target(server, before)
         _rolled_back(applied.result())
+        print("kept:", json.dumps(update))
+        # The update states the move: the bytes moved, and no host that
+        # refused it.
+        assert not update["host_refused"], update
+        assert update["previous_epoch_kept"] == "host", update
+        assert update["moved_to_host_bytes"] > 0, update
         _assert_whole(stream)
         assert _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32) == (
             answer

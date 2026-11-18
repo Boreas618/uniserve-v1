@@ -14,10 +14,10 @@ case compares the greedy tokens of fixed prompts, one of several blocks with
 a partial last one, with an undivided deployment's on one GPU: a prefill
 group computes no decode, so the tokens after the first are the decode
 group's, computed over the blocks it was transferred. Each case also reads
-the scheduler's transfer counters on ``/metrics``
-(``specs/scheduler-design.md`` §7.5) once a report counts a transfer for
-every request it answered and states nothing running or waiting: no
-transfer failed.
+the scheduler's transfer counters in the observation store
+(``/admin/query``, ``specs/scheduler-design.md`` §7.5) once a report counts
+a transfer for every request it answered and states nothing running or
+waiting: no transfer failed.
 
 The one-host case places both groups on the module's two GPUs. The two-host
 case places the decode group on the first GPU of the run's second host
@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from uniserve_testing import chat, client
+from uniserve_testing import admin, chat, client
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.deployments import Deployments, two_hosts
 from uniserve_testing.packages import merged
@@ -78,8 +78,8 @@ OPTIONS: dict[str, Any] = {
 
 # The scheduler's transfer counters (``specs/scheduler-design.md`` §7.5): the
 # transfers answered ``Transferred`` and those answered ``Failed``.
-TRANSFERS = "uniserve:request_transfers"
-FAILED_TRANSFERS = "uniserve:request_transfers_failed"
+TRANSFERS = "uniserve_request_transfers_total"
+FAILED_TRANSFERS = "uniserve_request_transfer_failures_total"
 
 # Each prompt's greedy tokens, each by its token id with no candidate ranked
 # (`uniserve_testing.chat.ranked_tokens`).
@@ -145,24 +145,28 @@ def _failed_transfers(server: Server, requests: int) -> float:
     A failed transfer ends its request as migratable, and the request is
     computed and transferred again, so its failure is counted before its
     answer arrives. The scheduler reports its statistics once a report
-    period, and no event announces a report, so the case reads ``/metrics``
-    until one states the transfers.
+    period, and no event announces a report, so the case reads the
+    observation store until one states the transfers.
     """  # noqa: D205
-    base_url = server.base_url
 
     def reported() -> bool:
-        transferred = client.metric(base_url, TRANSFERS) + client.metric(
-            base_url, FAILED_TRANSFERS
+        transferred = admin.counter(server, TRANSFERS) + admin.counter(
+            server, FAILED_TRANSFERS
         )
-        busy = client.metric(
-            base_url, "uniserve:scheduler_running"
-        ) + client.metric(base_url, "uniserve:scheduler_waiting")
+        busy = sum(
+            sample.value
+            for name in (
+                "uniserve_scheduler_running_requests",
+                "uniserve_scheduler_waiting_requests",
+            )
+            for sample in admin.gauge(server, name)
+        )
         return transferred >= requests and busy == 0
 
     server.wait_until(
         reported, REPORTED_S, "the requests' transfers were not reported"
     )
-    return client.metric(base_url, FAILED_TRANSFERS)
+    return admin.counter(server, FAILED_TRANSFERS)
 
 
 @pytest.fixture(scope="module")

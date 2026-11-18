@@ -10,8 +10,10 @@ grows back into new segments once it ends. A pass that even every segment
 past the first cannot make room for is refused, naming its bytes.
 
 A pass's device storage is what its worker measures when the session starts
-(``docs/profiling.md``, Range profiler passes), which the session reports
-(``workers``' ``device_storage``).
+(``docs/profiling.md``, Range profiler passes), which the session's
+``profile`` event reports (``workers``' ``device_storage``); the quota is
+what the leader states of it each second (``uniserve_gpu_quota_bytes``,
+``uniserve_gpu_reserved_bytes``).
 """
 
 from __future__ import annotations
@@ -48,14 +50,28 @@ def served(module_deployments: Deployments) -> Iterator[Server]:
         yield server
 
 
-def _quota(server: Server) -> dict[str, Any]:
-    """The quota of the worker's GPU: the one its process item is in."""
-    [quota] = [
-        quota
-        for quota in admin.quotas(server)
-        if any(entry["item"] == "process" for entry in quota["reservations"])
-    ]
-    return quota
+def _quota(server: Server, after: int | None = None) -> dict[str, Any]:
+    """The quota of the worker's GPU, the one its process item is in, as the
+    leader states it each second (in a second after the moment `after`, when
+    stated): its ``limit`` and its ``reservations`` (each item's ``bytes``).
+    """  # noqa: D205
+    reserved = admin.gauge(server, "uniserve_gpu_reserved_bytes", after=after)
+    [(host, gpu)] = {
+        (entry.labels["host"], entry.labels["gpu"])
+        for entry in reserved
+        if entry.labels["item"] == "process"
+    }
+    [limit] = admin.gauge(
+        server, "uniserve_gpu_quota_bytes", after=after, host=host, gpu=gpu
+    )
+    return {
+        "limit": int(limit.value),
+        "reservations": [
+            {"item": entry.labels["item"], "bytes": int(entry.value)}
+            for entry in reserved
+            if (entry.labels["host"], entry.labels["gpu"]) == (host, gpu)
+        ],
+    }
 
 
 def _bytes(quota: dict[str, Any], item: str) -> int:
@@ -88,14 +104,14 @@ def test_the_cache_makes_room_for_a_session_and_grows_back(
     served: Server, tmp_path: Path
 ):
     before = _quota(served)
-    session = profiling.start(served, _session(tmp_path / "profiles"))
-    [worker] = session["workers"]
+    started = profiling.start(served, _session(tmp_path / "profiles"))
+    [worker] = started.fields["workers"]
     storage = worker["device_storage"]
     # The KV region takes the quota's rest to within an allocation granule of
     # each of its planes, which leaves a pass less room than it takes.
     assert storage > _room(before), (worker, before)
 
-    during = _quota(served)
+    during = _quota(served, after=started.time)
     assert _bytes(during, "process") == _bytes(before, "process") + storage
     given_back = _bytes(before, "cache_segment") - _bytes(
         during, "cache_segment"
@@ -103,9 +119,9 @@ def test_the_cache_makes_room_for_a_session_and_grows_back(
     assert given_back >= storage - _room(before), during
     assert _room(during) >= 0, during
 
-    stopped = profiling.stop(served)
+    stopped = profiling.stop(served, started)
     assert stopped["end_reason"] == "operator", stopped
-    after = _quota(served)
+    after = _quota(served, after=admin.now(served))
     assert _bytes(after, "process") == _bytes(before, "process"), after
     assert _bytes(after, "cache_segment") == _bytes(before, "cache_segment"), (
         after
@@ -117,26 +133,26 @@ def test_a_pass_no_withdrawal_makes_room_for_is_refused(
 ):
     # A pass of the default ranges, as its worker measures it.
     measured = profiling.start(served, _session(tmp_path / "measured"))
-    [worker] = measured["workers"]
+    [worker] = measured.fields["workers"]
     default_pass = worker["device_storage"]
-    profiling.stop(served)
+    profiling.stop(served, measured)
 
-    before = _quota(served)
+    before = _quota(served, after=admin.now(served))
     # A pass's storage grows with its ranges, in proportion to them
     # (docs/profiling.md): enough default passes' ranges to take the room
     # and every segment of the cache together, and one more pass's to cover
     # the rounding of its storage.
     beyond = _room(before) + _bytes(before, "cache_segment")
     ranges = DEFAULT_RANGES * (-(-beyond // default_pass) + 1)
-    refused = admin.request(
-        served, "POST", profiling.PROFILE, body=_session(tmp_path, ranges)
+    refused = admin.change(
+        served, {"profiling_config": {"session": _session(tmp_path, ranges)}}
     )
     assert refused.status_code == 400, refused.text
     # The refusal names the bytes the pass holds, as its worker measured
     # them: more than every withdrawal could make room for.
     named = re.search(r"holds (\d+) bytes", refused.text)
     assert named is not None and int(named[1]) > beyond, refused.text
-    after = _quota(served)
+    after = _quota(served, after=admin.now(served))
     assert _bytes(after, "cache_segment") == _bytes(before, "cache_segment"), (
         after
     )

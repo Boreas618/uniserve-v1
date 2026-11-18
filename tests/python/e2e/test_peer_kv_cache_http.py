@@ -7,20 +7,20 @@ buffer pool and its host KV cache there, while its daemon serves B's API on
 this host. B's ``kv_cache_config.peers`` names A's Storage Server. A answers
 a long prompt; its write policy stores every full block it commits to A's
 host tier, which A's own admission then loads back once its device copies
-are evicted (``POST /admin/flush_cache``): that answer is computed over the
-stored blocks. B then answers the same prompt: its admission finds the keys
-in neither its device nor its host tier, and since the peers could deepen
-the hit by at least ``prefetch_min_tokens``, it submits a ``Prefetch`` from
-the peers (``specs/scheduler-design.md`` §4.4). A's Storage Server holds the
-host copies by key (``PeerHold``) while the Transfer Server of B's host
-reads them through NIXL into B's host tier, and B's admission loads them.
-B's first answer finds nothing cached on B itself, so the prompt tokens it
-states as cached (:mod:`uniserve_testing.caching`) are tokens the peers
-brought, and its greedy tokens equal A's answer over the stored blocks,
-computed over the same keys and values. A prompt A never saw brings nothing
-from A; once A's Storage Server stops, B computes a prompt A stored, with
-the same tokens as A computed it, and no request fails (a tier's failure
-never fails a request, ``specs/buffer-pool.md`` §12.4).
+are evicted (a change of the package's ``flush``): that answer is computed
+over the stored blocks. B then answers the same prompt: its admission finds
+the keys in neither its device nor its host tier, and since the peers could
+deepen the hit by at least ``prefetch_min_tokens``, it submits a
+``Prefetch`` from the peers (``specs/scheduler-design.md`` §4.4). A's
+Storage Server holds the host copies by key (``PeerHold``) while the
+Transfer Server of B's host reads them through NIXL into B's host tier, and
+B's admission loads them. B's first answer finds nothing cached on B itself,
+so the prompt tokens it states as cached (:mod:`uniserve_testing.caching`)
+are tokens the peers brought, and its greedy tokens equal A's answer over
+the stored blocks, computed over the same keys and values. A prompt A never
+saw brings nothing from A; once A's Storage Server stops, B computes a
+prompt A stored, with the same tokens as A computed it, and no request fails
+(a tier's failure never fails a request, ``specs/buffer-pool.md`` §12.4).
 
 **Converted reuse across hosts.** Deployment B keeps its device KV blocks in
 FP8 (``kv_cache_config.dtype=float8_e4m3fn``) while A keeps BF16: a key
@@ -122,13 +122,13 @@ def _stored(server: Server, prompt: str) -> tuple[dict, dict]:
     """A's answers to `prompt`: computed whole, and computed over the blocks
     A's host tier stores once it holds every reusable one.
 
-    The prompt asked again finds its whole reuse limit on the device. Once
-    the device copies are evicted (``POST /admin/flush_cache``), the prompt
-    asked once more loads what the host tier holds, A's only other tier, so
-    its answer reuses the whole reuse limit once the host tier holds every
-    block. The write policy stores a block once it is committed, by a copy
-    its executor runs with the next batch, so the copies may still run when
-    the request has answered, and ``flush_cache`` answers without waiting
+    The prompt asked again finds its whole reuse limit on the device. Once the
+    device copies are evicted (:func:`uniserve_testing.admin.flush`), the
+    prompt asked once more loads what the host tier holds, A's only other
+    tier, so its answer reuses the whole reuse limit once the host tier
+    holds every block. The write policy stores a block once it is committed,
+    by a copy its executor runs with the next batch, so the copies may still
+    run when the request has answered, and a flush converges without waiting
     for them: the case evicts and asks again until the answer loads every
     block, a state the deployment announces no event of.
     """  # noqa: D205
@@ -137,8 +137,7 @@ def _stored(server: Server, prompt: str) -> tuple[dict, dict]:
     answers: list[dict] = []
 
     def loaded() -> bool:
-        flushed = admin.operation(server, "flush_cache")
-        assert flushed.status_code == 200, flushed.text
+        admin.flush(server)
         answers.append(_ask(server.base_url, prompt))
         return cached_tokens(answers[-1]) == reusable
 

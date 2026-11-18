@@ -8,7 +8,7 @@ and the policy the deployment serves names the live replica with the fewest
 requests in flight, rotating among equally loaded ones
 (``docs/architecture.md``, The request interface). Each replica's scheduler
 reports its admissions under its own ``scheduler`` label
-(``uniserve:scheduler_admitted``).
+(``uniserve_scheduler_admitted_requests_total``).
 
 Requests sent one at a time find both replicas idle, so the policy alternates
 between them and each admits half. While one replica holds a long request,
@@ -16,11 +16,11 @@ every request sent meanwhile finds the other replica with fewer in flight, so
 the other replica admits all of them.
 
 An answer does not state the replica that served it, and the schedulers'
-statistics reach ``/metrics`` in a report once a report period
-(``worker_config.report_period``, a second) that no event announces and no
-sequence number orders, so the case reads each replica's admissions from the
-reports: before a phase once they held still over several reports with
-nothing running, and after it once they count the phase's requests.
+statistics reach the observation store (``/admin/query``) in a report once a
+report period (``worker_config.report_period``, a second) that no event
+announces, so the case reads each replica's admissions from the reports:
+before a phase once they held still over several reports with nothing
+running, and after it once they count the phase's requests.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from uniserve_testing import chat, client
+from uniserve_testing import admin, chat
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.deployments import Deployments
 from uniserve_testing.servers import Server
@@ -47,8 +47,8 @@ SCHEDULERS = (0, 1)
 SEQUENTIAL = 6
 # Requests sent while a long one runs on one replica.
 BESIDE = 4
-ADMITTED = "uniserve:scheduler_admitted"
-RUNNING = "uniserve:scheduler_running"
+ADMITTED = "uniserve_scheduler_admitted_requests_total"
+RUNNING = "uniserve_scheduler_running_requests"
 # The successive reports, a report period apart, that must state the same
 # admissions with nothing running before a phase starts: the serving path's
 # own requests at start are counted by then.
@@ -61,10 +61,21 @@ QUIET_S = 120
 REPORTED_S = 60
 
 
-def _per_scheduler(base_url: str, name: str) -> dict[int, float]:
-    """The metric `name` of each replica's scheduler."""
+def _admitted(server: Server) -> dict[int, float]:
+    """The requests each replica's scheduler admitted so far."""
     return {
-        scheduler: client.metric(base_url, name, scheduler=str(scheduler))
+        scheduler: admin.counter(server, ADMITTED, scheduler=str(scheduler))
+        for scheduler in SCHEDULERS
+    }
+
+
+def _running(server: Server) -> dict[int, float]:
+    """The requests each replica's scheduler runs, by its latest report."""
+    return {
+        scheduler: sum(
+            sample.value
+            for sample in admin.gauge(server, RUNNING, scheduler=str(scheduler))
+        )
         for scheduler in SCHEDULERS
     }
 
@@ -78,8 +89,8 @@ def _quiet(server: Server) -> dict[int, float]:
 
     def still() -> bool:
         nonlocal last, held
-        now = _per_scheduler(server.base_url, ADMITTED)
-        running = any(_per_scheduler(server.base_url, RUNNING).values())
+        now = _admitted(server)
+        running = any(_running(server).values())
         held = held + 1 if now == last and not running else 0
         last = now
         return held >= QUIET_READS
@@ -98,7 +109,7 @@ def _admitted_since(
     grown: dict[int, float] = {}
 
     def counted() -> bool:
-        now = _per_scheduler(server.base_url, ADMITTED)
+        now = _admitted(server)
         grown.update(
             {scheduler: now[scheduler] - before[scheduler] for scheduler in now}
         )
@@ -150,11 +161,11 @@ def test_requests_are_served_by_the_replicas_the_policy_routes_them_to(
         with ThreadPoolExecutor(max_workers=1) as pool:
             long = pool.submit(_ask, base_url, "Count from 1 to 3000.", 3000)
             server.wait_until(
-                lambda: any(_per_scheduler(base_url, RUNNING).values()),
+                lambda: any(_running(server).values()),
                 REPORTED_S,
                 "the long request did not start",
             )
-            running = _per_scheduler(base_url, RUNNING)
+            running = _running(server)
             held = next(
                 scheduler for scheduler, count in running.items() if count > 0
             )

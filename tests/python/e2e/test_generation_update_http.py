@@ -39,11 +39,13 @@ The Build Server is the run's, so the module installs the serving packages
 it replaced again when it ends: their latest revisions are then the tree's
 kernels, which every later deployment of the run serves.
 
-The admin surface is the operator socket's: `PUT /admin/policy`, answered
-once the change committed or ended, events whose `kind` is `update` and whose
-`data` is the update as it stood, its `phase` among them, and the status
-report's `epochs` array whose elements carry `kernels` and `previous_kernels`
-as a list of `{op, phase, package: {backend, revision, arguments}}`.
+The admin surface is the admin socket's: `PUT /admin/policy`, answered once
+the change committed or ended, and the observation store (`/admin/query`):
+the `log` events of source `update`, whose fields are the update as it
+entered each phase, its `phase` among them, and the gauge
+`uniserve_replica_module`, 1 for each module a replica runs, labelled with
+its interface (`op`: `engine`, `program` for the scheduling policy, or a
+kernel's operator), `backend` and `revision`.
 """
 
 from __future__ import annotations
@@ -53,14 +55,13 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 import pytest
 from uniserve_testing import admin, builds, chat, updates
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.builds import BuildServer
-from uniserve_testing.client import metric
 from uniserve_testing.deployments import Deployments, Settings
 from uniserve_testing.packages import merged
 from uniserve_testing.servers import Server
@@ -138,8 +139,7 @@ def server(module_deployments: Deployments) -> Iterator[Server]:
 
     Module-scoped because the cases are one epoch history — a rebind, a
     recapture with its policy, a rollback and a refusal — each read back
-    through the status report and ``/metrics`` against the same deployment's
-    records.
+    through the observation store against the same deployment's records.
     """
     with module_deployments.serve(
         merged(
@@ -314,37 +314,73 @@ def _update(server: Server) -> None:
     """Apply the newly installed revisions as a generation update, answered
     once it stood its trial and committed.
     """  # noqa: D205
-    before = admin.next_event(server)
+    before = admin.now(server)
     admin.revision(admin.change(server, _reselect(server)))
-    update = admin.wait_for_phase(
-        server, "committed", "abandoned", "rolled_back", after=before
-    )
+    update = admin.wait_for_log(
+        server,
+        "update",
+        after=before,
+        phase=("committed", "abandoned", "rolled_back"),
+    ).fields
     assert update["phase"] == "committed", update
 
 
-def epoch_record(server: Server) -> dict:
-    """The epoch the deployment serves, as the daemon records it.
+#: The interfaces of a module set that are no kernel package: the engine and
+#: the scheduling policy (``proto::module``).
+ENGINE = "engine"
+POLICY = "program"
 
-    The status report states every epoch, ascending; the one that serves is
-    the highest-numbered epoch in `serving` or `trial`, and `/admin/events`
-    names it by number (`data.epoch`).
-    """
-    epochs = admin.report(server)["epochs"]
-    live = [
-        epoch for epoch in epochs if epoch.get("status") in ("serving", "trial")
-    ]
-    assert live, f"the deployment serves no epoch: {epochs}"
-    return max(live, key=lambda epoch: epoch["epoch"])
+
+class Modules(NamedTuple):
+    """The modules replica 0 runs, each as ``(op, backend, revision)``: its
+    kernel packages and its scheduling policy.
+    """  # noqa: D205
+
+    kernels: frozenset[tuple[str, str, str]]
+    policy: frozenset[tuple[str, str, str]]
+
+
+def epoch_record(server: Server) -> Modules:
+    """The modules the deployment's serving replica runs, as the leader
+    recorded them when the deployment last converged: the series of
+    ``uniserve_replica_module`` at 1 for replica 0. The leader states the
+    gauge at each convergence alone, a module no longer run at 0, so it is
+    read over the store's whole retention (``after=0``).
+    """  # noqa: D205
+    running = {
+        (
+            sample.labels["op"],
+            sample.labels["backend"],
+            sample.labels["revision"],
+        )
+        for sample in admin.gauge(
+            server, "uniserve_replica_module", after=0, replica="0"
+        )
+        if sample.value == 1
+    }
+    assert running, "the deployment recorded no module it runs"
+    return Modules(
+        kernels=frozenset(
+            module for module in running if module[0] not in (ENGINE, POLICY)
+        ),
+        policy=frozenset(module for module in running if module[0] == POLICY),
+    )
 
 
 def mapped_within_budget(server: Server) -> None:
     """The allocator's mapped bytes stay within the device's budget.
 
     The deployment serves one device, so the bytes every pool mapped there
-    and the device's budget are the sums of their metrics.
+    and the device's budget are the sums of their gauges' latest values.
     """
-    budget = metric(server.base_url, "uniserve:memory_budget")
-    mapped = metric(server.base_url, "uniserve:memory_mapped")
+    budget = sum(
+        sample.value
+        for sample in admin.gauge(server, "uniserve_memory_budget_bytes")
+    )
+    mapped = sum(
+        sample.value
+        for sample in admin.gauge(server, "uniserve_memory_mapped_bytes")
+    )
     assert budget > 0, "the deployment published no memory budget"
     assert mapped <= budget, f"mapped {mapped} exceeds the budget {budget}"
 
@@ -368,16 +404,15 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
 
     _update(server)
     after = epoch_record(server)
-    assert after["kernels"] != before["kernels"], (
+    assert after.kernels != before.kernels, (
         "the generation update did not change the recorded kernel packages"
     )
     revisions = {
-        entry["package"]["revision"]
-        for entry in after["kernels"]
-        if isinstance(entry.get("package"), dict)
+        int(module_revision) for _, _, module_revision in after.kernels
     }
     assert revision in revisions, (
-        f"the recorded modules name no revision {revision}: {after['kernels']}"
+        f"the recorded modules name no revision {revision}: "
+        f"{sorted(after.kernels)}"
     )
     assert_no_failures("the rebind swap", traffic)
     mapped_within_budget(server)
@@ -407,10 +442,10 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
         # request in flight here would race `assert_no_failures` below.
         resident.close()
     after = epoch_record(server)
-    assert after["kernels"] != before["kernels"], (
+    assert after.kernels != before.kernels, (
         "the recapture swap did not change the recorded kernel packages"
     )
-    assert after["policy"] != before["policy"], (
+    assert after.policy != before.policy, (
         "the policy swap did not change the recorded policy"
     )
     assert_no_failures("the recapture and policy swap", traffic)
@@ -430,23 +465,23 @@ def test_a_rollback_restores_the_previous_generation(
     # The serving policy installed again: its next revision, the same code.
     build_server.install(repository / builds.POLICY_PACKAGE)
 
-    after_event = admin.next_event(server)
+    after_event = admin.now(server)
     with admin.changing(server, _reselect(server)) as change:
-        admin.wait_for_phase(server, "trial", after=after_event)
-        on_trial = epoch_record(server)
-        assert on_trial["policy"] != before["policy"], (
-            "the policy swap did not change the recorded policy"
-        )
-        assert on_trial["previous_policy"] is not None, (
-            "the epoch on trial kept no previous policy to roll back to"
-        )
+        # The policy swap is a generation of the serving epoch on trial.
+        on_trial = admin.wait_for_log(
+            server, "update", after=after_event, phase="trial"
+        ).fields
+        assert on_trial["change"] == "generation", on_trial
         # The loop slowed computes a fraction of the tokens per second it
         # computed before the switch, which the trial reads at its next
         # window.
         with traffic.slowed(TRICKLE_S):
-            update = admin.wait_for_phase(
-                server, "committed", "rolled_back", after=after_event
-            )
+            update = admin.wait_for_log(
+                server,
+                "update",
+                after=after_event,
+                phase=("committed", "rolled_back"),
+            ).fields
         response = change.result()
     print("rolled back:", json.dumps(update))
     assert update["phase"] == "rolled_back", update
@@ -456,10 +491,10 @@ def test_a_rollback_restores_the_previous_generation(
     assert "throughput_regression" in response.text, response.text
 
     after = epoch_record(server)
-    assert after["kernels"] == before["kernels"], (
+    assert after.kernels == before.kernels, (
         "the rollback did not restore the previous kernel packages"
     )
-    assert after["policy"] == before["policy"], (
+    assert after.policy == before.policy, (
         "the rollback did not restore the previous policy"
     )
     assert_no_failures("the rollback", traffic)
@@ -483,13 +518,19 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
     resident = _resident(server.base_url, PROMPTS[1])
     try:
         # The update is abandoned while it prepares, which the answer states
-        # with its reason (`409`), and the report with the update as it
-        # ended.
+        # with its reason (`409`), and its `update` event with the update as
+        # it ended.
+        after_event = admin.now(server)
         response = admin.change(server, _reselect(server))
     finally:
         resident.close()
     assert response.status_code == 409, response.text
-    update = admin.report(server)["update"]
+    update = admin.wait_for_log(
+        server,
+        "update",
+        after=after_event,
+        phase=("committed", "abandoned", "rolled_back"),
+    ).fields
     assert update["phase"] == "abandoned", update
     assert update["failure"]["kind"] == "prepare_failed", update
     refusal = update["failure"]["reason"]
@@ -512,10 +553,11 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
     )
 
     after = epoch_record(server)
-    assert after["kernels"] == before["kernels"], (
+    assert after.kernels == before.kernels, (
         "a refused update changed the serving generation"
     )
-    assert after["status"] in ("serving", "trial"), after["status"]
+    serving = admin.replica(server)
+    assert serving.state == "serving", serving
     assert_no_failures("the refused wrong kernel", traffic)
     mapped_within_budget(server)
 

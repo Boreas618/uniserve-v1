@@ -110,15 +110,14 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
         deployments.serve(config, serving=False) as server,
         deployments.follower(peer_host, server, repository),
     ):
-        # The standby epoch over both hosts parked with its graphs. No event
-        # of the node's log announces a standby that parks: the status
-        # states it once it parked.
+        # The standby epoch over both hosts parked with its graphs: the
+        # leader states its launch generations once it parked.
         server.wait_until(
-            lambda: admin.status(server)["deployment"]["standby"],
+            lambda: admin.replica(server).standby,
             STANDBY_S,
             "the deployment reported no parked standby",
         )
-        before = admin.status(server)["deployment"]
+        before = admin.replica(server)
         with httpx.stream(
             "POST",
             f"{server.base_url}/v1/chat/completions",
@@ -143,10 +142,10 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
             entry["token"]
             for entry in answer["choices"][0]["logprobs"]["content"]
         ]
-        after = admin.status(server)["deployment"]
+        after = admin.replica(server, after=admin.now(server))
 
     # The domain's standby epoch serves now, rather than an engine launched
     # anew, and the request continued on it where the kill stopped it.
-    assert after["generation"] == before["standby"][0], (before, after)
+    assert after.generation == before.standby[0], (before, after)
     assert streamed == reference
     assert usage == answer["usage"]

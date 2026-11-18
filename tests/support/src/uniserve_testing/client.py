@@ -1,9 +1,9 @@
 """What the end-to-end cases ask a deployment's client API, and how they
 read its answers.
 
-One helper per question, shared by every case: a deployment's metrics
-(``/metrics``, read with Prometheus' own text parser), a streamed answer's
-events, and the deployment layouts a case's packages state.
+One helper per question, shared by every case: a streamed answer's events,
+and the deployment layouts a case's packages state. What a deployment
+measures is read through its admin socket (:mod:`uniserve_testing.admin`).
 """  # noqa: D205
 
 from __future__ import annotations
@@ -13,30 +13,6 @@ from collections.abc import Mapping
 from typing import Any
 
 import httpx
-from prometheus_client.parser import text_string_to_metric_families
-
-
-def metric(base_url: str, name: str, **labels: str) -> float:
-    """The sum of the samples of the metric family `name` on ``/metrics``
-    over its label sets, or over those holding every label of `labels`, such
-    as ``mode="eager"``. A counter's family is named without its ``_total``
-    suffix, which its samples carry.
-    """  # noqa: D205
-    text = httpx.get(f"{base_url}/metrics", timeout=10).text
-    total = 0.0
-    # The samples are matched by their own names, whatever family the parser
-    # files them under: a counter's samples carry the `_total` suffix its
-    # `TYPE` line does not, and the text parser then files them under a
-    # family of their own name rather than the counter's.
-    for family in text_string_to_metric_families(text):
-        for sample in family.samples:
-            if sample.name not in (name, f"{name}_total"):
-                continue
-            if all(
-                sample.labels.get(key) == value for key, value in labels.items()
-            ):
-                total += sample.value
-    return total
 
 
 def post_sse(

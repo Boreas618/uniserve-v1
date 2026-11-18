@@ -44,13 +44,14 @@ that reads the trial serves with a trial of :data:`READ_TRIAL`, one whose
 target a fault rolls back with :data:`FAULT_TRIAL`, and one that reads
 nothing of the trial with :data:`SHORT_TRIAL`. What the tests check is what
 the admin API reports: ``PUT /admin/policy`` answers the revision the change
-converged to, the status's ``report`` the epoch that executes
-(``executing``), the update with its phase (``update``), the node's main
-processes (``processes``) and every GPU's quota (``quotas``), ``GET
-/admin/policy`` the configuration that serves, ``GET /admin/events`` the
-phases an update enters, and ``/metrics`` the prefix cache's counters. The
-tests print the time of every switch. Each test's deployment runs a
-Storage Server of its own.
+converged to and ``GET /admin/policy`` states the configuration that serves;
+the observation store (``/admin/query``) holds the update as it entered each
+phase (``log`` events of source ``update``), the main processes' states
+(``process`` events), the epoch replica 0 executes
+(``uniserve_replica_epoch``), every GPU's quota and its reservations
+(``uniserve_gpu_quota_bytes``, ``uniserve_gpu_reserved_bytes``) and the
+prefix cache's counters. The tests print the time of every switch. Each
+test's deployment runs a Storage Server of its own.
 """
 
 from __future__ import annotations
@@ -113,8 +114,6 @@ OTHER_LAYOUT: Config = {
 }
 # The items of a GPU's quota an epoch holds while it serves.
 EPOCH_ITEMS = ("weights", "cache_segment", "graph_pool", "process")
-# The states the daemon reports of a main process that no longer runs.
-ENDED_STATES = ("stopped", "failed")
 
 #: The trial of a case that reads the target on trial: longer than what the
 #: case reads takes (a few reports of the schedulers, a few dozen tokens of
@@ -143,8 +142,9 @@ STREAM_GAP_S = 1800.0
 #: another followed.
 REPORT_SETTLE_S = 2.0
 
-#: How long a request's prefix cache query takes to reach ``/metrics``, in
-#: seconds (scaled): the report that carries it follows within a second.
+#: How long a request's prefix cache query takes to reach the observation
+#: store, in seconds (scaled): the report that carries it follows within a
+#: second.
 QUERY_REPORTED_S = 30.0
 
 #: How long a commit or a rollback takes to release what only one epoch held,
@@ -275,23 +275,26 @@ class Streaming:
 
 
 def _executing(server: Server) -> int:
-    """The epoch that serves, which the status report states."""
-    executing = admin.report(server)["executing"]
-    assert executing["state"] == "serving", executing
-    return executing["epoch"]
+    """The epoch that serves, as the leader states replica 0's."""
+    serving = admin.replica(server)
+    assert serving.state == "serving", serving
+    assert serving.epoch is not None, serving
+    return serving.epoch
 
 
 @dataclass
 class Trial:
     """An epoch change on trial: the update as its trial began, the epoch on
-    trial, the answer the change's ``PUT`` will give, and the node's event
-    before the change, from which its phases are read.
+    trial, the answer the change's ``PUT`` will give, the daemon's clock
+    before the change, after which its phases are read, and the moment its
+    trial began, after which the gauges state the trial.
     """  # noqa: D205
 
     update: dict[str, Any]
     epoch: int
     answer: Future[httpx.Response]
     after: int
+    began: int
 
 
 @contextmanager
@@ -300,15 +303,21 @@ def _on_trial(server: Server, changes: Config) -> Iterator[Trial]:
     a thread of its own; the change once its target is on trial, while the
     block runs. The block's end waits for the change's answer.
     """  # noqa: D205
-    after = admin.next_event(server)
+    after = admin.now(server)
     with admin.changing(server, changes) as answer:
-        update = admin.wait_for_phase(
-            server, "trial", "abandoned", "rolled_back", after=after
+        entered = admin.wait_for_log(
+            server,
+            "update",
+            after=after,
+            phase=("trial", "abandoned", "rolled_back"),
         )
+        update = entered.fields
         assert update["phase"] == "trial", update
         assert update["change"] == "epoch", update
         print(f"switch: {update['switch_ms']} ms")
-        yield Trial(update, _executing(server), answer, after)
+        yield Trial(
+            update, _executing(server), answer, after, began=entered.time
+        )
 
 
 def _committed(trial: Trial) -> dict[str, Any]:
@@ -327,7 +336,9 @@ def _fault(server: Server, trial: Trial) -> dict[str, Any]:
     """  # noqa: D205
     target = admin.serving_engine(server)["pid"]
     os.kill(target, signal.SIGKILL)
-    update = admin.wait_for_phase(server, "rolled_back", after=trial.after)
+    update = admin.wait_for_log(
+        server, "update", after=trial.after, phase="rolled_back"
+    ).fields
     assert update["failure"]["kind"] in PROCESS_EXIT, update
     answer = trial.answer.result()
     assert answer.status_code == 409, answer.text
@@ -346,18 +357,17 @@ def _change_under_traffic(
     live request regardless of the number of requests preparation spans.
     """  # noqa: D205
     streams = [streaming]
-    after = admin.next_event(server)
+    after = admin.now(server)
     with (
         admin.changing(server, changes) as answer,
         ThreadPoolExecutor(max_workers=1) as executor,
     ):
         on_trial = executor.submit(
-            admin.wait_for_phase,
+            admin.wait_for_log,
             server,
-            "trial",
-            "abandoned",
-            "rolled_back",
+            "update",
             after=after,
+            phase=("trial", "abandoned", "rolled_back"),
         )
         while True:
             wait((on_trial, streams[-1].done), return_when=FIRST_COMPLETED)
@@ -365,7 +375,7 @@ def _change_under_traffic(
                 break
             streams[-1].join()
             streams.append(Streaming(server))
-        update = on_trial.result()
+        update = on_trial.result().fields
         assert update["phase"] == "trial", update
         streams[-1].mark()
         epoch = update["epoch"]
@@ -374,16 +384,43 @@ def _change_under_traffic(
     return epoch, streams
 
 
-def _quotas(server: Server) -> list[dict[str, Any]]:
+def _epochs(label: str) -> tuple[int, ...]:
+    """The epochs a reservation's ``epochs`` label names, comma-joined."""
+    return tuple(int(epoch) for epoch in label.split(",") if epoch)
+
+
+def _quotas(server: Server, after: int | None = None) -> list[dict[str, Any]]:
     """Every GPU's quota of the deployment, each of whose reservations' bytes
-    sum to no more than its limit.
+    sum to no more than its limit, as the leader stated them in a second
+    after the moment `after` (the daemon's clock now by default): each
+    quota's ``limit`` and its ``reservations``, each with its ``item``,
+    ``epochs`` and ``bytes``.
     """  # noqa: D205
-    quotas = admin.quotas(server)
+    if after is None:
+        after = admin.now(server)
+    quotas: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def quota(labels: dict[str, str]) -> dict[str, Any]:
+        gpu = (labels["host"], labels["gpu"])
+        return quotas.setdefault(gpu, {"limit": None, "reservations": []})
+
+    for sample in admin.gauge(server, "uniserve_gpu_quota_bytes", after=after):
+        quota(sample.labels)["limit"] = int(sample.value)
+    for sample in admin.gauge(
+        server, "uniserve_gpu_reserved_bytes", after=after
+    ):
+        quota(sample.labels)["reservations"].append(
+            {
+                "item": sample.labels["item"],
+                "epochs": _epochs(sample.labels["epochs"]),
+                "bytes": int(sample.value),
+            }
+        )
     assert quotas, "the deployment reports no quota"
-    for quota in quotas:
-        used = sum(entry["bytes"] for entry in quota["reservations"])
-        assert quota["limit"] is not None and used <= quota["limit"], quota
-    return quotas
+    for stated in quotas.values():
+        used = sum(entry["bytes"] for entry in stated["reservations"])
+        assert stated["limit"] is not None and used <= stated["limit"], stated
+    return list(quotas.values())
 
 
 def _epochs_of(quotas: list[dict[str, Any]], item: str) -> set[tuple[int, ...]]:
@@ -396,23 +433,26 @@ def _epochs_of(quotas: list[dict[str, Any]], item: str) -> set[tuple[int, ...]]:
     }
 
 
-def _segments_of(server: Server, epoch: int) -> int:
-    """The KV cache segments `epoch` holds on the deployment's GPUs."""
+def _segments_of(server: Server, epoch: int, after: int | None = None) -> int:
+    """The KV cache segments `epoch` holds on the deployment's GPUs, in a
+    second after the moment `after` (:func:`_quotas`).
+    """  # noqa: D205
     return sum(
         1
-        for entry in admin.reservations(server)
+        for quota in _quotas(server, after)
+        for entry in quota["reservations"]
         if entry["item"] == "cache_segment" and epoch in entry["epochs"]
     )
 
 
 def _running_engines(server: Server) -> set[int]:
-    """The process ids of the deployment's main processes that run, as the
-    daemon reports them (``processes``).
+    """The process ids of the deployment's main processes that run, as their
+    latest ``process`` events state them.
     """  # noqa: D205
     return {
         process["pid"]
-        for process in admin.engine_processes(server)
-        if process["pid"] is not None and process["state"] not in ENDED_STATES
+        for process in admin.processes(server, group="engine")
+        if process["pid"] is not None and process["state"] not in admin.ENDED
     }
 
 
@@ -420,8 +460,9 @@ def _released(server: Server, epoch: int, previous: set[int]) -> None:
     """Return once the quotas reserve the committed `epoch` alone and the
     previous epoch's main processes `previous` ended.
 
-    The commit's phase is an event, but the releases that follow it are not:
-    the processes' exits and the reservations' ends are read every second.
+    The releases follow the commit's phase: the processes' exits are their
+    ``process`` events and the reservations' ends the quotas' gauges, which
+    are read every second.
     """  # noqa: D205
     server.wait_until(
         lambda: all(
@@ -445,17 +486,21 @@ def _counters(server: Server) -> dict[str, float]:
     loaded from the host tier (``host_hits``).
     """  # noqa: D205
     return {
-        name: client.metric(server.base_url, f"uniserve:prefix_cache_{name}")
-        for name in ("queries", "hits", "host_hits")
+        name: admin.counter(server, f"uniserve_prefix_cache_{counter}_total")
+        for name, counter in (
+            ("queries", "queried_tokens"),
+            ("hits", "hit_tokens"),
+            ("host_hits", "host_hit_tokens"),
+        )
     }
 
 
 def _query_reported(server: Server, queries: float, what: str) -> None:
-    """Return once ``/metrics`` counts more prefix cache queries than
-    `queries`.
+    """Return once the observation store counts more prefix cache queries
+    than `queries`.
 
-    The counters reach ``/metrics`` with the schedulers' reports, which no
-    event of the node's log announces, so they are read every second.
+    The counters reach the store with the schedulers' reports, which no
+    event announces, so they are read every second.
     """  # noqa: D205
     server.wait_until(
         lambda: _counters(server)["queries"] > queries, QUERY_REPORTED_S, what
@@ -554,7 +599,7 @@ def test_an_epoch_change_continues_a_streaming_request_and_commits(
             # are reserved once, held by both, beside each epoch's graph
             # pool and process.
             assert engines_before <= _running_engines(server), engines_before
-            quotas = _quotas(server)
+            quotas = _quotas(server, trial.began)
             both = (serving, trial.epoch)
             assert _epochs_of(quotas, "weights") == {both}, quotas
             assert both in _epochs_of(quotas, "cache_segment"), quotas
@@ -697,7 +742,7 @@ def test_a_change_of_the_engine_alone_invalidates_nothing(
         # target maps every weight the serving epoch holds.
         change = updates.engine_revision(build_server, repository)
         with _on_trial(server, change) as trial:
-            weights = _epochs_of(_quotas(server), "weights")
+            weights = _epochs_of(_quotas(server, trial.began), "weights")
             assert weights == {(serving, trial.epoch)}, weights
             _committed(trial)
 
@@ -745,12 +790,12 @@ def test_a_change_of_layout_moves_device_memory_and_reaches_the_host_tier(
             # The two layouts' device memory is never in two regions: no
             # segment is reserved for both epochs, the drained epoch holds
             # fewer than it did, and the target holds the rest.
-            quotas = _quotas(server)
+            quotas = _quotas(server, trial.began)
             assert (serving, trial.epoch) not in _epochs_of(
                 quotas, "cache_segment"
             ), quotas
-            assert _segments_of(server, serving) < held, quotas
-            assert _segments_of(server, trial.epoch) > 0, quotas
+            assert _segments_of(server, serving, trial.began) < held, quotas
+            assert _segments_of(server, trial.epoch, trial.began) > 0, quotas
 
             # The migrated request streams on the target, so its admission
             # is counted before the cached prompt's is read.
@@ -799,9 +844,22 @@ def _kept(previous_epoch: str) -> Config:
     return {"update_config": {"previous_epoch": previous_epoch}}
 
 
-def _weights_of(server: Server) -> set[tuple[int, ...]]:
-    """The sets of epochs holding weights on the deployment's GPUs."""
-    return _epochs_of(_quotas(server), "weights")
+def _weights_of(
+    server: Server, after: int | None = None
+) -> set[tuple[int, ...]]:
+    """The sets of epochs holding weights on the deployment's GPUs, in a
+    second after the moment `after` (:func:`_quotas`).
+    """  # noqa: D205
+    return _epochs_of(_quotas(server, after), "weights")
+
+
+def _last_update(server: Server) -> dict[str, Any]:
+    """The update as it entered its latest phase: the fields of the latest
+    ``log`` event of source ``update``.
+    """  # noqa: D205
+    entered = admin.logs(server, "update")
+    assert entered, "the deployment recorded no update"
+    return entered[-1].fields
 
 
 @pytest.mark.parametrize(
@@ -840,6 +898,7 @@ def test_a_change_of_model_files_loads_the_targets_weights(
         streaming = Streaming(server)
         streaming.wait_for(EARLY_TOKENS)
 
+        rolled: dict[str, Any] | None = None
         with _on_trial(server, change) as trial:
             streaming.mark()
             epoch = trial.epoch
@@ -847,23 +906,15 @@ def test_a_change_of_model_files_loads_the_targets_weights(
             assert update["shrink"] is False, update
             if previous_epoch == "host":
                 # The previous epoch's weights the target does not map leave
-                # its GPU for host storage while the target serves; the
-                # update reports the move, which no event announces.
-                def moved() -> bool:
-                    report = admin.report(server)["update"]
-                    return (
-                        report["moved_to_host_bytes"] > 0
-                        or report["host_refused"]
-                    )
-
+                # its GPU for host storage while the target serves, which no
+                # event announces: the GPU's quota then reserves none of them
+                # for the previous epoch alone. The update states the bytes
+                # it moved in the phase it enters next.
                 server.wait_until(
-                    moved,
+                    lambda: (previous,) not in _weights_of(server),
                     MOVE_TO_HOST_S,
                     "the previous epoch's weights did not move",
                 )
-                update = admin.report(server)["update"]
-                assert not update["host_refused"], update
-            assert update["previous_epoch_kept"] == previous_epoch, update
 
             # The target answers with its own weights. Both epochs hold the
             # tensors the checkpoints share; the previous epoch keeps its
@@ -884,9 +935,17 @@ def test_a_change_of_model_files_loads_the_targets_weights(
                 rolled = _fault(server, trial)
                 print(f"rolled back: {json.dumps(rolled)}")
 
+        # The update states what the previous epoch kept through the trial,
+        # and, kept in host storage, that the node moved its weights there.
+        ended = rolled if rolled is not None else _last_update(server)
+        assert ended["previous_epoch_kept"] == previous_epoch, ended
+        if previous_epoch == "host":
+            assert not ended["host_refused"], ended
+            assert ended["moved_to_host_bytes"] > 0, ended
+
         if end == "commit":
             # The weights' reservations end once the released epoch's
-            # processes exited, which no event announces.
+            # processes exited, which the quota states.
             server.wait_until(
                 lambda: _weights_of(server) == {(epoch,)},
                 RELEASE_S,

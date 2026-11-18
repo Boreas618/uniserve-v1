@@ -21,7 +21,6 @@ dependencies = [
     "numpy",
     "nvidia-ml-py",
     "pillow>=10.4",
-    "prometheus-client",
     "pytest>=8.1",
     "tomli-w",
     # The tokenizer of a checkpoint a case serves, by its repository.

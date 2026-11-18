@@ -302,7 +302,7 @@ def _disconnect(server: Server, payload: dict) -> None:
     while the engine generates it, as a client that goes away does.
 
     The engine announces no admission of a request, so the deployment's
-    in-flight count (``GET /admin/status``) is read until it holds the
+    in-flight count (``uniserve_requests_in_flight``) is read until it holds the
     request; the connection then closes before any answer arrives.
     """  # noqa: D205
     address = urllib.parse.urlsplit(server.base_url)
@@ -315,7 +315,15 @@ def _disconnect(server: Server, payload: dict) -> None:
             headers={"Content-Type": "application/json"},
         )
         server.wait_until(
-            lambda: admin.status(server)["deployment"]["in_flight"] > 0,
+            lambda: (
+                sum(
+                    sample.value
+                    for sample in admin.gauge(
+                        server, "uniserve_requests_in_flight"
+                    )
+                )
+                > 0
+            ),
             media.GENERATION_S,
             "the engine did not take the request",
             interval_s=media.READ_S,

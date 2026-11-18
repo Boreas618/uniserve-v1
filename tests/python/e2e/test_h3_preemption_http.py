@@ -23,9 +23,9 @@ that continues it:
   prepares, and the serving engine's process is paused (``SIGSTOP``, as
   fault-injection suites pause a process) after its first denoising step and
   continued once the switch begins: the drain then lands at a step boundary
-  of the trajectory, whatever the two durations. The admin API holds no
-  pause at a step boundary (``POST /admin/pause_generation`` holds new
-  requests only), so the process is paused by its signal.
+  of the trajectory, whatever the two durations. The package holds no pause
+  at a step boundary (``paused = true`` holds new requests only), so the
+  process is paused by its signal.
 
 Each preempted video is the reference video, frame for frame and sample
 for sample. Preemption starts only after the public job status reports
@@ -212,21 +212,23 @@ def _change_under_a_denoising_request(
     The job starts once the target prepares. The serving engine's process
     is paused after the job's first denoising step and continued once the
     switch begins, so the drain finds the job mid-trajectory. The phases are
-    the node's ``update`` events, which the daemon writes from its own state
+    the ``update`` log events, which the daemon writes from its own state
     while the serving engine is paused.
     """  # noqa: D205
-    after = admin.next_event(server)
+    after = admin.now(server)
     with admin.changing(server, changes) as change:
-        admin.wait_for_phase(server, "preparing", after=after)
+        admin.wait_for_log(server, "update", after=after, phase="preparing")
         job = _start_job(server)
         media.wait_for_job(server, job, _denoised(1), "the job did not denoise")
         engine = admin.serving_engine(server)["pid"]
         os.kill(engine, signal.SIGSTOP)
         try:
-            admin.wait_for_phase(server, "switching", after=after)
+            admin.wait_for_log(server, "update", after=after, phase="switching")
         finally:
             os.kill(engine, signal.SIGCONT)
-        trial = admin.wait_for_phase(server, "trial", after=after)
+        trial = admin.wait_for_log(
+            server, "update", after=after, phase="trial"
+        ).fields
         record = admin.revision(change.result())
     assert record["effect"] == "epoch", record
     return job, trial
@@ -243,11 +245,9 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         # it from the stored step.
         job = _start_job(server)
         media.wait_for_job(server, job, _denoised(2), "the job did not denoise")
-        slept = admin.operation(server, "sleep")
-        assert slept.status_code == 200, slept.text
+        admin.revision(admin.change(server, {"asleep": True}))
         assert media.job(server, job)["status"] not in ("failed", "completed")
-        woke = admin.operation(server, "wake_up")
-        assert woke.status_code == 200, woke.text
+        admin.revision(admin.change(server, {"asleep": False}))
         media.assert_same_media(
             media.job_video(server, job).content, reference, tolerance=0
         )

@@ -55,11 +55,13 @@ def served(module_deployments: Deployments) -> Iterator[Server]:
 def test_collectors_cupti_cannot_run_beside_it_are_refused(
     served: Server, tmp_path: Path, request_body: dict[str, Any]
 ):
-    response = admin.request(
+    response = admin.change(
         served,
-        "POST",
-        profiling.PROFILE,
-        body={**request_body, "output_dir": str(tmp_path)},
+        {
+            "profiling_config": {
+                "session": {**request_body, "output_dir": str(tmp_path)}
+            }
+        },
     )
     assert response.status_code == 400, response.text
     assert "profiling_config.graph_pc_sampling" in response.text
@@ -70,7 +72,7 @@ def test_pc_samples_name_the_kernels_graphs_launch(
 ):
     output = tmp_path / "profiles"
     with Load(served):
-        profiling.start(
+        started = profiling.start(
             served,
             {
                 "collectors": ["timeline", "pc_sampling"],
@@ -81,7 +83,7 @@ def test_pc_samples_name_the_kernels_graphs_launch(
                 "output_dir": str(output),
             },
         )
-        session = profiling.ended(served)
+        session = profiling.ended(served, started)
     assert session["end_reason"] == "window", session
 
     [path] = sorted(output.glob("*.sqlite"))

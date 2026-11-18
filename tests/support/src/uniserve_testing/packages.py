@@ -11,8 +11,9 @@ A test states a configuration as the tree ``config.toml`` holds: nested
 mappings for its tables, lists for its arrays (an array of tables a list of
 mappings), and strings, numbers and booleans for its values, as
 :mod:`tomllib` reads the file and :mod:`tomli_w` writes it. :func:`merged`
-composes such trees, :func:`write` writes one as a package directory and
-:func:`archive` as the archive a ``PUT`` carries.
+composes such trees and :func:`without` removes options from one,
+:func:`write` writes one as a package directory and :func:`archive` as the
+archive a ``PUT`` carries.
 """
 
 from __future__ import annotations
@@ -52,6 +53,24 @@ def merged(*configs: Config) -> dict[str, Any]:
                 result[key] = merged(value)
             else:
                 result[key] = value
+    return result
+
+
+def without(config: Config, *removed: str) -> dict[str, Any]:
+    """`config` less the options `removed` names, each a dotted path of
+    tables to an option or a table (``profiling_config.session``); a path
+    `config` does not state is no change.
+    """  # noqa: D205
+    result = merged(config)
+    for path in removed:
+        *tables, option = path.split(".")
+        table: Any = result
+        for name in tables:
+            table = table.get(name)
+            if not isinstance(table, dict):
+                break
+        else:
+            table.pop(option, None)
     return result
 
 

@@ -1,12 +1,19 @@
 """The profiling cases' Qwen3 deployment, the decode load they profile, and
-the session calls of its admin API (``/admin/profile``, ``docs/profiling.md``).
+its profiling sessions (``docs/profiling.md``).
+
+A session is an option of the deployment's package, the table
+``[profiling_config.session]``: while the package states it, the serving
+epoch's workers run it, a change of it ends the running session and starts
+the new one, and its removal ends it. Each state a session enters is a
+``log`` event of source ``profile`` (:mod:`uniserve_testing.admin`).
 
 A profiling module serves one deployment for all of its cases (:func:`serve`,
 on the module's lease, with the module's own options over
 :data:`OPTIONS`); its cases keep decode steps running with :class:`Load`,
 start sessions with :func:`start`, end them with :func:`stop` or wait for
-their windows to end with :func:`ended`, read the fence probes' counts
-with :func:`fence_steps`, and read a session's file with :func:`table`.
+their windows to end with :func:`ended`, read a session's latest state with
+:func:`latest`, read the fence probes' counts with :func:`fence_steps`, and
+read a session's file with :func:`table`.
 """  # noqa: D205
 
 from __future__ import annotations
@@ -21,9 +28,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from prometheus_client.parser import text_string_to_metric_families
 
 from uniserve_testing import admin, chat
+from uniserve_testing.admin import Event
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.deployments import Deployments
 from uniserve_testing.packages import Config, merged
@@ -48,8 +55,12 @@ OPTIONS: dict[str, Any] = {
     },
 }
 
-#: The admin route of the profiling sessions.
-PROFILE = "/admin/profile"
+#: The option of the package that states the session the workers run.
+SESSION = "profiling_config.session"
+
+#: How long a stated session takes to start, in seconds (scaled): every
+#: worker prepares its collectors at its next step boundary.
+START_S = 120.0
 
 #: How long a session's window takes to end by itself, in seconds (scaled):
 #: its workers record the window's steps at the pace of the load's decode
@@ -148,74 +159,85 @@ class Load:
                 self._begin()
 
 
-def start(server: Server, request: dict[str, Any]) -> dict[str, Any]:
-    """Start a session of `request` (``POST /admin/profile``), answered once
-    every worker prepared its collectors; the session as it started, with
-    each worker's answer (``workers``).
+def start(server: Server, request: dict[str, Any]) -> Event:
+    """State the session of `request` (:data:`SESSION`), which ends the one
+    the package stated before; its ``profile`` event once every worker
+    prepared its collectors (``state`` ``running``), whose fields hold each
+    worker's answer (``workers``) and whose ``session`` label names it.
     """  # noqa: D205
-    response = admin.request(server, "POST", PROFILE, body=request)
-    assert response.status_code == 200, response.text
-    return response.json()["result"]
+    after = admin.now(server)
+    admin.revision(
+        admin.change(server, {"profiling_config": {"session": request}})
+    )
+    return admin.wait_for_log(
+        server,
+        "profile",
+        after=after,
+        timeout_s=START_S,
+        what="the profiling session did not start",
+        state="running",
+    )
 
 
-def stop(server: Server) -> dict[str, Any]:
-    """End the running session (``DELETE /admin/profile``), answered once
-    every worker wrote its file and the KV cache grew back into the storage
-    the session held; the session as it ended.
+def stop(server: Server, started: Event) -> dict[str, Any]:
+    """End the session `started` (:func:`start`) by removing it from the
+    package; the session once it ended, every worker having written its file
+    and the KV cache grown back into the storage the session held.
     """  # noqa: D205
-    response = admin.request(server, "DELETE", PROFILE)
-    assert response.status_code == 200, response.text
-    return response.json()["result"]
+    admin.revision(admin.change(server, {}, removed=(SESSION,)))
+    return ended(server, started, START_S)
 
 
-def session(server: Server) -> dict[str, Any] | None:
-    """The running session, or the last that ended (``GET
-    /admin/profile``); ``None`` before any.
+def ended(
+    server: Server, started: Event, timeout_s: float = WINDOW_S
+) -> dict[str, Any]:
+    """The session `started` (:func:`start`) once it ended, by itself (at
+    its window's end or by its guard), by its removal or with its epoch,
+    within `timeout_s` seconds (scaled).
     """  # noqa: D205
-    response = admin.request(server, "GET", PROFILE)
-    response.raise_for_status()
-    return response.json()["session"]
+    return admin.wait_for_log(
+        server,
+        "profile",
+        after=started.time,
+        timeout_s=timeout_s,
+        what="the profiling session did not end",
+        labels={"session": started.labels["session"]},
+        state="ended",
+    ).fields
 
 
-def ended(server: Server, timeout_s: float = WINDOW_S) -> dict[str, Any]:
-    """The session once it ended by itself (at its window's end or by its
-    guard), within `timeout_s` seconds (scaled).
-
-    No event of the node's log announces a session's end, so its state is
-    read every second.
+def latest(server: Server, started: Event) -> dict[str, Any]:
+    """The latest state of the session `started` (:func:`start`), from its
+    ``profile`` events: its ``state``, ``guard`` actions, ``files``, ...
     """  # noqa: D205
-    last: dict[str, Any] = {}
-
-    def is_ended() -> bool:
-        current = session(server) or {}
-        last.clear()
-        last.update(current)
-        return current.get("state") == "ended"
-
-    server.wait_until(is_ended, timeout_s, "the profiling session did not end")
-    return last
+    states = admin.logs(
+        server,
+        "profile",
+        after=started.time - 1,
+        session=started.labels["session"],
+    )
+    return states[-1].fields
 
 
-def fence_steps(server: Server, stage: str, module: str) -> int:
-    """The steps of `stage` the fence probes counted for the module classes
+def fence_steps(server: Server, phase: str, module: str) -> int:
+    """The steps of `phase` the fence probes counted for the module classes
     the pattern `module` names, as a request names them (``*`` matching any
-    run), or for the steps' own spans with ``step``: the counts of the
-    histogram ``uniserve:worker_fence_step_seconds`` (``docs/profiling.md``,
-    Fence probes), summed over its matching label sets.
+    run), or for the steps' own spans with ``step``: the observations of the
+    histogram ``uniserve_step_device_seconds`` (``docs/profiling.md``, Fence
+    probes), summed over its matching series.
     """  # noqa: D205
-    text = httpx.get(f"{server.base_url}/metrics", timeout=None).text
-    total = 0
-    for family in text_string_to_metric_families(text):
-        if family.name != "uniserve:worker_fence_step_seconds":
-            continue
-        for sample in family.samples:
-            if (
-                sample.name.endswith("_count")
-                and sample.labels.get("stage") == stage
-                and fnmatchcase(sample.labels.get("module", ""), module)
-            ):
-                total += int(sample.value)
-    return total
+    rows = admin.query(
+        server,
+        "SELECT labels['module'] AS module, "
+        "sum(histogram['count']) AS steps FROM stats "
+        "WHERE name = 'uniserve_step_device_seconds' "
+        f"AND labels['phase'] = {admin.literal(phase)} GROUP BY 1",
+    )
+    return sum(
+        int(row["steps"] or 0)
+        for row in rows
+        if fnmatchcase(row["module"] or "", module)
+    )
 
 
 def table(path: Path, name: str) -> list[dict[str, Any]]:

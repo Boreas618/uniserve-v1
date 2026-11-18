@@ -134,8 +134,8 @@ fn a_storage_server_reports_what_it_bound_and_stops_on_request() {
 
 /// A daemon whose package asks for port 0 binds its client listener and its admin sockets, in
 /// an instance directory of its own inside the runtime directory, before its deployment starts,
-/// and states them in its readiness record. Its admin socket answers its status while the
-/// deployment comes up, and its instance directory goes with it.
+/// and states them in its readiness record. Its admin socket answers a query of its observation
+/// store while the deployment comes up, and its instance directory goes with it.
 #[test]
 fn a_daemon_reports_the_listeners_it_bound_on_port_0() {
     let runtime = tempfile::tempdir().unwrap();
@@ -159,7 +159,8 @@ fn a_daemon_reports_the_listeners_it_bound_on_port_0() {
     let mut stream = std::os::unix::net::UnixStream::connect(admin.path().unwrap()).unwrap();
     std::io::Write::write_all(
         &mut stream,
-        b"GET /admin/status HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n",
+        b"GET /admin/query?q=SELECT%201%20AS%20one HTTP/1.1\r\nHost: admin\r\n\
+          Connection: close\r\n\r\n",
     )
     .unwrap();
     let mut response = String::new();

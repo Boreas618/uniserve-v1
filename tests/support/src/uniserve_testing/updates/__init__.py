@@ -296,11 +296,12 @@ def terminate(pid: int) -> None:
 @contextmanager
 def successors() -> Iterator[list[int]]:
     """The daemons hot restarts start in place of a case's daemon, each ended
-    when the block ends: the caller appends each successor's process id as
-    the restart answers it.
+    when the block ends: the caller appends each successor's process id once
+    it serves (:func:`uniserve_testing.admin.daemon_pid`).
 
-    A successor outlives the daemon that started it (``POST
-    /admin/restart``), so stopping the launched server does not end it.
+    A successor outlives the daemon that started it (a change of the
+    daemon's own options restarts it), so stopping the launched server does
+    not end it.
     """  # noqa: D205
     started: list[int] = []
     try:

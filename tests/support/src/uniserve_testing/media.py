@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from uniserve_testing import client
+from uniserve_testing import admin
 from uniserve_testing.assets import Checkpoint
 from uniserve_testing.servers import Server
 
@@ -432,37 +432,35 @@ def job_video(server: Server, job_id: str) -> httpx.Response:
 
 
 #: The workers' graph dispatches by runtime mode (``graph_replay``,
-#: ``graph_capture``, ``eager``), a counter family of ``/metrics``.
-GRAPH_DISPATCHES = "uniserve:worker_graph_runtime_mode_counts"
+#: ``graph_capture``, ``eager``), a counter of the observation store.
+GRAPH_DISPATCHES = "uniserve_graph_dispatches_total"
 
 #: How many successive reads, a second apart, must agree before the graph
 #: dispatches count as settled.
 SETTLED_READS = 3
 
 #: How long the graph dispatches may take to settle, in seconds (scaled):
-#: the workers' counters reach ``/metrics`` with the engine's report, one
-#: each ``worker_config.report_period`` (a second by default), so the calls
-#: of a finished request appear within a few periods.
+#: the workers' counters reach the observation store with the engine's
+#: report, one each ``worker_config.report_period`` (a second by default),
+#: so the calls of a finished request appear within a few periods.
 SETTLE_S = 120.0
 
 
 def graph_dispatches(server: Server, *modes: str) -> dict[str, float]:
-    """The workers' graph dispatches of each of `modes`, as ``/metrics``
-    counts them once they stopped moving.
+    """The workers' graph dispatches of each of `modes`, as the observation
+    store counts them once they stopped moving.
 
-    The counters reach ``/metrics`` with the engine's periodic report, which
-    states no sequence number, and no answer reports the dispatches of its
-    own request, so the counts are read a second apart until
-    :data:`SETTLED_READS` successive reads agree with the one before them.
+    The counters reach the store with the engine's periodic report, and no
+    answer reports the dispatches of its own request, so the counts are read
+    a second apart until :data:`SETTLED_READS` successive reads agree with
+    the one before them.
     """  # noqa: D205
     reads: list[dict[str, float]] = []
 
     def settled() -> bool:
         reads.append(
             {
-                mode: client.metric(
-                    server.base_url, GRAPH_DISPATCHES, mode=mode
-                )
+                mode: admin.counter(server, GRAPH_DISPATCHES, mode=mode)
                 for mode in modes
             }
         )
