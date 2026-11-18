@@ -1129,8 +1129,12 @@ impl Graphs {
     /// states its launches for the capture's check.
     ///
     /// The bucket is captured when it has no graph, its launch table changed, a launch's kernel
-    /// is another in `next`, or `next` places the kernel probes elsewhere; it is rehearsed first when it launches a native kernel
-    /// `serving` does not hold under the same key, whose first use a capture cannot record.
+    /// is another in `next`, or `next` places the kernel probes elsewhere. It is rehearsed first
+    /// when it launches a native kernel whose first use at the bucket's shapes a capture cannot
+    /// record: one `serving` does not hold under the same key, and any native kernel of a bucket
+    /// with no graph yet or whose launch table changed, since a native entry builds its plan
+    /// (a cuBLASLt matmul's, with its workspace) for each shape at that shape's first run, and a
+    /// generation's new bucket, such as one a catalog adds, runs shapes no serving bucket ran.
     ///
     /// # Errors
     ///
@@ -1186,13 +1190,17 @@ impl Graphs {
             }
             _ => true,
         };
+        // Shapes no serving graph of the bucket ran: a bucket with no graph, or one whose
+        // launches changed.
+        let new_shapes = held.is_none_or(|held| !same_launches(held, &profiled));
         let rehearse = capture
             && profiled.iter().any(|(operator, key, _)| {
                 let Ok(kernel) = next.kernel(operator, key) else {
                     return false;
                 };
                 let held = serving.and_then(|serving| serving.kernel(operator, key).ok());
-                !kernel.is_cubin() && held.is_none_or(|held| !Arc::ptr_eq(held, kernel))
+                !kernel.is_cubin()
+                    && (new_shapes || held.is_none_or(|held| !Arc::ptr_eq(held, kernel)))
             });
         Ok(Plan { capture, rehearse })
     }

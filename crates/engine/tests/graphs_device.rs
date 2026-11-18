@@ -690,6 +690,45 @@ fn a_generation_is_captured_beside_the_steps_switched_bucket_by_bucket_and_rolle
     Ok(())
 }
 
+/// A generation that adds a bucket under the serving kernels, as a catalog of other buckets
+/// does: the new bucket runs the product's native entry at a shape no serving bucket ran, which
+/// builds its plan at its first run, so the bucket is rehearsed before the capture thread
+/// captures it, and the capture succeeds.
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_generation_rehearses_a_bucket_it_adds_before_capturing_it() -> Outcome {
+    let bench = Bench::open()?;
+    let next = Arc::new(bench.serving.replace(2, Vec::new()));
+    let added = Bucket::decode(3, Variant::DecodeGreedy);
+
+    let (capture, rehearsal) = instances(&bench.runner)?;
+    let plan = capture
+        .graphs()
+        .examine(&*capture, &added, None, Some(&bench.serving), &next)?;
+    assert_eq!(
+        plan,
+        Plan {
+            capture: true,
+            rehearse: true
+        }
+    );
+    let graph = capture_planned(&*capture, &*rehearsal, &added, plan, &next)?;
+    assert!(graph.is_some());
+
+    // A bucket the serving generation captured, of unchanged launches and kernels, is kept.
+    let kept = Bucket::decode(ROWS as u32, Variant::DecodeGreedy);
+    let held = bench.runner.graphs.launch_table(&kept);
+    let plan = capture.graphs().examine(
+        &*capture,
+        &kept,
+        held.as_deref(),
+        Some(&bench.serving),
+        &next,
+    )?;
+    assert!(!plan.capture && !plan.rehearse, "{plan:?}");
+    Ok(())
+}
+
 /// A budget that never refuses: the case is about a comparison, not about memory.
 #[derive(Default)]
 struct Unbounded(Mutex<u64>);

@@ -17,8 +17,9 @@ Qwen3 serves on the GPU the module's lease holds:
 - A range_metrics session reserves its range profiler pass's device storage,
   which its worker measures and reports, with the worker's process item in
   the GPU's quota until it ends.
-- A session whose epoch is replaced ends with the epoch change, its file
-  written.
+- A session goes on across a kernel generation of its epoch, whose graphs
+  are captured again in the same processes, and ends with an epoch change,
+  its file written.
 - The quality-of-service guard turns collectors off, costliest first, and
   then ends a session whose step time stays past the slowdown it allows.
 """
@@ -270,7 +271,7 @@ def test_a_range_metrics_session_books_its_pass_while_it_runs(
     assert _process_bytes(served, after=admin.now(served)) == before
 
 
-def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
+def test_a_session_goes_on_across_a_generation_and_ends_with_its_epoch(
     served: Server, tmp_path: Path
 ):
     with Load(served, streams=1):
@@ -282,12 +283,20 @@ def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
                 "output_dir": str(tmp_path / "profiles"),
             },
         )
-        # The change answers once the new epoch stood its trial and
-        # committed; the session ended with the switch to it.
+        # Other decode buckets are a kernel generation: the serving
+        # processes capture the buckets in the background, the new ones
+        # rehearsed first, and switch to them; the epoch, and with it the
+        # session, goes on.
         changed = _change(
             served,
             {"cuda_graph_config": {"decode_batch_sizes": [1, 2, 4, 8, 16]}},
         )
+        assert changed["effect"] == "generation", changed
+        session = profiling.latest(served, started)
+        assert session["state"] == "running", session
+        # The change answers once the new epoch stood its trial and
+        # committed; the session ended with the switch to it.
+        changed = _change(served, {"kv_cache_config": {"max_tokens": 16384}})
         assert changed["effect"] == "epoch", changed
         session = profiling.latest(served, started)
         assert session["state"] == "ended", session

@@ -709,10 +709,11 @@ fn a_changed_launch_table_is_captured_again() {
     let next = Arc::new(serving.replace(2, []));
     let bucket = Bucket::decode(4, Variant::DecodeGreedy);
 
-    // The forward itself launches differently for the new generation, under the same kernels.
+    // The forward itself launches differently for the new generation, under the same kernels:
+    // its native kernels run at shapes no serving graph ran, so the bucket is rehearsed first.
     runner.model.deep.store(true, Ordering::Relaxed);
     let (_, plans) = prepared(&runner, &serving, &next);
-    assert!(plans.iter().all(|plan| plan.capture && !plan.rehearse));
+    assert!(plans.iter().all(|plan| plan.capture && plan.rehearse));
 
     // The serving graph is untouched until the switch, and the new one serves after it.
     let before = runner.graphs.launch_table(&bucket).unwrap();
