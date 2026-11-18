@@ -25,6 +25,7 @@
 //! - `metrics`: the Prometheus registry the daemon exports;
 //! - `observation`: the deployment's observation store, the `stats` and
 //!   `events` tables queried with SQL;
+//! - `programs`: the policy package's programs the leader runs or hands the Storage Servers;
 //! - `restart`: the hot restart that hands a deployment to a successor
 //!   daemon;
 //! - `keys`: the launches of a deployment's main processes for a start
@@ -45,6 +46,7 @@ pub mod observation;
 pub mod observe;
 pub mod policy;
 pub mod profiling;
+pub(crate) mod programs;
 pub mod restart;
 pub mod standby;
 pub mod supervision;

@@ -652,6 +652,101 @@ impl EngineControl {
         Ok(())
     }
 
+    /// Has every node's daemon have the deployment's Storage Server there run `program` as the
+    /// deployment's KV program from now on, or none (`Request::ConfigureProgram`): the leader's
+    /// node, this one, steps its tiering hook, and every node saves its state in its own
+    /// `program-state/`. Returns how each node's instance started, by host; `None` for a node
+    /// that runs none.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot be reached, and at the first node whose server refuses
+    /// the program, naming it; the nodes before it run the program.
+    pub(crate) fn program(
+        &self,
+        program: Option<&crate::programs::KvSetup>,
+    ) -> anyhow::Result<Vec<(String, Option<storage::protocol::ProgramStart>)>> {
+        let (mut connection, nodes) = self.connect()?;
+        let mut started = Vec::with_capacity(nodes.len());
+        for (index, node) in nodes.iter().enumerate() {
+            let program = program
+                .map(|program| program.wire(node.host == self.host))
+                .transpose()?;
+            connection.deliver(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: index as u64 + 1,
+                    kind: Some(request::Kind::ConfigureProgram(process::ConfigureProgram {
+                        host: node.host.clone(),
+                        deployment: self.deployment.clone(),
+                        program,
+                    })),
+                })),
+            })?;
+            let reply = await_reply(&mut connection, index as u64 + 1)
+                .context("awaiting the Storage Server's KV program")?;
+            anyhow::ensure!(
+                reply.error.is_empty(),
+                "the Storage Server of {}: {}",
+                node.host,
+                reply.error
+            );
+            let Some(reply::Kind::ProgramConfigured(configured)) = reply.kind else {
+                anyhow::bail!(
+                    "the daemon of {} answered the KV program with no result",
+                    node.host
+                );
+            };
+            started.push((node.host.clone(), program_start(&configured.start)?));
+        }
+        Ok(started)
+    }
+
+    /// What the deployment's KV program logged and how its outputs fared on every node since
+    /// the last call (`Request::ProgramRecords`), each record with its node's host, node by node
+    /// and oldest first within a node; each node's server keeps them no longer.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot be reached, and at the first node whose records cannot
+    /// be read, naming it.
+    pub(crate) fn program_records(
+        &self,
+    ) -> anyhow::Result<Vec<(String, storage::protocol::ProgramRecord)>> {
+        let (mut connection, nodes) = self.connect()?;
+        let mut records = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            connection.deliver(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: index as u64 + 1,
+                    kind: Some(request::Kind::ProgramRecords(process::ProgramRecordsQuery {
+                        host: node.host.clone(),
+                        deployment: self.deployment.clone(),
+                    })),
+                })),
+            })?;
+            let reply = await_reply(&mut connection, index as u64 + 1)
+                .context("awaiting the KV program's records")?;
+            anyhow::ensure!(
+                reply.error.is_empty(),
+                "the KV program's records at {}: {}",
+                node.host,
+                reply.error
+            );
+            let Some(reply::Kind::ProgramRecords(read)) = reply.kind else {
+                anyhow::bail!(
+                    "the daemon of {} answered the KV program's records with none",
+                    node.host
+                );
+            };
+            let read: Vec<storage::protocol::ProgramRecord> =
+                storage::protocol::decode(&read.records).with_context(|| {
+                    format!("reading the KV program's records of {}", node.host)
+                })?;
+            records.extend(read.into_iter().map(|record| (node.host.clone(), record)));
+        }
+        Ok(records)
+    }
+
     /// Has the daemon of `host` prepare the module set `filled` at its own Build Server
     /// (`Request::PrepareModules`), and returns the set as that Build Server prepared it.
     ///
@@ -926,6 +1021,24 @@ pub(crate) fn await_start(reader: &mut Connection) -> anyhow::Result<(EngineInfo
 
 /// Reads the reply `id` on a control connection. The daemon's service answers every request on
 /// it, so the read ends with the reply or with the connection's end.
+/// How a node's KV program started, as [`process::ProgramConfigured`] names it; `None` for the
+/// empty name of a node that runs none.
+///
+/// # Errors
+///
+/// Fails for a name of no start.
+fn program_start(name: &str) -> anyhow::Result<Option<storage::protocol::ProgramStart>> {
+    use storage::protocol::ProgramStart;
+
+    match name {
+        "" => Ok(None),
+        "kept" => Ok(Some(ProgramStart::Kept)),
+        "restored" => Ok(Some(ProgramStart::Restored)),
+        "created" => Ok(Some(ProgramStart::Created)),
+        other => anyhow::bail!("{other:?} names no start of a KV program"),
+    }
+}
+
 fn await_reply(control: &mut Connection, id: u64) -> anyhow::Result<process::Reply> {
     loop {
         let message: process::Downstream = control.recv_next()?;

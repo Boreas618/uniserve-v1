@@ -40,7 +40,8 @@ use prost::Message as _;
 use proto::process::refusal::Reason;
 use proto::process::{
     self, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface, Node,
-    NodesKnown, Refusal, Released, Replied, Reply, Request, Spawned, Stopped, StorageConfigured,
+    NodesKnown, ProgramConfigured, ProgramRecords, Refusal, Released, Replied, Reply, Request,
+    Spawned, Stopped, StorageConfigured,
     ToMember, TransfersThrottled, Unnumbered, Unserved, Upstream, UsageReport, Welcome, downstream,
     event, from_member, hello, reply, request, to_member, upstream,
 };
@@ -82,6 +83,16 @@ pub(crate) struct Local {
     preparations: super::ToService<(Asker, Reply)>,
     /// The replies of the preparations that ended, which the service delivers (`Local::prepared`).
     prepared: Receiver<(Asker, Reply)>,
+}
+
+/// How a KV program's instance started, as the storage protocol names it
+/// ([`storage::protocol::ProgramStart`]): what [`process::ProgramConfigured`] carries.
+pub(crate) fn start_name(start: storage::protocol::ProgramStart) -> &'static str {
+    match start {
+        storage::protocol::ProgramStart::Kept => "kept",
+        storage::protocol::ProgramStart::Restored => "restored",
+        storage::protocol::ProgramStart::Created => "created",
+    }
 }
 
 impl Local {
@@ -250,6 +261,29 @@ impl Local {
                     Err(error) => reply.error = format!("{error:#}"),
                 }
             }
+            Some(request::Kind::ConfigureProgram(configure)) => {
+                match self
+                    .claims
+                    .program(&configure.deployment, configure.program.clone())
+                {
+                    Ok(start) => {
+                        reply.kind = Some(reply::Kind::ProgramConfigured(ProgramConfigured {
+                            start: start.map_or("", start_name).to_owned(),
+                        }));
+                    }
+                    Err(error) => reply.error = format!("{error:#}"),
+                }
+            }
+            Some(request::Kind::ProgramRecords(query)) => match self
+                .claims
+                .program_records(&query.deployment)
+                .and_then(|records| Ok(storage::protocol::encode(&records)?))
+            {
+                Ok(records) => {
+                    reply.kind = Some(reply::Kind::ProgramRecords(ProgramRecords { records }));
+                }
+                Err(error) => reply.error = format!("{error:#}"),
+            },
             Some(request::Kind::Nodes(_)) => {
                 reply.error = "the leader replies for the deployment's nodes".to_owned();
             }
@@ -1095,6 +1129,8 @@ impl LeaderService {
             Some(request::Kind::PublishEpochs(publish)) => Some(publish.host.as_str()),
             Some(request::Kind::PrepareModules(prepare)) => Some(prepare.host.as_str()),
             Some(request::Kind::ConfigureStorage(configure)) => Some(configure.host.as_str()),
+            Some(request::Kind::ConfigureProgram(configure)) => Some(configure.host.as_str()),
+            Some(request::Kind::ProgramRecords(query)) => Some(query.host.as_str()),
             Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
         };
         let forwarded = ToMember {

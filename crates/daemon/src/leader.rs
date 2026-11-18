@@ -779,6 +779,52 @@ impl Leader {
             .context("the change of the Storage Servers' settings did not complete")?
     }
 
+    /// Has the deployment's Storage Server on every node run `program` as the deployment's KV
+    /// program from now on, or none (`EngineControl::program`): the leader's node steps its
+    /// tiering hook, and every node saves its state in its own `program-state/`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the deployment's engines have not started, so no node's daemon is known yet,
+    /// or a node's server refuses the program.
+    pub(crate) async fn set_kv_program(
+        &self,
+        program: Option<crate::programs::KvSetup>,
+    ) -> anyhow::Result<()> {
+        let Some(control) = self.replicas()[0].control.get().cloned() else {
+            anyhow::ensure!(
+                program.is_none(),
+                "the deployment's engines have not started: no node's Storage Server runs yet"
+            );
+            return Ok(());
+        };
+        let started = tokio::task::spawn_blocking(move || control.program(program.as_ref()))
+            .await
+            .context("setting the KV program did not complete")??;
+        for (host, start) in started {
+            info!(host, ?start, "the node's Storage Server runs the KV program");
+        }
+        Ok(())
+    }
+
+    /// What the deployment's KV program logged and how its outputs fared on every node since the
+    /// last call, each record with its node's host (`EngineControl::program_records`); none
+    /// before the deployment's engines started.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's records cannot be read.
+    pub(crate) async fn kv_records(
+        &self,
+    ) -> anyhow::Result<Vec<(String, storage::protocol::ProgramRecord)>> {
+        let Some(control) = self.replicas()[0].control.get().cloned() else {
+            return Ok(Vec::new());
+        };
+        tokio::task::spawn_blocking(move || control.program_records())
+            .await
+            .context("reading the KV program's records did not complete")?
+    }
+
     pub fn flush_cache(&self) -> Result<(), UpdateError> {
         for replica in self.replicas() {
             replica.flush_cache()?;

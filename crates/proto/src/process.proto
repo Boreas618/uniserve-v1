@@ -152,6 +152,8 @@ message Request {
     PublishEpochs publish_epochs = 11;
     PrepareModules prepare_modules = 12;
     ConfigureStorage configure_storage = 13;
+    ConfigureProgram configure_program = 14;
+    ProgramRecordsQuery program_records = 15;
   }
 }
 
@@ -174,6 +176,8 @@ message Reply {
     EpochsPublished epochs_published = 12;
     ModulesPrepared modules_prepared = 13;
     StorageConfigured storage_configured = 14;
+    ProgramConfigured program_configured = 15;
+    ProgramRecords program_records = 16;
   }
 }
 
@@ -442,6 +446,53 @@ message ConfigureStorage {
 }
 
 message StorageConfigured {}
+
+// Have the deployment's Storage Server on a node run `program` as the
+// deployment's KV program from now on, or none when it is absent
+// (`storage::protocol::Request::Program`). The node's daemon names the
+// directory the program's state is saved in: the deployment's
+// `program-state/` on that node.
+message ConfigureProgram {
+  string host = 1;
+  string deployment = 2;
+  optional KvProgram program = 3;
+}
+
+// A deployment's KV program as the leader hands it to each node.
+message KvProgram {
+  // Its name in the package (`[programs.<name>]`).
+  string name = 1;
+  // The wasm32 module.
+  bytes module = 2;
+  // The package's `args` table for it, as JSON.
+  string args = 3;
+  // How often its periodic work runs, in milliseconds.
+  uint64 period_ms = 4;
+  // Whether the node's server steps the tiering hook: the leader's node.
+  bool tiering = 5;
+}
+
+message ProgramConfigured {
+  // How the program's instance started, as the storage protocol names it
+  // (`storage::protocol::ProgramStart`: `kept`, `restored`, `created`);
+  // empty when the node runs no KV program.
+  string start = 1;
+}
+
+// What the deployment's KV program on a node logged and how its outputs
+// fared since the last such query (`storage::protocol::Request::ProgramRecords`);
+// the node's server keeps them no longer.
+message ProgramRecordsQuery {
+  string host = 1;
+  string deployment = 2;
+}
+
+message ProgramRecords {
+  // The records (`Vec<storage::protocol::ProgramRecord>`) in the storage
+  // protocol's own encoding (`storage::protocol::encode`), relayed unchanged:
+  // the message has one definition, the storage protocol's.
+  bytes records = 1;
+}
 
 message UsageReport {
   // The Storage Server's `Usage` response (`storage::protocol::Usage`) in the

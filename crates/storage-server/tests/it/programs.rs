@@ -105,8 +105,9 @@ fn records_until(head: &mut Client, done: impl Fn(&[ProgramRecord]) -> bool) -> 
 }
 
 /// The deployment's KV program decides each handoff's path where the handoff can take it. The
-/// same module and arguments set again keep the instance; another module is a new instance,
-/// restored from the state the one it replaces saved. An output the handoff cannot take, a
+/// same module and arguments set again keep the instance; new arguments are a new instance
+/// created from them, and another module under the same arguments a new instance restored from
+/// the state the one it replaces saved. An output the handoff cannot take, a
 /// read over a transport the sides lack, is refused and recorded, and the default rule pushes
 /// over the sides' first transport; a module that is not one leaves the program as it was.
 #[test]
@@ -123,7 +124,14 @@ fn a_kv_program_chooses_each_handoff_path_and_its_state_passes_to_its_replacemen
         Path::Push(Transport::Nixl)
     );
 
-    let kv = program("program-kv", state.path(), hour, false);
+    let mut kv = program("program-kv", state.path(), hour, false);
+    assert_eq!(
+        head.program(Some(kv.clone())).unwrap(),
+        Some(ProgramStart::Created)
+    );
+    // New arguments: a new instance created from them, though the one it replaces saved its
+    // state, which was saved under the others.
+    kv.args = serde_json::json!({ "watermark": 0.9 });
     assert_eq!(
         head.program(Some(kv.clone())).unwrap(),
         Some(ProgramStart::Created)
@@ -151,10 +159,15 @@ fn a_kv_program_chooses_each_handoff_path_and_its_state_passes_to_its_replacemen
         ),
         "{refused:?}"
     );
-    assert_eq!(head.program(Some(kv)).unwrap(), Some(ProgramStart::Kept));
+    assert_eq!(
+        head.program(Some(kv.clone())).unwrap(),
+        Some(ProgramStart::Kept)
+    );
 
-    // Another module: a new instance, restored from the two pulls the first one saved.
-    let read = program("program-kv-read", state.path(), hour, false);
+    // Another module under the same arguments: a new instance, restored from the two pulls the
+    // one it replaces saved.
+    let mut read = program("program-kv-read", state.path(), hour, false);
+    read.args = kv.args.clone();
     assert_eq!(
         head.program(Some(read)).unwrap(),
         Some(ProgramStart::Restored)
@@ -211,7 +224,7 @@ fn a_kv_program_chooses_each_handoff_path_and_its_state_passes_to_its_replacemen
 
     // No program: the instance leaves its state, and the default rule decides.
     assert_eq!(head.program(None).unwrap(), None);
-    assert!(state.path().join("kv").is_file());
+    assert!(state.path().join("kv.state").is_file());
     assert_eq!(
         head.handoff_path(handoff(3, nixl)).unwrap(),
         Path::Push(Transport::Nixl)
@@ -257,5 +270,5 @@ fn the_leader_s_kv_program_steps_its_tiering_hook_over_the_node_s_pool_every_per
             }),
         "{records:?}"
     );
-    assert!(state.path().join("kv").is_file());
+    assert!(state.path().join("kv.state").is_file());
 }

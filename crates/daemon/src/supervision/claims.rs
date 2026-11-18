@@ -190,6 +190,98 @@ impl ClaimHolder {
         Ok(())
     }
 
+    /// Has the deployment's Storage Server on this node run `program` as the deployment's KV
+    /// program from now on, or none (`storage::protocol::Request::Program`), and returns how its
+    /// instance started. The program's state is saved in the deployment's `program-state/` on
+    /// this node ([`crate::policy::revision::PROGRAM_STATE`]). A server is started with the
+    /// deployment's settings when none serves: the program runs from now on, whether or not an
+    /// epoch claimed the node yet. Running none where no server serves changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `deployment` is not this daemon's, the state directory has no place, the
+    /// server cannot be started or reached, or it refuses the program, with why.
+    pub(crate) fn program(
+        &mut self,
+        deployment: &str,
+        program: Option<proto::process::KvProgram>,
+    ) -> anyhow::Result<Option<storage::protocol::ProgramStart>> {
+        anyhow::ensure!(
+            deployment == self.deployment,
+            "this node's daemon serves deployment {}, not {deployment}",
+            self.deployment
+        );
+        let program = match program {
+            Some(program) => Some(storage::protocol::KvProgram {
+                args: serde_json::from_str(&program.args)
+                    .context("reading the KV program's args")?,
+                name: program.name,
+                module: program.module,
+                period_ms: program.period_ms,
+                tiering: program.tiering,
+                state: crate::policy::revision::directory(deployment)?
+                    .join(crate::policy::revision::PROGRAM_STATE),
+            }),
+            None => None,
+        };
+        let socket = self.socket()?;
+        let serving =
+            self.claim.is_some() || service::host::running::<storage::Settings>(&socket)?.is_some();
+        if program.is_none() && !serving {
+            return Ok(None);
+        }
+        if !serving {
+            self.serve(&self.settings)?;
+        }
+
+        let started = match &mut self.claim {
+            Some((client, _)) => client.program(program),
+            None => self.head()?.program(program),
+        };
+        started.with_context(|| format!("setting the KV program of deployment {deployment}"))
+    }
+
+    /// What the deployment's KV program on this node logged and how its outputs fared since the
+    /// last call (`storage::protocol::Request::ProgramRecords`); none where no server serves.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `deployment` is not this daemon's, or the server cannot be reached.
+    pub(crate) fn program_records(
+        &mut self,
+        deployment: &str,
+    ) -> anyhow::Result<Vec<storage::protocol::ProgramRecord>> {
+        anyhow::ensure!(
+            deployment == self.deployment,
+            "this node's daemon serves deployment {}, not {deployment}",
+            self.deployment
+        );
+        let records = match &mut self.claim {
+            Some((client, _)) => client.program_records(),
+            None => {
+                let socket = self.socket()?;
+                if service::host::running::<storage::Settings>(&socket)?.is_none() {
+                    return Ok(Vec::new());
+                }
+                self.head()?.program_records()
+            }
+        };
+        records.with_context(|| format!("reading the KV program records of deployment {deployment}"))
+    }
+
+    /// A connection to the deployment's Storage Server on this node as a head of the deployment
+    /// that claims nothing: what sets and reads the KV program before an epoch claimed the node.
+    fn head(&self) -> anyhow::Result<storage::Client> {
+        let socket = self.socket()?;
+        let role = storage::Role::Head {
+            deployment: self.deployment.clone(),
+            epoch: 0,
+            generation: 0,
+        };
+        storage::Client::connect(&socket, role)
+            .with_context(|| format!("connecting to the Storage Server at {}", socket.display()))
+    }
+
     /// The `host:port` other nodes reach the server of `record` at: this node's address, on the
     /// port it bound; empty when they reach it not.
     fn tcp(&self, record: &storage::Readiness) -> String {

@@ -22,10 +22,14 @@
 //! ([`Request::ProgramRecords`](::storage::protocol::Request::ProgramRecords)) into the
 //! deployment's `events` table.
 //!
-//! The program's fields are its state. The server saves it under the program's name in the
-//! directory its head names after every period (the tiering step's on the leader's node), before
-//! a new instance replaces it, and when the server ends or hands over to a successor; a new
-//! instance is restored from it when it decodes as the program's type.
+//! The program's fields are its state. The server saves it with the program's arguments as
+//! `<name>.state` in the directory its head names (the node's `program-state/`, the file the
+//! daemon keeps its own programs' states in, `{"args": ..., "state": ...}`) after every period
+//! (the tiering step's on the leader's node), before a new instance replaces it, and when the
+//! server ends or hands over to a successor. A new instance is restored from it when it was saved
+//! under the same arguments and decodes as the program's type: a new module of the program, or a
+//! new server, goes on from it, while new arguments start the program anew, since a program keeps
+//! the arguments it was created with in its fields.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -166,7 +170,13 @@ impl Running {
                 return;
             }
         };
-        if let Err(error) = write_state(&self.setup.state, &self.setup.name, &state) {
+        let written = write_state(
+            &self.setup.state,
+            &self.setup.name,
+            &self.setup.args,
+            &state,
+        );
+        if let Err(error) = written {
             tracing::warn!(program = %self.setup.name, %error, "the KV program's state was not saved");
         }
     }
@@ -174,18 +184,57 @@ impl Running {
 
 /// The file the state of the program `name` is saved in.
 fn state_file(directory: &FilePath, name: &str) -> PathBuf {
-    directory.join(name)
+    directory.join(format!("{name}.state"))
 }
 
-/// Writes `state` as the saved state of `name` in `directory`: a temporary file renamed over
-/// it once synced.
-fn write_state(directory: &FilePath, name: &str, state: &[u8]) -> io::Result<()> {
+/// A saved state as its file holds it: the arguments the program ran with, and the JSON of its
+/// fields, as its `save` replied them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    args: serde_json::Value,
+    state: serde_json::Value,
+}
+
+/// Writes `state`, the reply of the program's `save`, as the saved state of `name`, created
+/// from `args`, in `directory`: a temporary file renamed over it once synced.
+fn write_state(
+    directory: &FilePath,
+    name: &str,
+    args: &serde_json::Value,
+    state: &[u8],
+) -> io::Result<()> {
+    let saved = Saved {
+        args: args.clone(),
+        state: serde_json::from_slice(state)?,
+    };
     std::fs::create_dir_all(directory)?;
-    let file = state_file(directory, name);
-    let staging = directory.join(format!(".{name}.new"));
-    std::fs::write(&staging, state)?;
+    let staging = directory.join(format!(".{name}.state.new"));
+    std::fs::write(&staging, serde_json::to_vec(&saved)?)?;
     std::fs::File::open(&staging)?.sync_all()?;
-    std::fs::rename(&staging, &file)
+    std::fs::rename(&staging, state_file(directory, name))
+}
+
+/// The state of `setup`'s program saved under the arguments it now has, as its `restore` takes
+/// it; `None` when none was saved, or it was saved under other arguments.
+///
+/// # Errors
+///
+/// The file cannot be read, or holds no saved state.
+fn read_state(setup: &KvProgram) -> Result<Option<Vec<u8>>, String> {
+    let file = state_file(&setup.state, &setup.name);
+    let text = match std::fs::read(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("reading {}: {error}", file.display())),
+    };
+    let saved: Saved = serde_json::from_slice(&text)
+        .map_err(|error| format!("{} holds no saved state: {error}", file.display()))?;
+    if saved.args != setup.args {
+        return Ok(None);
+    }
+    serde_json::to_vec(&saved.state)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 /// The deployments' KV programs.
@@ -458,8 +507,8 @@ impl Programs {
     }
 }
 
-/// A new instance of `module` for `setup`: restored from the program's saved state when one
-/// decodes as its type, and created from its arguments otherwise.
+/// A new instance of `module` for `setup`: restored from the program's state saved under its
+/// arguments when that state decodes as its type, and created from its arguments otherwise.
 fn instantiate(
     module: &Module<Logs>,
     setup: &KvProgram,
@@ -468,12 +517,7 @@ fn instantiate(
         program: setup.name.clone(),
         records: Vec::new(),
     };
-    let saved = match std::fs::read(state_file(&setup.state, &setup.name)) {
-        Ok(saved) => Some(saved),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("reading the program's saved state: {error}")),
-    };
-    if let Some(saved) = saved {
+    if let Some(saved) = read_state(setup)? {
         match Instance::restore(module, logs(), &BUDGET, &saved) {
             Ok(instance) => return Ok((instance, ProgramStart::Restored)),
             // A state of another type is the program's previous version's: it starts anew.

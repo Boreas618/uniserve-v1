@@ -1437,10 +1437,10 @@ pub enum Request {
     /// (`scheduling::program::Kind::Kv`) of this build's program interface.
     /// The same module with the same name and arguments keeps the running
     /// instance and takes the new period and hooks; any other is a new
-    /// instance, restored from the state the program saved under its name in
-    /// [`KvProgram::state`] when that state decodes as the program's type, and
-    /// created from its arguments otherwise. The instance it replaces saves
-    /// its state there first. Responded with [`Response::Programmed`];
+    /// instance, restored from the state the program saved as `<name>.state`
+    /// in [`KvProgram::state`] when it was saved under the same arguments and
+    /// decodes as the program's type, and created from its arguments otherwise.
+    /// The instance it replaces saves its state there first. Responded with [`Response::Programmed`];
     /// refused, changing nothing, when the module does not load or the
     /// arguments are not the program's.
     Program { program: Option<KvProgram> },
@@ -1478,8 +1478,9 @@ pub struct KvProgram {
     pub period_ms: u64,
     /// Whether this server steps the tiering hook: the leader's node does.
     pub tiering: bool,
-    /// The directory the program's state is saved in: the node's
-    /// `program-state/` of the deployment.
+    /// The directory the program's state is saved in, as `<name>.state`
+    /// (`{"args": ..., "state": ...}`): the node's `program-state/` of the
+    /// deployment.
     pub state: std::path::PathBuf,
 }
 
