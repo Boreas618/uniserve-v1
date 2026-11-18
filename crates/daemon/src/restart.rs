@@ -832,6 +832,15 @@ async fn prepared_successor(
     let service_fds = (0..service_descriptors)
         .map(|_| next())
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // The process id of each engine the successor adopts, which its `process` event states: the
+    // service hands every process it supervises over under its launch generation.
+    let adopted_pids: std::collections::BTreeMap<u64, u32> = replicas
+        .iter()
+        .filter_map(|(replica, _)| {
+            let pid = service.pid(crate::engine::control::ENGINE_GROUP, 0, replica.engine)?;
+            Some((replica.engine, pid))
+        })
+        .collect();
     let daemon = Daemon::resume(
         config.leader_host(),
         Some(prepare.processes.clone()),
@@ -910,8 +919,13 @@ async fn prepared_successor(
     );
     // The successor adopts the epoch that serves, and below the epoch each other replica serves.
     {
-        let (record, process) =
-            adopted_epoch(served_epoch, handoff.engine, &options, modules.clone())?;
+        let (record, process) = adopted_epoch(
+            served_epoch,
+            handoff.engine,
+            adopted_pids.get(&handoff.engine).copied(),
+            &options,
+            modules.clone(),
+        )?;
         epoch_records.record(served_epoch, record);
         // The successor's observation store starts empty: the process it adopted is its first
         // `process` event.
@@ -950,8 +964,13 @@ async fn prepared_successor(
         let _ = replica.control.set(Arc::clone(&control));
         // A replica an epoch update moved apart from the first serves an epoch of its own.
         if epoch_records.recorded(served.epoch).is_none() {
-            let (record, process) =
-                adopted_epoch(served.epoch, handoff.engine, &options, modules.clone())?;
+            let (record, process) = adopted_epoch(
+                served.epoch,
+                handoff.engine,
+                adopted_pids.get(&handoff.engine).copied(),
+                &options,
+                modules.clone(),
+            )?;
             epoch_records.record(served.epoch, record);
             recorder.process(&options.leader_host(), &process);
             epoch_records.adopt_process(process);
@@ -1130,7 +1149,8 @@ async fn prepared_successor(
 /// The epoch record and the process row of an epoch a restarting daemon
 /// adopts: the build config and the modules the adopted configuration
 /// fills, serving, at the launch generation the engine reported (which is the
-/// identity it runs under). The record's own generation stays `None`:
+/// identity it runs under), with the process id `pid` the service handed over
+/// for that launch on this node. The record's own generation stays `None`:
 /// that field is the MODEL generation the adopted engine numbers for its
 /// modules, and a daemon that adopted it never saw that number — the launch
 /// generation belongs to the process row alone.
@@ -1141,6 +1161,7 @@ async fn prepared_successor(
 fn adopted_epoch(
     epoch: u64,
     engine: u64,
+    pid: Option<u32>,
     options: &crate::config::Config,
     modules: Option<proto::module::ModuleSet>,
 ) -> anyhow::Result<(crate::epoch::EpochRecord, proto::admin::ManagedProcess)> {
@@ -1158,7 +1179,7 @@ fn adopted_epoch(
     let process = proto::admin::ManagedProcess {
         group: crate::engine::control::ENGINE_GROUP.to_owned(),
         rank: 0,
-        pid: None,
+        pid,
         epoch: Some(epoch),
         build: deployment.engine.executable.clone(),
         generation: engine,
@@ -1239,7 +1260,7 @@ mod tests {
     fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
         let options = crate::config::Config::default();
         let (record, process) =
-            adopted_epoch(7, 12, &options, None).expect("the configuration resolves");
+            adopted_epoch(7, 12, Some(4321), &options, None).expect("the configuration resolves");
         assert_eq!(record.status, proto::admin::EpochState::Serving);
         assert_eq!(
             record.generation, None,
@@ -1250,6 +1271,7 @@ mod tests {
             options.engine_config().expect("the configuration resolves")
         );
         assert_eq!(process.generation, 12);
+        assert_eq!(process.pid, Some(4321));
         assert_eq!(process.epoch, Some(7));
         assert_eq!(process.state, proto::admin::ProcessState::Serving);
     }

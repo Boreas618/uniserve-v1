@@ -1426,6 +1426,23 @@ pub(crate) enum ServiceHandoff {
     },
 }
 
+impl ServiceHandoff {
+    /// The process id of the process this node supervises as launch generation `generation` of
+    /// `group`'s rank `rank`, when it supervises one: what a successor states of an engine it
+    /// adopts.
+    pub(crate) fn pid(&self, group: &str, rank: u32, generation: u64) -> Option<u32> {
+        let (Self::Leader { local, .. } | Self::Member { local, .. }) = self;
+        local
+            .processes
+            .processes
+            .iter()
+            .find(|process| {
+                process.group == group && process.rank == rank && process.generation == generation
+            })
+            .map(|process| process.pid)
+    }
+}
+
 /// A connection's state, its descriptor travelling apart.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ConnectionHandoff {
