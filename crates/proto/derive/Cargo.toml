@@ -1,0 +1,21 @@
+[package]
+name = "proto-derive"
+description = "The derive of the configuration's reload declaration (`proto::reload::Reload`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A procedural macro: every structure of the deployment's configuration derives
+# `proto::reload::Reload`, so each field states, where it is declared, how a change of it takes
+# effect, and the comparison of two configurations is generated from that declaration.
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
+[lints]
+workspace = true

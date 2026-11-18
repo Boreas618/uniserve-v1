@@ -20,6 +20,7 @@ members = [
     "crates/processing",
     "crates/build-server",
     "crates/proto",
+    "crates/proto/derive",
     "crates/scheduling",
     "crates/scheduling/policies/arrival",
     "crates/service",
@@ -91,6 +92,7 @@ models = { path = "crates/models" }
 processing = { path = "crates/processing" }
 build-server = { path = "crates/build-server" }
 proto = { path = "crates/proto" }
+proto-derive = { path = "crates/proto/derive" }
 scheduling = { path = "crates/scheduling" }
 testkit = { path = "crates/testkit" }
 service = { path = "crates/service" }

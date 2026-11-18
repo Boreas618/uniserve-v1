@@ -25,12 +25,17 @@
 //! between nodes: every envelope of the interfaces implements
 //! `service::Message` here.
 
+// The reload derive names its trait by the crate's path (`::proto::reload`), which this crate's own
+// configuration structures reach through this alias.
+extern crate self as proto;
+
 pub mod admin;
 pub mod catalog;
 pub mod config;
 pub mod media;
 pub mod module;
 pub mod profile;
+pub mod reload;
 pub mod report;
 pub mod request;
 pub mod shared_memory;
