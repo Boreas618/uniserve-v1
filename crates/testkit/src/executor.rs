@@ -591,15 +591,14 @@ impl State {
                 },
                 Completion::Replicated { runs, .. },
             ) => Some((*owner, id, vec![(*class, *at, runs.clone(), false)])),
-            (Request::Transfer { owner, .. }, Completion::Transferred { runs, .. }) => {
-                let mut blocks: BTreeMap<(u8, u32), (Vec<Run>, bool)> = BTreeMap::new();
-                for &(class, at, run, private) in runs {
-                    let block = blocks.entry((class, at)).or_insert((Vec::new(), private));
-                    block.0.push(run);
-                }
-                let entries = blocks.into_iter();
-                let entries =
-                    entries.map(|((class, at), (runs, private))| (class, at, runs, private));
+            // An import's blocks, a run each in the order of its tables, writable.
+            (Request::Import { owner, tables, .. }, Completion::Imported { runs, .. }) => {
+                let positions = tables
+                    .iter()
+                    .flat_map(|&(class, at, count)| (at..at + count).map(move |at| (class, at)));
+                let entries = positions
+                    .zip(runs)
+                    .map(|((class, at), run)| (class, at, vec![*run], true));
                 Some((*owner, id, entries.collect()))
             }
             (_, Completion::Copy { to, .. }) => {
@@ -770,7 +769,7 @@ impl Executor for FakeExecutor {
                 continue;
             };
             match &request {
-                Request::Release { .. } | Request::Detach { .. } | Request::Transfer { .. } => {
+                Request::Release { .. } | Request::Detach { .. } | Request::Lend { .. } => {
                     let named = |place: &Place, entry: &Entry| {
                         names(&request, entry.owner, place.1, place.2)
                     };
@@ -973,9 +972,7 @@ fn names(request: &Request, owner: OwnerId, class: u8, position: u32) -> bool {
             at,
             ..
         } => named == owner && of == class && at == position,
-        Request::Detach { owner: named, .. } | Request::Transfer { owner: named, .. } => {
-            named == owner
-        }
+        Request::Detach { owner: named, .. } | Request::Lend { owner: named, .. } => named == owner,
         _ => false,
     }
 }
@@ -986,7 +983,7 @@ fn stamps(request: &mut Request) -> Option<&mut Stamps> {
         Request::Detach { after, .. }
         | Request::Release { after, .. }
         | Request::Commit { after, .. }
-        | Request::Transfer { after, .. }
+        | Request::Lend { after, .. }
         | Request::Finish { after, .. }
         | Request::Replicate { after, .. } => Some(after),
         _ => None,

@@ -882,7 +882,7 @@ pub(crate) mod tests {
     /// The policy modules of the policy host's own tests, each a module of the interface's
     /// exports in a `.wat` file beside this module (`policy/`), assembled by `wat`: one that
     /// decides nothing, and modules that fault in a stated way. Each states the interface version
-    /// it implements, which is this release's (`scheduling::INTERFACE_VERSION`, 7) for all but
+    /// it implements, which is this release's (`scheduling::INTERFACE_VERSION`, 8) for all but
     /// [`Fixture::Stale`]: a module of another release is refused at instantiation, so a fixture
     /// of a stale version fails every case that instantiates it.
     #[derive(Clone, Copy, Debug)]

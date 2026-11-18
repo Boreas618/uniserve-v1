@@ -260,7 +260,7 @@ fn a_policy_that_states_no_token_budget_is_budgeted_by_the_scheduler() {
 /// the groups with room; §7.1 "Free slots told to the policy").
 #[test]
 fn a_request_waits_for_a_free_slot_and_runs_where_one_was_given_back() {
-    let mut harness = Deployment::tokens().replicas(2).slots(1).build();
+    let mut harness = Deployment::tokens().copies(2).slots(1).build();
     let short = harness.submit(token(1, 6, 2));
     let long = harness.submit(token(2, 6, 30));
     let waiting = harness.submit(token(3, 6, 4));

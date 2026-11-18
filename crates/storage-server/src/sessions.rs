@@ -68,7 +68,10 @@
 //!   ([`Request::PeerRelease`]) or its connection closes.
 
 mod hosts;
+mod imports;
 pub(crate) mod polling;
+
+use hosts::Here;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::OwnedFd;
@@ -80,7 +83,7 @@ use serde::{Deserialize, Serialize};
 use storage::ServerSettings;
 use storage::protocol::{
     ErrorKind, Event, HostCopy, Key, Location, PageShape, Priority, Region, RegionPart, Response,
-    Role, Segment, Span, StorageRecord, UnitRun,
+    Role, Segment, Span, StorageRecord, UnitLayout, UnitRun,
 };
 use storage::runtime::{Open, RequestId, Source, Tier};
 
@@ -107,9 +110,9 @@ type PoolTask = (QueueId, RequestId);
 type Place = (String, String, String, u32);
 
 /// Where a rank's units lie: the endpoint of the Storage Server of its host
-/// when it is another host, at which its runs' tensors are retained, and
-/// the runs.
-type Placed = (Option<String>, Vec<UnitRun>);
+/// when it is another host, at which its runs' tensors are retained, the
+/// runs, and for a KV region how the rank lays its part of a unit out.
+type Placed = (Option<String>, Vec<UnitRun>, Option<UnitLayout>);
 
 /// A session: its deployment and its epoch.
 type Session = (String, u64);
@@ -221,6 +224,9 @@ struct Running {
     /// For a read from the peers, the host parts each copy fills (none for a
     /// copy of groups that state no host parts).
     parts: Vec<Vec<HostPart>>,
+    /// For an import from a lend of this host, the lender's session and owner, whose lend
+    /// ends with the task.
+    lend: Option<(PoolSession, storage::runtime::OwnerId)>,
 }
 
 impl Running {
@@ -236,6 +242,7 @@ impl Running {
             release: None,
             reads: Vec::new(),
             parts: Vec::new(),
+            lend: None,
         }
     }
 }
@@ -768,6 +775,7 @@ impl Server {
         holder: &Holder,
         (region, memory, part): (&str, &str, u32),
         runs: &[UnitRun],
+        layout: Option<UnitLayout>,
     ) -> Result<Handling, (ErrorKind, String)> {
         if !self.current(holder) {
             return Err(crate::stale(holder));
@@ -792,7 +800,9 @@ impl Server {
             )));
         }
         let place = (deployment, region.to_owned(), memory.to_owned(), part);
-        self.sessions.places.insert(place, (None, runs.to_vec()));
+        self.sessions
+            .places
+            .insert(place, (None, runs.to_vec(), layout));
         Ok(Handling::Response(Response::Placed, Vec::new()))
     }
 
@@ -807,7 +817,7 @@ impl Server {
         id: ClientId,
         (deployment, epoch): (&str, u64),
         (region, memory, part): (&str, &str, u32),
-        endpoint: &str,
+        (endpoint, layout): (&str, Option<UnitLayout>),
         runs: &[UnitRun],
     ) -> Result<Handling, (ErrorKind, String)> {
         let engine = self.session_head(id, deployment, epoch)?;
@@ -837,7 +847,7 @@ impl Server {
             memory.to_owned(),
             part,
         );
-        let placed = (Some(endpoint.to_owned()), runs.to_vec());
+        let placed = (Some(endpoint.to_owned()), runs.to_vec(), layout);
         self.sessions.places.insert(place, placed);
         self.sessions
             .remote
@@ -1080,7 +1090,7 @@ impl Server {
                 host.clone(),
                 *part,
             );
-            let (at, _) = self.sessions.places.get(&place)?;
+            let (at, ..) = self.sessions.places.get(&place)?;
             let bytes = match at {
                 None => {
                     let held = (deployment.to_owned(), region.to_owned(), *part);
@@ -1527,7 +1537,7 @@ impl Server {
         // By the host of the destinations, `None` for this one: the spans,
         // each with whether its source is storage of this host that
         // another host reads.
-        let mut tasks: BTreeMap<Option<String>, Vec<(Span, bool)>> = BTreeMap::new();
+        let mut tasks: BTreeMap<Option<String>, Vec<(Span, Here)>> = BTreeMap::new();
         for (_, reads, writes, (from, _), (to, _)) in copies {
             let Some(to) = to.first() else {
                 // The slot row: memory of the ranks' own processes.
@@ -1568,22 +1578,22 @@ impl Server {
                 if destinations.is_empty() {
                     return Err(format!("no rank of {to} placed the units of {region}"));
                 }
-                for (rank, (at, destination)) in destinations {
-                    let (source_at, source) = sources.get(&rank).ok_or_else(|| {
+                for (rank, (at, destination, _)) in destinations {
+                    let (source_at, source, _) = sources.get(&rank).ok_or_else(|| {
                         format!("rank {rank} of {from} placed no unit of {source_region}")
                     })?;
                     let firsts = (*source_first, *first);
                     for mut span in spans(source, destination, firsts, *count)? {
                         let here = match (source_at, at) {
-                            (source_at, at) if source_at == at => false,
+                            (source_at, at) if source_at == at => Here::Neither,
                             (Some(endpoint), _) => {
                                 span.source = Region::Remote {
                                     endpoint: endpoint.clone(),
                                     region: Box::new(span.source),
                                 };
-                                false
+                                Here::Neither
                             }
-                            (None, _) => true,
+                            (None, _) => Here::Source,
                         };
                         tasks.entry(at.clone()).or_default().push((span, here));
                     }
@@ -1611,7 +1621,7 @@ impl Server {
         &mut self,
         session: &Session,
         number: u64,
-        mut tasks: BTreeMap<Option<String>, Vec<(Span, bool)>>,
+        mut tasks: BTreeMap<Option<String>, Vec<(Span, Here)>>,
     ) -> Result<(), String> {
         let deployment = session.0.as_str();
         let local = tasks.remove(&None);
@@ -1763,7 +1773,7 @@ impl Server {
 
         // By the host of the parts they write, `None` for this one: the spans,
         // each with whether its source is storage of this host.
-        let mut tasks: BTreeMap<Option<String>, Vec<(Span, bool)>> = BTreeMap::new();
+        let mut tasks: BTreeMap<Option<String>, Vec<(Span, Here)>> = BTreeMap::new();
         let mut reads = Vec::new();
         for (index, (write, named)) in writes.iter().zip(&parts).enumerate() {
             let Some(Some((connection, copy))) = sources.get(index) else {
@@ -1780,7 +1790,12 @@ impl Server {
                 break;
             };
             for (host, span, from_here) in spans {
-                tasks.entry(host).or_default().push((span, from_here));
+                let here = if from_here {
+                    Here::Source
+                } else {
+                    Here::Neither
+                };
+                tasks.entry(host).or_default().push((span, here));
             }
             reads.push((*connection, copy.tokens));
         }
@@ -2017,7 +2032,7 @@ impl Server {
 
     /// `parts` of the pool task `number` ended, all well or not; the task ends with its last
     /// part ([`Self::end_pool_task`]).
-    fn end_pool_parts(&mut self, number: u64, parts: usize, ok: bool) {
+    pub(crate) fn end_pool_parts(&mut self, number: u64, parts: usize, ok: bool) {
         let Some(running) = self.sessions.running.get_mut(&number) else {
             return;
         };
@@ -2035,9 +2050,14 @@ impl Server {
             return;
         };
         let ((deployment, _), task, ok) = (running.session, running.task, running.ok);
-        self.sessions
-            .thread
-            .send(move |pools| pools.ended(&deployment, task, ok));
+        let lend = running.lend;
+        self.sessions.thread.send(move |pools| {
+            // An import's lend of this host ends once the task has, before it is answered.
+            if let Some((session, owner)) = lend {
+                pools.give_back(&deployment, session, owner);
+            }
+            pools.ended(&deployment, task, ok);
+        });
     }
 
     /// The child process `pid` that ran a pool's task lost its connection:

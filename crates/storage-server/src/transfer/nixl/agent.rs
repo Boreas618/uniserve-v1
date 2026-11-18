@@ -329,6 +329,24 @@ impl Agent {
     /// mixed memory kinds, and spans NIXL does not find within storage this
     /// agent or `peer` registered under the span's key.
     pub(crate) fn read(&self, peer: &str, spans: &[Span]) -> Result<Transfer> {
+        self.post(peer, spans, Op::Read)
+    }
+
+    /// Posts one WRITE of every span's source, in storage this agent registered, into its
+    /// destination, in storage `peer` registered: [`Agent::read`] the other way, which a
+    /// handoff's push takes. The caller keeps every source unchanged until the transfer
+    /// completes, and the peer's process reads no destination before then.
+    ///
+    /// # Errors
+    ///
+    /// As [`Agent::read`].
+    pub(crate) fn write(&self, peer: &str, spans: &[Span]) -> Result<Transfer> {
+        self.post(peer, spans, Op::Write)
+    }
+
+    /// Posts one transfer of `spans` with `peer`: a READ of its storage into this agent's, or
+    /// a WRITE of this agent's into its.
+    fn post(&self, peer: &str, spans: &[Span], op: Op) -> Result<Transfer> {
         let Some(first) = spans.first() else {
             return Err(Error::NixlArgument(
                 "a READ has at least one span".to_owned(),
@@ -353,8 +371,8 @@ impl Agent {
         let c_peer = CString::new(peer)
             .map_err(|_| Error::NixlArgument("a peer's name holds no NUL byte".to_owned()))?;
 
-        // NIXL's local list is this agent's destinations; its remote list,
-        // the peer's sources.
+        // NIXL's local list is this agent's storage, its remote list the peer's: a READ's
+        // destinations and sources, a WRITE's sources and destinations.
         let api = self.shared.api;
         let destinations = Descriptors::new(api, destination_kind.kind())?;
         let sources = Descriptors::new(api, source_kind.kind())?;
@@ -362,17 +380,21 @@ impl Agent {
             destinations.add(span.destination)?;
             sources.add(span.source)?;
         }
+        let (local, remote, code, what) = match op {
+            Op::Read => (&destinations, &sources, capi::XFER_OP_READ, "a READ"),
+            Op::Write => (&sources, &destinations, capi::XFER_OP_WRITE, "a WRITE"),
+        };
 
         let state = self.shared.lock();
         let mut request = ptr::null_mut();
         // SAFETY: a live agent, two live lists and a NUL-terminated name;
         // the request copies the descriptors, so the lists may go after.
-        check("creating a READ", unsafe {
+        check(what, unsafe {
             (api.create_xfer_req)(
                 state.agent,
-                capi::XFER_OP_READ,
-                destinations.list,
-                sources.list,
+                code,
+                local.list,
+                remote.list,
                 c_peer.as_ptr(),
                 &mut request,
                 ptr::null_mut(),
@@ -392,13 +414,23 @@ impl Agent {
             capi::IN_PROG => {}
             status => {
                 return Err(Error::Nixl {
-                    call: "posting a READ",
+                    call: match op {
+                        Op::Read => "posting a READ",
+                        Op::Write => "posting a WRITE",
+                    },
                     status,
                 });
             }
         }
         Ok(transfer)
     }
+}
+
+/// Which way a transfer with a peer goes.
+#[derive(Clone, Copy)]
+enum Op {
+    Read,
+    Write,
 }
 
 impl std::fmt::Debug for Agent {

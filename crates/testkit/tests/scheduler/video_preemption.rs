@@ -106,6 +106,7 @@ fn stored_step(harness: &Harness, id: RequestId) -> u32 {
         cause: MigrationCause::Drain,
         denoised_steps,
         stored_layout,
+        lend: None,
     }) = harness.terminal(id)
     else {
         panic!(

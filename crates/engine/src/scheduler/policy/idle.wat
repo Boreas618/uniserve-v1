@@ -1,4 +1,4 @@
-;; A policy module of interface version 7 that speaks every export of the scheduling policy
+;; A policy module of interface version 8 that speaks every export of the scheduling policy
 ;; interface and decides nothing: `sched_init` replies nothing, `sched_limits` replies a
 ;; 256-token prefetch threshold and a 30 s starvation bound, `sched_dispatch` a decision that names nothing, `sched_observe` and
 ;; `sched_preempt` reply nothing, and `sched_place` chooses the first candidate.
@@ -10,7 +10,7 @@
   (memory (export "memory") 1)
   (data (i32.const 64768) "{\"prefetch_min_tokens\":256,\"timeout\":30000000000}")
   (data (i32.const 65024) "{\"admit\":[],\"reject\":[],\"work\":[],\"offload\":[],\"prefetch\":[],\"refill\":[]}")
-  (func (export "sched_interface_version") (result i32) (i32.const 7))
+  (func (export "sched_interface_version") (result i32) (i32.const 8))
   (func (export "sched_alloc") (param i32) (result i32) (i32.const 1024))
   (func (export "sched_free") (param i32 i32))
   (func (export "sched_init") (param i32 i32) (result i64) (i64.const 0))

@@ -120,6 +120,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
             ..Default::default()
         },
         scheduler: Default::default(),
+        roles: Vec::new(),
         media: Default::default(),
         mem_fraction_static: 0.9,
         load: Default::default(),

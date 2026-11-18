@@ -599,6 +599,7 @@ impl MainProcess {
             }
             Output::NumericalFault(batch, requests) => self.numerical_fault(batch, requests),
             Output::Shrunk(region, units) => self.shrunk(region, units),
+            Output::Handoff(request, handoff) => self.handoff(scheduler, request, handoff),
             Output::Failed(error) => {
                 let reason = format!("scheduler {scheduler} failed: {error}");
                 self.fail(
@@ -1291,6 +1292,34 @@ impl MainProcess {
     /// A scheduler's region `region` shrank to `units`: the segments it no longer covers are
     /// withdrawn and released on the operations thread on every rank that maps it, the peers'
     /// included, and the daemon is told once per host whose devices gave memory back.
+    /// Scheduler `scheduler`'s request `request` imports a lend: the deployment's KV program at
+    /// this host's Storage Server chooses how its full pages arrive (`handoff`), on a thread of
+    /// its own, and the scheduler is told the path. An engine with no session head, or a server
+    /// that cannot answer, reads them over NIXL, as the server's own rule would push them.
+    fn handoff(&mut self, scheduler: usize, request: RequestId, handoff: scheduling::kv::Handoff) {
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let Some(inbox) = engine.inboxes().into_iter().nth(scheduler) else {
+            return;
+        };
+        let head = engine.head.clone();
+        let fallback = scheduling::kv::Path::Read(scheduling::kv::Transport::Nixl);
+        let asked = std::thread::Builder::new()
+            .name("uniserve-handoff".into())
+            .spawn(move || {
+                let path = head.map_or(Ok(fallback), |head| service::lock(&head).handoff(handoff));
+                let path = path.unwrap_or_else(|error| {
+                    tracing::warn!(request = request.0, "{error:#}; the decode replica reads");
+                    fallback
+                });
+                let _ = inbox.send(crate::scheduler::Message::Path(request, path));
+            });
+        if let Err(error) = asked {
+            tracing::warn!(%error, "a handoff's path cannot be asked");
+        }
+    }
+
     fn shrunk(&mut self, region: u8, units: u32) {
         // An engine with no session head of its own holds no segment to release.
         let Some((engine, head)) = self

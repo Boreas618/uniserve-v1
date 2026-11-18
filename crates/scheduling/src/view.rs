@@ -288,8 +288,6 @@ pub struct ReplicaView {
     /// Whether this request's state already lives on it; a request is never
     /// migrated off a replica that holds it (design §4.4).
     pub holds_request: bool,
-    /// Whether it runs prefill only, so a decode-stage call never lands on it.
-    pub prefills_only: bool,
     /// Whether it already holds another stage of this request, which a
     /// dispatch prefers to a replica that holds none of it.
     pub holds_stage: bool,

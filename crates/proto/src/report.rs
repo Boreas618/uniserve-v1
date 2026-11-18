@@ -151,16 +151,14 @@ pub struct SchedulerStats {
     /// Calls left out of a step in the interval because blocks they write had not arrived from
     /// the buffer pool: the request's `Allocate` was still outstanding when the call was due.
     pub calls_without_blocks: u64,
-    /// Transfers of a request between worker groups, from the group that prefilled it to a decode
-    /// group, that the buffer pool answered `Transferred` in the interval.
-    pub transfers: u64,
-    /// Transfers the buffer pool answered `Failed` in the interval; each request ended as
-    /// migratable.
-    pub failed_transfers: u64,
-    /// The blocks the target groups of the interval's transfers received: every entry each
-    /// `Transferred` states, by class and position, whether its task copied the block or the
-    /// target group's memory held it already.
-    pub transferred_blocks: u64,
+    /// Imports of a handoff's lend that the buffer pool answered `Imported` in the interval: the
+    /// prompts this replica continues from what a prefill replica computed.
+    pub imports: u64,
+    /// Imports the buffer pool answered `Failed` in the interval; each request computed its
+    /// prompt again.
+    pub failed_imports: u64,
+    /// The blocks the interval's imports filled.
+    pub imported_blocks: u64,
     /// Running requests the scheduler preempted in the interval because a request's next call
     /// found no room: each ended as migratable (`Migratable { cause: Drain }`, a video request
     /// with its trajectory stored) for the daemon to resubmit, whether its policy named it or it
@@ -183,4 +181,22 @@ pub struct SchedulerStats {
     pub policy_calls: u64,
     /// The fuel those calls consumed (a lifetime value).
     pub policy_fuel: u64,
+    /// The prompt tokens the scheduler has yet to compute (gauge): every token of a waiting
+    /// request's prompt and the uncomputed rest of a running request's, which a routing program
+    /// reads as the replica's prefill queue.
+    pub queued_tokens: u64,
+    /// The KV cache's pages on the device (gauge): in use, and the capacity of its regions.
+    pub device_pages: Pages,
+    /// The KV cache's pages on the host tier (gauge); zero without a host tier.
+    pub host_pages: Pages,
+}
+
+/// The pages of one tier of a scheduler's KV cache: a page is a block of one cache class,
+/// one unit of its region.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pages {
+    /// Pages no allocation can take now: held by requests, cached, or retiring.
+    pub used: u64,
+    /// Pages the tier's regions hold.
+    pub capacity: u64,
 }

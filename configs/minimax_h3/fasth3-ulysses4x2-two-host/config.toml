@@ -4,7 +4,7 @@ hosts = ["rank-1", "rank-2"]
 
 [[worker_groups]]
 id = "text"
-replicas = 2
+copies = 2
 ranks = ["rank-1/cuda:0-3", "rank-2/cuda:0-3"]
 queue_depth = 6
 mem_fraction_static = 0.26
@@ -13,7 +13,7 @@ mem_fraction_static = 0.26
 tensor_parallel_size = 4
 [[worker_groups]]
 id = "flow"
-replicas = 2
+copies = 2
 ranks = ["rank-1/cuda:0-3", "rank-2/cuda:0-3"]
 queue_depth = 6
 mem_fraction_static = 0.73

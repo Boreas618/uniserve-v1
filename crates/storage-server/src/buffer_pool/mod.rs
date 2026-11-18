@@ -33,6 +33,7 @@
 
 mod copies;
 mod image;
+mod lends;
 mod peers;
 mod region;
 mod sessions;
@@ -57,6 +58,7 @@ use storage::runtime::{
 };
 
 pub(crate) use image::FORMAT;
+pub use lends::{ImportWork, LentBlocks, NamedRun};
 use region::{Region, Run};
 /// A kind of block, as a session states it in its layout; the pool keeps
 /// its host region by the pool's number of that region.
@@ -251,7 +253,7 @@ struct Block {
     runs: RefCell<Vec<Run>>,
     /// The memories that hold the block's content, a bit each: device
     /// memories and the memories of main processes for a device block, from
-    /// its allocation, changed by a transfer, by a load that fills one more
+    /// its allocation, changed by a load that fills one more
     /// memory and by a `Replicate`; host parts for a host block, from the
     /// end of the copy that wrote it, grown by a store that fills the parts
     /// it lacks.
@@ -364,7 +366,7 @@ struct Owner<B = Rc<Block>> {
     slot: B,
     /// Per class, by position.
     tables: Vec<BTreeMap<u32, Held<B>>>,
-    /// Whether its transfer waits or runs: it then takes only a detach.
+    /// Whether its lend or its import waits or runs: it then takes only a detach.
     moving: bool,
 }
 
@@ -429,13 +431,14 @@ enum Deferred<B = Rc<Block>> {
         tokens: u16,
         rest: Stamps,
     },
-    Transfer {
+    /// A lend waits for the stamps of the batches that may still write the owner's blocks.
+    Lend {
         queue: QueueId,
         #[serde(with = "image::request_id")]
         request: RequestId,
         #[serde(with = "image::owner_id")]
         owner: OwnerId,
-        to: GroupId,
+        lease: u64,
         rest: Stamps,
     },
     Finish {
@@ -524,11 +527,12 @@ enum Target {
         #[serde(with = "image::owner_id")]
         owner: OwnerId,
     },
-    /// The memory of the group an owner is transferred to.
-    Group {
+    /// A private block of an owner, at its position, that an import writes from a lend.
+    Import {
         #[serde(with = "image::owner_id")]
         owner: OwnerId,
-        to: GroupId,
+        class: u8,
+        at: u32,
     },
     /// A crossing: the block at an owner's position, read from its run in
     /// region `from`, in one memory the group reads the class in.
@@ -546,7 +550,7 @@ enum Target {
 /// connector. It holds what it reads and what it writes until it has ended.
 #[derive(Serialize, Deserialize)]
 struct Copy<B = Rc<Block>> {
-    /// The memories it writes: the device memory a clone, a load, a transfer or a crossing
+    /// The memories it writes: the device memory a clone, a load, an import or a crossing
     /// writes; the host parts a store, a save or a prefetch writes; none for a restore, which
     /// writes the slot row, and a put.
     memory: Memories,
@@ -628,10 +632,18 @@ pub struct BufferPool {
     /// The host copies each peer, another host's Storage Server, holds for
     /// its reads, by the peer's connection: holders like any other.
     peers: HashMap<u64, Vec<Rc<Block>>>,
+    /// The lent owners, each with the end of its lease, in nanoseconds of the host's monotonic
+    /// clock.
+    lends: BTreeMap<(ClientId, OwnerId), u64>,
+    /// What each import keeps until its task starts and ends.
+    imports: HashMap<(QueueId, RequestId), lends::Importing>,
+    /// The blocks of a lend another host's Storage Server borrowed, by its connection and the
+    /// lend: holders like any other.
+    borrows: HashMap<(u64, ClientId, OwnerId), Vec<Rc<Block>>>,
     /// The blocks whose holders the handler running now changed, counted
     /// again when it is done; empty between handlers.
     touched: RefCell<Vec<Weak<Block>>>,
-    /// The trace id of each transfer's request, by the request that asked for it, from its
+    /// The trace id of each import's request, by the request that asked for it, from its
     /// arrival to its task's end: the request its handoff span names. Not part of the pool's
     /// state, which a trace replays without it.
     traces: HashMap<(QueueId, RequestId), u64>,
@@ -676,6 +688,9 @@ impl BufferPool {
             started: Vec::new(),
             stopped: Vec::new(),
             peers: HashMap::new(),
+            lends: BTreeMap::new(),
+            imports: HashMap::new(),
+            borrows: HashMap::new(),
             touched: RefCell::new(Vec::new()),
             traces: HashMap::new(),
         }
@@ -798,16 +813,22 @@ impl BufferPool {
             Request::Save { owner, key, units } => self.save(queue, id, owner, key, units),
             Request::Restore { owner, key } => self.restore(queue, id, owner, key),
             Request::Finish { copy, ok, after } => self.finish(queue, id, copy, ok, after),
-            Request::Transfer {
+            Request::Lend {
                 owner,
-                group,
+                lease,
                 after,
+            } => self.lend(queue, id, owner, lease, after),
+            Request::Import {
+                owner,
+                tables,
+                lender,
+                push,
                 trace,
             } => {
                 if trace != 0 {
                     self.traces.insert((queue, id), trace);
                 }
-                self.transfer(queue, id, owner, group, after)
+                self.import(queue, id, owner, &tables, (lender, push))
             }
             Request::Prefetch {
                 group,
@@ -856,7 +877,7 @@ impl BufferPool {
         self.owners.get(&(client, owner)).ok_or(Cause::Owner)
     }
 
-    /// As [`Self::owner`], for a request that an owner in transfer refuses.
+    /// As [`Self::owner`], for a request that a lent or importing owner refuses.
     fn settled(&self, client: ClientId, owner: OwnerId) -> Result<&Owner, Cause> {
         let found = self.owner(client, owner)?;
         if found.moving {
@@ -898,6 +919,7 @@ impl BufferPool {
         };
         let copied = self.copies_of(client).any(|copy| {
             matches!(copy.to, Target::Owner { owner: target, class: of, at: position, .. }
+                | Target::Import { owner: target, class: of, at: position }
                 if target == owner && of == class && (at..end).contains(&position))
         });
         found.tables[usize::from(class)]
@@ -1054,7 +1076,7 @@ impl BufferPool {
         let found = self.owners.remove(&(queue.0, owner)).ok_or(Cause::Owner)?;
 
         // R6: a commit of this owner that waits holds its block and still
-        // takes effect. R9: so does a transfer's task hold what it copies.
+        // takes effect. R9: so does an import's task hold what it copies.
         let blocks = disowned(found);
         self.retire(queue.0, blocks, after);
         Ok(Some(Completion::Done))
@@ -1066,7 +1088,7 @@ impl BufferPool {
         for copy in self.copies_of(client) {
             let named = matches!(copy.to, Target::Owner { owner: target, .. }
                 | Target::Slot { owner: target }
-                | Target::Group { owner: target, .. } if target == owner);
+                | Target::Import { owner: target, .. } if target == owner);
             if named && self.live(client, copy) {
                 copy.write.disown();
                 self.touch(&copy.write);
@@ -1375,15 +1397,6 @@ impl BufferPool {
         Ok(Rc::clone(block))
     }
 
-    /// The blocks that waiting commits hold.
-    fn commits(&self) -> impl Iterator<Item = &Rc<Block>> {
-        let deferred = self.groups.values().flat_map(|group| &group.deferred);
-        deferred.filter_map(|(_, work)| match work {
-            Deferred::Commit { block, .. } => Some(block),
-            _ => None,
-        })
-    }
-
     /// R3: queues `work` under the first stamp of `after` that is not
     /// reached, with the stamps after it as its `rest`; when every stamp is
     /// reached the work takes effect.
@@ -1394,7 +1407,7 @@ impl BufferPool {
             {
                 match &mut work {
                     Deferred::Commit { rest, .. }
-                    | Deferred::Transfer { rest, .. }
+                    | Deferred::Lend { rest, .. }
                     | Deferred::Finish { rest, .. }
                     | Deferred::Replicate { rest, .. } => {
                         *rest = after;
@@ -1411,11 +1424,10 @@ impl BufferPool {
         }
     }
 
-    /// Queues a transfer or a crossing that is due and waits for a copy to
-    /// end, under stamp 0 of the group it copies to: it is looked at again
-    /// whenever deferred work is done.
+    /// Queues a crossing that is due and waits for a copy to end, under stamp 0 of the group
+    /// it copies to: it is looked at again whenever deferred work is done.
     fn wait(&mut self, client: ClientId, work: Deferred) {
-        let (Deferred::Transfer { to, .. } | Deferred::Replicate { to, .. }) = &work else {
+        let Deferred::Replicate { to, .. } = &work else {
             return;
         };
         if let Some(found) = self.groups.get_mut(&(client, *to)) {
@@ -1435,7 +1447,7 @@ impl BufferPool {
     }
 
     /// Does the deferred work whose stamps are reached, until none is left
-    /// that can go on: work that ends a copy lets a waiting transfer start.
+    /// that can go on: work that ends a copy lets a waiting crossing start.
     fn settle(&mut self) {
         loop {
             let mut due = Vec::new();
@@ -1453,7 +1465,7 @@ impl BufferPool {
             for (client, work) in due {
                 let rest = match &work {
                     Deferred::Commit { rest, .. }
-                    | Deferred::Transfer { rest, .. }
+                    | Deferred::Lend { rest, .. }
                     | Deferred::Finish { rest, .. }
                     | Deferred::Replicate { rest, .. } => rest.clone(),
                     Deferred::Release { .. } => Vec::new(),
@@ -1475,7 +1487,7 @@ impl BufferPool {
     }
 
     /// Deferred work takes effect: every stamp it waited for is reached.
-    /// Returns a transfer or a crossing that cannot start yet.
+    /// Returns a crossing that cannot start yet.
     fn effect(&mut self, client: ClientId, work: Deferred) -> Option<Deferred> {
         match work {
             Deferred::Release { blocks } => {
@@ -1507,23 +1519,13 @@ impl BufferPool {
                 let completion = self.finished(queue, copy, ok);
                 self.complete(queue, request, completion);
             }
-            Deferred::Transfer {
+            Deferred::Lend {
                 queue,
                 request,
                 owner,
-                to,
+                lease,
                 ..
-            } => {
-                if !self.start(queue, request, owner, to) {
-                    return Some(Deferred::Transfer {
-                        queue,
-                        request,
-                        owner,
-                        to,
-                        rest: Vec::new(),
-                    });
-                }
-            }
+            } => self.lent(queue, request, owner, lease),
             Deferred::Replicate { .. } => return self.cross(work),
         }
         None

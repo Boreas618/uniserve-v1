@@ -472,6 +472,15 @@ pub struct GenerationRequest {
     /// model alone (`uniserve.adapters`).
     #[serde(default)]
     pub adapter: u32,
+    /// The request hands off once its first token is sampled: the prefill replica that serves
+    /// it lends the KV of its prompt and ends it as migratable with the lend
+    /// (`MigrationCause::Handoff`), and the replica its route names for its tokens continues it.
+    #[serde(default)]
+    pub hand_off: bool,
+    /// The KV of the request's prompt, which a prefill replica lent: the engine imports it into
+    /// the request's pages, and computes what the import does not bring.
+    #[serde(default)]
+    pub lend: Option<super::Lend>,
 }
 
 impl GenerationRequest {
@@ -733,6 +742,8 @@ mod tests {
             },
             generated_token_ids: Vec::new(),
             adapter: 4,
+            hand_off: false,
+            lend: None,
         }
     }
 

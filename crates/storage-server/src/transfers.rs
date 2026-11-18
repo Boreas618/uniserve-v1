@@ -30,7 +30,9 @@
 //! A span's source on another host ([`Region::Remote`]) is forwarded as
 //! that host's region ([`Allocation::Remote`]), which this server cannot
 //! check: the Transfer Server has that host's server expose it and READs
-//! it. The other direction serves another host's Transfer Server, a
+//! it. A span's destination on another host, of a source of this host, is
+//! forwarded alike, and the Transfer Server WRITEs it (a handoff's push).
+//! The other direction serves another host's Transfer Server, a
 //! [`Role::Peer`]: its [`Request::Expose`](::storage::protocol::Request::Expose)
 //! names regions of a deployment here, which the server checks as a
 //! task's sources, gives the Transfer Server, and has it register with its
@@ -615,6 +617,43 @@ impl Server {
                     .and_then(|start| start.checked_add(span.bytes))
                     .ok_or_else(|| invalid("a span's rows overflow"))
             };
+            let crossing = invalid(
+                "a span copies to or from this host's storage, not between two other hosts",
+            );
+            // Another host's destination: that host checks it once the Transfer Server asks
+            // it to expose the region, and the span's source is this host's.
+            if let Region::Remote { endpoint, region } = &span.destination {
+                if matches!(span.source, Region::Remote { .. }) {
+                    return Err(crossing);
+                }
+                let source = self.resolve(deployment, &span.source, false)?;
+                if matches!(source.allocation, Allocation::Fabric { .. }) {
+                    return Err(crossing);
+                }
+                let source_offset = within(
+                    &source,
+                    span.source_offset,
+                    extent(span.source_pitch)?,
+                    "source",
+                )?;
+                bytes = span
+                    .bytes
+                    .checked_mul(span.rows)
+                    .and_then(|copied| bytes.checked_add(copied))
+                    .ok_or_else(|| invalid("the spans' bytes overflow"))?;
+                moves.push(Move {
+                    source: source.allocation.clone(),
+                    source_offset,
+                    destination: remote(deployment, endpoint, region)?,
+                    destination_offset: span.destination_offset,
+                    bytes: span.bytes,
+                    rows: span.rows,
+                    source_pitch: span.source_pitch,
+                    destination_pitch: span.destination_pitch,
+                });
+                need(&mut needed, source);
+                continue;
+            }
             let destination = self.resolve(deployment, &span.destination, true)?;
             let destination_offset = within(
                 &destination,
@@ -622,9 +661,6 @@ impl Server {
                 extent(span.destination_pitch)?,
                 "destination",
             )?;
-            let crossing = invalid(
-                "a span copies to or from this host's storage, not between two other hosts",
-            );
             let (source, source_offset) = match &span.source {
                 // Another host's region: that host checks it, and the span
                 // against it, once the Transfer Server asks it to expose
@@ -883,8 +919,7 @@ impl Server {
                 writable: destination,
             }),
             Region::Remote { .. } => Err(invalid(if destination {
-                "a span writes storage of this host: another host's region is a source, which \
-                 this host READs"
+                "another host's destination is WRITTEN from storage of this host"
             } else {
                 "another host exposes its own retained tensors and host regions' parts"
             })),

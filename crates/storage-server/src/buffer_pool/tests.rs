@@ -3,7 +3,9 @@
 //! [`BufferPool::check`].
 
 use storage::protocol::Key;
-use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Source, Tier};
+use storage::runtime::{
+    Cause, Completion, GroupId, Lender, OwnerId, Request, RequestId, Source, Tier,
+};
 
 use super::{BufferPool, Class, Group, Memories, QueueId, Validity};
 
@@ -1375,99 +1377,171 @@ fn a_load_names_the_encoding_of_the_host_copies_it_reads() {
     assert_eq!((keys, encodings), (vec![key(8)], Some(([9; 32], [0; 32]))));
 }
 
-#[test]
-fn a_transfer_moves_an_owner_and_copies_what_the_target_group_lacks() {
-    let mut fixture = Fixture::new();
-    let shared = fixture.cached(1, 7);
-    fixture.attach(2, PREFILL);
-    fixture.pin(2, 0, &[7]);
-    let private = fixture.allocate(2, 1, 1)[0];
+/// The lender of this pool that an import of `session`'s owner `owner` names.
+fn lender(session: u32, owner: u64) -> Lender {
+    Lender {
+        endpoint: None,
+        session,
+        owner: OwnerId(owner),
+    }
+}
 
-    // R3: the task starts when the source group has ended its batches.
-    let id = fixture.submit(
+/// An import into owner `owner`'s positions `at .. at + count` from the lend of `lent`.
+fn import(owner: u64, at: u32, count: u32, lent: u64) -> Request {
+    Request::Import {
+        owner: OwnerId(owner),
+        tables: vec![(KV, at, count)],
+        lender: lender(SERVING, lent),
+        push: false,
+        trace: 0,
+    }
+}
+
+#[test]
+fn a_lend_takes_effect_at_its_stamps_and_its_return_releases_the_owner() {
+    let mut fixture = Fixture::new();
+    let before = fixture.free(UNITS);
+    fixture.attach(1, PREFILL);
+    fixture.allocate(1, 0, 2);
+
+    // R3: the lend waits for the batches that may still write the owner's blocks.
+    let lend = fixture.submit(
         QUEUE,
-        Request::Transfer {
-            trace: 0,
-            owner: OwnerId(2),
-            group: DECODE,
+        Request::Lend {
+            owner: OwnerId(1),
+            lease: 1_000,
             after: vec![(PREFILL, 2)],
         },
     );
-    assert_eq!(fixture.pool.started(), Vec::new());
-    // An owner in transfer takes only a detach.
+    assert_eq!(fixture.answer(lend), None);
+    // A lent owner takes no other request.
     assert_eq!(
-        fixture.release(2, 1, 1, Vec::new()),
+        fixture.release(1, 0, 1, Vec::new()),
         Some(Completion::Refused {
             cause: Cause::Owner
         })
     );
     fixture.pool.advance(SERVING, PREFILL, 2);
     fixture.checked();
-    assert_eq!(fixture.pool.started(), [(QUEUE, id)]);
+    assert_eq!(fixture.answer(lend), Some(Completion::Done));
+    assert_eq!(fixture.free(UNITS), before - 2, "the lent blocks stay");
 
-    // The task copies both blocks into the decode group's memory and the slot into a row there.
-    let work = fixture.pool.work((QUEUE, id));
-    let copied: Vec<_> = work
-        .iter()
-        .map(|(_, from, to, _, _)| (from.clone(), to.clone()))
-        .collect();
-    assert_eq!(
-        copied[..2],
-        [
-            (vec![(UNITS, shared, 1)], vec![(UNITS, shared, 1)]),
-            (vec![(UNITS, private, 1)], vec![(UNITS, private, 1)])
-        ]
-    );
-    assert_eq!(copied[2], (vec![(1, 1, 1)], vec![(2, 1, 1)]));
-
-    // R9: what the task holds is not reclaimed before its end.
-    assert_eq!(
-        fixture.ask(Request::Evict { keys: vec![key(7)] }),
-        Some(Completion::Evicted { keys: Vec::new() })
-    );
-    fixture.pool.ended((QUEUE, id), true);
+    // The importer's return releases the owner as a detach does.
+    assert!(fixture.pool.give_back(SERVING, OwnerId(1)));
     fixture.checked();
-    let runs = vec![
-        (KV, 0, (UNITS, shared, 1), false),
-        (KV, 1, (UNITS, private, 1), true),
-    ];
-    assert_eq!(
-        fixture.answer(id),
-        Some(Completion::Transferred { slot: 1, runs })
+    assert_eq!(fixture.free(UNITS), before);
+    assert!(
+        !fixture.pool.give_back(SERVING, OwnerId(1)),
+        "a lend ends once"
     );
-    assert_eq!(fixture.free(1), 2);
-
-    // The shared block is valid in both groups; the private one in the decode group alone.
-    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b001, 0b11, 0)]);
-    assert_eq!(
-        fixture.commit(2, 1, 8, Vec::new()),
-        Some(Completion::Committed)
-    );
-    assert_eq!(fixture.listing()[1], (key(8), KV, 64, 0b001, 0b10, 0));
 }
 
-/// A handoff's span is its task's: it begins as the task starts and ends as it ends, naming the
-/// request's trace id and the bytes the task copied into the decode group's memory.
 #[test]
-fn a_transfer_spans_its_handoff_with_the_bytes_it_copies() {
-    // A trace id no other test of the process names: the rings are the process's.
-    const TRACE: u64 = 0x5eed_7a11;
+fn a_lend_whose_lease_passes_releases_its_owner() {
     let mut fixture = Fixture::new();
-    fixture.cached(1, 7);
-    fixture.attach(2, PREFILL);
-    fixture.pin(2, 0, &[7]);
-    fixture.allocate(2, 1, 1);
+    let before = fixture.free(UNITS);
+    fixture.attach(1, PREFILL);
+    fixture.allocate(1, 0, 1);
+    fixture.pool.tick(100);
+    let lend = Request::Lend {
+        owner: OwnerId(1),
+        lease: 50,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(lend), Some(Completion::Done));
+    assert_eq!(fixture.pool.next_deadline(), Some(150));
 
-    let id = fixture.submit(
-        QUEUE,
-        Request::Transfer {
-            owner: OwnerId(2),
-            group: DECODE,
-            after: vec![(PREFILL, 2)],
-            trace: TRACE,
-        },
+    fixture.pool.tick(149);
+    assert_eq!(fixture.free(UNITS), before - 1);
+    fixture.pool.tick(150);
+    fixture.checked();
+    assert_eq!(fixture.free(UNITS), before);
+    assert_eq!(fixture.pool.next_deadline(), None);
+}
+
+#[test]
+fn an_import_fills_blocks_of_its_own_from_the_lent_ones_which_it_holds_until_its_task_ends() {
+    let mut fixture = Fixture::new();
+    let before = fixture.free(UNITS);
+    fixture.attach(1, PREFILL);
+    let lent = fixture.allocate(1, 0, 2);
+    let lend = Request::Lend {
+        owner: OwnerId(1),
+        lease: 1_000,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(lend), Some(Completion::Done));
+    fixture.attach(2, DECODE);
+
+    // The import takes two blocks and a task fills them from the lent ones.
+    let id = fixture.submit(QUEUE, import(2, 0, 2, 1));
+    assert_eq!(fixture.pool.started(), [(QUEUE, id)]);
+    assert_eq!(fixture.free(UNITS), before - 4);
+    let work = fixture.pool.import_work((QUEUE, id)).unwrap();
+    let region = fixture.pool.region_name(UNITS).to_owned();
+    let name = |unit: u32| vec![(region.clone(), unit, 1)];
+    let written: Vec<u32> = work.pages.iter().map(|(.., to, _)| to[0].1).collect();
+    assert_eq!(
+        work.pages,
+        [
+            (KV, 0, name(written[0]), name(lent[0])),
+            (KV, 1, name(written[1]), name(lent[1])),
+        ]
     );
-    fixture.pool.advance(SERVING, PREFILL, 2);
+    assert_eq!(work.lender_memory.as_deref(), Some("prefill"));
+    assert_eq!(work.memory, "decode");
+    // The importing owner takes no other request meanwhile.
+    assert_eq!(
+        fixture.release(2, 0, 1, Vec::new()),
+        Some(Completion::Refused {
+            cause: Cause::Owner
+        })
+    );
+
+    // R9: the lend ends with the task, and the lent blocks outlive it until the task ends.
+    assert!(fixture.pool.give_back(SERVING, OwnerId(1)));
+    fixture.checked();
+    assert_eq!(fixture.free(UNITS), before - 4);
+    fixture.pool.ended((QUEUE, id), true);
+    fixture.checked();
+    let runs = written.iter().map(|unit| (UNITS, *unit, 1)).collect();
+    assert_eq!(
+        fixture.answer(id),
+        Some(Completion::Imported {
+            runs,
+            evicted: Vec::new()
+        })
+    );
+    assert_eq!(fixture.free(UNITS), before - 2);
+    assert_eq!(fixture.release(2, 0, 2, Vec::new()), Some(Completion::Done));
+    assert_eq!(fixture.free(UNITS), before);
+}
+
+/// A handoff's span is its import's task's: it begins as the task starts and ends as it ends,
+/// naming the request's trace id and the bytes the task writes into the importer's memory.
+#[test]
+fn an_import_spans_its_handoff_with_the_bytes_it_writes() {
+    // A trace id no other test of the process names: the rings are the process's.
+    const TRACE: u64 = 0x5eed_1e9d;
+    let mut fixture = Fixture::new();
+    fixture.attach(1, PREFILL);
+    fixture.allocate(1, 0, 2);
+    let lend = Request::Lend {
+        owner: OwnerId(1),
+        lease: 1_000,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(lend), Some(Completion::Done));
+    fixture.attach(2, DECODE);
+
+    let traced = Request::Import {
+        owner: OwnerId(2),
+        tables: vec![(KV, 0, 2)],
+        lender: lender(SERVING, 1),
+        push: false,
+        trace: TRACE,
+    };
+    let id = fixture.submit(QUEUE, traced);
     fixture.pool.ended((QUEUE, id), true);
 
     let spans: Vec<service::span::Span> = service::span::spans(&service::span::records(), |_| None)
@@ -1480,111 +1554,94 @@ fn a_transfer_spans_its_handoff_with_the_bytes_it_copies() {
         service::span::Name::Stage("handoff".to_owned())
     );
     assert_eq!(spans[0].process, service::span::Process::Storage);
-    // Two blocks of one 64-byte unit each; the slot row moves without a fill.
+    // Two blocks of one 64-byte unit each.
     assert_eq!(spans[0].bytes, Some(128));
     assert!(spans[0].start <= spans[0].end);
 }
 
 #[test]
-fn a_failed_transfer_leaves_the_owner_in_its_group() {
+fn an_import_without_a_standing_lend_or_of_taken_positions_changes_nothing() {
     let mut fixture = Fixture::new();
+    let before = fixture.free(UNITS);
     fixture.attach(1, PREFILL);
     fixture.allocate(1, 0, 1);
+    fixture.attach(2, DECODE);
+    fixture.allocate(2, 0, 1);
+
+    // No lend stands: the import fails at once, taking nothing.
+    assert_eq!(fixture.ask(import(2, 1, 1, 1)), Some(Completion::Failed));
+    assert_eq!(fixture.pool.started(), Vec::new());
+    // R1: a position the owner holds already.
+    assert_eq!(
+        fixture.ask(import(2, 0, 1, 1)),
+        Some(Completion::Refused {
+            cause: Cause::Position
+        })
+    );
+
+    // A lend that holds no page at a position is no source for it.
+    let lend = Request::Lend {
+        owner: OwnerId(1),
+        lease: 1_000,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(lend), Some(Completion::Done));
+    assert_eq!(fixture.ask(import(2, 1, 1, 1)), Some(Completion::Failed));
+
+    // A failed task of a lend of another host releases the blocks it took.
     let id = fixture.submit(
         QUEUE,
-        Request::Transfer {
+        Request::Import {
+            owner: OwnerId(2),
+            tables: vec![(KV, 1, 1)],
+            lender: Lender {
+                endpoint: Some("lender:1".into()),
+                session: SERVING,
+                owner: OwnerId(1),
+            },
+            push: true,
             trace: 0,
-            owner: OwnerId(1),
-            group: DECODE,
-            after: Vec::new(),
         },
     );
-    assert_eq!(fixture.free(2), 1);
-
+    assert_eq!(fixture.free(UNITS), before - 3);
     fixture.pool.ended((QUEUE, id), false);
     fixture.checked();
     assert_eq!(fixture.answer(id), Some(Completion::Failed));
-    assert_eq!(fixture.free(2), 2);
-    assert_eq!(fixture.release(1, 0, 1, Vec::new()), Some(Completion::Done));
-
-    // Without a free row in the target group the transfer fails at once.
-    fixture.attach(2, DECODE);
-    fixture.attach(3, DECODE);
-    let request = Request::Transfer {
-        trace: 0,
-        owner: OwnerId(1),
-        group: DECODE,
-        after: Vec::new(),
-    };
-    assert_eq!(fixture.ask(request), Some(Completion::Failed));
-    assert_eq!(fixture.detach(1, Vec::new()), Some(Completion::Done));
+    assert_eq!(fixture.free(UNITS), before - 2);
 }
 
 #[test]
-fn a_transfer_holds_its_blocks_until_its_task_ends_whatever_its_owner_does() {
+fn a_borrow_holds_the_lent_blocks_until_its_peer_releases_them() {
     let mut fixture = Fixture::new();
+    let before = fixture.free(UNITS);
     fixture.attach(1, PREFILL);
-    fixture.allocate(1, 0, 2);
-    let id = fixture.submit(
-        QUEUE,
-        Request::Transfer {
-            trace: 0,
-            owner: OwnerId(1),
-            group: DECODE,
-            after: Vec::new(),
-        },
-    );
-
-    // R9: the detach releases the owner's blocks, and the task still holds them.
-    assert_eq!(fixture.detach(1, Vec::new()), Some(Completion::Done));
-    assert_eq!(
-        (fixture.free(UNITS), fixture.free(1), fixture.free(2)),
-        (2, 1, 1)
-    );
-    assert_eq!(fixture.pool.capacity(QUEUE, UNITS), (2, 2, 0));
-
-    fixture.pool.ended((QUEUE, id), true);
-    fixture.checked();
-    assert_eq!(fixture.answer(id), Some(Completion::Failed));
-    assert_eq!(
-        (fixture.free(UNITS), fixture.free(1), fixture.free(2)),
-        (4, 2, 2)
-    );
-}
-
-#[test]
-fn a_transfer_waits_while_another_fills_the_target_memory_of_a_block_it_holds() {
-    let mut fixture = Fixture::new();
-    fixture.cached(1, 7);
-    fixture.attach(2, PREFILL);
-    fixture.attach(3, PREFILL);
-    fixture.pin(2, 0, &[7]);
-    fixture.pin(3, 0, &[7]);
-
-    let transfer = |owner| Request::Transfer {
-        trace: 0,
-        owner: OwnerId(owner),
-        group: DECODE,
+    let lent = fixture.allocate(1, 0, 2);
+    let lend = Request::Lend {
+        owner: OwnerId(1),
+        lease: 1_000,
         after: Vec::new(),
     };
-    let (first, second) = (
-        fixture.submit(QUEUE, transfer(2)),
-        fixture.submit(QUEUE, transfer(3)),
-    );
-    assert_eq!(fixture.pool.started(), [(QUEUE, first)]);
+    assert_eq!(fixture.ask(lend), Some(Completion::Done));
 
-    // When the first has ended the block is valid in the target group, and
-    // the second copies only its slot.
-    fixture.pool.ended((QUEUE, first), true);
+    let (memory, blocks) = fixture.pool.borrow(7, SERVING, OwnerId(1)).unwrap();
+    assert_eq!(memory, "prefill");
+    let region = fixture.pool.region_name(UNITS).to_owned();
+    assert_eq!(
+        blocks,
+        [
+            (KV, 0, vec![(region.clone(), lent[0], 1)]),
+            (KV, 1, vec![(region, lent[1], 1)])
+        ]
+    );
+    assert_eq!(fixture.pool.borrow(7, SERVING, OwnerId(9)), None);
+
+    // The lend's end leaves the borrowed blocks held, until the peer lets them go.
+    assert!(fixture.pool.give_back(SERVING, OwnerId(1)));
     fixture.checked();
-    assert_eq!(fixture.pool.started(), [(QUEUE, second)]);
-    assert_eq!(fixture.pool.work((QUEUE, second)).len(), 1);
-    fixture.pool.ended((QUEUE, second), true);
+    assert_eq!(fixture.free(UNITS), before - 2);
+    assert!(fixture.pool.release_borrows(7, None));
     fixture.checked();
-    assert!(matches!(
-        fixture.answer(second),
-        Some(Completion::Transferred { slot: 2, .. })
-    ));
+    assert_eq!(fixture.free(UNITS), before);
 }
 
 #[test]
@@ -2449,21 +2506,20 @@ fn a_crossing_waits_for_its_stamps_and_its_task_and_makes_the_block_valid_where_
     let unit = fixture.allocate(1, 0, 1)[0];
 
     // R3: nothing is copied while a batch that may write the block has not ended, and the
-    // owner is not transferred meanwhile.
+    // owner is not lent meanwhile.
     let crossing = fixture.submit(
         QUEUE,
         replicate(1, KV, 0, UNITS, DECODE, vec![(PREFILL, 1)]),
     );
     assert_eq!(fixture.answer(crossing), None);
     assert_eq!(fixture.pool.started(), Vec::new());
-    let transfer = Request::Transfer {
-        trace: 0,
+    let lend = Request::Lend {
         owner: OwnerId(1),
-        group: DECODE,
+        lease: 1_000,
         after: Vec::new(),
     };
     let refused = Some(Completion::Refused { cause: Cause::Copy });
-    assert_eq!(fixture.ask(transfer.clone()), refused);
+    assert_eq!(fixture.ask(lend.clone()), refused);
 
     // R1: one crossing of a position into a group at a time.
     let again = replicate(1, KV, 0, UNITS, DECODE, Vec::new());
@@ -2487,7 +2543,7 @@ fn a_crossing_waits_for_its_stamps_and_its_task_and_makes_the_block_valid_where_
             Memories::one(1)
         )]
     );
-    assert_eq!(fixture.ask(transfer), refused);
+    assert_eq!(fixture.ask(lend), refused);
     fixture.pool.ended((QUEUE, crossing), true);
     fixture.checked();
     let replicated = Some(Completion::Replicated {
@@ -2541,14 +2597,13 @@ fn a_crossing_that_names_what_does_not_fit_is_refused_and_changes_nothing() {
         assert_eq!(fixture.ask(request), refused(cause));
     }
 
-    // An owner whose transfer waits.
-    let transfer = Request::Transfer {
-        trace: 0,
+    // An owner whose lend waits.
+    let lend = Request::Lend {
         owner: OwnerId(2),
-        group: DECODE,
+        lease: 1_000,
         after: vec![(PREFILL, 1)],
     };
-    fixture.submit(QUEUE, transfer);
+    fixture.submit(QUEUE, lend);
     let crossing = replicate(2, KV, 0, UNITS, DECODE, Vec::new());
     assert_eq!(fixture.ask(crossing), refused(Cause::Owner));
 

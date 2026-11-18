@@ -297,6 +297,7 @@ The `[kernels]` table is the one module selection of kernels (`modules_of`, `cra
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
 | `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups. Independent replicas each run an engine of their own, and the leader sends a request to the one with the fewest in flight. With `moe_config.expert_parallel`, replicas of one rank each (`tensor_parallel_size` 1) share their experts and exchange tokens, so one engine runs every replica's scheduler and the request names the scheduler the leader chose for it; replicas of several tensor-parallel ranks each shard their experts over their own ranks and stay independent replicas. With `worker_groups`, the file's groups that serve requests form the schedulers as equal consecutive blocks |
 | `worker_groups` | Unset | The [deployment layout](#deployment-layout): `[[worker_groups]]` tables placing worker groups and their blocks |
+| `replicas` | `{}` | The deployment's replicas by id, `[replicas.<id>]` with `role` ([Replicas](#replicas)), which decides the requests the routing, a Dynamo frontend or the Dynamo sidecar give the replica ([`dynamo_config`](#dynamo_config)); a replica the table does not list is mixed. Token models only |
 | `hosts` | `[]` | The deployment's nodes, by host name (`uname -n`), the leader first ([Nodes](#nodes)); empty, the deployment is one node on whichever host serves it |
 | `engine_host` | The leader's host | The host of `hosts` that runs the engine and any ranks without an explicit host. Changing it starts a successor epoch there while the daemon that serves the API remains on the leader |
 | `paused` | `false` | Whether new requests wait in the daemon instead of reaching an engine; the requests in flight go on. A change takes effect from the next request on |
@@ -304,7 +305,6 @@ The `[kernels]` table is the one module selection of kernels (`modules_of`, `cra
 | `flush` | `0` | How many times the prefix cache was flushed: each change of the number revokes every cached prefix page at the engines' next step boundary, the requests in flight keeping the pages they hold |
 | `retire` | `false` | Whether the deployment's storage (its weights and caches) is released at its Storage Server once the deployment comes down at its stop signal; otherwise it stays retained for a start of the same deployment. Read when the deployment comes down |
 | `adapters` | `{}` | The LoRA adapters the workers hold (`[adapters]`), each the directory of a PEFT adapter under the name a request states as its `model` to compute with it; a change loads the adapters it adds into free slots of the workers' adapter pool and unloads the ones it removes, from the next request on, and an engine that starts later loads every one of them ([admin API](admin.md#lora-adapters)) |
-| `replicas` | `{}` | Each replica's options by its id, the deployment's scheduler number (`[replicas.<id>]`, the schedulers numbered across the replicas in the order the worker groups state them): its `role`, `prefill`, `decode` or `mixed` (`mixed` unless stated), which decides the requests the routing, a Dynamo frontend or the Dynamo sidecar give it; a change takes effect from the next request on, its process, weights and KV staying ([`dynamo_config`](#dynamo_config)) |
 
 A checkpoint that declares its own quantization in `config.json`'s `quantization_config` is read in the representation each weight's declaration and shard state; the declaration's `quant_method` names its producer, and the producer served is ModelOpt (`modelopt`), read in its own fields (`quant_algo`, `quantized_layers`). NVFP4 (`quant_algo: NVFP4`) runs NVFP4 products over activations encoded to NVFP4. A `MIXED_PRECISION` export states one algorithm per module in `quantized_layers`, and each module is read in its own: `FP8` is a per-tensor E4M3 product whose activation is encoded at the calibrated static `input_scale`; `NVFP4` as above. A representation no operator of this build multiplies is refused at load, naming the module, and never decoded into a dense matrix in its place: ModelOpt's weight-only `W4A16_NVFP4` and `FP8_PB_WO`, another producer's declaration (such as `quant_method: fp8` with a `weight_block_size`), and a shard that stores a `weight_scale_inv` beside a weight. This refuses Qwen3.8-Flash-Next-FP8, the Qwen3.8-Flash-Next NVFP4 export of NVIDIA (whose drafter's experts are `FP8_PB_WO`) and Qwen3.6-35B-A3B-NVFP4 (whose experts are `W4A16_NVFP4`) until those operators exist. A packed ModelOpt export of a diffusers pipeline declares its quantization in `modelopt_manifest.json` at its root instead: its calibrated projections are stored as `weight_packed`, `weight_scale` and `weight_tensor_scale`, run the same NVFP4 products, and encode their activations at the tensor scale the manifest states for each module (`activation_amax / (6 · 448)`). The key/value cache keeps the element type `kv_cache_config` states, the activations' otherwise.
 
@@ -392,6 +392,7 @@ The Transfer Server copies by its host's calibration, which `uniserve storage-se
 | `state_interval` | `256` | For a model that keeps a recurrent state per request, the decoded tokens between two checkpoints of a request's state (as SGLang's `--mamba-track-interval`); a prompt call checkpoints the last page boundary it reaches whatever the interval. A request resumed by its tokens (a migration, an epoch change, a prefix reuse) recomputes at most this many decoded tokens; a checkpoint, every recurrent layer's state, is one unit of the scheduler's recurrent-state region, a device region apart from the KV cache's |
 | `state_ratio` | `1.0` | For a model that keeps a recurrent state per request, the bytes of the recurrent-state region beyond one checkpoint per request slot over the bytes of the KV planes, positive (as SGLang's `mamba_full_memory_ratio`): of what a rank's share leaves once its request slots are held, the region takes the share `ratio / (1 + ratio)` and the KV planes the rest, or, with `max_tokens` stated, `ratio` times the bytes of those tokens' pages |
 | `prefetch_timeout_base` | `"1s"` | The time a copy of cached blocks the scheduler asks for may take whatever its size before it gives the copy up and the request computes those tokens, starts from noise or leaves with no stored step instead (as SGLang's `prefetch_timeout_base`): a prefetch from Mooncake or the peers, a load from or store to the host KV cache, and a stored trajectory's restore |
+| `lease` | `"30s"` | How long a prefill replica keeps the KV of a request it handed off for the decode replica to import, at most ([Replicas](#replicas)): the decode replica's import returns it earlier, and a lease that passes releases the pages and leaves the continuation to compute its prompt again |
 | `prefetch_timeout_per_ki_token` | `"250ms"` | The time such a copy may take beyond `prefetch_timeout_base` for every 1024 tokens it moves (as SGLang's `prefetch_timeout_per_ki_token`) |
 
 ### `scheduler_config`
@@ -676,17 +677,45 @@ Reference videos are decoded through the FFmpeg libraries the engine executable 
 | `retention` | `"1h"` | Time a finished asynchronous job stays retrievable |
 | `max_bytes` | `"1GiB"` | Generated video the asynchronous jobs keep in shared memory |
 
+## Replicas
+
+A deployment's replicas are its schedulers, `data_parallel_size` of them, each with its own KV cache and worker groups; a replica's id is its scheduler's index, `0` up to `data_parallel_size` less one in the order of the worker groups, and the observations label its rows `replica` by the same id. Every replica is built to serve both phases: both phases' graph buckets, chunk and workspace sizes and its whole KV capacity. Its role, `replicas.<id>.role`, decides only which requests it takes, from its next step on (`step`):
+
+| Role | Takes |
+| --- | --- |
+| `mixed` (default) | Every request, computed and generated in place |
+| `prefill` | The requests the leader routes to another replica's tokens: it computes the prompt, samples the first token, and hands the KV off |
+| `decode` | The continuations: a request whose KV a prefill replica handed off, and a request another migration moved with the tokens it generated |
+
+A role change starts no process and moves no data: a replica keeps its weights and KV, the requests it took serve there to their end, and a request a replica refuses for its role (`Rejected` of kind `role`, as a route that raced the change meets) is routed again. The roles must leave a replica that computes prompts and one that generates tokens; a video deployment's replicas are mixed.
+
+```toml
+data_parallel_size = 2
+
+[replicas.0]
+role = "prefill"
+
+[replicas.1]
+role = "decode"
+```
+
+The leader routes every new request through the routing program ([Programs](#programs)), whose input states each replica's role, its queued prompt tokens, the time of its running batch, its running requests, its KV pages in use by tier and the pages it could reserve, from its scheduler's latest report; without one, or when its route is refused, the leader routes by its own rule: the least loaded replica that computes prompts, by requests in flight, generated there when it is mixed and otherwise handed off to the least loaded replica that generates tokens. A route that names two replicas is a handoff:
+
+1. The prefill replica computes the prompt and samples the first token, which the client receives; its buffer pool then lends the request's pages (`Lend`, stamped by its workers) for at most `kv_cache_config.lease`, and the request leaves it as migratable with the lend.
+2. The decode replica's engine asks its host's Storage Server how the pages arrive, which the KV program's handoff hook decides (`crates/scheduling/src/kv.rs`) from the pages and the tail, the leading pages the decode replica's tiers already hold, whether the lend lies on this host, and the transports: a directed push, the lender's host writing the pages into the decode replica's (NIXL WRITE); a direct read, the decode replica's host reading them (NIXL READ, or a device copy on one host); or a pull by key, the decode replica reading the full pages from a tier that holds them as any admission reads a prefix and computing the tail. Without a hook, the pages are read.
+3. A push or a read imports every page of the lend into blocks of the decode replica's own (`Import`), resharded when the two replicas split the KV heads differently: each page moves as one copy per head range, from the source rank that holds those heads into the destination rank that holds them (`crates/storage-server/src/handoff.rs`); the two replicas keep the same page size. The request continues from the lend's tokens; an import that fails, and a model that keeps a recurrent state, computes the prompt again. The import's end returns the lend, which releases the prefill replica's pages.
+
 ## Deployment layout
 
 The `worker_groups` option is the deployment layout: it places worker groups on devices and hosts and names the blocks each runs. It is part of the configuration tree, one `[[worker_groups]]` table per group and one `[worker_groups.blocks.<name>]` table per block of the group; the packages of `configs/minimax_h3` state a layout each beside the model they serve, as `configs/minimax_h3/fasth3-ulysses4x2/config.toml` does. A change states the layout it moves to in its own package.
 
 ```toml
-# FastH3 on eight GPUs of one host: two Ulysses4 denoiser replicas, each with
+# FastH3 on eight GPUs of one host: two Ulysses4 denoiser copies, each with
 # its own TP4 text encoder.
 
 [[worker_groups]]
 id = "text"
-replicas = 2
+copies = 2
 ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.26
@@ -696,7 +725,7 @@ tensor_parallel_size = 4
 
 [[worker_groups]]
 id = "flow"
-replicas = 2
+copies = 2
 ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.73
@@ -730,32 +759,12 @@ A `[[worker_groups]]` table takes:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `id` | Required | Group name; replica `i` of a replicated group is `<id>-<i>` |
-| `role` | `model` | `model` for a group serving the model's blocks; `prefill` and `decode` for a prefill group and a decode group of the text model (below); `experts` for dedicated expert ranks, which take no blocks |
-| `replicas` | `1` | Copies of the group, each over the next equal block of `ranks`. The copies' blocks are replicas of the same blocks under one scheduler, which binds each request to one copy |
-| `ranks` | Required | The group's ranks, every replica's together, in rank order |
+| `id` | Required | Group name; copy `i` of a copied group is `<id>-<i>` |
+| `role` | `model` | `model` for a group serving the model's blocks; `experts` for dedicated expert ranks, which take no blocks |
+| `copies` | `1` | Copies of the group, each over the next equal block of `ranks`. The copies' blocks are copies of the same blocks under one scheduler, which binds each request to one copy |
+| `ranks` | Required | The group's ranks, every copy's together, in rank order |
 | `queue_depth` | Required | Batches in flight per rank. A rank that keeps video requests resident takes three positions per request, so such a group holds up to `queue_depth / 3` requests at once; a group serving several replicas, such as a shared text encoder, needs positions for all of them |
 | `mem_fraction_static` | Top-level `mem_fraction_static` | Each rank's share of its GPU's storage for this group, which bounds what the rank divides. The deployment's quota of a GPU is limited to the shares of the ranks placed there: each rank of a group that states its own adds it, the ranks of groups that state none hold the top-level fraction together, and the sum is at most the whole GPU |
-
-A `prefill` group prefills prompts only and a `decode` group decodes only; a deployment configures both or neither, and each places the `model` block alone. A request prefills on a prefill group; once its prompt is complete and its first token sampled, the host's Storage Server copies the request's cache units, device to device, from the prefill group's KV cache into the same units of a decode group's (a transfer task of the Transfer Server, reading a prefill group of another host through NIXL), and the request decodes there from its first token. One scheduler drives both groups as separate workers, each group's ranks running only that group's batches, so the two groups' devices compute side by side. The groups must have the same number of ranks, which startup checks, and the same KV cache layout, which the ranks agree at startup: every rank of the deployment sizes its cache to the same units. A group on another host (`gb200-b/cuda:0`) needs a deployment of several nodes, whose Storage Servers listen on TCP, with NIXL on both hosts' library search path ([NIXL transfers](nixl.md)). Such a deployment generates text: canvas requests are refused.
-
-```toml
-[[worker_groups]]
-id = "prefill"
-role = "prefill"
-ranks = ["cuda:0"]
-queue_depth = 2
-
-[worker_groups.blocks.model]
-
-[[worker_groups]]
-id = "decode"
-role = "decode"
-ranks = ["cuda:1"]
-queue_depth = 2
-
-[worker_groups.blocks.model]
-```
 
 A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the leader's host, the first of `hosts`; `gb200-b/cuda:0-3` places four ranks on the node of `hosts` whose host name is `gb200-b` ([Nodes](#nodes)).
 

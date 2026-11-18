@@ -1,6 +1,7 @@
 //! The path between hosts outside one NVLink fabric: NIXL READs this host's
 //! Transfer Server posts, from storage another host's Transfer Server
-//! registered with its own agent.
+//! registered with its own agent, and NIXL WRITEs into such storage from this
+//! host's (a handoff's push).
 //!
 //! The process has one NIXL agent with the UCX backend, over the host's
 //! usable RDMA ports with the transports the server's settings state, created
@@ -14,7 +15,8 @@
 //!   ([`Event::Deregister`]); the report carries each range and the agent's
 //!   metadata taken after the registrations ([`register`]).
 //! - **Destination.** A task's move from another host names that host's
-//!   Storage Server by its endpoint. Before the task's pieces are queued,
+//!   Storage Server by its endpoint; so does a move into another host, which
+//!   a WRITE copies, read from this host's storage. Before the task's pieces are queued,
 //!   [`Network::pieces`] asks that server, over this process's connection to
 //!   it as a [`Role::Peer`], to expose the task's regions there
 //!   ([`Request::Expose`]), loads the metadata of the agent that registered
@@ -102,23 +104,34 @@ pub(super) struct Source {
     pub(super) fabric: Option<FabricExport>,
 }
 
-/// A task's move from another host's storage into an allocation of this
-/// host's, before that host exposed its source; `hold` holds the GPU of a
-/// device destination.
+/// Which way a move between this host and another host goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Direction {
+    /// From the other host's region into this host's allocation: a READ.
+    Read,
+    /// From this host's allocation into the other host's region: a WRITE.
+    Write,
+}
+
+/// A task's move between another host's region and an allocation of this host's, before that
+/// host exposed its region; `hold` holds the GPU of a device allocation of this host.
 pub(super) struct Inbound {
     pub(super) endpoint: String,
     pub(super) deployment: String,
+    pub(super) direction: Direction,
+    /// The other host's region and the offset of the move in it.
     pub(super) region: Region,
-    pub(super) source_offset: u64,
-    pub(super) destination: Arc<Mapping>,
+    pub(super) remote_offset: u64,
+    /// This host's allocation and the offset of the move in it.
+    pub(super) local: Arc<Mapping>,
     pub(super) hold: Option<Hold>,
-    pub(super) destination_offset: u64,
-    /// The bytes of each row, the rows, and their pitches on each side, as
-    /// the span states them.
+    pub(super) local_offset: u64,
+    /// The bytes of each row, the rows, and their pitches in the other host's region and in
+    /// this host's allocation, as the span states them.
     pub(super) bytes: u64,
     pub(super) rows: u64,
-    pub(super) source_pitch: u64,
-    pub(super) destination_pitch: u64,
+    pub(super) remote_pitch: u64,
+    pub(super) local_pitch: u64,
 }
 
 /// An exposure of another host a task READs, which it ends when it ends.
@@ -259,35 +272,69 @@ impl Network {
             // against the range it registered from the region's first byte:
             // from its first row's start to its last row's end.
             let within = (copy.rows - 1)
-                .checked_mul(copy.source_pitch)
-                .and_then(|start| start.checked_add(copy.source_offset))
+                .checked_mul(copy.remote_pitch)
+                .and_then(|start| start.checked_add(copy.remote_offset))
                 .and_then(|start| start.checked_add(copy.bytes))
                 .is_some_and(|end| end <= source.region.len as u64);
             if !within {
                 return Err(self::copy(format!(
-                    "a span's source of {} rows of {} bytes at offset {} and pitch {} reaches \
+                    "a span's end of {} rows of {} bytes at offset {} and pitch {} reaches \
                      past the {} bytes of its region at {}",
                     copy.rows,
                     copy.bytes,
-                    copy.source_offset,
-                    copy.source_pitch,
+                    copy.remote_offset,
+                    copy.remote_pitch,
                     source.region.len,
                     source.endpoint
                 )));
             }
+            let local = End::Given {
+                mapped: Arc::clone(&copy.local),
+                hold: copy.hold.clone(),
+            };
+            if copy.direction == Direction::Write {
+                // A WRITE posts from this host's allocation into the other host's region.
+                match &copy.hold {
+                    Some(hold) => hold
+                        .session()
+                        .and_then(|session| session.nixl_region(agent, &copy.local)),
+                    None => copy.local.nixl_host_region(agent),
+                }
+                .map_err(self::copy)?;
+                let link = Link {
+                    source: copy.local.end.clone(),
+                    destination: source.end.clone(),
+                };
+                pieces.push((
+                    ThreadKey {
+                        link,
+                        runner: Runner::Network,
+                        path: Some(RemotePath::Read),
+                    },
+                    Piece {
+                        task,
+                        source: local,
+                        source_offset: copy.local_offset,
+                        destination: End::Remote(Arc::clone(source)),
+                        destination_offset: copy.remote_offset,
+                        bytes: copy.bytes,
+                        rows: copy.rows,
+                        source_pitch: copy.local_pitch,
+                        destination_pitch: copy.remote_pitch,
+                    },
+                ));
+                continue;
+            }
             let read = Piece {
                 task,
                 source: End::Remote(Arc::clone(source)),
-                source_offset: copy.source_offset,
-                destination: End::Given {
-                    mapped: copy.destination,
-                    hold: copy.hold,
-                },
-                destination_offset: copy.destination_offset,
+                source_offset: copy.remote_offset,
+                destination: local,
+                destination_offset: copy.local_offset,
                 bytes: copy.bytes,
                 rows: copy.rows,
-                source_pitch: copy.source_pitch,
-                destination_pitch: copy.destination_pitch,
+                source_pitch: copy.remote_pitch,
+                destination_pitch: copy.local_pitch,
             };
             let End::Given { mapped, hold } = &read.destination else {
                 unreachable!("a READ's destination is this host's allocation");

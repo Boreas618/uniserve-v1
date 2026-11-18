@@ -236,12 +236,11 @@ impl ModelRunner {
     }
 }
 
-/// Whether a text group of `role` encodes images, given a model with a vision tower: a group that
-/// prefills does, since a token request's image encodings are placed on the group of its prefill,
-/// which reads them (`crate::scheduler`'s placement). A decode group and an expert group encode
-/// none.
+/// Whether a text group of `role` encodes images, given a model with a vision tower: a model
+/// group does, since a token request's image encodings are placed on the group of its prefill,
+/// which reads them (`crate::scheduler`'s placement). An expert group encodes none.
 pub(crate) fn encodes(role: WorkerGroupRole) -> bool {
-    matches!(role, WorkerGroupRole::Model | WorkerGroupRole::Prefill)
+    role == WorkerGroupRole::Model
 }
 
 /// The class of encoder outputs in the session of a text deployment whose cache is laid out as

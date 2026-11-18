@@ -19,8 +19,9 @@ use storage::protocol::{Key, Segment};
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Stamps, Tier};
 
 use super::trace::{
-    CLOSE, COMPLETED, COMPLETION, DONE, ENDED, GRANT, HOLD, IMAGE, Input, OPEN, PEER_COPIES,
-    PUBLISH, RELEASE_PEER, REQUEST, ROLL_BACK, START, TICK, Task, WITHDRAW,
+    BORROW, CLOSE, COMPLETED, COMPLETION, DONE, ENDED, GIVE_BACK, GRANT, HOLD, IMAGE, Input, OPEN,
+    PEER_COPIES, PUBLISH, RELEASE_BORROWS, RELEASE_PEER, REQUEST, ROLL_BACK, START, TICK, Task,
+    WITHDRAW,
 };
 use super::{Block, BufferPool, ClientId, Copy, Deferred, Held, Memories, QueueId, Target};
 
@@ -73,6 +74,15 @@ pub(crate) fn apply(pool: &mut BufferPool, input: &Input) -> Result<(), String> 
         }
         Input::PeerCopies(task, held) => {
             pool.peer_copies(*task, held);
+        }
+        Input::Borrow(peer, client, owner) => {
+            pool.borrow(*peer, *client, *owner);
+        }
+        Input::GiveBack(client, owner) => {
+            pool.give_back(*client, *owner);
+        }
+        Input::ReleaseBorrows(peer, lend) => {
+            pool.release_borrows(*peer, *lend);
         }
     }
     Ok(())
@@ -340,6 +350,9 @@ pub(crate) fn stated_input(pool: &BufferPool, names: &SessionNames, input: &Inpu
                 .take_while(|encoding| encoding.is_some())
                 .count()
         ),
+        Input::Borrow(..) => "borrow".into(),
+        Input::GiveBack(..) => "give-back".into(),
+        Input::ReleaseBorrows(..) => "release-borrows".into(),
     }
 }
 
@@ -431,19 +444,16 @@ fn stated_request(request: &Request, session: &str) -> String {
                 keys(&[*key])
             )
         }
-        Request::Transfer {
+        Request::Lend {
             owner,
-            group,
             after: stamps,
             ..
-        } => {
-            format!(
-                "transfer o={} to={session}.g{} after={}",
-                owned(owner),
-                group.0,
-                after(stamps)
-            )
-        }
+        } => format!("lend o={} after={}", owned(owner), after(stamps)),
+        Request::Import { owner, tables, .. } => format!(
+            "import o={} pages={}",
+            owned(owner),
+            tables.iter().map(|(_, _, count)| count).sum::<u32>()
+        ),
         Request::Evict { keys: named } => format!("evict ks={}", keys(named)),
         Request::Victims { .. } => "victims".into(),
         Request::List => "list".into(),
@@ -1008,12 +1018,9 @@ pub(crate) fn stated(
                         )
                     }));
                 }
-                Deferred::Transfer {
-                    owner, to, rest, ..
-                } => lines.push(format!(
-                    "transfer o={} to={} after={}",
+                Deferred::Lend { owner, rest, .. } => lines.push(format!(
+                    "lend o={} after={}",
                     owner_name(*client, *owner),
-                    group_name(*client, *to),
                     pending(*client, at, rest)
                 )),
                 Deferred::Replicate {
@@ -1037,30 +1044,11 @@ pub(crate) fn stated(
     for (task, copies) in &pool.copies {
         let expired = u8::from(!pool.answers.contains_key(task));
         match copies.first().map(|copy| &copy.to) {
-            Some(Target::Group { owner, to }) => {
-                let held = copies
-                    .iter()
-                    .flat_map(|copy| &copy.reads)
-                    .map(&unit)
-                    .collect();
-                let writes = copies
-                    .iter()
-                    .filter(|copy| copy.fill)
-                    .map(|copy| unit(&copy.write))
-                    .collect();
-                let slot = copies
-                    .iter()
-                    .find(|copy| !copy.fill)
-                    .map_or("-".to_owned(), |copy| unit(&copy.write));
-                let line = format!(
-                    "task transfer o={} to={} slot={slot} units={} writes={}",
-                    owner_name(task.0.0, *owner),
-                    group_name(task.0.0, *to),
-                    units(held),
-                    units(writes)
-                );
-                lines.push(line.trim_end().to_owned());
-            }
+            Some(Target::Import { owner, .. }) => lines.push(format!(
+                "task import o={} units={}",
+                owner_name(task.0.0, *owner),
+                units(copies.iter().map(|copy| unit(&copy.write)).collect())
+            )),
             Some(Target::Memory {
                 owner, at, group, ..
             }) => lines.push(format!(
@@ -1162,6 +1150,27 @@ impl Input {
                     });
                 }
                 Self::PeerCopies(task, held)
+            }
+            BORROW => Self::Borrow(
+                u64::from_le_bytes(field(body)?),
+                u32::from_le_bytes(field(body)?),
+                OwnerId(u64::from_le_bytes(field(body)?)),
+            ),
+            GIVE_BACK => Self::GiveBack(
+                u32::from_le_bytes(field(body)?),
+                OwnerId(u64::from_le_bytes(field(body)?)),
+            ),
+            RELEASE_BORROWS => {
+                let peer = u64::from_le_bytes(field(body)?);
+                let lend = if body.is_empty() {
+                    None
+                } else {
+                    Some((
+                        u32::from_le_bytes(field(body)?),
+                        OwnerId(u64::from_le_bytes(field(body)?)),
+                    ))
+                };
+                Self::ReleaseBorrows(peer, lend)
             }
             other => return Err(format!("no input is of the kind {other}")),
         };

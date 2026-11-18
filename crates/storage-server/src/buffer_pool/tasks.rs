@@ -1,5 +1,5 @@
-//! Tasks: the copies the Transfer Server and the connector run. A transfer
-//! moves an owner to another group, a crossing (`Replicate`) brings a block
+//! Tasks: the copies the Transfer Server and the connector run. An import
+//! fills an owner's blocks from a lend (`lends`), a crossing (`Replicate`) brings a block
 //! into the memories another group reads it in, a prefetch brings keys into
 //! the host tier, a put writes host copies to the remote store.
 //!
@@ -39,10 +39,8 @@ impl BufferPool {
 
     /// What a task copies: per copy, the key it is for if any, the runs it
     /// reads and writes, where the content it reads is valid and the
-    /// memories it writes. A transfer's
-    /// copies have no key and read and write the same runs, from a memory
-    /// of the owner's group into the target group's, and its last copy
-    /// takes the slot row in the target group. A crossing's copies have no
+    /// memories it writes. An import's copies are stated apart
+    /// ([`BufferPool::import_work`]). A crossing's copies have no
     /// key; each reads the block's run in the region the request named,
     /// from the memories of that run that hold the block, and writes the
     /// block's runs that lie in one memory of the reading group. A
@@ -58,7 +56,6 @@ impl BufferPool {
                 Target::Entry { key, .. } => Some(key),
                 _ => None,
             };
-            // A transfer's last copy also holds the blocks it does not copy.
             let read = copy.reads.first();
             if let (Target::Memory { from, .. }, Some(block)) = (copy.to, read) {
                 let runs = block.runs.borrow();
@@ -89,10 +86,11 @@ impl BufferPool {
     /// of the host's monotonic clock: the time at which [`BufferPool::tick`]
     /// next has something to do. `None` when no task has one.
     pub fn next_deadline(&self) -> Option<u64> {
-        self.copies
+        let tasks = self
+            .copies
             .values()
-            .filter_map(|copies| copies.first()?.deadline?.at())
-            .min()
+            .filter_map(|copies| copies.first()?.deadline?.at());
+        tasks.chain(self.next_lease()).min()
     }
 
     /// Whether a task is outstanding: started and not ended, or not yet
@@ -100,210 +98,6 @@ impl BufferPool {
     pub fn tasks(&self) -> bool {
         let task = |copies: &Vec<Copy>| copies.iter().any(|copy| copy.deadline.is_some());
         !self.started.is_empty() || !self.stopped.is_empty() || self.copies.values().any(task)
-    }
-
-    /// A transfer waits for its stamps: until then the source group's
-    /// batches may still write the owner's blocks.
-    pub(super) fn transfer(
-        &mut self,
-        queue: QueueId,
-        id: RequestId,
-        owner: OwnerId,
-        to: GroupId,
-        after: Stamps,
-    ) -> Taken {
-        let client = queue.0;
-        let from = self.settled(client, owner)?.group;
-        if to == from || !self.groups.contains_key(&(client, to)) {
-            return Err(Cause::Group);
-        }
-        // R1: an owner that a copy writes for, or whose crossing waits or
-        // runs, is not transferred.
-        if self.copied(client, owner) || self.replicating(client, owner, None) {
-            return Err(Cause::Copy);
-        }
-        self.stamped(client, &after)?;
-
-        if let Some(found) = self.owners.get_mut(&(client, owner)) {
-            found.moving = true;
-        }
-        self.defer(
-            client,
-            after,
-            Deferred::Transfer {
-                queue,
-                request: id,
-                owner,
-                to,
-                rest: Vec::new(),
-            },
-        );
-        Ok(None)
-    }
-
-    /// A transfer comes due: a task starts that copies into the target
-    /// group's memory the owner's blocks that are not valid there. It holds
-    /// every block of the owner and a slot row of the target group. Returns
-    /// false when it must wait: a load or another owner's transfer fills the
-    /// target group's memory of a block the owner holds.
-    pub(super) fn start(
-        &mut self,
-        queue: QueueId,
-        request: RequestId,
-        owner: OwnerId,
-        to: GroupId,
-    ) -> bool {
-        let client = queue.0;
-        let target = self.memory(client, to);
-        let (Some(found), Some(group)) = (
-            self.owners.get(&(client, owner)),
-            self.groups.get(&(client, to)),
-        ) else {
-            // The owner was detached meanwhile: nothing is held.
-            self.complete(queue, request, Completion::Failed);
-            return true;
-        };
-        let held = || {
-            found
-                .tables
-                .iter()
-                .flat_map(|table| table.values().map(Held::block))
-        };
-        if held().any(|block| !block.valid.get().meets(target) && self.filling(block, target)) {
-            return false;
-        }
-
-        // Without a free row in the target group the transfer fails and nothing changes.
-        let slots = group.slots;
-        let (old, blocks): (Rc<Block>, Vec<Rc<Block>>) =
-            (Rc::clone(&found.slot), held().cloned().collect());
-        let Some(row) = self.regions[usize::from(slots)].take_row() else {
-            if let Some(found) = self.owners.get_mut(&(client, owner)) {
-                found.moving = false;
-            }
-            self.complete(queue, request, Completion::Failed);
-            return true;
-        };
-
-        let deadline = Some(Deadline::At(self.now.saturating_add(self.limits.0)));
-        let mut copies: Vec<Copy> = Vec::new();
-        let mut kept = vec![old];
-        for block in blocks {
-            let copied = !block.valid.get().meets(target)
-                && !copies.iter().any(|copy| Rc::ptr_eq(&copy.write, &block));
-            if copied {
-                let reads = vec![Rc::clone(&block)];
-                let to = Target::Group { owner, to };
-                copies.push(Copy {
-                    memory: target,
-                    reads,
-                    write: block,
-                    to,
-                    fill: true,
-                    deadline,
-                });
-            } else {
-                kept.push(block);
-            }
-        }
-        // The slot's row: it reads the row of the source group, and holds
-        // the blocks the task does not copy.
-        let slot = Rc::new(Block::new(None, vec![row], Validity::Everywhere, 0));
-        let to = Target::Group { owner, to };
-        copies.push(Copy {
-            memory: Memories::NONE,
-            reads: kept,
-            write: slot,
-            to,
-            fill: false,
-            deadline,
-        });
-
-        // The handoff's span: from its task's start to its end, with the bytes it copies into
-        // the decode group's memory.
-        if let Some(&trace) = self.traces.get(&(queue, request)) {
-            let run_bytes = |run: &Run| {
-                let unit = self
-                    .regions
-                    .get(usize::from(run.region()))
-                    .map_or(0, |region| region.unit_bytes);
-                u64::from(run.count()) * unit
-            };
-            let bytes = copies
-                .iter()
-                .filter(|copy| copy.fill)
-                .map(|copy| copy.write.runs.borrow().iter().map(run_bytes).sum::<u64>())
-                .sum();
-            service::span::bytes(Stage::Handoff, trace, bytes);
-            service::span::begin(Stage::Handoff, trace);
-        }
-        self.hold_copies((queue, request), copies);
-        self.answers.insert((queue, request), Vec::new());
-        self.started.push((queue, request));
-        true
-    }
-
-    /// A transfer's task ended. When it copied everything and the owner is
-    /// still there, the owner is attached to the target group with its new
-    /// slot row; otherwise the owner stays where it was.
-    fn transferred(
-        &mut self,
-        client: ClientId,
-        owner: OwnerId,
-        to: GroupId,
-        copies: &[Copy],
-        ok: bool,
-    ) -> Completion {
-        let target = self.memory(client, to);
-        let committing: Vec<*const Block> = self.commits().map(Rc::as_ptr).collect();
-        let Some(found) = self.owners.get_mut(&(client, owner)) else {
-            return Completion::Failed;
-        };
-        found.moving = false;
-        let Some(slot) = copies
-            .iter()
-            .find(|copy| !copy.fill)
-            .filter(|_| ok)
-            .map(|copy| Rc::clone(&copy.write))
-        else {
-            return Completion::Failed;
-        };
-
-        // The target group's memory holds what the task copied. A private
-        // block that no commit froze is written there from now on, so the
-        // source group's memory of it is stale.
-        let mut runs = Vec::new();
-        for (class, table) in found.tables.iter().enumerate() {
-            for (position, held) in table {
-                let block = held.block();
-                let frozen =
-                    matches!(held, Held::Shared(_)) || committing.contains(&Rc::as_ptr(block));
-                if copies
-                    .iter()
-                    .any(|copy| copy.fill && Rc::ptr_eq(&copy.write, block))
-                {
-                    block.valid.set(if frozen {
-                        block.valid.get().and(target)
-                    } else {
-                        Validity::In(target)
-                    });
-                }
-                runs.extend(
-                    block
-                        .stated()
-                        .into_iter()
-                        .map(|run| (class as u8, *position, run, !frozen)),
-                );
-            }
-        }
-        found.group = to;
-        let row = slot.runs.borrow().first().map_or(0, Run::first);
-        // The new row is the owner's slot, and the old one no longer.
-        slot.own();
-        let old = std::mem::replace(&mut found.slot, slot);
-        old.disown();
-        self.reclaim(old);
-        Completion::Transferred { slot: row, runs }
     }
 
     /// Whether a crossing of the owner waits for its stamps or for a copy
@@ -1070,12 +864,13 @@ impl BufferPool {
         };
         let answer = self.answers.remove(&task);
         let completion = match copies.first().map(|copy| copy.to) {
-            Some(Target::Group { owner, to }) => {
-                let completion = self.transferred(task.0.0, owner, to, &copies, ok);
+            // An import, of pages or of none.
+            _ if self.imports.contains_key(&task) => {
+                let completion = self.imported(task, &copies, ok);
                 if let Some(trace) = self.traces.remove(&task) {
                     service::span::end(Stage::Handoff, trace);
                 }
-                answer.map(|_| completion)
+                answer.and(completion)
             }
             Some(Target::Memory {
                 owner,
@@ -1123,6 +918,7 @@ impl BufferPool {
     /// nothing it produces may follow the order of a hash table.
     pub fn tick(&mut self, now: u64) -> bool {
         self.now = now;
+        let expired = self.expire_lends(now);
         let late = |copies: &Vec<Copy>| {
             copies
                 .first()
@@ -1167,6 +963,6 @@ impl BufferPool {
             }
         }
         self.settle_counts();
-        passed
+        passed || expired
     }
 }

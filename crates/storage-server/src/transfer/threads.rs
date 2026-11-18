@@ -501,6 +501,10 @@ impl Shared {
             });
         };
         let end = match (path, thread.runner) {
+            // A WRITE's local end is its source, whose RDMA rate the READs into it measure.
+            (RemotePath::Read, _) if matches!(link.destination, LinkEnd::Remote { .. }) => {
+                link.source.clone()
+            }
             (RemotePath::Read, _) => link.destination.clone(),
             (RemotePath::Fabric, Runner::Device(device)) => {
                 let gpu = self
@@ -1038,7 +1042,7 @@ impl Copier for HostCopier {
 }
 
 /// This process's NIXL agent, with READs from another host's storage into
-/// this host's.
+/// this host's and WRITEs the other way.
 struct NetworkCopier<'a> {
     network: &'a Network,
     /// The rate of the link's READs, in bytes per second.
@@ -1067,8 +1071,8 @@ impl Copier for NetworkCopier<'_> {
         let failure = transfer
             .wait(due)
             .err()
-            .map(|error| format!("a READ from another host failed: {error}"));
-        tracing::debug!(failure, "a READ ended");
+            .map(|error| format!("a transfer with another host failed: {error}"));
+        tracing::debug!(failure, "a transfer with another host ended");
         failure
     }
 }
@@ -1078,9 +1082,17 @@ impl Copier for NetworkCopier<'_> {
 /// host's, registered here at its first READ: device storage in its GPU's
 /// session, host storage with the allocation.
 fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
-    let (End::Remote(source), End::Given { mapped, hold }) = (&piece.source, &piece.destination)
-    else {
-        return Err("a READ reads another host's storage into this host's".into());
+    let (remote, mapped, hold, write) = match (&piece.source, &piece.destination) {
+        (End::Remote(source), End::Given { mapped, hold }) => (source, mapped, hold, false),
+        (End::Given { mapped, hold }, End::Remote(destination)) => {
+            (destination, mapped, hold, true)
+        }
+        _ => {
+            return Err(
+                "a READ or a WRITE moves bytes between another host's storage and this host's"
+                    .into(),
+            );
+        }
     };
     let agent = network.agent()?;
     let local = match hold {
@@ -1089,31 +1101,51 @@ fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
     };
     let len =
         usize::try_from(piece.bytes).map_err(|_| "a chunk exceeds the address space".to_owned())?;
-    // The server checked the destination span against its allocation, and
-    // the exposure resolution the source span against its region's range.
-    // One READ moves the chunk's rows, a descriptor each.
+    // The server checked this host's end of the span against its allocation, and the
+    // exposure resolution the other end against its region's range. One READ or WRITE moves
+    // the chunk's rows, a descriptor each.
+    let at = |region: nixl::Region, offset: u64, pitch: u64, row: u64| nixl::Region {
+        address: region.address + offset + row * pitch,
+        len,
+        ..region
+    };
     let spans: Vec<nixl::Span> = (0..piece.rows)
-        .map(|row| nixl::Span {
-            source: nixl::Region {
-                address: source.region.address + piece.source_offset + row * piece.source_pitch,
-                len,
-                ..source.region
-            },
-            destination: nixl::Region {
-                address: local.address + piece.destination_offset + row * piece.destination_pitch,
-                len,
-                ..local
-            },
+        .map(|row| {
+            let source = |region| at(region, piece.source_offset, piece.source_pitch, row);
+            let destination = |region| {
+                at(
+                    region,
+                    piece.destination_offset,
+                    piece.destination_pitch,
+                    row,
+                )
+            };
+            if write {
+                nixl::Span {
+                    source: source(local),
+                    destination: destination(remote.region),
+                }
+            } else {
+                nixl::Span {
+                    source: source(remote.region),
+                    destination: destination(local),
+                }
+            }
         })
         .collect();
-    let transfer = agent
-        .read(&source.peer, &spans)
-        .map_err(|error| format!("posting a READ from {}: {error}", source.endpoint))?;
+    let (transfer, what) = if write {
+        (agent.write(&remote.peer, &spans), "WRITE into")
+    } else {
+        (agent.read(&remote.peer, &spans), "READ from")
+    };
+    let transfer =
+        transfer.map_err(|error| format!("posting a {what} {}: {error}", remote.endpoint))?;
     tracing::debug!(
         task = piece.task,
         bytes = piece.bytes,
-        endpoint = source.endpoint,
-        "posted a READ"
+        endpoint = remote.endpoint,
+        write,
+        "posted a transfer with another host"
     );
     Ok(transfer)
 }

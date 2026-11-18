@@ -364,6 +364,8 @@ mod tests {
             cache: Default::default(),
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         }
         .into()
     }

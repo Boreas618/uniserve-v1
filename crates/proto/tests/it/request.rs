@@ -80,6 +80,14 @@ fn generation() -> GenerationRequest {
         include_stop_token: true,
         generated_token_ids: vec![40, 41, 42],
         adapter: 0,
+        hand_off: true,
+        lend: Some(proto::request::Lend {
+            endpoint: None,
+            session: 1,
+            owner: 5,
+            tokens: 64,
+            stored: 0,
+        }),
     }
 }
 
@@ -221,11 +229,29 @@ fn events_come_back_from_their_messages_unchanged() {
             cause: MigrationCause::Drain,
             denoised_steps: 3,
             stored_layout: vec![1, 2, 3],
+            lend: None,
         },
         Event::Migratable {
             cause: MigrationCause::Transfer,
             denoised_steps: 0,
             stored_layout: Vec::new(),
+            lend: None,
+        },
+        Event::Migratable {
+            cause: MigrationCause::Handoff,
+            denoised_steps: 0,
+            stored_layout: Vec::new(),
+            lend: Some(proto::request::Lend {
+                endpoint: Some("gb200-a:29800".to_owned()),
+                session: 3,
+                owner: 17,
+                tokens: 129,
+                stored: 2,
+            }),
+        },
+        Event::Rejected {
+            kind: RejectionKind::Role,
+            message: "a decode replica computes no prompt".to_owned(),
         },
     ];
     for event in events {
@@ -306,6 +332,11 @@ fn step_values_come_back_from_their_command() {
             topic: "kv".to_owned(),
             buffer_steps: NonZeroUsize::new(64).unwrap(),
         },
+        roles: vec![
+            proto::config::Role::Prefill,
+            proto::config::Role::Mixed,
+            proto::config::Role::Decode,
+        ],
     };
     let unstated = Tuning {
         revision: 1,
@@ -322,6 +353,7 @@ fn step_values_come_back_from_their_command() {
         compare_timeout: Duration::from_secs(300),
         nvtx_ranges: false,
         kv_events: Default::default(),
+        roles: Vec::new(),
     };
     let mut no_depth = stated.command(3);
     no_depth.queue_depths.insert("model".to_owned(), 0);

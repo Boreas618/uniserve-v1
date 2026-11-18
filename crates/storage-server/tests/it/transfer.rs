@@ -511,9 +511,9 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
             span(tensor_region(1), 0, tensor_region(2), 0, 8),
             span(tensor_region(1), 0, tensor_region(2), 0, 0),
         ],
-        // Another host's storage is a source only: this host READs it.
+        // A copy to another host's storage starts here: its source is this host's.
         vec![span(
-            tensor_region(1),
+            remote_region("10.0.0.3:7000", tensor_region(1)),
             0,
             remote_region("10.0.0.2:7000", tensor_region(2)),
             0,

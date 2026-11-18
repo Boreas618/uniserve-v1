@@ -3521,8 +3521,15 @@ fn open_media_runners(
 }
 
 /// Where one rank's part of a region's units lies, as it states it (`Place`): the region, the
-/// device memory, the part (the rank's index in its worker group) and the runs of its fields.
-pub(crate) type Place = (String, String, u32, Vec<UnitRun>);
+/// device memory, the part (the rank's index in its worker group), the runs of its fields and,
+/// for its KV region, how it lays its part of a unit out.
+pub(crate) type Place = (
+    String,
+    String,
+    u32,
+    Vec<UnitRun>,
+    Option<::storage::protocol::UnitLayout>,
+);
 
 /// Binds each rank of `ranks` to the session `layout` opened and `opened` answered: a served rank
 /// takes its part of each host region at its own host's Storage Server (`HostPart`), every rank's
@@ -3568,9 +3575,9 @@ pub(crate) fn bind(
         let host = rank_host(rank)?;
         let mut stated = |stated: Place| -> Result<()> {
             if place {
-                let (region, memory, part, runs) = &stated;
+                let (region, memory, part, runs, layout) = &stated;
                 client
-                    .place(region, memory, *part, runs)
+                    .place(region, memory, *part, runs, layout.clone())
                     .with_context(|| format!("placing the rank's units of region {region}"))?;
             }
             places.push(stated);
@@ -3580,7 +3587,7 @@ pub(crate) fn bind(
         // The parts of the host regions of whole blocks, which the holder took for its process.
         if Some(index) == holder {
             for region in whole_host_regions(rank, layout)? {
-                stated((region, host.clone(), 0, Vec::new()))?;
+                stated((region, host.clone(), 0, Vec::new(), None))?;
             }
         }
 
@@ -3591,7 +3598,7 @@ pub(crate) fn bind(
             let memory = rank.video()?.media.as_ref();
             let runs = memory.map(|memory| memory.placed()).unwrap_or_default();
             if !runs.is_empty() {
-                stated((region.name.clone(), region.memory.clone(), 0, runs))?;
+                stated((region.name.clone(), region.memory.clone(), 0, runs, None))?;
             }
             continue;
         };
@@ -3604,13 +3611,19 @@ pub(crate) fn bind(
         // memory.
         let part = rank.model_runner.part();
         let region = layout.regions[usize::from(kv)].name.clone();
-        let runs = unit_runs(&service::lock(&text.cache).info().plane_runs);
-        stated((region, group.memory.clone(), part, runs))?;
+        let (runs, unit) = {
+            let cache = service::lock(&text.cache);
+            (
+                unit_runs(&cache.info().plane_runs),
+                cache.layout().unit_layout(),
+            )
+        };
+        stated((region, group.memory.clone(), part, runs, Some(unit)))?;
         if let Some(states) = states {
             let region = layout.regions[usize::from(states)].name.clone();
             let runs = unit_runs(service::lock(&text.cache).state_plane_runs());
             if !runs.is_empty() {
-                stated((region, group.memory.clone(), part, runs))?;
+                stated((region, group.memory.clone(), part, runs, None))?;
             }
         }
 
@@ -3639,7 +3652,7 @@ pub(crate) fn bind(
                 )
                 .context("mapping the rank's parts of the host KV regions")?;
             for name in names.into_iter().chain(sources).flatten() {
-                stated((name.to_owned(), host.clone(), part, Vec::new()))?;
+                stated((name.to_owned(), host.clone(), part, Vec::new(), None))?;
             }
         }
         set_regions(rank, ((kv, states), host_regions), opened)?;

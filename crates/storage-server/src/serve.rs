@@ -228,7 +228,7 @@ fn list_pool(pool: &BufferPoolListing, out: &mut impl Write) -> std::io::Result<
                 let work = match work {
                     Waiting::Release => "release",
                     Waiting::Commit => "commit",
-                    Waiting::Transfer => "transfer",
+                    Waiting::Lend => "lend",
                     Waiting::Finish => "finish",
                     Waiting::Replicate => "replicate",
                 };

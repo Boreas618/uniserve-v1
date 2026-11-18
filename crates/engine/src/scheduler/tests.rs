@@ -185,6 +185,7 @@ fn built(
             completed: vec![0, 1],
             capacity: vec![(4, 2), (5, 5), (6, 8), (7, 11)],
         }],
+        session: 0,
     };
 
     let pool = QueuePair::create(ring_bytes, 14).unwrap();
@@ -256,6 +257,8 @@ impl Bench {
             include_stop_token: false,
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         };
         let now = Instant::now();
         let request = Request {
@@ -295,6 +298,7 @@ impl Bench {
             draft_limit: 0,
             last_progress: now,
             dirty: false,
+            path: None,
         };
         for &(_, owner, _) in attachments {
             self.scheduler.owners.insert(owner, id);
@@ -1365,6 +1369,7 @@ pub(crate) fn tuned() -> Arc<ArcSwap<Tuning>> {
         compare_timeout: proto::config::DEFAULT_COMPARE_TIMEOUT,
         nvtx_ranges: false,
         kv_events: Default::default(),
+        roles: Vec::new(),
     }))
 }
 

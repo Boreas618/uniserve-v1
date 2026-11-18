@@ -22,7 +22,7 @@ use crate::harness::{Deployment, Harness, chat_image, token};
 fn images() -> Deployment {
     Deployment::tokens()
         .images()
-        .replicas(2)
+        .copies(2)
         .batch(8, 32)
         .chunk(8)
 }

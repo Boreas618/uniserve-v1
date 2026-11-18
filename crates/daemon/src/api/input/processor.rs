@@ -499,6 +499,8 @@ impl Processor {
                 },
                 generated_token_ids: Vec::new(),
                 adapter: adapter.map_or(0, |adapter| adapter.slot),
+                hand_off: false,
+                lend: None,
             };
 
             self.tokenize(request, &images, &mut generation)?;

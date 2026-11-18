@@ -9,7 +9,7 @@
 //!
 //! The configurations are those of `MC_Pool` there, one per [`Shape`]: one
 //! key and one position, one or two owners, a prefill group and for
-//! transfers, crossings and host parts a decode group, with a memory each
+//! crossings and host parts a decode group, with a memory each
 //! and the host parts the shape states; or, for an update, two sessions of
 //! two layouts, the second on trial, each with a group and a region of its
 //! own over one device memory. The bounds are the model's: `completed` goes
@@ -57,7 +57,6 @@ struct Shape {
     host_units: u32,
     /// The model's bound `MaxCopies`: the copies a sequence makes.
     copies: u32,
-    transfers: bool,
     /// Whether prefetches and puts to the remote store arrive.
     tiers: bool,
     /// Whether the decode group reads, in its own memory, the class an
@@ -75,7 +74,7 @@ struct Shape {
     trial: bool,
 }
 
-const SHAPES: [Shape; 7] = [
+const SHAPES: [Shape; 6] = [
     Shape {
         name: "core",
         owners: 2,
@@ -84,7 +83,6 @@ const SHAPES: [Shape; 7] = [
         units: 2,
         host_units: 0,
         copies: 0,
-        transfers: false,
         tiers: false,
         crossings: false,
         parts: [&[1], &[]],
@@ -98,24 +96,9 @@ const SHAPES: [Shape; 7] = [
         units: 2,
         host_units: 1,
         copies: 2,
-        transfers: false,
         tiers: false,
         crossings: false,
         parts: [&[1], &[]],
-        trial: false,
-    },
-    Shape {
-        name: "transfer",
-        owners: 2,
-        groups: 2,
-        rows: 2,
-        units: 1,
-        host_units: 0,
-        copies: 0,
-        transfers: true,
-        tiers: false,
-        crossings: false,
-        parts: [&[2], &[2]],
         trial: false,
     },
     Shape {
@@ -126,14 +109,13 @@ const SHAPES: [Shape; 7] = [
         units: 1,
         host_units: 1,
         copies: 2,
-        transfers: false,
         tiers: true,
         crossings: false,
         parts: [&[1], &[]],
         trial: false,
     },
     // Two memories, the decode group's reading what owners of the prefill
-    // group hold: crossings, with the transfers, commits and detaches they
+    // group hold: crossings, with the commits and detaches they
     // must agree with. One owner and one unit, so that every step is
     // checked too.
     Shape {
@@ -144,7 +126,6 @@ const SHAPES: [Shape; 7] = [
         units: 1,
         host_units: 0,
         copies: 0,
-        transfers: true,
         tiers: false,
         crossings: true,
         parts: [&[2], &[2]],
@@ -161,7 +142,6 @@ const SHAPES: [Shape; 7] = [
         units: 1,
         host_units: 1,
         copies: 2,
-        transfers: false,
         tiers: false,
         crossings: false,
         parts: [&[2], &[2, 3]],
@@ -181,7 +161,6 @@ const SHAPES: [Shape; 7] = [
         units: 1,
         host_units: 0,
         copies: 0,
-        transfers: false,
         tiers: false,
         crossings: false,
         parts: [&[2], &[2]],
@@ -205,7 +184,6 @@ enum Step {
     Release(u64, u8),
     Detach(u64, u8),
     Commit(u64, u8),
-    Transfer(u64, u8, u8),
     /// A crossing of the owner's block into the decode group's memory.
     Replicate(u64, u8),
     /// The `Finish` of the n-th copy a worker runs, with its result.
@@ -589,9 +567,6 @@ impl Driver {
                     Step::Detach(owner, mask),
                     Step::Commit(owner, mask),
                 ]);
-                if shape.transfers {
-                    steps.extend((0..shape.groups).map(|group| Step::Transfer(owner, group, mask)));
-                }
                 if shape.crossings {
                     steps.push(Step::Replicate(owner, mask));
                 }
@@ -674,7 +649,6 @@ impl Driver {
             | Step::Release(o, _)
             | Step::Detach(o, _)
             | Step::Commit(o, _)
-            | Step::Transfer(o, _, _)
             | Step::Replicate(o, _) => Some(self.queue_of(o)),
             _ => None,
         };
@@ -746,12 +720,6 @@ impl Driver {
                 at: 0,
                 key: key(),
                 tokens: 64,
-                after: stamps(mask),
-            },
-            Step::Transfer(o, group, mask) => Request::Transfer {
-                trace: 0,
-                owner: owner(o),
-                group: GroupId(group),
                 after: stamps(mask),
             },
             Step::Replicate(o, mask) => Request::Replicate {

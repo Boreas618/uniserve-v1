@@ -214,7 +214,13 @@ fn release(owner: OwnerId, class: u8, at: u32, count: u32) -> runtime::Request {
 }
 
 /// A `Commit` of the block at `at` of `class` under `key`, holding `tokens` tokens.
-fn commit(owner: OwnerId, class: u8, at: u32, key: Key, tokens: u16) -> runtime::Request {
+pub(super) fn commit(
+    owner: OwnerId,
+    class: u8,
+    at: u32,
+    key: Key,
+    tokens: u16,
+) -> runtime::Request {
     let after = Vec::new();
     runtime::Request::Commit {
         owner,
@@ -228,17 +234,15 @@ fn commit(owner: OwnerId, class: u8, at: u32, key: Key, tokens: u16) -> runtime:
 
 /// Where a request's cache lies and how it is keyed (SD §4.2, §4.3).
 impl Scheduler {
-    /// The owner of a token request's cache classes: its owner on the prefill group, or on the
-    /// decode group after a transfer.
+    /// The owner of a token request's cache classes: its owner on the group that computes its
+    /// prompt, which decodes it too.
     pub(super) fn kv_owner(&self, request: &Request) -> Option<OwnerId> {
-        request
-            .owner_on(Phase::Prefill)
-            .or_else(|| request.owner_on(Phase::Decode))
+        request.owner_on(Phase::Prefill)
     }
 
     /// The group whose memory holds a token request's cache: its cache owner's; before it is
     /// attached, the group placed for its prefill, or the first group that prefills with a cache.
-    fn kv_group(&self, request: &Request) -> Option<GroupId> {
+    pub(super) fn kv_group(&self, request: &Request) -> Option<GroupId> {
         let attached = self
             .kv_owner(request)
             .and_then(|owner| request.attachment(owner));
@@ -255,7 +259,7 @@ impl Scheduler {
 
     /// The model's cache groups as a token request's first classes, as its cache group states
     /// them: per class, its kind and block size in tokens.
-    fn shapes(&self, request: &Request) -> &[(CacheGroupKind, u32)] {
+    pub(super) fn shapes(&self, request: &Request) -> &[(CacheGroupKind, u32)] {
         let group = self.kv_group(request).and_then(|id| self.group(id));
         group.map_or(&[], |group| &group.capacity.cache_groups)
     }
@@ -1595,7 +1599,7 @@ impl Scheduler {
     /// cache class: a full-attention or sliding-window class from the positions its read
     /// requests asked for, a recurrent-state class the checkpoint the chunk keeps, and the draft
     /// cache, where the deployment drafts, as full attention over the draft entries.
-    fn first_call_asks(
+    pub(super) fn first_call_asks(
         &self,
         request: &Request,
         owner: OwnerId,
@@ -1660,6 +1664,10 @@ impl Scheduler {
         asked: &runtime::Request,
         completion: &Completion,
     ) -> Vec<runtime::Request> {
+        // A handoff's import holds what its lend held (`super::handoff`).
+        if let runtime::Request::Import { owner, tables, .. } = asked {
+            return self.imported(id, (*owner, tables), completion);
+        }
         let mut follow = Vec::new();
         let Some(request) = self.requests.get(&id) else {
             return follow;
@@ -2848,6 +2856,7 @@ mod tests {
                 completed: vec![0],
                 capacity: vec![(4, 1), (5, 4), (6, 7)],
             }],
+            session: 0,
         };
 
         let pool = QueuePair::create(1 << 16, 10).unwrap();
@@ -2933,6 +2942,8 @@ mod tests {
                 include_stop_token: false,
                 generated_token_ids: Vec::new(),
                 adapter: 0,
+                hand_off: false,
+                lend: None,
             };
             let mut request = Request::new(input.into(), 1, Instant::now(), WINDOW, 0);
             request.placement[Phase::Prefill.index()] = Some(A);

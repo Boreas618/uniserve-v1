@@ -28,16 +28,16 @@
 //! - [`BlockTables::map`]: a request with its completion, and the slot the scheduler keeps the
 //!   request's entries under in this group: the slot row of the request's owner on the group, or,
 //!   for a group that reads a class it does not write (a decoder reading a media product), the
-//!   slot of the request's own owner there. `(Attach, Attached)` and `(Transfer, Transferred)`
-//!   attach an owner to the group in the slot they state. `(Allocate, Allocated)`, `(Pin,
-//!   Pinned)` and `(Transfer, Transferred)` put runs at the positions the request named.
+//!   slot of the request's own owner there. `(Attach, Attached)` attaches an owner to the group
+//!   in the slot it states. `(Allocate, Allocated)`, `(Pin, Pinned)` and `(Import, Imported)` put
+//!   runs at the positions the request named, an import's with no reset: its task wrote them.
 //!   `(Replicate, Replicated)` puts, read-only, the runs the crossing made valid at the position
 //!   it named, those the process maps; a rank whose process held the block already keeps its
 //!   entry. A `Copy` that answers a `Load`, `Clone`, `Store`, `Save` or `Restore` queues the
 //!   copies the rank must run. The answer of a `Finish` to a `Load` or a `Clone` (`Loaded`,
 //!   `Duplicate`, `Cloned`) puts the destination runs at the positions the `Load` or the `Clone`
 //!   named. Any other pair gives the table nothing.
-//! - [`BlockTables::apply`]: a `Release`, `Detach`, `Commit`, `Transfer`, `Replicate` or
+//! - [`BlockTables::apply`]: a `Release`, `Detach`, `Commit`, `Lend`, `Replicate` or
 //!   `Finish` on its way to the submission queue, before the worker stamps it. Every `Finish`
 //!   passes through it, the worker's own that reports a copy run as well as the scheduler's
 //!   give-up.
@@ -49,8 +49,8 @@
 //!
 //! | Method | Obligation |
 //! | --- | --- |
-//! | [`BlockTables::map`] | 1: an entry exists only as a run a completion gave, at the position its request named. 4: an entry is writable only when it came from `Allocated`, from a `Clone` answered `Cloned` or as a private block of `Transferred`; the destination of a load or a clone is no entry until the `Finish` of its copy is answered, so only the copy writes it |
-//! | [`BlockTables::apply`] | 2, the part before the stamp: the entries of a `Release`, a `Detach` or a `Transfer` leave, the entry of a `Commit` or a `Replicate` becomes read-only, a given-up copy that no batch has started is dropped and its destinations are no longer awaited. The stamp itself, the sequence of the last batch launched, is the worker's |
+//! | [`BlockTables::map`] | 1: an entry exists only as a run a completion gave, at the position its request named. 4: an entry is writable only when it came from `Allocated`, from a `Clone` answered `Cloned` or from `Imported`; the destination of a load or a clone is no entry until the `Finish` of its copy is answered, so only the copy writes it |
+//! | [`BlockTables::apply`] | 2, the part before the stamp: the entries of a `Release`, a `Detach` or a `Lend` leave, the entry of a `Commit` or a `Replicate` becomes read-only, a given-up copy that no batch has started is dropped and its destinations are no longer awaited. The stamp itself, the sequence of the last batch launched, is the worker's |
 //! | [`BlockTables::run`], [`BlockTables::runs`], [`BlockTables::units`], [`BlockTables::entries`] | 1: the only source of a kernel's addresses and of a media copy's |
 //! | [`BlockTables::writable`] | 4: whether a batch may write a position |
 //! | [`BlockTables::take_changes`] | 1: what the runner writes into the device block table, each change once. A run is stated for reset only while its entry is in the table, so the units of a block that left are never touched. 4: and only while a batch may write it, so a block a `Commit` marked before the next batch is never reset |
@@ -261,8 +261,7 @@ impl BlockTables {
         self.group
     }
 
-    /// The slot under which the entries of `owner` are kept: the one its `Attached` or its
-    /// `Transferred` stated, or for an owner of another group the one its first completion here
+    /// The slot under which the entries of `owner` are kept: the one its `Attached` stated, or for an owner of another group the one its first completion here
     /// was mapped under. `None` for an owner the table does not hold.
     pub(crate) fn slot(&self, owner: OwnerId) -> Option<u32> {
         self.slots.get(&owner).map(|(slot, _)| *slot)
@@ -297,7 +296,7 @@ impl BlockTables {
     }
 
     /// Whether a batch may write the block that `slot` holds at `position` of `class`: the
-    /// entry came from `Allocated`, from `Cloned` or as a private block of `Transferred`, and
+    /// entry came from `Allocated`, from `Cloned` or from `Imported`, and
     /// no `Commit` or `Replicate` has named it. A position without an entry is not writable.
     pub fn writable(&self, slot: u32, class: u8, position: u32) -> bool {
         self.entries
@@ -362,7 +361,7 @@ impl BlockTables {
     /// Takes the completion of `request`, whose number is `id`, and changes the table by what
     /// it gives: an owner's slot, runs at the positions the request named, or copies to run.
     /// `slot` is the slot under which the scheduler keeps the request's entries in this group
-    /// (module documentation): the slot an `Attached` or a `Transferred` states, and for any
+    /// (module documentation): the slot an `Attached` states, and for any
     /// other pair the slot of the owner the request names on this group, or of the request's own
     /// owner here when this group reads a class it does not write.
     ///
@@ -372,7 +371,7 @@ impl BlockTables {
     /// was given up or whose owner left since is such a pair. A `Copy` of a `Load` or a `Clone`
     /// whose owner left the group before it arrived queues the copies, which must run and end,
     /// and fills nothing: the owner is not held again. The caller hands a pair only
-    /// before any `Release`, `Detach`, `Commit`, `Transfer` or `Replicate` that names its
+    /// before any `Release`, `Detach`, `Commit`, `Lend` or `Replicate` that names its
     /// entries is applied, and hands a group that reads a product in a process its writer did
     /// not write it in the product's runs there only by the `Replicated` that made them valid.
     ///
@@ -477,50 +476,33 @@ impl BlockTables {
                 Ok(())
             }
 
-            (
-                Request::Transfer { owner, group, .. },
-                Completion::Transferred { slot: stated, runs },
-            ) => {
-                self.check_group(*group)?;
-                check_stated(slot, *stated)?;
+            (Request::Import { owner, tables, .. }, Completion::Imported { runs, .. }) => {
+                // A run per block, in the order of the import's tables and their positions.
+                let positions: Vec<(u8, u32)> = tables
+                    .iter()
+                    .flat_map(|&(class, at, count)| {
+                        (0..count).map(move |index| (class, at.saturating_add(index)))
+                    })
+                    .collect();
+                if positions.len() != runs.len() {
+                    return Err(Error::Invalid(format!(
+                        "`Imported` states {} runs for {} blocks",
+                        runs.len(),
+                        positions.len()
+                    )));
+                }
 
-                // A block of several runs states one item per run under one class and
-                // position; the rank keeps those the process maps, one at most in its own
-                // memory.
-                let mut kept: BTreeMap<(u8, u32), (Vec<Run>, bool)> = BTreeMap::new();
-                for &(class, position, run, private) in runs {
-                    check_run(run)?;
-                    if !self.reaches(run.0) {
-                        continue;
-                    }
-
-                    let (held, _) = kept
-                        .entry((class, position))
-                        .or_insert((Vec::new(), private));
-                    held.push(run);
-                    if held
-                        .iter()
-                        .filter(|run| self.regions.contains(&run.0))
-                        .count()
-                        > 1
-                    {
-                        return Err(Error::Invalid(format!(
-                            "`Transferred` states two runs in the rank's regions at position \
-                             {position} of class {class}"
-                        )));
+                let mut entries = Vec::new();
+                for ((class, position), run) in positions.into_iter().zip(runs) {
+                    let reached = self.reached(std::slice::from_ref(run))?;
+                    if !reached.is_empty() {
+                        entries.push((class, position, reached, true));
                     }
                 }
-                let entries: Vec<_> = kept
-                    .into_iter()
-                    .map(|((class, position), (runs, private))| (class, position, runs, private))
-                    .collect();
 
-                self.check_attach(*owner, slot)?;
+                self.check_held(*owner, slot)?;
                 self.check_vacant(slot, &entries)?;
-
-                // The task of the transfer copied the blocks' content into the group's
-                // memory: nothing is reset.
-                self.slots.insert(*owner, (slot, true));
+                // The import's task wrote the blocks' content: nothing is reset.
                 self.put(*owner, slot, entries, false);
                 Ok(())
             }
@@ -633,7 +615,7 @@ impl BlockTables {
                 Completion::Attached { .. }
                 | Completion::Allocated { .. }
                 | Completion::Pinned { .. }
-                | Completion::Transferred { .. }
+                | Completion::Imported { .. }
                 | Completion::Copy { .. }
                 | Completion::Cloned
                 | Completion::Replicated { .. },
@@ -648,12 +630,11 @@ impl BlockTables {
     /// Applies a request that the worker stamps, before it is stamped and submitted:
     ///
     /// - `Release`: the owner's entries at the positions it names leave;
-    /// - `Detach`, `Transfer`: the owner leaves with every entry of it, and the destinations of
+    /// - `Detach`, `Lend`: the owner leaves with every entry of it, and the destinations of
     ///   a copy that was to fill a position of it are no longer awaited. The entries other
     ///   owners keep in the same slot stay. Its
     ///   copies that no batch has started stay queued until their `Finish`: the buffer pool
-    ///   holds what a copy reads and writes until then. An owner whose transfer fails holds no
-    ///   entry here and takes only its `Detach`;
+    ///   holds what a copy reads and writes until then;
     /// - `Commit`, `Replicate`: the entry it names becomes read-only, and stays so whatever the
     ///   answer: a crossing reads the block once no batch in flight writes it, and none launched
     ///   after the stamp does;
@@ -687,7 +668,7 @@ impl BlockTables {
                 Ok(())
             }
 
-            Request::Detach { owner, .. } | Request::Transfer { owner, .. } => {
+            Request::Detach { owner, .. } | Request::Lend { owner, .. } => {
                 if let Some((slot, _)) = self.slots.remove(owner) {
                     self.remove(*owner, (slot, 0, 0)..=(slot, u8::MAX, u32::MAX));
                 }
@@ -934,7 +915,7 @@ impl BlockTables {
     /// `destination` is the owner, the slot its entries are kept under, the class, the first
     /// position and whether the request is a clone, for a request whose copies fill positions.
     ///
-    /// The copy of an owner the table no longer holds, whose `Detach` or `Transfer` was applied
+    /// The copy of an owner the table no longer holds, whose `Detach` or `Lend` was applied
     /// before its `Copy` arrived, is queued all the same, since it must run and end with its
     /// `Finish`, and fills nothing: the owner gets no slot and no destination is awaited.
     fn queue(
@@ -1254,15 +1235,14 @@ mod tests {
         assert_eq!(entries(&tables, 1, 1), [(0, (DEVICE, 50, 2))]);
         assert_eq!(entries(&tables, 2, 0).len(), 4);
 
-        // A detach and a transfer name an owner: its slot and every entry of it.
+        // A detach and a lend name an owner: its slot and every entry of it.
         tables.apply(&detach(2)).unwrap();
-        let transfer = Request::Transfer {
-            trace: 0,
+        let lend = Request::Lend {
             owner: OwnerId(3),
-            group: GroupId(1),
+            lease: 1_000,
             after: vec![],
         };
-        tables.apply(&transfer).unwrap();
+        tables.apply(&lend).unwrap();
         assert_eq!(entries(&tables, 2, 0), []);
         assert_eq!(entries(&tables, 3, 0), []);
         assert_eq!(tables.slot(OwnerId(2)), None);
@@ -1891,43 +1871,38 @@ mod tests {
         );
         assert_eq!(tables.units(1, 5, 1), Some(3..6));
 
-        // An owner that moves into the group brings every entry it holds, each writable
-        // when its block is private; a completion for another group is not this table's.
-        let transfer = |group| Request::Transfer {
-            trace: 0,
+        // An import's blocks are the owner's to write, and their units, which its task wrote,
+        // are not reset; an answer of more or fewer runs than blocks is refused.
+        attach(&mut tables, 2, 4);
+        let import = Request::Import {
             owner: OwnerId(2),
-            group,
-            after: vec![],
+            tables: vec![(0, 0, 2)],
+            lender: storage::runtime::Lender {
+                endpoint: None,
+                session: 1,
+                owner: OwnerId(9),
+            },
+            push: false,
+            trace: 0,
         };
-        let transferred = Completion::Transferred {
-            slot: 4,
-            runs: vec![
-                (0, 0, (DEVICE, 40, 1), false),
-                (0, 1, (DEVICE, 41, 1), true),
-                (5, 0, (OTHER_PRODUCTS, 14, 3), true),
-                (5, 0, (PRODUCTS, 6, 3), true),
-            ],
+        let short = Completion::Imported {
+            runs: vec![(DEVICE, 40, 1)],
+            evicted: vec![],
         };
-        assert!(
-            tables
-                .map(4, RequestId(2), &transfer(GroupId(1)), &transferred)
-                .is_err()
-        );
-        assert_eq!(tables.slot(OwnerId(2)), None);
-
+        assert!(tables.map(4, RequestId(2), &import, &short).is_err());
+        let imported = Completion::Imported {
+            runs: vec![(DEVICE, 40, 1), (DEVICE, 41, 1)],
+            evicted: vec![],
+        };
         tables.take_changes();
-        tables
-            .map(4, RequestId(2), &transfer(GROUP), &transferred)
-            .unwrap();
-        assert_eq!(tables.slot(OwnerId(2)), Some(4));
+        tables.map(4, RequestId(2), &import, &imported).unwrap();
         assert_eq!(
             entries(&tables, 4, 0),
             [(0, (DEVICE, 40, 1)), (1, (DEVICE, 41, 1))]
         );
-        assert_eq!(entries(&tables, 4, 5), [(0, (PRODUCTS, 6, 3))]);
-        assert!(!tables.writable(4, 0, 0));
-        assert!(tables.writable(4, 0, 1));
+        assert!(tables.writable(4, 0, 0) && tables.writable(4, 0, 1));
         assert!(tables.take_changes().iter().all(|change| !change.reset));
+        tables.apply(&detach(2)).unwrap();
 
         // A load into another rank's memory, and a store from it to a host pool this rank
         // maps, are not this rank's to run, and give it no entry; their requests are still
@@ -2128,31 +2103,6 @@ mod tests {
             .unwrap();
         assert_eq!(tables.runs(1, 6, 1), [(OTHER_PRODUCTS, 0, 3)]);
         assert!(!tables.writable(1, 6, 1));
-
-        // An owner that moves in keeps the runs its process maps of each block, one at most in
-        // the rank's own memory.
-        let transfer = Request::Transfer {
-            trace: 0,
-            owner: OwnerId(2),
-            group: GROUP,
-            after: vec![],
-        };
-        let transferred = Completion::Transferred {
-            slot: 4,
-            runs: vec![
-                (5, 0, (OTHER_PRODUCTS, 14, 2), true),
-                (5, 0, (PRODUCTS, 6, 2), true),
-                (5, 0, (9, 0, 2), true),
-            ],
-        };
-        tables
-            .map(4, RequestId(5), &transfer, &transferred)
-            .unwrap();
-        assert_eq!(
-            tables.runs(4, 5, 0),
-            [(OTHER_PRODUCTS, 14, 2), (PRODUCTS, 6, 2)]
-        );
-        assert_eq!(tables.run(4, 5, 0), Some((PRODUCTS, 6, 2)));
 
         // A detach takes the owner's entries, every run of each with them.
         tables.apply(&detach(2)).unwrap();

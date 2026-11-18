@@ -1,26 +1,23 @@
-"""A prefill group transfers each request to a decode group.
+"""A prefill replica hands each request off to a decode replica.
 
-Qwen3 is served by a deployment of two worker groups: a ``prefill`` group
-that computes each prompt and samples its first token, and a ``decode``
-group that continues the request from that token. One scheduler drives both
-as separate groups of its session with the host's buffer pool: once the
-prefill group's call that sampled the first token is output, the scheduler
-submits a ``Transfer`` of the request's owner to the decode group, stamped by
-the prefill group's executor; a task of the Transfer Server copies the
-request's blocks that are not valid in the decode group's memory, device to
-device, the owner gets a slot there, and the request decodes on the decode
-group (``specs/buffer-pool.md`` §11, ``specs/scheduler-design.md`` §4.1). Each
-case compares the greedy tokens of fixed prompts, one of several blocks with
-a partial last one, with an undivided deployment's on one GPU: a prefill
-group computes no decode, so the tokens after the first are the decode
-group's, computed over the blocks it was transferred. Each case also reads
-the scheduler's transfer counters in the observation store
-(``/admin/query``, ``specs/scheduler-design.md`` §7.5) once a report counts
-a transfer for every request it answered and states nothing running or
-waiting: no transfer failed.
+Qwen3 is served by a deployment of two replicas, two schedulers of one GPU
+each: replica ``0`` of the ``prefill`` role computes each prompt and samples
+its first token, and replica ``1`` of the ``decode`` role continues the
+request from that token (``replicas.<id>.role``, ``docs/configuration.md``
+under Replicas). Once the prefill replica's call that sampled the first
+token is output, its buffer pool lends the request's pages and the request
+migrates with the lend; the decode replica's buffer pool imports every lent
+page into blocks of its own, by a task of the Transfer Server, and the
+request decodes there. Each case compares the greedy tokens of fixed prompts,
+one of several pages with a partial last one, with an undivided deployment's
+on one GPU: a prefill replica generates the first token alone, so the tokens
+after it are the decode replica's, computed over the pages it imported. Each
+case also reads the decode replica's import counters in the observation store
+(``/admin/query``) once a report counts an import for every request it
+answered and states nothing running or waiting: no import failed.
 
-The one-host case places both groups on the module's two GPUs. The two-host
-case places the decode group on the first GPU of the run's second host
+The one-host case places both replicas on the module's two GPUs. The two-host
+case places the decode replica on the first GPU of the run's second host
 (``--peer-host``, ``uniserve_testing.plugin``): the package lists this host,
 the leader, and the second host by their host names
 (:func:`uniserve_testing.deployments.two_hosts`), and the second host's
@@ -28,7 +25,7 @@ daemon serves the same package there and joins the leader
 (:meth:`uniserve_testing.deployments.Deployments.follower`), at a Build
 Server there that installs the tree's packages from this repository's path,
 which the second host must mount at the same path. Its Transfer Server reads
-the prefill rank's planes through the NIXL package each host has installed
+the prefill replica's pages through the NIXL package each host has installed
 (``docs/nixl.md``).
 """
 
@@ -46,7 +43,8 @@ from uniserve_testing.remote import RemoteHost
 from uniserve_testing.servers import Server
 
 # The module's cases share two GPUs: the undivided reference serves on the
-# first, and the one-host prefill/decode deployment on both.
+# first, and the one-host deployment of a prefill and a decode replica on
+# both.
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.gpu,
@@ -65,7 +63,7 @@ PROMPTS = (
 )
 
 # Every deployment of the module serves these options: the divided
-# deployments capture the graphs the undivided one does, so that each group
+# deployments capture the graphs the undivided one does, so that each replica
 # computes its part of a request as the undivided deployment computes it.
 OPTIONS: dict[str, Any] = {
     "model": CHECKPOINTS["qwen3"].model,
@@ -76,43 +74,48 @@ OPTIONS: dict[str, Any] = {
     },
 }
 
-# The scheduler's transfer counters (``specs/scheduler-design.md`` §7.5): the
-# transfers answered ``Transferred`` and those answered ``Failed``.
-TRANSFERS = "uniserve_request_transfers_total"
-FAILED_TRANSFERS = "uniserve_request_transfer_failures_total"
+# The decode replica's import counters: the imports answered ``Imported`` and
+# those answered ``Failed``.
+IMPORTS = "uniserve_request_imports_total"
+FAILED_IMPORTS = "uniserve_request_import_failures_total"
 
 # Each prompt's greedy tokens, each by its token id with no candidate ranked
 # (`uniserve_testing.chat.ranked_tokens`).
 Decoded = list[list[tuple[str, set[str]]]]
 
-# How long the scheduler's report may take to count the transfers of the
+# How long the scheduler's report may take to count the imports of the
 # requests a case answered, in seconds: thirty report periods
 # (``worker_config.report_period``, a second).
 REPORTED_S = 30
 
 
 def _split(decode_host: str | None) -> dict[str, Any]:
-    """The layout of a prefill group on this host's first GPU and a decode
-    group on the next one, or on `decode_host`'s first.
+    """Two replicas of one GPU each: a prefill replica on this host's first
+    GPU and a decode replica on the next one, or on `decode_host`'s first.
     """  # noqa: D205
     decode = "cuda:1" if decode_host is None else f"{decode_host}/cuda:0"
-    return client.layout(
+    layout = client.layout(
         [
             {
-                "id": "prefill",
-                "role": "prefill",
+                "id": "model-0",
                 "ranks": ["cuda:0"],
                 "queue_depth": 2,
                 "blocks": {"model": {}},
             },
             {
-                "id": "decode",
-                "role": "decode",
+                "id": "model-1",
                 "ranks": [decode],
                 "queue_depth": 2,
                 "blocks": {"model": {}},
             },
         ],
+    )
+    return merged(
+        layout,
+        {
+            "data_parallel_size": 2,
+            "replicas": {"0": {"role": "prefill"}, "1": {"role": "decode"}},
+        },
     )
 
 
@@ -137,21 +140,21 @@ def _decoded(base_url: str) -> Decoded:
     ]
 
 
-def _failed_transfers(server: Server, requests: int) -> float:
-    """The transfers the scheduler answered as failed, once a report counts
-    at least `requests` transfers, as many as the requests the case
-    answered, and states nothing running or waiting.
+def _failed_imports(server: Server, requests: int) -> float:
+    """The imports the decode replica answered as failed, once a report counts
+    at least `requests` imports, as many as the requests the case answered,
+    and states nothing running or waiting.
 
-    A failed transfer ends its request as migratable, and the request is
-    computed and transferred again, so its failure is counted before its
-    answer arrives. The scheduler reports its statistics once a report
-    period, and no event announces a report, so the case reads the
-    observation store until one states the transfers.
+    A failed import leaves its request to compute its prompt on the decode
+    replica, so its failure is counted before its answer arrives. The
+    scheduler reports its statistics once a report period, and no event
+    announces a report, so the case reads the observation store until one
+    states the imports.
     """  # noqa: D205
 
     def reported() -> bool:
-        transferred = admin.counter(server, TRANSFERS) + admin.counter(
-            server, FAILED_TRANSFERS
+        imported = admin.counter(server, IMPORTS) + admin.counter(
+            server, FAILED_IMPORTS
         )
         busy = sum(
             sample.value
@@ -161,12 +164,12 @@ def _failed_transfers(server: Server, requests: int) -> float:
             )
             for sample in admin.gauge(server, name)
         )
-        return transferred >= requests and busy == 0
+        return imported >= requests and busy == 0
 
     server.wait_until(
-        reported, REPORTED_S, "the requests' transfers were not reported"
+        reported, REPORTED_S, "the requests' imports were not reported"
     )
-    return admin.counter(server, FAILED_TRANSFERS)
+    return admin.counter(server, FAILED_IMPORTS)
 
 
 @pytest.fixture(scope="module")
@@ -176,7 +179,7 @@ def reference(module_deployments: Deployments) -> Decoded:
         return _decoded(server.base_url)
 
 
-def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
+def test_a_prefill_replica_hands_requests_off_to_a_decode_replica_on_one_host(
     deployments: Deployments,
     reference: Decoded,
 ):
@@ -185,20 +188,20 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
         calibration=deployments.calibration(),
     ) as server:
         decoded = _decoded(server.base_url)
-        failed = _failed_transfers(server, len(PROMPTS))
+        failed = _failed_imports(server, len(PROMPTS))
 
     assert decoded == reference
     assert failed == 0
 
 
-def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
+def test_a_prefill_replica_hands_requests_off_to_a_decode_replica_across_hosts(
     repository: Path,
     deployments: Deployments,
     peer_host: RemoteHost,
     reference: Decoded,
 ):
-    # The decode group's Transfer Server reads the prefill rank's cache on
-    # this host through NIXL: both hosts' calibrations time those READs.
+    # The decode replica's Transfer Server reads the prefill replica's pages
+    # on this host through NIXL: both hosts' calibrations time those READs.
     calibration = deployments.calibration(reads=True)
     with (
         deployments.serve(
@@ -215,7 +218,7 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
         ),
     ):
         decoded = _decoded(server.base_url)
-        failed = _failed_transfers(server, len(PROMPTS))
+        failed = _failed_imports(server, len(PROMPTS))
 
     assert decoded == reference
     assert failed == 0

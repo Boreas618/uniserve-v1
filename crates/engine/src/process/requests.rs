@@ -473,6 +473,7 @@ impl MainProcess {
             cause: MigrationCause::Loss,
             denoised_steps: 0,
             stored_layout: Vec::new(),
+            lend: None,
         };
         let held = std::mem::take(&mut self.held)
             .into_iter()
@@ -535,6 +536,8 @@ impl MainProcess {
                 include_stop_token: false,
                 generated_token_ids: Vec::new(),
                 adapter: 0,
+                hand_off: false,
+                lend: None,
             };
             // A deployment whose limits refuse the request a client could not submit either.
             let servable = engine.limits.features.contains(request.required_features())

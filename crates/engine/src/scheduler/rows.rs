@@ -1028,6 +1028,8 @@ mod tests {
             include_stop_token: false,
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         };
         let prompt_tokens = u32::try_from(prompt.len()).unwrap();
         row(id, input.into(), prompt, prompt_tokens, slot, computed)
@@ -1077,6 +1079,7 @@ mod tests {
             draft_limit: 0,
             last_progress: now,
             dirty: false,
+            path: None,
         }
     }
 

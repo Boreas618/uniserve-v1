@@ -190,7 +190,7 @@ Every request has a timeline of its own: the stages it passes through in the dae
 | | `copy_out` | batch | From the issue of its outputs' copy until the host holds them |
 | | `postprocess` | batch | The calls' outputs assembled on the host: sampled tokens, stop conditions, logprobs |
 | | `step` | batch | The batch's step on the device, between its step markers |
-| storage | `handoff` | request | A prefill-to-decode handoff: the buffer pool's copy of the request's blocks into the decode group's memory, with the `bytes` it copied |
+| storage | `handoff` | request | A prefill-to-decode handoff: the decode replica's import of the request's lent blocks into blocks of its own, with the `bytes` it wrote |
 
 A request's id is its trace id, which the daemon gives it as it receives it and which the request carries to the engine (`Request.trace`) and to the Storage Server (`Transfer.trace`); it stays the same when the request migrates, and the request's `request` event states it as its `request` field. A batch's id is its scheduler's number of it, which carries the scheduler's data-parallel rank from bit 40. As the scheduler forms a batch it writes a membership record for each request in it, which joins the request to the batch.
 

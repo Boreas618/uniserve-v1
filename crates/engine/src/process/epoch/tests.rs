@@ -106,7 +106,7 @@ fn a_release_is_reported_once_per_host_its_ranks_gave_memory_back_on() {
     let group = |id: &str, hosts: &[&str]| WorkerGroupConfig {
         id: WorkerGroupId(id.to_owned()),
         role: Default::default(),
-        replicas: 1,
+        copies: 1,
         ranks: hosts
             .iter()
             .map(|host| WorkerRank {

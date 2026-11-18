@@ -32,7 +32,7 @@ use super::{
 /// written are records of this build's runtime interface
 /// (`storage::runtime::VERSION`). A change of the image or of those records
 /// is a new format.
-pub(crate) const FORMAT: u32 = 7;
+pub(crate) const FORMAT: u32 = 8;
 
 /// The image of a pool, over the regions `R` and the blocks `B`: borrowed
 /// from a pool to write it, owned to make a pool of it. Maps keyed by more
@@ -63,6 +63,8 @@ struct Image<R, B> {
     started: Vec<(QueueId, u64)>,
     stopped: Vec<(QueueId, u64)>,
     peers: Vec<(u64, Vec<u32>)>,
+    /// The lent owners, each with the end of its lease.
+    lends: Vec<(ClientId, u64, u64)>,
 }
 
 impl Serialize for BufferPool {
@@ -176,6 +178,11 @@ impl Serialize for BufferPool {
                 .map(|(queue, id)| (*queue, id.0))
                 .collect(),
             peers,
+            lends: self
+                .lends
+                .iter()
+                .map(|((client, owner), deadline)| (*client, owner.0, *deadline))
+                .collect(),
         };
         image.serialize(serializer)
     }
@@ -239,6 +246,11 @@ impl BufferPool {
             }
             pool.peers.insert(peer, holds);
         }
+        pool.lends = image
+            .lends
+            .into_iter()
+            .map(|(client, owner, deadline)| ((client, OwnerId(owner)), deadline))
+            .collect();
         pool.answers = image
             .answers
             .into_iter()
@@ -359,17 +371,17 @@ impl<B> Deferred<B> {
                 tokens: *tokens,
                 rest: rest.clone(),
             },
-            Self::Transfer {
+            Self::Lend {
                 queue,
                 request,
                 owner,
-                to,
+                lease,
                 rest,
-            } => Deferred::Transfer {
+            } => Deferred::Lend {
                 queue: *queue,
                 request: *request,
                 owner: *owner,
-                to: *to,
+                lease: *lease,
                 rest: rest.clone(),
             },
             Self::Finish {

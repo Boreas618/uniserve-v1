@@ -140,24 +140,24 @@ curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.too
 
 ### Deployments
 
-The packages are the directories of `configs/minimax_h3/`, each a `config.toml` that states the checkpoint it serves (FastH3, or the OmniRef export for the `reference` layouts) and its layout in the TOML format [Configuration](../configuration.md#deployment-layout) describes: each `[[worker_groups]]` group lists its ranks, such as `cuda:0-3` or `rank-2/cuda:0-3`, and the blocks placed on them, and `replicas` copies a group over equal blocks of its ranks. Each package places the condition encoders and the media reader that keyframe and reference requests use; the `fasth3-` packages split each GPU's storage between workers by FastH3's sizes.
+The packages are the directories of `configs/minimax_h3/`, each a `config.toml` that states the checkpoint it serves (FastH3, or the OmniRef export for the `reference` layouts) and its layout in the TOML format [Configuration](../configuration.md#deployment-layout) describes: each `[[worker_groups]]` group lists its ranks, such as `cuda:0-3` or `rank-2/cuda:0-3`, and the blocks placed on them, and `copies` copies a group over equal blocks of its ranks. Each package places the condition encoders and the media reader that keyframe and reference requests use; the `fasth3-` packages split each GPU's storage between workers by FastH3's sizes.
 
 | Package | GPUs | Denoiser | Text encoder |
 | --- | --- | --- | --- |
 | `ulysses4` | Four on one host | Ulysses4 | TP4 |
 | `ulysses8` | Eight on one host | Ulysses8 | TP8 |
 | `ulysses8-two-host` | Four on each of two hosts | Ulysses8 | TP8 |
-| `fasth3-ulysses4x2` | Eight on one host | Two Ulysses4 replicas | TP4 per replica |
-| `fasth3-ulysses4x2-two-host` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
-| `fasth3-dp8-text-tp8` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
-| `fasth3-dp8-text-tp4x2` | Eight on one host | Eight one-GPU replicas | Two TP4, one per four-GPU half |
-| `fasth3-dp8-text-tp8-host-weights` | Eight on one host | Eight one-GPU replicas, layer projections in host storage | One shared TP8 |
+| `fasth3-ulysses4x2` | Eight on one host | Two Ulysses4 copies | TP4 per copy |
+| `fasth3-ulysses4x2-two-host` | Four on each of two hosts | One Ulysses4 copy per host | TP4 per copy |
+| `fasth3-dp8-text-tp8` | Eight on one host | Eight one-GPU copies | One shared TP8 |
+| `fasth3-dp8-text-tp4x2` | Eight on one host | Eight one-GPU copies | Two TP4, one per four-GPU half |
+| `fasth3-dp8-text-tp8-host-weights` | Eight on one host | Eight one-GPU copies, layer projections in host storage | One shared TP8 |
 | `gather8` | Eight on one host | Eight-way all-gather | TP8 |
 | `ulysses4-reference` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
 | `ulysses8-reference` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
 | `ulysses8-reference-two-host` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on the first host |
 
-A block placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights` places every replica's denoiser this way, and each replica holds its own host copy. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `max_running_requests = 8`, `max_model_len = 10240`, `video_config = { text_capacities = [1024], sizes = ["1344x768"] }` and `mem_fraction_static = 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
+A block placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights` places every copy's denoiser this way, and each copy holds its own weights in host storage. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `max_running_requests = 8`, `max_model_len = 10240`, `video_config = { text_capacities = [1024], sizes = ["1344x768"] }` and `mem_fraction_static = 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
 
 A Ulysses denoiser's `sequence_parallel` table also selects how each layer's Q/K/V/gate projection reaches every rank's heads. With `projection = "gather"`, the default, every rank all-gathers the other ranks' input rows and projects its own heads, holding the projection weights partitioned by head. With `projection = "exchange"`, every rank projects its own rows for all heads, holding the whole weights, and sends each rank that rank's heads. For FastH3 the exchange transfers two thirds of the gather's bytes with eight ranks and more than the gather with four, and every rank holds the whole Q/K/V/gate weights of the 50 layers, 14.4 GiB in BF16, instead of its share of them. `projection_rows = <rows>` makes the exchange project and send each rank's rows in steps of that many rows, each step's transfer overlapping the next step's projection; without it the exchange sends the whole shard at once. A step holds whole attention tiles: a multiple of the checkpoint's 64- or 128-row tile, so a multiple of 128 suits every FastH3 checkpoint. Every mode produces the same values and serves every precision preset. None applies to the `allgather` kind, which exchanges no heads, and the Ulysses members of a `hybrid` split gather. A denoiser that exchanges in steps:
 

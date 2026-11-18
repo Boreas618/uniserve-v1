@@ -47,6 +47,19 @@ use super::Pages;
 use super::polling::Notifier;
 use crate::Server;
 
+/// Which end of a span that runs on another host is storage of this host, which that host
+/// reaches as a region of another host ([`Region::Remote`]) at the address the connection leaves
+/// this host from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Here {
+    /// Neither: both lie on the running host or on a host the span names.
+    Neither,
+    /// The source, which the running host READs.
+    Source,
+    /// The destination, which the running host WRITEs.
+    Destination,
+}
+
 /// How the main loop stops a helper that waits for another host's task: the write end of a pipe
 /// whose read end the helper waits on. Stopping writes to it, and dropping it closes it, which
 /// stops the helper alike: a helper whose pool task is gone stops too.
@@ -168,9 +181,9 @@ pub(super) fn read_from_peers(
 
 /// A transfer of the pool task `number` that runs on the Transfer Server of
 /// the host whose Storage Server listens at `endpoint`, submitted there as
-/// a head of `deployment`'s `epoch`. Each span's source is that host's own
-/// storage or another host's region, or, when flagged, storage of this
-/// host, whose server listens on `port`. Notices the main loop of its end
+/// a head of `deployment`'s `epoch`. Each span's ends are that host's own
+/// storage or another host's region, or, as its [`Here`] states, storage of
+/// this host, whose server listens on `port`. Notices the main loop of its end
 /// ([`Server::end_pool_task`]); its stop (`cancel`, [`Stop`]) cancels it, as does `limit`
 /// passing.
 ///
@@ -182,7 +195,7 @@ pub(super) fn transfer_at(
     number: u64,
     endpoint: String,
     session: (String, u64),
-    spans: Vec<(Span, bool)>,
+    spans: Vec<(Span, Here)>,
     port: Option<u16>,
     (cancel, limit): (OwnedFd, Duration),
 ) -> io::Result<()> {
@@ -207,7 +220,7 @@ pub(super) fn transfer_at(
 fn transfer(
     endpoint: &str,
     (deployment, epoch): (String, u64),
-    spans: Vec<(Span, bool)>,
+    spans: Vec<(Span, Here)>,
     port: Option<u16>,
     cancel: &OwnedFd,
     limit: Duration,
@@ -221,7 +234,7 @@ fn transfer(
 
     // This host as the other one reaches it: the address the connection
     // leaves from, and the port this server listens on.
-    let here = if spans.iter().any(|(_, here)| *here) {
+    let here = if spans.iter().any(|(_, here)| *here != Here::Neither) {
         let port = port.ok_or_else(|| {
             Error::Protocol("this host's Storage Server accepts no other host".into())
         })?;
@@ -232,12 +245,17 @@ fn transfer(
     };
     let spans = spans
         .into_iter()
-        .map(|(mut span, from_here)| {
-            if let (true, Some(here)) = (from_here, &here) {
-                span.source = Region::Remote {
-                    endpoint: here.clone(),
-                    region: Box::new(span.source),
-                };
+        .map(|(mut span, end)| {
+            let remote = |region: Region, here: &String| Region::Remote {
+                endpoint: here.clone(),
+                region: Box::new(region),
+            };
+            match (end, &here) {
+                (Here::Source, Some(here)) => span.source = remote(span.source, here),
+                (Here::Destination, Some(here)) => {
+                    span.destination = remote(span.destination, here);
+                }
+                _ => {}
             }
             span
         })

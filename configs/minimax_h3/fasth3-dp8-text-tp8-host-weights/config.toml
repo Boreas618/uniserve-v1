@@ -11,7 +11,7 @@ mem_fraction_static = 0.18
 tensor_parallel_size = 8
 [[worker_groups]]
 id = "flow"
-replicas = 8
+copies = 8
 ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.81

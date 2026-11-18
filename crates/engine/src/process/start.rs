@@ -624,8 +624,8 @@ pub(crate) fn start(
         for (region, segments) in theirs {
             agree(&mut created, region, segments)?;
         }
-        for (region, memory, part, runs) in places {
-            head.place_remote(&region, &memory, part, &endpoint, &runs)?;
+        for (region, memory, part, runs, layout) in places {
+            head.place_remote(&region, &memory, part, (&endpoint, layout), &runs)?;
         }
         stated_by_peers.extend(capacities);
     }
@@ -703,8 +703,12 @@ pub(crate) fn start(
     // and after an update abandoned before its switch: the target's process then ends unpromoted,
     // and the Storage Server closes its session once the process has exited
     // (`specs/buffer-pool.md` §14.1).
+    // A lend of this host's schedulers names this host's Storage Server, at which an importing
+    // replica of another host borrows it.
+    let mut lending = launch.clone();
+    lending.engine_config.scheduler.storage = storage.tcp.clone();
     let mut engine = Engine::new(
-        launch,
+        &lending,
         &open,
         &opened,
         pairs,

@@ -10,6 +10,7 @@ mod columns;
 mod drain;
 mod failures;
 mod groups;
+mod handoff;
 mod harness;
 mod images;
 mod keys;

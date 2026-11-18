@@ -591,7 +591,7 @@ fn stamped(request: &Request) -> bool {
         Request::Release { .. }
             | Request::Detach { .. }
             | Request::Commit { .. }
-            | Request::Transfer { .. }
+            | Request::Lend { .. }
             | Request::Replicate { .. }
             | Request::Finish { ok: false, .. }
     )

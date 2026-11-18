@@ -28,9 +28,24 @@ pub(crate) struct Sample {
     pub(crate) tokens: u64,
 }
 
+/// One scheduler's load as its latest report states it, which routing reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Load {
+    /// The prompt tokens it has yet to compute.
+    pub(crate) queued_tokens: u64,
+    /// Its batches' mean time from submission to result over the report's interval, in
+    /// microseconds: the time the batch running now takes; zero without a batch.
+    pub(crate) step_us: u64,
+    /// Its KV cache's pages on the device and on the host tier.
+    pub(crate) device: proto::report::Pages,
+    pub(crate) host: proto::report::Pages,
+}
+
 /// What the observer keeps between records.
 struct Kept {
     samples: VecDeque<Sample>,
+    /// Each epoch's schedulers' latest load.
+    loads: BTreeMap<(u64, u32), Load>,
     /// Each epoch's schedulers' latest report, where the next one's interval begins.
     latest: BTreeMap<(u64, u32), Instant>,
     /// How long a sample is kept after it arrived.
@@ -54,6 +69,7 @@ impl Observer {
         Self {
             kept: std::sync::Mutex::new(Kept {
                 samples: VecDeque::new(),
+                loads: BTreeMap::new(),
                 latest: BTreeMap::new(),
                 retention,
             }),
@@ -95,6 +111,16 @@ impl Observer {
             let mut kept = service::lock(&self.kept);
             let now = Instant::now();
             let since = kept.latest.insert((epoch, scheduler), now);
+            let load = Load {
+                queued_tokens: stats.queued_tokens,
+                step_us: stats
+                    .batch_roundtrip_us
+                    .checked_div(stats.batch_count)
+                    .unwrap_or(0),
+                device: stats.device_pages,
+                host: stats.host_pages,
+            };
+            kept.loads.insert((epoch, scheduler), load);
             kept.samples.push_back(Sample {
                 at: now,
                 since,
@@ -114,8 +140,27 @@ impl Observer {
             }
             kept.latest
                 .retain(|_, latest| now.duration_since(*latest) <= retention);
+            let latest = &kept.latest;
+            let live: Vec<(u64, u32)> = kept
+                .loads
+                .keys()
+                .filter(|key| !latest.contains_key(key))
+                .copied()
+                .collect();
+            for key in live {
+                kept.loads.remove(&key);
+            }
         }
         self.records.send_modify(|records| *records += 1);
+    }
+
+    /// Scheduler `scheduler` of `epoch`'s load as its latest report states it; `None` before its
+    /// first report, or once its reports aged past the retention.
+    pub(crate) fn load(&self, epoch: u64, scheduler: u32) -> Option<Load> {
+        service::lock(&self.kept)
+            .loads
+            .get(&(epoch, scheduler))
+            .copied()
     }
 
     /// `epoch`'s rates over the `window` before now, from `since` on; `None` without a batch in
@@ -223,6 +268,42 @@ mod tests {
             batch_tokens: tokens,
             ..Default::default()
         }
+    }
+
+    /// A scheduler's load is what its latest report states: its queued prompt tokens, its mean
+    /// batch time and its pages by tier, apart from another scheduler's and another epoch's.
+    #[test]
+    fn a_load_is_the_latest_reports() {
+        use proto::report::Pages;
+
+        let observer = Observer::new(Duration::from_secs(60));
+        assert_eq!(observer.load(1, 0), None);
+        observer.record(1, 0, &stats(1_000, 10, 500));
+        observer.record(
+            1,
+            0,
+            &SchedulerStats {
+                queued_tokens: 300,
+                device_pages: Pages {
+                    used: 40,
+                    capacity: 100,
+                },
+                host_pages: Pages {
+                    used: 5,
+                    capacity: 200,
+                },
+                ..stats(9_000, 3, 64)
+            },
+        );
+        observer.record(2, 0, &stats(500, 1, 8));
+
+        let load = observer.load(1, 0).expect("the scheduler reported");
+        assert_eq!(load.queued_tokens, 300);
+        assert_eq!(load.step_us, 3_000);
+        assert_eq!((load.device.used, load.device.capacity), (40, 100));
+        assert_eq!((load.host.used, load.host.capacity), (5, 200));
+        assert_eq!(observer.load(1, 1), None);
+        assert_eq!(observer.load(2, 0).map(|load| load.step_us), Some(500));
     }
 
     /// A report counts toward the span it arrived in: the steps of a span that ended are read

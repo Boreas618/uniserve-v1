@@ -166,6 +166,35 @@ pub struct CacheLayout {
 }
 
 impl CacheLayout {
+    /// How this rank lays its part of a unit out, as it states it to the Storage Server with its
+    /// runs (`storage::protocol::UnitLayout`): the attention groups, each the class of its index
+    /// in the session's layout, which a handoff between replicas reshards by their heads. The
+    /// draft and the state groups are not handed off: a decode replica refills the one and the
+    /// other lies in the state region.
+    pub(crate) fn unit_layout(&self) -> ::storage::protocol::UnitLayout {
+        let classes = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.attention())
+            .map(|(class, group)| ::storage::protocol::PageLayout {
+                class: class as u8,
+                block_size: group.block_size,
+                layers: group.layer_ids.clone(),
+                kv_heads: group.num_kv_heads,
+                kv_head_offset: group.kv_head_offset,
+                total_kv_heads: group.total_kv_heads,
+                head_bytes: (u64::from(group.head_dim) * element_bytes(group.dtype)) as u32,
+                quantized: self.quantized,
+                index_bytes: group.index_bytes(group.block_size),
+            })
+            .collect();
+        ::storage::protocol::UnitLayout {
+            columns: self.columns,
+            classes,
+        }
+    }
+
     /// The cache of one group of `layers` attention layers: one column per layer, each holding
     /// `block_size` rows of `kv_heads × head_dim` of `dtype`, with a scale per plane when
     /// `dtype` is FP8.

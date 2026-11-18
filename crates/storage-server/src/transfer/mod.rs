@@ -89,7 +89,7 @@ use rustix::event::{PollFd, PollFlags, poll};
 pub use calibration::Calibration;
 use contexts::{Contexts, GpuContext, Hold, Reservation, Reservations};
 use devices::Gpus;
-use network::{Exposed, Inbound, Lease, Network, Sources};
+use network::{Direction, Exposed, Inbound, Lease, Network, Sources};
 use storage::{Fabric, Mapping};
 use threads::{CopyThreads, End, Piece, Policy, Runner, ThreadKey};
 
@@ -596,18 +596,53 @@ impl TransferServer {
                     inbound.push(Inbound {
                         endpoint: endpoint.clone(),
                         deployment: deployment.clone(),
+                        direction: Direction::Read,
                         region: (**region).clone(),
-                        source_offset: copy.source_offset,
-                        destination,
+                        remote_offset: copy.source_offset,
+                        local: destination,
                         hold,
-                        destination_offset: copy.destination_offset,
+                        local_offset: copy.destination_offset,
                         bytes: copy.bytes,
                         rows: copy.rows,
-                        source_pitch: copy.source_pitch,
-                        destination_pitch: copy.destination_pitch,
+                        remote_pitch: copy.source_pitch,
+                        local_pitch: copy.destination_pitch,
                     });
                     Ok(())
                 }),
+                // Into another host's region: a WRITE from this host's allocation.
+                _ if matches!(copy.destination, Allocation::Remote { .. }) => {
+                    let Allocation::Remote {
+                        endpoint,
+                        deployment,
+                        region,
+                    } = &copy.destination
+                    else {
+                        unreachable!("matched as another host's region");
+                    };
+                    self.given(&copy.source).and_then(|source| {
+                        let hold = match source.end {
+                            LinkEnd::Device { .. } => {
+                                Some(self.hold(&mut holds, source.device()?)?)
+                            }
+                            _ => None,
+                        };
+                        inbound.push(Inbound {
+                            endpoint: endpoint.clone(),
+                            deployment: deployment.clone(),
+                            direction: Direction::Write,
+                            region: (**region).clone(),
+                            remote_offset: copy.destination_offset,
+                            local: source,
+                            hold,
+                            local_offset: copy.source_offset,
+                            bytes: copy.bytes,
+                            rows: copy.rows,
+                            remote_pitch: copy.destination_pitch,
+                            local_pitch: copy.source_pitch,
+                        });
+                        Ok(())
+                    })
+                }
                 _ => self
                     .piece(task, copy, &mut imports, &mut holds)
                     .map(|piece| pieces.push(piece)),

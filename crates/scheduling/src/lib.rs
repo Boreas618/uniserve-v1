@@ -43,7 +43,7 @@
 /// The version of the scheduling policy interface: the calls of [`wire`] and
 /// what their messages mean. Every change to a call, a message or what one of
 /// its fields means raises it.
-pub const INTERFACE_VERSION: u32 = 7;
+pub const INTERFACE_VERSION: u32 = 8;
 
 pub mod abi;
 pub mod control;

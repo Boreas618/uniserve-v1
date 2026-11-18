@@ -12,20 +12,20 @@
 //! storage-server --test it hosts -- --ignored`.
 
 use std::fs::File;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::time::Duration;
 
 use ::storage::protocol::UnitRun;
 use ::storage::runtime::{
-    Class, Completion, Group, GroupId, Open, OwnerId, Request, Source, Tier, VERSION,
+    Class, Completion, Group, GroupId, Lender, Open, OwnerId, Request, Source, Tier, VERSION,
 };
 use ::storage::{Access, Claimant, Key, Location};
 
 use crate::server::{Running, engine_head, head, host, key, memfd, scope, tensor, transfer_child};
 use crate::sessions::{
-    DECODE, HOST, KV, PREFILL, Scheduler, UNITS, host_copy, host_parts, layout, rank,
-    split_host_region, store_on_host, values,
+    HOST, KV, PREFILL, Scheduler, assert_imported, handoff_ranks, host_copy, host_parts,
+    imported_units, layout, lend_two_pages, rank, split_host_region, store_on_host,
 };
 use crate::transfer::{Paths, calibration, pattern, read, transfer_pid};
 
@@ -266,97 +266,99 @@ fn a_prefetch_from_the_peers_reads_each_part_on_the_host_it_lies_on() {
     assert_eq!(prefill.ask(Request::List), listed);
 }
 
-#[test]
-#[ignore = "requires NIXL"]
-fn a_transfer_reaches_a_rank_of_another_host_through_that_host_s_transfer_server() {
-    let here = network_server();
-    let there = network_server();
-
-    // The prefill rank is on the scheduler's host, the decode rank on the
-    // other one, each holding the KV region's values in storage of its
-    // own, retained by its host's Storage Server.
-    let prefill_planes = memfd(&[0; 144]);
-    let claim = head(&here.socket)
+/// The two replicas of the handoff cases on two hosts: the prefill replica's engine and its
+/// rank on `lender`, the decode replica's engine and its two ranks on `importer`, each engine
+/// with its scheduler; the prefill owner lent two pages. Returns the importer's scheduler, the
+/// lender (named by its host's endpoint) and the decode ranks' tensors.
+fn two_hosts(
+    lender: &Running,
+    importer: &Running,
+) -> (Scheduler, Lender, [OwnedFd; 2], Vec<Box<dyn std::any::Any>>) {
+    let lender_claim = head(&lender.socket)
         .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
         .unwrap();
-    let mut prefill_rank = rank(&here.socket, "prefill", 0, claim);
-    let prefill_tensor = tensor(key(10), "values", 0, 0, Access::Exclusive);
-    prefill_rank
-        .put(vec![prefill_tensor], &[(host(144), prefill_planes.as_fd())])
-        .unwrap();
-    prefill_rank
-        .place("units".into(), "gpu0".into(), 0, values(key(10)))
-        .unwrap();
-    let decode_planes = memfd(&[0; 144]);
-    let there_claim = head(&there.socket)
-        .claim(Claimant::Head, 0, vec![scope("decode", 0)], Vec::new())
-        .unwrap();
-    let mut decode_rank = rank(&there.socket, "decode", 0, there_claim);
-    let decode_tensor = tensor(key(11), "values", 0, 0, Access::Exclusive);
-    decode_rank
-        .put(vec![decode_tensor], &[(host(144), decode_planes.as_fd())])
-        .unwrap();
-
-    // The engine's head states where the decode rank's units lie, as that
-    // rank stated it over the engine's link.
-    let mut engine = engine_head(&here.socket, 0);
-    let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
-    engine
-        .place_remote(
-            "units".into(),
-            "gpu1".into(),
+    let importer_claim = head(&importer.socket)
+        .claim(
+            Claimant::Head,
             0,
-            there.tcp.clone(),
-            values(key(11)),
+            vec![scope("decode", 1), scope("decode", 2)],
+            Vec::new(),
         )
         .unwrap();
-    let region = opened.regions[UNITS].0;
-    let mut schedulers = Scheduler::all(&opened, descriptors);
-    let prefill = &mut schedulers[0];
-    let attach = Request::Attach {
-        owner: OwnerId(1),
-        group: PREFILL,
-    };
-    assert_eq!(prefill.ask(attach), Completion::Attached { slot: 1 });
-    let allocate = Request::Allocate {
-        owner: OwnerId(1),
-        class: KV,
-        at: 0,
-        count: 2,
-        units: 0,
-    };
-    assert!(matches!(
-        prefill.ask(allocate),
-        Completion::Allocated { .. }
-    ));
+    let [(prefill, lent), ..] = handoff_ranks(&lender.socket, lender_claim);
+    let [_, (first, first_storage), (second, second_storage)] =
+        handoff_ranks(&importer.socket, importer_claim);
 
-    // Into the rank of the other host: its host's Transfer Server reads
-    // units 1 and 2 from this host.
-    let written = pattern(32, 5);
-    prefill_planes.write_all_at(&written, 16).unwrap();
-    let transfer = |group| Request::Transfer {
+    let mut prefill_engine = engine_head(&lender.socket, 0);
+    let (prefill_opened, descriptors) = prefill_engine.open_pool(layout(0)).unwrap();
+    let mut prefill_schedulers = Scheduler::all(&prefill_opened, descriptors);
+    let mut decode_engine = engine_head(&importer.socket, 0);
+    let (decode_opened, descriptors) = decode_engine.open_pool(layout(0)).unwrap();
+    let mut decode_schedulers = Scheduler::all(&decode_opened, descriptors);
+
+    let mut both = [prefill_schedulers.remove(0), decode_schedulers.remove(1)];
+    let mut lender_owner = lend_two_pages(&mut both, &prefill_opened, &lent);
+    lender_owner.endpoint = Some(lender.tcp.clone());
+    let [_, decode] = both;
+    // The engines, ranks and schedulers serve on while the test holds them.
+    let held: Vec<Box<dyn std::any::Any>> = vec![
+        Box::new(prefill),
+        Box::new(first),
+        Box::new(second),
+        Box::new(prefill_engine),
+        Box::new(decode_engine),
+        Box::new(prefill_schedulers),
+        Box::new(decode_schedulers),
+    ];
+    (decode, lender_owner, [first_storage, second_storage], held)
+}
+
+#[test]
+#[ignore = "requires NIXL"]
+fn an_import_reads_a_lend_of_another_host_through_this_host_s_transfer_server() {
+    let lender = network_server();
+    let importer = network_server();
+    let (mut decode, lent, [first, second], _held) = two_hosts(&lender, &importer);
+
+    // This host's Transfer Server READs each head from the lender's host into its rank.
+    let import = Request::Import {
+        owner: OwnerId(2),
+        tables: vec![(KV, 0, 2)],
+        lender: lent.clone(),
+        push: false,
         trace: 0,
-        owner: OwnerId(1),
-        group,
-        after: Vec::new(),
     };
-    let runs = vec![(KV, 0, (region, 1, 1), true), (KV, 1, (region, 2, 1), true)];
-    let moved = prefill.submit(transfer(DECODE));
-    assert_eq!(
-        prefill.next(),
-        (moved, Completion::Transferred { slot: 1, runs })
-    );
-    assert_eq!(read(&decode_planes, 16, 32), written);
+    let units = imported_units(decode.ask(import));
+    assert_imported(&[&first, &second], &units);
 
-    // Back from it: this host's Transfer Server reads them from there.
-    let rewritten = pattern(32, 9);
-    decode_planes.write_all_at(&rewritten, 16).unwrap();
-    let moved = prefill.submit(transfer(PREFILL));
-    assert!(matches!(
-        prefill.next(),
-        (id, Completion::Transferred { .. }) if id == moved
-    ));
-    assert_eq!(read(&prefill_planes, 16, 32), rewritten);
+    // The import returned the lend there: another import of it fails.
+    let again = Request::Import {
+        owner: OwnerId(2),
+        tables: vec![(KV, 2, 2)],
+        lender: lent,
+        push: false,
+        trace: 0,
+    };
+    assert_eq!(decode.ask(again), Completion::Failed);
+}
+
+#[test]
+#[ignore = "requires NIXL"]
+fn an_import_pushed_from_another_host_is_written_by_that_host_s_transfer_server() {
+    let lender = network_server();
+    let importer = network_server();
+    let (mut decode, lent, [first, second], _held) = two_hosts(&lender, &importer);
+
+    // The lender's host's Transfer Server WRITEs each head into this host's ranks.
+    let import = Request::Import {
+        owner: OwnerId(2),
+        tables: vec![(KV, 0, 2)],
+        lender: lent,
+        push: true,
+        trace: 0,
+    };
+    let units = imported_units(decode.ask(import));
+    assert_imported(&[&first, &second], &units);
 }
 
 /// The group that writes products in the main process of the session's
@@ -484,6 +486,7 @@ fn a_crossing_copies_a_product_into_a_main_process_of_another_host_through_that_
             "process a".into(),
             0,
             products(key(10)),
+            None,
         )
         .unwrap();
     let mut engine = engine_head(&here.socket, 0);
@@ -495,6 +498,7 @@ fn a_crossing_copies_a_product_into_a_main_process_of_another_host_through_that_
             0,
             there.tcp.clone(),
             products(key(11)),
+            None,
         )
         .unwrap();
     let (written, receiving) = (opened.regions[WRITTEN].0, opened.regions[RECEIVING].0);

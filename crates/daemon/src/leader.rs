@@ -52,9 +52,10 @@ use crate::config::{Config, ReasoningParser, Stated};
 use crate::engine::client::{EngineClient, EngineReport, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
-use crate::migration::{Migrator, RequestEvents};
+use crate::migration::{Migrator, Next, RequestEvents, Target};
 use crate::observation::log::StatsLogger;
 use crate::observation::record::{self, Recorded, Recorder};
+use scheduling::routing::Role;
 
 /// One model served over its engine process.
 ///
@@ -125,6 +126,163 @@ impl Replicas {
     pub(crate) fn next_profile(&self) -> u64 {
         self.profile_sessions.fetch_add(1, Ordering::Relaxed) + 1
     }
+
+    /// The replicas that serve requests now.
+    pub(crate) fn serving_now(&self) -> Vec<Arc<Replica>> {
+        let replicas = self.serving.borrow().clone();
+        replicas
+            .into_iter()
+            .filter(|replica| replica.hold.is_serving())
+            .collect()
+    }
+}
+
+/// A refused request goes where the deployment's own rule routes it now ([`pair`]): a new
+/// request as any new one, a continuation to the least loaded scheduler whose role generates
+/// tokens.
+impl crate::migration::Reroute for Replicas {
+    fn reroute(&self, request: &Request) -> Option<Target> {
+        let serving = self.serving_now();
+        let candidates = candidates(&serving);
+        let route = pair(&loads(&candidates), request)?;
+        Some(target(&candidates, route).1)
+    }
+}
+
+/// One scheduler of a serving replica, as a route chooses among them: the replica, the
+/// scheduler's index in its engine and in the deployment, its role, its requests in flight and
+/// its latest report's load.
+struct Candidate {
+    replica: Arc<Replica>,
+    scheduler: u32,
+    /// The deployment's index of the scheduler, which `replicas.<id>` names it by.
+    index: usize,
+    role: Role,
+    running: u32,
+    load: Option<crate::observe::Load>,
+}
+
+/// Every scheduler of `serving`'s engines, in the deployment's order of replicas and schedulers.
+fn candidates(serving: &[Arc<Replica>]) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for replica in serving {
+        let Some(client) = replica.hold.client() else {
+            continue;
+        };
+        let epoch = client.epoch();
+        let running = client.in_flight_by_scheduler();
+        for (scheduler, running) in running.into_iter().enumerate() {
+            let scheduler = u32::try_from(scheduler).unwrap_or(u32::MAX);
+            candidates.push(Candidate {
+                index: replica_id(replica.ordinal, scheduler) as usize,
+                role: replica.role(scheduler),
+                load: replica.observer.load(epoch, scheduler),
+                replica: Arc::clone(replica),
+                scheduler,
+                running,
+            });
+        }
+    }
+    candidates
+}
+
+/// Each of `candidates`' role and requests in flight, which the deployment's own route weighs
+/// ([`pair`]).
+fn loads(candidates: &[Candidate]) -> Vec<(Role, u32)> {
+    let load = |candidate: &Candidate| (candidate.role, candidate.running);
+    candidates.iter().map(load).collect()
+}
+
+/// The routing program's input for `request` of session `session` over `candidates`: each
+/// scheduler's role, requests in flight and latest report's load.
+fn routing(
+    request: &Request,
+    session: Option<&str>,
+    candidates: &[Candidate],
+) -> scheduling::routing::Routing {
+    let prompt = match request {
+        Request::Generation(generation) => generation.prompt_token_ids.len(),
+        Request::Diffusion(_) => 0,
+    };
+    let replicas = candidates
+        .iter()
+        .map(|candidate| {
+            let load = candidate.load.unwrap_or_default();
+            let usage = |tier, pages: proto::report::Pages| scheduling::routing::Usage {
+                tier,
+                used: pages.used,
+                capacity: pages.capacity,
+            };
+            scheduling::routing::Replica {
+                id: candidate.index.to_string(),
+                role: candidate.role,
+                queued: load.queued_tokens,
+                remaining: scheduling::time::Duration(load.step_us.saturating_mul(1_000)),
+                running: candidate.running,
+                usage: vec![
+                    usage(scheduling::kv::Tier::Device, load.device),
+                    usage(scheduling::kv::Tier::Host, load.host),
+                ],
+                reservable: load.device.capacity.saturating_sub(load.device.used),
+                hits: Vec::new(),
+            }
+        })
+        .collect();
+    scheduling::routing::Routing {
+        request: scheduling::routing::Request {
+            prompt: u32::try_from(prompt).unwrap_or(u32::MAX),
+            prefix: Vec::new(),
+            session: session.map(str::to_owned),
+        },
+        replicas,
+    }
+}
+
+/// The deployment's own route of `request` among `candidates`, each scheduler's role and requests
+/// in flight, as indices into them: the least loaded scheduler whose role takes the request
+/// first, by requests in flight, the first of them on a tie. A continuation
+/// (it names a lend or tokens it generated) goes to one that generates tokens; any other token
+/// request to one that computes prompts, generated there too when that one is mixed and handed
+/// off to the least loaded that generates tokens otherwise; a video request to a mixed one.
+/// `None` when no candidate's role takes it.
+fn pair(candidates: &[(Role, u32)], request: &Request) -> Option<(usize, usize)> {
+    let least = |takes: &dyn Fn(Role) -> bool| {
+        (0..candidates.len())
+            .filter(|&index| takes(candidates[index].0))
+            .min_by_key(|&index| candidates[index].1)
+    };
+    let generation = match request {
+        Request::Generation(generation) => generation,
+        Request::Diffusion(_) => {
+            let mixed = least(&|role| role == Role::Mixed)?;
+            return Some((mixed, mixed));
+        }
+    };
+    if generation.lend.is_some() || !generation.generated_token_ids.is_empty() {
+        let decode = least(&Role::decodes)?;
+        return Some((decode, decode));
+    }
+    let prefill = least(&Role::prefills)?;
+    if candidates[prefill].0 == Role::Mixed {
+        return Some((prefill, prefill));
+    }
+    let decode = least(&Role::decodes)?;
+    Some((prefill, decode))
+}
+
+/// The target `route`, indices into `candidates`, names, with the replica that takes the request
+/// first.
+fn target(candidates: &[Candidate], (prefill, decode): (usize, usize)) -> (Arc<Replica>, Target) {
+    let next = |candidate: &Candidate| Next {
+        hold: Arc::clone(&candidate.replica.hold),
+        scheduler: Some(candidate.scheduler),
+    };
+    let first = &candidates[prefill];
+    let target = Target {
+        first: next(first),
+        decode: (decode != prefill).then(|| next(&candidates[decode])),
+    };
+    (Arc::clone(&first.replica), target)
 }
 
 /// Counts one new request in [`Replicas::held`] while it waits for a
@@ -197,9 +355,20 @@ pub(crate) struct EpochTarget {
     pub(crate) processing: Option<Box<Prepared>>,
 }
 
+/// The id of scheduler `scheduler` of engine `ordinal` among the deployment's replicas, which
+/// `replicas.<id>` names it by: the deployment's index of the scheduler. An engine of several
+/// schedulers is the deployment's one engine (an expert union), whose schedulers are numbered as
+/// the deployment's; every other engine runs one scheduler, numbered as the engine.
+pub(crate) fn replica_id(ordinal: usize, scheduler: u32) -> u32 {
+    u32::try_from(ordinal)
+        .unwrap_or(u32::MAX)
+        .saturating_add(scheduler)
+}
+
 /// Records what replica `replica`'s engine reports into the deployment's observation store
 /// through `recorder`: each scheduler's statistics, also read by `observer` for each epoch's
-/// rates, and its main process's allocators.
+/// rates, and its main process's allocators. A scheduler's rows are labelled with its replica's
+/// id ([`replica_id`]), which `replicas.<id>` names it by.
 pub(crate) fn stats_sink(
     observer: Arc<crate::observe::Observer>,
     recorder: Recorder,
@@ -213,7 +382,11 @@ pub(crate) fn stats_sink(
             stats,
         } => {
             observer.record(epoch, scheduler, &stats);
-            recorder.scheduler(record::Scheduler { replica, scheduler }, &stats);
+            let at = record::Scheduler {
+                replica: replica_id(replica as usize, scheduler),
+                scheduler,
+            };
+            recorder.scheduler(at, &stats);
         }
         EngineReport::Memory(devices) => recorder.memory(replica, &devices),
     })
@@ -294,6 +467,10 @@ pub(crate) fn epoch_hosts(config: &proto::config::EngineConfig) -> anyhow::Resul
 /// Replicas whose experts are sharded over each one's own tensor-parallel ranks are independent
 /// and keep the flag.
 ///
+/// Each engine's schedulers serve the roles the deployment's schedulers of their indices serve
+/// (`replicas.<id>.role`): an engine of the expert union numbers them as the deployment does,
+/// and each independent replica's one scheduler takes the role of its own index.
+///
 /// Each independent replica's engine host is the host of its first rank: its scheduler node
 /// holds its rank 0 and its schedulers ([`crate::engine::control::world_hosts`]), so a replica
 /// the deployment places on another host (`device_config.worker_hosts`) runs its engine there.
@@ -316,10 +493,14 @@ pub(crate) fn replica_configs(
     );
     Ok(groups
         .chunks(groups.len() / count)
-        .map(|groups| {
+        .enumerate()
+        .map(|(index, groups)| {
             let mut replica = config.clone();
             replica.parallel.data_parallel_size = std::num::NonZeroUsize::MIN;
             replica.parallel.worker_groups = groups.to_vec();
+            // The engine's one scheduler is the deployment's scheduler `index`, and serves its
+            // role.
+            replica.roles = config.roles.get(index).copied().into_iter().collect();
             if let Some(first) = groups.iter().flat_map(|group| group.ranks.iter()).next() {
                 replica.parallel.engine_host = first.host.clone();
             }
@@ -428,75 +609,56 @@ impl Leader {
         }
     }
 
-    /// The replica and the scheduler of it a new request goes to: the routing program's choice
-    /// among every serving replica's schedulers while one runs (`crate::programs::Router`), and
-    /// otherwise, or when its route is refused, the least loaded replica, whose engine gives the
-    /// request to its least loaded scheduler.
+    /// Where a new request goes ([`Target`]): the routing program's choice among every serving
+    /// replica's schedulers while one runs (`crate::programs::Router`), and otherwise, or when
+    /// its route is refused, the deployment's own rule ([`pair`]). A deployment whose schedulers
+    /// are all mixed and runs no program gives the request to the least loaded replica, whose
+    /// engine gives it to its least loaded scheduler.
     ///
-    /// Every replica serves both phases, so the request is computed and decoded where the
-    /// route's prefill names: a deployment of mixed replicas hands no request between two.
+    /// A route that names two replicas computes the prompt on the first, which hands the KV off
+    /// once the first token is sampled, and generates the tokens on the second
+    /// ([`crate::migration::Next`]).
     async fn route(
         &self,
         request: &Request,
         session: Option<&str>,
-    ) -> Result<(Arc<Replica>, Option<u32>), SubmitError> {
+    ) -> Result<(Arc<Replica>, Target), SubmitError> {
         let least = self.replica_for_request().await?;
-        if !self.router.routes() {
-            return Ok((least, None));
+        let serving = self.replicas.serving_now();
+        let candidates = candidates(&serving);
+        let mixed = candidates
+            .iter()
+            .all(|candidate| candidate.role == Role::Mixed);
+        if mixed && !self.router.routes() {
+            let target = Target {
+                first: Next {
+                    hold: Arc::clone(&least.hold),
+                    scheduler: None,
+                },
+                decode: None,
+            };
+            return Ok((least, target));
         }
 
-        let serving: Vec<Arc<Replica>> = self
-            .replicas()
-            .into_iter()
-            .filter(|replica| replica.hold.is_serving())
-            .collect();
-        let mut schedulers = Vec::new();
-        let mut views = Vec::new();
-        for (index, replica) in serving.iter().enumerate() {
-            let Some(client) = replica.hold.client() else {
-                continue;
-            };
-            // Each scheduler is the replica `replicas.<id>` names by its number, of the role
-            // stated there.
-            let roles = service::lock(&replica.config).replicas.clone();
-            for (scheduler, running) in client.in_flight_by_scheduler().into_iter().enumerate() {
-                let scheduler = u32::try_from(scheduler).unwrap_or(u32::MAX);
-                schedulers.push((index, scheduler));
-                let number = u32::try_from(replica.ordinal).unwrap_or(u32::MAX) + scheduler;
-                let id = number.to_string();
-                let role = roles
-                    .get(&id)
-                    .map_or(scheduling::routing::Role::Mixed, |stated| stated.role);
-                views.push(scheduling::routing::Replica {
-                    id,
-                    role,
-                    queued: 0,
-                    remaining: scheduling::time::Duration(0),
-                    running,
-                    usage: Vec::new(),
-                    reservable: 0,
-                    hits: Vec::new(),
-                });
+        let route = self
+            .router
+            .routes()
+            .then(|| self.router.route(&routing(request, session, &candidates)))
+            .flatten()
+            .map(|route| (route.prefill, route.decode))
+            .or_else(|| pair(&loads(&candidates), request));
+        Ok(match route {
+            Some(route) => target(&candidates, route),
+            None => {
+                let target = Target {
+                    first: Next {
+                        hold: Arc::clone(&least.hold),
+                        scheduler: None,
+                    },
+                    decode: None,
+                };
+                (least, target)
             }
-        }
-        let prompt = match request {
-            Request::Generation(generation) => generation.prompt_token_ids.len(),
-            Request::Diffusion(_) => 0,
-        };
-        let routing = scheduling::routing::Routing {
-            request: scheduling::routing::Request {
-                prompt: u32::try_from(prompt).unwrap_or(u32::MAX),
-                prefix: Vec::new(),
-                session: session.map(str::to_owned),
-            },
-            replicas: views,
-        };
-        Ok(match self.router.route(&routing) {
-            Some(route) => {
-                let (index, scheduler) = schedulers[route.prefill];
-                (Arc::clone(&serving[index]), Some(scheduler))
-            }
-            None => (least, None),
         })
     }
 
@@ -1503,13 +1665,19 @@ impl Leader {
         // The route the routing program chose, then the hand-over until the engine accepted.
         let trace = request.trace();
         let route = (trace != 0).then(|| enter(Stage::Route, trace));
-        let (replica, scheduler) = self.route(&request, session).await?;
+        let (replica, target) = self.route(&request, session).await?;
         drop(route);
         let submit = (trace != 0).then(|| enter(Stage::Submit, trace));
-        let (events, scheduler) = replica.migrator.submit(request, scheduler).await?;
+        let (events, scheduler) = replica
+            .migrator
+            .submit(request, target.first.scheduler, target.decode)
+            .await?;
         drop(submit);
+        // Its rows are the scheduler's replica's, by the id `replicas.<id>` names it by.
         let placement = Placement {
-            replica: replica.ordinal as u32,
+            replica: scheduler.map_or(replica.ordinal as u32, |scheduler| {
+                replica_id(replica.ordinal, scheduler)
+            }),
             scheduler,
         };
         Ok((events, placement))
@@ -1559,9 +1727,10 @@ impl Leader {
 
     /// Submits `request` routed as its submitter chose, without the routing program: its prompt
     /// to the deployment's scheduler `prefill` and its tokens to scheduler `decode`, as a
-    /// routing program's route names them. The submitter checked the replicas' roles. The
-    /// prefill's replica serves the request's whole until replicas hand a request's KV over
-    /// (`specs/tasks.md`, T32), as a route of the routing program is served.
+    /// routing program's route names them. The submitter checked the replicas' roles. Two
+    /// schedulers hand the request off as a route of the routing program that names two
+    /// replicas does: the prefill's computes the prompt and lends its KV, and the decode's
+    /// continues the request from it.
     ///
     /// # Errors
     ///
@@ -1574,15 +1743,21 @@ impl Leader {
     ) -> Result<RequestEvents, SubmitError> {
         let serving = self.numbered();
         let found = |number: u32| serving.iter().find(|numbered| numbered.number == number);
-        let (Some(at), Some(_)) = (found(prefill), found(decode)) else {
+        let (Some(at), Some(to)) = (found(prefill), found(decode)) else {
             return Err(SubmitError::Unavailable(format!(
                 "no serving replica is scheduler {prefill} or {decode}"
             )));
         };
+        // Two replicas hand the request off once its prompt is computed: the decode replica
+        // continues it from the KV the prefill replica lends.
+        let handoff = (prefill != decode).then(|| Next {
+            hold: Arc::clone(&to.replica.hold),
+            scheduler: Some(to.scheduler),
+        });
         let (events, _) = at
             .replica
             .migrator
-            .submit(request, Some(at.scheduler))
+            .submit(request, Some(at.scheduler), handoff)
             .await?;
         Ok(events)
     }
@@ -2054,6 +2229,16 @@ pub(crate) struct Replica {
 }
 
 impl Replica {
+    /// The role of the engine's scheduler `scheduler`, as the arguments the engine serves with
+    /// state it (`replicas.<id>.role`); mixed for an engine run elsewhere.
+    pub(crate) fn role(&self, scheduler: u32) -> Role {
+        let served = service::lock(&self.served);
+        let roles = served.as_ref().map(|args| &args.engine_config.roles);
+        roles
+            .and_then(|roles| roles.get(scheduler as usize).copied())
+            .unwrap_or(Role::Mixed)
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "a replica's model families, options and engine, the two readers of its \
@@ -2071,11 +2256,16 @@ impl Replica {
         adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     ) -> Arc<Self> {
         let hold = Arc::new(RequestHold::new());
+        let reroute: std::sync::Weak<Replicas> = std::sync::Weak::clone(&registry);
         let replica = Arc::new(Replica {
             families,
             registry,
             ordinal,
-            migrator: Migrator::new(Arc::clone(&hold), options.migration_config.max_migrations),
+            migrator: Migrator::new(
+                Arc::clone(&hold),
+                options.migration_config.max_migrations,
+                Some(reroute as std::sync::Weak<dyn crate::migration::Reroute>),
+            ),
             hold: Arc::clone(&hold),
             control: std::sync::OnceLock::new(),
             served: std::sync::Mutex::new(None),
@@ -3837,22 +4027,22 @@ mod tests {
         serde_json::from_slice(&rows.json().unwrap()).unwrap()
     }
 
-    /// The sum of the values of metric `name` measured at scheduler `scheduler` of replica 0,
-    /// with `and` a further condition of the rows.
+    /// The sum of the values of metric `name` measured at scheduler `scheduler` of the test's one
+    /// engine, the replica of the same id, with `and` a further condition of the rows.
     async fn total(engine: &Leader, name: &str, scheduler: u32, and: &str) -> f64 {
         let sql = format!(
             "SELECT coalesce(sum(value), 0) AS total FROM stats WHERE name = '{name}' \
-             AND labels['replica'] = '0' AND labels['scheduler'] = '{scheduler}' {and}"
+             AND labels['replica'] = '{scheduler}' AND labels['scheduler'] = '{scheduler}' {and}"
         );
         rows(engine, &sql).await[0]["total"].as_f64().unwrap()
     }
 
-    /// The observations histogram `name` holds at scheduler `scheduler` of replica 0: their
-    /// count and sum.
+    /// The observations histogram `name` holds at scheduler `scheduler` of the test's one engine,
+    /// the replica of the same id: their count and sum.
     async fn observed(engine: &Leader, name: &str, scheduler: u32) -> (u64, f64) {
         let sql = format!(
             "SELECT histogram FROM stats WHERE name = '{name}' \
-             AND labels['replica'] = '0' AND labels['scheduler'] = '{scheduler}'"
+             AND labels['replica'] = '{scheduler}' AND labels['scheduler'] = '{scheduler}'"
         );
         rows(engine, &sql)
             .await
@@ -3888,6 +4078,8 @@ mod tests {
             cache: Default::default(),
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         }
         .into()
     }
@@ -4296,6 +4488,107 @@ mod tests {
         assert!(replicas.iter().all(|replica| {
             replica.parallel.data_parallel_size.get() == 1 && replica.scheduler == config.scheduler
         }));
+    }
+
+    /// Each replica's role reaches the engine that runs its scheduler: an independent replica's
+    /// engine states the role of its own id, and the expert union's one engine every
+    /// scheduler's, by the deployment's ids.
+    #[test]
+    fn every_engine_states_the_roles_of_its_replicas() {
+        use scheduling::routing::Role;
+
+        let configured = |experts: bool| {
+            let mut options = crate::config::Config {
+                data_parallel_size: std::num::NonZeroUsize::new(3).unwrap(),
+                ..Default::default()
+            };
+            options.moe_config.expert_parallel = experts;
+            for (id, role) in [("0", Role::Prefill), ("2", Role::Decode)] {
+                options
+                    .replicas
+                    .insert(id.to_owned(), crate::config::ReplicaConfig { role });
+            }
+            options.engine_config().expect("the configuration resolves")
+        };
+
+        let independent = super::replica_configs(&configured(false)).unwrap();
+        let roles: Vec<&[Role]> = independent.iter().map(|engine| &engine.roles[..]).collect();
+        assert_eq!(
+            roles,
+            [&[Role::Prefill][..], &[Role::Mixed], &[Role::Decode]]
+        );
+        let union = super::replica_configs(&configured(true)).unwrap();
+        let [engine] = &union[..] else {
+            panic!("an expert union runs one engine");
+        };
+        assert_eq!(engine.roles, [Role::Prefill, Role::Mixed, Role::Decode]);
+        assert_eq!(
+            [(0, 0), (1, 0), (2, 0), (0, 2)]
+                .map(|(ordinal, scheduler)| { super::replica_id(ordinal, scheduler) }),
+            [0, 1, 2, 2],
+            "a replica's id is its scheduler's index in the deployment"
+        );
+    }
+
+    /// The deployment's own route: a new token request to the least loaded scheduler that
+    /// computes prompts, generated there when it is mixed and handed off to the least loaded
+    /// that generates tokens otherwise; a continuation to one that generates tokens; a video
+    /// request to a mixed one; nothing when no role takes the request.
+    #[test]
+    fn a_route_pairs_the_roles_that_take_the_request() {
+        use proto::request::{DiffusionRequest, DiffusionSamplingParams, Lend, Trajectory};
+        use scheduling::routing::Role;
+
+        let fresh = text_request();
+        let Request::Generation(generation) = &fresh else {
+            unreachable!("a text request is a token request");
+        };
+        let continued = Request::Generation(Box::new(GenerationRequest {
+            lend: Some(Lend {
+                endpoint: None,
+                session: 1,
+                owner: 2,
+                tokens: 16,
+                stored: 0,
+            }),
+            ..(**generation).clone()
+        }));
+        let video = Request::Diffusion(Box::new(DiffusionRequest {
+            request_id: Default::default(),
+            prompt_token_ids: vec![1, 2],
+            conditioning: Vec::new(),
+            conditions: Vec::new(),
+            media: Vec::new(),
+            priority: 0,
+            sampling: DiffusionSamplingParams {
+                num_frames: 25,
+                video_units: 1,
+                seed: 3,
+                width: 64,
+                height: 32,
+                condition_rows: 0,
+            },
+            trajectory: Trajectory::default(),
+            encoder_inputs: None,
+            trace: 0,
+        }));
+
+        let split = [
+            (Role::Prefill, 3),
+            (Role::Decode, 5),
+            (Role::Prefill, 1),
+            (Role::Decode, 2),
+        ];
+        assert_eq!(super::pair(&split, &fresh), Some((2, 3)));
+        assert_eq!(super::pair(&split, &continued), Some((3, 3)));
+        assert_eq!(super::pair(&split, &video), None);
+
+        let mixed = [(Role::Prefill, 4), (Role::Mixed, 1), (Role::Decode, 0)];
+        assert_eq!(super::pair(&mixed, &fresh), Some((1, 1)));
+        assert_eq!(super::pair(&mixed, &continued), Some((2, 2)));
+        assert_eq!(super::pair(&mixed, &video), Some((1, 1)));
+
+        assert_eq!(super::pair(&[(Role::Decode, 0)], &fresh), None);
     }
 
     /// Replicas spread over a second host run their engines where their ranks are: each one's

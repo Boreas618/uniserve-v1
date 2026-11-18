@@ -149,7 +149,7 @@ impl BufferPool {
         match target {
             Target::Owner { owner, .. }
             | Target::Slot { owner }
-            | Target::Group { owner, .. }
+            | Target::Import { owner, .. }
             | Target::Memory { owner, .. } => self.owners.contains_key(&(client, *owner)),
             Target::Entry { .. } => true,
         }
@@ -193,11 +193,11 @@ impl BufferPool {
                 Deferred::Commit { block, .. } => hold(block, BlockState::Private),
                 // A crossing reads its block, as a release holds it.
                 Deferred::Replicate { block, .. } => hold(block, BlockState::Retired),
-                Deferred::Transfer { .. } | Deferred::Finish { .. } => {}
+                Deferred::Lend { .. } | Deferred::Finish { .. } => {}
             }
         }
-        // A peer's hold reads a cached block, as a pin does.
-        for block in self.peers.values().flatten() {
+        // A peer's hold reads a cached block, as a pin does; a borrow reads a lent one.
+        for block in self.peers.values().chain(self.borrows.values()).flatten() {
             hold(block, BlockState::Retired);
         }
         for ((queue, _), copies) in &self.copies {
@@ -259,7 +259,7 @@ impl BufferPool {
         let waiting = |work: &Deferred| match work {
             Deferred::Release { .. } => Waiting::Release,
             Deferred::Commit { .. } => Waiting::Commit,
-            Deferred::Transfer { .. } => Waiting::Transfer,
+            Deferred::Lend { .. } => Waiting::Lend,
             Deferred::Finish { .. } => Waiting::Finish,
             Deferred::Replicate { .. } => Waiting::Replicate,
         };

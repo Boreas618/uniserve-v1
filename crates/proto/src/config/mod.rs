@@ -271,6 +271,12 @@ pub struct KvCacheConfig {
     /// stated.
     #[reload(epoch)]
     pub conversion_buffer_mib: NonZeroU64,
+    /// How long a prefill replica keeps the KV of a request it handed off for the decode
+    /// replica to import, at most: the decode replica's import returns it earlier
+    /// ([`DEFAULT_LEASE`] unless stated).
+    #[serde(with = "values::duration")]
+    #[reload(epoch)]
+    pub lease: Duration,
 }
 
 /// How a switch of a capability the epoch lays out storage for takes effect: switched off at the
@@ -283,6 +289,11 @@ pub fn switched_off(previous: Option<&bool>, next: &bool) -> crate::reload::Effe
         _ => crate::reload::Effect::Epoch,
     }
 }
+
+/// How long a prefill replica keeps a handoff's KV for its import when the deployment states no
+/// `kv_cache_config.lease`: thirty seconds, beyond the time a decode replica takes to admit a
+/// request whose prompt another replica computed.
+pub const DEFAULT_LEASE: Duration = Duration::from_secs(30);
 
 impl Default for KvCacheConfig {
     fn default() -> Self {
@@ -302,6 +313,7 @@ impl Default for KvCacheConfig {
             prefetch_timeout_per_ki_token: DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN,
             peers: Vec::new(),
             conversion_buffer_mib: DEFAULT_CONVERSION_BUFFER_MIB,
+            lease: DEFAULT_LEASE,
         }
     }
 }
@@ -419,7 +431,24 @@ pub struct SchedulerConfig {
     #[serde(skip)]
     #[reload(step)]
     pub report_period: Duration,
+    /// The role of each scheduler of the engine, by its index, resolved from the
+    /// configuration's `replicas.<id>.role`: which requests each takes.
+    #[serde(skip)]
+    #[reload(step)]
+    pub roles: Vec<Role>,
+    /// How long a handoff's lend lasts at most, resolved from `kv_cache_config.lease`.
+    #[serde(skip)]
+    #[reload(epoch)]
+    pub lease: Duration,
+    /// The TCP endpoint of the Storage Server of the scheduler's host, which a handoff's lend
+    /// names; `None` for a server that listens on none. Resolved from the engine's launch.
+    #[serde(skip)]
+    #[reload(epoch)]
+    pub storage: Option<String>,
 }
+
+/// The requests a replica takes (`replicas.<id>.role`).
+pub use scheduling::routing::Role;
 
 /// The budget a scheduling policy module runs under (`scheduler_config.policy_budget`): the
 /// engine's policy host meters every call into the module by fuel, wasmtime's count of executed
@@ -496,6 +525,9 @@ impl Default for SchedulerConfig {
             prefetch_timeout_base: DEFAULT_PREFETCH_TIMEOUT_BASE,
             prefetch_timeout_per_ki_token: DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN,
             report_period: DEFAULT_REPORT_PERIOD,
+            roles: Vec::new(),
+            lease: DEFAULT_LEASE,
+            storage: None,
         }
     }
 }
@@ -527,6 +559,9 @@ impl SchedulerConfig {
             prefetch_timeout_base: engine.kv_cache.prefetch_timeout_base,
             prefetch_timeout_per_ki_token: engine.kv_cache.prefetch_timeout_per_ki_token,
             report_period: engine.worker.report_period,
+            roles: engine.roles.clone(),
+            lease: engine.kv_cache.lease,
+            storage: engine.scheduler.storage.clone(),
         }
     }
 
@@ -586,9 +621,17 @@ pub struct Tuning {
     /// Where and how the schedulers publish their KV events (`kv_events_config`).
     #[serde(default)]
     pub kv_events: KvEventsConfig,
+    /// The role of each of the engine's schedulers, by its index; a scheduler past them is
+    /// mixed.
+    pub roles: Vec<Role>,
 }
 
 impl Tuning {
+    /// The role of the engine's scheduler `scheduler`: mixed unless the values state another.
+    pub fn role(&self, scheduler: usize) -> Role {
+        self.roles.get(scheduler).copied().unwrap_or(Role::Mixed)
+    }
+
     /// The step values `config` states, as of `revision`.
     pub fn of(config: &EngineConfig, revision: u64) -> Self {
         let queue_depths = config
@@ -612,6 +655,7 @@ impl Tuning {
             compare_timeout: config.worker.compare_timeout,
             nvtx_ranges: config.profiling.nvtx_ranges,
             kv_events: config.kv_events.clone(),
+            roles: config.roles.clone(),
         }
     }
 
@@ -642,6 +686,11 @@ impl Tuning {
             kv_events_replay_endpoint: self.kv_events.replay_endpoint.clone(),
             kv_events_topic: self.kv_events.topic.clone(),
             kv_events_buffer_steps: count(self.kv_events.buffer_steps),
+            roles: self
+                .roles
+                .iter()
+                .map(|role| crate::request::wire::Role::from(*role) as i32)
+                .collect(),
         }
     }
 
@@ -674,6 +723,12 @@ impl Tuning {
                 topic: command.kv_events_topic.clone(),
                 buffer_steps: count(command.kv_events_buffer_steps)?,
             },
+            roles: command
+                .roles
+                .iter()
+                .map(|role| crate::request::wire::Role::try_from(*role).map(Role::from))
+                .collect::<Result<_, _>>()
+                .ok()?,
         })
     }
 }
@@ -1909,6 +1964,9 @@ pub struct EngineConfig {
     pub max_logprobs: u32,
     pub device: DeviceConfig,
     pub scheduler: SchedulerConfig,
+    /// The role of each of the engine's schedulers, by its index (`replicas.<id>.role`): which
+    /// requests it takes. A scheduler past them is mixed.
+    pub roles: Vec<Role>,
     pub media: MediaConfig,
     /// Each rank's share of its device's storage.
     pub mem_fraction_static: f64,
@@ -1954,9 +2012,9 @@ impl EngineConfig {
     /// any of these types does not compile until it is placed in the build part or named as a
     /// generation-layer value. The generation layer's values are the scheduling policy's
     /// parameters (the scheduler section, the batched token budget, the speculative cost
-    /// figures); the values the serving engine takes at a step boundary (the probes' switches,
-    /// the NVTX ranges, the queue depth, the workers' bounds, report period and copy budget);
-    /// and the media section, which the frontend reads. A switch the engine takes in place only
+    /// figures); the schedulers' roles; the values the serving engine takes at a step boundary
+    /// (the probes' switches, the NVTX ranges, the queue depth, the workers' bounds, report
+    /// period and copy budget); and the media section, which the frontend reads. A switch the engine takes in place only
     /// when it is switched off (`kv_cache_config.prefix_caching`, `host_tier`) stays in the
     /// build part.
     pub fn build_part(&self) -> BuildPart<'_> {
@@ -1969,6 +2027,7 @@ impl EngineConfig {
             max_logprobs,
             device,
             scheduler: _,
+            roles: _,
             media: _,
             mem_fraction_static,
             load,

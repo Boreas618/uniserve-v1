@@ -50,8 +50,8 @@ const TERMINAL_RESERVE: u32 = 2;
 ///
 /// Invariants: `completed[p] <= scheduled[p]` and `num_computed_tokens <= token_ids.len()`; no
 /// call writes a block the request does not hold or one that is read-only; it holds one owner
-/// per group it is attached to, from that group's `Attach` (or the `Transfer` that moves the
-/// owner there) until that owner's `Detach`.
+/// per group it is attached to, from that group's `Attach` until that owner's `Detach`, or its
+/// `Lend` once the lend took effect.
 #[derive(Clone, Debug)]
 pub(crate) struct Request {
     // What the daemon submitted. Immutable.
@@ -66,7 +66,7 @@ pub(crate) struct Request {
     /// Per phase, by [`Phase::index`], the group that serves it; `None` until placed.
     pub placement: [Option<GroupId>; Phase::COUNT],
     /// Per group the request is attached to: its owner there (drawn at each admission), its slot
-    /// row there (from `Attached` or `Transferred`; 0, a row no owner holds, until then), and
+    /// row there (from `Attached`; 0, a row no owner holds, until then), and
     /// whether that group has seen it.
     pub attachments: Vec<(GroupId, OwnerId, u32, bool)>,
     /// Per phase, the calls handed to the executor.
@@ -80,7 +80,7 @@ pub(crate) struct Request {
     pub blocks: Vec<Blocks>,
     /// Whether it is in the scheduler's waiting queue.
     pub queued: bool,
-    /// The answers its admission or its transfer still waits for.
+    /// The answers its admission or its lend still waits for.
     pub pending: u32,
 
     // Token progress.
@@ -144,6 +144,9 @@ pub(crate) struct Request {
     pub last_progress: Instant,
     /// Whether its view changed since the policy was told.
     pub dirty: bool,
+    /// For a request that imports a lend, how its full pages arrive, as the KV program chose
+    /// (`super::handoff`); `None` until it answered.
+    pub path: Option<scheduling::kv::Path>,
 }
 
 /// Where a request is (vLLM's `RequestStatus`).
@@ -152,7 +155,8 @@ pub(crate) struct Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RequestStatus {
     Waiting,
-    /// Answers of its admission or its transfer are outstanding at the buffer pool.
+    /// Answers of its admission (an import among them) or of its lend are outstanding at the
+    /// buffer pool.
     WaitingForRemoteKvs,
     Running,
     Finished,
@@ -273,6 +277,7 @@ impl Request {
             draft_limit,
             last_progress: arrival,
             dirty: false,
+            path: None,
         }
     }
 
@@ -1026,6 +1031,8 @@ mod tests {
             include_stop_token: false,
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         }
     }
 

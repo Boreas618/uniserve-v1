@@ -120,6 +120,10 @@ impl Scheduler {
             let message = QUEUE_FULL.to_owned();
             return self.send(id, Event::Rejected { kind, message });
         }
+        // The role decides which requests the replica takes from now on.
+        if let Err((kind, message)) = self.takes(&input) {
+            return self.send(id, Event::Rejected { kind, message });
+        }
 
         // A resumed request's generated tokens continue its prompt; it is named for its
         // continuation by this epoch unless it carries a name.
@@ -1135,8 +1139,12 @@ impl Scheduler {
         };
         let expected = self.expected(request);
         // A resumed request's previous life committed its blocks, through another queue pair
-        // when it ran on another epoch, whose commits `cache` learns only from a `Listing`.
-        if self.awaits_listing(id, expected) {
+        // when it ran on another epoch, whose commits `cache` learns only from a `Listing`; one
+        // that imports a lend reads its prompt from the lend.
+        let imports = request
+            .generation()
+            .is_some_and(|input| input.lend.is_some());
+        if !imports && self.awaits_listing(id, expected) {
             self.requeue(id);
             return false;
         }
@@ -1175,9 +1183,31 @@ impl Scheduler {
             self.ask(id, runtime::Request::Attach { owner, group });
         }
         // The round sizes the request's tables and sets the hit it expects, which its answers
-        // lower to what they show.
-        for ask in self.admission_requests(id) {
-            self.ask(id, ask);
+        // lower to what they show. A request that imports a lend asks how its pages arrive
+        // first, and its round follows the answer (`super::handoff`).
+        if imports {
+            let known = self
+                .requests
+                .get_mut(&id)
+                .and_then(|request| {
+                    request.status = RequestStatus::WaitingForRemoteKvs;
+                    if request.path.is_none() {
+                        request.pending += 1;
+                    }
+                    request.path
+                })
+                .is_some();
+            if known {
+                for ask in self.handoff_requests(id) {
+                    self.ask(id, ask);
+                }
+            } else {
+                self.ask_path(id);
+            }
+        } else {
+            for ask in self.admission_requests(id) {
+                self.ask(id, ask);
+            }
         }
 
         // Other requests are scheduled meanwhile.
@@ -1295,8 +1325,7 @@ impl Scheduler {
     /// Places request `id` on a group for every phase it runs (SD §3.5 `place`, §7.3 "Routes"),
     /// in the order of its route: a group it is placed on already; else, for a request placed
     /// nowhere yet, the group the policy's `place` names among the candidates when there is a
-    /// choice; else the least loaded candidate. A request whose prefill lands on a `Prefill`
-    /// group is placed for its decode by its transfer, and never refills. False, with the
+    /// choice; else the least loaded candidate. False, with the
     /// request's placement as it was,
     /// when a phase has no candidate or the policy faults. Each group the request is newly placed
     /// on counts it once.
@@ -1311,11 +1340,6 @@ impl Scheduler {
             let Some(request) = self.requests.get(&id) else {
                 return false;
             };
-            if matches!(phase, Phase::Decode | Phase::Verify | Phase::Refill)
-                && self.splits(request)
-            {
-                continue;
-            }
             let candidates = self.candidates(request, phase);
             let nowhere = request.placement.iter().all(Option::is_none);
 
@@ -1399,14 +1423,6 @@ impl Scheduler {
             }
         }
         phases
-    }
-
-    /// Whether `request`'s prefill is placed on a `Prefill` group, whose blocks its transfer
-    /// moves to a decode group.
-    fn splits(&self, request: &Request) -> bool {
-        request.placement[Phase::Prefill.index()]
-            .and_then(|group| self.group(group))
-            .is_some_and(|group| group.config.role == proto::config::WorkerGroupRole::Prefill)
     }
 
     /// Restores request `id`'s placement to `before`; no group counted it yet.
@@ -1776,6 +1792,8 @@ mod tests {
             include_stop_token: false,
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         }
     }
 
@@ -1897,8 +1915,8 @@ mod tests {
     }
 
     /// A token request is placed for its prefill and its decode on one group of the `Model`
-    /// role, counted there once; on a `Prefill` group only for its prefill, its transfer choosing
-    /// its decode group; with no group for a phase it is placed nowhere.
+    /// role, counted there once; with no `Model` group for one of its phases it is placed
+    /// nowhere.
     #[test]
     fn a_token_request_is_placed_by_the_roles_of_the_groups() {
         let mut bench = bench(1024);
@@ -1922,21 +1940,13 @@ mod tests {
         assert_eq!(placement[Phase::Decode.index()], Some(A));
         assert_eq!(scheduler.groups[0].num_requests, 1);
 
-        serve(&mut bench, 0, WorkerGroupRole::Prefill, &[Phase::Prefill]);
-        serve(&mut bench, 1, WorkerGroupRole::Decode, &[Phase::Decode]);
+        serve(&mut bench, 0, WorkerGroupRole::Model, &[Phase::Prefill]);
+        serve(&mut bench, 1, WorkerGroupRole::Experts, &[Phase::Decode]);
         let scheduler = &mut bench.scheduler;
         let (placed, placement) = place(scheduler, 2);
-        assert!(placed);
-        assert_eq!(placement[Phase::Prefill.index()], Some(A));
-        assert_eq!(placement[Phase::Decode.index()], None);
-        assert_eq!(scheduler.groups[1].num_requests, 0);
-
-        serve(&mut bench, 0, WorkerGroupRole::Decode, &[Phase::Decode]);
-        let scheduler = &mut bench.scheduler;
-        let (placed, placement) = place(scheduler, 3);
         assert!(!placed);
         assert_eq!(placement, [None; Phase::COUNT]);
-        assert_eq!(scheduler.groups[0].num_requests, 2);
+        assert_eq!(scheduler.groups[0].num_requests, 1);
     }
 
     /// Under a shortage, the idle requests with the fewest tokens left give up their whole draft

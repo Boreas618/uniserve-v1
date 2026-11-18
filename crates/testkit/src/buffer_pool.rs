@@ -171,6 +171,7 @@ impl InProcessPool {
                 segments,
                 limits,
                 registers,
+                session: client,
             },
             ends,
         ))
@@ -349,10 +350,16 @@ impl InProcessPool {
         self.pool.take(queue, id, request);
     }
 
-    /// Runs a task the pool started to its end: a transfer copies everything, a prefetch the
-    /// leading keys its source holds, a put every key; with failing tasks, none of it.
+    /// Runs a task the pool started to its end: a crossing or an import copies everything, a
+    /// prefetch the leading keys its source holds, a put every key; with failing tasks, none of
+    /// it. An import's lend of this pool ends with it, as the server ends it.
     fn run(&mut self, task: (QueueId, runtime::RequestId)) {
         let ok = !self.fail_tasks;
+        if let Some(work) = self.pool.import_work(task)
+            && work.lender.endpoint.is_none()
+        {
+            self.pool.give_back(work.lender.session, work.lender.owner);
+        }
         let source = match self.sources.remove(&(task.0, task.1.0)) {
             Some(Source::Remote) => Some(&self.remote),
             Some(Source::Peers) => Some(&self.peers),
@@ -850,28 +857,42 @@ mod tests {
     }
 
     #[test]
-    fn a_transfer_runs_within_the_turn_and_a_failed_task_answers_failed() {
+    fn an_import_runs_within_the_turn_ends_its_lend_and_a_failed_task_answers_failed() {
         let mut bench = bench(4096);
         bench.ask(A, 0, attach(1, A));
         bench.ask(A, 1, allocate(1, 2));
-        let transfer = |owner| Request::Transfer {
-            trace: 0,
-            owner: OwnerId(owner),
-            group: B,
+        let lend = Request::Lend {
+            owner: OwnerId(1),
+            lease: 60_000_000_000,
             after: Vec::new(),
         };
-
-        bench.fake.stamp(A, vec![transfer(1)]);
+        bench.fake.stamp(A, vec![lend]);
         let stamped = bench.stamped().remove(0);
         assert!(
             bench.fake.entries(A).is_empty(),
-            "the source's workers removed the entries"
+            "the lender's workers removed the entries"
         );
-        let transferred = bench.ask(B, 1, stamped);
-        let Completion::Transferred { slot, runs } = transferred else {
-            panic!("the transfer answered {transferred:?}");
+        assert_eq!(bench.ask(A, 2, stamped), Completion::Done);
+
+        // The import fills two blocks of its own from the lend, which ends with it.
+        bench.ask(B, 0, attach(2, B));
+        let session = bench.opened.session;
+        let import = |owner| Request::Import {
+            owner: OwnerId(owner),
+            tables: vec![(0, 0, 2)],
+            lender: runtime::Lender {
+                endpoint: None,
+                session,
+                owner: OwnerId(1),
+            },
+            push: false,
+            trace: 0,
         };
-        assert_eq!((slot, runs.len()), (1, 2));
+        let imported = bench.ask(B, 1, import(2));
+        let Completion::Imported { runs, .. } = imported else {
+            panic!("the import answered {imported:?}");
+        };
+        assert_eq!(runs.len(), 2);
         assert!(bench.fake.entries(B).values().all(|entry| entry.writable));
         assert!(
             bench.fake.violations().is_empty(),
@@ -879,12 +900,21 @@ mod tests {
             bench.fake.violations()
         );
 
-        bench.ask(A, 0, attach(2, A));
-        bench.ask(A, 2, allocate(2, 1));
+        // A lend of another host's pool whose task fails takes nothing.
+        bench.ask(B, 3, attach(3, B));
         bench.pool.fail_tasks(true);
-        bench.fake.stamp(A, vec![transfer(2)]);
-        let stamped = bench.stamped().remove(0);
-        assert_eq!(bench.ask(B, 0, stamped), Completion::Failed);
+        let remote = Request::Import {
+            owner: OwnerId(3),
+            tables: vec![(0, 0, 1)],
+            lender: runtime::Lender {
+                endpoint: Some("lender:1".into()),
+                session: 1,
+                owner: OwnerId(1),
+            },
+            push: true,
+            trace: 0,
+        };
+        assert_eq!(bench.ask(B, 4, remote), Completion::Failed);
     }
 
     #[test]

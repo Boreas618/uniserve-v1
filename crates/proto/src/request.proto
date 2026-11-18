@@ -429,6 +429,21 @@ message Tune {
   optional string kv_events_replay_endpoint = 16;
   string kv_events_topic = 17;
   uint64 kv_events_buffer_steps = 18;
+  // The role of each of the engine's schedulers, by its index: which
+  // requests it takes from the next submission on (`replicas.<id>.role`).
+  repeated Role roles = 19;
+}
+
+// The requests a scheduler, a replica of the deployment, takes.
+enum Role {
+  // Both: it computes prompts and generates tokens.
+  ROLE_MIXED = 0;
+  // Prompts alone: a request it takes hands its KV off once its first token
+  // is sampled.
+  ROLE_PREFILL = 1;
+  // Token generation alone: a request it takes imports the KV a prefill
+  // replica lent.
+  ROLE_DECODE = 2;
 }
 
 message CommitExperts {
@@ -865,9 +880,9 @@ message SchedulerStats {
   uint64 numerical_faults = 16;
   repeated DomainSchedulerStats domain_stats = 17;
   uint64 calls_without_blocks = 18;
-  uint64 transfers = 19;
-  uint64 failed_transfers = 20;
-  uint64 transferred_blocks = 21;
+  uint64 imports = 19;
+  uint64 failed_imports = 20;
+  uint64 imported_blocks = 21;
   uint64 preempted_requests = 22;
   uint64 evicted_blocks = 23;
   uint64 given_up_draft_blocks = 24;
@@ -876,6 +891,15 @@ message SchedulerStats {
   uint64 policy_fuel = 27;
   // The configuration revision of the step values the scheduler last read.
   uint64 revision = 28;
+  uint64 queued_tokens = 29;
+  Pages device_pages = 30;
+  Pages host_pages = 31;
+}
+
+// The pages of one tier of a scheduler's KV cache (`proto::report::Pages`).
+message Pages {
+  uint64 used = 1;
+  uint64 capacity = 2;
 }
 
 message PrefixCacheStats {
@@ -1022,6 +1046,31 @@ message GenerationRequest {
   // The LoRA adapter the request computes with: the slot of the workers'
   // adapter pool the daemon loaded it into, or 0 for the base model alone.
   uint32 adapter = 16;
+  // The request hands off once its first token is sampled: the engine lends
+  // the KV of its prompt and ends it as migratable with the lend
+  // (`MIGRATION_CAUSE_HANDOFF`), and the replica the route names for its
+  // tokens continues it.
+  bool hand_off = 19;
+  // The KV of the request's prompt, which a prefill replica lent: the
+  // engine imports it into the request's pages, and computes what the
+  // import does not bring.
+  Lend lend = 20;
+}
+
+// The KV of a request's prompt that a prefill replica's engine lent: its
+// owner in the buffer pool of its host (`storage::runtime::Lender`).
+message Lend {
+  // The TCP endpoint of the Storage Server of the lender's host; absent for a
+  // server that listens on none.
+  optional string endpoint = 1;
+  // The lender's session in that server's buffer pool.
+  uint32 session = 2;
+  // The lent owner.
+  uint64 owner = 3;
+  // The prefix of the prompt the lent pages hold, in tokens.
+  uint32 tokens = 4;
+  // The leading pages of the prompt the lender put in the remote store.
+  uint32 stored = 5;
 }
 
 message ImageInput {
@@ -1340,6 +1389,8 @@ message Migratable {
   // With stored steps, where the engine put the trajectory's pages and how
   // each stored rank laid its part out (`DiffusionRequest.stored_layout`).
   bytes stored_layout = 3;
+  // For a handoff, the KV of the request's prompt the engine lent.
+  Lend lend = 4;
 }
 
 enum MigrationCause {
@@ -1347,13 +1398,16 @@ enum MigrationCause {
   MIGRATION_CAUSE_DRAIN = 0;
   // The workers that held the request were lost.
   MIGRATION_CAUSE_LOSS = 1;
-  // A transfer of the request's blocks between its worker groups failed: a
-  // prefill-to-decode transfer or a crossing of a product between processes.
-  // Its groups serve on, and a video request's trajectory is stored; the
+  // A crossing of a product of the request between processes failed. Its
+  // groups serve on, and a video request's trajectory is stored; the
   // engine does not try the copy again, and the daemon counts the migration
   // against the request's limit as it counts a loss, since the request's
   // next attempt may take the same path.
   MIGRATION_CAUSE_TRANSFER = 2;
+  // The request's prompt is computed and its first token sampled on a
+  // prefill replica, which lent its KV: it continues on the replica its
+  // route names for its tokens. Not counted against the request's limit.
+  MIGRATION_CAUSE_HANDOFF = 3;
 }
 
 message Scheduled {
@@ -1458,6 +1512,8 @@ message Rejected {
 enum RejectionKind {
   REJECTION_KIND_INVALID = 0;
   REJECTION_KIND_OVERLOADED = 1;
+  // The scheduler's role takes no such request: the leader routes it again.
+  REJECTION_KIND_ROLE = 2;
 }
 
 message Failed {

@@ -98,12 +98,18 @@ impl ApiError {
     ///
     /// `Invalid` becomes a 400 invalid request that fails the same way on
     /// retry; `Overloaded` becomes a 503 that the same request may pass once
-    /// the engine's waiting queue drains.
+    /// the engine's waiting queue drains; `Role`, which reaches the caller only
+    /// when no replica's role took the request when the leader routed it again,
+    /// becomes a 503 that the same request may pass once a replica's role
+    /// takes it.
     pub fn rejected(kind: proto::request::RejectionKind, message: impl Into<String>) -> Self {
         match kind {
             proto::request::RejectionKind::Invalid => Self::invalid_request(message, None),
             proto::request::RejectionKind::Overloaded => {
                 Self::service_unavailable("server_overloaded", message)
+            }
+            proto::request::RejectionKind::Role => {
+                Self::service_unavailable("replica_unavailable", message)
             }
         }
     }

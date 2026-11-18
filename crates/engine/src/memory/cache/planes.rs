@@ -45,20 +45,10 @@ use crate::memory::exclusive::{ExclusiveConfig, ExclusiveStorage, SegmentPart, S
 use crate::memory::lend;
 use crate::worker::{Error, Result};
 
-/// The value storages' names, keys then values.
-const VALUES: [&str; 2] = ["prefix_cache.key.values", "prefix_cache.value.values"];
-
-/// The initialization flag storages' names, keys then values.
-const FLAGS: [&str; 2] = [
-    "prefix_cache.key.initialized",
-    "prefix_cache.value.initialized",
-];
-
-/// The FP8 scale storages' names, keys then values.
-const SCALES: [&str; 2] = ["prefix_cache.key.scale", "prefix_cache.value.scale"];
-
-/// The index-key storage's name.
-const INDEX_KEYS: &str = "prefix_cache.index_key.values";
+/// The storages' names, which a handoff between replicas reads a rank's fields by
+/// (`storage::protocol::planes`): the value storages, keys then values; their initialization
+/// flags; their FP8 scales; and the index keys.
+use ::storage::protocol::planes::{FLAGS, INDEX_KEYS, SCALES, VALUES};
 
 /// The neutral FP8 scale, `1.0f32`, as the bits a 32-bit fill writes: what every scale of a new
 /// unit of the planes and of a scratch page set holds.

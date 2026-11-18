@@ -1239,6 +1239,7 @@ mod tests {
             )]],
             limits: vec![65],
             registers: Vec::new(),
+            session: 0,
         };
         let created = vec![(
             "kv 0 ab".to_owned(),
@@ -1264,6 +1265,20 @@ mod tests {
                 offset: 0,
                 bytes: 32,
             }],
+            Some(storage::protocol::UnitLayout {
+                columns: 1,
+                classes: vec![storage::protocol::PageLayout {
+                    class: 0,
+                    block_size: 64,
+                    layers: vec![0],
+                    kv_heads: 1,
+                    kv_head_offset: 0,
+                    total_kv_heads: 2,
+                    head_bytes: 256,
+                    quantized: false,
+                    index_bytes: 0,
+                }],
+            }),
         )];
         let capacities = vec![(GROUP, capacity())];
 

@@ -649,7 +649,7 @@ impl BufferPool {
                     Target::Entry { key, .. } => self.stored(client, &copy, key),
                     // The slot holds the stored trajectory.
                     Target::Slot { .. } => Completion::Restored,
-                    Target::Group { .. } | Target::Memory { .. } => Completion::Done,
+                    Target::Import { .. } | Target::Memory { .. } => Completion::Done,
                 };
             }
             self.drop_copy(client, copy);

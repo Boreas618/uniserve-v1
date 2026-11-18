@@ -1311,6 +1311,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             cause: proto::request::MigrationCause::Loss,
             denoised_steps: 0,
             stored_layout: Vec::new(),
+            lend: None,
         });
     }
 }
@@ -1571,6 +1572,8 @@ mod tests {
             cache: Default::default(),
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         }
         .into()
     }

@@ -23,7 +23,16 @@
 //! trajectory from the stored step, and the daemon's detokenizer,
 //! stop-string matcher and response assembly keep their state.
 //!
-//! A migration caused by a drain is not counted. A request survives
+//! A request a prefill replica computed the prompt of migrates by a handoff
+//! (`MigrationCause::Handoff`): the migratable event carries the KV the
+//! replica lent (`Lend`), and the continuation, which names the lend, goes
+//! to the decode replica the request's route named ([`Next`]), whose engine
+//! imports the lent pages and generates from them. A request a replica's role
+//! refuses (`RejectionKind::Role`), because the role changed after the request
+//! was routed, is routed again ([`Reroute`]) and submitted where the new route
+//! names, at most [`REROUTES`] times.
+//!
+//! A migration caused by a drain or a handoff is not counted. A request survives
 //! `max_migrations` migrations caused by losses of its workers or by failed
 //! transfers between its worker groups, together, and fails on the next one:
 //! a failed transfer leaves the engine serving, and the request's next attempt
@@ -46,13 +55,44 @@ use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use proto::request::{
-    CacheResume, DiffusionRequest, Event, GenerationRequest, MigrationCause, Request, RequestId,
-    Trajectory,
+    CacheResume, DiffusionRequest, Event, GenerationRequest, Lend, MigrationCause, RejectionKind,
+    Request, RequestId, Trajectory,
 };
 
 use crate::api::events::Events;
 use crate::engine::client::{EventStream, StreamCancelCause, SubmitError};
 use crate::engine::hold::{Kept, RequestHold};
+
+/// The most times a request a replica's role refused is routed again before
+/// the refusal reaches its consumer: enough for a role change racing a route,
+/// few enough that a deployment whose roles take no such request answers it.
+pub const REROUTES: u32 = 3;
+
+/// Where a request goes next: the hold of a replica's engine and the scheduler
+/// of it the route names (`None` lets the engine choose).
+#[derive(Clone)]
+pub struct Next {
+    pub hold: Arc<RequestHold>,
+    pub scheduler: Option<u32>,
+}
+
+/// Where a request goes: the replica that computes its prompt, and the replica
+/// that generates its tokens when that is another one, to which it is handed
+/// off once its first token is sampled.
+#[derive(Clone)]
+pub struct Target {
+    pub first: Next,
+    pub decode: Option<Next>,
+}
+
+/// Routes a request again once a replica's role refused it.
+pub trait Reroute: Send + Sync {
+    /// Where `request`, as last submitted, goes now: a continuation of a
+    /// handoff or of another migration to a replica that generates tokens, any
+    /// other request as a new one is routed. `None` when no serving replica's
+    /// role takes it.
+    fn reroute(&self, request: &Request) -> Option<Target>;
+}
 
 /// Submits the leader's requests and moves its token requests between
 /// engines.
@@ -60,15 +100,24 @@ pub struct Migrator {
     hold: Arc<RequestHold>,
     /// Migrations caused by losses or failed transfers a request survives.
     max_migrations: u32,
+    /// What routes a request again after a role refused it; `None` routes no
+    /// request again.
+    reroute: Option<std::sync::Weak<dyn Reroute>>,
 }
 
 impl Migrator {
     /// A migrator that submits through `hold`, under which a request survives
-    /// `max_migrations` migrations caused by losses or failed transfers.
-    pub fn new(hold: Arc<RequestHold>, max_migrations: u32) -> Self {
+    /// `max_migrations` migrations caused by losses or failed transfers, and
+    /// that routes a refused request again through `reroute`.
+    pub fn new(
+        hold: Arc<RequestHold>,
+        max_migrations: u32,
+        reroute: Option<std::sync::Weak<dyn Reroute>>,
+    ) -> Self {
         Self {
             hold,
             max_migrations,
+            reroute,
         }
     }
 
@@ -79,7 +128,8 @@ impl Migrator {
     /// request, are kept for a later migration, a token request with the seed it carries from entry
     /// (`api::input::request_seed`), so that its draws repeat on the engine
     /// that serves it next, and a video request with its trajectories'
-    /// identity.
+    /// identity. A token request with a `decode` replica hands its KV off
+    /// once its first token is sampled, and continues there.
     ///
     /// # Errors
     ///
@@ -88,7 +138,11 @@ impl Migrator {
         &self,
         mut request: Request,
         scheduler: Option<u32>,
+        decode: Option<Next>,
     ) -> Result<(RequestEvents, Option<u32>), SubmitError> {
+        if let Request::Generation(generation) = &mut request {
+            generation.hand_off = decode.is_some();
+        }
         let resumable = match &mut request {
             Request::Generation(generation) => Resumable::Generation(generation.clone()),
             Request::Diffusion(diffusion) => {
@@ -103,6 +157,9 @@ impl Migrator {
             stream,
             request: Some(resumable),
             hold: Some(Arc::clone(&self.hold)),
+            decode,
+            reroute: self.reroute.clone(),
+            rerouted: 0,
             max_migrations: self.max_migrations,
             counted: 0,
             pending: None,
@@ -159,6 +216,12 @@ impl Resumable {
                 // Its prompt's log-probabilities were reported where it began.
                 request.sampling.return_prompt_logprobs = false;
                 request.sampling.n_prompt_logprobs = 0;
+                // A handoff's continuation imports what the prefill replica lent and hands
+                // nothing off again; a later migration finds no lend, which its import ended.
+                if cause == MigrationCause::Handoff {
+                    request.hand_off = false;
+                }
+                request.lend = migration.lend.clone();
                 if request.cache.resume.is_none() {
                     request.cache.resume = provenance;
                 }
@@ -230,20 +293,38 @@ struct Migration {
     /// stored none, and the request names the trajectory it named before,
     /// which is the same at that step whenever it is read.
     stored: Option<Stored>,
+    /// The KV a prefill replica lent at a handoff, which the continuation
+    /// imports.
+    lend: Option<Lend>,
 }
 
 impl Migration {
-    /// The migration an `Event::Migratable` states: its cause, and the steps
-    /// it stored (none at zero, as the request interface states none).
-    fn of(cause: MigrationCause, denoised_steps: u32, stored_layout: Vec<u8>) -> Self {
+    /// The migration an `Event::Migratable` states: its cause, the steps it
+    /// stored (none at zero, as the request interface states none) and the
+    /// KV it lent.
+    fn of(
+        cause: MigrationCause,
+        denoised_steps: u32,
+        stored_layout: Vec<u8>,
+        lend: Option<Lend>,
+    ) -> Self {
         Self {
             cause,
             stored: NonZeroU32::new(denoised_steps).map(|steps| Stored {
                 steps,
                 layout: stored_layout,
             }),
+            lend,
         }
     }
+}
+
+/// What the next `recv` or `migrate_pending` carries out.
+enum Pending {
+    /// The request left its engine.
+    Migration(Migration),
+    /// A replica's role refused the request, which is routed again.
+    Reroute(String),
 }
 
 /// One request's events across the engines that serve it.
@@ -263,13 +344,19 @@ pub struct RequestEvents {
     /// The hold the request migrates through; `None` for a request this
     /// process took over, which the engine that serves it admitted.
     hold: Option<Arc<RequestHold>>,
+    /// The decode replica a handoff continues the request on.
+    decode: Option<Next>,
+    /// What routes the request again after a role refused it.
+    reroute: Option<std::sync::Weak<dyn Reroute>>,
+    /// The times the request was routed again.
+    rerouted: u32,
     max_migrations: u32,
     /// Migrations counted against `max_migrations` so far: those caused by
     /// losses and by failed transfers.
     counted: u32,
-    /// A migration `poll_step` met, which the next `recv` or
+    /// A migration or a refusal `poll_step` met, which the next `recv` or
     /// `migrate_pending` carries out.
-    pending: Option<Migration>,
+    pending: Option<Pending>,
     /// Whether the stream resumed on another engine, whose scheduling event
     /// repeats one the consumer received. A migration that happened *before*
     /// the consumer received any scheduling event leaves this false: the
@@ -298,6 +385,9 @@ impl RequestEvents {
             stream,
             request: None,
             hold: None,
+            decode: None,
+            reroute: None,
+            rerouted: 0,
             max_migrations: 0,
             counted: 0,
             pending: None,
@@ -312,22 +402,118 @@ impl RequestEvents {
     /// `None` once the request ended.
     async fn next_event(&mut self) -> Option<Event> {
         loop {
-            if let Some(migration) = self.pending.take() {
-                match self.migrate(migration).await {
+            if let Some(pending) = self.pending.take() {
+                match self.carry_out(pending).await {
                     Ok(()) => continue,
                     Err(event) => return self.deliver(Some(event)),
                 }
             }
             match self.stream.recv().await {
-                Some(Event::Migratable {
+                Some(event) => {
+                    if let Some(event) = self.pends(event) {
+                        return self.deliver(Some(event));
+                    }
+                }
+                None => return self.deliver(None),
+            }
+        }
+    }
+
+    /// Takes `event` as a migration or a refusal to route again when it is one, and returns
+    /// what the consumer receives of it otherwise: nothing for a scheduling it received before.
+    fn pends(&mut self, event: Event) -> Option<Event> {
+        match event {
+            Event::Migratable {
+                cause,
+                denoised_steps,
+                stored_layout,
+                lend,
+            } => {
+                self.pending = Some(Pending::Migration(Migration::of(
                     cause,
                     denoised_steps,
                     stored_layout,
-                }) => self.pending = Some(Migration::of(cause, denoised_steps, stored_layout)),
-                Some(event) if self.skips(&event) => {}
-                event => return self.deliver(event),
+                    lend,
+                )));
+                None
+            }
+            Event::Rejected {
+                kind: RejectionKind::Role,
+                message,
+            } if self.routes_again() => {
+                self.pending = Some(Pending::Reroute(message));
+                None
+            }
+            event if self.skips(&event) => None,
+            event => Some(event),
+        }
+    }
+
+    /// Whether a refusal by a replica's role routes the request again: it resumes, it may
+    /// still be cancelled, and it was not routed again too often.
+    fn routes_again(&self) -> bool {
+        self.open && self.request.is_some() && self.reroute.is_some() && self.rerouted < REROUTES
+    }
+
+    /// Carries out `pending`.
+    async fn carry_out(&mut self, pending: Pending) -> Result<(), Event> {
+        match pending {
+            Pending::Migration(migration) => self.migrate(migration).await,
+            Pending::Reroute(refusal) => self.route_again(refusal).await,
+        }
+    }
+
+    /// Submits the request, as last submitted, where it is routed now that a replica's role
+    /// refused it, and goes on with that engine's events.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when no replica's role takes the request, or the error when it could
+    /// not be submitted again.
+    async fn route_again(&mut self, refusal: String) -> Result<(), Event> {
+        let refused = || Event::Rejected {
+            kind: RejectionKind::Role,
+            message: refusal.clone(),
+        };
+        let (Some(request), Some(reroute)) = (
+            self.request.as_ref(),
+            self.reroute.as_ref().and_then(std::sync::Weak::upgrade),
+        ) else {
+            return Err(refused());
+        };
+        let mut submitted = request.request();
+        let Some(target) = reroute.reroute(&submitted) else {
+            return Err(refused());
+        };
+        self.rerouted += 1;
+        if let Request::Generation(generation) = &mut submitted {
+            // A request that has not yet handed off hands off when the new route splits it.
+            if generation.lend.is_none() && generation.generated_token_ids.is_empty() {
+                generation.hand_off = target.decode.is_some();
             }
         }
+        if let (Some(Resumable::Generation(kept)), Request::Generation(generation)) =
+            (&mut self.request, &submitted)
+        {
+            kept.hand_off = generation.hand_off;
+        }
+        tracing::info!(
+            request = self.stream.id().0,
+            rerouted = self.rerouted,
+            "a request a replica's role refused is routed again"
+        );
+        let (stream, _scheduler) = target
+            .first
+            .hold
+            .submit(submitted, target.first.scheduler)
+            .await
+            .map_err(|error| Event::Error {
+                message: format!("the request could not be routed again: {error}"),
+            })?;
+        self.stream = stream;
+        self.hold = Some(target.first.hold);
+        self.decode = target.decode;
+        Ok(())
     }
 
     /// Whether `event` repeats what the consumer received from an engine
@@ -407,13 +593,13 @@ impl RequestEvents {
                 "the request was cancelled while it migrated".to_owned(),
             ));
         }
-        let (Some(request), Some(hold)) = (&mut self.request, &self.hold) else {
+        let (Some(request), Some(hold)) = (&mut self.request, &mut self.hold) else {
             return Err(failed(
                 "the request's engine stopped serving it, and it does not migrate".to_owned(),
             ));
         };
         // A loss and a failed transfer are failures the next attempt may meet
-        // again; a drain is the deployment's own decision.
+        // again; a drain and a handoff are the deployment's own decisions.
         if matches!(cause, MigrationCause::Loss | MigrationCause::Transfer) {
             if self.counted >= self.max_migrations {
                 return Err(failed(format!(
@@ -423,6 +609,18 @@ impl RequestEvents {
             }
             self.counted += 1;
         }
+        // A handoff continues on the decode replica its route named, which serves the request
+        // from then on; any other migration on the replica that served it.
+        let (hold, scheduler) = match (cause, self.decode.take()) {
+            (MigrationCause::Handoff, Some(next)) => {
+                *hold = Arc::clone(&next.hold);
+                (next.hold, next.scheduler)
+            }
+            (_, decode) => {
+                self.decode = decode;
+                (Arc::clone(hold), None)
+            }
+        };
         // A request an epoch change moves to an epoch computing other
         // numerics continues with the state it reached (`in_flight = keep`).
         let previous_epoch = (cause == MigrationCause::Drain).then(|| self.stream.epoch());
@@ -438,10 +636,11 @@ impl RequestEvents {
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         let continuation = request.resume(&migration, kept, self.stream.cache_resume());
-        // The continuation names no scheduler: the next engine's are of another epoch, not the
-        // ones the routing program chose among, and its least loaded takes it.
+        // The continuation of a drain or a loss names no scheduler: the next engine's are of
+        // another epoch, not the ones the routing program chose among, and its least loaded
+        // takes it. A handoff's continuation goes to the decode scheduler its route named.
         let (stream, _scheduler) = client
-            .submit(continuation, None)
+            .submit(continuation, scheduler)
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         // The previous engine's stream ended with its migratable event.
@@ -469,18 +668,11 @@ impl Events for RequestEvents {
                 return Poll::Ready(Step::Migrate);
             }
             match ready!(self.stream.poll_recv(cx)) {
-                Some(Event::Migratable {
-                    cause,
-                    denoised_steps,
-                    stored_layout,
-                }) => {
-                    self.pending = Some(Migration::of(cause, denoised_steps, stored_layout));
-                    return Poll::Ready(Step::Migrate);
-                }
-                Some(event) if self.skips(&event) => {}
                 Some(event) => {
-                    self.observe(&event);
-                    return Poll::Ready(Step::Event(event));
+                    if let Some(event) = self.pends(event) {
+                        self.observe(&event);
+                        return Poll::Ready(Step::Event(event));
+                    }
                 }
                 None => {
                     self.finish();
@@ -497,7 +689,7 @@ impl Events for RequestEvents {
     fn migrate_pending(&mut self) -> Pin<Box<dyn Future<Output = Result<(), Event>> + Send + '_>> {
         Box::pin(async move {
             match self.pending.take() {
-                Some(migration) => self.migrate(migration).await,
+                Some(pending) => self.carry_out(pending).await,
                 None => Ok(()),
             }
         })
@@ -568,6 +760,8 @@ mod tests {
             cache: Default::default(),
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         }
     }
 
@@ -601,6 +795,7 @@ mod tests {
             cause,
             denoised_steps: steps,
             stored_layout: layout.to_vec(),
+            lend: None,
         }
     }
 
@@ -647,9 +842,9 @@ mod tests {
         let hold = Arc::new(RequestHold::new());
         let (first, process) = engine();
         hold.serve(Arc::clone(&first));
-        let migrator = Migrator::new(Arc::clone(&hold), 0);
+        let migrator = Migrator::new(Arc::clone(&hold), 0, None);
         let (mut events, _) = migrator
-            .submit(Request::Generation(Box::new(request(200))), None)
+            .submit(Request::Generation(Box::new(request(200))), None, None)
             .await
             .unwrap();
 
@@ -707,9 +902,9 @@ mod tests {
     async fn a_resumed_stream_keeps_the_scheduling_its_consumer_never_read() {
         let hold = Arc::new(RequestHold::new());
         hold.serve(migrating(1, MigrationCause::Loss));
-        let migrator = Migrator::new(Arc::clone(&hold), 1);
+        let migrator = Migrator::new(Arc::clone(&hold), 1, None);
         let (mut events, _) = migrator
-            .submit(Request::Generation(Box::new(request(1))), None)
+            .submit(Request::Generation(Box::new(request(1))), None, None)
             .await
             .unwrap();
 
@@ -746,9 +941,9 @@ mod tests {
     async fn a_lost_engines_request_waits_through_a_slow_relaunch() {
         let hold = Arc::new(RequestHold::new());
         hold.serve(migrating(1, MigrationCause::Loss));
-        let migrator = Migrator::new(Arc::clone(&hold), 3);
+        let migrator = Migrator::new(Arc::clone(&hold), 3, None);
         let (mut events, _) = migrator
-            .submit(Request::Generation(Box::new(request(8))), None)
+            .submit(Request::Generation(Box::new(request(8))), None, None)
             .await
             .unwrap();
         hold.hold();
@@ -799,9 +994,9 @@ mod tests {
         for cause in [MigrationCause::Loss, MigrationCause::Transfer] {
             let hold = Arc::new(RequestHold::new());
             hold.serve(migrating(1, cause));
-            let migrator = Migrator::new(Arc::clone(&hold), 0);
+            let migrator = Migrator::new(Arc::clone(&hold), 0, None);
             let (mut events, _) = migrator
-                .submit(Request::Generation(Box::new(request(8))), None)
+                .submit(Request::Generation(Box::new(request(8))), None, None)
                 .await
                 .unwrap();
             match events.recv().await {
@@ -827,9 +1022,9 @@ mod tests {
         if let Some(kept) = kept {
             hold.keep(kept);
         }
-        let migrator = Migrator::new(Arc::clone(&hold), 1);
+        let migrator = Migrator::new(Arc::clone(&hold), 1, None);
         let (mut events, _) = migrator
-            .submit(Request::Diffusion(Box::new(video(trajectory))), None)
+            .submit(Request::Diffusion(Box::new(video(trajectory))), None, None)
             .await
             .unwrap();
 
@@ -897,5 +1092,152 @@ mod tests {
         let stream = client.take_over(RequestId(5), 0).unwrap();
         let mut events = RequestEvents::taken_over(stream, 0);
         assert!(matches!(events.recv().await, Some(Event::Error { .. })));
+    }
+
+    /// The lend a prefill replica's engine states at a handoff.
+    fn lend() -> Lend {
+        Lend {
+            endpoint: Some("10.0.0.2:7000".to_owned()),
+            session: 3,
+            owner: 9,
+            tokens: 4,
+            stored: 0,
+        }
+    }
+
+    /// A request routed to a prefill replica and a decode replica is submitted to the first to
+    /// hand off; at its handoff it continues on the decode replica's scheduler with the lend and
+    /// the token the prefill replica generated, handing off no more, and its consumer reads one
+    /// stream to the finish. A handoff is the deployment's own move and counts against no limit.
+    #[tokio::test]
+    async fn a_handoff_continues_on_the_decode_replica_with_the_lend() {
+        let token = |letter: u8| Event::TextToken {
+            id: u32::from(letter),
+            logprob: None,
+        };
+        let prefill = Arc::new(RequestHold::new());
+        let (first, first_engine) = scripted_client(1, move |_| {
+            vec![
+                token(b'a'),
+                Event::Migratable {
+                    cause: MigrationCause::Handoff,
+                    denoised_steps: 0,
+                    stored_layout: Vec::new(),
+                    lend: Some(lend()),
+                },
+            ]
+        });
+        prefill.serve(Arc::new(first));
+        let decode = Arc::new(RequestHold::new());
+        let (second, second_engine) =
+            scripted_client(1, move |_| vec![token(b'b'), token(b'c'), finished(3)]);
+        decode.serve(Arc::new(second));
+
+        let migrator = Migrator::new(Arc::clone(&prefill), 0, None);
+        let next = Next {
+            hold: Arc::clone(&decode),
+            scheduler: Some(0),
+        };
+        let (mut events, _) = migrator
+            .submit(Request::Generation(Box::new(request(3))), None, Some(next))
+            .await
+            .unwrap();
+        let mut tokens = Vec::new();
+        let finished = loop {
+            match events.recv().await {
+                Some(Event::TextToken { id, .. }) => tokens.push(id),
+                Some(event) if event.is_terminal() => break event,
+                Some(_) => {}
+                None => panic!("the request ended without a finish"),
+            }
+        };
+        assert!(matches!(finished, Event::Finished { .. }), "{finished:?}");
+        assert_eq!(tokens, b"abc".map(u32::from));
+
+        let Ok(Request::Generation(handed)) = first_engine.submitted.try_recv() else {
+            panic!("the prefill replica took no token request");
+        };
+        assert!(handed.hand_off && handed.lend.is_none());
+        let Ok(Request::Generation(continued)) = second_engine.submitted.try_recv() else {
+            panic!("the decode replica took no token request");
+        };
+        assert!(!continued.hand_off);
+        assert_eq!(continued.lend, Some(lend()));
+        assert_eq!(continued.generated_token_ids, [u32::from(b'a')]);
+    }
+
+    /// Routes every request to one hold, or to none.
+    struct Fixed(Option<Arc<RequestHold>>);
+
+    impl Reroute for Fixed {
+        fn reroute(&self, _: &Request) -> Option<Target> {
+            let hold = self.0.clone()?;
+            Some(Target {
+                first: Next {
+                    hold,
+                    scheduler: None,
+                },
+                decode: None,
+            })
+        }
+    }
+
+    /// A request a replica's role refuses is routed again and served where the new route names;
+    /// when no replica's role takes it, its consumer reads the refusal.
+    #[tokio::test]
+    async fn a_request_a_role_refuses_is_routed_again() {
+        let refusing = || {
+            Arc::new(
+                scripted_client(1, |_| {
+                    vec![Event::Rejected {
+                        kind: RejectionKind::Role,
+                        message: "a prefill replica computes prompts for other replicas alone"
+                            .to_owned(),
+                    }]
+                })
+                .0,
+            )
+        };
+        let served = Arc::new(RequestHold::new());
+        served.serve(client());
+        let routes: Arc<dyn Reroute> = Arc::new(Fixed(Some(served)));
+        let hold = Arc::new(RequestHold::new());
+        hold.serve(refusing());
+        let migrator = Migrator::new(Arc::clone(&hold), 0, Some(Arc::downgrade(&routes)));
+        let (mut events, _) = migrator
+            .submit(Request::Generation(Box::new(request(2))), None, None)
+            .await
+            .unwrap();
+        let ended = loop {
+            match events.recv().await {
+                Some(event) if event.is_terminal() => break event,
+                Some(_) => {}
+                None => panic!("the request ended without a terminal event"),
+            }
+        };
+        assert!(
+            matches!(
+                ended,
+                Event::Finished {
+                    completion_tokens: 2,
+                    ..
+                }
+            ),
+            "{ended:?}"
+        );
+
+        let nowhere: Arc<dyn Reroute> = Arc::new(Fixed(None));
+        let migrator = Migrator::new(Arc::clone(&hold), 0, Some(Arc::downgrade(&nowhere)));
+        let (mut events, _) = migrator
+            .submit(Request::Generation(Box::new(request(2))), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Rejected {
+                kind: RejectionKind::Role,
+                ..
+            })
+        ));
     }
 }

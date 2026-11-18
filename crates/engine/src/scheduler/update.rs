@@ -43,7 +43,6 @@ use std::time::Instant;
 use crate::batch::{
     Batch, BatchId, BatchOutput, CallOutput, CallStatus, ErrorCode, MediaOutput, Phase,
 };
-use proto::config::WorkerGroupRole;
 use proto::request::{
     ArtifactEvent, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind,
     RequestId, StopReason, TokenLogprob,
@@ -240,7 +239,8 @@ impl Scheduler {
     /// A prefill or refill chunk's output. A refill wrote the draft cache alone. A prefill chunk's
     /// complete blocks are committed and the blocks no later call reads are given up (SD §4.4);
     /// its prompt scores go to a request that asked for them; the chunk that ends the prompt
-    /// samples the first token, and a request a prefill group served then moves to a decode group.
+    /// samples the first token, and a request that hands off then lends its KV once nothing of it
+    /// is in flight (`super::handoff`).
     fn update_prefill(&mut self, id: RequestId, batch: &Batch, row: usize, call: CallOutput) {
         if batch.phase == Phase::Refill {
             self.record_refill(id, batch, row);
@@ -266,8 +266,8 @@ impl Scheduler {
             let eos = self.eos_on(batch.group);
             self.append_tokens(id, &call.tokens, &call, &eos);
         }
-        if self.transfers(id) {
-            self.start_transfer(id);
+        if self.hands_off(id) {
+            self.hand_off(id);
         }
     }
 
@@ -1000,9 +1000,9 @@ impl Scheduler {
     /// is no miss names something the scheduler chose from its own counts, which is its defect:
     /// the scheduler stops. A block committed, or stored on the host, is stored on as the write
     /// policy says (`write_policy`), whether or not its owner is still live, and the answer to a
-    /// `Transfer` is counted in the statistics (SD §7.5). Completions of requests that act for no
+    /// handoff's `Import` is counted in the statistics (SD §7.5). Completions of requests that act for no
     /// owner change the scheduler's regions and its admissions' prefetches; the rest apply to the
-    /// request the owner is for, as an admission's, a transfer's or a running request's answer.
+    /// request the owner is for, as an admission's, a lend's or a running request's answer.
     pub(super) fn answered(
         &mut self,
         _: runtime::RequestId,
@@ -1028,9 +1028,11 @@ impl Scheduler {
             (runtime::Request::Prefetch { .. }, Completion::Prefetched { .. }) => {
                 return self.prefetched(&request, &completion);
             }
-            // Every transfer the scheduler asked for is counted by its answer, also the transfer
-            // of a request cancelled meanwhile.
-            (runtime::Request::Transfer { .. }, _) => self.count_transfer(&completion),
+            // Every handoff's import is counted by its answer, also the import of a request
+            // cancelled meanwhile.
+            (runtime::Request::Import { tables, .. }, _) if !tables.is_empty() => {
+                self.count_import(&completion);
+            }
             _ => {}
         }
 
@@ -1061,7 +1063,9 @@ impl Scheduler {
                 self.admission_answered(id, owner, &request, &completion, follow);
             }
             RequestStatus::WaitingForRemoteKvs => {
-                self.transfer_answered(id, owner, &request, &completion);
+                if let runtime::Request::Lend { .. } = request {
+                    self.lend_answered(id, owner);
+                }
             }
             _ => {
                 for ask in follow {
@@ -1121,80 +1125,6 @@ impl Scheduler {
             request: PolicyRequestId(id.0),
         });
         self.mark(id);
-    }
-
-    /// Starts moving a request a prefill group served to a decode group, once its prompt is
-    /// computed and nothing of it is in flight (SD §3.5 "Prefill to decode transfer"): the decode
-    /// group is placed as any phase is, and the request's owner on the prefill group is moved
-    /// there by `Transfer`, which the prefill group's workers stamp. The request waits in
-    /// `WaitingForRemoteKvs` for the answer, out of every batch and of admission. With no decode
-    /// group able to take it now, it stays where it is and a later step tries again
-    /// (`start_transfers`).
-    pub(super) fn start_transfer(&mut self, id: RequestId) {
-        let Some(request) = self.requests.get(&id) else {
-            return;
-        };
-        let Some(owner) = request.owner_on(Phase::Prefill) else {
-            return;
-        };
-        let candidates = self.candidates(request, Phase::Decode);
-        let Some(target) = self.choose(request, &candidates, None) else {
-            return;
-        };
-        let Some(index) = self.group_index(target) else {
-            return;
-        };
-        let verifies = self.groups[index].serves(Phase::Verify);
-        // The Storage Server's span of the handoff names the request.
-        let trace = request.input.trace();
-
-        if let Some(request) = self.requests.get_mut(&id) {
-            request.placement[Phase::Decode.index()] = Some(target);
-            if verifies {
-                request.placement[Phase::Verify.index()] = Some(target);
-            }
-            request.status = RequestStatus::WaitingForRemoteKvs;
-            request.pending = 1;
-        }
-        self.groups[index].join();
-        self.submit(runtime::Request::Transfer {
-            owner,
-            group: target,
-            after: Vec::new(),
-            trace,
-        });
-        self.mark(id);
-    }
-
-    /// Starts the transfer of every running request a prefill group finished that no decode group
-    /// could take when it finished: called once per pass of the loop, after the capacity words
-    /// are read.
-    pub(super) fn start_transfers(&mut self) {
-        let finished: Vec<RequestId> = self
-            .running
-            .iter()
-            .copied()
-            .filter(|&id| self.transfers(id))
-            .collect();
-        for id in finished {
-            self.start_transfer(id);
-        }
-    }
-
-    /// Whether a request moves to a decode group now: it runs on a group of the `Prefill` role
-    /// with no decode group placed, its prompt is computed and no call of it is in flight.
-    fn transfers(&self, id: RequestId) -> bool {
-        let Some(request) = self.requests.get(&id) else {
-            return false;
-        };
-        let prefills = request.placement[Phase::Prefill.index()]
-            .and_then(|group| self.group(group))
-            .is_some_and(|group| group.config.role == WorkerGroupRole::Prefill);
-        request.status == RequestStatus::Running
-            && prefills
-            && request.placement[Phase::Decode.index()].is_none()
-            && request.num_computed_tokens >= request.num_prompt_tokens
-            && request.idle()
     }
 
     /// What an answer states of the request beyond its tables, whatever the request is doing:
@@ -1290,71 +1220,6 @@ impl Scheduler {
         }
     }
 
-    /// An answer to a transfer's `Transfer` (SD §3.5): `Transferred` makes the owner the
-    /// request's attachment to the decode group, with its slot there, and the request runs;
-    /// `Failed` leaves the owner attached to the prefill group, holding blocks no device block
-    /// table holds, so it is detached with no stamp and the request ends as migratable with the
-    /// cause `Transfer`, which the daemon counts against the request's migrations. Other answers
-    /// of the owner (the commits of its last chunk) change nothing.
-    fn transfer_answered(
-        &mut self,
-        id: RequestId,
-        owner: OwnerId,
-        request: &runtime::Request,
-        completion: &Completion,
-    ) {
-        let runtime::Request::Transfer { group: target, .. } = *request else {
-            return;
-        };
-        match completion {
-            Completion::Transferred { slot, .. } => self.transferred(id, owner, target, *slot),
-            Completion::Failed => {
-                // The attachment goes first, so that `submit` finds no group to stamp the
-                // `Detach` (the owner's entries left every device block table).
-                if let Some(row) = self.requests.get_mut(&id) {
-                    row.attachments.retain(|attachment| attachment.1 != owner);
-                }
-                self.submit(runtime::Request::Detach {
-                    owner,
-                    after: Vec::new(),
-                });
-                self.finish(id, migratable(MigrationCause::Transfer));
-            }
-            _ => {}
-        }
-    }
-
-    /// The owner moved to group `target` with slot `slot`: the request leaves the prefill group,
-    /// whose placement entries it clears, and the decode group sees it for the first time, so its
-    /// first decode carries a `NewSlot`.
-    fn transferred(&mut self, id: RequestId, owner: OwnerId, target: GroupId, slot: u32) {
-        let Some((source, _)) = self.requests.get(&id).and_then(|row| row.attachment(owner)) else {
-            return;
-        };
-        let index = self.group_index(source);
-        if let (Some(index), Some(row)) = (index, self.requests.get(&id)) {
-            self.groups[index].leave(row);
-        }
-
-        let Some(row) = self.requests.get_mut(&id) else {
-            return;
-        };
-        for placed in &mut row.placement {
-            if *placed == Some(source) {
-                *placed = None;
-            }
-        }
-        for attachment in &mut row.attachments {
-            if attachment.1 == owner {
-                *attachment = (target, owner, slot, false);
-            }
-        }
-        row.status = RequestStatus::Running;
-        row.pending = 0;
-        row.last_progress = Instant::now();
-        self.mark(id);
-    }
-
     /// An answer to a running or finished request: a running request's `Allocate` that found no
     /// room leaves its class short, and the request preempts (SD §3.6); a `Save` ends its
     /// request.
@@ -1393,7 +1258,7 @@ impl Scheduler {
     /// One more answer of an admission arrived. At the last, the request is admitted when its
     /// entries hold its first call and low watermark (`settled`); otherwise the next step's
     /// `admit` asks for the rest in one more round, which makes the hit final (§4.4).
-    fn answer_arrived(&mut self, id: RequestId) {
+    pub(super) fn answer_arrived(&mut self, id: RequestId) {
         let Some(row) = self.requests.get_mut(&id) else {
             return;
         };
@@ -1535,6 +1400,7 @@ pub(super) fn migratable(cause: MigrationCause) -> Event {
         cause,
         denoised_steps: 0,
         stored_layout: Vec::new(),
+        lend: None,
     }
 }
 
@@ -1698,7 +1564,6 @@ mod tests {
         Row, Shape, TimingCounters, Variant,
     };
     use crossbeam_channel::Receiver;
-    use proto::config::WorkerGroupRole;
     use proto::request::{
         Event, FinishReason, MigrationCause, RejectionKind, RequestId, StopReason, TokenLogprob,
     };
@@ -2297,51 +2162,53 @@ mod tests {
         assert_eq!(cached_tokens, 2);
     }
 
-    /// A request a prefill group served moves to a decode group once its prompt is computed: its
-    /// owner's `Transfer` is stamped by the prefill group, and at `Transferred` the owner is its
-    /// attachment to the decode group, with the slot there, which has not seen it yet.
+    /// A request that hands off lends its owner's blocks once its prompt is computed and its first
+    /// token sampled: the `Lend` is stamped by the group whose device block table holds them, and
+    /// once the lend took effect the request ends as migratable with the lend, which names the
+    /// owner and the tokens it holds; the owner is the lend's from then on, so no `Detach` of it
+    /// follows.
     #[test]
-    fn a_prefill_group_hands_its_request_to_a_decode_group() {
+    fn a_request_that_hands_off_lends_its_blocks_and_ends_with_the_lend() {
         let (mut bench, outputs) = scheduler();
-        prefill_and_decode(&mut bench);
+        prefilled(&mut bench);
 
-        let transfer = runtime::Request::Transfer {
-            trace: 0,
+        let lease = u64::try_from(bench.scheduler.config.lease.as_nanos()).unwrap();
+        let lend = runtime::Request::Lend {
             owner: OWNER_A,
-            group: B,
+            lease,
             after: Vec::new(),
         };
-        assert_eq!(bench.stamps(), [(A, transfer)]);
+        assert_eq!(bench.stamps(), [(A, lend)]);
+        assert_eq!(
+            bench.scheduler.requests[&ID].status,
+            RequestStatus::WaitingForRemoteKvs
+        );
         assert!(matches!(
             events(&outputs)[..],
             [Event::TextToken { id: 7, .. }]
         ));
-        let request = &bench.scheduler.requests[&ID];
-        assert_eq!(request.status, RequestStatus::WaitingForRemoteKvs);
-        assert_eq!(request.placement[Phase::Decode.index()], Some(B));
 
-        stamp_transfer(&mut bench);
-        let answered = answer(
-            &mut bench,
-            &[Completion::Transferred {
-                slot: 6,
-                runs: Vec::new(),
-            }],
+        stamp_lend(&mut bench, lease);
+        let answered = answer(&mut bench, &[Completion::Done]);
+        assert!(matches!(answered[..], [runtime::Request::Lend { .. }]));
+        let [
+            Event::Migratable {
+                cause: MigrationCause::Handoff,
+                lend: Some(lend),
+                ..
+            },
+        ] = &events(&outputs)[..]
+        else {
+            panic!("the request did not end with its lend");
+        };
+        assert_eq!((lend.owner, lend.tokens), (OWNER_A.0, 3));
+        assert!(bench.scheduler.requests.is_empty());
+        assert!(
+            answer(&mut bench, &[]).is_empty(),
+            "no detach of the lent owner"
         );
-        assert!(matches!(answered[..], [runtime::Request::Transfer { .. }]));
-
-        let scheduler = &bench.scheduler;
-        let request = &scheduler.requests[&ID];
-        assert_eq!(request.status, RequestStatus::Running);
-        assert_eq!(request.attachments, [(B, OWNER_A, 6, false)]);
-        assert_eq!(request.placement[Phase::Prefill.index()], None);
-        assert_eq!(request.placement[Phase::Decode.index()], Some(B));
-        assert_eq!(scheduler.groups[0].num_requests, 0);
-        assert_eq!(scheduler.groups[1].num_requests, 1);
     }
 
-    /// A transfer that failed leaves the owner on the prefill group with blocks no device block
-    /// table holds: its `Detach` is written with no stamp and the request leaves as migratable.
     /// A scheduler that fails tells the engine (`Output::Failed`) before it ends a running request
     /// as migratable: the engine then tells its daemons that it failed before the request leaves
     /// it, so no daemon submits the request to the failing engine again.
@@ -2378,70 +2245,27 @@ mod tests {
         assert_eq!(order, ["failed", "migratable"]);
     }
 
-    #[test]
-    fn a_failed_transfer_ends_the_request_as_migratable_and_detaches_it_unstamped() {
-        let (mut bench, outputs) = scheduler();
-        prefill_and_decode(&mut bench);
-        bench.stamps();
-        events(&outputs);
-
-        stamp_transfer(&mut bench);
-        answer(&mut bench, &[Completion::Failed]);
-        assert!(matches!(
-            events(&outputs)[..],
-            [Event::Migratable {
-                cause: MigrationCause::Transfer,
-                denoised_steps: 0,
-                ..
-            }]
-        ));
-        assert!(bench.scheduler.requests.is_empty());
-        assert!(bench.stamps().is_empty());
-        assert_eq!(answer(&mut bench, &[]), [detach(OWNER_A)]);
-        assert_eq!(bench.scheduler.groups[1].num_requests, 0);
-    }
-
-    /// A request whose decode groups have no free slot stays on its prefill group, and moves once
-    /// a later step finds one.
-    #[test]
-    fn a_transfer_that_finds_no_decode_group_waits_for_one() {
-        let (mut bench, _outputs) = scheduler();
-        bench.scheduler.available[3] = 0;
-        prefill_and_decode(&mut bench);
-        assert!(bench.stamps().is_empty());
-        assert_eq!(bench.scheduler.requests[&ID].status, RequestStatus::Running);
-
-        bench.scheduler.start_transfers();
-        assert!(bench.stamps().is_empty());
-        bench.scheduler.available[3] = 4;
-        bench.scheduler.start_transfers();
-        assert!(matches!(
-            bench.stamps()[..],
-            [(A, runtime::Request::Transfer { group: B, .. })]
-        ));
-    }
-
-    /// Request 1 prefilled on group A, a prefill group, beside group B, a decode group: its
-    /// prompt's one chunk returned its first token.
-    fn prefill_and_decode(bench: &mut Bench) {
-        running(bench, &[Phase::Prefill]);
-        let scheduler = &mut bench.scheduler;
-        scheduler.groups[0].config.role = WorkerGroupRole::Prefill;
-        scheduler.groups[0].num_requests = 1;
-        scheduler.groups[1].config.role = WorkerGroupRole::Decode;
-        scheduler.groups[1].capacity.phases = 1 << Phase::Decode.index();
-        scheduler.requests.get_mut(&ID).unwrap().num_computed_tokens = 0;
+    /// Request 1, which hands off, prefilled on group A: its prompt's one chunk returned its first
+    /// token.
+    fn prefilled(bench: &mut Bench) {
+        running(bench, &[Phase::Prefill, Phase::Decode]);
+        input(bench).hand_off = true;
+        bench
+            .scheduler
+            .requests
+            .get_mut(&ID)
+            .unwrap()
+            .num_computed_tokens = 0;
 
         schedule(bench, Phase::Prefill, 1, 3);
         apply(bench, batch(Phase::Prefill, 0, 3), output(&[7]));
     }
 
-    /// Group A's workers return request 1's `Transfer`, stamped.
-    fn stamp_transfer(bench: &mut Bench) {
-        bench.scheduler.stamped(vec![runtime::Request::Transfer {
-            trace: 0,
+    /// Group A's workers return request 1's `Lend`, stamped.
+    fn stamp_lend(bench: &mut Bench, lease: u64) {
+        bench.scheduler.stamped(vec![runtime::Request::Lend {
             owner: OWNER_A,
-            group: B,
+            lease,
             after: vec![(A, 9)],
         }]);
     }

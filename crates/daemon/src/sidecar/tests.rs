@@ -323,6 +323,8 @@ async fn node(
         clients,
     ));
     let mut config = service::lock(&leader.replicas()[0].config).clone();
+    // The deployment's schedulers are its replicas, which `replicas.<id>` names.
+    config.data_parallel_size = std::num::NonZeroUsize::new(replicas).unwrap();
     config.dynamo_config = dynamo;
     config.kv_events_config.endpoint = events;
     for (number, role) in roles {

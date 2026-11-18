@@ -118,13 +118,6 @@ pub enum WorkerGroupRole {
     /// Model capabilities, request state, and (when present) attention/KV.
     #[default]
     Model,
-    /// A model group that prefills prompts only: a request continues on a
-    /// `Decode` group of its scheduler, into whose device cache the scheduler
-    /// copies the request's units (prefill/decode disaggregation).
-    Prefill,
-    /// A model group that decodes only, continuing requests a `Prefill`
-    /// group prefilled.
-    Decode,
     /// Routed experts shared by the deployment's schedulers.
     Experts,
 }
@@ -144,15 +137,15 @@ impl WorkerGroupRole {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerGroupConfig {
-    /// Group identity; replica `i` of a replicated group is `<id>-<i>`.
+    /// Group identity; copy `i` of a copied group is `<id>-<i>`.
     pub id: WorkerGroupId,
     #[serde(default)]
     pub role: WorkerGroupRole,
     /// Copies of the group the file states, each over an equal consecutive block of `ranks`; the
-    /// copies' blocks are replicas of the same numerical blocks under one scheduler, which binds
-    /// each request to one copy. Reading the file expands them, so a read group has one.
+    /// copies' blocks run the same numerical blocks under one scheduler, which binds each
+    /// request to one copy. Reading the file expands them, so a read group has one.
     #[serde(default = "one", skip_serializing_if = "is_one")]
-    pub replicas: usize,
+    pub copies: usize,
     /// Ordered physical members; a rank's position is its rank number within
     /// the group.
     #[serde(with = "ranks")]
@@ -174,7 +167,7 @@ pub struct WorkerGroupConfig {
     pub mem_fraction_static: Option<f64>,
 }
 
-/// Serde default for a replica count.
+/// Serde default for a count of copies.
 const fn one() -> usize {
     1
 }
@@ -191,18 +184,18 @@ struct File {
 }
 
 impl WorkerGroupConfig {
-    /// The groups a deployment file states, with its ranks placed and its replicas expanded.
+    /// The groups a deployment file states, with its ranks placed and its copies expanded.
     ///
     /// A rank entry without a host runs on `engine_host`, the launching process's own host
-    /// identity. A group with `replicas = N` becomes `N` groups named `<id>-0` through
+    /// identity. A group with `copies = N` becomes `N` groups named `<id>-0` through
     /// `<id>-<N-1>`, each over the next equal block of its ranks; a block without `ranks` spans
-    /// every rank of its replica. The video decoder and the video codec always take one temporal
+    /// every rank of its copy. The video decoder and the video codec always take one temporal
     /// unit per rank, so their distribution is completed and any other unit count refused.
     ///
     /// # Errors
     ///
-    /// Fails when the text is not a deployment file, names no group, a group's replica count is
-    /// zero or does not divide its ranks, the decoder or codec states another unit count, or
+    /// Fails when the text is not a deployment file, names no group, a group's count of copies
+    /// is zero or does not divide its ranks, the decoder or codec states another unit count, or
     /// [`WorkerGroupConfig::validate_all`] refuses the expanded groups.
     pub fn parse_file(text: &str, engine_host: &str) -> anyhow::Result<Vec<Self>> {
         let file: File = toml::from_str(text)?;
@@ -211,7 +204,7 @@ impl WorkerGroupConfig {
 
     /// The groups a deployment states, as its `[[worker_groups]]` tables read them (in a
     /// deployment file or in the serving configuration's `worker_groups`), with its ranks placed
-    /// and its replicas expanded, as [`WorkerGroupConfig::parse_file`] describes.
+    /// and its copies expanded, as [`WorkerGroupConfig::parse_file`] describes.
     ///
     /// # Errors
     ///
@@ -233,7 +226,7 @@ impl WorkerGroupConfig {
         Ok(groups)
     }
 
-    /// Appends this file group's replicas to `groups`, placed on `engine_host`.
+    /// Appends this file group's copies to `groups`, placed on `engine_host`.
     fn expand(self, engine_host: &str, groups: &mut Vec<Self>) -> anyhow::Result<()> {
         use anyhow::Context as _;
         let ranks: Vec<WorkerRank> = self
@@ -249,20 +242,20 @@ impl WorkerGroupConfig {
             })
             .collect();
         anyhow::ensure!(
-            self.replicas > 0 && !ranks.is_empty() && ranks.len().is_multiple_of(self.replicas),
-            "{} ranks do not form {} equal replicas",
+            self.copies > 0 && !ranks.is_empty() && ranks.len().is_multiple_of(self.copies),
+            "{} ranks do not form {} equal copies",
             ranks.len(),
-            self.replicas
+            self.copies
         );
-        let per_replica = ranks.len() / self.replicas;
+        let per_copy = ranks.len() / self.copies;
         let mut blocks = self.blocks.clone();
         for block in blocks.values_mut() {
             if block.ranks.is_empty() {
-                block.ranks = (0..per_replica).collect();
+                block.ranks = (0..per_copy).collect();
             }
         }
-        for (index, replica) in ranks.chunks(per_replica).enumerate() {
-            let id = if self.replicas == 1 {
+        for (index, copy) in ranks.chunks(per_copy).enumerate() {
+            let id = if self.copies == 1 {
                 self.id.0.clone()
             } else {
                 format!("{}-{index}", self.id.0)
@@ -270,8 +263,8 @@ impl WorkerGroupConfig {
             groups.push(Self {
                 id: WorkerGroupId::new(id.clone()).with_context(|| format!("group id {id}"))?,
                 role: self.role,
-                replicas: 1,
-                ranks: replica.to_vec(),
+                copies: 1,
+                ranks: copy.to_vec(),
                 blocks: blocks.clone(),
                 queue_depth: self.queue_depth,
                 mem_fraction_static: self.mem_fraction_static,
@@ -439,7 +432,7 @@ impl WorkerGroupConfig {
     /// Validates unique group identities and every local rank layout.
     ///
     /// Block names may repeat across groups. Repeated names are
-    /// replicas of the same numerical block; the scheduler binds each
+    /// copies of the same numerical block; the scheduler binds each
     /// request to one of them and keeps that affinity for the request lifetime.
     ///
     /// Physical devices may repeat across groups; only `validate_members`
@@ -450,38 +443,6 @@ impl WorkerGroupConfig {
         for worker in workers {
             worker.validate()?;
             anyhow::ensure!(ids.insert(&worker.id), "worker group identity is repeated");
-        }
-        // A request prefilled on a prefill group decodes on a decode group,
-        // which holds the same text model and nothing else.
-        let has = |role| workers.iter().any(|worker| worker.role == role);
-        anyhow::ensure!(
-            has(WorkerGroupRole::Prefill) == has(WorkerGroupRole::Decode),
-            "prefill groups and decode groups are configured together"
-        );
-        // A hand-off copies each prefill rank's units into the decode rank of the same index, so
-        // every prefill and decode group has as many ranks as the others.
-        let mut split_ranks: Option<(usize, &WorkerGroupId)> = None;
-        for worker in workers {
-            if matches!(
-                worker.role,
-                WorkerGroupRole::Prefill | WorkerGroupRole::Decode
-            ) {
-                anyhow::ensure!(
-                    worker.blocks.keys().eq([DEFAULT_BLOCK]),
-                    "worker {}: a prefill or decode group places the `{DEFAULT_BLOCK}` block alone",
-                    worker.id
-                );
-                match split_ranks {
-                    Some((ranks, first)) => anyhow::ensure!(
-                        ranks == worker.ranks.len(),
-                        "worker {} has {} ranks and worker {first} has {ranks}: prefill and decode \
-                         groups hand a request's cache rank by rank",
-                        worker.id,
-                        worker.ranks.len()
-                    ),
-                    None => split_ranks = Some((worker.ranks.len(), &worker.id)),
-                }
-            }
         }
         Ok(())
     }
@@ -561,9 +522,9 @@ impl WorkerGroupConfig {
     /// The groups each of `data_parallel` schedulers serves, by index into `groups`: the groups
     /// that serve requests, in order, dealt as equal consecutive blocks.
     ///
-    /// A scheduler drives every group of its block as one of its worker groups, so a deployment's
-    /// prefill and decode groups are one scheduler's, and the shorthand's `model-<i>` group is
-    /// scheduler `i`'s alone.
+    /// A scheduler drives every group of its block as one of its worker groups, so the copies of
+    /// a media deployment's groups are one scheduler's, and the shorthand's `model-<i>` group is
+    /// scheduler `i`'s alone. Each scheduler is one replica of the deployment.
     ///
     /// # Errors
     ///
@@ -645,7 +606,7 @@ impl WorkerGroupConfig {
         Self {
             id: WorkerGroupId(DEFAULT_BLOCK.into()),
             role: WorkerGroupRole::Model,
-            replicas: 1,
+            copies: 1,
             ranks: rank_layout,
             blocks,
             queue_depth,
@@ -682,7 +643,7 @@ impl WorkerGroupConfig {
             .map(|(index, ranks)| Self {
                 id: WorkerGroupId(format!("{DEFAULT_BLOCK}-{index}")),
                 role: WorkerGroupRole::Model,
-                replicas: 1,
+                copies: 1,
                 ranks: ranks.to_vec(),
                 blocks: placed.blocks.clone(),
                 queue_depth,
@@ -878,15 +839,15 @@ mod tests {
         assert!(WorkerGroupConfig::shorthand("localhost", &cpu, 2, 1).is_err());
     }
 
-    /// Replicas take equal consecutive blocks of the stated ranks and are
-    /// named by their index; blocks without ranks span each replica.
+    /// Copies take equal consecutive blocks of the stated ranks and are
+    /// named by their index; blocks without ranks span each copy.
     #[test]
-    fn replicas_split_the_ranks_into_named_blocks() {
+    fn copies_split_the_ranks_into_named_blocks() {
         let placed = workers(
             r#"
             [[worker_groups]]
             id = "flow"
-            replicas = 2
+            copies = 2
             ranks = ["cuda:0-3"]
             queue_depth = 6
             mem_fraction_static = 0.5
@@ -981,14 +942,17 @@ mod tests {
             |body: &str| format!("[[worker_groups]]\nid = \"model\"\nqueue_depth = 2\n{body}");
         for refused in [
             // Unknown keys, at the group and the block.
-            group("ranks = [\"cuda:0\"]\nreplica = 2"),
+            group("ranks = [\"cuda:0\"]\ncopy = 2"),
             group("ranks = [\"cuda:0\"]\n[worker_groups.blocks.model]\ntensor_parallel = 1"),
             // Rank entries that name no devices.
             group("ranks = [\"cuda:3-1\"]"),
             group("ranks = [\"cpu*0\"]"),
             group("ranks = [\"/cuda:0\"]"),
-            // Replicas that do not divide the ranks.
-            group("ranks = [\"cuda:0-2\"]\nreplicas = 2"),
+            // Copies that do not divide the ranks.
+            group("ranks = [\"cuda:0-2\"]\ncopies = 2"),
+            // The roles of a group name what it holds; the role a replica serves is the
+            // deployment's `replicas.<id>.role`.
+            group("role = \"prefill\"\nranks = [\"cuda:0\"]"),
             // A block whose degrees do not match its ranks.
             group("ranks = [\"cuda:0-1\"]\n[worker_groups.blocks.model]\ntensor_parallel_size = 4"),
             // No groups at all.
@@ -1043,24 +1007,24 @@ mod tests {
         assert!(files > 0, "configs/ publishes deployments");
     }
 
-    /// A prefill/decode deployment's groups are one scheduler's, the shorthand's data-parallel
-    /// groups one scheduler's each; a rank is found in its group by the deployment's numbering, and
-    /// a prefill and a decode group of different rank counts are refused.
+    /// Each of the shorthand's data-parallel groups is one scheduler's, a replica of its own, and
+    /// a rank is found in its group by the deployment's numbering.
     #[test]
     fn serving_groups_form_the_schedulers_and_ranks_find_their_group() {
-        let split = workers(
-            "[[worker_groups]]\nid = \"prefill\"\nrole = \"prefill\"\nranks = [\"cuda:0\"]\n\
-             queue_depth = 2\n[worker_groups.blocks.model]\n\
-             [[worker_groups]]\nid = \"decode\"\nrole = \"decode\"\nranks = [\"r2/cuda:0\"]\n\
+        let two = workers(
+            "[[worker_groups]]\nid = \"prefill\"\nranks = [\"cuda:0-1\"]\n\
+             queue_depth = 2\n[worker_groups.blocks.model]\ntensor_parallel_size = 2\n\
+             [[worker_groups]]\nid = \"decode\"\nranks = [\"r2/cuda:0\"]\n\
              queue_depth = 2\n[worker_groups.blocks.model]\n",
         )
         .unwrap();
+        // Two replicas of different layouts, one group each.
         assert_eq!(
-            WorkerGroupConfig::scheduler_blocks(&split, 1).unwrap(),
-            vec![vec![0, 1]]
+            WorkerGroupConfig::scheduler_blocks(&two, 2).unwrap(),
+            vec![vec![0], vec![1]]
         );
-        assert_eq!(WorkerGroupConfig::place_rank(&split, 1), Some((1, 0)));
-        assert_eq!(WorkerGroupConfig::place_rank(&split, 2), None);
+        assert_eq!(WorkerGroupConfig::place_rank(&two, 2), Some((1, 0)));
+        assert_eq!(WorkerGroupConfig::place_rank(&two, 3), None);
 
         let shorthand = WorkerGroupConfig::data_parallel(
             &["engine".to_owned()],
@@ -1077,14 +1041,6 @@ mod tests {
         assert_eq!(WorkerGroupConfig::first_ranks(&shorthand), vec![0, 2]);
         assert_eq!(WorkerGroupConfig::place_rank(&shorthand, 3), Some((1, 1)));
         assert!(WorkerGroupConfig::scheduler_blocks(&shorthand, 3).is_err());
-
-        let uneven = workers(
-            "[[worker_groups]]\nid = \"prefill\"\nrole = \"prefill\"\nranks = [\"cuda:0-1\"]\n\
-             queue_depth = 2\n[worker_groups.blocks.model]\ntensor_parallel_size = 2\n\
-             [[worker_groups]]\nid = \"decode\"\nrole = \"decode\"\nranks = [\"cuda:2\"]\n\
-             queue_depth = 2\n[worker_groups.blocks.model]\n",
-        );
-        assert!(uneven.is_err(), "a hand-off copies between equal ranks");
     }
 
     /// Each rank holds its group's share of its GPU; the deployment's quota of a GPU holds every
@@ -1104,7 +1060,7 @@ mod tests {
 
             [[worker_groups]]
             id = "flow"
-            replicas = 2
+            copies = 2
             ranks = ["cuda:0-1"]
             queue_depth = 2
             mem_fraction_static = 0.81

@@ -1922,7 +1922,7 @@ mod tests {
         proto::config::WorkerGroupConfig {
             id: proto::config::WorkerGroupId(id.to_owned()),
             role,
-            replicas: 1,
+            copies: 1,
             ranks: ranks
                 .iter()
                 .map(|&(host, device)| proto::config::WorkerRank {

@@ -221,6 +221,7 @@ pub fn launch() -> EngineArgs {
             max_num_batched_tokens: 32,
             ..Default::default()
         },
+        roles: Vec::new(),
         media: Default::default(),
         mem_fraction_static: 0.9,
         load: Default::default(),

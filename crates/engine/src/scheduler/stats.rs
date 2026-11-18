@@ -21,10 +21,10 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use crate::batch::{Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
-use proto::report::{DomainSchedulerStats, ForwardStats, SchedulerStats};
+use proto::report::{DomainSchedulerStats, ForwardStats, Pages, SchedulerStats};
 use proto::request::RequestId;
 use scheduling::PhaseClass;
-use storage::runtime::Completion;
+use storage::runtime::{Completion, Tier};
 
 use super::{Output, Scheduler};
 
@@ -262,24 +262,15 @@ impl Scheduler {
         add(&mut self.stats.given_up_draft_blocks, u64::from(blocks));
     }
 
-    /// Counts the answer to a transfer's `Transfer` (SD §3.5 "Prefill to decode transfer"):
-    /// `Transferred` is one more transfer and the blocks its runs state, one per entry (a block
-    /// of several runs, a product's, states each of them at its one position); `Failed` is one
-    /// more failed transfer.
-    pub(super) fn count_transfer(&mut self, completion: &Completion) {
+    /// Counts the answer to a handoff's `Import` of pages (`super::handoff`): `Imported` is one
+    /// more import and the blocks it filled, a run each; `Failed` is one more failed import.
+    pub(super) fn count_import(&mut self, completion: &Completion) {
         match completion {
-            Completion::Transferred { runs, .. } => {
-                let mut entries: Vec<(u8, u32)> = runs
-                    .iter()
-                    .map(|&(class, position, _, _)| (class, position))
-                    .collect();
-                entries.sort_unstable();
-                entries.dedup();
-
-                add(&mut self.stats.transfers, 1);
-                add(&mut self.stats.transferred_blocks, entries.len() as u64);
+            Completion::Imported { runs, .. } => {
+                add(&mut self.stats.imports, 1);
+                add(&mut self.stats.imported_blocks, runs.len() as u64);
             }
-            Completion::Failed => add(&mut self.stats.failed_transfers, 1),
+            Completion::Failed => add(&mut self.stats.failed_imports, 1),
             _ => {}
         }
     }
@@ -310,6 +301,9 @@ impl Scheduler {
         report.num_running_reqs = self.running.len() as u64;
         report.num_waiting_reqs = self.waiting.len() as u64;
         report.prefix_cache_usage = self.cache_usage();
+        report.queued_tokens = self.queued_tokens();
+        report.device_pages = self.pages(&self.kv_regions());
+        report.host_pages = self.pages(&self.host_regions());
         report.avg_queue_wait_us = report
             .queue_wait_us_total
             .checked_div(report.num_admitted_reqs)
@@ -357,6 +351,45 @@ impl Scheduler {
 
     /// The fraction of the KV cache's units that an allocation cannot take now, over its device
     /// regions: 1 less the regions' `available` over their capacity; 0 without a KV cache.
+    /// The prompt tokens no call has computed yet, over the waiting and the running requests.
+    fn queued_tokens(&self) -> u64 {
+        let owed = |id: &RequestId| {
+            self.requests.get(id).map_or(0, |request| {
+                u64::from(
+                    request
+                        .num_prompt_tokens
+                        .saturating_sub(request.num_computed_tokens),
+                )
+            })
+        };
+        self.waiting.iter().chain(&self.running).map(owed).sum()
+    }
+
+    /// The host regions of the session, as indices into its regions: the host tier's pages.
+    fn host_regions(&self) -> Vec<usize> {
+        let host =
+            |(_, (_, region)): &(usize, &(u8, storage::runtime::Region))| region.tier == Tier::Host;
+        self.regions
+            .iter()
+            .enumerate()
+            .filter(host)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The pages of `regions` in use and their capacity: a region's units less those an
+    /// allocation can take now.
+    fn pages(&self, regions: &[usize]) -> Pages {
+        let mut pages = Pages::default();
+        for &region in regions {
+            let capacity = self.capacity.get(region).copied().unwrap_or(0);
+            let available = self.available.get(region).copied().unwrap_or(0);
+            pages.capacity += u64::from(capacity);
+            pages.used += u64::from(capacity.saturating_sub(available));
+        }
+        pages
+    }
+
     fn cache_usage(&self) -> f64 {
         let (mut units, mut free) = (0_u64, 0_u64);
         for region in self.kv_regions() {
@@ -405,7 +438,7 @@ mod tests {
         Row, Shape, TimingCounters, Variant,
     };
     use crossbeam_channel::Receiver;
-    use proto::report::{DomainSchedulerStats, ForwardStats, SchedulerStats};
+    use proto::report::{DomainSchedulerStats, ForwardStats, Pages, SchedulerStats};
     use proto::request::RequestId;
     use storage::runtime::GroupId;
 
@@ -699,6 +732,7 @@ mod tests {
     #[test]
     fn a_report_states_the_queues_the_kv_cache_in_use_and_the_steps_and_policy_counts() {
         let (mut bench, outputs) = scheduler();
+        bench.attach(&[]);
         let scheduler = &mut bench.scheduler;
         let start = scheduler.published;
 
@@ -707,6 +741,11 @@ mod tests {
         scheduler.available = vec![32, 64, 0, 0];
         scheduler.running = vec![RequestId(1), RequestId(2)];
         scheduler.waiting.push_back(RequestId(3));
+        // Request 1 runs with 200 of its 300 prompt tokens to compute; the bench holds no
+        // request 2 or 3.
+        let request = scheduler.requests.get_mut(&RequestId(1)).unwrap();
+        request.num_prompt_tokens = 300;
+        request.num_computed_tokens = 100;
         scheduler.step = 17;
         scheduler.policy.calls = 34;
         scheduler.policy.fuel = 5_000;
@@ -716,6 +755,15 @@ mod tests {
         assert_eq!(scheduler.kv_regions(), [0, 1]);
         assert_eq!(report.prefix_cache_usage, 0.25);
         assert_eq!((report.num_running_reqs, report.num_waiting_reqs), (2, 1));
+        assert_eq!(report.queued_tokens, 200);
+        assert_eq!(
+            report.device_pages,
+            Pages {
+                used: 32,
+                capacity: 128
+            }
+        );
+        assert_eq!(report.host_pages, Pages::default());
         assert_eq!(report.steps, 17);
         assert_eq!((report.policy_calls, report.policy_fuel), (34, 5_000));
     }

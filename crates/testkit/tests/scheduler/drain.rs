@@ -30,6 +30,7 @@ fn drained(event: Option<&Event>) -> bool {
             cause: MigrationCause::Drain,
             denoised_steps: 0,
             stored_layout,
+            lend: None,
         }) if stored_layout.is_empty()
     )
 }

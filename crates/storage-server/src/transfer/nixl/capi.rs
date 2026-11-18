@@ -42,6 +42,7 @@ pub(crate) const MEM_VRAM: MemType = 1;
 /// `nixl_capi_xfer_op_t`.
 pub(crate) type XferOp = c_int;
 pub(crate) const XFER_OP_READ: XferOp = 0;
+pub(crate) const XFER_OP_WRITE: XferOp = 1;
 
 /// Every handle type of the C API (`nixl_capi_agent_t`,
 /// `nixl_capi_reg_dlist_t`, ...): a pointer to a structure the library

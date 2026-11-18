@@ -27,7 +27,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use storage::protocol::{Key, Segment};
-use storage::runtime::{Completion, GroupId, Open, RequestId};
+use storage::runtime::{Completion, GroupId, Open, OwnerId, RequestId};
 
 use super::{BufferPool, ClientId, Encoding, QueueId};
 
@@ -53,6 +53,9 @@ pub(super) const WITHDRAW: u8 = 15;
 /// The kind of the records of the completions beside the inputs.
 pub(super) const COMPLETION: u8 = 16;
 pub(super) const PEER_COPIES: u8 = 17;
+pub(super) const BORROW: u8 = 18;
+pub(super) const GIVE_BACK: u8 = 19;
+pub(super) const RELEASE_BORROWS: u8 = 20;
 
 /// An input the buffer pool's thread acts on, as a trace records it.
 pub(crate) enum Input {
@@ -85,6 +88,12 @@ pub(crate) enum Input {
     /// What the peers hold of a prefetch's keys: per copy of the task, in
     /// order, the encoding of the peer's host copy it reads, if any.
     PeerCopies(Task, Vec<Option<Encoding>>),
+    /// Another host's server, by its connection, borrows the lend of a session's owner.
+    Borrow(u64, ClientId, OwnerId),
+    /// The lend of a session's owner ends.
+    GiveBack(ClientId, OwnerId),
+    /// The borrows of a connection end: of one lend, or every one.
+    ReleaseBorrows(u64, Option<(ClientId, OwnerId)>),
 }
 
 impl Input {
@@ -174,6 +183,25 @@ impl Input {
                     }
                 }
                 PEER_COPIES
+            }
+            Self::Borrow(peer, client, owner) => {
+                body.extend_from_slice(&peer.to_le_bytes());
+                body.extend_from_slice(&client.to_le_bytes());
+                body.extend_from_slice(&owner.0.to_le_bytes());
+                BORROW
+            }
+            Self::GiveBack(client, owner) => {
+                body.extend_from_slice(&client.to_le_bytes());
+                body.extend_from_slice(&owner.0.to_le_bytes());
+                GIVE_BACK
+            }
+            Self::ReleaseBorrows(peer, lend) => {
+                body.extend_from_slice(&peer.to_le_bytes());
+                if let Some((client, owner)) = lend {
+                    body.extend_from_slice(&client.to_le_bytes());
+                    body.extend_from_slice(&owner.0.to_le_bytes());
+                }
+                RELEASE_BORROWS
             }
         };
         Ok((kind, body))
@@ -322,7 +350,7 @@ impl Trace {
 #[cfg(test)]
 mod tests {
     use storage::protocol::{Key, Segment};
-    use storage::runtime::{GroupId, Open, RequestId, VERSION};
+    use storage::runtime::{GroupId, Open, OwnerId, RequestId, VERSION};
 
     use super::Input;
 
@@ -363,6 +391,9 @@ mod tests {
             Input::Grant("units".into(), segment, 16, 17),
             Input::Withdraw("units".into(), segment),
             Input::PeerCopies(task, vec![Some(([18; 32], [19; 32])), None]),
+            Input::Borrow(20, 2, OwnerId(21)),
+            Input::GiveBack(2, OwnerId(21)),
+            Input::ReleaseBorrows(20, Some((2, OwnerId(21)))),
         ];
         let mut kinds = Vec::new();
         for input in inputs {

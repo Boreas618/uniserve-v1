@@ -2150,7 +2150,7 @@ mod tests {
         let group = WorkerGroupConfig {
             id: WorkerGroupId("model".to_owned()),
             role: Default::default(),
-            replicas: 1,
+            copies: 1,
             ranks: vec![rank; 4],
             blocks,
             queue_depth: 6,

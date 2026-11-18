@@ -11,7 +11,6 @@
 //! ([`super::monotonic_nanos`]); a policy only compares instants.
 
 use crate::batch::Phase;
-use proto::config::WorkerGroupRole;
 use proto::request::RequestId;
 use scheduling::decision::{Inflight, Room};
 use scheduling::ids::{RequestId as PolicyRequestId, StageId};
@@ -217,7 +216,6 @@ fn replica_view(index: usize, group: &WorkerGroup, request: Option<&Request>) ->
                 .iter()
                 .any(|&(attached, _, _, _)| attached == id)
         }),
-        prefills_only: group.config.role == WorkerGroupRole::Prefill,
         holds_stage: request.is_some_and(|request| request.placement.contains(&Some(id))),
     }
 }
@@ -405,6 +403,8 @@ pub(super) mod tests {
             include_stop_token: false,
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         };
         let now = Instant::now();
         Request {
@@ -441,6 +441,7 @@ pub(super) mod tests {
             draft_limit: 0,
             last_progress: now,
             dirty: false,
+            path: None,
         }
     }
 

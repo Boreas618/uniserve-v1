@@ -910,7 +910,7 @@ impl BufferPool {
                         self.answers.remove(&(queue, request));
                         self.reclaim(block);
                     }
-                    Deferred::Transfer { .. } | Deferred::Finish { .. } => {}
+                    Deferred::Lend { .. } | Deferred::Finish { .. } => {}
                 }
             }
         }
@@ -937,6 +937,8 @@ impl BufferPool {
             region.uninstall(client);
         }
         self.numbers.retain(|queue, _| queue.0 != client);
+        // Its lends end with its owners; what a borrow holds stays held until it is returned.
+        self.lends.retain(|(of, _), _| *of != client);
         self.completions.retain(|(queue, _, _)| queue.0 != client);
         self.sessions.remove(&client);
         self.classes.remove(&client);

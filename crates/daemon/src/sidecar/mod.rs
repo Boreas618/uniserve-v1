@@ -869,6 +869,8 @@ fn generation_of(request: &wire::Request) -> GenerationRequest {
         include_stop_token: false,
         generated_token_ids: Vec::new(),
         adapter: 0,
+        hand_off: false,
+        lend: None,
     }
 }
 

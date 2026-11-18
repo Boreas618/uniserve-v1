@@ -610,11 +610,9 @@ impl Policy for Arrival {
     }
 
     fn place(&mut self, call: &CallView, replicas: &[ReplicaView]) -> usize {
-        // A decode-stage call never lands on a replica that only prefills.
-        let decode_stage = matches!(call.kind, Phase::Decode | Phase::Verify);
-        let mut candidates = replicas.iter().filter(|replica| {
-            replica.kinds.contains(&call.kind) && !(decode_stage && replica.prefills_only)
-        });
+        let mut candidates = replicas
+            .iter()
+            .filter(|replica| replica.kinds.contains(&call.kind));
         // The replica that already holds the request's state keeps it: a
         // request's state is never migrated, and a full replica delays the call
         // rather than moving it.
@@ -1101,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_replica_keeps_the_request_and_a_decode_avoids_prefill_only() {
+    fn a_held_replica_keeps_the_request_and_a_call_takes_the_least_loaded_otherwise() {
         let mut policy = policy();
         let call = CallView {
             request: RequestId(1),
@@ -1113,20 +1111,18 @@ mod tests {
                 index: 0,
                 block: StageId(0),
                 kinds: vec![Phase::Decode],
-                running_requests: 0,
+                running_requests: 3,
                 capacity: 4,
                 holds_request: false,
-                prefills_only: true,
                 holds_stage: false,
             },
             ReplicaView {
                 index: 1,
                 block: StageId(0),
                 kinds: vec![Phase::Decode],
-                running_requests: 3,
+                running_requests: 0,
                 capacity: 4,
                 holds_request: false,
-                prefills_only: false,
                 holds_stage: false,
             },
         ];
@@ -1134,7 +1130,6 @@ mod tests {
         let held = ReplicaView {
             index: 0,
             holds_request: true,
-            prefills_only: false,
             ..replicas[0].clone()
         };
         let replicas = [held, replicas[1].clone()];

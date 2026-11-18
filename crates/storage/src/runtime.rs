@@ -29,7 +29,7 @@ use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface that this build's engine and buffer pool
 /// speak, the one version either accepts.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// The clock every instant of this interface is stated in: the host's
 /// monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds since an unspecified
@@ -54,7 +54,8 @@ pub struct RequestId(pub u64);
 
 /// An owner's number within its session: a request's attachment to one worker
 /// group. Drawn by the scheduler from a counter and never reused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct OwnerId(pub u64);
 
 /// A worker group of the session's engine epoch. The engine numbers the
@@ -309,6 +310,21 @@ pub struct Opened {
     pub limits: Vec<u32>,
     /// Per scheduler, where its queue pair's registers lie.
     pub registers: Vec<Registers>,
+    /// The session's number in the buffer pool of its deployment on the host, which a
+    /// [`Lender`] names it by. The pool never gives a number twice.
+    pub session: u32,
+}
+
+/// The owner whose blocks another replica imports in a handoff ([`Request::Lend`],
+/// [`Request::Import`]): the prefill replica's owner, in its session of its host's buffer pool.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Lender {
+    /// The TCP endpoint (`host:port`) of the Storage Server of the lender's host; `None` for a
+    /// server that listens on no TCP endpoint, which only a session of its own host reaches.
+    pub endpoint: Option<String>,
+    /// The lender's session ([`Opened::session`]).
+    pub session: u32,
+    pub owner: OwnerId,
 }
 
 /// The registers of one scheduler's queue pair.
@@ -379,14 +395,13 @@ pub enum Request {
         at: u32,
         key: Key,
     },
-    /// Move the owner to another group, copying its blocks to that group's memory: a
-    /// prefill-to-decode handoff of the request of trace id `trace` (zero for one nothing
-    /// traces), whose span the server records.
-    Transfer {
+    /// Lend the owner's blocks to a handoff once the stamps are reached, and release the owner
+    /// as a `Detach` does when the importer returns the lend or `lease` nanoseconds have passed
+    /// with no import reading it, whichever comes first. A lent owner takes no other request.
+    Lend {
         owner: OwnerId,
-        group: GroupId,
+        lease: u64,
         after: Stamps,
-        trace: u64,
     },
     /// Reclaim each named block that is shared and has no pin.
     Evict { keys: Vec<Key> },
@@ -453,6 +468,22 @@ pub enum Request {
         from: u8,
         group: GroupId,
         after: Stamps,
+    },
+    /// Private blocks at the free positions `tables` names (per class, its first position and
+    /// the count), all or none, filled from the blocks at the same positions of the lender's
+    /// owner: a task of the Transfer Server of this host when `push` is false (a read), of the
+    /// lender's host when it is true (a push), which reshards each page's heads between the two
+    /// layouts. The blocks enter the owner's table once the task copied every page; otherwise
+    /// they are released. The lend ends once the task has, whatever its outcome; an import of
+    /// no position only ends the lend. The import is the handoff of the request of trace id
+    /// `trace` (zero for one nothing traces), whose span the server records from its task's start
+    /// to its end.
+    Import {
+        owner: OwnerId,
+        tables: Vec<(u8, u32, u32)>,
+        lender: Lender,
+        push: bool,
+        trace: u64,
     },
 }
 
@@ -527,14 +558,14 @@ pub enum Completion {
     },
     Saved,
     Restored,
-    /// The owner's slot in the group it moved to, and every entry it holds
-    /// there: class, position, run, and whether the block is private.
-    Transferred {
-        slot: u32,
-        runs: Vec<(u8, u32, Run, bool)>,
-    },
-    /// A transfer or a task failed; what it held was released.
+    /// A task failed; what it held was released.
     Failed,
+    /// The blocks an import filled, in the order of its tables and their positions, and the
+    /// keys evicted for them.
+    Imported {
+        runs: Vec<Run>,
+        evicted: Vec<Key>,
+    },
     Evicted {
         keys: Vec<Key>,
     },
@@ -628,6 +659,15 @@ impl Writer<'_> {
             self.long(*sequence);
         }
     }
+
+    /// A text that may be absent: a flag, then its length and its UTF-8 bytes.
+    fn text(&mut self, text: Option<&str>) {
+        self.byte(u8::from(text.is_some()));
+        if let Some(text) = text {
+            self.word(text.len() as u32);
+            self.0.extend_from_slice(text.as_bytes());
+        }
+    }
 }
 
 /// Reads fields out of a record; every read fails past the record's end.
@@ -699,6 +739,17 @@ impl Reader<'_> {
         (0..self.length(9)?)
             .map(|_| Ok((GroupId(self.byte()?), self.long()?)))
             .collect()
+    }
+
+    fn text(&mut self) -> Result<Option<String>> {
+        if !self.flag()? {
+            return Ok(None);
+        }
+        let length = self.length(1)?;
+        let bytes = self.take(length)?;
+        String::from_utf8(bytes.to_vec())
+            .map(Some)
+            .map_err(|_| Error::Protocol("a text is not UTF-8".into()))
     }
 
     fn flag(&mut self) -> Result<bool> {
@@ -833,17 +884,15 @@ impl Request {
                 writer.word(*at);
                 writer.key(key);
             }
-            Self::Transfer {
+            Self::Lend {
                 owner,
-                group,
+                lease,
                 after,
-                trace,
             } => {
                 writer.byte(7);
                 writer.long(owner.0);
-                writer.byte(group.0);
+                writer.long(*lease);
                 writer.stamps(after);
-                writer.long(*trace);
             }
             Self::Evict { keys } => {
                 writer.byte(8);
@@ -930,6 +979,27 @@ impl Request {
                 writer.byte(group.0);
                 writer.stamps(after);
             }
+            Self::Import {
+                owner,
+                tables,
+                lender,
+                push,
+                trace,
+            } => {
+                writer.byte(19);
+                writer.long(owner.0);
+                writer.word(tables.len() as u32);
+                for (class, at, count) in tables {
+                    writer.byte(*class);
+                    writer.word(*at);
+                    writer.word(*count);
+                }
+                writer.text(lender.endpoint.as_deref());
+                writer.word(lender.session);
+                writer.long(lender.owner.0);
+                writer.byte(u8::from(*push));
+                writer.long(*trace);
+            }
         }
     }
 
@@ -984,11 +1054,10 @@ impl Request {
                 at: reader.word()?,
                 key: reader.key()?,
             },
-            7 => Self::Transfer {
+            7 => Self::Lend {
                 owner: OwnerId(reader.long()?),
-                group: GroupId(reader.byte()?),
+                lease: reader.long()?,
                 after: reader.stamps()?,
-                trace: reader.long()?,
             },
             8 => Self::Evict {
                 keys: reader.keys()?,
@@ -1053,6 +1122,24 @@ impl Request {
                 group: GroupId(reader.byte()?),
                 after: reader.stamps()?,
             },
+            19 => {
+                let owner = OwnerId(reader.long()?);
+                let tables = (0..reader.length(9)?)
+                    .map(|_| Ok((reader.byte()?, reader.word()?, reader.word()?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let lender = Lender {
+                    endpoint: reader.text()?,
+                    session: reader.word()?,
+                    owner: OwnerId(reader.long()?),
+                };
+                Self::Import {
+                    owner,
+                    tables,
+                    lender,
+                    push: reader.flag()?,
+                    trace: reader.long()?,
+                }
+            }
             other => {
                 return Err(Error::Protocol(format!(
                     "request variant {other} is not of version {VERSION}"
@@ -1132,18 +1219,12 @@ impl Completion {
             }
             Self::Saved => writer.byte(12),
             Self::Restored => writer.byte(13),
-            Self::Transferred { slot, runs } => {
-                writer.byte(14);
-                writer.word(*slot);
-                writer.word(runs.len() as u32);
-                for (class, at, run, private) in runs {
-                    writer.byte(*class);
-                    writer.word(*at);
-                    writer.run(run);
-                    writer.byte(u8::from(*private));
-                }
-            }
             Self::Failed => writer.byte(15),
+            Self::Imported { runs, evicted } => {
+                writer.byte(14);
+                writer.runs(runs);
+                writer.keys(evicted);
+            }
             Self::Evicted { keys } => {
                 writer.byte(16);
                 writer.keys(keys);
@@ -1245,18 +1326,9 @@ impl Completion {
             },
             12 => Self::Saved,
             13 => Self::Restored,
-            14 => Self::Transferred {
-                slot: reader.word()?,
-                runs: (0..reader.length(15)?)
-                    .map(|_| {
-                        Ok((
-                            reader.byte()?,
-                            reader.word()?,
-                            reader.run()?,
-                            reader.flag()?,
-                        ))
-                    })
-                    .collect::<Result<_>>()?,
+            14 => Self::Imported {
+                runs: reader.runs()?,
+                evicted: reader.keys()?,
             },
             15 => Self::Failed,
             16 => Self::Evicted {
@@ -1353,11 +1425,32 @@ mod tests {
                 at: 4,
                 key: key(9),
             },
-            Request::Transfer {
+            Request::Lend {
                 owner: OwnerId(1),
-                group: GroupId(1),
+                lease: 30_000_000_000,
                 after: after.clone(),
+            },
+            Request::Import {
+                owner: OwnerId(2),
+                tables: vec![(0, 0, 3), (1, 2, 1)],
+                lender: Lender {
+                    endpoint: Some("gb200-b:29800".into()),
+                    session: 4,
+                    owner: OwnerId(7),
+                },
+                push: true,
                 trace: 1 << 40,
+            },
+            Request::Import {
+                owner: OwnerId(2),
+                tables: Vec::new(),
+                lender: Lender {
+                    endpoint: None,
+                    session: 1,
+                    owner: OwnerId(3),
+                },
+                push: false,
+                trace: 0,
             },
             Request::Evict { keys: vec![] },
             Request::Victims {
@@ -1466,11 +1559,11 @@ mod tests {
             },
             Completion::Saved,
             Completion::Restored,
-            Completion::Transferred {
-                slot: 2,
-                runs: vec![(0, 0, (0, 5, 1), true), (0, 1, (0, 6, 1), false)],
-            },
             Completion::Failed,
+            Completion::Imported {
+                runs: vec![(0, 5, 1), (0, 6, 1)],
+                evicted: vec![key(2)],
+            },
             Completion::Evicted { keys: vec![key(5)] },
             Completion::Prefetched {
                 found: 2,

@@ -13,9 +13,9 @@ use super::wire;
 use super::{
     ArtifactEvent, ArtifactMedia, CachePolicy, CacheResume, ConditionExtent, DiffusionRequest,
     DiffusionSamplingParams, EncoderInputs, Event, FinishReason, GenerationFeatures,
-    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput, MediaKind,
-    MigrationCause, MultimodalInputs, PositionLogprobs, RejectionKind, Request, RequestId,
-    SamplingParams, StopReason, TokenLogprob, Trajectory,
+    GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput, Lend,
+    MediaKind, MigrationCause, MultimodalInputs, PositionLogprobs, RejectionKind, Request,
+    RequestId, SamplingParams, StopReason, TokenLogprob, Trajectory,
 };
 
 /// A message that states no valid value.
@@ -127,6 +127,8 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
             include_stop_token: request.include_stop_token,
             generated_token_ids: request.generated_token_ids.clone(),
             adapter: request.adapter,
+            hand_off: request.hand_off,
+            lend: request.lend.as_ref().map(Into::into),
         }
     }
 }
@@ -172,6 +174,8 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
             include_stop_token: request.include_stop_token,
             generated_token_ids: request.generated_token_ids,
             adapter: request.adapter,
+            hand_off: request.hand_off,
+            lend: request.lend.map(Into::into),
         })
     }
 }
@@ -517,6 +521,7 @@ impl Event {
                 kind: match kind {
                     RejectionKind::Invalid => wire::RejectionKind::Invalid,
                     RejectionKind::Overloaded => wire::RejectionKind::Overloaded,
+                    RejectionKind::Role => wire::RejectionKind::Role,
                 } as i32,
                 message: message.clone(),
             }),
@@ -527,14 +532,17 @@ impl Event {
                 cause,
                 denoised_steps,
                 stored_layout,
+                lend,
             } => Kind::Migratable(wire::Migratable {
                 cause: match cause {
                     MigrationCause::Drain => wire::MigrationCause::Drain,
                     MigrationCause::Loss => wire::MigrationCause::Loss,
                     MigrationCause::Transfer => wire::MigrationCause::Transfer,
+                    MigrationCause::Handoff => wire::MigrationCause::Handoff,
                 } as i32,
                 denoised_steps: *denoised_steps,
                 stored_layout: stored_layout.clone(),
+                lend: lend.as_ref().map(Into::into),
             }),
         };
         let event = wire::Event {
@@ -618,6 +626,7 @@ impl Event {
                 kind: match known::<wire::RejectionKind>(rejected.kind, "rejection kind")? {
                     wire::RejectionKind::Invalid => RejectionKind::Invalid,
                     wire::RejectionKind::Overloaded => RejectionKind::Overloaded,
+                    wire::RejectionKind::Role => RejectionKind::Role,
                 },
                 message: rejected.message,
             },
@@ -629,12 +638,58 @@ impl Event {
                     wire::MigrationCause::Drain => MigrationCause::Drain,
                     wire::MigrationCause::Loss => MigrationCause::Loss,
                     wire::MigrationCause::Transfer => MigrationCause::Transfer,
+                    wire::MigrationCause::Handoff => MigrationCause::Handoff,
                 },
                 denoised_steps: migratable.denoised_steps,
                 stored_layout: migratable.stored_layout,
+                lend: migratable.lend.map(Into::into),
             },
         };
         Ok((request, event))
+    }
+}
+
+impl From<crate::config::Role> for wire::Role {
+    fn from(role: crate::config::Role) -> Self {
+        match role {
+            crate::config::Role::Mixed => Self::Mixed,
+            crate::config::Role::Prefill => Self::Prefill,
+            crate::config::Role::Decode => Self::Decode,
+        }
+    }
+}
+
+impl From<wire::Role> for crate::config::Role {
+    fn from(role: wire::Role) -> Self {
+        match role {
+            wire::Role::Mixed => Self::Mixed,
+            wire::Role::Prefill => Self::Prefill,
+            wire::Role::Decode => Self::Decode,
+        }
+    }
+}
+
+impl From<&Lend> for wire::Lend {
+    fn from(lend: &Lend) -> Self {
+        Self {
+            endpoint: lend.endpoint.clone(),
+            session: lend.session,
+            owner: lend.owner,
+            tokens: lend.tokens,
+            stored: lend.stored,
+        }
+    }
+}
+
+impl From<wire::Lend> for Lend {
+    fn from(lend: wire::Lend) -> Self {
+        Self {
+            endpoint: lend.endpoint,
+            session: lend.session,
+            owner: lend.owner,
+            tokens: lend.tokens,
+            stored: lend.stored,
+        }
     }
 }
 

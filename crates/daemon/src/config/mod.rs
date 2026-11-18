@@ -160,6 +160,7 @@ impl Config {
             media_config: Of(Kind::Video),
             video_job_config: Of(Kind::Video),
             programs: Every,
+            // A video request is computed where it arrives: its replicas are mixed.
             paused: Every,
             asleep: Every,
             flush: Every,
@@ -180,6 +181,9 @@ impl Config {
             prefetch_timeout_base: Every,
             prefetch_timeout_per_ki_token: Every,
             report_period: Every,
+            roles: Every,
+            lease: Every,
+            storage: Every,
         });
         let devices = classified!(DeviceConfig, "device_config.", {
             device: Shorthand,
@@ -424,6 +428,15 @@ pub struct Config {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[reload(program)]
     pub programs: std::collections::BTreeMap<String, program::Program>,
+    /// The deployment's replicas by id (`[replicas.<id>]`), each one scheduler with its own KV
+    /// cache, numbered `0` up to `data_parallel_size` in the order of the worker groups. Every
+    /// replica is built to serve both phases, and its `role` decides only which requests it
+    /// takes from the next step on: a change starts no process and moves no data, and a
+    /// request a replica took serves there to its end. A replica the table does not list is
+    /// mixed. Token models only.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[reload(step)]
+    pub replicas: std::collections::BTreeMap<String, ReplicaConfig>,
     /// Whether new requests wait in the daemon instead of reaching an engine; the requests in
     /// flight go on. A change takes effect from the next request on.
     #[reload(step)]
@@ -451,11 +464,6 @@ pub struct Config {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[reload(step)]
     pub adapters: std::collections::BTreeMap<String, String>,
-    /// Each replica's options, by its id (`[replicas.<id>]`): its role, which decides which
-    /// requests it takes and which a change sets from the next request on.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    #[reload(step)]
-    pub replicas: std::collections::BTreeMap<String, ReplicaConfig>,
 }
 
 impl Default for Config {
@@ -507,12 +515,31 @@ impl Default for Config {
             media_config: MediaConfig::default(),
             video_job_config: VideoJobConfig::default(),
             programs: std::collections::BTreeMap::new(),
+            replicas: std::collections::BTreeMap::new(),
             paused: false,
             asleep: false,
             flush: 0,
             retire: false,
             adapters: std::collections::BTreeMap::new(),
-            replicas: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// One replica of the deployment (`[replicas.<id>]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplicaConfig {
+    /// Which requests the replica takes: `prefill`, the prompts of requests whose tokens
+    /// another replica generates, which hand their KV off once the first token is sampled;
+    /// `decode`, the continuations of those requests, which import the KV handed off; or
+    /// `mixed`, every request, computed and generated in place.
+    pub role: proto::config::Role,
+}
+
+impl Default for ReplicaConfig {
+    fn default() -> Self {
+        Self {
+            role: proto::config::Role::Mixed,
         }
     }
 }
@@ -631,21 +658,6 @@ pub enum Workers {
     /// The deployment is one aggregated worker, whose data-parallel ranks are its replicas; its
     /// routing program chooses within it.
     Deployment,
-}
-
-/// One replica's options (`[replicas.<id>]`), the replica being the deployment's scheduler
-/// `<id>`: its schedulers numbered across its replicas in the order the worker groups state
-/// them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReplicaConfig {
-    /// Which requests the replica takes: `prefill`, `decode` or `mixed`.
-    #[serde(default = "mixed")]
-    pub role: scheduling::routing::Role,
-}
-
-fn mixed() -> scheduling::routing::Role {
-    scheduling::routing::Role::Mixed
 }
 
 /// The default `admin_config.join`: a fixed port, since the other nodes of a deployment reach the
@@ -775,6 +787,7 @@ impl Config {
             max_logprobs: self.max_logprobs,
             device: self.device_config.clone(),
             scheduler: self.scheduler_config.clone(),
+            roles: self.roles(),
             media: self.media_config.clone(),
             mem_fraction_static: self.mem_fraction_static,
             load: self.load_config.clone(),
@@ -787,6 +800,18 @@ impl Config {
             profiling: self.profiling_config.clone(),
             kv_events: self.kv_events_config.clone(),
         })
+    }
+
+    /// The role of each of the deployment's replicas, by its index: what `replicas` states, and
+    /// mixed for a replica it does not list.
+    pub fn roles(&self) -> Vec<proto::config::Role> {
+        (0..self.data_parallel_size.get())
+            .map(|index| {
+                self.replicas
+                    .get(&index.to_string())
+                    .map_or(proto::config::Role::Mixed, |replica| replica.role)
+            })
+            .collect()
     }
 
     /// The configured model as it is stated: the repository (`model`) or the
@@ -853,13 +878,6 @@ impl Config {
             self.states_model(),
             "the package names no model: set `model` or `model_dir` in its `config.toml`"
         );
-        // A replica is named by its scheduler's number.
-        for id in self.replicas.keys() {
-            anyhow::ensure!(
-                id.parse::<u32>().is_ok(),
-                "`replicas.{id}` names no replica: a replica's id is its scheduler's number"
-            );
-        }
         // Every scheduler binds the KV events' endpoints offset by its number from the first's.
         let events = &self.kv_events_config;
         for (name, endpoint) in [
@@ -939,6 +957,26 @@ impl Config {
                 "invalid `worker_config.{name}`: it must be positive"
             );
         }
+        // A replica is one of the deployment's schedulers, by its index; a request that one
+        // prefills is generated on another that decodes.
+        for id in self.replicas.keys() {
+            let index = id
+                .parse::<usize>()
+                .ok()
+                .filter(|index| id == &index.to_string());
+            anyhow::ensure!(
+                index.is_some_and(|index| index < self.data_parallel_size.get()),
+                "`replicas.{id}` names no replica: the replicas are numbered 0 to {} \
+                 (`data_parallel_size`)",
+                self.data_parallel_size.get() - 1
+            );
+        }
+        let roles = self.roles();
+        anyhow::ensure!(
+            roles.iter().any(|role| role.prefills()) && roles.iter().any(|role| role.decodes()),
+            "`replicas` leaves no replica to compute prompts or none to generate tokens: a \
+             deployment keeps a replica of each, or a mixed one"
+        );
         // A program's name names its saved state's file and the revisions it writes.
         for (name, program) in &self.programs {
             anyhow::ensure!(

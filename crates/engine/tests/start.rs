@@ -411,6 +411,8 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
             include_stop_token: false,
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         }));
     requests
         .deliver(&wire::ToEngine {
@@ -669,6 +671,8 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
             include_stop_token: false,
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         }));
     a.requests
         .deliver(&wire::ToEngine {

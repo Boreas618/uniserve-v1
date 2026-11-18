@@ -849,7 +849,7 @@ fn split_launch() -> EngineArgs {
     let group = |id: &str, device: &str, blocks: BTreeMap<String, BlockConfig>| WorkerGroupConfig {
         id: WorkerGroupId(id.to_owned()),
         role: Default::default(),
-        replicas: 1,
+        copies: 1,
         ranks: vec![WorkerRank {
             host: "localhost".to_owned(),
             device: device.parse().unwrap(),
@@ -1734,7 +1734,7 @@ fn a_dedicated_expert_rank_maps_no_kv_region() {
     let attention = WorkerGroupConfig {
         id: WorkerGroupId("attention".to_owned()),
         role: Default::default(),
-        replicas: 1,
+        copies: 1,
         ranks: vec![rank("cuda:0")],
         blocks: WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
         queue_depth: 2,
@@ -1743,7 +1743,7 @@ fn a_dedicated_expert_rank_maps_no_kv_region() {
     let experts = WorkerGroupConfig {
         id: WorkerGroupId("experts".to_owned()),
         role: proto::config::WorkerGroupRole::Experts,
-        replicas: 1,
+        copies: 1,
         ranks: vec![rank("cuda:1")],
         blocks: BTreeMap::new(),
         queue_depth: 2,
@@ -1830,7 +1830,7 @@ fn a_host_numbers_its_text_ranks_by_their_places_in_the_deployment() {
     let group = |id: &str, ranks: Vec<WorkerRank>| WorkerGroupConfig {
         id: WorkerGroupId(id.to_owned()),
         role: Default::default(),
-        replicas: 1,
+        copies: 1,
         blocks: WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, ranks.len()),
         ranks,
         queue_depth: 2,
@@ -2049,7 +2049,7 @@ fn parallel_launch(devices: u32, degrees: impl FnOnce(&mut BlockConfig)) -> Engi
     let group = WorkerGroupConfig {
         id: WorkerGroupId("model".to_owned()),
         role: Default::default(),
-        replicas: 1,
+        copies: 1,
         blocks: BTreeMap::from([(proto::config::DEFAULT_BLOCK.to_owned(), block)]),
         ranks,
         queue_depth: 2,
@@ -2234,7 +2234,7 @@ fn a_text_group_splits_its_model_along_one_axis_and_every_group_alike() {
     let group = |id: &str, role, devices: [&str; 2], block: BlockConfig| WorkerGroupConfig {
         id: WorkerGroupId(id.to_owned()),
         role,
-        replicas: 1,
+        copies: 1,
         blocks: BTreeMap::from([(proto::config::DEFAULT_BLOCK.to_owned(), block)]),
         ranks: devices
             .iter()
@@ -2249,7 +2249,7 @@ fn a_text_group_splits_its_model_along_one_axis_and_every_group_alike() {
     split.engine_config.parallel.worker_groups = vec![
         group(
             "prefill",
-            proto::config::WorkerGroupRole::Prefill,
+            proto::config::WorkerGroupRole::Model,
             ["cuda:0", "cuda:1"],
             BlockConfig {
                 pipeline_parallel_size: 2,
@@ -2258,7 +2258,7 @@ fn a_text_group_splits_its_model_along_one_axis_and_every_group_alike() {
         ),
         group(
             "decode",
-            proto::config::WorkerGroupRole::Decode,
+            proto::config::WorkerGroupRole::Model,
             ["cuda:2", "cuda:3"],
             BlockConfig {
                 tensor_parallel_size: 2,
@@ -2381,7 +2381,7 @@ fn expert_parallelism_places_whole_experts_on_a_tensor_group_and_shares_them_in_
     let scheduler = |index: usize| WorkerGroupConfig {
         id: WorkerGroupId(format!("model-{index}")),
         role: Default::default(),
-        replicas: 1,
+        copies: 1,
         ranks: vec![WorkerRank {
             host: "localhost".to_owned(),
             device: proto::config::RankDevice::cuda(index as u32),

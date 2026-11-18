@@ -33,7 +33,6 @@ use std::path::PathBuf;
 
 use proto::profile::{Collector, RankRelease, RankStart, RankStop, SessionStart};
 use serde::{Deserialize, Serialize};
-use storage::protocol::UnitRun;
 use storage::runtime::{Completion, GroupId, Open, Opened, Request, RequestId, Segments};
 
 use crate::batch::{Batch, BatchOutput, Capacity, ErrorCode};
@@ -476,7 +475,7 @@ pub(crate) enum MainProcessResponse {
         /// Per region, device memory and part (the rank's index in its worker group), where a
         /// rank's part of the region's units lies (`Place`), which the scheduler node states for
         /// it (`PlaceRemote`).
-        places: Vec<(String, String, u32, Vec<UnitRun>)>,
+        places: Vec<crate::process::ranks::Place>,
         /// What the peer's ranks serve, per worker group they are ranks of.
         capacities: Vec<(GroupId, Capacity)>,
     },

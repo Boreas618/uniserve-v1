@@ -6,13 +6,13 @@
 //! when they were ready ([`Capacity`]), how the epoch's session with the buffer pool states it
 //! (its [`GroupId`], memory, slot region and per class its device regions), and the occupancy the
 //! scheduler counts. A scheduler's groups are its own: the data-parallel replicas of a configured
-//! group under it, its prefill and decode groups, and its media stages. A group of the `Experts`
+//! group under it and its media stages. A group of the `Experts`
 //! role serves no phase and is never a placement.
 //!
 //! The rules here are SD §3.4 and §3.5:
 //!
 //! - **Phases and roles.** A group serves a phase when its workers stated it and its role
-//!   allows it: a `Prefill` group never decodes or verifies, a `Decode` group does nothing else.
+//!   allows it: an `Experts` group serves none.
 //! - **Occupancy.** The stage that serves a phase holds at most `Capacity::rows` requests at once.
 //!   A request holds the stage while a call of the phase is in flight, so its further calls (a
 //!   pipelined decode, the next denoising step) run beside it; the denoiser is held from the
@@ -115,18 +115,11 @@ impl WorkerGroup {
     }
 
     /// Whether the group runs calls of `phase`: its workers stated the phase, and its role
-    /// allows it. A `Prefill` group runs no decode or verification, which a request reaches on a
-    /// decode group by the transfer of its blocks; a `Decode` group runs nothing else; an
-    /// `Experts` group serves the deployment's schedulers and runs no phase of a request.
+    /// allows it. An `Experts` group serves the deployment's schedulers and runs no phase of a
+    /// request; a model group runs every phase its workers serve, whatever the replica's role,
+    /// which decides which requests the scheduler takes (`super::handoff`).
     pub(crate) fn serves(&self, phase: Phase) -> bool {
-        let decodes = matches!(phase, Phase::Decode | Phase::Verify);
-        let allowed = match self.config.role {
-            WorkerGroupRole::Model => true,
-            WorkerGroupRole::Prefill => !decodes,
-            WorkerGroupRole::Decode => decodes,
-            WorkerGroupRole::Experts => false,
-        };
-        allowed && self.capacity.serves(phase)
+        self.config.role == WorkerGroupRole::Model && self.capacity.serves(phase)
     }
 
     /// Whether the stage that serves `phase` can take the next call of `request`: the request
@@ -453,7 +446,7 @@ mod tests {
         WorkerGroupConfig {
             id: WorkerGroupId(id.to_owned()),
             role,
-            replicas: 1,
+            copies: 1,
             ranks: hosts
                 .iter()
                 .map(|host| WorkerRank {
@@ -566,6 +559,7 @@ mod tests {
                 completed: Vec::new(),
                 capacity: Vec::new(),
             }],
+            session: 0,
         };
 
         let (output, _) = crossbeam_channel::unbounded();
@@ -604,6 +598,8 @@ mod tests {
             include_stop_token: false,
             generated_token_ids: Vec::new(),
             adapter: 0,
+            hand_off: false,
+            lend: None,
         };
         let now = Instant::now();
         Request {
@@ -640,6 +636,7 @@ mod tests {
             draft_limit: 0,
             last_progress: now,
             dirty: false,
+            path: None,
         }
     }
 
@@ -695,11 +692,6 @@ mod tests {
         };
 
         assert_eq!(served(WorkerGroupRole::Model), stated);
-        assert_eq!(served(WorkerGroupRole::Prefill), [Phase::Prefill]);
-        assert_eq!(
-            served(WorkerGroupRole::Decode),
-            [Phase::Decode, Phase::Verify]
-        );
         assert!(served(WorkerGroupRole::Experts).is_empty());
     }
 
@@ -895,41 +887,6 @@ mod tests {
         assert_eq!(
             scheduler.candidates(&held, Phase::Decode),
             [GroupId(0), GroupId(1)]
-        );
-    }
-
-    #[test]
-    fn prefill_and_decode_groups_split_a_request_and_experts_take_none() {
-        let stated = [Phase::Prefill, Phase::Decode, Phase::Verify];
-        let scheduler = scheduler(
-            vec![
-                (
-                    config("prefill", WorkerGroupRole::Prefill, &["a"]),
-                    capacity(&stated, 1),
-                ),
-                (
-                    config("decode", WorkerGroupRole::Decode, &["a"]),
-                    capacity(&stated, 1),
-                ),
-                (
-                    config("experts", WorkerGroupRole::Experts, &["a"]),
-                    capacity(&stated, 1),
-                ),
-            ],
-            &[4, 4, 4],
-        );
-        let mut prefilled = request(1);
-        prefilled.placement[Phase::Prefill.index()] = Some(GroupId(0));
-
-        assert_eq!(
-            scheduler.candidates(&prefilled, Phase::Prefill),
-            [GroupId(0)]
-        );
-        let candidates = scheduler.candidates(&prefilled, Phase::Decode);
-        assert_eq!(candidates, [GroupId(1)]);
-        assert_eq!(
-            scheduler.choose(&prefilled, &candidates, None),
-            Some(GroupId(1))
         );
     }
 

@@ -14,10 +14,13 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ::storage::protocol::{BlockState, ErrorKind, HostCopy, Listing, RegionPart, UnitRun, Waiting};
+use ::storage::protocol::{
+    BlockState, ErrorKind, HostCopy, Listing, PageLayout, RegionPart, UnitLayout, UnitRun, Waiting,
+    planes,
+};
 use ::storage::runtime::{
-    Cause, Class, Completion, Group, GroupId, Open, Opened, OwnerId, Region, Registers, Request,
-    RequestId, Tier, VERSION,
+    Cause, Class, Completion, Group, GroupId, Lender, Open, Opened, OwnerId, Region, Registers,
+    Request, RequestId, Tier, VERSION,
 };
 use ::storage::{
     Access, Claim, Claimant, Client, Interest, Key, Location, Mode, QueueDescriptors, QueuePair,
@@ -27,7 +30,7 @@ use ::storage::{
 use crate::server::{
     Running, engine_head, head, host, key, memfd, scope, server_error, tensor, worker,
 };
-use crate::transfer::{Gpus, pattern, read, serving};
+use crate::transfer::{Gpus, read, serving};
 
 pub(crate) const PREFILL: GroupId = GroupId(0);
 pub(crate) const DECODE: GroupId = GroupId(1);
@@ -566,51 +569,143 @@ pub(crate) fn values(key: Key) -> Vec<UnitRun> {
     }]
 }
 
-#[test]
-fn a_transfer_copies_an_owner_s_units_between_its_groups_ranks_through_the_transfer_server() {
-    let server = serving(Gpus::Hidden);
-    let claim = head(&server.socket)
-        .claim(
-            Claimant::Head,
-            0,
-            vec![scope("prefill", 0), scope("decode", 1)],
-            Vec::new(),
-        )
-        .unwrap();
+/// The heads of each layer of the KV region of the handoff cases, the bytes of a head of a
+/// token, the tokens of a page and the units a rank holds: a page's plane is two tokens of two
+/// heads of four bytes on a rank that holds both heads.
+pub(crate) const HEADS: u32 = 2;
+pub(crate) const HEAD_BYTES: u32 = 4;
+pub(crate) const PAGE: u32 = 2;
+const CELLS: u32 = 9;
 
-    // Each group's rank holds the KV region's values in storage of its own,
-    // and states where the units lie in its group's memory. The deployment
-    // numbers the decode group's rank 1, after the prefill group's; in its
-    // group it is the first, which holds the share of a unit the prefill
-    // group's first rank holds: the two are matched by that index, their
-    // part.
-    let planes = [memfd(&[0; 144]), memfd(&[0; 144])];
-    let mut ranks = [
-        rank(&server.socket, "prefill", 0, claim),
-        rank(&server.socket, "decode", 1, claim),
-    ];
-    for ((rank, planes), (name, memory)) in ranks
-        .iter_mut()
-        .zip(&planes)
-        .zip([(10, "gpu0"), (11, "gpu1")])
-    {
-        let values_tensor = tensor(key(name), "values", 0, 0, Access::Exclusive);
-        rank.put(vec![values_tensor], &[(host(144), planes.as_fd())])
-            .unwrap();
-        rank.place("units".into(), memory.into(), 0, values(key(name)))
-            .unwrap();
+/// How a rank holding `heads` heads from `offset` lays out its part of the KV region's units:
+/// one layer in one column, a page a unit.
+pub(crate) fn kv_layout(offset: u32, heads: u32) -> UnitLayout {
+    UnitLayout {
+        columns: 1,
+        classes: vec![PageLayout {
+            class: KV,
+            block_size: PAGE,
+            layers: vec![0],
+            kv_heads: heads,
+            kv_head_offset: offset,
+            total_kv_heads: HEADS,
+            head_bytes: HEAD_BYTES,
+            quantized: false,
+            index_bytes: 0,
+        }],
     }
+}
 
-    let mut engine = engine_head(&server.socket, 0);
-    let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
-    let region = opened.regions[UNITS].0;
-    let mut schedulers = Scheduler::all(&opened, descriptors);
-    let prefill = &mut schedulers[0];
-    let attach = Request::Attach {
-        owner: OwnerId(1),
-        group: PREFILL,
+/// The bytes of a rank's plane of a page when it holds `heads` heads.
+pub(crate) fn plane(heads: u32) -> u64 {
+    u64::from(PAGE * heads * HEAD_BYTES)
+}
+
+/// Where a rank holding `heads` heads keeps every unit's fields in the host tensor `key`: the
+/// keys' planes, the values' planes, then the two planes' written flags, nine units each.
+pub(crate) fn kv_runs(key: Key, heads: u32) -> Vec<UnitRun> {
+    let plane = plane(heads);
+    let fields = [
+        (planes::VALUES[0], 0, plane),
+        (planes::VALUES[1], u64::from(CELLS) * plane, plane),
+        (planes::FLAGS[0], 2 * u64::from(CELLS) * plane, 1),
+        (
+            planes::FLAGS[1],
+            2 * u64::from(CELLS) * plane + u64::from(CELLS),
+            1,
+        ),
+    ];
+    fields
+        .into_iter()
+        .map(|(name, offset, bytes)| UnitRun {
+            field: planes::field(name, 0),
+            key,
+            location: Location::Host { numa_node: None },
+            first: 0,
+            count: CELLS,
+            offset,
+            bytes,
+        })
+        .collect()
+}
+
+/// The bytes of a rank's tensor of [`kv_runs`].
+pub(crate) fn kv_bytes(heads: u32) -> u64 {
+    2 * u64::from(CELLS) * plane(heads) + 2 * u64::from(CELLS)
+}
+
+/// The byte of plane `plane` (keys or values) of page `page`, token `token`, head `head`.
+pub(crate) fn kv_byte(page: u32, plane: u32, token: u32, head: u32, byte: u32) -> u8 {
+    (page * 37 + plane * 19 + token * 7 + head * 5 + byte + 1) as u8
+}
+
+/// Writes pages, page `index` into unit `units[index]`, as a rank holding `heads` heads from
+/// `offset` holds them in the tensor `file` laid out by [`kv_runs`].
+pub(crate) fn write_pages(file: &std::fs::File, units: &[u32], (offset, heads): (u32, u32)) {
+    let plane_bytes = plane(heads);
+    for (page, unit) in units.iter().enumerate() {
+        for kind in 0..2 {
+            let mut bytes = Vec::new();
+            for token in 0..PAGE {
+                for head in offset..offset + heads {
+                    for byte in 0..HEAD_BYTES {
+                        bytes.push(kv_byte(page as u32, kind, token, head, byte));
+                    }
+                }
+            }
+            let at = u64::from(kind * CELLS + unit) * plane_bytes;
+            file.write_all_at(&bytes, at).unwrap();
+            let flag = 2 * u64::from(CELLS) * plane_bytes + u64::from(kind * CELLS + unit);
+            file.write_all_at(&[1], flag).unwrap();
+        }
+    }
+}
+
+/// The ranks of the handoff cases' two replicas, on one server: the prefill group's rank 0,
+/// which holds both heads, and the decode group's ranks 0 and 1, one head each; each with the
+/// tensor it holds its units in, placed in its group's memory.
+pub(crate) fn handoff_ranks(socket: &Path, claim: Claim) -> [(Client, OwnedFd); 3] {
+    let placed =
+        |group: &str, number: u32, memory: &str, part: u32, (offset, heads): (u32, u32)| {
+            let mut rank = rank(socket, group, number, claim);
+            let storage = memfd(&vec![0; kv_bytes(heads) as usize]);
+            let name = 20 + number as u8 + if group == "decode" { 10 } else { 0 };
+            let values = tensor(key(name), "kv", 0, 0, Access::Exclusive);
+            rank.put(vec![values], &[(host(kv_bytes(heads)), storage.as_fd())])
+                .unwrap();
+            let layout = Some(kv_layout(offset, heads));
+            rank.place(
+                "units".into(),
+                memory.into(),
+                part,
+                kv_runs(key(name), heads),
+                layout,
+            )
+            .unwrap();
+            (rank, OwnedFd::from(storage))
+        };
+    [
+        placed("prefill", 0, "gpu0", 0, (0, HEADS)),
+        placed("decode", 1, "gpu1", 0, (0, 1)),
+        placed("decode", 2, "gpu1", 1, (1, 1)),
+    ]
+}
+
+/// Lends owner 1 of the prefill scheduler, which wrote two pages into its units, and attaches
+/// owner 2 of the decode scheduler. Returns the lender.
+pub(crate) fn lend_two_pages(
+    schedulers: &mut [Scheduler],
+    opened: &Opened,
+    prefill: &OwnedFd,
+) -> Lender {
+    let attach = |scheduler: &mut Scheduler, owner: u64, group| {
+        let attach = Request::Attach {
+            owner: OwnerId(owner),
+            group,
+        };
+        assert!(matches!(scheduler.ask(attach), Completion::Attached { .. }));
     };
-    assert_eq!(prefill.ask(attach), Completion::Attached { slot: 1 });
+    attach(&mut schedulers[0], 1, PREFILL);
     let allocate = Request::Allocate {
         owner: OwnerId(1),
         class: KV,
@@ -618,32 +713,89 @@ fn a_transfer_copies_an_owner_s_units_between_its_groups_ranks_through_the_trans
         count: 2,
         units: 0,
     };
-    assert!(matches!(
-        prefill.ask(allocate),
-        Completion::Allocated { .. }
-    ));
-
-    // The prefill group's batches wrote units 1 and 2; the transfer copies
-    // them into the decode rank's planes, and the owner moves.
-    let written = pattern(32, 5);
-    planes[0].write_all_at(&written, 16).unwrap();
-    let transfer = prefill.submit(Request::Transfer {
-        trace: 0,
+    let Completion::Allocated { runs, .. } = schedulers[0].ask(allocate) else {
+        panic!("no units");
+    };
+    let lent: Vec<u32> = runs.into_iter().map(|(_, first, _)| first).collect();
+    let prefill = std::fs::File::from(prefill.try_clone().unwrap());
+    write_pages(&prefill, &lent, (0, HEADS));
+    let lend = Request::Lend {
         owner: OwnerId(1),
-        group: DECODE,
+        lease: 60_000_000_000,
         after: Vec::new(),
-    });
-    let runs = vec![(KV, 0, (region, 1, 1), true), (KV, 1, (region, 2, 1), true)];
-    assert_eq!(
-        prefill.next(),
-        (transfer, Completion::Transferred { slot: 1, runs })
-    );
-    assert_eq!(read(&planes[1], 16, 32), written);
-    assert_eq!(
-        read(&planes[1], 48, 16),
-        [0; 16],
-        "only the owner's units move"
-    );
+    };
+    assert_eq!(schedulers[0].ask(lend), Completion::Done);
+    attach(&mut schedulers[1], 2, DECODE);
+    Lender {
+        endpoint: None,
+        session: opened.session,
+        owner: OwnerId(1),
+    }
+}
+
+/// The units of an import's answer.
+pub(crate) fn imported_units(completion: Completion) -> Vec<u32> {
+    let Completion::Imported { runs, .. } = completion else {
+        panic!("the import answered {completion:?}");
+    };
+    runs.into_iter().map(|(_, first, _)| first).collect()
+}
+
+/// Whether the decode ranks' tensors hold the two pages in `units`, each rank its own head,
+/// with the planes' flags set.
+pub(crate) fn assert_imported(decode: &[&OwnedFd], units: &[u32]) {
+    for (head, storage) in decode.iter().enumerate() {
+        let expected = memfd(&vec![0; kv_bytes(1) as usize]);
+        write_pages(&expected, units, (head as u32, 1));
+        let file = std::fs::File::from(storage.try_clone().unwrap());
+        let bytes = kv_bytes(1) as usize;
+        assert_eq!(
+            read(&file, 0, bytes),
+            read(&expected, 0, bytes),
+            "decode rank {head} holds its head of both pages"
+        );
+    }
+}
+
+#[test]
+fn an_import_reshards_a_lent_owner_s_pages_into_its_owner_s_ranks_through_the_transfer_server() {
+    let server = serving(Gpus::Hidden);
+    let claim = head(&server.socket)
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("prefill", 0), scope("decode", 1), scope("decode", 2)],
+            Vec::new(),
+        )
+        .unwrap();
+    let [(_prefill, lent), (_first, first), (_second, second)] =
+        handoff_ranks(&server.socket, claim);
+
+    // Two replicas of one engine: the prefill scheduler's owner lends what its rank wrote, and
+    // the decode scheduler's owner imports it, each of its two ranks taking its head.
+    let mut engine = engine_head(&server.socket, 0);
+    let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
+    let mut schedulers = Scheduler::all(&opened, descriptors);
+    let lender = lend_two_pages(&mut schedulers, &opened, &lent);
+    let import = Request::Import {
+        owner: OwnerId(2),
+        tables: vec![(KV, 0, 2)],
+        lender: lender.clone(),
+        push: false,
+        trace: 0,
+    };
+    let units = imported_units(schedulers[1].ask(import));
+    assert_imported(&[&first, &second], &units);
+
+    // The import ended the lend: another of it fails at once.
+    let again = Request::Import {
+        owner: OwnerId(2),
+        tables: vec![(KV, 2, 2)],
+        lender,
+        push: true,
+        trace: 0,
+    };
+    assert_eq!(schedulers[1].ask(again), Completion::Failed);
 }
 
 #[test]
@@ -754,6 +906,7 @@ pub(crate) fn split_host_region(
             1,
             there.tcp.clone(),
             values(key(11)),
+            None,
         )
         .unwrap();
 

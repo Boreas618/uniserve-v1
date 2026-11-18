@@ -792,6 +792,22 @@ impl StorageClient {
         Ok(())
     }
 
+    /// How the full pages of `handoff` reach this host's replica, as the deployment's KV program
+    /// chooses at this host's Storage Server (`storage::protocol::Request::Handoff`).
+    ///
+    /// # Errors
+    ///
+    /// The server's refusal: the two sides have no transport in common.
+    pub(crate) fn handoff(
+        &mut self,
+        handoff: scheduling::kv::Handoff,
+    ) -> anyhow::Result<scheduling::kv::Path> {
+        lock(&self.state)
+            .client
+            .handoff_path(handoff)
+            .context("asking how a handoff's pages arrive")
+    }
+
     /// Applies `change` to the segment table of the memory space of the region named `region`,
     /// as the session's answer states it for every region of that space: the Storage Server keeps
     /// one table per space. Nothing changes before the session is open, or for a region it does
@@ -828,7 +844,7 @@ impl StorageClient {
         region: &str,
         memory: &str,
         part: u32,
-        endpoint: &str,
+        (endpoint, layout): (&str, Option<::storage::protocol::UnitLayout>),
         runs: &[UnitRun],
     ) -> anyhow::Result<()> {
         lock(&self.state)
@@ -839,6 +855,7 @@ impl StorageClient {
                 part,
                 endpoint.to_owned(),
                 runs.to_vec(),
+                layout,
             )
             .with_context(|| {
                 format!("placing part {part} of {endpoint} in region {region} of memory {memory}")
@@ -890,9 +907,16 @@ impl StorageClient {
         memory: &str,
         part: u32,
         runs: &[UnitRun],
+        layout: Option<::storage::protocol::UnitLayout>,
     ) -> Result<()> {
         self.call("placing the rank's units", |client| {
-            client.place(region.to_owned(), memory.to_owned(), part, runs.to_vec())
+            client.place(
+                region.to_owned(),
+                memory.to_owned(),
+                part,
+                runs.to_vec(),
+                layout.clone(),
+            )
         })
     }
 

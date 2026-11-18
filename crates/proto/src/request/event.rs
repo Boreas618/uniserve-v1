@@ -153,6 +153,8 @@ pub enum Event {
         /// and how each stored rank laid its part out
         /// (`Trajectory::stored_layout`); empty otherwise.
         stored_layout: Vec<u8>,
+        /// For a handoff, the KV of the request's prompt the engine lent.
+        lend: Option<Lend>,
     },
 }
 
@@ -164,11 +166,31 @@ pub enum MigrationCause {
     Drain,
     /// The workers that held the request were lost.
     Loss,
-    /// A transfer of the request's blocks between its worker groups failed: a prefill-to-decode
-    /// transfer or a crossing of a product between processes. Its groups serve on, and a video
-    /// request's trajectory is stored; the migration counts against the request's limit as a
-    /// loss does.
+    /// A crossing of a product of the request between processes failed. Its groups serve on,
+    /// and a video request's trajectory is stored; the migration counts against the request's
+    /// limit as a loss does.
     Transfer,
+    /// The request's prompt is computed and its first token sampled on a prefill replica, which
+    /// lent its KV ([`Lend`]): it continues on the replica its route names for its tokens. It
+    /// does not count against the request's limit.
+    Handoff,
+}
+
+/// The KV of a request's prompt that a prefill replica's engine lent, which the decode
+/// replica's engine imports (`storage::runtime::Lender`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lend {
+    /// The TCP endpoint of the Storage Server of the lender's host; `None` for a server that
+    /// listens on none.
+    pub endpoint: Option<String>,
+    /// The lender's session in that server's buffer pool.
+    pub session: u32,
+    /// The lent owner.
+    pub owner: u64,
+    /// The prefix of the prompt the lent pages hold, in tokens.
+    pub tokens: u32,
+    /// The leading pages of the prompt the lender put in the remote store.
+    pub stored: u32,
 }
 
 impl Event {
@@ -196,6 +218,9 @@ pub enum RejectionKind {
     Invalid,
     /// The waiting queue is at its bound.
     Overloaded,
+    /// The scheduler's role takes no such request (`replicas.<id>.role`): the leader routes it
+    /// again.
+    Role,
 }
 
 /// Kind of media referenced by an artifact event.

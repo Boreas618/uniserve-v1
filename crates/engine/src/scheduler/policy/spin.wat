@@ -8,7 +8,7 @@
   (memory (export "memory") 1)
   (data (i32.const 64768) "{\"prefetch_min_tokens\":256,\"timeout\":30000000000}")
   (data (i32.const 65024) "{\"admit\":[],\"reject\":[],\"work\":[],\"offload\":[],\"prefetch\":[],\"refill\":[]}")
-  (func (export "sched_interface_version") (result i32) (i32.const 7))
+  (func (export "sched_interface_version") (result i32) (i32.const 8))
   (func (export "sched_alloc") (param i32) (result i32) (i32.const 1024))
   (func (export "sched_free") (param i32 i32))
   (func (export "sched_init") (param i32 i32) (result i64)

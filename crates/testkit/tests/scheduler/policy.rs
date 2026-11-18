@@ -807,7 +807,7 @@ fn a_starting_instance_is_given_the_blocks_of_cache() {
 fn the_policys_offload_is_stored_per_group_by_key() {
     let mut harness = Deployment::tokens()
         .cache(&HYBRID)
-        .replicas(2)
+        .copies(2)
         .host(64)
         .build();
     let serving = Script {

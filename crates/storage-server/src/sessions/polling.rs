@@ -583,6 +583,12 @@ impl Hosted {
         let source = self.sources.remove(&task);
         let pool = &self.pool;
         let epoch = pool.epoch(task.0.0)?;
+        if let Some(work) = pool.import_work(task) {
+            let deployment = deployment.to_owned();
+            return Some(Box::new(move |server: &mut Server| {
+                server.start_import((deployment, epoch), task, work);
+            }));
+        }
         let named = |runs: Vec<storage::runtime::Run>| -> Vec<NamedRun> {
             runs.into_iter()
                 .map(|(region, first, count)| (pool.region_name(region).to_owned(), first, count))
@@ -952,6 +958,7 @@ impl Pools {
                 segments,
                 limits,
                 registers,
+                session: client,
             },
             descriptors,
         ))
@@ -1099,12 +1106,65 @@ impl Pools {
         released
     }
 
-    /// The peer's connection closed: its holds in every pool end.
+    /// The peer's connection closed: its holds and its borrows in every pool end.
     pub(crate) fn peer_gone(&mut self, peer: u64) {
         for (deployment, hosted) in &mut self.deployments {
             hosted.dirty |= hosted.pool.release_peer(peer);
             let input = || Input::ReleasePeer(peer);
             hosted.watch.acted(deployment, input);
+            hosted.dirty |= hosted.pool.release_borrows(peer, None);
+            let input = || Input::ReleaseBorrows(peer, None);
+            hosted.watch.acted(deployment, input);
+        }
+    }
+
+    /// The blocks of the lend of `session`'s owner `owner` in `deployment`'s pool, held for
+    /// `peer` ([`BufferPool::borrow`]).
+    pub(crate) fn borrow(
+        &mut self,
+        deployment: &str,
+        peer: u64,
+        session: ClientId,
+        owner: storage::runtime::OwnerId,
+    ) -> Option<crate::buffer_pool::LentBlocks> {
+        let hosted = self.deployments.get_mut(deployment)?;
+        hosted.dirty = true;
+        let lent = hosted.pool.borrow(peer, session, owner);
+        hosted
+            .watch
+            .acted(deployment, || Input::Borrow(peer, session, owner));
+        lent
+    }
+
+    /// The borrows of `peer` in `deployment`'s pool end: of one lend, or every one
+    /// ([`BufferPool::release_borrows`]).
+    pub(crate) fn release_borrows(
+        &mut self,
+        deployment: &str,
+        peer: u64,
+        lend: Option<(ClientId, storage::runtime::OwnerId)>,
+    ) {
+        if let Some(hosted) = self.deployments.get_mut(deployment) {
+            hosted.dirty |= hosted.pool.release_borrows(peer, lend);
+            hosted
+                .watch
+                .acted(deployment, || Input::ReleaseBorrows(peer, lend));
+        }
+    }
+
+    /// The lend of `session`'s owner `owner` in `deployment`'s pool ends
+    /// ([`BufferPool::give_back`]).
+    pub(crate) fn give_back(
+        &mut self,
+        deployment: &str,
+        session: ClientId,
+        owner: storage::runtime::OwnerId,
+    ) {
+        if let Some(hosted) = self.deployments.get_mut(deployment) {
+            hosted.dirty |= hosted.pool.give_back(session, owner);
+            hosted
+                .watch
+                .acted(deployment, || Input::GiveBack(session, owner));
         }
     }
 

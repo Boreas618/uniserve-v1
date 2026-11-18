@@ -134,6 +134,7 @@ fn session() -> (storage::runtime::Open, storage::runtime::Opened) {
             completed: vec![0],
             capacity: vec![(0, 1)],
         }],
+        session: 0,
     };
     (open, opened)
 }
@@ -242,7 +243,13 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
         MainProcessResponse::Placed {
             endpoint: "10.0.0.3:7000".to_owned(),
             created: vec![(open.regions[0].name.clone(), opened.segments[0].clone())],
-            places: vec![(open.regions[0].name.clone(), "a/0,b/0".to_owned(), 1, runs)],
+            places: vec![(
+                open.regions[0].name.clone(),
+                "a/0,b/0".to_owned(),
+                1,
+                runs,
+                None,
+            )],
             capacities: vec![(storage::runtime::GroupId(2), group_capacity())],
         },
         MainProcessResponse::Result {

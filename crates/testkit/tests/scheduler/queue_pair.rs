@@ -1053,42 +1053,6 @@ fn a_give_up_crossing_the_workers_finish_ends_the_copy_once() {
     assert_eq!(harness.failure(), None);
 }
 
-/// A request waiting for the transfer of its blocks to its decode group is running, not
-/// waiting: no step takes it for an admission while its `Transferred` is withheld, and it decodes
-/// on the decode group once it arrives (SD §3.5 "Prefill to decode transfer").
-#[test]
-fn a_request_waiting_on_its_transfer_is_never_taken_for_an_admission() {
-    let mut harness = Deployment::tokens().disaggregated().build();
-    harness
-        .pool
-        .withhold(|request, _| matches!(request, Request::Transfer { .. }));
-    let id = harness.submit(token(1, 9, 5));
-    harness.run_until(20, |harness| harness.pool.withheld() == 1);
-    let attaches = |harness: &Harness| {
-        let taken = harness.taken().into_iter();
-        taken
-            .filter(|request| matches!(request, Request::Attach { .. }))
-            .count()
-    };
-    let attached = attaches(&harness);
-    harness.run(10);
-    assert_eq!(
-        attaches(&harness),
-        attached,
-        "no admission round while it transfers"
-    );
-
-    harness.pool.release();
-    harness.settle(100);
-    assert_eq!(harness.tokens(id).len(), 5);
-    let decodes = harness
-        .batches_of(id)
-        .into_iter()
-        .filter(|batch| batch.phase == Phase::Decode);
-    assert!(decodes.clone().count() > 0);
-    assert!(decodes.into_iter().all(|batch| batch.group == B));
-}
-
 /// A `Store` to the host answered `Full` leaves its blocks where they are: the request ends as
 /// any other, and a later request of the same prompt finds the blocks on the device (SD §3.5
 /// `Full`, §4.4 "The write policy").

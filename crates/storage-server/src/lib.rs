@@ -36,6 +36,7 @@ pub mod buffer_pool;
 mod child;
 pub mod command;
 mod error;
+mod handoff;
 mod kv_storage;
 mod memory;
 pub mod mooncake;
@@ -918,6 +919,7 @@ impl Server {
                     part,
                     endpoint,
                     runs,
+                    layout,
                 },
                 Role::Head {
                     deployment, epoch, ..
@@ -926,7 +928,7 @@ impl Server {
                 id,
                 (&deployment, epoch),
                 (region, memory, *part),
-                endpoint,
+                (endpoint, layout.clone()),
                 runs,
             ),
             (
@@ -950,6 +952,22 @@ impl Server {
                 self.peer_hold(id, deployment, keys)
             }
             (Request::PeerRelease { deployment }, Role::Peer) => self.peer_release(id, deployment),
+            (
+                Request::Borrow {
+                    deployment,
+                    session,
+                    owner,
+                },
+                Role::Peer,
+            ) => self.borrow_lend(id, deployment, (*session, *owner)),
+            (
+                Request::Return {
+                    deployment,
+                    session,
+                    owner,
+                },
+                Role::Peer,
+            ) => self.return_lend(id, deployment, (*session, *owner)),
             (
                 Request::Pages {
                     region,
@@ -1133,7 +1151,8 @@ impl Server {
                         memory,
                         part,
                         runs,
-                    } => self.place(&holder, (region, memory, *part), runs),
+                        layout,
+                    } => self.place(&holder, (region, memory, *part), runs, layout.clone()),
                     Request::HostPart {
                         region,
                         part,

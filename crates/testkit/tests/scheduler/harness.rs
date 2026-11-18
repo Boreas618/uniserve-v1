@@ -204,24 +204,11 @@ impl Deployment {
         }
     }
 
-    /// `count` replicas of group [`A`], each with the same roles and phases.
-    pub(crate) fn replicas(mut self, count: usize) -> Self {
+    /// `count` copies of group [`A`] under the one scheduler, each with the same roles and
+    /// phases.
+    pub(crate) fn copies(mut self, count: usize) -> Self {
         let first = self.groups[0].clone();
         self.groups = vec![first; count];
-        self
-    }
-
-    /// Prefill and decode on two groups: [`A`] of the `Prefill` role serving every phase of the
-    /// deployment but decodes and verifications, [`B`] of the `Decode` role serving those.
-    pub(crate) fn disaggregated(mut self) -> Self {
-        let (_, phases) = self.groups[0].clone();
-        let decodes = |phase: &Phase| matches!(phase, Phase::Decode | Phase::Verify);
-        let prefill = phases.iter().copied().filter(|phase| !decodes(phase));
-        let decode = phases.iter().copied().filter(decodes);
-        self.groups = vec![
-            (WorkerGroupRole::Prefill, prefill.collect()),
-            (WorkerGroupRole::Decode, decode.collect()),
-        ];
         self
     }
 
@@ -642,7 +629,7 @@ impl Deployment {
         WorkerGroupConfig {
             id: WorkerGroupId(format!("group-{index}")),
             role: self.groups[index].0,
-            replicas: 1,
+            copies: 1,
             ranks: vec![rank; ranks],
             blocks: self
                 .blocks
@@ -843,6 +830,7 @@ impl Deployment {
             compare_timeout: proto::config::DEFAULT_COMPARE_TIMEOUT,
             nvtx_ranges: false,
             kv_events: Default::default(),
+            roles: Vec::new(),
         }
     }
 }
@@ -1321,6 +1309,22 @@ impl Harness {
         &self.record
     }
 
+    /// The handoffs the scheduler asked the KV program about (`Output::Handoff`), with their
+    /// requests, in the order it asked.
+    pub(crate) fn handoffs(&self) -> Vec<(RequestId, scheduling::kv::Handoff)> {
+        let asked = self.record.iter().filter_map(|output| match output {
+            Output::Handoff(id, handoff) => Some((*id, handoff.clone())),
+            _ => None,
+        });
+        asked.collect()
+    }
+
+    /// Answers request `id`'s handoff with the path the KV program chose, as the engine does
+    /// (`Message::Path`).
+    pub(crate) fn route(&mut self, id: RequestId, path: scheduling::kv::Path) {
+        self.apply(Message::Path(id, path));
+    }
+
     /// Every event the scheduler sent, with its request, in the order it sent them.
     pub(crate) fn sent(&self) -> impl Iterator<Item = &(RequestId, Event)> {
         self.record.iter().flat_map(|output| match output {
@@ -1657,6 +1661,8 @@ pub(crate) fn token(id: u64, prompt_tokens: u32, max_tokens: usize) -> Generatio
         include_stop_token: false,
         generated_token_ids: Vec::new(),
         adapter: 0,
+        hand_off: false,
+        lend: None,
     }
 }
 

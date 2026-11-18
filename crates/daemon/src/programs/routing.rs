@@ -169,5 +169,13 @@ fn check(routing: &Routing, route: Route) -> Result<(), String> {
             decode.id
         ));
     }
+    // A request computed and generated in one place is a mixed replica's: a prefill replica
+    // hands every request off, and a decode replica continues only what another handed off.
+    if route.prefill == route.decode && prefill.role != scheduling::routing::Role::Mixed {
+        return Err(format!(
+            "it computes and generates the request on replica {}, which is not mixed",
+            prefill.id
+        ));
+    }
     Ok(())
 }

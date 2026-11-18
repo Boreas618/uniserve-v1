@@ -201,8 +201,30 @@ impl Recorder {
                 "uniserve_scheduler_queue_wait_max_seconds",
                 seconds(stats.max_queue_wait_us),
             ),
+            (
+                "uniserve_scheduler_queued_prompt_tokens",
+                stats.queued_tokens as f64,
+            ),
         ] {
             self.set(name, &labels, revision, value);
+        }
+        // The KV cache's pages by tier, which a routing or a planning program weighs a
+        // replica's room by.
+        for (tier, pages) in [("device", stats.device_pages), ("host", stats.host_pages)] {
+            let mut labels = labels.clone();
+            labels.insert("tier".to_owned(), tier.to_owned());
+            self.set(
+                "uniserve_kv_cache_used_pages",
+                &labels,
+                revision,
+                pages.used as f64,
+            );
+            self.set(
+                "uniserve_kv_cache_pages",
+                &labels,
+                revision,
+                pages.capacity as f64,
+            );
         }
 
         let cache = &stats.prefix_cache_stats;
@@ -231,14 +253,14 @@ impl Recorder {
                 "uniserve_prefix_cache_peer_hit_tokens_total",
                 cache.peer_hits as f64,
             ),
-            ("uniserve_request_transfers_total", stats.transfers as f64),
+            ("uniserve_request_imports_total", stats.imports as f64),
             (
-                "uniserve_request_transfer_failures_total",
-                stats.failed_transfers as f64,
+                "uniserve_request_import_failures_total",
+                stats.failed_imports as f64,
             ),
             (
-                "uniserve_request_transferred_blocks_total",
-                stats.transferred_blocks as f64,
+                "uniserve_request_imported_blocks_total",
+                stats.imported_blocks as f64,
             ),
             (
                 "uniserve_scheduler_calls_without_blocks_total",
@@ -969,7 +991,7 @@ mod tests {
 
         let moved = rows(
             store,
-            "SELECT count(*) AS n FROM stats WHERE name = 'uniserve_request_transfers_total'",
+            "SELECT count(*) AS n FROM stats WHERE name = 'uniserve_request_imports_total'",
         )
         .await;
         assert_eq!(moved[0]["n"], 0);

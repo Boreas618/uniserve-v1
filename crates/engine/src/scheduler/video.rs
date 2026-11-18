@@ -1276,7 +1276,7 @@ mod tests {
         WorkerGroupConfig {
             id: WorkerGroupId(format!("video-{}", id.0)),
             role: WorkerGroupRole::Model,
-            replicas: 1,
+            copies: 1,
             ranks: vec![rank; 2],
             blocks,
             queue_depth: 2,
@@ -1402,6 +1402,7 @@ mod tests {
             draft_limit: 0,
             last_progress: now,
             dirty: false,
+            path: None,
         }
     }
 
@@ -1515,6 +1516,7 @@ mod tests {
                 completed: (0..ids.len() as u32).collect(),
                 capacity: vec![(4, 4), (5, 7), (6, 10)],
             }],
+            session: 0,
         };
         let configs = served
             .iter()
@@ -1991,6 +1993,7 @@ mod tests {
                 cause,
                 denoised_steps: 0,
                 stored_layout: Vec::new(),
+                lend: None,
             });
             request
         };
@@ -2164,6 +2167,7 @@ mod tests {
                     .map(|(&number, word)| (number, word))
                     .collect(),
             }],
+            session: 0,
         };
 
         let rank = |host: &str| WorkerRank {

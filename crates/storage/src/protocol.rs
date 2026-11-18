@@ -121,9 +121,12 @@
 //! refused or skipped is drained by the head ([`Request::ProgramRecords`]).
 //!
 //! A span's source may lie on another host ([`Region::Remote`]): the
-//! destination host's Transfer Server READs it through NIXL. It asks the
-//! source host's server, over that server's TCP endpoint as a
-//! [`Role::Peer`], to expose the regions ([`Request::Expose`]); that server
+//! destination host's Transfer Server READs it through NIXL. A span's
+//! destination may lie on another host instead, when its source lies on this
+//! one: this host's Transfer Server WRITEs it through NIXL, as a handoff's
+//! push does. Either way it asks the other host's server, over that server's
+//! TCP endpoint as a [`Role::Peer`], to expose the regions
+//! ([`Request::Expose`]); that server
 //! has its own Transfer Server register their allocations with its NIXL
 //! agent ([`Event::Register`], [`Request::Registered`]) and responds with the
 //! agent's metadata and each region's address ([`Response::Exposed`]). The
@@ -131,6 +134,15 @@
 //! ended ([`Request::Unexpose`]), or its connection closes: the source's
 //! Transfer Server then lets the registrations go ([`Event::Deregister`]),
 //! and with them the GPU contexts they held. A peer connection states no
+//!
+//! **Lend.** A handoff's blocks, which a prefill replica's owner lends
+//! (`runtime::Request::Lend`) and a decode replica's owner imports
+//! (`runtime::Request::Import`). A decode replica on another host has its
+//! Storage Server borrow the lend from the lender's ([`Request::Borrow`]),
+//! learning the blocks and where the lender's ranks hold them, and return it
+//! once the import ended ([`Request::Return`]).
+//!
+//! A peer connection states no
 //! credential: the TCP endpoint is unauthenticated, and a host relies on the
 //! isolation of the network it listens on to keep other processes from
 //! reading the host tensors and host copies it serves.
@@ -145,7 +157,7 @@ use crate::runtime::{Open, Opened};
 /// speaks: the one version either accepts. Each process that talks to the
 /// server checks it at its own `Hello`, independently of the other
 /// interfaces it speaks.
-pub const VERSION: u32 = 29;
+pub const VERSION: u32 = 30;
 
 /// How long a server of another host may take to answer a request it answers from what it holds
 /// (a hello, a peer's hold and release, a task's submission or cancellation, a connector's pages):
@@ -694,15 +706,16 @@ pub enum Region {
         bytes: u64,
         offset: u64,
     },
-    /// Storage of another host that this host's Transfer Server READs
-    /// through NIXL: `region`, a retained tensor or a host region's part of
-    /// the caller's deployment, as a client of that host names it, at the
-    /// Storage Server listening at `endpoint` (that server's
-    /// [`Request::Status`], `peer`). Offsets count as they do in `region`. Only a
-    /// span's source lies on another host, since the destination's host
-    /// posts the READ. That host's server checks the region and its
-    /// Transfer Server registers it once the task runs, so a region of
-    /// another deployment, or a span past its end, fails the task instead
+    /// Storage of another host that this host's Transfer Server READs or
+    /// WRITEs through NIXL: `region`, a retained tensor or a host region's
+    /// part of the caller's deployment, as a client of that host names it, at
+    /// the Storage Server listening at `endpoint` (that server's
+    /// [`Request::Status`], `peer`). Offsets count as they do in `region`. A
+    /// span's source lies on another host, and this host posts a READ, or
+    /// its destination does, of a span whose source is this host's, and this
+    /// host posts a WRITE; never both. That host's server checks the region
+    /// and its Transfer Server registers it once the task runs, so a region
+    /// of another deployment, or a span past its end, fails the task instead
     /// of refusing it.
     Remote {
         endpoint: String,
@@ -990,6 +1003,92 @@ pub struct UnitRun {
     pub count: u32,
     pub offset: u64,
     pub bytes: u64,
+}
+
+/// The fields of a KV region's unit, as a rank names its [`UnitRun`]s: each storage holds the
+/// cells of every column, field `{name}/{column}` being one column's cells, one per unit.
+pub mod planes {
+    /// The key and the value planes: a cell is one layer's `[block_size, kv_heads, head_dim]`
+    /// of one page, row-major, the rank's heads `kv_head_offset ..` of the layer's.
+    pub const VALUES: [&str; 2] = ["prefix_cache.key.values", "prefix_cache.value.values"];
+    /// Whether a plane was written: one byte a cell.
+    pub const FLAGS: [&str; 2] = [
+        "prefix_cache.key.initialized",
+        "prefix_cache.value.initialized",
+    ];
+    /// The FP8 scale of a plane: one F32 a cell, over the rank's heads of the plane.
+    pub const SCALES: [&str; 2] = ["prefix_cache.key.scale", "prefix_cache.value.scale"];
+    /// The index keys a layer keeps beside its keys and values, which every rank holds whole.
+    pub const INDEX_KEYS: &str = "prefix_cache.index_key.values";
+
+    /// The field of column `column` of the storage `name`.
+    pub fn field(name: &str, column: u32) -> String {
+        format!("{name}/{column}")
+    }
+}
+
+/// How one rank lays out its part of a KV region's units ([`Request::Place`]): what a handoff
+/// between replicas of two layouts reshards a page's heads by. Layer `k` of a page, in a
+/// class's column order, lies in column `k % columns` of the page's unit `k / columns`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitLayout {
+    /// Columns of one unit.
+    pub columns: u32,
+    /// Per class whose pages lie in the region, how a page of it lies on this rank.
+    pub classes: Vec<PageLayout>,
+}
+
+/// How one rank holds a page of one attention class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageLayout {
+    /// The class, as the session's layout numbers it.
+    pub class: u8,
+    /// Tokens of one page.
+    pub block_size: u32,
+    /// The global ids of the class's layers, in column order.
+    pub layers: Vec<u32>,
+    /// Key and value heads the rank holds of each layer, from `kv_head_offset` on, of the
+    /// layer's `total_kv_heads`.
+    pub kv_heads: u32,
+    pub kv_head_offset: u32,
+    pub total_kv_heads: u32,
+    /// Bytes of one head of one token: its elements times their size.
+    pub head_bytes: u32,
+    /// Whether the planes store FP8 with one scale per plane.
+    pub quantized: bool,
+    /// Bytes of one layer's index keys of one page; zero for layers that keep none.
+    pub index_bytes: u64,
+}
+
+impl PageLayout {
+    /// The units one page takes in a region of `columns` columns.
+    pub fn units(&self, columns: u32) -> u32 {
+        (self.layers.len() as u32).div_ceil(columns.max(1))
+    }
+}
+
+/// The blocks a lent owner holds ([`Request::Borrow`]) and where the ranks of its group hold
+/// their units: per class and position, the block's runs by the names of their regions; per
+/// rank part, its place of the region those runs lie in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lent {
+    pub blocks: Vec<(u8, u32, Vec<NamedRun>)>,
+    pub ranks: Vec<LentRank>,
+}
+
+/// A run of units by the name of its region: the region, the first unit and the count.
+pub type NamedRun = (String, u32, u32);
+
+/// Where one rank of a lent owner's group holds its part of the units of a region: on the host
+/// whose Storage Server listens at `endpoint` (`None` for the host that answers), in the runs
+/// it placed there, laid out as `layout` states.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LentRank {
+    pub region: String,
+    pub part: u32,
+    pub endpoint: Option<String>,
+    pub runs: Vec<UnitRun>,
+    pub layout: Option<UnitLayout>,
 }
 
 /// A host copy another host's Storage Server holds for its reads
@@ -1319,11 +1418,14 @@ pub enum Request {
     /// lies on, as the layout's host parts name it
     /// (`runtime::Group::parts`), with no run: a task reaches a host part
     /// only where a place states it. Responded with [`Response::Placed`].
+    /// A rank of a KV region also states how it lays its part of a unit out (`layout`), which
+    /// a handoff into or out of the region reshards by; `None` for every other region.
     Place {
         region: String,
         memory: String,
         part: u32,
         runs: Vec<UnitRun>,
+        layout: Option<UnitLayout>,
     },
     /// From the head of an epoch whose session is open, on the host: where
     /// the part `part` of the units of the device region `region` lies in
@@ -1342,6 +1444,7 @@ pub enum Request {
         part: u32,
         endpoint: String,
         runs: Vec<UnitRun>,
+        layout: Option<UnitLayout>,
     },
     /// From the head of an epoch whose session is open, on the host: the
     /// engine's ranks created the storages of `segment` of the device
@@ -1404,6 +1507,25 @@ pub enum Request {
     /// connection holds nothing there; the reading host commits what it
     /// read only on `Valid`.
     PeerRelease { deployment: String },
+    /// From another host's Storage Server, which imports a handoff's blocks
+    /// (`runtime::Request::Import`): the blocks the owner `owner` of the session `session` of
+    /// `deployment`'s buffer pool lent (`runtime::Request::Lend`), and where its group's ranks
+    /// hold them. The lend stays until the borrower returns it ([`Request::Return`]) or its
+    /// connection closes, whatever its lease. Responded with [`Response::Borrowed`]; refused
+    /// when no such lend stands.
+    Borrow {
+        deployment: String,
+        session: u32,
+        owner: u64,
+    },
+    /// From another host's Storage Server: the import of a lend it borrowed ended, and the
+    /// lend with it, whose owner is released. Responded with [`Response::Returned`], also for
+    /// a lend that ended before.
+    Return {
+        deployment: String,
+        session: u32,
+        owner: u64,
+    },
     /// From a head of the deployment, which is another host's Storage
     /// Server running a task of its buffer pool that touches the part of a
     /// rank of this host (`specs/buffer-pool.md` §15): have this host's
@@ -1646,6 +1768,12 @@ pub enum Response {
     },
     /// The holds a [`Request::PeerRelease`] ended stood until now.
     Valid,
+    /// What a [`Request::Borrow`] borrowed.
+    Borrowed {
+        lent: Lent,
+    },
+    /// A [`Request::Return`] was taken.
+    Returned,
     /// The connection held nothing to release.
     Gone,
     /// The KV program a [`Request::Program`] set runs, started as `start`;
@@ -1800,7 +1928,7 @@ pub struct GroupListing {
 pub enum Waiting {
     Release,
     Commit,
-    Transfer,
+    Lend,
     Finish,
     /// A crossing (`storage::runtime::Request::Replicate`).
     Replicate,

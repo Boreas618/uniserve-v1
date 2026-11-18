@@ -19,8 +19,8 @@ pub use convert::WireError;
 pub use dtype::ModelDtype;
 pub use event::{
     ArtifactEvent, ArtifactMedia, ConditionExtent, DiffusionRequest, DiffusionRequestError,
-    EncoderInputs, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind,
-    Request, StopReason, Trajectory,
+    EncoderInputs, Event, FinishReason, Lend, MediaKind, MigrationCause, PositionLogprobs,
+    RejectionKind, Request, StopReason, Trajectory,
 };
 pub use generation::{
     CachePolicy, CacheResume, GenerationFeatures, GenerationLimits, GenerationRequest,

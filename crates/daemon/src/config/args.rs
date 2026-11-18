@@ -142,6 +142,68 @@ mod tests {
         Ok((config, engine))
     }
 
+    /// A replica's role is stated by its id, the index of its scheduler, and reaches the
+    /// engine; an id past the replicas, an unknown role, or roles that leave the deployment no
+    /// replica to compute prompts or none to generate tokens are refused.
+    #[test]
+    fn replicas_state_their_roles_by_id() {
+        use proto::config::Role;
+
+        let (_, engine) = lowered(&package(
+            "data_parallel_size = 2
+[replicas.0]
+role = \"prefill\"
+             [replicas.1]
+role = \"decode\"
+",
+        ))
+        .unwrap();
+        assert_eq!(engine.roles, [Role::Prefill, Role::Decode]);
+        let (_, engine) = lowered(&package(
+            "data_parallel_size = 2
+[replicas.1]
+role = \"prefill\"
+",
+        ))
+        .unwrap();
+        assert_eq!(engine.roles, [Role::Mixed, Role::Prefill]);
+
+        let refused = |body: &str| format!("{:#}", lowered(&package(body)).unwrap_err());
+        let past = refused(
+            "data_parallel_size = 2
+[replicas.2]
+role = \"decode\"
+",
+        );
+        assert!(past.contains("`replicas.2` names no replica"), "{past}");
+        let spelled = refused(
+            "[replicas.00]
+role = \"mixed\"
+",
+        );
+        assert!(
+            spelled.contains("`replicas.00` names no replica"),
+            "{spelled}"
+        );
+        assert!(
+            lowered(&package(
+                "[replicas.0]
+role = \"both\"
+"
+            ))
+            .is_err()
+        );
+        let lonely = refused(
+            "data_parallel_size = 2
+[replicas.0]
+role = \"prefill\"
+                              [replicas.1]
+role = \"prefill\"
+",
+        );
+        assert!(lonely.contains("none to generate tokens"), "{lonely}");
+    }
+
     /// Every option is read by its own type: lists are arrays, tables nest, and durations and
     /// sizes are text with units; everything unstated keeps its default.
     #[test]

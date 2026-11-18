@@ -6,7 +6,7 @@ use crate::request::wire;
 
 use super::{
     BaseCacheStats, BlockingCall, DomainSchedulerStats, FenceStep, ForwardStats, KernelLaunch,
-    PrefixCacheStats, ProfileProgress, SchedulerStats, StreamTime,
+    Pages, PrefixCacheStats, ProfileProgress, SchedulerStats, StreamTime,
 };
 
 impl From<&SchedulerStats> for wire::SchedulerStats {
@@ -31,15 +31,36 @@ impl From<&SchedulerStats> for wire::SchedulerStats {
             numerical_faults: stats.numerical_faults,
             domain_stats: stats.domain_stats.iter().map(Into::into).collect(),
             calls_without_blocks: stats.calls_without_blocks,
-            transfers: stats.transfers,
-            failed_transfers: stats.failed_transfers,
-            transferred_blocks: stats.transferred_blocks,
+            imports: stats.imports,
+            failed_imports: stats.failed_imports,
+            imported_blocks: stats.imported_blocks,
             preempted_requests: stats.preempted_requests,
             evicted_blocks: stats.evicted_blocks,
             given_up_draft_blocks: stats.given_up_draft_blocks,
             steps: stats.steps,
             policy_calls: stats.policy_calls,
             policy_fuel: stats.policy_fuel,
+            queued_tokens: stats.queued_tokens,
+            device_pages: Some(stats.device_pages.into()),
+            host_pages: Some(stats.host_pages.into()),
+        }
+    }
+}
+
+impl From<Pages> for wire::Pages {
+    fn from(pages: Pages) -> Self {
+        Self {
+            used: pages.used,
+            capacity: pages.capacity,
+        }
+    }
+}
+
+impl From<wire::Pages> for Pages {
+    fn from(pages: wire::Pages) -> Self {
+        Self {
+            used: pages.used,
+            capacity: pages.capacity,
         }
     }
 }
@@ -68,15 +89,19 @@ impl From<wire::SchedulerStats> for SchedulerStats {
             numerical_faults: stats.numerical_faults,
             domain_stats: stats.domain_stats.into_iter().map(Into::into).collect(),
             calls_without_blocks: stats.calls_without_blocks,
-            transfers: stats.transfers,
-            failed_transfers: stats.failed_transfers,
-            transferred_blocks: stats.transferred_blocks,
+            imports: stats.imports,
+            failed_imports: stats.failed_imports,
+            imported_blocks: stats.imported_blocks,
             preempted_requests: stats.preempted_requests,
             evicted_blocks: stats.evicted_blocks,
             given_up_draft_blocks: stats.given_up_draft_blocks,
             steps: stats.steps,
             policy_calls: stats.policy_calls,
             policy_fuel: stats.policy_fuel,
+            queued_tokens: stats.queued_tokens,
+            // An absent message states no page, as Protobuf states every absent scalar as zero.
+            device_pages: stats.device_pages.unwrap_or_default().into(),
+            host_pages: stats.host_pages.unwrap_or_default().into(),
         }
     }
 }

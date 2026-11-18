@@ -73,6 +73,10 @@ impl VideoStreamError {
                 kind: RejectionKind::Overloaded,
                 ..
             } => "server_overloaded",
+            Self::Rejected {
+                kind: RejectionKind::Role,
+                ..
+            } => "replica_unavailable",
             Self::Failed { .. } => "generation_failed",
             Self::Ended { .. } | Self::Cancelled => "generation_terminated",
             Self::MissingArtifact => "missing_artifact",

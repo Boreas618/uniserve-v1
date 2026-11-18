@@ -27,7 +27,7 @@
 //! entries its owner holds, so a `Commit` follows the completion that gave its block, and in some
 //! recordings a batch that wrote it; the answer to a copy's `Finish` arrives once `completed`
 //! reached the batch that ran the copy. A completion that gives an owner entries is dropped when
-//! the owner's `Detach` or `Transfer` was handed before it (§9, obligation 1); a copy's completion
+//! the owner's `Detach` or `Lend` was handed before it (§9, obligation 1); a copy's completion
 //! is still handed, so the copy runs and ends.
 //!
 //! ## The interleavings
@@ -48,7 +48,7 @@
 //!
 //! 1. At every batch on every rank, the tables and the device table the runner wrote from their
 //!    changes hold exactly the runs the completions handed before the batch gave, at the positions
-//!    their requests named, less the entries the `Release`, `Detach` and `Transfer` handed before
+//!    their requests named, less the entries the `Release`, `Detach` and `Lend` handed before
 //!    it took away.
 //! 2. Every stamped request returns with the number of batches handed before it: the group's
 //!    launched sequence when every rank applied it. By 1, no batch numbered above the stamp reads
@@ -58,7 +58,7 @@
 //!    word the buffer pool reads have not reached the batch; after every step, both equal the last
 //!    batch every rank has ended.
 //! 4. An entry is writable exactly when it came from `Allocated`, `Cloned` or a private block of
-//!    `Transferred` and no `Commit` named it since; a batch resets only units `Allocated` gave since
+//!    `Imported` and no `Commit` named it since; a batch resets only units `Allocated` gave since
 //!    the rank's previous batch whose entry is still writable, since a reset writes them; it starts
 //!    every copy handed and neither started nor given up, and no other; the destination of a copy
 //!    is no entry until the copy's answer gives it.
@@ -99,9 +99,6 @@ const HOST: u8 = 1;
 /// move a few units together, far within the workers' copy budget, so every batch starts every
 /// copy handed before it.
 const UNIT_BYTES: [(u8, u64); 2] = [(KV, 256), (HOST, 256)];
-
-/// The group an owner moves to or comes from.
-const ELSEWHERE: GroupId = GroupId(4);
 
 /// The one class of the recordings, and the slots their owners are kept under.
 const CLASS: u8 = 0;
@@ -277,23 +274,25 @@ fn store(id: u64, from: Run, to: Run) -> Hand {
     map(0, id, request, copied(id, from, to))
 }
 
-/// The owner arriving from another group into `slot` with `entries`: per position, its unit and
-/// whether its block is private.
-fn moved_in(id: u64, owner: u64, slot: u32, entries: &[(u32, u32, bool)]) -> Hand {
-    let request = Request::Transfer {
-        trace: 0,
+/// The import of a lend into owner `owner`'s positions from 0 on, in `slot`: per position, the
+/// unit of the block it filled, which the owner may write.
+fn imported(id: u64, owner: u64, slot: u32, units: &[u32]) -> Hand {
+    let request = Request::Import {
         owner: OwnerId(owner),
-        group: GROUP,
-        after: vec![(ELSEWHERE, 1)],
+        tables: vec![(CLASS, 0, units.len() as u32)],
+        lender: storage::runtime::Lender {
+            endpoint: None,
+            session: 1,
+            owner: OwnerId(9),
+        },
+        push: false,
+        trace: 0,
     };
-    let transferred = Completion::Transferred {
-        slot,
-        runs: entries
-            .iter()
-            .map(|&(position, unit, private)| (CLASS, position, (KV, unit, 1), private))
-            .collect(),
+    let filled = Completion::Imported {
+        runs: units.iter().map(|&unit| (KV, unit, 1)).collect(),
+        evicted: Vec::new(),
     };
-    map(slot, id, request, transferred)
+    map(slot, id, request, filled)
 }
 
 fn release(owner: u64, at: u32, count: u32) -> Hand {
@@ -324,12 +323,11 @@ fn detach(owner: u64) -> Hand {
     })
 }
 
-/// The owner leaving for another group.
-fn moved_out(owner: u64) -> Hand {
-    Hand::Stamp(Request::Transfer {
-        trace: 0,
+/// The owner lending its blocks to a handoff.
+fn lent(owner: u64) -> Hand {
+    Hand::Stamp(Request::Lend {
         owner: OwnerId(owner),
-        group: ELSEWHERE,
+        lease: 1_000,
         after: Vec::new(),
     })
 }
@@ -426,22 +424,23 @@ fn give_up_store() -> Vec<Event> {
     ]
 }
 
-/// Owner 1 in slot 1 holds an allocated block and moves to another group (`Transfer`); owner 2
-/// arrives in slot 2 from another group with a shared and a private block (`Transferred`), and a
-/// `Release` takes the shared one away.
-fn transfer() -> Vec<Event> {
+/// Owner 1 in slot 1 holds an allocated block and lends it to a handoff (`Lend`); owner 2, in
+/// slot 2, imports a lend into two blocks of its own (`Imported`), whose units no batch resets,
+/// and a `Release` takes one away.
+fn handoff() -> Vec<Event> {
     use Need::Handed;
 
     vec![
         event("attach", attach(1, 1, 1), &[]),
         event("allocate", allocate(2, 1, 1, 0, &[10]), &[Handed("attach")]),
+        event("attach-2", attach(3, 2, 2), &[]),
         event(
-            "moved-in",
-            moved_in(3, 2, 2, &[(0, 40, false), (1, 41, true)]),
-            &[],
+            "imported",
+            imported(4, 2, 2, &[40, 41]),
+            &[Handed("attach-2")],
         ),
-        event("release", release(2, 0, 1), &[Handed("moved-in")]),
-        event("moved-out", moved_out(1), &[Handed("allocate")]),
+        event("release", release(2, 0, 1), &[Handed("imported")]),
+        event("lent", lent(1), &[Handed("allocate")]),
         event("b1", Hand::Batch, &[]),
         event("b2", Hand::Batch, &[Handed("b1")]),
     ]
@@ -453,7 +452,7 @@ fn named(request: &Request) -> Option<u64> {
         Request::Attach { owner, .. }
         | Request::Allocate { owner, .. }
         | Request::Pin { owner, .. }
-        | Request::Transfer { owner, .. }
+        | Request::Import { owner, .. }
         | Request::Load { owner, .. }
         | Request::Clone { owner, .. } => Some(owner.0),
         _ => None,
@@ -477,12 +476,10 @@ fn gives(recording: &[Event], index: usize) -> Option<u64> {
     }
 }
 
-/// The owner a stamped request takes every entry of: a `Detach`, or a `Transfer` away.
+/// The owner a stamped request takes every entry of: a `Detach`, or a `Lend`.
 fn leaves(hand: &Hand) -> Option<u64> {
     match hand {
-        Hand::Stamp(Request::Detach { owner, .. } | Request::Transfer { owner, .. }) => {
-            Some(owner.0)
-        }
+        Hand::Stamp(Request::Detach { owner, .. } | Request::Lend { owner, .. }) => Some(owner.0),
         _ => None,
     }
 }
@@ -756,10 +753,12 @@ impl Expected {
                     self.give(owner.0, slot, (*class, at + index, *run, false));
                 }
             }
-            (Request::Transfer { owner, .. }, Completion::Transferred { slot, runs }) => {
-                self.slots.insert(owner.0, *slot);
-                for entry in runs {
-                    self.give(owner.0, *slot, *entry);
+            (Request::Import { owner, tables, .. }, Completion::Imported { runs, .. }) => {
+                let positions = tables
+                    .iter()
+                    .flat_map(|&(class, at, count)| (at..at + count).map(move |at| (class, at)));
+                for ((class, position), run) in positions.zip(runs) {
+                    self.give(owner.0, slot, (class, position, *run, true));
                 }
             }
             (
@@ -808,7 +807,7 @@ impl Expected {
                     *holder != owner.0 || held != *class || !released.contains(&position)
                 });
             }
-            Request::Detach { owner, .. } | Request::Transfer { owner, .. } => {
+            Request::Detach { owner, .. } | Request::Lend { owner, .. } => {
                 self.slots.remove(&owner.0);
                 self.entries.retain(|_, (.., holder)| *holder != owner.0);
                 self.awaited.retain(|_, (holder, _)| *holder != owner.0);
@@ -887,7 +886,7 @@ impl View {
         if seen.tables != self.tables {
             return Err(format!(
                 "obligation 4: {at} may write {:?}; only {:?} came from `Allocated`, `Cloned` or \
-                 a private block of `Transferred` with no `Commit` since",
+                 `Imported` with no `Commit` since",
                 writable(&seen.tables),
                 writable(&self.tables)
             ));
@@ -1370,7 +1369,7 @@ fn stamped(request: &Request, stamps: Stamps) -> Request {
         Request::Detach { after, .. }
         | Request::Release { after, .. }
         | Request::Commit { after, .. }
-        | Request::Transfer { after, .. }
+        | Request::Lend { after, .. }
         | Request::Finish { after, .. } => *after = stamps,
         _ => {}
     }
@@ -1673,14 +1672,14 @@ fn a_copy_given_up_before_a_batch_starts_it_never_runs_with_steps_in_flight() {
     replay_all(&give_up_store(), 3_528, Turns::Two);
 }
 
-/// 1,260 interleavings, with a batch held in its one turn.
+/// 3,360 interleavings, with a batch held in its one turn.
 #[test]
-fn an_owner_moving_in_brings_its_entries_and_one_moving_out_takes_them() {
-    replay_all(&transfer(), 1_260, Turns::One);
+fn an_import_brings_writable_entries_and_a_lend_takes_its_owner_s() {
+    replay_all(&handoff(), 3_360, Turns::One);
 }
 
-/// The same 1,260 interleavings, with each step in flight across two turns.
+/// The same 3,360 interleavings, with each step in flight across two turns.
 #[test]
-fn an_owner_moving_in_brings_its_entries_and_one_moving_out_takes_them_with_steps_in_flight() {
-    replay_all(&transfer(), 1_260, Turns::Two);
+fn an_import_brings_writable_entries_and_a_lend_takes_its_owner_s_with_steps_in_flight() {
+    replay_all(&handoff(), 3_360, Turns::Two);
 }

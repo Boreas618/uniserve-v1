@@ -25,10 +25,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ANSWER, Claim, Claimant, ClientMessage, Event, Hello, HostCopy, Item, Key, KvProgram, Link,
-    Listing, Location, Mode, Priority, ProgramRecord, ProgramStart, Quota, Refusal, Region,
+    ANSWER, Claim, Claimant, ClientMessage, Event, Hello, HostCopy, Item, Key, KvProgram, Lent,
+    Link, Listing, Location, Mode, Priority, ProgramRecord, ProgramStart, Quota, Refusal, Region,
     RegionPart, Registration, Request, Response, Role, Scope, Segment, ServerMessage, Span,
-    StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitRun, Usage, VERSION, Welcome,
+    StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitLayout, UnitRun, Usage,
+    VERSION, Welcome,
 };
 use crate::queue::QueueDescriptors;
 use crate::runtime::{Open, Opened};
@@ -737,12 +738,14 @@ impl Client {
         memory: String,
         part: u32,
         runs: Vec<UnitRun>,
+        layout: Option<UnitLayout>,
     ) -> Result<()> {
         let request = Request::Place {
             region,
             memory,
             part,
             runs,
+            layout,
         };
         match self.request(&request, &[])?.0 {
             Response::Placed => Ok(()),
@@ -760,6 +763,7 @@ impl Client {
         part: u32,
         endpoint: String,
         runs: Vec<UnitRun>,
+        layout: Option<UnitLayout>,
     ) -> Result<()> {
         let request = Request::PlaceRemote {
             region,
@@ -767,6 +771,7 @@ impl Client {
             part,
             endpoint,
             runs,
+            layout,
         };
         match self.request(&request, &[])?.0 {
             Response::Placed => Ok(()),
@@ -856,6 +861,33 @@ impl Client {
             Response::Valid => Ok(true),
             Response::Gone => Ok(false),
             other => Err(unexpected("peer release", &other)),
+        }
+    }
+
+    /// See [`Request::Borrow`]: the blocks the owner `owner` of the session `session` of
+    /// `deployment`'s buffer pool lent, which this connection holds until it returns them.
+    pub fn borrow(&mut self, deployment: String, session: u32, owner: u64) -> Result<Lent> {
+        let request = Request::Borrow {
+            deployment,
+            session,
+            owner,
+        };
+        match self.request(&request, &[])?.0 {
+            Response::Borrowed { lent } => Ok(lent),
+            other => Err(unexpected("borrow", &other)),
+        }
+    }
+
+    /// See [`Request::Return`]: the import of the lend of `session`'s owner `owner` ended.
+    pub fn give_back(&mut self, deployment: String, session: u32, owner: u64) -> Result<()> {
+        let request = Request::Return {
+            deployment,
+            session,
+            owner,
+        };
+        match self.request(&request, &[])?.0 {
+            Response::Returned => Ok(()),
+            other => Err(unexpected("return", &other)),
         }
     }
 
