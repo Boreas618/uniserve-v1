@@ -8,9 +8,9 @@
 //! nor a model.
 //!
 //! `main` parses the command line and runs its command: `serve` (a node's
-//! daemon, and on the leader the application, [`serve`]), `keys` (a
-//! deployment's recorded key list, [`keys`]), and a deployment's servers
-//! `storage-server` and `build-server`, whose commands are their crates' own.
+//! daemon, and on the leader the application, [`serve`]) and a deployment's
+//! servers `storage-server` and `build-server`, whose commands are their
+//! crates' own.
 //! `serve` installs tracing and builds the Tokio runtime; its module hands the
 //! policy package it reads to `daemon::serve` with a cancellation token that
 //! fires on Ctrl-C or SIGTERM. A deployment's servers run before any thread exists,
@@ -20,7 +20,6 @@
 //! command that starts threads takes them from here.
 
 mod cli;
-mod keys;
 mod serve;
 
 use anyhow::{Context, Result};
@@ -70,7 +69,6 @@ fn main() -> Result<std::process::ExitCode> {
     let cli = <Cli as clap::Parser>::parse();
     match cli.command {
         Command::Serve(args) => serve::run(*args, &cli.log),
-        Command::Keys(args) => keys::run(&args.package, &cli.log),
         Command::StorageServer(args) => storage_server::command::run(*args, &cli.log.levels())
             .map(|()| std::process::ExitCode::SUCCESS),
         Command::BuildServer(args) => {

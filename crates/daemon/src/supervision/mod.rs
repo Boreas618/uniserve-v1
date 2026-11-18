@@ -24,7 +24,6 @@ mod service;
 mod supervisor;
 
 pub(crate) use service::{ServiceHandoff, readable};
-pub(crate) use supervisor::engine_executable;
 
 /// The kernel's name of the executable image this process runs. The servers a daemon starts for
 /// its deployment (the Build Server and the Storage Server) are commands of the running build, so the daemon

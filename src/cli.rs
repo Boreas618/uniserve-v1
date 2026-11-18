@@ -2,14 +2,13 @@
 //!
 //! One executable runs every UniServe process, each as a command. The public
 //! commands are `serve` (a node's daemon, and on the leader the application),
-//! `keys` (the key list a deployment's main processes launch),
 //! `storage-server` (a deployment's Storage Server on a node) and `build-server`
 //! (a deployment's Build Server on a node); their commands are their crates' own
 //! (`storage_server::command`, `build_server::command`). `engine` (a node's
 //! main process for one epoch) is started by the daemon and hidden from the
 //! help. The binary's own options, its log levels, are global; each command
-//! declares its own. `serve` and `keys` take a policy package, a directory
-//! whose `config.toml` is the deployment's whole configuration
+//! declares its own. `serve` takes a policy package, a directory whose
+//! `config.toml` is the deployment's whole configuration
 //! (`daemon::policy::Package`); no option comes from the command line.
 
 use std::path::PathBuf;
@@ -63,12 +62,6 @@ pub(crate) enum Command {
     /// package lists none) applies the package and serves the OpenAI API, and every other node
     /// joins it. While it serves, `PUT /admin/policy` applies another package.
     Serve(Box<ServeArgs>),
-    /// Print the modules the main processes of the package in PACKAGE launch, as the key list
-    /// `uniserve build-server build --keys` reads (`operator<TAB>key` lines, sorted, each
-    /// once), and exit. Starts the deployment's ranks on this node's devices as `serve` does,
-    /// loading the model from its checkpoint's headers; no weight is read, and no daemon,
-    /// Storage Server or communicator is started.
-    Keys(Box<KeysArgs>),
     /// The Storage Server of this host and the operator's commands against
     /// it.
     StorageServer(Box<storage_server::command::Args>),
@@ -94,14 +87,6 @@ pub(crate) struct ServeArgs {
     /// it takes over, as a daemon restart starts its successor (`daemon::restart`).
     #[arg(long, hide = true, value_name = "FD")]
     pub predecessor: Option<i32>,
-}
-
-/// `uniserve keys`'s arguments.
-#[derive(Debug, Args)]
-pub(crate) struct KeysArgs {
-    /// The policy package whose deployment's keys are recorded.
-    #[arg(value_name = "PACKAGE")]
-    pub package: PathBuf,
 }
 
 #[cfg(test)]
@@ -142,14 +127,12 @@ mod tests {
     fn each_process_is_a_command() {
         for (args, expected) in [
             (vec!["uniserve", "serve", "model"], "serve"),
-            (vec!["uniserve", "keys", "model"], "keys"),
             (vec!["uniserve", "storage-server", "list"], "storage-server"),
             (vec!["uniserve", "build-server", "list"], "build-server"),
         ] {
             let cli = Cli::try_parse_from(args).expect("parses");
             let name = match cli.command {
                 Command::Serve(_) => "serve",
-                Command::Keys(_) => "keys",
                 Command::StorageServer(_) => "storage-server",
                 Command::BuildServer(_) => "build-server",
             };

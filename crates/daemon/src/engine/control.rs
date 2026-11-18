@@ -1563,29 +1563,6 @@ pub(crate) struct Interfaces<'a> {
     pub(crate) build_server: &'a Path,
 }
 
-/// The launch file's contents for the scheduler node's process `engine`: `args`, with the
-/// process's place in the deployment (its devices, group, first rank and world) and the interfaces
-/// `interfaces` states. The scheduler node is the deployment's engine host.
-///
-/// A value the file requires and the daemon cannot state is an error here
-/// rather than a default: the engine refuses a launch file that lacks one,
-/// and a default would be a fact the daemon invented about the process.
-///
-/// # Errors
-///
-/// Fails for a configuration of no model, ranks the engine host does not lead
-/// ([`world_hosts`]), a rank on a device that is not CUDA's, and a queue depth
-/// the file cannot hold.
-pub(crate) fn place(
-    args: EngineArgs,
-    engine: u64,
-    interfaces: &Interfaces<'_>,
-) -> anyhow::Result<EngineArgs> {
-    let hosts = world_hosts(&args.engine_config)?;
-    let world_size = world_size(&args.engine_config)?;
-    place_on(args, engine, interfaces, &hosts[0], world_size)
-}
-
 /// The launch files of the world of `args`, one engine per host of its worker groups in
 /// [`world_hosts`]'s order (the scheduler node's first), numbered `numbers`: each process with its
 /// host's place in a world of every rank of the deployment ([`world_size`]), all in the epoch of
@@ -1723,6 +1700,10 @@ fn world_size(config: &proto::config::EngineConfig) -> anyhow::Result<u32> {
 /// The launch file's contents for the process `engine` on `host`, in a world of `world_size`
 /// ranks: `args`, with the process's place and the interfaces `interfaces` states. The node that
 /// starts it states its own Build Server (`Spawn::launch`).
+///
+/// A value the file requires and the daemon cannot state is an error here rather than a default:
+/// the engine refuses a launch file that lacks one, and a default would be a fact the daemon
+/// invented about the process.
 fn place_on(
     mut args: EngineArgs,
     engine: u64,
@@ -1825,7 +1806,10 @@ mod tests {
             build_server: Path::new(""),
         };
 
-        let placed = place(args, 1, &interfaces).expect("the process places");
+        let [placed] = place_world(args, &[1], &interfaces)
+            .expect("the process places")
+            .try_into()
+            .expect("one host, one process");
         assert_eq!(placed.devices, vec![6, 7]);
         assert_eq!(placed.host, "rank-0");
         assert_eq!(placed.engine, 1);

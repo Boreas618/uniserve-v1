@@ -14,9 +14,8 @@
 //! none. A child process of the same deployment is given its parent's level on its own command
 //! line ([`arguments`]).
 //!
-//! The daemon and the engine log to stdout. A command whose own output is stdout
-//! (`uniserve keys`) and a deployment's server, whose standard error is the log beside its
-//! socket, log to stderr ([`Output`]). ANSI colors follow the `fmt` layer's default: they are on unless
+//! The daemon and the engine log to stdout. A deployment's server, whose standard error is the
+//! log beside its socket, logs to stderr ([`Output`]). ANSI colors follow the `fmt` layer's default: they are on unless
 //! `NO_COLOR` is set to a non-empty value, with no terminal detection, so redirected output also
 //! carries escape sequences.
 

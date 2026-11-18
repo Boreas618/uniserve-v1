@@ -198,7 +198,7 @@ pub(crate) struct Supervisor {
 /// a store that lost the module builds it again first. A module of another version of the
 /// engine interface than this daemon's ([`proto::ENGINE_INTERFACE_VERSION`]) is refused here,
 /// before a process starts.
-pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
+fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
     let engine = &launch.modules.engine;
     let named = format!(
         "the engine package {} revision {}",

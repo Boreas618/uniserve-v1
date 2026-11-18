@@ -10,9 +10,7 @@
 //! and serves until its daemon commands it down or the epoch fails. [`serve`]
 //! is the same control thread over two given connections and a [`Start`], the
 //! function that builds the started epoch ([`Engine`]): the binary's loads
-//! ranks, a test's builds fakes. [`record`] runs the start to the point where
-//! every device has recorded the packages its runners launch, and serves
-//! nothing.
+//! ranks, a test's builds fakes.
 //!
 //! ## The modules, by the thread that runs them
 //!
@@ -40,6 +38,5 @@ pub mod scheduler;
 pub mod worker;
 
 pub use process::ranks::text_layout;
-pub use process::record::{Recorded, record};
 pub use process::{Engine, Failed, Start, connect, run, serve};
 pub use scheduler::Error;

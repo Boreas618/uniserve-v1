@@ -27,9 +27,7 @@
 //!   `events` tables queried with SQL;
 //! - `programs`: the policy package's programs the leader runs or hands the Storage Servers;
 //! - `restart`: the hot restart that hands a deployment to a successor
-//!   daemon;
-//! - `keys`: the launches of a deployment's main processes for a start
-//!   that records the modules they launch (`uniserve keys`).
+//!   daemon.
 
 pub mod api;
 pub mod config;
@@ -38,7 +36,6 @@ pub mod epoch;
 pub mod experts;
 pub mod http;
 mod interference;
-pub mod keys;
 mod leader;
 pub mod metrics;
 pub mod migration;

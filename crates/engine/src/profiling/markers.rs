@@ -113,9 +113,8 @@ pub(crate) fn classes(profiling: &ProfilingConfig, step_stack: &str) -> Vec<Stri
         .unwrap_or_else(|| vec![step_stack.to_owned()])
 }
 
-/// The kernels a process launches for its markers, by operator, as a recorded start states the
-/// kernels it launches and the module load selects their packages: the `range_marker` package's
-/// stamp and clock kernels.
+/// The kernels a process launches for its markers, by operator, as the module load selects their
+/// packages: the `range_marker` package's stamp and clock kernels.
 pub(crate) fn keys() -> BTreeMap<String, BTreeSet<String>> {
     BTreeMap::from([(
         proto::module::operator::RANGE_MARKER.to_owned(),

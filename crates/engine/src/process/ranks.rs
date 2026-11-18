@@ -54,8 +54,8 @@
 //! steps over owners that hold no device: its loads stop after the profile run, its "segments"
 //! are statements of units with no memory behind them, the multiprocessors a member of an expert
 //! union shapes its exchange for are what the start states of the device each rank stands in
-//! for, and it serves generation [`FIRST_GENERATION`] of no kernel. That is what a recorded start
-//! reads and what the engine's host tests start.
+//! for, and it serves generation [`FIRST_GENERATION`] of no kernel. That is what a launch on the
+//! meta device and the engine's host tests start.
 
 pub(crate) mod rank;
 

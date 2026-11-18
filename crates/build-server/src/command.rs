@@ -146,7 +146,10 @@ pub enum Command {
 /// The arguments of `build`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct BuildArgs {
-    /// A key list, `operator<TAB>descriptor key` per line; repeatable.
+    /// A key list, `operator<TAB>descriptor key` per line, such as a
+    /// deployment's kernel inventory (the `op` and `descriptor` labels of its
+    /// `uniserve_kernel_launches_total` stats, read with `/admin/query`);
+    /// repeatable.
     #[arg(long = "keys", value_name = "FILE")]
     pub keys: Vec<PathBuf>,
     /// The directory of a package that fills a whole interface with one

@@ -10,15 +10,10 @@
 //! the daemon is gone ([`follow_lifeline`]). The process states the settings its
 //! CUDA and NCCL libraries read at initialization itself ([`RUNTIME_SETTINGS`]).
 //!
-//! With `--keys` the process runs the same start up to the profile run of
-//! every device's runners, prints the kernel keys they recorded as the key
-//! list `uniserve build-server build --keys` reads, and serves nothing.
-//!
 //! The engine names no concrete model: the executable loads the families
 //! `models` registers ([`models::FAMILIES`]), and the library dispatches by
 //! capability.
 
-use std::io::Write as _;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
@@ -64,11 +59,6 @@ struct Cli {
     /// daemon holds. The process ends once the pipe does.
     #[arg(long, value_name = "FD")]
     lifeline: Option<i32>,
-    /// Print the kernel keys this launch's profile runs record
-    /// (`operator<TAB>key` lines, sorted, each once) and exit, serving
-    /// nothing.
-    #[arg(long)]
-    keys: bool,
     /// Log level of every target (tracing's names: `off`, `error`, `warn`, `info`, `debug`,
     /// `trace`), `info` when unset; the daemon passes its own.
     #[arg(long)]
@@ -82,24 +72,6 @@ fn main() -> Result<ExitCode> {
     let lifeline = cli.lifeline.map(take_lifeline);
     let launch = read_launch(cli.launch)?;
     let registry = nn::family::Registry::new(models::FAMILIES.iter().copied())?;
-
-    if cli.keys {
-        // The key list is this command's output, so its logs go to standard
-        // error.
-        logging::init(
-            "Engine",
-            &logging::Levels::new(cli.log_level),
-            logging::Output::Stderr,
-        );
-        let recorded = engine::record(&launch, &registry)?;
-        let list = build_server::build::key_list(&recorded)?;
-        let mut stdout = std::io::stdout().lock();
-        stdout
-            .write_all(list.as_bytes())
-            .and_then(|()| stdout.flush())
-            .context("writing the key list")?;
-        return Ok(ExitCode::SUCCESS);
-    }
 
     follow_lifeline(lifeline);
     // A rank receives and creates a descriptor per part of its KV region's segments.

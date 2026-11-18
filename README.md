@@ -223,7 +223,7 @@ A change may also be a `signal` with a `host`, sent to the one process of this u
 The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and its workers divide the work, how a main process's threads divide it, and how a request travels through them.
 
 ```text
-src/                    The root package, `uniserve`: the command line, logging, the `serve` and `keys` commands, and `main.rs`, which dispatches every command; the base executable holds the daemon, the Storage Server and the Build Server, and links no engine or model
+src/                    The root package, `uniserve`: the command line, logging, the `serve` command, and `main.rs`, which dispatches every command; the base executable holds the daemon, the Storage Server and the Build Server, and links no engine or model
 crates/engine/          The main process of a node and epoch: its control thread, one scheduler per data-parallel rank, the executor each scheduler hands its batches to, the batch vocabulary, the peer link, one worker thread per device with its runners, graphs and memory owners, the client of the Storage Server, and the catalogue that resolves a checkpoint to its model family
 crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf), and the video condition vocabulary
 crates/scheduling/      The scheduling interface between the scheduler's mechanism and its policy, and the policy package under `policies/` (`arrival`), compiled to WebAssembly
