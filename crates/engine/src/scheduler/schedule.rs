@@ -278,8 +278,13 @@ impl Scheduler {
             self.prefetch(RequestId(prefetch.0));
         }
 
-        // 2. Then the waiting queue, in the policy's order, unless the scheduler drains.
-        if self.draining.is_none() {
+        // 2. Then the waiting queue, in the policy's order, unless the scheduler drains with a
+        // deadline: a complete drain admits what it holds in its turn.
+        if self
+            .draining
+            .as_ref()
+            .is_none_or(|(_, _, deadline, _)| deadline.is_none())
+        {
             for reject in &output.reject {
                 let kind = RejectionKind::Overloaded;
                 self.reject_waiting(RequestId(reject.0), kind, POLICY_REJECTED);

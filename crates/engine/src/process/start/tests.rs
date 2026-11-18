@@ -92,7 +92,7 @@ fn open_admission(engine: &Engine) {
 /// Drains `engine` beside an epoch of the same layout, which keeps the regions the two share
 /// (`Drain` without `shrink`), and waits until every scheduler holds no request.
 fn drain_beside(engine: &Engine) {
-    for reply in drain(&engine.inboxes(), Instant::now() + LONG, false).unwrap() {
+    for reply in drain(&engine.inboxes(), Some(Instant::now() + LONG), false).unwrap() {
         reply.recv_timeout(LONG).unwrap();
     }
 }

@@ -710,6 +710,54 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// A new request is processed by the processor that serves when it arrives: once an epoch of
+    /// model files that process requests otherwise replaced it, the same request renders with
+    /// the replacement's chat template (here one that repeats the message), and a rollback's
+    /// return to the former processor renders it as before.
+    #[tokio::test]
+    async fn a_request_is_processed_by_the_processor_that_serves_when_it_arrives() {
+        let leader = Arc::new(served_engine(crate::test_support::CHAT));
+        let app = router(Arc::clone(&leader));
+        let prompt_tokens = || async {
+            let (status, _, body) = send(
+                &app,
+                post_json("/v1/chat/completions", &chat_body(2, false)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["usage"]["prompt_tokens"].as_u64().unwrap()
+        };
+        let before = prompt_tokens().await;
+
+        let limits = leader.replicas()[0]
+            .hold()
+            .client()
+            .expect("the replica serves")
+            .info()
+            .limits
+            .clone();
+        let repeating = crate::api::input::Processor::new(
+            crate::test_support::test_model(crate::test_support::CHAT),
+            crate::api::test_support::configured_tokenizer(),
+            crate::api::input::RequestRenderer::Chat(
+                crate::api::input::chat::HfChatRenderer::new(
+                    Some("{{ messages[0].content }}{{ messages[0].content }}".to_owned()),
+                    std::collections::HashMap::new(),
+                    Some(crate::config::ChatTemplateContentFormat::String),
+                )
+                .unwrap(),
+            ),
+            limits,
+            false,
+        )
+        .unwrap();
+        let former = leader.replicas.process_with(Arc::new(repeating));
+        assert_eq!(prompt_tokens().await, 2 * before);
+
+        leader.replicas.process_with(former);
+        assert_eq!(prompt_tokens().await, before);
+    }
+
     /// A configuration whose adapter takes the served model's name, or whose profiling session
     /// runs no collector, is refused as a start refuses it.
     #[test]

@@ -71,7 +71,7 @@ pub mod handoff {
 /// that interface's hello: the Storage Server's protocol
 /// (`storage::protocol::VERSION`) at the Storage Server, the buffer pool's
 /// runtime interface (`storage::runtime::VERSION`) when a session opens.
-pub const ENGINE_INTERFACE_VERSION: u32 = 12;
+pub const ENGINE_INTERFACE_VERSION: u32 = 13;
 
 impl process::Refusal {
     /// The refusal of a peer whose hello states version `offered` of the engine

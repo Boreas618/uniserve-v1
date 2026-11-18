@@ -161,9 +161,11 @@ pub enum Message {
     /// Form no batch; the reply is sent once nothing is in flight.
     Pause(Sender<()>),
     Resume,
-    /// Admit nothing; running requests end or migrate for the cause by the deadline; with
-    /// `true`, give device memory back by `Resize`. The reply is sent once no request remains.
-    Drain(MigrationCause, Instant, bool, Sender<()>),
+    /// Admit nothing new; running requests end or migrate for the cause by the deadline, and with
+    /// no deadline every request held runs to its end, the queued ones admitted in their turn;
+    /// with `true`, give device memory back by `Resize`. The reply is sent once no request
+    /// remains.
+    Drain(MigrationCause, Option<Instant>, bool, Sender<()>),
     /// A policy generation that serves from the next step; the reply is the outcome of its
     /// instantiation, and the serving policy is untouched on failure.
     SetPolicy(Arc<wasmtime::Module>, Parameters, Sender<Result<(), Error>>),
@@ -450,8 +452,9 @@ pub struct Scheduler {
     closing: bool,
     /// The replies owed to `Pause` once nothing is in flight.
     boundary: Vec<Sender<()>>,
-    /// The reply, cause, deadline and whether memory is given back, of a drain under way.
-    draining: Option<(Sender<()>, MigrationCause, Instant, bool)>,
+    /// The reply, cause, deadline (none for a complete drain) and whether memory is given back,
+    /// of a drain under way.
+    draining: Option<(Sender<()>, MigrationCause, Option<Instant>, bool)>,
     /// The warm-up requests the scheduler holds, by the id it gave each, with the daemon's request
     /// of the same id that arrived meanwhile, which waits until the warm-up request is forgotten
     /// ([`Scheduler::warm_up`]).
@@ -1087,7 +1090,7 @@ impl Scheduler {
         }
 
         // A deadline already passed was met by the step that just ran.
-        if let Some((_, _, due, _)) = &self.draining
+        if let Some((_, _, Some(due), _)) = &self.draining
             && *due > now
         {
             deadline = deadline.min(*due);

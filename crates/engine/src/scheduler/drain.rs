@@ -24,15 +24,17 @@ use super::Scheduler;
 use super::update::migratable;
 
 impl Scheduler {
-    /// Starts a drain for `cause` (SD §3.8): from here on nothing is admitted; every queued
+    /// Starts a drain for `cause` (SD §3.8): from here on nothing new is admitted; every queued
     /// request leaves at once as migratable, holding nothing worth keeping, and the daemon
-    /// resubmits it; the running requests end by themselves or at `deadline`. With `shrink`
-    /// (a drain to an epoch of another layout) the device memory is given back as requests end.
-    /// `reply` is answered once no request remains.
+    /// resubmits it; the running requests end by themselves or at `deadline`. A complete drain
+    /// (no deadline, before an epoch that processes requests otherwise) ends no request as
+    /// migratable: the queued ones are admitted in their turn and every one runs to its end. With
+    /// `shrink` (a drain to an epoch of another layout) the device memory is given back as
+    /// requests end. `reply` is answered once no request remains.
     pub(super) fn drain(
         &mut self,
         cause: MigrationCause,
-        deadline: Instant,
+        deadline: Option<Instant>,
         shrink: bool,
         reply: Sender<()>,
     ) {
@@ -51,6 +53,13 @@ impl Scheduler {
     /// runs to its end; and with `shrink` the device regions give back what came free.
     pub(super) fn drain_due(&mut self, now: Instant) {
         let Some(&(_, cause, deadline, shrink)) = self.draining.as_ref() else {
+            return;
+        };
+        // A complete drain's requests continue nowhere else: each runs here to its end.
+        let Some(deadline) = deadline else {
+            if shrink {
+                self.shrink_regions();
+            }
             return;
         };
 
@@ -235,7 +244,7 @@ mod tests {
         let (reply, _replied) = crossbeam_channel::bounded(1);
         scheduler.drain(
             MigrationCause::Drain,
-            now + Duration::from_secs(60),
+            Some(now + Duration::from_secs(60)),
             false,
             reply,
         );
@@ -257,6 +266,37 @@ mod tests {
         assert!(scheduler.requests.is_empty());
     }
 
+    /// A complete drain, before an epoch that processes requests otherwise, ends no request as
+    /// migratable, however long it runs: the queued and the running requests stay to run here
+    /// to their ends.
+    #[test]
+    fn a_complete_drain_keeps_every_request_it_holds() {
+        let (mut bench, outputs) = scheduler();
+        bench.attach(&[(A, OWNER_A, 3)]);
+        let scheduler = &mut bench.scheduler;
+        let queued = RequestId(1);
+        let running = RequestId(2);
+        let mut request = scheduler.requests[&queued].clone();
+        request.id = running;
+        request.status = RequestStatus::Running;
+        request.queued = false;
+        request.attachments.clear();
+        scheduler.requests.insert(running, request);
+        scheduler.waiting.push_back(queued);
+        scheduler.running.push(running);
+
+        let (reply, replied) = crossbeam_channel::bounded(1);
+        scheduler.drain(MigrationCause::Drain, None, false, reply);
+        scheduler.drain_due(Instant::now() + Duration::from_secs(24 * 3600));
+        assert_eq!(migrated(&outputs), Vec::<RequestId>::new());
+        assert!(scheduler.requests.contains_key(&queued));
+        assert!(scheduler.requests.contains_key(&running));
+        assert!(
+            replied.try_recv().is_err(),
+            "the drain holds requests still"
+        );
+    }
+
     /// A drain to another layout gives back what is free in each device region, keeping what the
     /// live requests hold, one `Resize` per region at a time; each `Resized` is reported, and
     /// once nothing more frees no further `Resize` is asked for.
@@ -266,7 +306,7 @@ mod tests {
         let scheduler = &mut bench.scheduler;
         scheduler.available = vec![10, 0, 0, 0];
         let (reply, _replied) = crossbeam_channel::bounded(1);
-        scheduler.drain(MigrationCause::Drain, Instant::now(), true, reply);
+        scheduler.drain(MigrationCause::Drain, Some(Instant::now()), true, reply);
         scheduler.drain_due(Instant::now());
 
         let resize = runtime::Request::Resize {
@@ -339,7 +379,7 @@ mod tests {
         // At its deadline the running request leaves, and its owner's `Detach` is handed to
         // group A's workers; nothing is free yet.
         let (reply, replied) = crossbeam_channel::bounded(1);
-        scheduler.drain(MigrationCause::Drain, Instant::now(), true, reply);
+        scheduler.drain(MigrationCause::Drain, Some(Instant::now()), true, reply);
         assert!(bench.scheduler.requests.is_empty());
         let detach = |after| runtime::Request::Detach {
             owner: OWNER_A,
@@ -419,7 +459,7 @@ mod tests {
         let (reply, replied) = crossbeam_channel::bounded(1);
         bench
             .scheduler
-            .drain(MigrationCause::Drain, Instant::now(), true, reply);
+            .drain(MigrationCause::Drain, Some(Instant::now()), true, reply);
         bench.scheduler.reply_at_boundary();
         assert!(replied.try_recv().is_err());
 

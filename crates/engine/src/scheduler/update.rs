@@ -2584,7 +2584,7 @@ mod tests {
         let (drained, _) = crossbeam_channel::bounded(1);
         bench.scheduler.drain(
             MigrationCause::Drain,
-            std::time::Instant::now(),
+            Some(std::time::Instant::now()),
             false,
             drained,
         );

@@ -22,7 +22,7 @@ fn a_drain_with_no_request_replies_at_once() {
 
     let replies = drain(
         &node.schedulers,
-        Instant::now() + Duration::from_secs(3600),
+        Some(Instant::now() + Duration::from_secs(3600)),
         false,
     )
     .unwrap();

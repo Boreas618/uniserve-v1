@@ -1240,7 +1240,9 @@ impl MainProcess {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
-        let deadline = Instant::now() + Duration::from_millis(drain.deadline_ms);
+        // A complete drain has no deadline: its requests continue nowhere else.
+        let deadline =
+            (!drain.complete).then(|| Instant::now() + Duration::from_millis(drain.deadline_ms));
         let schedulers = engine.inboxes();
         let (epoch, shrink) = (drain.epoch, drain.shrink);
         self.serial(Box::new(move || {

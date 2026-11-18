@@ -201,6 +201,7 @@ impl Deployment {
             keeps: PreviousEpoch::Parked,
             recompute: false,
             drain: Duration::from_secs_f64(UpdateConfig::default().drain_s),
+            complete: false,
             target_layouts: vec![self.layout()],
             retire: Vec::new(),
         }
@@ -647,6 +648,41 @@ fn an_engine_lost_on_trial_rolls_the_record_back() {
 
 // --- the epoch form -----------------------------------------------------------------------------
 
+/// An epoch update to model files that process requests otherwise drains the serving engine
+/// completely: its `Drain` states `complete`, so every request it holds runs there to its end and
+/// none migrates to the target, whatever `update_config.drain_s` states.
+#[test]
+fn a_switch_to_files_that_process_requests_otherwise_drains_completely() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
+    switch.complete = true;
+    let nodes = vec![Node::new(
+        HOST.to_owned(),
+        0,
+        PREVIOUS,
+        PREVIOUS,
+        scopes(0..1),
+        deployment.layout(),
+    )];
+    let update = deployment.epoch_over(1, nodes, switch, LONG);
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+    deployment.engines.start_spawned(BUILD);
+    deployment.run();
+    assert_eq!(*deployment.epochs.served().borrow(), TARGET);
+    assert_eq!(
+        deployment.engines.received(PREVIOUS),
+        [command::Kind::Drain(process::Drain {
+            epoch: SERVING,
+            deadline_ms: 5_000,
+            shrink: false,
+            complete: true,
+        })]
+    );
+}
+
 /// An epoch update starts the target from a launch file that states the
 /// epoch's module set and the engine it succeeds, and switches once it
 /// parked: the target is promoted first, and new requests go to it from its
@@ -704,6 +740,7 @@ fn an_epoch_update_promotes_the_target_and_then_drains_the_serving_engine() {
             epoch: SERVING,
             deadline_ms: 5_000,
             shrink: false,
+            complete: false,
         })]
     );
 
@@ -757,6 +794,7 @@ fn the_drain_states_its_deadline_and_shrinks_across_layouts() {
             epoch: SERVING,
             deadline_ms: 2_500,
             shrink: true,
+            complete: false,
         })]
     );
     assert_eq!(
@@ -1092,6 +1130,7 @@ fn a_replica_added_beside_a_kept_layout_moves_no_memory_of_it() {
             epoch: SERVING,
             deadline_ms: 5_000,
             shrink: false,
+            complete: false,
         })]
     );
     assert_eq!(deployment.status()["shrink"].as_bool(), Some(false));
@@ -1225,6 +1264,7 @@ fn a_rollback_on_trial_promotes_the_previous_epoch_before_the_target_drains() {
             epoch: TARGET,
             deadline_ms: 5_000,
             shrink: false,
+            complete: false,
         })
     );
     assert_eq!(deployment.entered(), ["switching", "rolled_back"]);

@@ -67,7 +67,6 @@ pub struct Leader {
     /// The single model name the API serves, which a change of `served_model_name` renames from
     /// the next request on.
     served_model_name: std::sync::Mutex<Arc<str>>,
-    processor: Arc<Processor>,
     /// Independent replica epochs behind the public request entry point.
     pub(crate) replicas: Arc<Replicas>,
     images: MediaConnector,
@@ -103,9 +102,25 @@ pub(crate) struct Replicas {
     /// The last profiling session's identity, which every replica's session of it states
     /// (`crate::profiling`).
     profile_sessions: std::sync::atomic::AtomicU64,
+    /// The request processor of the model files the serving epoch runs (its tokenizer, chat
+    /// template and model facts): a request takes the one that serves when it arrives and keeps
+    /// it to its end, and an epoch switch to model files that process requests otherwise
+    /// replaces it ([`Replicas::process_with`]).
+    processor: std::sync::Mutex<Arc<Processor>>,
 }
 
 impl Replicas {
+    /// The request processor new requests are processed with.
+    pub(crate) fn processor(&self) -> Arc<Processor> {
+        Arc::clone(&service::lock(&self.processor))
+    }
+
+    /// Processes new requests with `processor` from now on, and returns the one it replaces:
+    /// the requests processed with that one keep it to their ends.
+    pub(crate) fn process_with(&self, processor: Arc<Processor>) -> Arc<Processor> {
+        std::mem::replace(&mut *service::lock(&self.processor), processor)
+    }
+
     /// The identity of the deployment's next profiling session.
     pub(crate) fn next_profile(&self) -> u64 {
         self.profile_sessions.fetch_add(1, Ordering::Relaxed) + 1
@@ -176,6 +191,10 @@ pub(crate) struct EpochTarget {
     /// Whether the requests in flight at the switch continue with the state they reached
     /// where the target computes otherwise (`in_flight = keep`).
     pub(crate) keep: bool,
+    /// The target's model files as the leader processes requests with them, when they process
+    /// requests otherwise than the served ones: the deployment's request processor is the
+    /// target's from its switch on, and the previous one's again on a rollback.
+    pub(crate) processing: Option<Box<Prepared>>,
 }
 
 /// Records what replica `replica`'s engine reports into the deployment's observation store
@@ -1045,14 +1064,44 @@ impl Leader {
         updates: Arc<crate::updates::Updater>,
         recorder: Recorder,
     ) -> anyhow::Result<Self> {
-        let Prepared {
+        let families = prepared.families.clone();
+        let processor = Self::processor_of(config, prepared, client.info(), &served)?;
+        let engine = Self::new(
             families,
+            vec![Arc::new(client)],
+            processor,
+            config,
+            observer,
+            recorder,
+            updates,
+        )?;
+        let replica = Arc::clone(&engine.replicas.serving.borrow()[0]);
+        let _ = replica.control.set(control);
+        *service::lock(&replica.served) = Some(served);
+        Ok(engine)
+    }
+
+    /// The request processor of `prepared`'s model files under `config`, bound to what the
+    /// engine `info` describes started with the arguments `served`: the tokenizer, the chat
+    /// renderer and the images it lowers, or the video service its denoiser declares, and the
+    /// limits its workers report.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the model cannot be bound to the capabilities the engine's workers report.
+    pub(crate) fn processor_of(
+        config: &Config,
+        prepared: Prepared,
+        info: &crate::engine::client::EngineInfo,
+        served: &proto::config::EngineArgs,
+    ) -> anyhow::Result<Processor> {
+        let Prepared {
+            families: _,
             model_config,
             tokenizer,
             renderer,
             engine: _,
         } = prepared;
-        let info = client.info().clone();
 
         // A video checkpoint serves what its placed denoiser declares in the
         // worker handshake, prepared against the conditioner's vision
@@ -1100,19 +1149,7 @@ impl Leader {
         )
         .context("failed to bind the configured model description")?
         .with_images(images);
-        let engine = Self::new(
-            families,
-            vec![Arc::new(client)],
-            processor,
-            config,
-            observer,
-            recorder,
-            updates,
-        )?;
-        let replica = Arc::clone(&engine.replicas.serving.borrow()[0]);
-        let _ = replica.control.set(control);
-        *service::lock(&replica.served) = Some(served);
-        Ok(engine)
+        Ok(processor)
     }
 
     /// Serves `processor`'s model over the independent replicas in `clients`, each replica's
@@ -1172,6 +1209,7 @@ impl Leader {
             updates: Arc::downgrade(&updates),
             held: AtomicUsize::new(0),
             profile_sessions: std::sync::atomic::AtomicU64::new(0),
+            processor: std::sync::Mutex::new(Arc::new(processor)),
         });
         for replica in replicas.serving.borrow().iter() {
             replica.monitor();
@@ -1179,7 +1217,6 @@ impl Leader {
         Ok(Self {
             families,
             served_model_name: std::sync::Mutex::new(Arc::from(served_model_name)),
-            processor: Arc::new(processor),
             replicas,
             images,
             updates,
@@ -1195,9 +1232,10 @@ impl Leader {
         &self.router
     }
 
-    /// The loaded model's input processor.
-    pub fn processor(&self) -> &Processor {
-        &self.processor
+    /// The request processor of the model files the serving epoch runs: new requests are
+    /// processed with it, and a request keeps the one it arrived with to its end.
+    pub fn processor(&self) -> Arc<Processor> {
+        self.replicas.processor()
     }
 
     /// The deployment's writer of the observation store.
@@ -1217,16 +1255,10 @@ impl Leader {
         info!(%former, name, "the deployment serves under its new name");
     }
 
-    /// The video service of this deployment; `None` for a model that
-    /// generates no video.
-    pub fn video_service(&self) -> Option<&VideoService> {
-        self.processor.video_service()
-    }
-
     /// The tasks this engine serves: what the served family declares it serves
     /// ([`processing::Family::serving`]).
     pub fn supported_tasks(&self) -> Vec<Task> {
-        match self.processor.config().family.serving {
+        match self.processor().config().family.serving {
             processing::Serving::Chat(_) => vec![Task::Generate],
             processing::Serving::Video(_) => vec![Task::VideoGeneration],
         }
@@ -1274,7 +1306,10 @@ impl Leader {
     > {
         let started = Instant::now();
         let session = request.prompt_cache_key.clone();
-        let image_urls = if self.processor.supports_image_input() {
+        // The request is processed, and its output decoded, by the processor that serves when it
+        // arrives, whatever replaces it meanwhile.
+        let processor = self.processor();
+        let image_urls = if processor.supports_image_input() {
             request.image_urls()
         } else {
             Vec::new()
@@ -1291,9 +1326,9 @@ impl Leader {
                 source: error.source,
             })?;
         drop(fetch);
-        let processor = Arc::clone(&self.processor);
         let (request, lowering) = preprocess(&request_id, {
             let request_id = request_id.clone();
+            let processor = Arc::clone(&processor);
             move || processor.process(&request_id, &request, adapter.as_ref(), images, trace)
         })
         .await?;
@@ -1309,7 +1344,7 @@ impl Leader {
             .traced(trace);
         // Dropping the events on a failure cancels the request in its engine.
         let output = crate::api::output::OutputProcessor::new(
-            self.processor.tokenizer(),
+            processor.tokenizer(),
             lowering,
             compile_us,
             Box::new(stats),
@@ -1322,7 +1357,7 @@ impl Leader {
     /// The model's tokenizer, which a successor builds the decoder of a
     /// handoff's body from.
     pub(crate) fn tokenizer(&self) -> crate::api::tokenizer::DynTokenizer {
-        self.processor.tokenizer()
+        self.processor().tokenizer()
     }
 
     /// The statistics recorder of a request this process takes over, under
@@ -1389,18 +1424,18 @@ impl Leader {
         trace: u64,
     ) -> Result<(ProcessedVideo, RequestOutputStream), ServeError> {
         let started = Instant::now();
-        let video =
-            self.processor
-                .video_service()
-                .ok_or_else(|| ServeError::UnsupportedFeature {
-                    request_id: request_id.clone(),
-                    feature: "video_generation",
-                })?;
+        let processor = self.processor();
+        let video = processor
+            .video_service()
+            .ok_or_else(|| ServeError::UnsupportedFeature {
+                request_id: request_id.clone(),
+                feature: "video_generation",
+            })?;
         let (request, processed) = video
             .process(
                 &request_id,
                 &request,
-                self.processor.config().max_model_len,
+                processor.config().max_model_len,
                 trace,
             )
             .await?;
@@ -2186,6 +2221,7 @@ impl Replica {
             config,
             epoch,
             keep,
+            processing,
         } = target;
         let config = *config;
         let Some(registry) = self.registry.upgrade() else {
@@ -2289,6 +2325,25 @@ impl Replica {
         }
         drop(preparation);
 
+        // Model files that process requests otherwise serve with a request processor of their
+        // own, bound to what the target's engines describe; one that does not bind ends the
+        // update before its switch.
+        let target_processor = match processing.map(|prepared| {
+            Leader::processor_of(&config, *prepared, clients[0].info(), &targets[0].0)
+        }) {
+            None => None,
+            Some(Ok(processor)) => Some(Arc::new(processor)),
+            Some(Err(error)) => {
+                let reason = format!("the target's request processor did not bind: {error:#}");
+                warn!(epoch, "{reason}");
+                updater.rollback(proto::admin::Failure::new(
+                    proto::admin::FailureKind::PrepareFailed,
+                    reason,
+                ));
+                return;
+            }
+        };
+
         // From here the update owns both epochs' engines: an engine lost is
         // the update's to judge, not the watcher's to relaunch. What the
         // previous epoch served with stays until the update ends: it serves
@@ -2353,6 +2408,10 @@ impl Replica {
         let mut everyone = routed.clone();
         everyone.extend(previous.iter().skip(routed.len()).cloned());
         route(&everyone, &routed, &target_clients, keep);
+        // New requests are processed by the target's processor from the switch on; those the
+        // previous processor processed run to their ends on the previous epoch, which drains
+        // completely (`EpochSwitch::complete`).
+        let previous_processor = target_processor.map(|processor| registry.process_with(processor));
         for (replica, client) in routed.iter().zip(&clients) {
             tokio::spawn(watch_engine(Arc::clone(replica), Arc::downgrade(client)));
         }
@@ -2457,6 +2516,9 @@ impl Replica {
                 let mut everyone = previous.clone();
                 everyone.extend(routed.iter().skip(previous.len()).cloned());
                 route(&everyone, &previous, &serving_again, false);
+                if let Some(processor) = &previous_processor {
+                    registry.process_with(Arc::clone(processor));
+                }
                 warn!(
                     epoch,
                     "the update returns the deployment to the previous epoch"
@@ -2488,6 +2550,9 @@ impl Replica {
             let mut everyone = previous.clone();
             everyone.extend(routed.iter().skip(previous.len()).cloned());
             route(&everyone, &previous, &serving_again, false);
+            if let Some(processor) = &previous_processor {
+                registry.process_with(Arc::clone(processor));
+            }
         }
         for replica in previous.iter().chain(&routed) {
             replica.following.store(false, Ordering::SeqCst);

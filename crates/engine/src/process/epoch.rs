@@ -43,8 +43,10 @@ use crate::process::binding::{Released, WeightBinding};
 use crate::scheduler::Message;
 
 /// Starts the drain of every scheduler (`specs/scheduler-design.md` §3.8): each admits nothing
-/// from here on, ends its queued requests as migratable at once and its running ones by
-/// themselves or at `deadline`, and with `shrink` gives its device regions back as they end.
+/// new from here on, ends its queued requests as migratable at once and its running ones by
+/// themselves or at `deadline`; with no deadline (a complete drain, before an epoch that processes
+/// requests otherwise) it runs every request it holds to its end, admitting the queued ones in
+/// their turn. With `shrink` it gives its device regions back as they end.
 /// Returns each scheduler's reply, in the schedulers' order, which arrives once it holds no
 /// request (and with `shrink`, once its regions answered their last `Resize`); a drained
 /// scheduler then forms no batch until it is resumed ([`promote`]).
@@ -57,7 +59,7 @@ use crate::scheduler::Message;
 /// When a scheduler has stopped.
 pub(crate) fn drain(
     schedulers: &[Sender<Message>],
-    deadline: Instant,
+    deadline: Option<Instant>,
     shrink: bool,
 ) -> Result<Vec<Receiver<()>>> {
     let mut replies = Vec::with_capacity(schedulers.len());

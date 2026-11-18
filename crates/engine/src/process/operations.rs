@@ -129,7 +129,7 @@ pub(crate) fn sleep(
     head: &Mutex<StorageClient>,
     binding: &WeightBinding,
 ) -> Result<()> {
-    let drained = epoch::drain(schedulers, Instant::now(), true)?;
+    let drained = epoch::drain(schedulers, Some(Instant::now()), true)?;
     for (index, replied) in drained.into_iter().enumerate() {
         replied.recv().map_err(|_| stopped(index))?;
     }

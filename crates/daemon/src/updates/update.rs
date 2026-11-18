@@ -137,6 +137,10 @@ pub(crate) struct EpochSwitch {
     /// How long a draining engine steps its requests after its `Drain`
     /// (`update_config.drain_s`).
     pub(crate) drain: Duration,
+    /// Whether the two sides process requests otherwise (other model files): each side that
+    /// drains then runs every request it holds to its end, none migrating, whatever `drain`
+    /// states (a complete drain).
+    pub(crate) complete: bool,
     /// The layouts the target replicas lay their device memory out in, one per replica: a
     /// serving engine whose layout none of them shares drains with `shrink`
     /// ([`Node::moves_across`]).
@@ -1363,13 +1367,15 @@ pub(crate) fn promote(recompute: bool, grow: bool) -> process::Command {
 }
 
 /// The drain of an engine executing `epoch` in `switch`: the deadline from
-/// now, and `shrink` when the engine's device memory moves to the other side
-/// of the switch ([`Node::moves_across`]).
+/// now, or none for a switch between sides that process requests otherwise
+/// (`complete`), and `shrink` when the engine's device memory moves to the
+/// other side of the switch ([`Node::moves_across`]).
 fn drain(epoch: u64, switch: &EpochSwitch, shrink: bool) -> process::Command {
     command(command::Kind::Drain(process::Drain {
         epoch,
         deadline_ms: u64::try_from(switch.drain.as_millis()).unwrap_or(u64::MAX),
         shrink,
+        complete: switch.complete,
     }))
 }
 

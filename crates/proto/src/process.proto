@@ -680,6 +680,11 @@ message Drain {
   // device regions back to the quota by `Resize` as its requests end, and
   // answers `Drained` once its regions answered the last one.
   bool shrink = 3;
+  // The epoch that serves next processes requests otherwise (other model
+  // files): no request this engine holds can continue there, so the engine
+  // runs every one to its end, admitting the queued ones in their turn, and
+  // ends none as migratable; `deadline_ms` is not read.
+  bool complete = 4;
 }
 
 message Promote {

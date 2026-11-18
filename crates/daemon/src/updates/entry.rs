@@ -169,10 +169,7 @@ impl Leader {
         }
         let options = target.update_config.clone();
         if form == Effect::Epoch {
-            Box::pin(
-                self.epoch_update(number, &current, &target, next, serving, &options, revision),
-            )
-            .await
+            Box::pin(self.epoch_update(number, &target, next, serving, &options, revision)).await
         } else {
             // The generation switches bucket by bucket and includes no step: the change's step
             // and order options take effect in place first, with the options the graphs are
@@ -448,7 +445,6 @@ impl Leader {
     async fn epoch_update(
         &self,
         number: u64,
-        current: &Config,
         target: &Config,
         next: Epoch,
         serving: crate::epoch::Recorded,
@@ -483,36 +479,38 @@ impl Leader {
         // The target's engine configuration is resolved as a deployment's
         // start resolves it: the options state the scheduler and the rank
         // layout, and the model's files complete what they determine.
-        let engine = Leader::prepare(
+        let prepared = Leader::prepare(
             &self.families,
             target,
             &crate::config::Stated::from_paths(Vec::new()),
         )
         .await
-        .map_err(refused)?
-        .engine;
-        // Other model files serve the deployment's requests only when they
-        // are processed as the serving ones are.
-        if current.model() != target.model() {
-            let served = service::lock(&replicas[0].served).clone();
-            if let Some(served) = &served {
-                crate::leader::same_processing(
+        .map_err(refused)?;
+        let engine = prepared.engine.clone();
+        // Other model files may process requests otherwise than the served ones: another
+        // tokenizer, chat template, generation defaults or model facts. The target then serves
+        // with a request processor of its own from its switch on, and the requests the serving
+        // epoch holds continue nowhere else: it runs every one to its end (a complete drain),
+        // none migrating, and a rollback does the same the other way.
+        let served = service::lock(&replicas[0].served).clone();
+        let processes_otherwise = match served {
+            Some(served) if served.engine_config.model.model != engine.model.model => {
+                let files = crate::leader::same_processing(
                     &self.families,
                     &served.engine_config.model.model,
                     &engine.model.model,
                 )
-                .await
-                .map_err(UpdateError::Refused)?;
+                .await;
+                files.is_err() || !served.engine_config.model.processes_as(&engine.model)
             }
-            if served.is_some_and(|served| !served.engine_config.model.processes_as(&engine.model))
-            {
-                return Err(UpdateError::Refused(format!(
-                    "the model at {} has other generation limits, control tokens or context \
-                     length than the served model, which change how requests are processed: \
-                     deploy it instead",
-                    target.model()
-                )));
-            }
+            _ => false,
+        };
+        if processes_otherwise {
+            info!(
+                model = target.model(),
+                "the target's model files process requests otherwise: it serves with a processor \
+                 of its own, and the serving epoch runs its requests to their ends"
+            );
         }
 
         // One launch number per engine of every target replica's world, from the deployment's
@@ -593,6 +591,7 @@ impl Leader {
                 keeps: options.previous_epoch,
                 recompute: options.in_flight == InFlight::Recompute,
                 drain: Duration::from_secs_f64(options.drain_s),
+                complete: processes_otherwise,
                 target_layouts,
                 retire: self.updates.take_retire(),
             },
@@ -612,6 +611,7 @@ impl Leader {
                 config: Box::new(target.clone()),
                 epoch: target_epoch,
                 keep: options.in_flight == InFlight::Keep,
+                processing: processes_otherwise.then(|| Box::new(prepared)),
             }),
         );
         Ok(Applied::Update(Box::new(report)))
