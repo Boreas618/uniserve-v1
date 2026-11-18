@@ -7,9 +7,9 @@ directory it serves under (the ``runtime`` fixture).
 
 - A deployment's storage belongs to it: once a deployment whose package
   states ``retire = true`` comes down (its daemon ends on SIGTERM), its
-  Storage Server holds nothing of it, and a deployment whose host regions
-  the host's available storage cannot hold does not come up, with the
-  sizes that decided it.
+  Storage Server has stopped, releasing what it held of it, and a
+  deployment whose host regions the host's available storage cannot hold
+  does not come up, with the sizes that decided it.
 - A serving deployment answers its admin API, on the daemon's admin socket:
   new requests wait while the package states ``paused`` and are served once
   it no longer does; a change of ``flush`` evicts the device copies of the
@@ -469,8 +469,9 @@ def test_a_deployment_releases_its_storage_and_one_too_large_does_not_come_up(
     with _serve(deployments, name, runtime=runtime) as server:
         assert _ask(server.base_url, name, "Say hello.")
 
-        # The host's Storage Server holds the deployment: its claim and the
-        # weights its quota reserves.
+        # The deployment's Storage Server holds the deployment: its claim and
+        # the weights its quota reserves.
+        assert storage_status(uniserve, runtime, name) is not None
         held = _held_of(updates.listing(uniserve, runtime), name)
         assert held["deployments"], held
         reserved = {
@@ -483,20 +484,22 @@ def test_a_deployment_releases_its_storage_and_one_too_large_does_not_come_up(
         (usage,) = admin.gauge(server, "uniserve_host_available_bytes")
         available = int(usage.value)
 
-        # A deployment that retires releases its storage at its Storage
-        # Server as it comes down, which its daemon does on SIGTERM: the
-        # daemon, whose node serves this deployment alone, ends with it,
-        # having released what the deployment held.
+        # A deployment that retires releases its storage as it comes down,
+        # which its daemon does on SIGTERM: the daemon, whose node serves this
+        # deployment alone, stops the deployment's Storage Server, which
+        # released its weights and caches with it, and ends.
         retiring = admin.revision(admin.change(server, {"retire": True}))
         assert retiring["effect"] == "step", retiring
         server.process.send_signal(signal.SIGTERM)
         assert server.process.wait() == 0, "the daemon ended in an error"
-    released = _held_of(updates.listing(uniserve, runtime), name)
-    assert not any(released.values()), released
+    assert storage_status(uniserve, runtime, name) is None, (
+        "the retired deployment's Storage Server outlived it"
+    )
 
-    # A host tier the host's available storage cannot hold, at the same
-    # Storage Server: the deployment does not come up, and its daemon's log
-    # states the sizes that decided it.
+    # A host tier the host's available storage cannot hold, under the same
+    # runtime directory: the deployment's own Storage Server reads the
+    # host's available storage, the deployment does not come up, and its
+    # daemon's log states the sizes that decided it.
     too_large = "qwen3-live-too-large"
     with (
         pytest.raises(RuntimeError, match="ended before it was serving"),
@@ -1131,8 +1134,10 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
         # request that waited ran beside the recomputed count, whose batch
         # changes the numerics.
         assert _ask(server.base_url, name, prompt, 32) == before
+        # The policy read back leaves an option at its default out, so the
+        # woken deployment's states neither.
         config = admin.policy(server).config
-        assert config["asleep"] is False, config
+        assert config.get("asleep", False) is False, config
         assert config.get("paused", False) is False, config
 
 
