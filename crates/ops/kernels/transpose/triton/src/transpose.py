@@ -19,7 +19,9 @@ import triton.language as tl
 from uniserve_kernels import dependent_launch
 
 
-@triton.jit
+# Every integer argument is a launch word, read at run time as the launch table compiles it:
+# a JIT launch must not fold a word equal to 1 into a constant, which leaves no tensor to cast.
+@triton.jit(do_not_specialize=["rows", "columns", "block"])
 def _transpose_kernel(
     input,
     out,

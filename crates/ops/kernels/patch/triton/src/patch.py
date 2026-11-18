@@ -25,7 +25,9 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# Every integer argument is a launch word, read at run time as the launch table compiles it:
+# a JIT launch must not fold a word equal to 1 into a constant, which leaves no tensor to cast.
+@triton.jit(do_not_specialize=["frames", "rows", "channels", "height", "width", "block"])
 def _patch_kernel(
     x_ptr,
     out_ptr,

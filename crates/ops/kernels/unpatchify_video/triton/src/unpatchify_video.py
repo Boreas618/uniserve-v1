@@ -87,7 +87,23 @@ def _token_offsets(
     return token * (channels * patch_volume) + patch_channel, destination, channel, live
 
 
-@triton.jit
+# Every integer argument is a launch word, read at run time as the launch table compiles it:
+# a JIT launch must not fold a word equal to 1 into a constant, which leaves no tensor to cast.
+@triton.jit(
+    do_not_specialize=[
+        "channels",
+        "frames",
+        "height",
+        "width",
+        "patch_frames",
+        "patch_height",
+        "patch_width",
+        "out_stride0",
+        "out_stride1",
+        "out_stride2",
+        "block",
+    ]
+)
 def _unpatchify_video_kernel(
     tokens_ptr,
     out_ptr,
@@ -130,7 +146,23 @@ def _unpatchify_video_kernel(
     )
 
 
-@triton.jit
+# Every integer argument is a launch word, read at run time as the launch table compiles it:
+# a JIT launch must not fold a word equal to 1 into a constant, which leaves no tensor to cast.
+@triton.jit(
+    do_not_specialize=[
+        "channels",
+        "frames",
+        "height",
+        "width",
+        "patch_frames",
+        "patch_height",
+        "patch_width",
+        "out_stride0",
+        "out_stride1",
+        "out_stride2",
+        "block",
+    ]
+)
 def _unpatchify_video_affine_kernel(
     tokens_ptr,
     scale_ptr,

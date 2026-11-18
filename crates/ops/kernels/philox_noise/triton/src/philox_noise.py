@@ -86,7 +86,9 @@ def _philox_words(counter0, counter1, stage, draw, k0, k1):
     return word0, word1
 
 
-@triton.jit
+# Every integer argument is a launch word, read at run time as the launch table compiles it:
+# a JIT launch must not fold a word equal to 1 into a constant, which leaves no tensor to cast.
+@triton.jit(do_not_specialize=["elements", "stage", "draw", "key", "offset"])
 def _philox_noise_kernel(
     out_ptr,
     keys_ptr,

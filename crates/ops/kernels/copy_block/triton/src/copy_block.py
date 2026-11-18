@@ -25,7 +25,26 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# Every integer argument is a launch word, read at run time as the launch table compiles it:
+# a JIT launch must not fold a word equal to 1 into a constant, which leaves no tensor to cast.
+@triton.jit(
+    do_not_specialize=[
+        "e0",
+        "e1",
+        "e2",
+        "e3",
+        "s0",
+        "s1",
+        "s2",
+        "s3",
+        "d0",
+        "d1",
+        "d2",
+        "d3",
+        "total",
+        "block",
+    ]
+)
 def _copy_block_kernel(
     source_ptr,
     out_ptr,
