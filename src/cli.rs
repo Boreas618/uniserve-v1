@@ -127,8 +127,20 @@ mod tests {
     fn each_process_is_a_command() {
         for (args, expected) in [
             (vec!["uniserve", "serve", "model"], "serve"),
-            (vec!["uniserve", "storage-server", "list"], "storage-server"),
-            (vec!["uniserve", "build-server", "list"], "build-server"),
+            (
+                vec![
+                    "uniserve",
+                    "storage-server",
+                    "list",
+                    "--deployment",
+                    "qwen3",
+                ],
+                "storage-server",
+            ),
+            (
+                vec!["uniserve", "build-server", "list", "--deployment", "qwen3"],
+                "build-server",
+            ),
         ] {
             let cli = Cli::try_parse_from(args).expect("parses");
             let name = match cli.command {
