@@ -251,8 +251,6 @@ pub mod operator {
     pub const GATED_RMS_NORM: &str = "gated_rms_norm";
     pub const LAYER_NORM: &str = "layer_norm";
     pub const SOFTMAX: &str = "softmax";
-    pub const PAGE_CONVERSION: &str = "page_conversion";
-    pub const CACHE_COPY_REGION: &str = "cache_copy_region";
     pub const WEIGHTED_RMS_NORM: &str = "weighted_rms_norm";
     pub const SCALED_RESIDUAL_RMS_NORM: &str = "scaled_residual_rms_norm";
     pub const SCALED_RESIDUAL_LAYER_NORM: &str = "scaled_residual_layer_norm";
@@ -354,8 +352,6 @@ pub mod operator {
         GATED_RMS_NORM,
         LAYER_NORM,
         SOFTMAX,
-        PAGE_CONVERSION,
-        CACHE_COPY_REGION,
         WEIGHTED_RMS_NORM,
         SCALED_RESIDUAL_RMS_NORM,
         SCALED_RESIDUAL_LAYER_NORM,

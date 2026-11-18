@@ -53,19 +53,11 @@
 //!   of `n` units being `n` pages under keys derived from its key
 //!   ([`unit_key`]): a prefetch's into the host parts it fills, a put's from
 //!   a host part of each index that holds the copy; the pages of a part on
-//!   another host go to that host's connector ([`Request::Pages`]). A
-//!   prefetch from the peers holds the keys at the
-//!   peers the session names, has the Transfer Server of each part's host
-//!   read each held copy from the peer's part of the same index, wherever
-//!   that lies, and keeps what was read only from a peer whose holds stood
-//!   until the read ended ([`hosts`]). A task that cannot reach every part
-//!   of a unit moves none of it. A child's
+//!   another host go to that host's connector ([`Request::Pages`]). A task
+//!   that cannot reach every part of a unit moves none of it. A child's
 //!   report ends the task; a child's loss ends its tasks as failed once its
 //!   process has exited, so an end is reported only when nothing touches
 //!   the blocks any more (A5).
-//! - **Peers.** Another host's Storage Server holds the host copies it
-//!   reads ([`Request::PeerHold`]) until it releases them
-//!   ([`Request::PeerRelease`]) or its connection closes.
 
 mod hosts;
 mod imports;
@@ -82,18 +74,18 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use storage::ServerSettings;
 use storage::protocol::{
-    ErrorKind, Event, HostCopy, Key, Location, PageShape, Priority, Region, RegionPart, Response,
-    Role, Segment, Span, StorageRecord, UnitLayout, UnitRun,
+    ErrorKind, Event, Key, Location, PageShape, Priority, Region, Response, Role, Segment, Span,
+    StorageRecord, UnitLayout, UnitRun,
 };
-use storage::runtime::{Open, RequestId, Source, Tier};
+use storage::runtime::{Open, RequestId, Tier};
 
-use crate::buffer_pool::{ClientId as PoolSession, Encoding, QueueId};
+use crate::buffer_pool::{ClientId as PoolSession, QueueId};
 use crate::kv_storage::{Owner, Task};
 use crate::{
     Attachment, Client, ClientId, Handling, Holder, Server, StorageEntry, StorageId, invalid,
     resource,
 };
-use polling::{Copied, HostPart, NamedRun};
+use polling::{Copied, HeldCopy, HostPart};
 
 #[cfg(doc)]
 use storage::protocol::Request;
@@ -161,8 +153,6 @@ pub(crate) struct Sessions {
     /// Where the units of the device regions lie, by deployment, region,
     /// device memory and part, as each rank stated it.
     places: BTreeMap<Place, Placed>,
-    /// The peers each session names, which a prefetch from the peers reads.
-    peers: BTreeMap<Session, Vec<String>>,
     /// The parts of each engine's ranks of other hosts, each with the
     /// endpoint of its host's Storage Server, as the head of the engine's
     /// session stated where those ranks' units lie
@@ -216,14 +206,9 @@ struct Running {
     stopped: bool,
     /// What stops its transfers on other hosts' Transfer Servers and their connectors' pages.
     cancels: Vec<hosts::Stop>,
-    /// A read from the peers: what has the helper release its holds once
-    /// dropped, and per copy the peer connection it is read from with the
-    /// tokens its block holds, for the leading copies being read.
+    /// For an import from a lend of another host: what has the helper return the lend once
+    /// dropped ([`imports`]).
     release: Option<mpsc::Sender<()>>,
-    reads: Vec<(usize, u16)>,
-    /// For a read from the peers, the host parts each copy fills (none for a
-    /// copy of groups that state no host parts).
-    parts: Vec<Vec<HostPart>>,
     /// For an import from a lend of this host, the lender's session and owner, whose lend
     /// ends with the task.
     lend: Option<(PoolSession, storage::runtime::OwnerId)>,
@@ -240,8 +225,6 @@ impl Running {
             stopped: false,
             cancels: Vec::new(),
             release: None,
-            reads: Vec::new(),
-            parts: Vec::new(),
             lend: None,
         }
     }
@@ -266,7 +249,6 @@ pub(crate) struct SessionsHandoff {
     hosts: Vec<((String, String), HostRegion)>,
     parts: Vec<((String, String, u32), Part)>,
     places: Vec<(Place, Placed)>,
-    peers: Vec<(Session, Vec<String>)>,
     remote: Vec<(Engine, BTreeSet<(u32, String)>)>,
     next: u64,
     rolled: Vec<(String, u64)>,
@@ -307,7 +289,6 @@ impl Sessions {
             parts: BTreeMap::new(),
             next_pool: 1,
             places: BTreeMap::new(),
-            peers: BTreeMap::new(),
             remote: BTreeMap::new(),
             running: BTreeMap::new(),
             next: 1,
@@ -350,7 +331,6 @@ impl Sessions {
             hosts: std::mem::take(&mut self.hosts).into_iter().collect(),
             parts: std::mem::take(&mut self.parts).into_iter().collect(),
             places: std::mem::take(&mut self.places).into_iter().collect(),
-            peers: std::mem::take(&mut self.peers).into_iter().collect(),
             remote: std::mem::take(&mut self.remote).into_iter().collect(),
             next: self.next,
             rolled: std::mem::take(&mut self.rolled).into_iter().collect(),
@@ -388,7 +368,6 @@ impl Sessions {
             .max()
             .unwrap_or(1);
         sessions.places = handoff.places.into_iter().collect();
-        sessions.peers = handoff.peers.into_iter().collect();
         sessions.remote = handoff.remote.into_iter().collect();
         sessions.next = handoff.next;
         sessions.rolled = handoff.rolled.into_iter().collect();
@@ -493,71 +472,6 @@ fn one_of_each(hosts: &mut Vec<PartHost>) {
     hosts.dedup_by_key(|(part, ..)| *part);
 }
 
-/// The spans that read a host copy a peer holds (`copy`, held at the peer
-/// `peer`, whose parts of its host regions are `held`) into the units `write`
-/// names of a host region whose parts lie as `destinations` states
-/// ([`Server::part_hosts`]): per part, from the peer's part of the same
-/// index and bytes, on the peer's host or on the one the peer names. Each
-/// span comes with the host it is copied on, the destination's (`None` for
-/// this host, which listens at `here`), and whether its source is storage
-/// of this host, which another host reads. `None` when the copy cannot be
-/// read whole: it holds other units than the write, a part has no host or
-/// no counterpart at the peer.
-fn read_spans(
-    copy: &HostCopy,
-    (peer, held): (&str, &[RegionPart]),
-    (region, first, count): &NamedRun,
-    (parts, destinations): &PartHosts,
-    here: Option<&str>,
-) -> Option<Vec<(Option<String>, Span, bool)>> {
-    let whole = (0..*parts).all(|part| destinations.iter().any(|(at, ..)| *at == part));
-    if copy.count != *count || *parts == 0 || !whole {
-        return None;
-    }
-
-    let mut spans = Vec::with_capacity(destinations.len());
-    for (part, host, bytes) in destinations {
-        let source = held.iter().find(|source| {
-            source.region == copy.region && source.rank == *part && source.bytes == *bytes
-        })?;
-        let source_host = source.endpoint.as_deref().unwrap_or(peer);
-        let source_part = Region::Part {
-            region: copy.region.clone(),
-            rank: *part,
-        };
-        // A source on the destination's host is that host's own storage; one
-        // on this host that another host reads is flagged for it to name.
-        let on_this_host = here == Some(source_host);
-        let (source, from_here) = match host {
-            Some(endpoint) if endpoint == source_host => (source_part, false),
-            Some(_) if on_this_host => (source_part, true),
-            None if on_this_host => (source_part, false),
-            _ => (
-                Region::Remote {
-                    endpoint: source_host.to_owned(),
-                    region: Box::new(source_part),
-                },
-                false,
-            ),
-        };
-        let span = Span {
-            source,
-            source_offset: u64::from(copy.first) * bytes,
-            destination: Region::Part {
-                region: region.clone(),
-                rank: *part,
-            },
-            destination_offset: u64::from(*first) * bytes,
-            bytes: u64::from(*count) * bytes,
-            rows: 1,
-            source_pitch: 0,
-            destination_pitch: 0,
-        };
-        spans.push((host.clone(), span, from_here));
-    }
-    Some(spans)
-}
-
 impl Server {
     /// See [`Request::Open`], from the head `id` of `epoch` of `deployment`, the main process
     /// of the engine of launch `generation`.
@@ -584,7 +498,6 @@ impl Server {
         }
         // One session per engine: another engine of the epoch (its standby, a relaunch beside a
         // lost engine) opens one of its own.
-        let session = (deployment.to_owned(), epoch);
         let engine = (deployment.to_owned(), epoch, generation);
         if self.sessions.open.contains_key(&engine) || self.sessions.gone.contains_key(&engine) {
             return Err((
@@ -623,7 +536,6 @@ impl Server {
                 (region.limit, region.unit_bytes, region.part_bytes),
             );
         }
-        self.sessions.peers.insert(session, open.peers.clone());
         self.sessions.open.insert(engine, (id, pool));
         Ok(Handling::Descriptors(Response::Opened(opened), descriptors))
     }
@@ -659,7 +571,7 @@ impl Server {
 
     /// What the end of `engine`'s session leaves of its epoch, the server
     /// holding it open no more: when it was its epoch's last session, the
-    /// peers the epoch names go, and the return is whether the epoch's
+    /// return is whether the epoch's
     /// update was rolled back while it was open, which the pool then rolls
     /// back. An epoch's other sessions (its engine's standby) keep both.
     fn epoch_ends(&mut self, engine: &Engine) -> bool {
@@ -674,7 +586,6 @@ impl Server {
             return false;
         }
         let session = (deployment.clone(), *epoch);
-        self.sessions.peers.remove(&session);
         self.sessions.rolled.remove(&session)
     }
 
@@ -1164,7 +1075,7 @@ impl Server {
         &mut self,
         deployment: &str,
         holder: u64,
-        held: Vec<(HostCopy, Vec<HostPart>)>,
+        held: Vec<(HeldCopy, Vec<HostPart>)>,
     ) -> (usize, Vec<(Key, String)>) {
         let mut skipped = Vec::new();
         if self.kv_storage.client.is_none() {
@@ -1214,84 +1125,7 @@ impl Server {
         (tasks, skipped)
     }
 
-    /// See [`Request::PeerHold`], from the peer `id`. The peer reads every
-    /// copy of a region from the same parts, one of each part index: those
-    /// the region's first held copy lies in, this host's where it holds one,
-    /// or for a copy of groups that state no host parts every part of the
-    /// region this server knows. A later copy that does not lie in all of
-    /// them is left out of the answer, as a key without a copy is: the peer
-    /// reads a host copy only from host parts that hold it.
-    pub(crate) fn peer_hold(
-        &mut self,
-        id: ClientId,
-        deployment: &str,
-        keys: &[Key],
-    ) -> Result<Handling, (ErrorKind, String)> {
-        let (named, held) = (deployment.to_owned(), keys.to_vec());
-        let held = self
-            .sessions
-            .thread
-            .call(move |pools| pools.hold(&named, id, &held))
-            .map_err(resource)?;
-
-        // Per region, whether its copies lie in named host parts, and the
-        // parts the peer reads them from.
-        let mut read: BTreeMap<String, (bool, Vec<PartHost>)> = BTreeMap::new();
-        let mut copies = Vec::new();
-        for (copy, holding) in held {
-            let (_, lies) = self.parts_at(deployment, None, &copy.region, &holding);
-            let named = !holding.is_empty();
-            let (stated, parts) = read.entry(copy.region.clone()).or_insert_with(|| {
-                let mut parts = lies.clone();
-                if named {
-                    one_of_each(&mut parts);
-                }
-                (named, parts)
-            });
-            if *stated == named && parts.iter().all(|part| lies.contains(part)) {
-                copies.push(copy);
-            }
-        }
-        let parts = read
-            .into_iter()
-            .flat_map(|(region, (_, parts))| {
-                parts
-                    .into_iter()
-                    .map(move |(rank, endpoint, bytes)| RegionPart {
-                        region: region.clone(),
-                        rank,
-                        bytes,
-                        endpoint,
-                    })
-            })
-            .collect();
-        Ok(Handling::Response(
-            Response::PeerHeld { copies, parts },
-            Vec::new(),
-        ))
-    }
-
-    /// See [`Request::PeerRelease`], from the peer `id`.
-    pub(crate) fn peer_release(
-        &mut self,
-        id: ClientId,
-        deployment: &str,
-    ) -> Result<Handling, (ErrorKind, String)> {
-        let named = deployment.to_owned();
-        let held = self
-            .sessions
-            .thread
-            .call(move |pools| pools.release_peer(&named, id))
-            .map_err(resource)?;
-        let response = if held {
-            Response::Valid
-        } else {
-            Response::Gone
-        };
-        Ok(Handling::Response(response, Vec::new()))
-    }
-
-    /// A client's connection closed: a peer's holds end, and the session
+    /// A client's connection closed: a peer's borrows end, and the session
     /// an engine's main process opened waits for the engine's processes to
     /// leave.
     pub(crate) fn sessions_client_gone(&mut self, id: ClientId, client: &Client) {
@@ -1464,13 +1298,11 @@ impl Server {
 
     /// A pool's task starts: a transfer goes to the Transfer Servers of the
     /// hosts its destinations lie on, a prefetch from the remote store and
-    /// a put to the connector, a prefetch from the peers to the peers its
-    /// session names; whatever cannot run ends at once as failed.
+    /// a put to the connector; whatever cannot run ends at once as failed.
     pub(crate) fn start_pool_task(
         &mut self,
         session: Session,
         task: PoolTask,
-        source: Option<Source>,
         copies: Vec<Copied>,
     ) {
         let number = self.sessions.next;
@@ -1485,12 +1317,8 @@ impl Server {
         let started = if copies.iter().all(|(key, ..)| key.is_none()) {
             self.transfer_blocks(&session, number, &copies)
         } else if copies.iter().all(|(_, reads, ..)| reads.is_empty()) {
-            // Copies that read nothing are a prefetch's, whose request named its source.
-            match source {
-                Some(Source::Remote) => self.move_pages(&session, number, &copies, false),
-                Some(Source::Peers) => self.read_from_peers(&session, number, &copies),
-                None => Err("a prefetch's task states no source".to_owned()),
-            }
+            // Copies that read nothing are a prefetch's from the remote store.
+            self.move_pages(&session, number, &copies, false)
         } else {
             self.move_pages(&session, number, &copies, true)
         };
@@ -1672,191 +1500,6 @@ impl Server {
         Ok(())
     }
 
-    /// A prefetch from the peers the session names: a helper holds the
-    /// keys there ([`hosts::read_from_peers`]), then
-    /// [`Self::peers_held`] reads what they hold. Returns whether there is
-    /// a peer to ask.
-    fn read_from_peers(
-        &mut self,
-        session: &Session,
-        number: u64,
-        copies: &[Copied],
-    ) -> Result<bool, String> {
-        let endpoints = self
-            .sessions
-            .peers
-            .get(session)
-            .cloned()
-            .unwrap_or_default();
-        if endpoints.is_empty() {
-            return Ok(false);
-        }
-        let keys = copies.iter().filter_map(|(key, ..)| *key).collect();
-        let (release, released) = mpsc::channel();
-        let notifier = self.sessions.thread.notifier();
-        hosts::read_from_peers(
-            notifier,
-            number,
-            session.0.clone(),
-            endpoints,
-            keys,
-            released,
-        )
-        .map_err(|error| format!("a read from the peers cannot start: {error}"))?;
-        if let Some(running) = self.sessions.running.get_mut(&number) {
-            running.release = Some(release);
-            running.parts = copies
-                .iter()
-                .map(|(.., (_, parts))| parts.clone())
-                .collect();
-        }
-        Ok(true)
-    }
-
-    /// The peers hold what they hold of a read's keys: the buffer pool
-    /// chooses the block each leading copy held is read into by the encoding
-    /// of the peer's copy ([`crate::buffer_pool::BufferPool::peer_copies`]),
-    /// and the Transfer Server of each part's host reads the copies into
-    /// them, in each host part the copy fills (in every part of the region,
-    /// this host's and those of the session's ranks of other hosts, for
-    /// groups that state no host parts), from the peer's part of the same
-    /// index, wherever that lies, which must hold the same bytes of a unit,
-    /// and the copy the same units ([`read_spans`]). A copy with a host part
-    /// to fill that no place states is not read. With nothing to read, the
-    /// holds are released at once.
-    pub(crate) fn peers_held(&mut self, number: u64, (sources, peers): hosts::Held) {
-        let Some(running) = self.sessions.running.get(&number) else {
-            return;
-        };
-        let session = running.session.clone();
-        let task = running.task;
-        // The engine whose session submitted the task: where its ranks' parts lie.
-        let pool = task.0.0;
-        let parts = if running.stopped {
-            Vec::new()
-        } else {
-            running.parts.clone()
-        };
-        let here = self.tcp_endpoint().map(|endpoint| endpoint.to_string());
-        let here = here.as_deref();
-
-        // The block each copy is read into follows the encoding of the peer's
-        // copy, which the buffer pool weighs against its class.
-        let encodings: Vec<Option<Encoding>> = sources
-            .iter()
-            .take(parts.len())
-            .map(|source| {
-                source
-                    .as_ref()
-                    .map(|(_, copy)| (copy.tensors, copy.encoding))
-            })
-            .collect();
-        let writes = if encodings.is_empty() {
-            Vec::new()
-        } else {
-            let deployment = session.0.clone();
-            let chosen = self
-                .sessions
-                .thread
-                .call(move |pools| pools.peer_copies(&deployment, task, &encodings));
-            match chosen {
-                Ok(writes) => writes,
-                // The pools are gone with their thread: the read fails, which is all a notice's
-                // handler can answer.
-                Err(error) => {
-                    tracing::error!(%error, number, "a read from the peers has no blocks to fill");
-                    self.end_pool_task(number, false);
-                    return;
-                }
-            }
-        };
-
-        // By the host of the parts they write, `None` for this one: the spans,
-        // each with whether its source is storage of this host.
-        let mut tasks: BTreeMap<Option<String>, Vec<(Span, Here)>> = BTreeMap::new();
-        let mut reads = Vec::new();
-        for (index, (write, named)) in writes.iter().zip(&parts).enumerate() {
-            let Some(Some((connection, copy))) = sources.get(index) else {
-                break;
-            };
-            let Some((peer, held)) = peers.get(*connection) else {
-                break;
-            };
-            let destinations = self.parts_at(&session.0, Some(pool), &write.0, named);
-            if destinations.1.len() < named.len() {
-                break;
-            }
-            let Some(spans) = read_spans(copy, (peer, held), write, &destinations, here) else {
-                break;
-            };
-            for (host, span, from_here) in spans {
-                let here = if from_here {
-                    Here::Source
-                } else {
-                    Here::Neither
-                };
-                tasks.entry(host).or_default().push((span, here));
-            }
-            reads.push((*connection, copy.tokens));
-        }
-
-        if let Some(running) = self.sessions.running.get_mut(&number) {
-            running.reads = reads;
-        }
-        let held = sources.iter().take(parts.len()).flatten().count();
-        if tasks.is_empty() && held > 0 {
-            tracing::info!(
-                deployment = session.0,
-                held,
-                "the peers hold no copy of the prefetch's leading keys that its class reads"
-            );
-        }
-        let started = if tasks.is_empty() {
-            Err(None)
-        } else {
-            self.spread(&session, number, tasks).map_err(Some)
-        };
-        if let Err(failure) = started {
-            if let Some(message) = failure {
-                tracing::warn!(deployment = session.0, %message, "a peer's host copies cannot be read");
-            }
-            if let Some(running) = self.sessions.running.get_mut(&number) {
-                running.ok = false;
-                running.release = None;
-            }
-        }
-    }
-
-    /// A read from the peers released its holds: `valid` says, per peer
-    /// connection, whether its holds stood until then. The copies read are
-    /// cached, in order, up to the first read from a peer whose holds did
-    /// not stand, or not read whole; the task then ends.
-    pub(crate) fn peers_released(&mut self, number: u64, valid: Vec<bool>) {
-        let Some(running) = self.sessions.running.remove(&number) else {
-            return;
-        };
-        let stood = |connection: &usize| valid.get(*connection).copied().unwrap_or(false);
-        let done: Vec<u16> = if running.ok {
-            running
-                .reads
-                .iter()
-                .map_while(|(connection, tokens)| stood(connection).then_some(*tokens))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let whole = done.len() == running.keys.len();
-        let ((deployment, _), task) = (running.session, running.task);
-        self.sessions.thread.send(move |pools| {
-            for tokens in done {
-                pools.done(&deployment, task, tokens);
-            }
-            if !whole {
-                pools.ended(&deployment, task, false);
-            }
-        });
-    }
-
     /// A prefetch's or a put's pages as one connector task per part of the
     /// host region: this host's connector moves the pages of its own parts,
     /// and the connector of the host of each part of a rank of another host
@@ -2024,8 +1667,8 @@ impl Server {
 
     /// A part of a pool's task ended on a child or on another host, which
     /// touches its blocks no more: the task ends with its last part, as
-    /// having copied everything when every part did. A read from the peers
-    /// releases its holds first ([`Self::peers_released`]).
+    /// having copied everything when every part did. An import from a lend of another host
+    /// returns the lend first ([`Self::import_returned`]).
     pub(crate) fn end_pool_task(&mut self, number: u64, ok: bool) {
         self.end_pool_parts(number, 1, ok);
     }
@@ -2042,7 +1685,7 @@ impl Server {
             return;
         }
         if running.release.is_some() {
-            // The helper releases the holds once the sender is gone.
+            // The helper returns the lend once the sender is gone, and ends the task then.
             running.release = None;
             return;
         }

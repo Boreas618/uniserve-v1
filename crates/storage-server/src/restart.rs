@@ -1194,7 +1194,6 @@ mod tests {
                 state_in_slot: false,
                 tensors: [0; 32],
                 encoding: [0; 32],
-                source: None,
             }],
             trajectory: 0,
             groups: vec![Group {
@@ -1206,7 +1205,6 @@ mod tests {
                 parts: Vec::new(),
             }],
             schedulers: vec![vec![GroupId(0)]],
-            peers: Vec::new(),
         };
         let mut engine = Client::connect(
             &path,

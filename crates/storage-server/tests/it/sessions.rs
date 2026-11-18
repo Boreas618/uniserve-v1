@@ -15,8 +15,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use ::storage::protocol::{
-    BlockState, ErrorKind, HostCopy, Listing, PageLayout, RegionPart, UnitLayout, UnitRun, Waiting,
-    planes,
+    BlockState, ErrorKind, Listing, PageLayout, UnitLayout, UnitRun, Waiting, planes,
 };
 use ::storage::runtime::{
     Cause, Class, Completion, Group, GroupId, Lender, Open, Opened, OwnerId, Region, Registers,
@@ -85,7 +84,6 @@ pub(crate) fn layout(epoch: u64) -> Open {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
-            source: None,
         }],
         trajectory: KV,
         groups: vec![
@@ -107,7 +105,6 @@ pub(crate) fn layout(epoch: u64) -> Open {
             },
         ],
         schedulers: vec![vec![PREFILL], vec![DECODE]],
-        peers: Vec::new(),
     }
 }
 
@@ -555,20 +552,6 @@ pub(crate) fn rank(socket: &Path, group: &str, rank: u32, claim: Claim) -> Clien
     worker(socket, scope(group, rank), 1, claim)
 }
 
-/// Where a rank's values of all nine units of the KV region lie: 16 bytes
-/// a unit in the host tensor `key`.
-pub(crate) fn values(key: Key) -> Vec<UnitRun> {
-    vec![UnitRun {
-        field: "values".into(),
-        key,
-        location: Location::Host { numa_node: None },
-        first: 0,
-        count: 9,
-        offset: 0,
-        bytes: 16,
-    }]
-}
-
 /// The heads of each layer of the KV region of the handoff cases, the bytes of a head of a
 /// token, the tokens of a page and the units a rank holds: a page's plane is two tokens of two
 /// heads of four bytes on a rank that holds both heads.
@@ -868,58 +851,6 @@ pub(crate) fn host_copy(server: &Running) -> (Client, Vec<Scheduler>, Opened, Ve
     (engine, schedulers, opened, parts)
 }
 
-/// An engine of epoch 0 whose prefill group has a rank on each of two
-/// hosts, with its schedulers. Its head opens the session on `here`, naming
-/// `peers`, where rank 0 takes part 0 of the host region; rank 1 takes part
-/// 1 on `there`, at whose server the engine's peer opened the session's
-/// host regions alone, and the head states where that rank's units lie.
-/// Returns the head, the peer's session, the schedulers, the answer, and
-/// the memfds of the parts here and there.
-pub(crate) fn split_host_region(
-    here: &Running,
-    there: &Running,
-    peers: Vec<String>,
-) -> (Client, Client, Vec<Scheduler>, Opened, [OwnedFd; 2]) {
-    let mut open = layout(0);
-    open.peers = peers;
-    let claim = head(&here.socket)
-        .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
-        .unwrap();
-    let mut engine = engine_head(&here.socket, 0);
-    let (opened, descriptors) = engine.open_pool(open.clone()).unwrap();
-    let mut first = rank(&here.socket, "prefill", 0, claim);
-    let (_, here_part) = first.host_part("host".into(), 0, 16, None).unwrap();
-
-    // The peer's session states the layout's host regions alone, with no
-    // group and no scheduler.
-    let mut hosts = open;
-    hosts.regions.retain(|region| region.tier == Tier::Host);
-    hosts.classes.clear();
-    hosts.groups.clear();
-    hosts.schedulers.clear();
-    hosts.peers.clear();
-    let there_claim = head(&there.socket)
-        .claim(Claimant::Head, 0, vec![scope("prefill", 1)], Vec::new())
-        .unwrap();
-    let mut peer = engine_head(&there.socket, 0);
-    peer.open_pool(hosts).unwrap();
-    let mut second = rank(&there.socket, "prefill", 1, there_claim);
-    let (_, there_part) = second.host_part("host".into(), 1, 16, None).unwrap();
-    engine
-        .place_remote(
-            "units".into(),
-            "gpu0".into(),
-            1,
-            there.tcp.clone(),
-            values(key(11)),
-            None,
-        )
-        .unwrap();
-
-    let schedulers = Scheduler::all(&opened, descriptors);
-    (engine, peer, schedulers, opened, [here_part, there_part])
-}
-
 /// The prefill scheduler caches key 7 on the device and stores it on the
 /// host, in unit 0 of the host region, the test running the store's copy.
 pub(crate) fn store_on_host(prefill: &mut Scheduler) {
@@ -1078,53 +1009,6 @@ fn a_host_region_is_admitted_part_by_part_as_its_ranks_take_them() {
             assert_eq!(units, 4);
         }
     }
-}
-
-#[test]
-fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
-    let server = Running::with_children(None);
-    let (_engine, schedulers, opened, _parts) = host_copy(&server);
-    let host = opened.regions[HOST].0;
-    let prefill = &schedulers[0];
-    prefill.await_capacity(host, (3, 0, 1));
-
-    // Another host's Storage Server holds what it reads; a held copy is no
-    // longer evictable.
-    let mut peer = Client::connect_peer(&server.tcp).unwrap();
-    let (copies, mut parts) = peer
-        .peer_hold("model".into(), vec![key(7), key(8)])
-        .unwrap();
-    // The copy states the encoding the class that wrote it states.
-    let held = HostCopy {
-        key: key(7),
-        tokens: 64,
-        region: "host".into(),
-        first: 0,
-        count: 1,
-        tensors: [0; 32],
-        encoding: [0; 32],
-    };
-    assert_eq!(copies, [held]);
-    parts.sort_by_key(|part| part.rank);
-    let part = |rank| RegionPart {
-        region: "host".into(),
-        rank,
-        bytes: 16,
-        endpoint: None,
-    };
-    assert_eq!(parts, [part(0), part(1)]);
-    prefill.await_capacity(host, (3, 0, 0));
-
-    // Its release ends the holds, which stood: what it read is valid.
-    assert!(peer.peer_release("model".into()).unwrap());
-    prefill.await_capacity(host, (3, 0, 1));
-    assert!(!peer.peer_release("model".into()).unwrap());
-
-    // The holds end with the peer's connection too.
-    peer.peer_hold("model".into(), vec![key(7)]).unwrap();
-    prefill.await_capacity(host, (3, 0, 0));
-    drop(peer);
-    prefill.await_capacity(host, (3, 0, 1));
 }
 
 #[test]

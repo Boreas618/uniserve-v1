@@ -890,7 +890,6 @@ impl Scheduler {
             request.blocks.clear();
             request.num_cached_tokens = 0;
             request.num_host_tokens = 0;
-            request.num_peer_tokens = 0;
             request.num_encoded_inputs = 0;
             for encoding in &mut request.encodings {
                 encoding.1 = None;
@@ -1288,8 +1287,8 @@ impl Scheduler {
     }
 
     /// A `Prefetch` ended (SD §3.5): the found keys are on the host (`learn` recorded them). An
-    /// admission waiting for it is the one whose lookup keys of the class hold its first key; it
-    /// counts the tokens a peers' `Prefetch` found (`filled`), and its next round loads them. A
+    /// admission waiting for it is the one whose lookup keys of the class hold its first key, and
+    /// its next round loads them. A
     /// prefetch the policy asked for a waiting request answers no admission.
     fn prefetched(&mut self, request: &runtime::Request, completion: &Completion) {
         let runtime::Request::Prefetch { class, keys, .. } = request else {

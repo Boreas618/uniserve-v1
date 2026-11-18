@@ -1,7 +1,7 @@
 ------------------------------- MODULE KvStep9 -------------------------------
 (***************************************************************************)
 (* The inductive step of IndInv for the tasks of the host tier: Prefetch,  *)
-(* StoreRemote, PeerLost, Deadline, PrefetchEnd and PutEnd.                *)
+(* StoreRemote, Deadline, PrefetchEnd and PutEnd.                          *)
 (***************************************************************************)
 EXTENDS KvFrame
 
@@ -10,13 +10,13 @@ USE Sizes, Design DEF On, AllRules
 -----------------------------------------------------------------------------
 (* Task t is a record of the fields of Task alone.                         *)
 TaskRecord(t) ==
-  t = [kind |-> t.kind, k |-> t.k, h |-> t.h, src |-> t.src, ok |-> t.ok,
+  t = [kind |-> t.kind, k |-> t.k, h |-> t.h,
        expired |-> t.expired, p |-> t.p, o |-> t.o, to |-> t.to, slot |-> t.slot,
        held |-> t.held, units |-> t.units, writes |-> t.writes]
 
 (* The prefetch a group's admission asks for: a task that fills that       *)
 (* group's host parts.                                                     *)
-PrefetchTask(k, h, src, g) == [Task("prefetch", k, h, src) EXCEPT !.to = g]
+PrefetchTask(k, h, g) == [Task("prefetch", k, h) EXCEPT !.to = g]
 
 -----------------------------------------------------------------------------
 (* The crossings, and where copies and crossings read, across a step that  *)
@@ -133,7 +133,7 @@ LEMMA TierTypes ==
            /\ t.units \subseteq AllUnits /\ t.writes \subseteq AllUnits
            /\ t.k \in Keys \cup {NONE} /\ t.h \in HostUnits \cup {NONE}
            /\ t.slot \in Slots \cup {NONE} /\ t.o \in Owners \cup {NONE} /\ t.to \in Groups \cup {NONE}
-           /\ t.p \in Positions \cup {NONE} /\ t.src \in {NONE, "remote", "peer"}
+           /\ t.p \in Positions \cup {NONE}
            /\ t.kind \in {"transfer", "replicate"} <=> t.k = NONE
            /\ t.kind = "prefetch" => t.to \in Groups
            /\ TaskRecord(t)
@@ -143,26 +143,26 @@ LEMMA TierTypes ==
 -----------------------------------------------------------------------------
 (* Prefetch                                                                *)
 
-(* Prefetch(k, src, g) taking host unit h, which is free.                  *)
-PrefetchAt(k, src, g, h) ==
+(* Prefetch(k, g) taking host unit h, which is free.                  *)
+PrefetchAt(k, g, h) ==
   /\ hcache[k] = NONE
   /\ h \in free /\ alloc[h] = NONE /\ sharedKey[h] = NONE /\ Unheld(h)
   /\ \A j \in Keys : cache[j] # h
   /\ free' = free \ {h}
   /\ alloc' = [alloc EXCEPT ![h] = "task"]
-  /\ tasks' = tasks \cup {PrefetchTask(k, h, src, g)}
+  /\ tasks' = tasks \cup {PrefetchTask(k, h, g)}
   /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
                  member, valid, vis, dbt, launched, inflight, handoff, requests, sharedKey, remote,
                  lost, bad>>
 
 LEMMA PrefetchPick ==
-  ASSUME IndInv, NEW k \in Keys, NEW src \in {"remote", "peer"}, NEW g \in Groups,
-         Prefetch(k, src, g)
-  PROVE  \E h \in HostUnits : PrefetchAt(k, src, g, h)
+  ASSUME IndInv, NEW k \in Keys, NEW g \in Groups,
+         Prefetch(k, g)
+  PROVE  \E h \in HostUnits : PrefetchAt(k, g, h)
   <1>1. PICK h \in free \cap HostUnits :
           /\ free' = free \ {h}
           /\ alloc' = [alloc EXCEPT ![h] = "task"]
-          /\ tasks' = tasks \cup {PrefetchTask(k, h, src, g)}
+          /\ tasks' = tasks \cup {PrefetchTask(k, h, g)}
     BY DEF Prefetch, PrefetchTask
   <1>2. /\ hcache[k] = NONE
         /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
@@ -177,13 +177,13 @@ LEMMA PrefetchPick ==
     BY <1>1, <1>2, <1>3, <1>4 DEF PrefetchAt
 
 LEMMA PrefetchInv ==
-  ASSUME IndInv, NEW k \in Keys, NEW src \in {"remote", "peer"}, NEW g \in Groups,
-         NEW h \in HostUnits, PrefetchAt(k, src, g, h)
+  ASSUME IndInv, NEW k \in Keys, NEW g \in Groups,
+         NEW h \in HostUnits, PrefetchAt(k, g, h)
   PROVE  IndInv'
-  <1> DEFINE t0 == PrefetchTask(k, h, src, g)
+  <1> DEFINE t0 == PrefetchTask(k, h, g)
   <1>1. TypeOK
     BY TypeFacts
-  <1>2. /\ t0.kind = "prefetch" /\ t0.k = k /\ t0.h = h /\ t0.src = src /\ t0.held
+  <1>2. /\ t0.kind = "prefetch" /\ t0.k = k /\ t0.h = h /\ t0.held
         /\ t0.units = {} /\ t0.writes = {} /\ t0.slot = NONE /\ t0.o = NONE /\ t0.to = g
         /\ t0.p = NONE
         /\ TaskRecord(t0)
@@ -316,7 +316,7 @@ StoreRemoteAt(k) ==
   /\ hcache[k] \in HostUnits /\ alloc[hcache[k]] = "shared" /\ sharedKey[hcache[k]] = k
   /\ \A j \in Keys : hcache[j] = hcache[k] => j = k
   /\ vis[k].h = NONE
-  /\ tasks' = tasks \cup {Task("put", k, hcache[k], "remote")}
+  /\ tasks' = tasks \cup {Task("put", k, hcache[k])}
   /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
                  member, valid, vis, dbt, launched, inflight, handoff, requests, alloc, sharedKey,
                  remote, lost, bad>>
@@ -325,7 +325,7 @@ LEMMA StoreRemotePick ==
   ASSUME IndInv, NEW k \in Keys, StoreRemote(k)
   PROVE  StoreRemoteAt(k)
   <1>1. /\ hcache[k] # NONE /\ vis[k].h = NONE
-        /\ tasks' = tasks \cup {Task("put", k, hcache[k], "remote")}
+        /\ tasks' = tasks \cup {Task("put", k, hcache[k])}
         /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
                        trial, member, valid, vis, dbt, launched, inflight, handoff, requests, alloc,
                        sharedKey, remote, lost, bad>>
@@ -339,8 +339,8 @@ LEMMA StoreRemotePick ==
 LEMMA StoreRemoteInv ==
   ASSUME IndInv, NEW k \in Keys, StoreRemoteAt(k)
   PROVE  IndInv'
-  <1> DEFINE t0 == Task("put", k, hcache[k], "remote")
-  <1>1. /\ t0.kind = "put" /\ t0.k = k /\ t0.h = hcache[k] /\ t0.src = "remote" /\ t0.held
+  <1> DEFINE t0 == Task("put", k, hcache[k])
+  <1>1. /\ t0.kind = "put" /\ t0.k = k /\ t0.h = hcache[k] /\ t0.held
         /\ t0.units = {} /\ t0.writes = {} /\ t0.slot = NONE /\ t0.o = NONE /\ t0.to = NONE
     BY DEF Task
   <1>2. Transfers' = Transfers /\ Crossings' = Crossings /\ TaskUnits' \subseteq TaskUnits
@@ -359,7 +359,7 @@ LEMMA StoreRemoteInv ==
             /\ t.units \subseteq AllUnits /\ t.writes \subseteq AllUnits
             /\ t.k \in Keys \cup {NONE} /\ t.h \in HostUnits \cup {NONE}
             /\ t.slot \in Slots \cup {NONE} /\ t.o \in Owners \cup {NONE} /\ t.to \in Groups \cup {NONE}
-            /\ t.p \in Positions \cup {NONE} /\ t.src \in {NONE, "remote", "peer"}
+            /\ t.p \in Positions \cup {NONE}
             /\ t.kind \in {"transfer", "replicate"} <=> t.k = NONE
             /\ t.kind = "prefetch" => t.to \in Groups
             /\ TaskRecord(t)
@@ -389,13 +389,12 @@ LEMMA StoreRemoteInv ==
     BY <1>4, <1>5, <1>6, <1>7 DEF IndInv
 
 -----------------------------------------------------------------------------
-(* PeerLost and Deadline: a prefetch or a remote store is replaced by one  *)
-(* that differs from it only in whether its source held the block and      *)
-(* whether its deadline passed.                                            *)
+(* Deadline: a prefetch or a remote store is replaced by one that differs  *)
+(* from it only in whether its deadline passed.                            *)
 
 LEMMA RelabelInv ==
   ASSUME IndInv, NEW t \in tasks, t.kind \in {"prefetch", "put"}, NEW x,
-         x.kind = t.kind, x.k = t.k, x.h = t.h, x.src = t.src, x.o = t.o, x.to = t.to,
+         x.kind = t.kind, x.k = t.k, x.h = t.h, x.o = t.o, x.to = t.to,
          x.p = t.p, x.slot = t.slot, x.held = t.held, x.units = t.units, x.writes = t.writes,
          TaskRecord(x),
          tasks' = (tasks \ {t}) \cup {x},
@@ -417,7 +416,7 @@ LEMMA RelabelInv ==
             /\ y.units \subseteq AllUnits /\ y.writes \subseteq AllUnits
             /\ y.k \in Keys \cup {NONE} /\ y.h \in HostUnits \cup {NONE}
             /\ y.slot \in Slots \cup {NONE} /\ y.o \in Owners \cup {NONE} /\ y.to \in Groups \cup {NONE}
-            /\ y.p \in Positions \cup {NONE} /\ y.src \in {NONE, "remote", "peer"}
+            /\ y.p \in Positions \cup {NONE}
             /\ y.kind \in {"transfer", "replicate"} <=> y.k = NONE
             /\ y.kind = "prefetch" => y.to \in Groups
             /\ TaskRecord(y)
@@ -456,26 +455,6 @@ LEMMA RelabelInv ==
   <1> QED
     BY <1>3, <1>4, <1>5, <1>6 DEF IndInv
 
-LEMMA PeerLostInv ==
-  ASSUME IndInv, NEW t \in tasks, PeerLost(t)
-  PROVE  IndInv'
-  <1> DEFINE x == [t EXCEPT !.ok = FALSE]
-  <1>1. /\ t.kind = "prefetch"
-        /\ tasks' = (tasks \ {t}) \cup {x}
-        /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
-                       trial, member, valid, vis, dbt, launched, inflight, handoff, requests, alloc,
-                       sharedKey, remote, lost, bad>>
-    BY DEF PeerLost, plane, rare
-  <1>2. TaskRecord(t)
-    BY DEF IndInv, TypeInv, TaskRecord
-  <1>3. /\ x.kind = t.kind /\ x.k = t.k /\ x.h = t.h /\ x.src = t.src /\ x.o = t.o /\ x.to = t.to
-        /\ x.p = t.p /\ x.slot = t.slot /\ x.held = t.held /\ x.units = t.units
-        /\ x.writes = t.writes
-        /\ TaskRecord(x)
-    BY <1>2 DEF TaskRecord
-  <1> QED
-    BY <1>1, <1>3, RelabelInv
-
 LEMMA DeadlineInv ==
   ASSUME IndInv, NEW t \in tasks, Deadline(t)
   PROVE  IndInv'
@@ -490,7 +469,7 @@ LEMMA DeadlineInv ==
     BY <1>1 DEF IndInv, TasksOk
   <1>3. TaskRecord(t)
     BY DEF IndInv, TypeInv, TaskRecord
-  <1>4. /\ x.kind = t.kind /\ x.k = t.k /\ x.h = t.h /\ x.src = t.src /\ x.o = t.o /\ x.to = t.to
+  <1>4. /\ x.kind = t.kind /\ x.k = t.k /\ x.h = t.h /\ x.o = t.o /\ x.to = t.to
         /\ x.p = t.p /\ x.slot = t.slot /\ x.held = t.held /\ x.units = t.units
         /\ x.writes = t.writes
         /\ TaskRecord(x)
@@ -1004,7 +983,7 @@ LEMMA PrefetchEndInv ==
     BY DEF PrefetchEnd, plane
   <1>2. t.held /\ t.h \in HostUnits
     BY <1>1, PrefetchSole
-  <1>3. CASE found /\ ~t.expired /\ t.held /\ hcache[t.k] = NONE /\ t.ok
+  <1>3. CASE found /\ ~t.expired /\ t.held /\ hcache[t.k] = NONE
     <2>1. /\ hcache' = [hcache EXCEPT ![t.k] = t.h]
           /\ free' = free
           /\ alloc' = [alloc EXCEPT ![t.h] = "shared"]
@@ -1015,7 +994,7 @@ LEMMA PrefetchEndInv ==
       BY <1>3 DEF PrefetchEnd
     <2> QED
       BY <1>1, <1>3, <2>1, PrefetchCachedInv
-  <1>4. CASE ~(found /\ ~t.expired /\ t.held /\ hcache[t.k] = NONE /\ t.ok)
+  <1>4. CASE ~(found /\ ~t.expired /\ t.held /\ hcache[t.k] = NONE)
     <2>1. /\ DropWith({t.h}, table, oslot, cache, hcache, deferred, copies, tasks')
           /\ UNCHANGED <<hcache, bad, vis, valid>>
       BY <1>2, <1>4 DEF PrefetchEnd
@@ -1068,7 +1047,7 @@ LEMMA PutEndInv ==
             /\ y.units \subseteq AllUnits /\ y.writes \subseteq AllUnits
             /\ y.k \in Keys \cup {NONE} /\ y.h \in HostUnits \cup {NONE}
             /\ y.slot \in Slots \cup {NONE} /\ y.o \in Owners \cup {NONE} /\ y.to \in Groups \cup {NONE}
-            /\ y.p \in Positions \cup {NONE} /\ y.src \in {NONE, "remote", "peer"}
+            /\ y.p \in Positions \cup {NONE}
             /\ y.kind \in {"transfer", "replicate"} <=> y.k = NONE
             /\ y.kind = "prefetch" => y.to \in Groups
             /\ TaskRecord(y)
@@ -1086,25 +1065,25 @@ LEMMA PutEndInv ==
 (* The group                                                               *)
 
 Next9 ==
-  \/ \E k \in Keys, g \in Groups : Prefetch(k, "remote", g) \/ Prefetch(k, "peer", g)
+  \/ \E k \in Keys, g \in Groups : Prefetch(k, g)
   \/ \E k \in Keys : StoreRemote(k)
-  \/ \E t \in tasks : PeerLost(t) \/ Deadline(t)
+  \/ \E t \in tasks : Deadline(t)
   \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
 
 THEOREM Step9 == IndInv /\ Next9 => IndInv'
   <1> SUFFICES ASSUME IndInv, Next9 PROVE IndInv'
     OBVIOUS
-  <1>1. CASE \E k \in Keys, g \in Groups : Prefetch(k, "remote", g) \/ Prefetch(k, "peer", g)
-    <2>1. PICK k \in Keys, g \in Groups, src \in {"remote", "peer"} : Prefetch(k, src, g)
+  <1>1. CASE \E k \in Keys, g \in Groups : Prefetch(k, g)
+    <2>1. PICK k \in Keys, g \in Groups : Prefetch(k, g)
       BY <1>1
-    <2>2. PICK h \in HostUnits : PrefetchAt(k, src, g, h)
+    <2>2. PICK h \in HostUnits : PrefetchAt(k, g, h)
       BY <2>1, PrefetchPick
     <2> QED
       BY <2>2, PrefetchInv
   <1>2. CASE \E k \in Keys : StoreRemote(k)
     BY <1>2, StoreRemotePick, StoreRemoteInv
-  <1>3. CASE \E t \in tasks : PeerLost(t) \/ Deadline(t)
-    BY <1>3, PeerLostInv, DeadlineInv
+  <1>3. CASE \E t \in tasks : Deadline(t)
+    BY <1>3, DeadlineInv
   <1>4. CASE \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
     BY <1>4, PrefetchEndInv, PutEndInv
   <1> QED

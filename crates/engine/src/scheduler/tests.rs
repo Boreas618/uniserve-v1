@@ -152,7 +152,6 @@ fn layouts(count: usize) -> (runtime::Open, runtime::Opened) {
         state_in_slot: false,
         tensors: [0; 32],
         encoding: [0; 32],
-        source: None,
     };
     let layout = runtime::Open {
         version: runtime::VERSION,
@@ -166,7 +165,6 @@ fn layouts(count: usize) -> (runtime::Open, runtime::Opened) {
         ],
         classes: vec![class(1), class(0)],
         trajectory: PRODUCT,
-        peers: Vec::new(),
         groups: vec![group(A, 0), group(B, 1)],
         schedulers: vec![[A, B][..count].to_vec()],
     };
@@ -300,7 +298,6 @@ pub(super) fn attached(attachments: &[(GroupId, OwnerId, u32)]) -> Request {
         num_computed_tokens: 0,
         num_cached_tokens: 0,
         num_host_tokens: 0,
-        num_peer_tokens: 0,
         listing: 0,
         keys: Vec::new(),
         spec_token_ids: Vec::new(),

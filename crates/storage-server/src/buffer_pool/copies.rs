@@ -87,10 +87,7 @@ impl BufferPool {
     /// `written`, and the encodings its copy names: `None` when the copy is
     /// in the class's own encoding and its bytes are copied as they are.
     /// R1: a copy of other tensors is not loaded or restored for the class,
-    /// nor one outside the class's host region and its converted-load source
-    /// region, which are the host regions its ranks map; a copy in the
-    /// source region is one only in the source's encoding, which the worker
-    /// converts as it loads it (`specs/buffer-pool.md` §13).
+    /// nor one outside the class's host region, the host region its ranks map.
     fn convertible(
         &self,
         client: ClientId,
@@ -102,16 +99,8 @@ impl BufferPool {
         if written.0 != found.tensors {
             return Err(Cause::Class);
         }
-        let region = host.region();
-        match (found.host, found.source) {
-            (_, Some((source, encoding))) if source == region => {
-                if written.1 == encoding {
-                    Ok(Some((written.1, found.encoding)))
-                } else {
-                    Err(Cause::Class)
-                }
-            }
-            (Some((own, _)), _) if own == region => {
+        match found.host {
+            Some((own, _)) if own == host.region() => {
                 Ok((written.1 != found.encoding).then_some((written.1, found.encoding)))
             }
             _ => Err(Cause::Class),

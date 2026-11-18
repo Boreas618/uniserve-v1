@@ -3,11 +3,9 @@
 //! [`BufferPool::check`].
 
 use storage::protocol::Key;
-use storage::runtime::{
-    Cause, Completion, GroupId, Lender, OwnerId, Request, RequestId, Source, Tier,
-};
+use storage::runtime::{Cause, Completion, GroupId, Lender, OwnerId, Request, RequestId, Tier};
 
-use super::{BufferPool, Class, Group, Memories, QueueId, Validity};
+use super::{BufferPool, Class, Group, Memories, Validity};
 
 /// The KV class: one unit per block, host copies of one unit.
 const KV: u8 = 0;
@@ -72,7 +70,6 @@ fn laid_out(encoding: [u8; 32]) -> (Vec<Class>, u8) {
         state_in_slot: false,
         tensors: [index + 1; 32],
         encoding,
-        source: None,
     };
     let classes = vec![
         class(KV, 1, Some((HOST, 1))),
@@ -1653,7 +1650,6 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
         class: KV,
         units: 0,
         keys,
-        source: Source::Remote,
         deadline: 50,
     };
     let id = fixture.submit(QUEUE, request);
@@ -1687,7 +1683,6 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
         class: KV,
         units: 0,
         keys: vec![key(1)],
-        source: Source::Peers,
         deadline: 90,
     };
     assert_eq!(
@@ -1697,136 +1692,6 @@ fn a_prefetch_brings_the_leading_keys_into_the_host_tier_by_its_deadline() {
             evicted: Vec::new()
         })
     );
-}
-
-/// The converted-load source region of [`Fixture::converting`]: host units of 128 bytes, a
-/// dense page of a KV block each.
-const SOURCE: u8 = 8;
-
-/// The encoding a copy in the source region is written in: another representation of the KV
-/// class's tensors.
-const DENSE: [u8; 32] = [9; 32];
-
-impl Fixture {
-    /// As [`Self::new`], with a converted-load source region of `units` units, which the KV
-    /// class names as its source, in the encoding [`DENSE`].
-    fn converting(units: u32) -> Self {
-        let mut fixture = Self::new();
-        fixture.pool.grant(8, 0, 1 << 20);
-        let opened =
-            (fixture.pool).open_region("source", Tier::Host, 8, (128, 128), 0, units, units);
-        assert_eq!(opened, SOURCE);
-        let (mut classes, trajectory) = classes();
-        classes[usize::from(KV)].source = Some((SOURCE, DENSE));
-        fixture.pool.classes.insert(SERVING, (classes, trajectory));
-        fixture.checked();
-        fixture
-    }
-
-    /// Submits a prefetch of `names` from the peers and returns its task, which has started.
-    fn prefetch_peers(&mut self, names: &[u8]) -> (QueueId, RequestId) {
-        let request = Request::Prefetch {
-            group: PREFILL,
-            class: KV,
-            units: 0,
-            keys: names.iter().map(|name| key(*name)).collect(),
-            source: Source::Peers,
-            deadline: 1_000,
-        };
-        let id = self.submit(QUEUE, request);
-        assert_eq!(self.pool.started(), [(QUEUE, id)]);
-        (QUEUE, id)
-    }
-}
-
-/// A prefetch from the peers reads each peer copy into a block of the region its encoding
-/// belongs to: the class's host region for the class's own encoding, its converted-load source
-/// region for the source's, which a load then names with the two encodings its worker converts
-/// between. No queue pair orders the source region: a read that finds it full takes the unit of
-/// its unheld copy, lowest unit first, and the prefetch names the key it evicted; one that
-/// finds every copy there held, or a copy in an encoding the class neither has nor converts
-/// from, is not read.
-#[test]
-fn a_prefetch_from_the_peers_stages_a_copy_of_the_source_encoding_for_a_converted_load() {
-    let mut fixture = Fixture::converting(1);
-    let own = ([KV + 1; 32], [0; 32]);
-    let dense = ([KV + 1; 32], DENSE);
-
-    // Key 1's peer copy is dense and moves to the source region; key 2's is in the class's own
-    // encoding and keeps its host block.
-    let task = fixture.prefetch_peers(&[1, 2]);
-    let runs = fixture.pool.peer_copies(task, &[Some(dense), Some(own)]);
-    fixture.checked();
-    assert_eq!(runs, [(SOURCE, 0, 1), (HOST, 1, 1)]);
-    assert_eq!((fixture.free(HOST), fixture.free(SOURCE)), (1, 0));
-    fixture.pool.done(task, 64);
-    fixture.pool.done(task, 64);
-    fixture.checked();
-    let found = Completion::Prefetched {
-        found: 2,
-        evicted: Vec::new(),
-    };
-    assert_eq!(fixture.answer(task.1), Some(found));
-
-    // A load reads the staged copy and names both encodings; key 2's copy is in another
-    // encoding, so the load ends before it.
-    fixture.attach(1, PREFILL);
-    let load = fixture.submit(
-        QUEUE,
-        Request::Load {
-            owner: OwnerId(1),
-            class: KV,
-            at: 0,
-            keys: vec![key(1), key(2)],
-        },
-    );
-    let Some(Completion::Copy {
-        keys,
-        from,
-        encodings,
-        ..
-    }) = fixture.answer(load)
-    else {
-        panic!("no copy")
-    };
-    assert_eq!(keys, [key(1)]);
-    assert_eq!(from, [(SOURCE, 0, 1)]);
-    assert_eq!(encodings, Some((DENSE, [0; 32])));
-
-    // While the load reads it, the staged copy is held: a dense read finds no unit for its
-    // copy and reads nothing.
-    let held = fixture.prefetch_peers(&[3]);
-    assert_eq!(fixture.pool.peer_copies(held, &[Some(dense)]), []);
-    fixture.pool.ended(held, false);
-    fixture.checked();
-    let nothing = Completion::Prefetched {
-        found: 0,
-        evicted: Vec::new(),
-    };
-    assert_eq!(fixture.answer(held.1), Some(nothing.clone()));
-
-    // Once loaded, nothing holds it: the next dense read takes its unit and names its key.
-    assert_eq!(fixture.finish(load, true), Some(Completion::Loaded));
-    let task = fixture.prefetch_peers(&[3]);
-    assert_eq!(
-        fixture.pool.peer_copies(task, &[Some(dense)]),
-        [(SOURCE, 0, 1)]
-    );
-    fixture.pool.done(task, 64);
-    fixture.checked();
-    let recycled = Completion::Prefetched {
-        found: 1,
-        evicted: vec![key(1)],
-    };
-    assert_eq!(fixture.answer(task.1), Some(recycled));
-
-    // A copy in a third encoding is read into neither region.
-    let other = fixture.prefetch_peers(&[4]);
-    let third = ([KV + 1; 32], [5; 32]);
-    assert_eq!(fixture.pool.peer_copies(other, &[Some(third)]), []);
-    fixture.pool.ended(other, false);
-    fixture.checked();
-    assert_eq!(fixture.answer(other.1), Some(nothing));
 }
 
 #[test]
@@ -1845,7 +1710,6 @@ fn tasks_past_their_deadlines_at_one_tick_are_answered_in_the_order_of_their_dea
                     class: KV,
                     units: 0,
                     keys: vec![key(10 + index as u8)],
-                    source: Source::Peers,
                     deadline: 80 - 10 * index,
                 },
             )
@@ -1911,7 +1775,6 @@ fn a_prefetch_into_a_full_host_tier_evicts_in_the_order_and_names_what_it_evicte
         class: KV,
         units: 0,
         keys: vec![key(5), key(6)],
-        source: Source::Remote,
         deadline: 50,
     };
     let id = fixture.submit(QUEUE, prefetch);
@@ -2149,7 +2012,6 @@ fn a_state_marks_the_units_an_owner_holds_in_another_class() {
         state_in_slot: false,
         tensors: [index + 1; 32],
         encoding: [0; 32],
-        source: None,
     };
     let classes = vec![
         class(KV, 1, Some((HOST, 1))),
@@ -2431,7 +2293,7 @@ fn a_resize_moves_free_units_between_a_region_and_the_quota() {
 }
 
 #[test]
-fn a_peer_s_hold_keeps_a_host_copy_until_it_is_released() {
+fn a_move_s_hold_keeps_a_host_copy_until_it_is_released() {
     let mut fixture = Fixture::new();
     // Both host units hold a copy: of key 7, then of key 8.
     for (owner, name) in [(1, 7), (2, 8)] {
@@ -2452,7 +2314,7 @@ fn a_peer_s_hold_keeps_a_host_copy_until_it_is_released() {
     // hold is a holder: the copy is no longer evictable.
     let held = fixture.pool.hold(9, &[key(7), key(9)]);
     fixture.checked();
-    assert_eq!(held, [(key(7), (HOST, 0, 1), 64, ([KV + 1; 32], [0; 32]))]);
+    assert_eq!(held, [(key(7), (HOST, 0, 1))]);
     assert_eq!(fixture.pool.capacity(QUEUE, HOST), (0, 0, 1));
 
     // A store that needs room evicts in the installed order and skips it.
@@ -2471,10 +2333,10 @@ fn a_peer_s_hold_keeps_a_host_copy_until_it_is_released() {
     };
     assert_eq!(evicted, [key(8)]);
 
-    // The release ends every hold of the peer; a second finds none.
-    assert!(fixture.pool.release_peer(9));
+    // The release ends every hold of the holder; a second finds none.
+    assert!(fixture.pool.release_holds(9));
     fixture.checked();
-    assert!(!fixture.pool.release_peer(9));
+    assert!(!fixture.pool.release_holds(9));
     assert_eq!(fixture.pool.capacity(QUEUE, HOST), (1, 0, 1));
 }
 
@@ -2706,7 +2568,6 @@ fn processes_layout(groups: Vec<storage::runtime::Group>) -> storage::runtime::O
         state_in_slot: false,
         tensors: [units as u8; 32],
         encoding: [0; 32],
-        source: None,
     };
     let schedulers = vec![groups.iter().map(|group| group.id).collect()];
     Open {
@@ -2725,7 +2586,6 @@ fn processes_layout(groups: Vec<storage::runtime::Group>) -> storage::runtime::O
         trajectory: 1,
         groups,
         schedulers,
-        peers: Vec::new(),
     }
 }
 

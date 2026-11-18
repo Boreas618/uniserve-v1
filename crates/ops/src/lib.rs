@@ -183,7 +183,6 @@ pub mod patch;
 pub mod pcm;
 pub mod position;
 pub mod posterior;
-pub mod prefix_cache;
 mod primitives;
 pub mod profiler;
 pub mod recurrent;

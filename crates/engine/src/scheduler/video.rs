@@ -1406,7 +1406,6 @@ mod tests {
             num_computed_tokens: 0,
             num_cached_tokens: 0,
             num_host_tokens: 0,
-            num_peer_tokens: 0,
             listing: 0,
             keys: Vec::new(),
             spec_token_ids: Vec::new(),
@@ -1499,7 +1498,6 @@ mod tests {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
-            source: None,
         };
         let mut classes = vec![Class {
             units: 1,
@@ -1507,7 +1505,6 @@ mod tests {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
-            source: None,
         }];
         classes.extend(pipeline().products.iter().map(|_| sized(None)));
         classes.push(sized(Some((LATENTS, 0))));
@@ -1524,7 +1521,6 @@ mod tests {
             ],
             classes,
             trajectory: trajectory(),
-            peers: Vec::new(),
             groups: ids.iter().map(|&id| layout(id)).collect(),
             schedulers: vec![ids.clone()],
         };
@@ -2141,7 +2137,6 @@ mod tests {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
-            source: None,
         };
         let mut classes = vec![class(1, None)];
         classes.extend(pipeline().products.iter().map(|_| class(0, None)));
@@ -2189,7 +2184,6 @@ mod tests {
             ],
             classes,
             trajectory: trajectory(),
-            peers: Vec::new(),
             groups: vec![
                 group(A, 2, model, receives),
                 group(B, 3, muxer, vec![Vec::new(); trajectory() as usize + 1]),

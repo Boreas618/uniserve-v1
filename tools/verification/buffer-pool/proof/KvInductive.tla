@@ -65,7 +65,7 @@ TypeInv ==
          /\ t.units \subseteq AllUnits /\ t.writes \subseteq AllUnits
          /\ t.k \in Keys \cup {NONE} /\ t.h \in HostUnits \cup {NONE}
          /\ t.slot \in Slots \cup {NONE} /\ t.o \in Owners \cup {NONE} /\ t.to \in Groups \cup {NONE}
-         /\ t.p \in Positions \cup {NONE} /\ t.src \in {NONE, "remote", "peer"}
+         /\ t.p \in Positions \cup {NONE}
          /\ t.kind \in {"transfer", "replicate"} <=> t.k = NONE
          /\ t.kind = "prefetch" => t.to \in Groups
     /\ \A r \in requests :
@@ -88,7 +88,7 @@ TypeInv ==
               read |-> c.read, write |-> c.write, fill |-> c.fill, parts |-> c.parts,
               seq |-> c.seq, done |-> c.done, stopped |-> c.stopped]
     /\ \A t \in tasks :
-         t = [kind |-> t.kind, k |-> t.k, h |-> t.h, src |-> t.src, ok |-> t.ok,
+         t = [kind |-> t.kind, k |-> t.k, h |-> t.h,
               expired |-> t.expired, p |-> t.p, o |-> t.o, to |-> t.to, slot |-> t.slot,
               held |-> t.held, units |-> t.units, writes |-> t.writes]
     /\ \A r \in requests :

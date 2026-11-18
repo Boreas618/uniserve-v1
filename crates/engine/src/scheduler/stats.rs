@@ -207,10 +207,9 @@ impl Scheduler {
     }
 
     /// Counts the admission of request `id` at `at`: its wait from arrival, and for a token
-    /// request the prefix query and its hit by tier and source (SD §4.4). The query is
-    /// `prompt_len - 1` tokens; the hits are the tokens of its hit, the host hits those of them
-    /// loaded from the host, and the peer hits those of the host hits a `Prefetch` from the peers
-    /// brought.
+    /// request the prefix query and its hit by tier (SD §4.4). The query is `prompt_len - 1`
+    /// tokens; the hits are the tokens of its hit, and the host hits those of them loaded from
+    /// the host.
     pub(super) fn count_admitted(&mut self, id: RequestId, at: Instant) {
         let Some(request) = self.requests.get(&id) else {
             return;
@@ -227,7 +226,6 @@ impl Scheduler {
         }
         let hits = u64::from(request.num_cached_tokens);
         let host = u64::from(request.num_host_tokens).min(hits);
-        let peers = u64::from(request.num_peer_tokens).min(host);
 
         let prefix = &mut stats.prefix_cache_stats;
         add(
@@ -236,7 +234,6 @@ impl Scheduler {
         );
         add(&mut prefix.base.hits, hits);
         add(&mut prefix.host_hits, host);
-        add(&mut prefix.peer_hits, peers);
     }
 
     /// Counts a call left out of a step because blocks it writes had not arrived from the buffer
@@ -705,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn an_admission_counts_its_prefix_query_and_its_hit_by_tier_and_source() {
+    fn an_admission_counts_its_prefix_query_and_its_hit_by_tier() {
         let (mut bench, outputs) = scheduler();
         bench.attach(&[]);
         let scheduler = &mut bench.scheduler;
@@ -713,12 +710,11 @@ mod tests {
         let id = RequestId(1);
 
         // A prompt of 300 tokens with a hit of 256: 64 pinned on the device, 192 loaded from the
-        // host, of which a peers' prefetch brought 128.
+        // host.
         let request = scheduler.requests.get_mut(&id).unwrap();
         request.num_prompt_tokens = 300;
         request.num_cached_tokens = 256;
         request.num_host_tokens = 192;
-        request.num_peer_tokens = 128;
         let arrival = request.arrival;
         scheduler.count_admitted(id, arrival);
         scheduler.publish_stats(start + Duration::from_secs(1));
@@ -728,7 +724,6 @@ mod tests {
         assert_eq!(prefix.base.queries, 299);
         assert_eq!(prefix.base.hits, 256);
         assert_eq!(prefix.host_hits, 192);
-        assert_eq!(prefix.peer_hits, 128);
     }
 
     #[test]

@@ -101,10 +101,7 @@
 //! a host region, which the server creates ([`Request::HostPart`]). The
 //! head grants a device region's memory space each segment its ranks
 //! created ([`Request::Grant`]) and withdraws one before they release it
-//! ([`Request::Withdraw`]). The server reads the host copies of other hosts
-//! that serve the deployment for a prefetch from the peers; another host's
-//! Storage Server holds the host copies it reads ([`Request::PeerHold`],
-//! [`Request::PeerRelease`]). A rank of another host has its part of a host
+//! ([`Request::Withdraw`]). A rank of another host has its part of a host
 //! region on its own host, so a put or a prefetch of the session's that
 //! touches it runs on that host: its Transfer Server copies into the part
 //! ([`Request::Submit`]) and its connector moves the part's pages
@@ -158,12 +155,12 @@ use crate::runtime::{Open, Opened};
 /// speaks: the one version either accepts. Each process that talks to the
 /// server checks it at its own `Hello`, independently of the other
 /// interfaces it speaks.
-pub const VERSION: u32 = 30;
+pub const VERSION: u32 = 31;
 
 /// How long a server of another host may take to answer a request it answers from what it holds
-/// (a hello, a peer's hold and release, a task's submission or cancellation, a connector's pages):
-/// a host whose server does not answer within it is taken as unresponsive, so a prefetch skips
-/// the peer and a transfer there fails rather than holding its task. Connecting to the host is
+/// (a hello, a borrow or return of a lend, a task's submission or cancellation, a connector's
+/// pages): a host whose server does not answer within it is taken as unresponsive, so a transfer
+/// there fails rather than holding its task. Connecting to the host is
 /// bounded alike. A server of this host has no such bound: its end closes the connection.
 pub const ANSWER: Duration = Duration::from_secs(2);
 
@@ -280,8 +277,7 @@ pub enum Role {
     /// that host's Transfer Server, which READs storage of this host through
     /// NIXL for the tasks of its own host and asks the server to expose
     /// regions ([`Request::Expose`]), or that host's Storage Server, which
-    /// holds the host copies of a buffer pool it reads
-    /// ([`Request::PeerHold`]). A peer states no credential: the
+    /// borrows a handoff's lend ([`Request::Borrow`]). A peer states no credential: the
     /// endpoint is unauthenticated and relies on network isolation.
     Peer,
     /// An operator's client, which lists what the server holds, changes the settings it serves
@@ -635,9 +631,8 @@ pub struct TensorRecord {
 }
 
 /// What the pages of a pool the connector maps are (a rank's part of a
-/// buffer pool's host region, [`Event::Pool`]), and what the source pages of
-/// a converted load are: their byte layout, the kv heads a page holds and
-/// its bytes.
+/// buffer pool's host region, [`Event::Pool`]): their byte layout, the kv
+/// heads a page holds and its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PageShape {
     /// The digest of a page's byte layout, computed by the worker: the page
@@ -1092,38 +1087,6 @@ pub struct LentRank {
     pub layout: Option<UnitLayout>,
 }
 
-/// A host copy another host's Storage Server holds for its reads
-/// ([`Request::PeerHold`]): the key, the tokens its block holds, the units
-/// of the host region `region` that hold it, `count` from `first`, and the
-/// encoding it is written in, as the class that wrote it states it
-/// (`crate::runtime::Class::tensors` and `Class::encoding`). Each part of
-/// the region ([`RegionPart`]) holds its bytes of those units. The reader
-/// reads a copy only into a block of a class of the same encoding, or of a
-/// class that converts from it (`crate::runtime::Class::source`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostCopy {
-    pub key: Key,
-    pub tokens: u16,
-    pub region: String,
-    pub first: u32,
-    pub count: u32,
-    pub tensors: [u8; 32],
-    pub encoding: [u8; 32],
-}
-
-/// One rank's part of a host region: unit `u` lies at byte `u × bytes` of
-/// the part, which a transfer names as [`Region::Part`]. The part lies on
-/// the host whose Storage Server listens at `endpoint` when that is another
-/// host than the answering server's: the part of a rank of another host of
-/// the deployment's engine, which lies on that rank's host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegionPart {
-    pub region: String,
-    pub rank: u32,
-    pub bytes: u64,
-    pub endpoint: Option<String>,
-}
-
 /// The device storage the Transfer Server's CUDA context takes on one GPU,
 /// as NVML attributes it to the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1497,21 +1460,6 @@ pub enum Request {
         bytes: u64,
         numa_node: Option<u32>,
     },
-    /// From another host's Storage Server ([`Role::Peer`]): hold the host
-    /// copies of `keys` in `deployment`'s buffer pool that every epoch may
-    /// use, for that host to READ, until its [`Request::PeerRelease`] or
-    /// its connection closes. A held copy is a holder of its block like
-    /// any other, so it is not evicted. Responded with
-    /// [`Response::PeerHeld`], naming the copies held; keys without such a
-    /// copy are left out.
-    PeerHold { deployment: String, keys: Vec<Key> },
-    /// From another host's Storage Server: its reads of the copies it holds
-    /// in `deployment`'s buffer pool ended, and every hold ends. Responded
-    /// with [`Response::Valid`] when the holds stood until now, so what it
-    /// read is what the copies held, and with [`Response::Gone`] when this
-    /// connection holds nothing there; the reading host commits what it
-    /// read only on `Valid`.
-    PeerRelease { deployment: String },
     /// From another host's Storage Server, which imports a handoff's blocks
     /// (`runtime::Request::Import`): the blocks the owner `owner` of the session `session` of
     /// `deployment`'s buffer pool lent (`runtime::Request::Lend`), and where its group's ranks
@@ -1766,25 +1714,12 @@ pub enum Response {
     HostPart {
         units: u32,
     },
-    /// The host copies a [`Request::PeerHold`] holds, and every part of
-    /// the host regions they lie in that this server knows: its own host's,
-    /// and those of the ranks of other hosts its sessions' heads stated. A
-    /// region's copies are read from the same parts, one of each index; a
-    /// held copy that does not lie in all of them is left out.
-    PeerHeld {
-        copies: Vec<HostCopy>,
-        parts: Vec<RegionPart>,
-    },
-    /// The holds a [`Request::PeerRelease`] ended stood until now.
-    Valid,
     /// What a [`Request::Borrow`] borrowed.
     Borrowed {
         lent: Lent,
     },
     /// A [`Request::Return`] was taken.
     Returned,
-    /// The connection held nothing to release.
-    Gone,
     /// The KV program a [`Request::Program`] set runs, started as `start`;
     /// `None` when it set none.
     Programmed {

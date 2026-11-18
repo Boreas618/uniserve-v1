@@ -1146,7 +1146,7 @@ mod tests {
     use proto::config::{KvCacheConfig, SchedulerConfig};
     use scheduling::{Event, PageId};
     use storage::Key;
-    use storage::runtime::{self, Cause, Completion, OwnerId, Source, Tier};
+    use storage::runtime::{self, Cause, Completion, OwnerId, Tier};
 
     use super::super::super::tests::{A, B, Bench, KV, OWNER_A, PRODUCT, attached, bench, key};
     use super::super::super::{Request, WorkerGroup};
@@ -1581,7 +1581,6 @@ mod tests {
             class: KV,
             units: 0,
             keys: vec![key(4), key(5), key(6)],
-            source: Source::Remote,
             deadline: 0,
         };
         let prefetched = Completion::Prefetched {

@@ -884,7 +884,6 @@ impl StorageClient {
             trajectory: 0,
             groups: Vec::new(),
             schedulers: Vec::new(),
-            peers: Vec::new(),
             ..layout.clone()
         };
         self.open(hosts).map(drop)

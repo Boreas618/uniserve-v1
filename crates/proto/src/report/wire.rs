@@ -113,7 +113,6 @@ impl From<&PrefixCacheStats> for wire::PrefixCacheStats {
             queries: stats.base.queries,
             hits: stats.base.hits,
             host_hits: stats.host_hits,
-            peer_hits: stats.peer_hits,
             preempted_requests: stats.preempted_requests,
             preempted_queries: stats.preempted_queries,
             preempted_hits: stats.preempted_hits,
@@ -130,7 +129,6 @@ impl From<wire::PrefixCacheStats> for PrefixCacheStats {
                 hits: stats.hits,
             },
             host_hits: stats.host_hits,
-            peer_hits: stats.peer_hits,
             preempted_requests: stats.preempted_requests,
             preempted_queries: stats.preempted_queries,
             preempted_hits: stats.preempted_hits,
@@ -437,7 +435,6 @@ mod tests {
                     hits: 60,
                 },
                 host_hits: 20,
-                peer_hits: 5,
                 ..PrefixCacheStats::default()
             },
             worker_forward_stats: Some(forward),

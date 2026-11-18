@@ -25,11 +25,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ANSWER, Claim, Claimant, ClientMessage, Event, Hello, HostCopy, Item, Key, KvProgram, Lent,
-    Link, Listing, Location, Mode, Priority, ProgramRecord, ProgramStart, Quota, Refusal, Region,
-    RegionPart, Registration, Request, Response, Role, Scope, Segment, ServerMessage, Span,
-    StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitLayout, UnitRun, Usage,
-    VERSION, Welcome,
+    ANSWER, Claim, Claimant, ClientMessage, Event, Hello, Item, Key, KvProgram, Lent, Link,
+    Listing, Location, Mode, Priority, ProgramRecord, ProgramStart, Quota, Refusal, Region,
+    Registration, Request, Response, Role, Scope, Segment, ServerMessage, Span, StorageRecord,
+    TaskStatus, TensorRecord, Tensors, Throttle, UnitLayout, UnitRun, Usage, VERSION, Welcome,
 };
 use crate::queue::QueueDescriptors;
 use crate::runtime::{Open, Opened};
@@ -842,34 +841,6 @@ impl Client {
                 Ok((units, descriptor))
             }
             (other, _) => Err(unexpected("host part", &other)),
-        }
-    }
-
-    /// See [`Request::PeerHold`]: hold the host copies of `keys` in
-    /// `deployment`'s buffer pool for this connection, a [`Role::Peer`].
-    /// Returns the copies held and the parts of their host regions.
-    pub fn peer_hold(
-        &mut self,
-        deployment: String,
-        keys: Vec<Key>,
-    ) -> Result<(Vec<HostCopy>, Vec<RegionPart>)> {
-        match self
-            .request(&Request::PeerHold { deployment, keys }, &[])?
-            .0
-        {
-            Response::PeerHeld { copies, parts } => Ok((copies, parts)),
-            other => Err(unexpected("peer hold", &other)),
-        }
-    }
-
-    /// See [`Request::PeerRelease`]: end this connection's holds in
-    /// `deployment`'s buffer pool. Returns whether they stood until now
-    /// ([`Response::Valid`]), so what was read under them is valid.
-    pub fn peer_release(&mut self, deployment: String) -> Result<bool> {
-        match self.request(&Request::PeerRelease { deployment }, &[])?.0 {
-            Response::Valid => Ok(true),
-            Response::Gone => Ok(false),
-            other => Err(unexpected("peer release", &other)),
         }
     }
 

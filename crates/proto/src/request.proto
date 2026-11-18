@@ -923,7 +923,8 @@ message PrefixCacheStats {
   uint64 queries = 2;
   uint64 hits = 3;
   uint64 host_hits = 4;
-  uint64 peer_hits = 5;
+  reserved 5;
+  reserved "peer_hits";
   uint64 preempted_requests = 6;
   uint64 preempted_queries = 7;
   uint64 preempted_hits = 8;

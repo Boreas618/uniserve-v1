@@ -32,9 +32,9 @@
 //! requests. [`BufferPool::check`] compares the counts with a scan.
 
 mod copies;
+mod holds;
 mod image;
 mod lends;
-mod peers;
 mod region;
 mod sessions;
 mod state;
@@ -629,9 +629,9 @@ pub struct BufferPool {
     /// Transfer Server or the connector.
     started: Vec<(QueueId, RequestId)>,
     stopped: Vec<(QueueId, RequestId)>,
-    /// The host copies each peer, another host's Storage Server, holds for
-    /// its reads, by the peer's connection: holders like any other.
-    peers: HashMap<u64, Vec<Rc<Block>>>,
+    /// The host copies each move of the KV program holds while it reads them, by the move's
+    /// holder number: holders like any other.
+    holds: HashMap<u64, Vec<Rc<Block>>>,
     /// The lent owners, each with the end of its lease, in nanoseconds of the host's monotonic
     /// clock.
     lends: BTreeMap<(ClientId, OwnerId), u64>,
@@ -687,7 +687,7 @@ impl BufferPool {
             completions: Vec::new(),
             started: Vec::new(),
             stopped: Vec::new(),
-            peers: HashMap::new(),
+            holds: HashMap::new(),
             lends: BTreeMap::new(),
             imports: HashMap::new(),
             borrows: HashMap::new(),
@@ -835,7 +835,6 @@ impl BufferPool {
                 class,
                 units,
                 keys,
-                source: _,
                 deadline,
             } => self.prefetch(queue, id, group, class, units, &keys, deadline),
             Request::Replicate {

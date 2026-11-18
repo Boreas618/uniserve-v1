@@ -53,7 +53,7 @@ use proto::request::{ImageEncoder, RequestId};
 use scheduling::Event;
 use storage::Key;
 use storage::key::{Digest, encoder_output, page_key, page_root};
-use storage::runtime::{self, Completion, GroupId, OwnerId, Source, Tier};
+use storage::runtime::{self, Completion, GroupId, OwnerId, Tier};
 
 use super::super::rows::state_interval;
 use super::super::video::products;
@@ -1351,11 +1351,10 @@ impl Kv {
     }
 
     /// The `Prefetch`es that deepen a token request's expected `hit` (SD §4.4): from the remote
-    /// store when the blocks `cache` says it holds deepen the hit by at least the policy's
-    /// `prefetch_min_tokens`, else from the peers when the deployment has some and the reuse
-    /// limit lies that far beyond the hit; with `forced`, the policy named the request and any
-    /// deepening is asked for. Either deepens it only to a boundary with which the admission
-    /// holds no more than the regions' capacity alone ([`Kv::holds_alone`]). One per cache class
+    /// store (Mooncake Store) when the blocks `cache` says it holds deepen the hit by at least
+    /// the policy's `prefetch_min_tokens`; with `forced`, the policy named the request and any
+    /// deepening is asked for. It deepens it only to a boundary with which the admission holds
+    /// no more than the regions' capacity alone ([`Kv::holds_alone`]). One per cache class
     /// but the draft cache, with the class's keys beyond what the device and the host hold, and a
     /// deadline of the copy timeout of the deepening from now (`SchedulerConfig::copy_timeout`).
     pub(crate) fn prefetch_requests(
@@ -1415,19 +1414,10 @@ impl Kv {
                 })
                 .unwrap_or(0)
         };
-        let remote = deepest(&present);
-        let peers = kv_config(request, groups).is_some_and(|kv| !kv.peers.is_empty());
-        let reach = || deepest(&|_| true);
-        let (target, source) = if remote >= hit.saturating_add(least) {
-            (remote, Source::Remote)
-        } else if let Some(reach) = peers
-            .then(reach)
-            .filter(|&reach| reach >= hit.saturating_add(least))
-        {
-            (reach, Source::Peers)
-        } else {
+        let target = deepest(&present);
+        if target < hit.saturating_add(least) {
             return Vec::new();
-        };
+        }
 
         let wait = step.config.copy_timeout(target - hit).as_nanos();
         let now = monotonic_nanos(Instant::now());
@@ -1448,7 +1438,6 @@ impl Kv {
                 class: u8::try_from(class).unwrap_or(u8::MAX),
                 units: 0,
                 keys: keys.to_vec(),
-                source,
                 deadline,
             });
         }
@@ -1519,7 +1508,6 @@ impl Kv {
         request.blocks = blocks;
         request.num_cached_tokens = hit;
         request.num_host_tokens = 0;
-        request.num_peer_tokens = 0;
         asks
     }
 
@@ -1708,8 +1696,8 @@ impl Kv {
     /// `shared` only where they continue it: entries beyond a position the hit lost are given up
     /// at once; a `Commit` answered `Duplicate` states nothing of them, its block staying private
     /// and held as it was (BP §11). An encoder output the answer did not hold is allocated at
-    /// once, so that its encode computes it; one it holds has its position. A peers'
-    /// `Prefetched` counts the tokens it brought. A `Loaded` that copied nothing holds no entry:
+    /// once, so that its encode computes it; one it holds has its position. A `Loaded` that
+    /// copied nothing holds no entry:
     /// its `Load` comes narrowed to no key ([`super::covered`]), and the positions it named are
     /// missing like those a short pin leaves, for the admission's last round to allocate. A pin
     /// that falls short of what `cache` expected, and the prefetch it calls for, read the
@@ -1738,12 +1726,7 @@ impl Kv {
         };
         let Some((owner, Some(class), positions)) = span(asked) else {
             let (
-                runtime::Request::Prefetch {
-                    class,
-                    keys,
-                    source,
-                    ..
-                },
+                runtime::Request::Prefetch { class, keys, .. },
                 Completion::Prefetched { found, .. },
             ) = (asked, completion)
             else {
@@ -1759,8 +1742,7 @@ impl Kv {
                 let first = keys.first()?;
                 chain.iter().position(|key| key == first).map(count)
             });
-            if *source == Source::Remote
-                && let (Some(owner), Some(at)) = (kv_owner(request), at)
+            if let (Some(owner), Some(at)) = (kv_owner(request), at)
                 && (at + 1).saturating_mul(block) <= request.num_cached_tokens
             {
                 let found = keys.get(..*found as usize).unwrap_or(keys);
@@ -1772,11 +1754,6 @@ impl Kv {
                         keys: found.to_vec(),
                     });
                 }
-            }
-
-            if *source == Source::Peers && first_required == Some(usize::from(*class)) {
-                let tokens = found.saturating_mul(block);
-                request.num_peer_tokens = request.num_peer_tokens.saturating_add(tokens);
             }
             return follow;
         };
@@ -1944,7 +1921,6 @@ impl Kv {
             class,
             units: 0,
             keys: keys[..stored].to_vec(),
-            source: Source::Remote,
             deadline,
         }]
     }
@@ -2803,7 +2779,6 @@ mod tests {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
-            source: None,
         };
         let mut classes: Vec<Class> = shapes.iter().map(|_| class(1)).collect();
         classes.extend((0..=sized).map(|_| class(0)));
@@ -2827,7 +2802,6 @@ mod tests {
             }],
             classes,
             schedulers: vec![vec![A]],
-            peers: Vec::new(),
         };
         let opened = runtime::Opened {
             regions: vec![(4, 256), (5, 256), (6, 256)],
@@ -3336,7 +3310,6 @@ mod tests {
             runtime::Request::Prefetch {
                 class: 0,
                 keys: wanted,
-                source: runtime::Source::Remote,
                 ..
             },
         ] = &follow[..]
@@ -3419,41 +3392,17 @@ mod tests {
         let runtime::Request::Prefetch {
             class,
             keys: fetched,
-            source,
             ..
         } = &asks[1]
         else {
             panic!("a prefetch, not {:?}", asks[1]);
         };
-        assert_eq!(
-            (*class, &fetched[..], *source),
-            (0, &keys[2..10], runtime::Source::Remote)
-        );
+        assert_eq!((*class, &fetched[..]), (0, &keys[2..10]));
 
         // 192 tokens more is short of the policy's 256: the chunk is allocated instead.
         session.list(&tiers(5));
         let asks = session.scheduler.admission_requests(id);
         assert_eq!(asks, [pin(1, 0, 0, &keys[..2]), allocate(1, 0, 2, 1 + 1)]);
-
-        // With peers, the reuse limit lies far enough beyond the hit to ask them.
-        let kv = KvCacheConfig {
-            peers: vec!["peer:1".to_owned()],
-            ..KvCacheConfig::default()
-        };
-        session.scheduler.groups[0].capacity.kv_cache = Some(kv);
-        let asks = session.scheduler.admission_requests(id);
-        let runtime::Request::Prefetch {
-            keys: fetched,
-            source,
-            ..
-        } = &asks[1]
-        else {
-            panic!("a prefetch, not {:?}", asks[1]);
-        };
-        assert_eq!(
-            (&fetched[..], *source),
-            (&keys[2..15], runtime::Source::Peers)
-        );
     }
 
     #[test]
@@ -4445,20 +4394,10 @@ mod tests {
         };
         assert!(fetched(false).is_empty());
         let asks = fetched(true);
-        let [
-            runtime::Request::Prefetch {
-                keys: wanted,
-                source,
-                ..
-            },
-        ] = &asks[..]
-        else {
+        let [runtime::Request::Prefetch { keys: wanted, .. }] = &asks[..] else {
             panic!("one prefetch, not {asks:?}");
         };
-        assert_eq!(
-            (&wanted[..], *source),
-            (&keys[1..2], runtime::Source::Remote)
-        );
+        assert_eq!(&wanted[..], &keys[1..2]);
     }
 
     /// The KV decisions built alone answer an admission from the keys its request needs and the

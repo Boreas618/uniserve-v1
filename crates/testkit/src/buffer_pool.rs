@@ -12,7 +12,7 @@
 //!    workers write it, and read back into the pool;
 //! 2. the requests of each submission queue are taken in order;
 //! 3. the tasks the pool started run to their end: a transfer copies the owner's blocks, a
-//!    prefetch brings the leading keys its source holds ([`InProcessPool::hold_in`]), a put to
+//!    prefetch brings the leading keys the remote store holds ([`InProcessPool::store_remote`]), a put to
 //!    the remote store is acknowledged key by key;
 //! 4. the pool is told the host's monotonic clock ([`runtime::monotonic_nanos`]), which a
 //!    task's deadline is stated in;
@@ -31,9 +31,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 
-use storage::runtime::{
-    self, Cause, Completion, GroupId, Open, Opened, Registers, Request, Source,
-};
+use storage::runtime::{self, Cause, Completion, GroupId, Open, Opened, Registers, Request};
 use storage::{Key, QueuePair, ServerSettings};
 use storage_server::buffer_pool::{self, BufferPool, ClientId, QueueId};
 
@@ -82,12 +80,9 @@ pub struct InProcessPool {
     stopped: bool,
     capacity: HashMap<u8, (u32, u32, u32)>,
     fail_tasks: bool,
-    /// The keys the remote store and the peers hold, with the tokens of each.
+    /// The keys the remote store holds, with the tokens of each.
     remote: HashMap<Key, u16>,
-    peers: HashMap<Key, u16>,
 
-    /// The source of each prefetch, by its request.
-    sources: HashMap<(QueueId, u64), Source>,
     requests: HashMap<(QueueId, u64), Request>,
     taken: Vec<(QueueId, runtime::RequestId, Request)>,
     written: Vec<(QueueId, runtime::RequestId, Completion)>,
@@ -114,8 +109,6 @@ impl InProcessPool {
             capacity: HashMap::new(),
             fail_tasks: false,
             remote: HashMap::new(),
-            peers: HashMap::new(),
-            sources: HashMap::new(),
             requests: HashMap::new(),
             taken: Vec::new(),
             written: Vec::new(),
@@ -336,9 +329,6 @@ impl InProcessPool {
     /// Takes one request of the queue pair at `index`.
     fn take(&mut self, index: usize, id: runtime::RequestId, request: Request) {
         let served = &self.queues[index];
-        if let Request::Prefetch { source, .. } = &request {
-            self.sources.insert((served.queue, id.0), *source);
-        }
         served.executor.taken(id, &request);
         self.requests.insert((served.queue, id.0), request.clone());
         self.taken.push((served.queue, id, request.clone()));
@@ -351,7 +341,7 @@ impl InProcessPool {
     }
 
     /// Runs a task the pool started to its end: a crossing or an import copies everything, a
-    /// prefetch the leading keys its source holds, a put every key; with failing tasks, none of
+    /// prefetch the leading keys the remote store holds, a put every key; with failing tasks, none of
     /// it. An import's lend of this pool ends with it, as the server ends it.
     fn run(&mut self, task: (QueueId, runtime::RequestId)) {
         let ok = !self.fail_tasks;
@@ -360,11 +350,6 @@ impl InProcessPool {
         {
             self.pool.give_back(work.lender.session, work.lender.owner);
         }
-        let source = match self.sources.remove(&(task.0, task.1.0)) {
-            Some(Source::Remote) => Some(&self.remote),
-            Some(Source::Peers) => Some(&self.peers),
-            None => None,
-        };
         if ok {
             // A transfer's copies name no key; a prefetch's read nothing; a put's read its block.
             for (key, reads, ..) in self.pool.work(task) {
@@ -372,7 +357,7 @@ impl InProcessPool {
                     break;
                 };
                 let tokens = if reads.is_empty() {
-                    match source.and_then(|held| held.get(&key)) {
+                    match self.remote.get(&key) {
                         Some(tokens) => *tokens,
                         None => break,
                     }
@@ -503,12 +488,9 @@ impl InProcessPool {
         self.fail_tasks = fail;
     }
 
-    /// `source` holds `key`, whose block holds `tokens` tokens: a prefetch from it brings it.
-    pub fn hold_in(&mut self, source: Source, key: Key, tokens: u16) {
-        match source {
-            Source::Remote => self.remote.insert(key, tokens),
-            Source::Peers => self.peers.insert(key, tokens),
-        };
+    /// The remote store holds `key`, whose block holds `tokens` tokens: a prefetch brings it.
+    pub fn store_remote(&mut self, key: Key, tokens: u16) {
+        self.remote.insert(key, tokens);
     }
 
     /// Every request taken, in the order taken.
@@ -587,10 +569,8 @@ mod tests {
                 state_in_slot: false,
                 tensors: [0; 32],
                 encoding: [0; 32],
-                source: None,
             }],
             trajectory: KV,
-            peers: Vec::new(),
             groups: vec![group(A, "gpu 0", 1), group(B, "gpu 1", 2)],
             schedulers: vec![vec![A, B]],
         }
@@ -918,17 +898,15 @@ mod tests {
     }
 
     #[test]
-    fn a_prefetch_brings_the_leading_keys_its_source_holds() {
+    fn a_prefetch_brings_the_leading_keys_the_remote_store_holds() {
         let mut bench = bench(4096);
-        bench.pool.hold_in(Source::Remote, key(1), 4);
-        bench.pool.hold_in(Source::Remote, key(2), 4);
-        bench.pool.hold_in(Source::Peers, key(3), 4);
+        bench.pool.store_remote(key(1), 4);
+        bench.pool.store_remote(key(2), 4);
         let prefetch = Request::Prefetch {
             group: A,
             class: KV,
             units: 0,
             keys: vec![key(1), key(2), key(3)],
-            source: Source::Remote,
             deadline: u64::MAX,
         };
         assert!(bench.submit(&prefetch));

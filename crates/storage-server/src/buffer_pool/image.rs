@@ -62,7 +62,8 @@ struct Image<R, B> {
     completions: Vec<(QueueId, Vec<u8>)>,
     started: Vec<(QueueId, u64)>,
     stopped: Vec<(QueueId, u64)>,
-    peers: Vec<(u64, Vec<u32>)>,
+    /// The host copies each move of the KV program holds, by its holder.
+    holds: Vec<(u64, Vec<u32>)>,
     /// The lent owners, each with the end of its lease.
     lends: Vec<(ClientId, u64, u64)>,
 }
@@ -111,13 +112,13 @@ impl Serialize for BufferPool {
             }
             copies.push((*queue, request.0, mapped));
         }
-        let mut peers = Vec::with_capacity(self.peers.len());
-        for (peer, blocks) in &self.peers {
+        let mut holds = Vec::with_capacity(self.holds.len());
+        for (holder, blocks) in &self.holds {
             let mut mapped = Vec::with_capacity(blocks.len());
             for block in blocks {
                 mapped.push(named::<_, S::Error>(name(block))?);
             }
-            peers.push((*peer, mapped));
+            holds.push((*holder, mapped));
         }
 
         let completions = self.completions.iter().map(|(queue, request, completion)| {
@@ -177,7 +178,7 @@ impl Serialize for BufferPool {
                 .iter()
                 .map(|(queue, id)| (*queue, id.0))
                 .collect(),
-            peers,
+            holds,
             lends: self
                 .lends
                 .iter()
@@ -239,12 +240,12 @@ impl BufferPool {
             }
             pool.copies.insert((queue, RequestId(request)), copies);
         }
-        for (peer, held) in image.peers {
+        for (holder, held) in image.holds {
             let mut holds = Vec::with_capacity(held.len());
             for index in &held {
                 holds.push(block(index)?);
             }
-            pool.peers.insert(peer, holds);
+            pool.holds.insert(holder, holds);
         }
         pool.lends = image
             .lends

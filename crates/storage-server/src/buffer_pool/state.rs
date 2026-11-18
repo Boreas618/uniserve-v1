@@ -196,8 +196,8 @@ impl BufferPool {
                 Deferred::Lend { .. } | Deferred::Finish { .. } => {}
             }
         }
-        // A peer's hold reads a cached block, as a pin does; a borrow reads a lent one.
-        for block in self.peers.values().chain(self.borrows.values()).flatten() {
+        // A move's hold reads a cached block, as a pin does; a borrow reads a lent one.
+        for block in self.holds.values().chain(self.borrows.values()).flatten() {
             hold(block, BlockState::Retired);
         }
         for ((queue, _), copies) in &self.copies {
@@ -522,11 +522,11 @@ impl BufferPool {
             }
         }
 
-        // A peer holds only host copies of the cache.
-        for (peer, held) in &self.peers {
+        // A move holds only host copies of the cache.
+        for (holder, held) in &self.holds {
             if let Some(block) = held.iter().find(|block| !cached(block)) {
                 return Err(format!(
-                    "peer {peer} holds block {:?}, which is not cached",
+                    "holder {holder} holds block {:?}, which is not cached",
                     block.stated().first().copied()
                 ));
             }

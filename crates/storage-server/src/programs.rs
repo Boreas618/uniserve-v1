@@ -56,10 +56,6 @@ const BUDGET: Budget = Budget {
 /// The most records a deployment's program keeps for its head; past it the oldest go.
 const RECORDS: usize = 4096;
 
-/// The holders the pool knows the KV program's moves by: numbers above every connection's, so a
-/// move's holds are never a peer's.
-const HOLDERS: u64 = 1 << 63;
-
 /// The embedder of a KV program: what it logs, kept as records of its program.
 pub(crate) struct Logs {
     program: String,
@@ -241,7 +237,8 @@ fn read_state(setup: &KvProgram) -> Result<Option<Vec<u8>>, String> {
 #[derive(Default)]
 pub(crate) struct Programs {
     running: HashMap<String, Running>,
-    /// The next holder number of a move ([`HOLDERS`]).
+    /// The holder number the pool knows the last move by: each move holds its copies under a
+    /// number of its own.
     next_holder: u64,
     /// Each move under way: its deployment, the connector tasks still running and the keys
     /// whose pages did not all arrive.
@@ -436,7 +433,7 @@ impl Programs {
     /// A holder number for a move of `deployment`'s, whose pool holds the copies it writes.
     pub(crate) fn holder(&mut self) -> u64 {
         self.next_holder += 1;
-        HOLDERS + self.next_holder
+        self.next_holder
     }
 
     /// A move holding its copies under `holder` started `tasks` connector tasks.

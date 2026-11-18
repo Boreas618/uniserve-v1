@@ -84,9 +84,8 @@ impl ModelRunner {
 
     /// The layout of the rank's cache for `model` (step 5): one attention group of the model's
     /// layers, the state group of a model that keeps a recurrent state, the index keys its
-    /// attention reads when it states them, the draft group of the drafter the checkpoint
-    /// carries and the rank's placement loads ([`ModelRunner::drafter_cache`]), and converted
-    /// loads of peers' dense pages into an FP8 cache.
+    /// attention reads when it states them, and the draft group of the drafter the checkpoint
+    /// carries and the rank's placement loads ([`ModelRunner::drafter_cache`]).
     ///
     /// # Errors
     ///
@@ -157,23 +156,6 @@ impl ModelRunner {
                 }
                 None => layout,
             },
-        };
-
-        // A deployment that reads other hosts' host KV cache pages (`kv_cache_config.peers`) into
-        // an FP8 pool also loads the pages they computed in the dense compute dtype, by converting
-        // them as they load (never the other direction). A pool whose groups have no conversion
-        // (a state or draft group, index keys) loads only its own shape.
-        let converts = kv.host_tier && kv.prefix_caching && !kv.peers.is_empty();
-        let layout = if converts && layout.quantized {
-            match layout.clone().with_conversion() {
-                Ok(converting) => converting,
-                Err(why) => {
-                    tracing::info!(%why, "the KV cache loads no converted peer page");
-                    layout
-                }
-            }
-        } else {
-            layout
         };
 
         layout.validated().context("checking the KV cache's layout")

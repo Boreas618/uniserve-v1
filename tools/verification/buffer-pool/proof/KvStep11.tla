@@ -573,7 +573,7 @@ LEMMA TakeReplicate_Inv ==
 Crossed(d) == CHOOSE x \in d.units : TRUE
 Holding(d) == ostate[d.o] = "live" /\ table[d.o][d.p].u = Crossed(d)
 NewCrossing(d) ==
-    [kind |-> "replicate", k |-> NONE, h |-> NONE, src |-> NONE, ok |-> TRUE, expired |-> FALSE,
+    [kind |-> "replicate", k |-> NONE, h |-> NONE, expired |-> FALSE,
      p |-> d.p, o |-> d.o, to |-> d.to, slot |-> NONE, held |-> TRUE,
      units |-> {Crossed(d)}, writes |-> {Crossed(d)}]
 Reading(d) == [g |-> d.to, o |-> d.o, p |-> d.p, u |-> Crossed(d), w |-> FALSE]
@@ -678,10 +678,10 @@ LEMMA ReplicateDue_Start ==
         /\ \A b \in inflight : \A w \in b.writes : w[2] # u
         /\ Mem(ogroup[d.o]) \in valid[u]
     BY ReplicateDue_Facts
-  <1>3. /\ t0.kind = "replicate" /\ t0.k = NONE /\ t0.h = NONE /\ t0.src = NONE /\ t0.held
+  <1>3. /\ t0.kind = "replicate" /\ t0.k = NONE /\ t0.h = NONE /\ t0.held
         /\ t0.o = d.o /\ t0.p = d.p /\ t0.to = d.to /\ t0.slot = NONE
         /\ t0.units = {u} /\ t0.writes = {u}
-        /\ t0 = [kind |-> t0.kind, k |-> t0.k, h |-> t0.h, src |-> t0.src, ok |-> t0.ok,
+        /\ t0 = [kind |-> t0.kind, k |-> t0.k, h |-> t0.h,
                  expired |-> t0.expired, p |-> t0.p, o |-> t0.o, to |-> t0.to, slot |-> t0.slot,
                  held |-> t0.held, units |-> t0.units, writes |-> t0.writes]
     BY DEF NewCrossing

@@ -39,7 +39,6 @@ MC_HostSplit NoR11 CopiesPlaced
 # configuration, hazard switched on, the properties one of which is reported.
 hazards="
 MC_Transfer H1 TaskIsolation
-MC_Tiers H2 SourcesHeld
 MC_Copies H3 CopyIsolation
 MC_Tiers H4 Exactness
 MC_Copies H5 CopyIsolation|FreeUnheld

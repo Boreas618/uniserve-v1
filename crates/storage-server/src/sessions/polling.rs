@@ -56,7 +56,7 @@
 //! the successor ([`Pools::hand_off`], [`Thread::start`]); the queue pairs
 //! keep their indices, and requests submitted meanwhile wait in the rings.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -66,15 +66,13 @@ use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
 use service::{Wake, Waker};
-use storage::protocol::{BufferPoolListing, HostCopy, Key, Segment};
-use storage::runtime::{
-    Cause, Completion, GroupId, Open, Opened, Registers, Request, RequestId, Source,
-};
+use storage::protocol::{BufferPoolListing, Key, Segment};
+use storage::runtime::{Cause, Completion, GroupId, Open, Opened, Registers, Request, RequestId};
 use storage::{Interest, QueueDescriptors, QueuePair, Signals};
 
 use crate::Server;
 use crate::buffer_pool::trace::{Input, Trace};
-use crate::buffer_pool::{BufferPool, ClientId, Encoding, QueueId, Validity};
+use crate::buffer_pool::{BufferPool, ClientId, QueueId, Validity};
 
 /// The bytes of each ring of a queue pair. The largest record a ring takes
 /// is a little less; a scheduler keeps room for everything outstanding.
@@ -93,6 +91,16 @@ pub(crate) type NamedRun = (String, u32, u32);
 /// A host part as a task names it: the host, as the session's layout names
 /// it (`storage::runtime::Group::parts`), and the part index.
 pub(crate) type HostPart = (String, u32);
+
+/// A host copy the pool holds for a move of the KV program's ([`Pools::hold`]): its key and the
+/// units of the host region `region` that hold it, `count` from `first`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldCopy {
+    pub(crate) key: Key,
+    pub(crate) region: String,
+    pub(crate) first: u32,
+    pub(crate) count: u32,
+}
 
 /// Memories as a task names them: device memories and main processes'
 /// memories by name, and host parts.
@@ -312,8 +320,6 @@ struct Hosted {
     queues: BTreeMap<QueueId, Queue>,
     /// The number the next session takes; numbers are never reused.
     next: ClientId,
-    /// The source of each prefetch whose task has not started yet.
-    sources: HashMap<(QueueId, RequestId), Source>,
     /// Whether the pool changed since its capacity words were written.
     dirty: bool,
 }
@@ -438,7 +444,6 @@ impl Hosted {
             pool,
             queues: BTreeMap::new(),
             next: 1,
-            sources: HashMap::new(),
             dirty: true,
         }
     }
@@ -505,9 +510,6 @@ impl Hosted {
                     busy = true;
                     match Request::decode(&record) {
                         Ok((id, request)) => {
-                            if let Request::Prefetch { source, .. } = &request {
-                                self.sources.insert((*queue, id), *source);
-                            }
                             self.pool.take(*queue, id, request);
                         }
                         Err(error) => {
@@ -577,10 +579,9 @@ impl Hosted {
     }
 
     /// The notice that starts a task: the epoch of its session, what it
-    /// copies, by the names of regions and memories, and for a prefetch
-    /// its source. None for a task whose session closed before it started, which ended with it.
+    /// copies, by the names of regions and memories. None for a task whose session closed before
+    /// it started, which ended with it.
     fn start(&mut self, deployment: &str, task: (QueueId, RequestId)) -> Option<Notice> {
-        let source = self.sources.remove(&task);
         let pool = &self.pool;
         let epoch = pool.epoch(task.0.0)?;
         if let Some(work) = pool.import_work(task) {
@@ -621,7 +622,7 @@ impl Hosted {
             .collect();
         let deployment = deployment.to_owned();
         Some(Box::new(move |server: &mut Server| {
-            server.start_pool_task((deployment, epoch), task, source, copies);
+            server.start_pool_task((deployment, epoch), task, copies);
         }))
     }
 }
@@ -979,7 +980,6 @@ impl Pools {
         hosted.pool.end(client);
         hosted.watch.acted(deployment, || Input::Close(client));
         hosted.queues.retain(|queue, _| queue.0 != client);
-        hosted.sources.retain(|(queue, _), _| queue.0 != client);
         hosted.dirty = true;
         tracing::info!(
             deployment,
@@ -1028,22 +1028,22 @@ impl Pools {
         }
     }
 
-    /// Holds the host copies of `keys` for `peer` ([`BufferPool::hold`]).
-    /// Returns the copies held, by the name of their region, each with the
-    /// host parts that hold it: none for a copy of groups that state no host
-    /// parts, which every part of its region holds.
+    /// Holds the host copies of `keys` for `holder`, a move of the KV program's
+    /// ([`BufferPool::hold`]). Returns the copies held, by the name of their region, each with the
+    /// host parts that hold it: none for a copy of groups that state no host parts, which every
+    /// part of its region holds.
     pub(crate) fn hold(
         &mut self,
         deployment: &str,
-        peer: u64,
+        holder: u64,
         keys: &[Key],
-    ) -> Vec<(HostCopy, Vec<HostPart>)> {
+    ) -> Vec<(HeldCopy, Vec<HostPart>)> {
         let Some(hosted) = self.deployments.get_mut(deployment) else {
             return Vec::new();
         };
         hosted.dirty = true;
-        let held = hosted.pool.hold(peer, keys);
-        let input = || Input::Hold(peer, keys.to_vec());
+        let held = hosted.pool.hold(holder, keys);
+        let input = || Input::Hold(holder, keys.to_vec());
         hosted.watch.acted(deployment, input);
 
         let pool = &hosted.pool;
@@ -1052,66 +1052,31 @@ impl Pools {
             held.map(|(host, part)| (host.to_owned(), part)).collect()
         };
         held.into_iter()
-            .map(
-                |(key, (region, first, count), tokens, (tensors, encoding))| {
-                    let copy = HostCopy {
-                        key,
-                        tokens,
-                        region: pool.region_name(region).to_owned(),
-                        first,
-                        count,
-                        tensors,
-                        encoding,
-                    };
-                    (copy, parts(&key))
-                },
-            )
+            .map(|(key, (region, first, count))| {
+                let copy = HeldCopy {
+                    key,
+                    region: pool.region_name(region).to_owned(),
+                    first,
+                    count,
+                };
+                (copy, parts(&key))
+            })
             .collect()
     }
 
-    /// What the peers hold of the keys of `deployment`'s prefetch `task`:
-    /// per copy, in order, the encoding of the peer's host copy it reads
-    /// ([`BufferPool::peer_copies`]). Returns the runs the leading copies
-    /// write, by the names of their regions.
-    pub(crate) fn peer_copies(
-        &mut self,
-        deployment: &str,
-        task: (QueueId, RequestId),
-        held: &[Option<Encoding>],
-    ) -> Vec<NamedRun> {
+    /// Ends the holds of `holder` in `deployment`'s pool ([`BufferPool::release_holds`]).
+    pub(crate) fn release_holds(&mut self, deployment: &str, holder: u64) {
         let Some(hosted) = self.deployments.get_mut(deployment) else {
-            return Vec::new();
+            return;
         };
-        hosted.dirty = true;
-        let runs = hosted.pool.peer_copies(task, held);
-        let input = || Input::PeerCopies(task, held.to_vec());
+        hosted.dirty |= hosted.pool.release_holds(holder);
+        let input = || Input::ReleaseHolds(holder);
         hosted.watch.acted(deployment, input);
-
-        let pool = &hosted.pool;
-        runs.into_iter()
-            .map(|(region, first, count)| (pool.region_name(region).to_owned(), first, count))
-            .collect()
     }
 
-    /// Ends the holds of `peer` in `deployment`'s pool. Returns whether it
-    /// held anything there.
-    pub(crate) fn release_peer(&mut self, deployment: &str, peer: u64) -> bool {
-        let Some(hosted) = self.deployments.get_mut(deployment) else {
-            return false;
-        };
-        hosted.dirty = true;
-        let released = hosted.pool.release_peer(peer);
-        let input = || Input::ReleasePeer(peer);
-        hosted.watch.acted(deployment, input);
-        released
-    }
-
-    /// The peer's connection closed: its holds and its borrows in every pool end.
+    /// The peer's connection closed: its borrows in every pool end.
     pub(crate) fn peer_gone(&mut self, peer: u64) {
         for (deployment, hosted) in &mut self.deployments {
-            hosted.dirty |= hosted.pool.release_peer(peer);
-            let input = || Input::ReleasePeer(peer);
-            hosted.watch.acted(deployment, input);
             hosted.dirty |= hosted.pool.release_borrows(peer, None);
             let input = || Input::ReleaseBorrows(peer, None);
             hosted.watch.acted(deployment, input);

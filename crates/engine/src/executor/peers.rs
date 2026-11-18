@@ -1225,7 +1225,6 @@ mod tests {
             trajectory: 0,
             groups: Vec::new(),
             schedulers: Vec::new(),
-            peers: Vec::new(),
         };
         let opened = Opened {
             regions: vec![(4, 0)],

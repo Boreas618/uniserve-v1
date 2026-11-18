@@ -44,7 +44,7 @@ checked: an open, a pool's image, a close that closes a KV region (its
 evictions and shrinks, one step to the pool, are as many to the model,
 in every order), or one that changes the layout otherwise than by its
 session's groups and slot rows leaving it; a request of a class other
-than 0; a prefetch from the peers; a load or a store of several keys (the
+than 0; a load or a store of several keys (the
 model makes one per key; a prefetch of several is checked as one per key
 in order, and a state states a task of several keys as one per key); a
 request of no open session; a state while no session is open, with units
@@ -537,7 +537,7 @@ def outside_state(state, regions):
 # The inputs.
 
 ARRIVE = {"release", "detach", "commit", "finish", "transfer", "replicate"}
-STUTTER = {"victims", "list", "unreadable", "limits", "hold", "release-peer", "grant", "withdraw"}
+STUTTER = {"victims", "list", "unreadable", "limits", "hold", "release-holds", "grant", "withdraw"}
 OUTSIDE = {"open", "image"}
 ACTS = {"attach": ["Attach"], "allocate": ["Allocate"], "pin": ["Pin"], "clone": ["Clone"],
         "load": ["Load"], "save": ["Save", "EvictHost"], "restore": ["Restore"], "evict": ["Evict"],
@@ -572,12 +572,7 @@ def acts(text):
         if len(keys) > 1:
             raise Outside("a store of several keys")
         return {"host": ["Store", "EvictHost"], "remote": ["StoreRemote"]}.get(found["tier"], [])
-    if kind == "peer-copies":
-        # The blocks a prefetch from the peers reads its peers' copies into.
-        raise Outside("a prefetch from the peers")
     if kind == "prefetch":
-        if found["source"] != "remote":
-            raise Outside("a prefetch from the peers")
         # A prefetch makes room for its block as a store does, by evicting host copies.
         return ["Prefetch", "EvictHost"]
     if kind not in ACTS:

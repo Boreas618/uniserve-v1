@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use storage::protocol::Key;
-use storage::runtime::{GroupId, OwnerId, Request, RequestId, Source, Stamps, Tier};
+use storage::runtime::{GroupId, OwnerId, Request, RequestId, Stamps, Tier};
 
 use super::replay::{SessionNames, apply, classes, copies_asked, layout, stated, stated_input};
 use super::trace::Input;
@@ -258,7 +258,6 @@ impl Driver {
                 state_in_slot: false,
                 tensors: [0; 32],
                 encoding: [0; 32],
-                source: None,
             },
             Class {
                 units: 0,
@@ -266,7 +265,6 @@ impl Driver {
                 state_in_slot: false,
                 tensors: [1; 32],
                 encoding: [0; 32],
-                source: None,
             },
         ];
         let mut pool = BufferPool::new((1_000, 1_000));
@@ -352,7 +350,6 @@ impl Driver {
                     state_in_slot: false,
                     tensors: [0; 32],
                     encoding: [0; 32],
-                    source: None,
                 },
                 Class {
                     units: 0,
@@ -360,7 +357,6 @@ impl Driver {
                     state_in_slot: false,
                     tensors: [1; 32],
                     encoding: [0; 32],
-                    source: None,
                 },
             ]
         };
@@ -740,7 +736,6 @@ impl Driver {
                 class: KV,
                 units: 0,
                 keys: vec![key()],
-                source: Source::Remote,
                 deadline: u64::MAX - 1,
             },
             Step::Put => Request::Store {

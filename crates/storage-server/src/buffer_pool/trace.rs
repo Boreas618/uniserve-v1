@@ -12,7 +12,7 @@
 //! the deadlines of the tasks that start; each task handed to whoever runs
 //! it, each key a task reports done and each task's end; and what else the
 //! server tells the pool: an update committed or rolled
-//! back, a peer's holds, a segment granted or withdrawn. A second file beside
+//! back, a KV program move's holds, a segment granted or withdrawn. A second file beside
 //! it keeps every completion the pool produced, in the order it produced
 //! them.
 //!
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use storage::protocol::{Key, Segment};
 use storage::runtime::{Completion, GroupId, Open, OwnerId, RequestId};
 
-use super::{BufferPool, ClientId, Encoding, QueueId};
+use super::{BufferPool, ClientId, QueueId};
 
 /// A task: the queue pair and the number of the request that started it.
 pub(super) type Task = (QueueId, RequestId);
@@ -47,12 +47,11 @@ pub(super) const ENDED: u8 = 8;
 pub(super) const PUBLISH: u8 = 10;
 pub(super) const ROLL_BACK: u8 = 11;
 pub(super) const HOLD: u8 = 12;
-pub(super) const RELEASE_PEER: u8 = 13;
+pub(super) const RELEASE_HOLDS: u8 = 13;
 pub(super) const GRANT: u8 = 14;
 pub(super) const WITHDRAW: u8 = 15;
 /// The kind of the records of the completions beside the inputs.
 pub(super) const COMPLETION: u8 = 16;
-pub(super) const PEER_COPIES: u8 = 17;
 pub(super) const BORROW: u8 = 18;
 pub(super) const GIVE_BACK: u8 = 19;
 pub(super) const RELEASE_BORROWS: u8 = 20;
@@ -78,16 +77,13 @@ pub(crate) enum Input {
     /// The update of an epoch on trial is committed, or rolled back.
     Publish(u64),
     RollBack(u64),
-    /// A peer holds host copies, or lets go of them.
+    /// A move of the KV program, by its holder number, holds host copies, or lets go of them.
     Hold(u64, Vec<Key>),
-    ReleasePeer(u64),
+    ReleaseHolds(u64),
     /// A segment of a region, by the region's name, granted with its first
     /// unit and its units, or withdrawn.
     Grant(String, Segment, u32, u32),
     Withdraw(String, Segment),
-    /// What the peers hold of a prefetch's keys: per copy of the task, in
-    /// order, the encoding of the peer's host copy it reads, if any.
-    PeerCopies(Task, Vec<Option<Encoding>>),
     /// Another host's server, by its connection, borrows the lend of a session's owner.
     Borrow(u64, ClientId, OwnerId),
     /// The lend of a session's owner ends.
@@ -151,14 +147,14 @@ impl Input {
                     ROLL_BACK
                 }
             }
-            Self::Hold(peer, keys) => {
-                body.extend_from_slice(&peer.to_le_bytes());
+            Self::Hold(holder, keys) => {
+                body.extend_from_slice(&holder.to_le_bytes());
                 keys.iter().for_each(|key| body.extend_from_slice(&key.0));
                 HOLD
             }
-            Self::ReleasePeer(peer) => {
-                body.extend_from_slice(&peer.to_le_bytes());
-                RELEASE_PEER
+            Self::ReleaseHolds(holder) => {
+                body.extend_from_slice(&holder.to_le_bytes());
+                RELEASE_HOLDS
             }
             Self::Grant(region, segment, first, units) => {
                 segmented(&mut body, *segment);
@@ -171,18 +167,6 @@ impl Input {
                 segmented(&mut body, *segment);
                 body.extend_from_slice(region.as_bytes());
                 WITHDRAW
-            }
-            Self::PeerCopies(task, held) => {
-                tasked(&mut body, *task);
-                // Per copy a byte, 1 when its encoding's two digests follow.
-                for encoding in held {
-                    body.push(u8::from(encoding.is_some()));
-                    if let Some((tensors, layout)) = encoding {
-                        body.extend_from_slice(tensors);
-                        body.extend_from_slice(layout);
-                    }
-                }
-                PEER_COPIES
             }
             Self::Borrow(peer, client, owner) => {
                 body.extend_from_slice(&peer.to_le_bytes());
@@ -372,7 +356,6 @@ mod tests {
             trajectory: 0,
             groups: Vec::new(),
             schedulers: vec![vec![GroupId(0)]],
-            peers: vec!["peer:1".into()],
         };
         let inputs = [
             Input::Image(vec![1, 2, 3]),
@@ -387,10 +370,9 @@ mod tests {
             Input::Publish(12),
             Input::RollBack(13),
             Input::Hold(14, vec![Key([1; 32]), Key([2; 32])]),
-            Input::ReleasePeer(15),
+            Input::ReleaseHolds(15),
             Input::Grant("units".into(), segment, 16, 17),
             Input::Withdraw("units".into(), segment),
-            Input::PeerCopies(task, vec![Some(([18; 32], [19; 32])), None]),
             Input::Borrow(20, 2, OwnerId(21)),
             Input::GiveBack(2, OwnerId(21)),
             Input::ReleaseBorrows(20, Some((2, OwnerId(21)))),

@@ -240,15 +240,15 @@ Start(x) ==
                     rl \in st.releases}
        /\ tasks =
               {CASE tl.kind = "transfer" ->
-                      [kind |-> "transfer", k |-> NONE, h |-> NONE, src |-> NONE, ok |-> TRUE,
+                      [kind |-> "transfer", k |-> NONE, h |-> NONE,
                        expired |-> FALSE, p |-> NONE, o |-> tl.o, to |-> tl.to, slot |-> tl.slot,
                        held |-> TRUE, units |-> tl.units, writes |-> tl.writes]
                  [] tl.kind = "replicate" ->
-                      [kind |-> "replicate", k |-> NONE, h |-> NONE, src |-> NONE, ok |-> TRUE,
+                      [kind |-> "replicate", k |-> NONE, h |-> NONE,
                        expired |-> FALSE, p |-> tl.p, o |-> tl.o, to |-> tl.to, slot |-> NONE,
                        held |-> TRUE, units |-> tl.units, writes |-> tl.writes]
                  [] OTHER ->
-                      [kind |-> tl.kind, k |-> tl.k, h |-> tl.h, src |-> "remote", ok |-> TRUE,
+                      [kind |-> tl.kind, k |-> tl.k, h |-> tl.h,
                        expired |-> tl.expired = 1, p |-> NONE, o |-> NONE,
                        \* The group whose host parts a prefetch writes.
                        to |-> IF tl.kind = "prefetch"
@@ -399,7 +399,7 @@ Step(in) ==
     \/ "Lose" \in in.acts /\ \E e \in Epochs \cap {in.req.e} : Lose(e)
     \/ "Prefetch" \in in.acts /\ \E g \in in.gs :
          LET i == FirstToFetch(in.korder, 1)
-         IN i > 0 /\ Prefetch(in.korder[i], "remote", g)
+         IN i > 0 /\ Prefetch(in.korder[i], g)
     \/ "StoreRemote" \in in.acts /\ \E y \in in.ks : StoreRemote(y)
     \/ "Deadline" \in in.acts /\ \E t \in tasks : Deadline(t)
     \/ "PrefetchEnd" \in in.acts /\ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok)

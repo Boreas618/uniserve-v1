@@ -94,9 +94,9 @@ THEOREM Step == IndInv /\ [Next]_vars => IndInv'
     OBVIOUS
   <1>1. CASE Serving /\ UNCHANGED rare
     BY <1>1, ServingStep
-  <1>2. CASE \/ \E k \in Keys, g \in Groups : Prefetch(k, "remote", g) \/ Prefetch(k, "peer", g)
+  <1>2. CASE \/ \E k \in Keys, g \in Groups : Prefetch(k, g)
              \/ \E k \in Keys : StoreRemote(k)
-             \/ \E t \in tasks : PeerLost(t) \/ Deadline(t)
+             \/ \E t \in tasks : Deadline(t)
              \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
     BY <1>2, Step9 DEF Next9
   <1>3. CASE \E e \in Epochs : Lose(e)

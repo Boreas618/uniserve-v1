@@ -631,25 +631,6 @@ impl Planes {
         })
     }
 
-    /// The stored values of `field` as `[columns, units, plane_bytes]` bytes, its scales as
-    /// `[columns, units]` F32 for an FP8 cache, and its flags as `[columns, units]` U8: the
-    /// fields `cache_copy_region` writes a converted page into.
-    pub(crate) fn fields(&self, field: usize) -> Result<(Tensor, Option<Tensor>, Tensor)> {
-        let (columns, units) = (self.layout.columns as usize, self.units as usize);
-        let cells = [columns, units];
-
-        let values = self.tensor(
-            |device| &device.values[field],
-            0,
-            &[columns, units, self.layout.plane_bytes as usize],
-            DType::U8,
-        )?;
-        let scales = self.scales(field, 0, &cells)?;
-        let initialized = self.tensor(|device| &device.initialized[field], 0, &cells, DType::U8)?;
-
-        Ok((values, scales, initialized))
-    }
-
     /// The address of the plane of `field` in `column` of `unit`.
     pub(crate) fn plane_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         self.require_unit(unit)?;

@@ -249,10 +249,6 @@ impl Recorder {
                 "uniserve_prefix_cache_host_hit_tokens_total",
                 cache.host_hits as f64,
             ),
-            (
-                "uniserve_prefix_cache_peer_hit_tokens_total",
-                cache.peer_hits as f64,
-            ),
             ("uniserve_request_imports_total", stats.imports as f64),
             (
                 "uniserve_request_import_failures_total",

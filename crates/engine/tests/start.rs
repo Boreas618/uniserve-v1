@@ -339,7 +339,6 @@ fn holds_session(storage: &StorageServer, epoch: u64, generation: u64) -> bool {
         trajectory: 0,
         groups: Vec::new(),
         schedulers: Vec::new(),
-        peers: Vec::new(),
     };
     match head.open(empty) {
         Ok(_) => false,

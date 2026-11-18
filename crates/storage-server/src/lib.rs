@@ -948,10 +948,6 @@ impl Server {
                     deployment, epoch, ..
                 },
             ) => self.withdraw(id, (&deployment, epoch), region, *segment),
-            (Request::PeerHold { deployment, keys }, Role::Peer) => {
-                self.peer_hold(id, deployment, keys)
-            }
-            (Request::PeerRelease { deployment }, Role::Peer) => self.peer_release(id, deployment),
             (
                 Request::Borrow {
                     deployment,
@@ -2433,7 +2429,7 @@ impl Server {
     fn program_moved(&mut self, holder: u64, pages: &[Key], moved: &[bool]) {
         if let Some(deployment) = self.programs.moved(holder, pages, moved) {
             self.sessions.thread.send(move |pools| {
-                pools.release_peer(&deployment, holder);
+                pools.release_holds(&deployment, holder);
             });
         }
     }
@@ -2493,7 +2489,7 @@ impl Server {
             if tasks == 0 {
                 let named = deployment.clone();
                 self.sessions.thread.send(move |pools| {
-                    pools.release_peer(&named, holder);
+                    pools.release_holds(&named, holder);
                 });
             } else {
                 self.programs.moving(&deployment, holder, tasks);

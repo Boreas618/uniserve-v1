@@ -2048,7 +2048,7 @@ impl WeightBinding {
         first
     }
 
-    /// Has each rank's cache and state launch their own work from the generation the rank's
+    /// Has each rank's state launch its own work from the generation the rank's
     /// graphs serve, from the rank's next job on: what the engine does after it switched or
     /// rolled back a generation, since no worker job sets it. Each rank takes its own device's
     /// generation, whose kernels its context loaded.
@@ -2064,8 +2064,7 @@ impl WeightBinding {
 
     /// [`Self::set_kernels`] on this process's ranks.
     fn set_kernels_here(&self) -> Result<()> {
-        self.each("setting the cache's and the state's kernels", |_, rank| {
-            let cache = rank.cache.as_ref().map(Arc::clone);
+        self.each("setting the state's kernels", |_, rank| {
             let state = rank.state.as_ref().map(Arc::clone);
 
             Box::new(move |runners: &mut [Box<dyn Runner>]| {
@@ -2073,9 +2072,6 @@ impl WeightBinding {
                 let Some(kernels) = runners.first().map(|runner| runner.graphs().kernels()) else {
                     return Ok(());
                 };
-                if let Some(cache) = cache {
-                    lock(&cache).set_kernels(Arc::clone(&kernels));
-                }
                 if let Some(state) = state {
                     lock(&state).set_kernels(kernels);
                 }

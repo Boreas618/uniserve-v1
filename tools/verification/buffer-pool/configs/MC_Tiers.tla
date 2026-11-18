@@ -1,8 +1,8 @@
 ------------------------------ MODULE MC_Tiers ------------------------------
 (* The tiers below the device on one worker group: prefetches from the     *)
-(* remote store and from peers, puts to the remote store, a media          *)
-(* request's trajectory saved and restored, and the host region resized    *)
-(* by `Resize` beside them.                                                *)
+(* remote store, puts to the remote store, a media request's trajectory    *)
+(* saved and restored, and the host region resized by `Resize` beside      *)
+(* them.                                                                   *)
 EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS g1, e1

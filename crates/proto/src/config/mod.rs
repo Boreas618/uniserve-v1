@@ -162,15 +162,6 @@ pub const DEFAULT_HOST_RATIO: f64 = 2.0;
 /// checkpoints its prefix reuse needs run out first.
 pub const DEFAULT_STATE_RATIO: f64 = 1.0;
 
-/// The host storage of one cache group's converted-load source buffer per rank, in MiB, when a
-/// deployment states no `kv_cache_config.conversion_buffer_mib`: a GiB, which holds a long
-/// prompt's dense pages of the widest row for the models served while keeping the host storage
-/// a group pins on every rank within a GiB.
-pub const DEFAULT_CONVERSION_BUFFER_MIB: NonZeroU64 = match NonZeroU64::new(1024) {
-    Some(mib) => mib,
-    None => NonZeroU64::MIN,
-};
-
 /// The KV cache (`kv_cache_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
@@ -190,8 +181,7 @@ pub struct KvCacheConfig {
     /// Reuse and retain cached prompt prefixes across requests. Switched off, the schedulers
     /// neither read nor write cached prefixes from their next step on, and the cached pages
     /// leave by eviction; switched on, a new epoch builds what an epoch that caches prefixes
-    /// lays out beside the device cache (the host tier's region, a converted load's buffers)
-    /// ([`switched_off`]).
+    /// lays out beside the device cache (the host tier's region) ([`switched_off`]).
     #[reload(by = switched_off)]
     pub prefix_caching: bool,
     /// Offload full prompt pages to the host KV cache of each host's Storage
@@ -240,7 +230,7 @@ pub struct KvCacheConfig {
     /// The time a copy of cached blocks the scheduler asks for may take
     /// whatever its size, before it gives the copy up and the request
     /// computes those tokens instead (as SGLang's `prefetch_timeout_base`):
-    /// a prefetch from the remote store or the peers, a copy between the
+    /// a prefetch from the remote store, a copy between the
     /// host and the device, and a stored trajectory's restore
     /// ([`DEFAULT_PREFETCH_TIMEOUT_BASE`] unless stated).
     #[serde(with = "values::duration")]
@@ -253,24 +243,6 @@ pub struct KvCacheConfig {
     #[serde(with = "values::duration")]
     #[reload(epoch)]
     pub prefetch_timeout_per_ki_token: Duration,
-    /// The Storage Server endpoints (`host:port`) of other hosts serving the
-    /// same model under the same served name, whose published host KV cache
-    /// pages admission reads when they deepen a prompt's hit: the pages are
-    /// pinned there by key, read into this host's pools by its Transfer
-    /// Server and loaded like host pages. The endpoints are unauthenticated;
-    /// the hosts rely on the isolation of their network. Applies with
-    /// `host_tier`; none when empty.
-    #[reload(epoch)]
-    pub peers: Vec<String>,
-    /// The most host storage, in MiB, one cache group's converted-load
-    /// source buffer takes on each rank: the buffer a peer's pages of
-    /// another representation are read into before a load converts them
-    /// (an FP8 cache reading peers' dense pages). It holds one request's
-    /// pages of the widest row within this bound; a page it finds no slot
-    /// for is computed instead. [`DEFAULT_CONVERSION_BUFFER_MIB`] unless
-    /// stated.
-    #[reload(epoch)]
-    pub conversion_buffer_mib: NonZeroU64,
     /// How long a prefill replica keeps the KV of a request it handed off for the decode
     /// replica to import, at most: the decode replica's import returns it earlier
     /// ([`DEFAULT_LEASE`] unless stated).
@@ -311,8 +283,6 @@ impl Default for KvCacheConfig {
             state_ratio: DEFAULT_STATE_RATIO,
             prefetch_timeout_base: DEFAULT_PREFETCH_TIMEOUT_BASE,
             prefetch_timeout_per_ki_token: DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN,
-            peers: Vec::new(),
-            conversion_buffer_mib: DEFAULT_CONVERSION_BUFFER_MIB,
             lease: DEFAULT_LEASE,
         }
     }

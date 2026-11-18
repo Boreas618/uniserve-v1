@@ -29,7 +29,7 @@ use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface that this build's engine and buffer pool
 /// speak, the one version either accepts.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// The clock every instant of this interface is stated in: the host's
 /// monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds since an unspecified
@@ -73,13 +73,6 @@ pub enum Tier {
     Remote,
 }
 
-/// Where a prefetch reads from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Source {
-    Remote,
-    Peers,
-}
-
 /// What a refused request named that does not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
@@ -119,10 +112,6 @@ pub struct Open {
     /// registers hold the `completed` word of each of its groups and the
     /// capacity words of each region its groups and their classes name.
     pub schedulers: Vec<Vec<GroupId>>,
-    /// The Storage Servers of the other hosts that serve the deployment
-    /// (`host:port`, each one's endpoint), which a prefetch from the peers
-    /// reads the host copies of, in the order they are asked.
-    pub peers: Vec<String>,
 }
 
 /// A region's segment table: each segment of its memory space, in the order
@@ -199,18 +188,6 @@ pub struct Class {
     /// another encoding is answered with a [`Completion::Copy`] that names
     /// both, and the worker runs it through the copy manifest of the two.
     pub encoding: [u8; 32],
-    /// The converted-load source of the class: a host region, as an index
-    /// into [`Open::regions`], whose unit `u` is slot `u` of each rank's
-    /// source buffer, and the encoding of the class's tensors that a copy
-    /// there is written in (another representation of the same logical
-    /// tensors, such as the dense pages an FP8 cache converts). A
-    /// [`Request::Prefetch`] from the peers reads a peer's host copy written
-    /// in that encoding into a block of that region, and a [`Request::Load`]
-    /// of it is answered with a [`Completion::Copy`] from that region, which
-    /// the worker converts into the class's encoding as it loads it
-    /// (`specs/buffer-pool.md` §13). `None` for a class that converts no
-    /// copy.
-    pub source: Option<(u8, [u8; 32])>,
 }
 
 /// The digests a class states of the layout its blocks are written in, from
@@ -435,7 +412,7 @@ pub enum Request {
         ok: bool,
         after: Stamps,
     },
-    /// Bring the leading keys the source holds into the host tier, on the
+    /// Bring the leading keys the remote store (Mooncake Store) holds into the host tier, on the
     /// host parts the group copies the class with ([`Group::parts`]), by
     /// the deadline, in nanoseconds of the host's monotonic clock. The keys
     /// are of one class; `units` is the size of each block of a sized class
@@ -446,7 +423,6 @@ pub enum Request {
         class: u8,
         units: u32,
         keys: Vec<Key>,
-        source: Source,
         deadline: u64,
     },
     /// State every cached key.
@@ -943,7 +919,6 @@ impl Request {
                 class,
                 units,
                 keys,
-                source,
                 deadline,
             } => {
                 writer.byte(15);
@@ -951,10 +926,6 @@ impl Request {
                 writer.byte(*class);
                 writer.word(*units);
                 writer.keys(keys);
-                writer.byte(match source {
-                    Source::Remote => 0,
-                    Source::Peers => 1,
-                });
                 writer.long(*deadline);
             }
             Self::List => writer.byte(16),
@@ -1100,13 +1071,6 @@ impl Request {
                 class: reader.byte()?,
                 units: reader.word()?,
                 keys: reader.keys()?,
-                source: match reader.byte()? {
-                    0 => Source::Remote,
-                    1 => Source::Peers,
-                    other => {
-                        return Err(Error::Protocol(format!("a prefetch names source {other}")));
-                    }
-                },
                 deadline: reader.long()?,
             },
             16 => Self::List,
@@ -1487,7 +1451,6 @@ mod tests {
                 class: 0,
                 units: 0,
                 keys: vec![key(7), key(8)],
-                source: Source::Peers,
                 deadline: 123_456_789,
             },
             Request::List,

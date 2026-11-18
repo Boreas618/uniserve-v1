@@ -87,14 +87,6 @@ impl GroupLayout {
         u64::from(self.num_kv_heads) * u64::from(self.head_dim) * element_bytes(self.dtype)
     }
 
-    /// Elements of one field of one page: `layers · block_size · heads · head_dim`.
-    pub(crate) fn page_elements(&self) -> u64 {
-        self.layers.len() as u64
-            * u64::from(self.block_size)
-            * u64::from(self.num_kv_heads)
-            * u64::from(self.head_dim)
-    }
-
     /// Bytes the index keys of one layer's `tokens` tokens occupy: one key of the layers'
     /// compute type per `ratio` tokens. Zero for a group that keeps none.
     pub(crate) fn index_bytes(&self, tokens: u32) -> u64 {
@@ -160,9 +152,6 @@ pub struct CacheLayout {
     pub groups: Vec<GroupLayout>,
     /// One checkpoint per recurrent layer, in the plane order of a unit of the state region.
     pub checkpoints: Vec<Checkpoint>,
-    /// The dense representation whose pages the cache loads by converting them
-    /// ([`Self::with_conversion`]); `None` for a cache that loads only pages of its own.
-    pub converts_from: Option<PrefixCacheDtype>,
 }
 
 impl CacheLayout {
@@ -237,7 +226,6 @@ impl CacheLayout {
                 index_keys: None,
             }],
             checkpoints: Vec::new(),
-            converts_from: None,
         }
     }
 
@@ -253,17 +241,12 @@ impl CacheLayout {
     ///
     /// # Errors
     ///
-    /// A layout that keeps index keys already or admits converted loads, which convert keys
-    /// and values alone, or index keys the pages do not hold in whole ([`Self::validated`]).
+    /// A layout that keeps index keys already, or index keys the pages do not hold in whole
+    /// ([`Self::validated`]).
     pub fn with_index_keys(mut self, keys: IndexKeys) -> Result<Self> {
         if self.groups.iter().any(|group| group.index_keys.is_some()) {
             return Err(Error::Invalid(
                 "a cache layout states its index keys once".into(),
-            ));
-        }
-        if self.converts_from.is_some() {
-            return Err(Error::Invalid(
-                "a cache that loads converted pages keeps no index keys".into(),
             ));
         }
 
@@ -316,102 +299,6 @@ impl CacheLayout {
             (tokens / keys.ratio) as usize,
             keys.width as usize,
         ]))
-    }
-
-    /// The layout with converted loads admitted: pages another host computed in the groups'
-    /// dense compute type load into this FP8 cache through `page_conversion` and
-    /// `cache_copy_region`, encoded as the cache encodes its own writes.
-    ///
-    /// Only the direction that does not lower the destination's precision is admitted: a dense
-    /// source into an FP8 cache. A cache with a state or draft group admits none, because those
-    /// pages have no conversion and a hit needs every group; neither does a cache that keeps
-    /// index keys, which a conversion does not carry.
-    ///
-    /// # Errors
-    ///
-    /// A cache that is not FP8, holds a state or draft group, keeps index keys, or whose groups
-    /// do not compute in one dense element type.
-    pub fn with_conversion(mut self) -> Result<Self> {
-        if !self.quantized {
-            return Err(Error::Invalid(
-                "a dense cache loads no converted page: only an FP8 cache converts".into(),
-            ));
-        }
-        if self
-            .groups
-            .iter()
-            .any(|group| group.state() || group.draft())
-        {
-            return Err(Error::Invalid(
-                "a cache with a state or draft group loads no converted page".into(),
-            ));
-        }
-        if self.groups.iter().any(|group| group.index_keys.is_some()) {
-            return Err(Error::Invalid(
-                "a cache that keeps index keys loads no converted page".into(),
-            ));
-        }
-
-        let compute = self.groups.first().map(|group| group.compute_dtype);
-        let source = match compute {
-            Some(DType::BF16) => PrefixCacheDtype::BFloat16,
-            Some(DType::F16) => PrefixCacheDtype::Float16,
-            other => {
-                return Err(Error::Invalid(format!(
-                    "a cache that computes in {other:?} loads no converted page"
-                )));
-            }
-        };
-        if self
-            .groups
-            .iter()
-            .any(|group| Some(group.compute_dtype) != compute)
-        {
-            return Err(Error::Invalid(
-                "a cache whose groups compute in several element types loads no converted page"
-                    .into(),
-            ));
-        }
-
-        self.converts_from = Some(source);
-        Ok(self)
-    }
-
-    /// The layout of the cache the converted pages come from: this layout's groups and columns
-    /// in the dense source type, as a deployment that stores that type lays them out, so its
-    /// pages' shape and bytes are the source cache's. `None` without converted loads.
-    pub fn source(&self) -> Option<Self> {
-        let source = self.converts_from?;
-        if matches!(source, PrefixCacheDtype::Float8E4m3Fn) {
-            return None;
-        }
-        let element = stored(source);
-        let stored_bytes = element_bytes(self.groups.first()?.dtype);
-        if stored_bytes == 0 {
-            return None;
-        }
-
-        // A plane is one layer's page, so it grows with the element width; a dense unit holds
-        // both fields' planes and their flags per column and no scale.
-        let plane_bytes = self.plane_bytes / stored_bytes * element_bytes(element);
-
-        Some(Self {
-            columns: self.columns,
-            plane_bytes,
-            quantized: false,
-            unit_bytes: u64::from(self.columns) * cell_bytes(plane_bytes, false, 0),
-            dtype: source,
-            groups: self
-                .groups
-                .iter()
-                .map(|group| GroupLayout {
-                    dtype: element,
-                    ..group.clone()
-                })
-                .collect(),
-            checkpoints: Vec::new(),
-            converts_from: None,
-        })
     }
 
     /// The layout, once its fields are checked against each other.
@@ -1044,8 +931,7 @@ mod tests {
         Ok(())
     }
 
-    /// Index keys are whole groups of a page's tokens, stated once, and a cache that keeps
-    /// them loads no converted page.
+    /// Index keys are whole groups of a page's tokens, stated once.
     #[test]
     fn index_keys_a_page_does_not_hold_are_refused() -> Result<()> {
         let dense = |dtype| CacheLayout::dense(64, 4, 2, 128, dtype);
@@ -1057,10 +943,6 @@ mod tests {
         assert!(bf16().with_index_keys(keys(128, 0)).is_err());
         assert!(bf16().with_index_keys(keys(0, 4)).is_err());
         assert!(bf16().with_index_keys(KEYS)?.with_index_keys(KEYS).is_err());
-
-        let fp8 = || dense(PrefixCacheDtype::Float8E4m3Fn);
-        assert!(fp8().with_index_keys(KEYS)?.with_conversion().is_err());
-        assert!(fp8().with_conversion()?.with_index_keys(KEYS).is_err());
         Ok(())
     }
 
@@ -1093,24 +975,6 @@ mod tests {
         let mut none = dense();
         none.groups.clear();
         assert!(none.validated().is_err());
-    }
-
-    /// Only an FP8 cache of attention groups converts, from its groups' dense compute type, and
-    /// the source layout is the one a deployment storing that type lays out.
-    #[test]
-    fn an_fp8_cache_converts_from_its_compute_type() -> Result<()> {
-        let fp8 = CacheLayout::dense(64, 4, 2, 128, PrefixCacheDtype::Float8E4m3Fn)
-            .validated()?
-            .with_conversion()?;
-        let bf16 = CacheLayout::dense(64, 4, 2, 128, PrefixCacheDtype::BFloat16).validated()?;
-
-        assert_eq!(fp8.converts_from, Some(PrefixCacheDtype::BFloat16));
-        assert_eq!(fp8.source(), Some(bf16.clone()));
-
-        // The other direction lowers the destination's precision.
-        assert!(bf16.clone().with_conversion().is_err());
-        assert!(bf16.source().is_none());
-        Ok(())
     }
 
     /// A token capacity takes whole pages of every attention group, and nothing of the state

@@ -24,14 +24,12 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::Arc;
 
 use ::storage::Key;
 use ::storage::protocol::PageShape;
 use platform::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
 use tensor::DType;
 
-use super::conversion::Conversion;
 use super::layout::{CacheLayout, GroupLayout};
 use super::planes::Planes;
 use super::states::StateUnits;
@@ -135,8 +133,7 @@ fn content_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
 }
 
 /// The shape of the host pages of group `group` of a cache of `layout`: their layout digest,
-/// the rank's head slice and their bytes. A cache's own pages have it, and so do the pages a
-/// converted load reads, under the source layout ([`CacheLayout::source`]).
+/// the rank's head slice and their bytes.
 ///
 /// # Errors
 ///
@@ -201,28 +198,24 @@ pub(crate) fn page_identities(layout: &CacheLayout, fingerprint: &str) -> Vec<Ke
 }
 
 /// One page's copy between the host tier and the units of the pool: the cache group, the page
-/// of the group's host region (or of its converted-load source buffer), and the units of the
-/// block on the device.
+/// of the group's host region, and the units of the block on the device.
 pub(crate) type HostPage = (u32, u64, Range<u32>);
 
-/// The rank's parts of the cache groups' host regions, by cache group, the stream its page
-/// copies run on, and the converted loads of a cache that admits them.
+/// The rank's parts of the cache groups' host regions, by cache group, and the stream its page
+/// copies run on.
 pub(crate) struct HostTier {
     /// Each group's part with the planes of one field a page of the group spans; a group whose
     /// pages have no host copy has none.
     parts: BTreeMap<u32, (HostPart, u32)>,
     /// The copy stream: page copies run on it beside the forwards on a batch's stream.
     stream: Stream,
-    conversion: Option<Conversion>,
 }
 
 impl HostTier {
     /// Maps part `part` (the rank's index in its worker group) of the host region `regions` names
     /// for each cache group of `layout` at the rank's host's Storage Server, registered with
     /// `device`: one page of the group a unit. A group named `None` has no host copy. The copies
-    /// run on `stream`, and
-    /// `conversion` is the converted loads of a cache that admits them, opened on the same
-    /// stream.
+    /// run on `stream`.
     ///
     /// # Errors
     ///
@@ -233,7 +226,6 @@ impl HostTier {
         device: DeviceId,
         (regions, part): (&[Option<&str>], u32),
         stream: Stream,
-        conversion: Option<Conversion>,
     ) -> Result<Self> {
         // A part the device's rank index creates lies on the host NUMA node closest to the
         // device, so the copies between them cross no link between nodes.
@@ -250,23 +242,12 @@ impl HostTier {
             parts.insert(index as u32, (held, layout.page_planes(group) as u32));
         }
 
-        Ok(Self {
-            parts,
-            stream,
-            conversion,
-        })
-    }
-
-    /// The generation the converted loads launch from, from the next load on.
-    pub(crate) fn set_kernels(&self, kernels: Arc<ops::Generation>) {
-        if let Some(conversion) = &self.conversion {
-            conversion.set_kernels(kernels);
-        }
+        Ok(Self { parts, stream })
     }
 
     /// Issues the copies a batch runs between the host tier and the units on the copy stream:
-    /// `loads` from their host pages into their units, `converted` from the conversion
-    /// source's pages, and `stores` from their units into their host pages; a page of the state
+    /// `loads` from their host pages into their units, and `stores` from their units into their
+    /// host pages; a page of the state
     /// group is a unit of `states`. Returns the event recorded behind them, which the batch's end
     /// waits on; `None` when there is none.
     ///
@@ -281,23 +262,17 @@ impl HostTier {
     ///
     /// # Errors
     ///
-    /// A page of a group that has no host region or outside the rank's part of it, or a page of
-    /// the conversion source on a cache that converts none; the driver's refusal.
+    /// A page of a group that has no host region or outside the rank's part of it; the driver's
+    /// refusal.
     pub(crate) fn copy(
         &self,
         layout: &CacheLayout,
         (planes, states): (&Planes, Option<&StateUnits>),
         loads: &[HostPage],
-        converted: &[HostPage],
         stores: &[HostPage],
     ) -> Result<Option<Event>> {
-        if loads.is_empty() && converted.is_empty() && stores.is_empty() {
+        if loads.is_empty() && stores.is_empty() {
             return Ok(None);
-        }
-        if !converted.is_empty() && self.conversion.is_none() {
-            return Err(Error::Invalid(
-                "a copy reads a page of a conversion source and the cache converts none".into(),
-            ));
         }
         let memory = (planes, states);
         for copy in loads.iter().chain(stores) {
@@ -314,9 +289,6 @@ impl HostTier {
             let started = Event::new(timing);
             started.record(&self.stream)?;
             self.load(layout, memory, loads, &self.stream)?;
-            if let Some(conversion) = &self.conversion {
-                conversion.load(planes, converted, &self.stream)?;
-            }
             self.store(layout, memory, stores, &self.stream)?;
 
             let ended = Event::new(timing);
@@ -548,19 +520,6 @@ mod tests {
         let (plain, keyed) = (page_shape(&plain, 0)?, page_shape(&keyed, 0)?);
         assert_eq!(keyed.page_bytes, plain.page_bytes + 4 * (16 * 128 * 2));
         assert_ne!(keyed.layout, plain.layout);
-        Ok(())
-    }
-
-    /// A converting FP8 cache asks for exactly the pages a BF16 deployment of the same model
-    /// stores: the source layout's page shape is the BF16 cache's, and differs from its own.
-    #[test]
-    fn an_fp8_cache_converts_the_pages_a_bf16_cache_stores() -> Result<()> {
-        let fp8 = layout(PrefixCacheDtype::Float8E4m3Fn).with_conversion()?;
-        let source = fp8.source().expect("a converting layout has a source");
-        let bf16 = layout(PrefixCacheDtype::BFloat16);
-
-        assert_eq!(page_shape(&source, 0)?, page_shape(&bf16, 0)?);
-        assert_ne!(page_shape(&fp8, 0)?, page_shape(&bf16, 0)?);
         Ok(())
     }
 

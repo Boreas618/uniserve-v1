@@ -78,7 +78,7 @@ PoolServing ==
 
 PoolNext ==
     \/ PoolServing /\ UNCHANGED rare
-    \/ \E k \in Keys, g \in Groups : Prefetch(k, "remote", g)
+    \/ \E k \in Keys, g \in Groups : Prefetch(k, g)
     \/ \E k \in Keys : StoreRemote(k)
     \/ \E t \in tasks : Deadline(t)
     \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)

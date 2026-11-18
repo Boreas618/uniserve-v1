@@ -12,8 +12,7 @@
 //!   group's entries of the rank's device block table, which a forward gathers its rows from;
 //! - the **attention workspace**, which the paged-attention kernel uses during a forward;
 //! - the **host tier** ([`host`]): the rank's parts of the host regions of the cache groups'
-//!   pages, which pages are loaded from and stored to on the rank's copy stream, with the
-//!   converted loads ([`conversion`]) of a cache that admits them;
+//!   pages, which pages are loaded from and stored to on the rank's copy stream;
 //! - the **scratch pages** ([`scratch`]) a shadow forward writes;
 //! - for a model that keeps a recurrent state, the **state units** ([`states`]): the memory of
 //!   the scheduler's state region, one checkpoint a unit, which the state copies and the host
@@ -65,7 +64,6 @@
 //! column of a shadow forward, which its runner numbers over the scratch set's pages, holds
 //! `nn::NO_SLOT` where a token writes nothing, as the slot column of a served batch does.
 
-pub(crate) mod conversion;
 pub(crate) mod host;
 pub(crate) mod info;
 pub(crate) mod layout;
@@ -75,7 +73,6 @@ pub mod segments;
 mod states;
 mod tables;
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use self::info::PrefixCacheInfo;
@@ -84,7 +81,6 @@ use platform::{DeviceId, Event, Stream};
 use storage::runtime::Run;
 use tensor::{DType, Tensor};
 
-use self::conversion::Conversion;
 use self::host::{HostPage, HostTier};
 pub use self::layout::{CacheLayout, Checkpoint, GroupLayout};
 use self::planes::Planes;
@@ -127,12 +123,10 @@ pub struct KvCacheConfig {
 }
 
 impl KvCacheConfig {
-    /// The device bytes the cache holds beside its planes: the pooled page tables, the
-    /// attention workspace, and the scratch and unit table of its converted loads.
+    /// The device bytes the cache holds beside its planes: the pooled page tables and the
+    /// attention workspace.
     pub(crate) fn fixed_bytes(&self) -> u64 {
-        PageTables::device_bytes(&self.layout, self.slots, self.width)
-            + self.workspace_bytes
-            + conversion::device_bytes(&self.layout, self.width)
+        PageTables::device_bytes(&self.layout, self.slots, self.width) + self.workspace_bytes
     }
 
     /// Checks what the cache's tensors rely on: a workspace, at least one attention group, each
@@ -190,7 +184,7 @@ impl KvCacheConfig {
 
 /// The numbers the buffer pool gave the regions the cache's memory is (the answer to `Open`):
 /// what tells a run a completion states, `(region, first unit, count)`, as units of the pool,
-/// state units, pages of the host tier or slots of a converted-load source buffer.
+/// state units or pages of the host tier.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CacheRegions {
     /// The region of the pool's units on the device: unit `u` of it is the pool's unit `u`.
@@ -201,9 +195,6 @@ pub(crate) struct CacheRegions {
     /// Per cache group, the host region of the group's pages: unit `u` of it is the group's host
     /// page `u`. `None` for a group whose pages have no host copy.
     pub host: Vec<Option<u8>>,
-    /// Per cache group, the region of the group's converted-load source buffer: unit `u` of it
-    /// is slot `u` of the buffer. `None` for a group that converts none.
-    pub sources: Vec<Option<u8>>,
 }
 
 /// The KV cache of one rank: its planes, page tables, workspace, host tier and scratch pages.
@@ -565,11 +556,10 @@ impl KvCacheMemory {
     /// Regions stated for another number of cache groups than the layout's.
     pub(crate) fn set_regions(&mut self, regions: CacheRegions) -> Result<()> {
         let groups = self.config.layout.groups.len();
-        if regions.host.len() != groups || regions.sources.len() != groups {
+        if regions.host.len() != groups {
             return Err(Error::Invalid(format!(
-                "regions stated for {} and {} cache groups of a cache of {groups}",
-                regions.host.len(),
-                regions.sources.len()
+                "host regions stated for {} cache groups of a cache of {groups}",
+                regions.host.len()
             )));
         }
         if regions.states.is_some() != self.states.is_some() {
@@ -593,23 +583,14 @@ impl KvCacheMemory {
     }
 
     /// Whether `region` is memory of the cache, as [`Self::set_regions`] stated it: its units,
-    /// its state units, or a cache group's host pages or converted-load source buffer. A cache
-    /// whose regions are not stated holds none.
+    /// its state units, or a cache group's host pages. A cache whose regions are not stated
+    /// holds none.
     pub(crate) fn holds(&self, region: u8) -> bool {
         self.regions.as_ref().is_some_and(|regions| {
             regions.units == region
                 || regions.states == Some(region)
                 || regions.host.contains(&Some(region))
-                || regions.sources.contains(&Some(region))
         })
-    }
-
-    /// Whether `region` is a cache group's converted-load source region, whose pages the cache
-    /// converts into its own representation as it loads them ([`Self::copy`]).
-    pub(crate) fn converts_from(&self, region: u8) -> bool {
-        self.regions
-            .as_ref()
-            .is_some_and(|regions| regions.sources.contains(&Some(region)))
     }
 
     /// Applies `changes`, the rank's device block table's changes since the last batch
@@ -674,11 +655,8 @@ impl KvCacheMemory {
     /// cache group's host region at the rank's host's Storage Server through `client`, whose
     /// copies run on `stream`, the rank's copy stream. `regions` names, per cache group, the host
     /// region of its pages as the session's layout states it (unit `u` of the region is page `u`
-    /// of the group), or `None` for a group whose pages have no host copy, and `sources` its
-    /// converted-load source region (unit `u` is slot `u` of the group's source buffer), or
-    /// `None` for a group that converts none; the open session must state them. A cache that
-    /// admits converted loads takes its part of each source region as the group's source buffer,
-    /// with its conversion scratch, and launches its conversions with `kernels`.
+    /// of the group), or `None` for a group whose pages have no host copy; the open session must
+    /// state them.
     ///
     /// # Errors
     ///
@@ -687,9 +665,8 @@ impl KvCacheMemory {
     pub(crate) fn map_host_parts(
         &mut self,
         client: &StorageClient,
-        (regions, sources, part): (&[Option<&str>], &[Option<&str>], u32),
+        (regions, part): (&[Option<&str>], u32),
         stream: Stream,
-        kernels: Arc<ops::Generation>,
     ) -> Result<()> {
         let device = self.planes.device_id().ok_or(Error::State(
             "the cache holds no device: it maps no host tier",
@@ -699,32 +676,20 @@ impl KvCacheMemory {
         }
 
         let layout = &self.config.layout;
-        if regions.len() != layout.groups.len() || sources.len() != layout.groups.len() {
+        if regions.len() != layout.groups.len() {
             return Err(Error::Invalid(format!(
-                "host regions stated for {} and source regions for {} cache groups of a cache \
-                 of {}",
+                "host regions stated for {} cache groups of a cache of {}",
                 regions.len(),
-                sources.len(),
                 layout.groups.len()
             )));
         }
 
-        let conversion = Conversion::open(
-            client,
-            layout,
-            device,
-            (sources, part),
-            self.config.width,
-            &stream,
-            kernels,
-        )?;
         self.host = Some(HostTier::map(
             client,
             layout,
             device,
             (regions, part),
             stream,
-            conversion,
         )?);
         Ok(())
     }
@@ -756,9 +721,7 @@ impl KvCacheMemory {
     ///   ([`Planes::copy_units`]);
     /// - a group's host page to units, a load, and units to a group's host page, a store: on
     ///   the copy stream, through the host tier; the same for the state group's host page and a
-    ///   state unit, a checkpoint's load and store;
-    /// - a slot of a group's converted-load source to units, a converted load: on the copy
-    ///   stream.
+    ///   state unit, a checkpoint's load and store.
     ///
     /// A copy writes only its destination, which no table entry names until the copy is
     /// reported done, and reads a source the buffer pool holds until then: nothing orders it
@@ -790,7 +753,7 @@ impl KvCacheMemory {
             "the regions of the cache's memory are not stated: no copy names its runs",
         ))?;
 
-        // The group whose host pages, or whose source slots, `region` holds.
+        // The group whose host pages `region` holds.
         let group_of = |regions: &[Option<u8>], region: u8| {
             regions
                 .iter()
@@ -821,8 +784,7 @@ impl KvCacheMemory {
         let matches = |group: u32, region: u8| {
             (Some(group) == state_group) == (regions.states == Some(region))
         };
-        let (mut units, mut loads, mut converted, mut stores) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut units, mut loads, mut stores) = (Vec::new(), Vec::new(), Vec::new());
         for &(from, to) in copies {
             let (source, destination) = (device(from.0), device(to.0));
             if source && destination && (from.0 != regions.units || to.0 != regions.units) {
@@ -854,12 +816,10 @@ impl KvCacheMemory {
                             )));
                         }
                         loads.push((group, page(from)?, block));
-                    } else if let Some(group) = group_of(&regions.sources, from.0) {
-                        converted.push((group, page(from)?, block));
                     } else {
                         return Err(Error::Invalid(format!(
                             "a copy into the cache's units reads region {}, which is none of \
-                             its host pages or source buffers",
+                             its host pages",
                             from.0
                         )));
                     }
@@ -894,7 +854,7 @@ impl KvCacheMemory {
         // units, every other a block of the pool, which never holds the padding unit.
         self.planes.check_copies(&units)?;
         let state = state_group;
-        let paged: Vec<&HostPage> = loads.iter().chain(&converted).chain(&stores).collect();
+        let paged: Vec<&HostPage> = loads.iter().chain(&stores).collect();
         for (group, _, block) in &paged {
             if Some(*group) == state {
                 if block.len() != 1 || block.end > self.state_units() {
@@ -945,7 +905,6 @@ impl KvCacheMemory {
                 &self.config.layout,
                 (&self.planes, self.states.as_ref()),
                 &loads,
-                &converted,
                 &stores,
             ) {
                 Ok(copied) => events.extend(copied),
@@ -962,25 +921,6 @@ impl KvCacheMemory {
             }
         }
         Ok(events)
-    }
-
-    /// The generation the cache's own kernels launch from, from the next converted load on:
-    /// set at a generation switch.
-    pub(crate) fn set_kernels(&self, kernels: Arc<ops::Generation>) {
-        if let Some(host) = &self.host {
-            host.set_kernels(kernels);
-        }
-    }
-
-    /// The kernels the cache's own work launches, as `(operator, key)`: those of its converted
-    /// loads, stated under a meta context, so a cache that holds no device states them too.
-    /// Empty for a cache that converts none.
-    ///
-    /// # Errors
-    ///
-    /// When a conversion's descriptors refuse the cache's layout.
-    pub(crate) fn keys(&self) -> Result<BTreeSet<(&'static str, String)>> {
-        conversion::keys(&self.config.layout, self.config.units)
     }
 
     /// Creates the segments of the device region `region` given back again at their addresses,
@@ -1286,7 +1226,6 @@ mod tests {
             units: UNITS,
             states: (groups == 3).then_some(STATES),
             host: HOST[..groups].iter().copied().map(Some).collect(),
-            sources: vec![None; groups],
         }
     }
 
@@ -1507,9 +1446,6 @@ mod tests {
         let info = cache.info();
         assert_eq!((info.num_units, info.groups.len()), (16, 3));
         assert!(info.plane_runs.is_empty() && info.segments.is_empty());
-
-        // A cache that converts nothing launches no kernel of its own.
-        assert!(cache.keys()?.is_empty());
         Ok(())
     }
 
@@ -1574,7 +1510,7 @@ mod tests {
         assert!(KvCacheMemory::meta(config).is_err());
     }
 
-    /// The fixed bytes are the tables, the workspace and the conversion's scratch and units.
+    /// The fixed bytes are the tables and the workspace.
     #[test]
     fn the_fixed_bytes_are_the_tables_and_the_workspace() {
         let config = two_groups();
@@ -1695,7 +1631,6 @@ mod tests {
             units: UNITS,
             states: None,
             host: vec![None],
-            sources: vec![None],
         })?;
         let held_of = |cache: &KvCacheMemory| {
             cache

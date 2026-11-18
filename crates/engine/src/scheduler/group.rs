@@ -534,7 +534,6 @@ mod tests {
                 .collect(),
             classes: Vec::new(),
             trajectory: 0,
-            peers: Vec::new(),
             groups: ids
                 .iter()
                 .map(|id| runtime::Group {
@@ -617,7 +616,6 @@ mod tests {
             num_computed_tokens: 0,
             num_cached_tokens: 0,
             num_host_tokens: 0,
-            num_peer_tokens: 0,
             listing: 0,
             keys: Vec::new(),
             spec_token_ids: Vec::new(),

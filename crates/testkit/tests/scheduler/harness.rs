@@ -144,10 +144,8 @@ pub(crate) struct Deployment {
     queue_depth: usize,
     /// The bytes of each ring of the queue pair.
     ring_bytes: usize,
-    /// Whether the deployment keeps its host copies in the remote store, and has peers whose
-    /// host copies a prefetch may read.
+    /// Whether the deployment keeps its host copies in the remote store.
     remote: bool,
-    peers: bool,
     /// The identity of the weights the groups that encode state for their encoder outputs
     /// (`Capacity::encoder_identity`); empty: none.
     encoder_identity: String,
@@ -182,7 +180,6 @@ impl Deployment {
             queue_depth: 2,
             ring_bytes: 1 << 16,
             remote: false,
-            peers: false,
             encoder_identity: String::new(),
             blocks: Vec::new(),
             ranks: Vec::new(),
@@ -322,13 +319,6 @@ impl Deployment {
     /// and an admission prefetches from it what it holds beyond the host.
     pub(crate) fn remote(mut self) -> Self {
         self.remote = true;
-        self
-    }
-
-    /// Peers beside the host tier: an admission whose prompt reaches far enough beyond what this
-    /// host holds prefetches from their host copies.
-    pub(crate) fn peers(mut self) -> Self {
-        self.peers = true;
         self
     }
 
@@ -545,7 +535,6 @@ impl Deployment {
             state_in_slot,
             tensors: [0; 32],
             encoding: [0; 32],
-            source: None,
         };
         let mut classes: Vec<Class> = self
             .cache
@@ -591,7 +580,6 @@ impl Deployment {
             regions,
             classes,
             trajectory,
-            peers: Vec::new(),
             groups,
             schedulers: vec![(0..self.groups.len()).map(group_id).collect()],
         }
@@ -714,11 +702,6 @@ impl Deployment {
                     device: String::new(),
                     segment_gib: 0,
                 }),
-                peers: if self.peers {
-                    vec!["peer-1:7600".to_owned()]
-                } else {
-                    Vec::new()
-                },
                 ..KvCacheConfig::default()
             }),
             cache_groups: if tokens {

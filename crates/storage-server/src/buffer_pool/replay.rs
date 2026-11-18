@@ -20,8 +20,7 @@ use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Stamps,
 
 use super::trace::{
     BORROW, CLOSE, COMPLETED, COMPLETION, DONE, ENDED, GIVE_BACK, GRANT, HOLD, IMAGE, Input, OPEN,
-    PEER_COPIES, PUBLISH, RELEASE_BORROWS, RELEASE_PEER, REQUEST, ROLL_BACK, START, TICK, Task,
-    WITHDRAW,
+    PUBLISH, RELEASE_BORROWS, RELEASE_HOLDS, REQUEST, ROLL_BACK, START, TICK, Task, WITHDRAW,
 };
 use super::{Block, BufferPool, ClientId, Copy, Deferred, Held, Memories, QueueId, Target};
 
@@ -56,11 +55,11 @@ pub(crate) fn apply(pool: &mut BufferPool, input: &Input) -> Result<(), String> 
         Input::Ended(task, ok) => pool.ended(*task, *ok),
         Input::Publish(epoch) => pool.commit_update(*epoch),
         Input::RollBack(epoch) => pool.roll_back(*epoch),
-        Input::Hold(peer, keys) => {
-            pool.hold(*peer, keys);
+        Input::Hold(holder, keys) => {
+            pool.hold(*holder, keys);
         }
-        Input::ReleasePeer(peer) => {
-            pool.release_peer(*peer);
+        Input::ReleaseHolds(holder) => {
+            pool.release_holds(*holder);
         }
         Input::Grant(region, segment, first, units) => {
             if let Some(number) = pool.region_number(region) {
@@ -71,9 +70,6 @@ pub(crate) fn apply(pool: &mut BufferPool, input: &Input) -> Result<(), String> 
             if let Some(number) = pool.region_number(region) {
                 let _ = pool.withdraw_segment(number, *segment);
             }
-        }
-        Input::PeerCopies(task, held) => {
-            pool.peer_copies(*task, held);
         }
         Input::Borrow(peer, client, owner) => {
             pool.borrow(*peer, *client, *owner);
@@ -341,15 +337,9 @@ pub(crate) fn stated_input(pool: &BufferPool, names: &SessionNames, input: &Inpu
         Input::Publish(epoch) => format!("publish e=e{epoch}"),
         Input::RollBack(epoch) => format!("roll-back e=e{epoch}"),
         Input::Hold(..) => "hold".into(),
-        Input::ReleasePeer(_) => "release-peer".into(),
+        Input::ReleaseHolds(_) => "release-holds".into(),
         Input::Grant(..) => "grant".into(),
         Input::Withdraw(..) => "withdraw".into(),
-        Input::PeerCopies(_, held) => format!(
-            "peer-copies held={}",
-            held.iter()
-                .take_while(|encoding| encoding.is_some())
-                .count()
-        ),
         Input::Borrow(..) => "borrow".into(),
         Input::GiveBack(..) => "give-back".into(),
         Input::ReleaseBorrows(..) => "release-borrows".into(),
@@ -496,15 +486,10 @@ fn stated_request(request: &Request, session: &str) -> String {
             group,
             class,
             keys: named,
-            source,
             ..
         } => {
-            let source = match source {
-                storage::runtime::Source::Remote => "remote",
-                storage::runtime::Source::Peers => "peers",
-            };
             format!(
-                "prefetch g={session}.g{} class={class} ks={} source={source}",
+                "prefetch g={session}.g{} class={class} ks={}",
                 group.0,
                 keys(named)
             )
@@ -1120,14 +1105,14 @@ impl Input {
             PUBLISH => Self::Publish(u64::from_le_bytes(field(body)?)),
             ROLL_BACK => Self::RollBack(u64::from_le_bytes(field(body)?)),
             HOLD => {
-                let peer = u64::from_le_bytes(field(body)?);
+                let holder = u64::from_le_bytes(field(body)?);
                 let mut keys = Vec::new();
                 while !body.is_empty() {
                     keys.push(Key(field(body)?));
                 }
-                Self::Hold(peer, keys)
+                Self::Hold(holder, keys)
             }
-            RELEASE_PEER => Self::ReleasePeer(u64::from_le_bytes(field(body)?)),
+            RELEASE_HOLDS => Self::ReleaseHolds(u64::from_le_bytes(field(body)?)),
             GRANT => {
                 let segment = segment(body)?;
                 let (first, units) = (
@@ -1139,17 +1124,6 @@ impl Input {
             WITHDRAW => {
                 let segment = segment(body)?;
                 Self::Withdraw(named(body)?, segment)
-            }
-            PEER_COPIES => {
-                let task = task(body)?;
-                let mut held = Vec::new();
-                while !body.is_empty() {
-                    held.push(match field::<1>(body)? {
-                        [0] => None,
-                        _ => Some((field(body)?, field(body)?)),
-                    });
-                }
-                Self::PeerCopies(task, held)
             }
             BORROW => Self::Borrow(
                 u64::from_le_bytes(field(body)?),

@@ -64,7 +64,7 @@ fn each_report_counts_its_second_and_states_the_gauges_as_they_are() {
     assert!(busy.max_queue_wait_us <= busy.queue_wait_us_total);
     let prefix = &busy.prefix_cache_stats;
     assert_eq!((prefix.base.queries, prefix.base.hits), (12 + 12, 12));
-    assert_eq!((prefix.host_hits, prefix.peer_hits), (0, 0));
+    assert_eq!(prefix.host_hits, 0);
     assert_eq!((busy.num_running_reqs, busy.num_waiting_reqs), (1, 1));
     assert_eq!(domain(&busy, "prefill"), (2, 2), "the two prefills");
     assert!(domain(&busy, "decode").0 > 0);

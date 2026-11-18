@@ -293,19 +293,14 @@ pub(crate) fn profile(runner: &CausalLmRunner) -> Result<()> {
         .context("profiling the rank's causal runner")
 }
 
-/// Every kernel `runner` and the owners it reads launch: its graphs' profiled launches, the
-/// cache's copies and conversions, and the recurrent state's copies.
+/// Every kernel `runner` and the owners it reads launch: its graphs' profiled launches and the
+/// recurrent state's copies.
 ///
 /// # Errors
 ///
 /// When an owner's descriptors refuse its tensors.
-pub(crate) fn keys(
-    runner: &CausalLmRunner,
-    cache: &Mutex<KvCacheMemory>,
-    state: Option<&Mutex<StateMemory>>,
-) -> Result<Keys> {
+pub(crate) fn keys(runner: &CausalLmRunner, state: Option<&Mutex<StateMemory>>) -> Result<Keys> {
     let mut keys = crate::runner::Forward::graphs(runner).keys();
-    keys.extend(service::lock(cache).keys()?);
     if let Some(state) = state {
         keys.extend(service::lock(state).keys()?);
     }

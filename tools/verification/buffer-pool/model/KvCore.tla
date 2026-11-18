@@ -104,7 +104,7 @@ VARIABLES
     copies,      \* the copies in flight, each holding the block it reads and the one it writes
     \* @type: Int;
     ncopy,       \* the copies ever asked for
-    \* @type: Set({kind: Str, k: Str, h: Str, src: Str, ok: Bool, expired: Bool, p: Str, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)});
+    \* @type: Set({kind: Str, k: Str, h: Str, expired: Bool, p: Str, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)});
     tasks,       \* the transfers, crossings, prefetches and remote puts in flight, each
                  \* holding the blocks it copies
     \* @type: Str -> Set(Str);
@@ -157,7 +157,7 @@ vars == <<pool, plane, alloc, sharedKey, rare>>
 \* @typeAlias: req = {kind: Str, e: Str, o: Str, ps: Set(Str), p: Str, k: Str, c: Int, ok: Bool, to: Str, after: Str -> Int, by: Set(Str), sg: Set(Str)};
 \* @typeAlias: def = {kind: Str, units: Set(Str), after: Str -> Int, o: Str, p: Str, k: Str, c: Int, ok: Bool, g: Str, to: Str};
 \* @typeAlias: copy = {id: Int, kind: Str, o: Str, p: Str, k: Str, g: Str, read: Str, write: Str, fill: Bool, parts: Set(Str), seq: Int, done: Bool, stopped: Bool};
-\* @typeAlias: task = {kind: Str, k: Str, h: Str, src: Str, ok: Bool, expired: Bool, p: Str, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)};
+\* @typeAlias: task = {kind: Str, k: Str, h: Str, expired: Bool, p: Str, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)};
 \* @typeAlias: batch = {g: Str, seq: Int, reads: Set(<<Str, Str>>), writes: Set(<<Str, Str>>), cr: Set(Str), cw: Set(Str)};
 \* @typeAlias: hand = {g: Str, o: Str, p: Str, u: Str, w: Bool};
 KvAliases == TRUE
@@ -950,8 +950,8 @@ TransferDue(d) ==
                     /\ free' = free \ {s}
                     /\ alloc' = [alloc EXCEPT ![s] = d.o]
                     /\ tasks' = tasks \cup
-                         {[kind |-> "transfer", k |-> NONE, h |-> NONE, src |-> NONE,
-                           ok |-> TRUE, expired |-> FALSE, p |-> NONE,
+                         {[kind |-> "transfer", k |-> NONE, h |-> NONE,
+                            expired |-> FALSE, p |-> NONE,
                            o |-> d.o, to |-> d.to, slot |-> s, held |-> TRUE,
                            units |-> units \cup {oslot[d.o]},
                            writes |-> {u \in units : Mem(d.to) \notin valid[u]}]}
@@ -1068,8 +1068,8 @@ ReplicateDue(d) ==
           /\ deferred' = deferred \ {d}
           /\ IF held /\ ~there
              THEN /\ tasks' = tasks \cup
-                       {[kind |-> "replicate", k |-> NONE, h |-> NONE, src |-> NONE,
-                         ok |-> TRUE, expired |-> FALSE, p |-> d.p,
+                       {[kind |-> "replicate", k |-> NONE, h |-> NONE,
+                          expired |-> FALSE, p |-> d.p,
                          o |-> d.o, to |-> d.to, slot |-> NONE, held |-> TRUE,
                          units |-> {u}, writes |-> {u}]}
                   /\ UNCHANGED <<free, alloc, sharedKey, dbt, handoff>>
@@ -1114,22 +1114,22 @@ MapEarly(g, o, p) ==
 (* The prefetches and remote stores in flight.                             *)
 TierTasks == {t \in tasks : t.kind \in {"prefetch", "put"}}
 
-\* @type: (Str, Str, Str, Str) => $task;
-Task(kind, k, h, src) ==
-    [kind |-> kind, k |-> k, h |-> h, src |-> src, ok |-> TRUE, expired |-> FALSE, p |-> NONE,
+\* @type: (Str, Str, Str) => $task;
+Task(kind, k, h) ==
+    [kind |-> kind, k |-> k, h |-> h, expired |-> FALSE, p |-> NONE,
      o |-> NONE, to |-> NONE, slot |-> NONE, held |-> TRUE, units |-> {}, writes |-> {}]
 
 (* `Prefetch`: a task brings a key into a new host block from the remote   *)
-(* store or from a peer, where the reader pins the block it reads, on the  *)
-(* host parts of the group whose admission asked for it (`g`).             *)
-Prefetch(k, src, g) ==
+(* store, on the host parts of the group whose admission asked for it      *)
+(* (`g`).                                                                  *)
+Prefetch(k, g) ==
     /\ Cardinality(TierTasks) < MaxTasks
     /\ hcache[k] = NONE
     /\ ~\E t \in tasks : t.kind = "prefetch" /\ t.k = k
     /\ \E h \in free \cap HostUnits :
          /\ free' = free \ {h}
          /\ alloc' = [alloc EXCEPT ![h] = "task"]
-         /\ tasks' = tasks \cup {[Task("prefetch", k, h, src) EXCEPT !.to = g]}
+         /\ tasks' = tasks \cup {[Task("prefetch", k, h) EXCEPT !.to = g]}
     /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
                    member, valid, vis, plane, sharedKey, rare>>
 
@@ -1140,16 +1140,7 @@ StoreRemote(k) ==
     /\ On("R8") => vis[k].h = NONE
     /\ k \notin remote
     /\ ~\E t \in tasks : t.kind = "put" /\ t.k = k
-    /\ tasks' = tasks \cup {Task("put", k, hcache[k], "remote")}
-    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
-                   trial, member, valid, vis, plane, alloc, sharedKey, rare>>
-
-(* The peer a prefetch reads from lets go of its pin: the peer's           *)
-(* connection closed, or it answered `Gone`.                               *)
-\* @type: ($task) => Bool;
-PeerLost(t) ==
-    /\ t \in tasks /\ t.kind = "prefetch" /\ t.src = "peer" /\ t.ok
-    /\ tasks' = (tasks \ {t}) \cup {[t EXCEPT !.ok = FALSE]}
+    /\ tasks' = tasks \cup {Task("put", k, hcache[k])}
     /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
                    trial, member, valid, vis, plane, alloc, sharedKey, rare>>
 
@@ -1170,20 +1161,19 @@ Deadline(t) ==
                    member, valid, vis, plane, rare>>
 
 (* A5: a task's completion is produced only after it stopped touching its  *)
-(* blocks. A prefetch that found its key before its deadline, from a       *)
-(* source that held the block throughout, caches the host block. The       *)
-(* hazard H2 of the system as built caches it whatever the peer did.       *)
+(* blocks. A prefetch that found its key before its deadline caches the    *)
+(* host block.                                                             *)
 \* @type: ($task, Bool) => Bool;
 PrefetchEnd(t, found) ==
     /\ t \in tasks /\ t.kind = "prefetch"
     /\ tasks' = tasks \ {t}
-    /\ IF found /\ ~t.expired /\ t.held /\ hcache[t.k] = NONE /\ (t.ok \/ "H2" \in Hazards)
+    /\ IF found /\ ~t.expired /\ t.held /\ hcache[t.k] = NONE
        THEN /\ hcache' = [hcache EXCEPT ![t.k] = t.h]
             /\ free' = free
             /\ alloc' = [alloc EXCEPT ![t.h] = "shared"]
             /\ sharedKey' = [sharedKey EXCEPT ![t.h] = t.k]
-            /\ bad' = IF t.ok THEN bad ELSE bad \cup {<<t.k, "host">>}
-            \* What the remote store and the peers hold is what every epoch may use.
+            /\ bad' = bad
+            \* What the remote store holds is what every epoch may use.
             /\ vis' = [vis EXCEPT ![t.k].h = NONE]
             \* The connector wrote the asking group's host parts.
             /\ valid' = [valid EXCEPT ![t.h] = GroupParts[t.to]]
@@ -1358,9 +1348,9 @@ Serving ==
 
 Next ==
     \/ Serving /\ UNCHANGED rare
-    \/ \E k \in Keys, g \in Groups : Prefetch(k, "remote", g) \/ Prefetch(k, "peer", g)
+    \/ \E k \in Keys, g \in Groups : Prefetch(k, g)
     \/ \E k \in Keys : StoreRemote(k)
-    \/ \E t \in tasks : PeerLost(t) \/ Deadline(t)
+    \/ \E t \in tasks : Deadline(t)
     \/ \E t \in tasks, ok \in BOOLEAN : PrefetchEnd(t, ok) \/ PutEnd(t, ok)
     \/ \E e \in Epochs : Lose(e)
     \/ \E k \in Keys : EvictNot(k) \/ StoreOffered(k)

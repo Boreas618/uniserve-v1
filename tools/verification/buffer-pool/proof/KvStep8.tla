@@ -13,7 +13,7 @@ USE Sizes, Design
 (* The free slot rows of the target group, and the task that starts.       *)
 FreeRows(d) == {s \in free \cap Slots : SlotGroup[s] = d.to}
 NewTask(d, s) ==
-    [kind |-> "transfer", k |-> NONE, h |-> NONE, src |-> NONE, ok |-> TRUE, expired |-> FALSE,
+    [kind |-> "transfer", k |-> NONE, h |-> NONE, expired |-> FALSE,
      p |-> NONE, o |-> d.o, to |-> d.to, slot |-> s, held |-> TRUE,
      units |-> TableUnits(d.o) \cup {oslot[d.o]},
      writes |-> {u \in TableUnits(d.o) : Mem(d.to) \notin valid[u]}]
@@ -281,11 +281,11 @@ LEMMA TransferDue_Start ==
       BY <1>0, <1>3 DEF IndInv, Tables, OwnerTyped, Empty, Private, Shared
     <2> QED
       BY <1>3, <1>4, <2>1, <2>2, <2>3 DEF Held, HeldIn
-  <1>6. /\ t0.kind = "transfer" /\ t0.k = NONE /\ t0.h = NONE /\ t0.src = NONE /\ t0.held
+  <1>6. /\ t0.kind = "transfer" /\ t0.k = NONE /\ t0.h = NONE /\ t0.held
         /\ t0.o = d.o /\ t0.to = d.to /\ t0.slot = s /\ t0.p = NONE
         /\ t0.units = TableUnits(d.o) \cup {oslot[d.o]}
         /\ t0.writes = {u \in TableUnits(d.o) : Mem(d.to) \notin valid[u]}
-        /\ t0 = [kind |-> t0.kind, k |-> t0.k, h |-> t0.h, src |-> t0.src, ok |-> t0.ok,
+        /\ t0 = [kind |-> t0.kind, k |-> t0.k, h |-> t0.h,
                  expired |-> t0.expired, p |-> t0.p, o |-> t0.o, to |-> t0.to, slot |-> t0.slot,
                  held |-> t0.held, units |-> t0.units, writes |-> t0.writes]
     BY <1>1 DEF NewTask

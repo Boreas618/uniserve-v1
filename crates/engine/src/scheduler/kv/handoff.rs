@@ -146,7 +146,6 @@ impl Kv {
         request.blocks = vec![Blocks::default(); shapes.len()];
         request.num_cached_tokens = 0;
         request.num_host_tokens = 0;
-        request.num_peer_tokens = 0;
         vec![runtime::Request::Import {
             owner,
             tables,

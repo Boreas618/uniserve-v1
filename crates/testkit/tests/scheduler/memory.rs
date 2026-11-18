@@ -8,8 +8,8 @@
 //! - What a table gives up behind: a sliding window the blocks no later call reads, a recurrent
 //!   state all but its latest checkpoint.
 //! - The hit: the deepest boundary every class accepts, read by pins of the device copies, loads
-//!   of the host copies, a clone of a partial last block, and prefetches from the remote store or
-//!   the peers when they deepen it enough; and its statistics per tier and per source.
+//!   of the host copies, a clone of a partial last block, and prefetches from the remote store
+//!   when they deepen it enough; and its statistics per tier.
 //! - The write policy: committed full-attention blocks stored to the host, sliding windows only
 //!   before aligned boundaries, each block once, and the host copies stored on to the remote
 //!   store; a block whose store stored nothing offered again only once its answer could differ.
@@ -25,9 +25,7 @@ use engine::scheduler::Message;
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
 use storage::Key;
 use storage::key::{page_key, page_root};
-use storage::runtime::{
-    Cause, Completion, GroupId, OwnerId, Request, Source, Tier, monotonic_nanos,
-};
+use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, Tier, monotonic_nanos};
 
 use crate::harness::{A, BLOCK, Deployment, Harness, prompt, sharing, token};
 
@@ -93,18 +91,14 @@ fn prompt_keys(tokens: &[u32]) -> Vec<Key> {
         .collect()
 }
 
-/// The hit counters of every report up to the next one: the tokens of the hits, those loaded
-/// from the host, and those of them a prefetch from the peers brought.
-fn hits(harness: &mut Harness) -> (u64, u64, u64) {
+/// The hit counters of every report up to the next one: the tokens of the hits, and those
+/// loaded from the host.
+fn hits(harness: &mut Harness) -> (u64, u64) {
     harness.next_report();
     let reports = harness.reports();
     let stats = reports.iter().map(|report| &report.prefix_cache_stats);
-    stats.fold((0, 0, 0), |(hits, host, peers), stats| {
-        (
-            hits + stats.base.hits,
-            host + stats.host_hits,
-            peers + stats.peer_hits,
-        )
+    stats.fold((0, 0), |(hits, host), stats| {
+        (hits + stats.base.hits, host + stats.host_hits)
     })
 }
 
@@ -603,14 +597,14 @@ fn a_host_hit_is_loaded_and_counted_as_a_host_hit() {
     assert_eq!(loads, [(0, keys.clone())]);
     assert_eq!(harness.first_written(reader, 0), Some(12));
     assert_eq!(harness.tokens(reader).len(), 2);
-    assert_eq!(hits(&mut harness), (12, 12, 0));
+    assert_eq!(hits(&mut harness), (12, 12));
 }
 
 /// A deployment with a host tier of 80 units and a remote store, whose step holds 512 tokens,
 /// where request 1's prompt of 264 tokens is cached in the remote store alone: its 66 blocks
 /// were stored to the host and on to the remote store, then the KV region and the host region
 /// were shrunk to nothing, each evicting the whole order the scheduler installed there. The
-/// remote store holds the keys (`InProcessPool::hold_in`). Returns the harness and the keys.
+/// remote store holds the keys (`InProcessPool::store_remote`). Returns the harness and the keys.
 fn in_the_remote_store_alone() -> (Harness, Vec<Key>) {
     let mut harness = Deployment::tokens().host(80).remote().batch(8, 512).build();
     let first = harness.submit(token(1, 264, 1));
@@ -620,7 +614,7 @@ fn in_the_remote_store_alone() -> (Harness, Vec<Key>) {
     let keys = harness.committed(harness.owner(first, A).unwrap());
     assert_eq!(keys.len(), 66);
     for key in &keys {
-        harness.pool.hold_in(Source::Remote, *key, BLOCK as u16);
+        harness.pool.store_remote(*key, BLOCK as u16);
     }
     for (region, units) in [("kv-0", 256), ("host", 80)] {
         assert_eq!(harness.resize(region, 0), 0);
@@ -648,10 +642,9 @@ fn a_deep_enough_remainder_is_prefetched_from_the_remote_store_and_loaded() {
                 Request::Prefetch {
                     class,
                     keys,
-                    source,
                     deadline,
                     ..
-                } => Some((class, keys, source, deadline)),
+                } => Some((class, keys, deadline)),
                 _ => None,
             })
     };
@@ -659,8 +652,8 @@ fn a_deep_enough_remainder_is_prefetched_from_the_remote_store_and_loaded() {
     let after = monotonic_nanos();
 
     // The reuse limit is 260 tokens: 65 blocks, all deepening the hit.
-    let (class, asked, source, deadline) = prefetch(&harness).unwrap();
-    assert_eq!((class, source), (0, Source::Remote));
+    let (class, asked, deadline) = prefetch(&harness).unwrap();
+    assert_eq!(class, 0);
     assert_eq!(asked, keys[..65]);
     let wait = u64::try_from(harness.config.copy_timeout(260).as_nanos()).unwrap();
     assert!(
@@ -675,65 +668,6 @@ fn a_deep_enough_remainder_is_prefetched_from_the_remote_store_and_loaded() {
         .any(|request| matches!(request, Request::Load { at: 0, keys, .. } if keys == asked));
     assert!(loaded, "what the prefetch found is loaded");
     assert_eq!(harness.first_written(reader, 0), Some(260));
-}
-
-/// When the remote store does not deepen the hit and the deployment has peers, a prompt whose
-/// reuse limit lies at least `prefetch_min_tokens` beyond the hit prefetches from the peers every
-/// key beyond it; the leading keys they hold are loaded, the request computes from there, and
-/// its hit is counted as a hit, a host hit and a peer hit (SD §4.4 "Pins, loads, clones and
-/// prefetches", "Hit statistics"; §7.5 "Statistics rules").
-#[test]
-fn a_deep_enough_remainder_is_prefetched_from_the_peers_and_counted_as_a_peer_hit() {
-    let mut harness = Deployment::tokens().host(80).peers().batch(8, 512).build();
-    let tokens = prompt(1, 264);
-    let keys = prompt_keys(&tokens);
-    // The peers hold the first forty blocks.
-    for key in &keys[..40] {
-        harness.pool.hold_in(Source::Peers, *key, BLOCK as u16);
-    }
-    let id = harness.submit(token(1, 264, 2));
-    harness.settle(200);
-
-    let owner = harness.owner(id, A).unwrap();
-    let prefetches: Vec<(Source, Vec<Key>)> = harness
-        .taken()
-        .into_iter()
-        .filter_map(|request| match request {
-            Request::Prefetch { keys, source, .. } => Some((source, keys)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(prefetches, [(Source::Peers, keys[..65].to_vec())]);
-    let loaded = asked_by(&harness, owner)
-        .into_iter()
-        .any(|request| match request {
-            Request::Load {
-                at: 0,
-                keys: loaded,
-                ..
-            } => loaded == keys[..40],
-            _ => false,
-        });
-    assert!(loaded, "what the peers held is loaded");
-    assert_eq!(harness.first_written(id, 0), Some(160));
-    assert_eq!(hits(&mut harness), (160, 160, 160));
-}
-
-/// A remainder shallower than `prefetch_min_tokens` beyond the hit is computed, not prefetched:
-/// on a deployment with peers, a prompt whose reuse limit is 196 tokens asks no `Prefetch` and
-/// computes from its first token (SD §4.4 "Pins, loads, clones and prefetches").
-#[test]
-fn a_shallow_remainder_is_computed_and_not_prefetched() {
-    let mut harness = Deployment::tokens().host(80).peers().batch(8, 512).build();
-    let id = harness.submit(token(1, 200, 2));
-    harness.settle(200);
-    let prefetched = harness
-        .taken()
-        .iter()
-        .any(|request| matches!(request, Request::Prefetch { .. }));
-    assert!(!prefetched);
-    assert_eq!(harness.first_written(id, 0), Some(0));
-    assert_eq!(harness.tokens(id).len(), 2);
 }
 
 /// A request that left as migratable committed its partial last block under its tail key; the
@@ -1138,7 +1072,7 @@ fn host_hits_beyond_what_the_device_has_free_are_admitted_in_turn_and_all_end() 
         );
     }
     // Each read its 31 blocks from the host.
-    assert_eq!(hits(&mut harness), (4 * 124, 4 * 124, 0));
+    assert_eq!(hits(&mut harness), (4 * 124, 4 * 124));
     let refused = harness.answers().into_iter().any(|(request, answer)| {
         matches!(request, Request::Load { .. }) && matches!(answer, Completion::Full { .. })
     });
@@ -1244,7 +1178,7 @@ fn a_request_resumed_from_another_epoch_reads_every_block_that_epoch_committed()
     assert!(cloned, "the tail is cloned at its position");
     assert_eq!(harness.first_written(id, 0), Some(18));
     assert_eq!(harness.tokens(id).len(), 8);
-    assert_eq!(hits(&mut harness), (18, 0, 0));
+    assert_eq!(hits(&mut harness), (18, 0));
 }
 
 /// A prompt's recurrent-state checkpoint cached without the attention blocks before it: request

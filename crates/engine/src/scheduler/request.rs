@@ -95,9 +95,6 @@ pub(crate) struct Request {
     /// beyond what its `Pin`s found on the device. Set with the hit once the admission's last
     /// answer arrived, and counted as host hits at admission.
     pub num_host_tokens: u32,
-    /// Of `num_host_tokens`, the tokens a `Prefetch` from the peers brought to the host (the
-    /// peers' `Prefetched`), counted as peer hits at admission.
-    pub num_peer_tokens: u32,
     /// The `List`s the scheduler had asked when the request arrived. A resumed request whose
     /// expected hit falls short of what its previous life computed is admitted once a `List`
     /// asked after it arrived has been answered (SD §4.4 "The hit").
@@ -261,7 +258,6 @@ impl Request {
             num_computed_tokens: 0,
             num_cached_tokens: 0,
             num_host_tokens: 0,
-            num_peer_tokens: 0,
             listing: 0,
             keys: Vec::new(),
             spec_token_ids: Vec::new(),

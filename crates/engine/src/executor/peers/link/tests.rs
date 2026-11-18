@@ -124,7 +124,6 @@ fn session() -> (storage::runtime::Open, storage::runtime::Opened) {
         trajectory: 0,
         groups: Vec::new(),
         schedulers: vec![Vec::new()],
-        peers: vec!["10.0.0.3:7000".to_owned()],
     };
     let opened = Opened {
         regions: vec![(0, 128)],

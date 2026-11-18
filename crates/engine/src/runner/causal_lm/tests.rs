@@ -2743,7 +2743,6 @@ fn regions(cache: &KvCacheMemory) -> CacheRegions {
         units: UNITS,
         states: cache.layout().state_group().map(|_| STATES),
         host: (0..groups).map(|group| Some(4 + group as u8)).collect(),
-        sources: vec![None; groups],
     }
 }
 
