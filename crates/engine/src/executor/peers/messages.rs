@@ -270,8 +270,12 @@ pub enum DataOperation {
     /// batches that reached them could not compare. Asked once the shadow pass ended.
     Uncompared,
     /// Answers what a generation update that replaces `operators` asks of every rank's device
-    /// of the peer (`crate::process::binding::UpdateRoom`).
-    UpdateRoom { operators: Vec<String> },
+    /// of the peer (`crate::process::binding::UpdateRoom`), its runners measured under
+    /// `options`, the generation's graph options where they differ from the serving ones.
+    UpdateRoom {
+        operators: Vec<String>,
+        options: Option<proto::config::GraphOptions>,
+    },
     /// Answers the bytes each GPU's quota limit of the peer falls by under `fractions`, every
     /// rank's share of its GPU by the rank's number (`WeightBinding::lowered_limits`).
     LoweredLimits {

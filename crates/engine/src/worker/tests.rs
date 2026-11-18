@@ -720,7 +720,7 @@ fn a_generation_is_prepared_switched_to_and_committed_on_every_runner_between_ba
 
     // The preparation captures every bucket beside the serving graphs, which serve meanwhile.
     let next = replacing(&kernels, 2, "rms_norm");
-    output_of(&worker.prepare(next).unwrap());
+    output_of(&worker.prepare(next, None).unwrap());
     output_of(&worker.ready(2, None));
     assert_eq!(captures(&log).len(), 6);
     assert_eq!(generations(&worker), [1, 1]);
@@ -766,7 +766,9 @@ fn buckets_become_ready_in_order_and_switch_ahead_of_the_others() {
     // The switch of a bucket submitted with the preparation, before any capture could be
     // installed, is refused.
     let (release, held) = hold(&worker);
-    let prepare = worker.prepare(replacing(&kernels, 2, "rms_norm")).unwrap();
+    let prepare = worker
+        .prepare(replacing(&kernels, 2, "rms_norm"), None)
+        .unwrap();
     let early = worker
         .switch_buckets(2, vec![(0, Bucket::decode(2, Variant::DecodeGreedy))])
         .unwrap();
@@ -811,7 +813,11 @@ fn a_generation_is_rolled_back_prepared_or_on_trial() {
 
     // Prepared and never switched to: its graphs go, a wait for it fails, and the next update
     // starts from the serving generation.
-    output_of(&worker.prepare(replacing(&kernels, 2, "rms_norm")).unwrap());
+    output_of(
+        &worker
+            .prepare(replacing(&kernels, 2, "rms_norm"), None)
+            .unwrap(),
+    );
     output_of(&worker.rollback(2).unwrap());
     assert_eq!(generations(&worker), [1, 1]);
     let refused = failure_of(&worker.switch(2).unwrap());
@@ -819,7 +825,11 @@ fn a_generation_is_rolled_back_prepared_or_on_trial() {
     assert_eq!(generations(&worker), [1, 1]);
 
     // On trial: the generation it replaced serves again.
-    output_of(&worker.prepare(replacing(&kernels, 3, "rms_norm")).unwrap());
+    output_of(
+        &worker
+            .prepare(replacing(&kernels, 3, "rms_norm"), None)
+            .unwrap(),
+    );
     output_of(&worker.ready(3, None));
     output_of(&worker.switch(3).unwrap());
     assert_eq!(generations(&worker), [3, 3]);
@@ -840,7 +850,9 @@ fn a_switch_before_every_capture_was_installed_switches_no_runner() {
     // The preparation begins, and the switch is taken before the capture thread handed back
     // any bucket.
     let (release, held) = hold(&worker);
-    let prepare = worker.prepare(replacing(&kernels, 2, "rms_norm")).unwrap();
+    let prepare = worker
+        .prepare(replacing(&kernels, 2, "rms_norm"), None)
+        .unwrap();
     let switch = worker.switch(2).unwrap();
     drop(release);
     output_of(&held);
@@ -853,11 +865,19 @@ fn a_switch_before_every_capture_was_installed_switches_no_runner() {
     // A generation that lacks a kernel the runners launch fails its capture: it is never
     // ready, and is not being prepared once rolled back.
     output_of(&worker.rollback(2).unwrap());
-    output_of(&worker.prepare(Arc::new(Generation::new(4, []))).unwrap());
+    output_of(
+        &worker
+            .prepare(Arc::new(Generation::new(4, [])), None)
+            .unwrap(),
+    );
     let refused = failure_of(&worker.ready(4, None));
     assert!(refused.contains("holds no kernel"), "{refused}");
     output_of(&worker.rollback(4).unwrap());
-    output_of(&worker.prepare(replacing(&kernels, 5, "rms_norm")).unwrap());
+    output_of(
+        &worker
+            .prepare(replacing(&kernels, 5, "rms_norm"), None)
+            .unwrap(),
+    );
     output_of(&worker.ready(5, None));
 }
 
@@ -870,7 +890,11 @@ fn a_preparation_that_keeps_every_graph_captures_nothing() {
     output_of(&worker.warm_up().unwrap());
     lock(&log).clear();
 
-    output_of(&worker.prepare(Arc::new(kernels.replace(2, []))).unwrap());
+    output_of(
+        &worker
+            .prepare(Arc::new(kernels.replace(2, [])), None)
+            .unwrap(),
+    );
     output_of(&worker.submit(1, batch(1, Phase::Decode, 2)).unwrap());
     output_of(&worker.ready(2, None));
     assert!(captures(&log).is_empty());
@@ -1029,7 +1053,11 @@ fn a_shadow_batch_compares_the_replaced_operators_its_bucket_launches() {
     // The bucket of three rows is the one of four, which launches the replaced normalization
     // and not a replaced embedding: one paired forward, of that operator. Graphs with no
     // device run none, which is the failure the pair is named in.
-    output_of(&worker.prepare(replacing(&kernels, 2, "rms_norm")).unwrap());
+    output_of(
+        &worker
+            .prepare(replacing(&kernels, 2, "rms_norm"), None)
+            .unwrap(),
+    );
     let refused = failure_of(&shadow(2));
     assert!(
         refused.contains(
@@ -1050,7 +1078,7 @@ fn a_shadow_batch_compares_the_replaced_operators_its_bucket_launches() {
             unlaunched_kernel(),
         )],
     ));
-    output_of(&worker.prepare(adding).unwrap());
+    output_of(&worker.prepare(adding, None).unwrap());
     output_of(&shadow(3));
 
     let uncompared = worker.uncompared();

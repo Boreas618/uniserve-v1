@@ -177,6 +177,25 @@ impl Features {
         })
     }
 
+    /// The feature buffer of a shape of the runner whose buckets hold at most `tokens` tokens
+    /// (`Runner::reshape`), over the same encoder outputs: this one when it holds as many, and
+    /// otherwise one of its own on the device of `stream`, made as [`Features::new`] makes one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Features::new`].
+    pub(super) fn with_tokens(
+        &self,
+        model: &dyn TextModel,
+        tokens: usize,
+        stream: Option<&Stream>,
+    ) -> Result<Self> {
+        if tokens <= self.extents.0 {
+            return Ok(self.clone());
+        }
+        Self::new(model, tokens, stream, Arc::clone(&self.memory), self.class)
+    }
+
     /// The copies of `batch`'s image blocks into the buffer, through `tables`: each block's
     /// features and then its coordinates, from the encoder output of the request whose row
     /// holds it. Nothing is issued.

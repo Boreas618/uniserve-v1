@@ -165,6 +165,9 @@ struct Device {
     stream: Stream,
     /// The tables' memory.
     storage: Arc<Storage>,
+    /// The ban masks' memory, when they lie apart from the other tables: those of a shape of the
+    /// runner whose buckets hold other rows than the tables were made for ([`Slots::with_rows`]).
+    bans: Option<Arc<Storage>>,
     /// Each table's offset in `storage`, by the table's discriminant.
     offsets: [u64; Table::COUNT],
     /// The page-locked blocks the step's copies read. A step that needs more than the blocks
@@ -174,6 +177,16 @@ struct Device {
     used: usize,
     /// Whether copies were issued that the runner has not yet seen complete.
     unsettled: bool,
+}
+
+impl Device {
+    /// The device address of `table`'s first byte.
+    fn address(&self, table: Table) -> u64 {
+        match (&self.bans, table) {
+            (Some(bans), Table::Bans) => bans.address(),
+            _ => self.storage.address() + self.offsets[table as usize],
+        }
+    }
 }
 
 /// The shape and the element type of each table, by the table's discriminant (as
@@ -226,6 +239,73 @@ impl Slots {
             accepted: self.accepted.clone(),
             device: None,
         }
+    }
+
+    /// The same tables for a shape of the runner whose buckets hold at most `rows` rows
+    /// (`Runner::reshape`): a request's state lies in these tables whatever shape serves it, so
+    /// every table is shared but the ban masks, which every step writes before its replay and
+    /// which a shape of other rows holds in memory of its own, on the same stream. The two
+    /// values write on the stream in turn: the one that serves writes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for no row; the driver's refusal of the masks' allocation.
+    pub(crate) fn with_rows(&self, rows: u32) -> Result<Self> {
+        if rows == 0 {
+            return Err(Error::Invalid(
+                "slot state for buckets of no row holds no ban mask".into(),
+            ));
+        }
+        let words = ban_words(self.vocabulary) as usize;
+        let shape: Shape = (rows as usize, words).into();
+        let bytes = rows as usize * words * 4;
+
+        let mut tables = self.tables.clone();
+        let device = match &self.device {
+            Some(device) => {
+                let bans = if rows == self.rows {
+                    device.bans.clone()
+                } else {
+                    let storage = Storage::linear(device.stream.device(), bytes)?;
+                    // SAFETY: the tensor lies over the whole allocation, which the value keeps
+                    // for as long as the graphs captured over the tensor exist.
+                    tables.bans = unsafe { storage.external(0, shape, DType::U32) }?;
+                    Some(storage)
+                };
+                Some(Device {
+                    stream: device.stream.clone(),
+                    storage: Arc::clone(&device.storage),
+                    bans,
+                    offsets: device.offsets,
+                    blocks: Vec::new(),
+                    used: 0,
+                    unsettled: false,
+                })
+            }
+            None => {
+                // SAFETY: a tensor over the meta device has no memory: its address is never
+                // read or written.
+                tables.bans = unsafe { ops::external(0, shape, DType::U32, &ops::meta()) }?;
+                None
+            }
+        };
+
+        Ok(Self {
+            slots: self.slots,
+            vocabulary: self.vocabulary,
+            rows,
+            width: self.width,
+            tables,
+            context: self.context.clone(),
+            accepted: self.accepted.clone(),
+            device,
+        })
+    }
+
+    /// The bytes of device memory the ban masks of buckets of at most `rows` rows take, over a
+    /// `vocabulary`-wide logit row: what a shape of other rows allocates ([`Slots::with_rows`]).
+    pub(crate) fn ban_bytes(vocabulary: u32, rows: u32) -> u64 {
+        u64::from(rows) * u64::from(ban_words(vocabulary)) * 4
     }
 
     /// The bytes of device memory the state of `slots` request slots takes, over a
@@ -298,6 +378,7 @@ impl Slots {
                 Some(Device {
                     stream,
                     storage,
+                    bans: None,
                     offsets,
                     blocks: Vec::new(),
                     used: 0,
@@ -648,7 +729,7 @@ impl Slots {
             std::ptr::copy_nonoverlapping(source.as_ptr(), block.as_ptr().add(at), source.len());
         }
 
-        let destination = device.storage.address() + device.offsets[table as usize] + offset;
+        let destination = device.address(table) + offset;
         device.unsettled = true;
 
         // SAFETY: the destination is `source.len()` bytes of a table of this value's storage,
@@ -670,7 +751,7 @@ impl Slots {
         let Some(device) = &mut self.device else {
             return Ok(());
         };
-        let destination = device.storage.address() + device.offsets[table as usize] + offset;
+        let destination = device.address(table) + offset;
         device.unsettled = true;
 
         // SAFETY: the destination is a row of a table of this value's storage, which the

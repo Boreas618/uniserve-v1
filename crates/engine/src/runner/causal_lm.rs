@@ -131,6 +131,22 @@
 //! alone. Everything of a step that can refuse the batch is done before the agreement: once
 //! a step is agreed, every member launches it, or the others wait on their devices.
 //!
+//! ## Shapes
+//!
+//! What a kernel generation's options fix of the runner is its shape: the bucket catalog, the
+//! candidates a scored row reports and the drafts a verification holds (`GraphOptions`), with
+//! what follows from them (the config, the input layout, the samplers, the ban masks, a
+//! speculating runner's kept outputs, the feature buffer) and the graphs captured for them. A
+//! generation of other options prepares the shape beside the serving one ([`Runner::reshape`]):
+//! its graphs are made over the runner's region or one of their own ([`Graphs::over`]) and
+//! every bucket of the shape is captured for them by the worker's capture thread
+//! ([`Runner::reshaped_capturer`]), while the serving shape serves. The switch exchanges the two
+//! whole at a batch boundary ([`Runner::switch_shape`]), the serving one kept until the commit
+//! ([`Runner::commit_shape`]) and served again after a rollback ([`Runner::rollback_shape`]).
+//! The request slots' state, the cache, the recurrent state, the scratch page set, the page
+//! work and the expert union are the runner's whatever shape serves; a step lands with the
+//! candidates of the shape that launched it.
+//!
 //! ## Speculation
 //!
 //! A runner whose config states drafts speculates with its model's drafter ([`speculation`]).
@@ -186,7 +202,7 @@ use crate::runner::DeviceCopy;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
 use crate::runner::sampler::{self, Sampler, SamplerConfig};
-use crate::runner::{Forward, Runner};
+use crate::runner::{Forward, GraphOptions, Measure, Runner};
 use crate::worker::completion::Waker;
 use crate::worker::{Error, Result};
 
@@ -321,6 +337,26 @@ pub struct CausalLmRunner {
     /// The thread that wakes the worker once a step in `flights` completed on the device,
     /// started with the runner's first such step.
     lander: Option<Lander>,
+    /// The shape a kernel generation of other options prepared beside the serving one, with
+    /// the generation's number ([`Runner::reshape`]).
+    prepared: Option<(u64, Form)>,
+    /// The shape that served before the generation of this number switched to its own, kept
+    /// for its rollback until its commit ([`Runner::switch_shape`]).
+    kept: Option<(u64, Form)>,
+}
+
+/// One shape of a runner: what a kernel generation's options fix of it, and the graphs captured
+/// for them (module documentation, "Shapes"), as the fields of [`CausalLmRunner`] of the same
+/// names, which a switch exchanges whole.
+struct Form {
+    config: CausalLmConfig,
+    graphs: Graphs,
+    layout: Layout,
+    slots: Slots,
+    sampler: Sampler,
+    buckets: Buckets,
+    speculation: Option<Speculation>,
+    features: Option<Features>,
 }
 
 /// A step the runner launched and has not landed: what its landing reads beside its batch.
@@ -337,6 +373,9 @@ struct Flight {
     pending: Pending,
     /// How many of the read tensors are the drafter's proposals, the last ones.
     proposals: usize,
+    /// The candidates each scored row of the step reports: the shape's that launched it, which a
+    /// switch between its launch and its landing does not change.
+    candidates: u32,
     /// When the runner took the batch, and when it launched the step.
     started: Instant,
     launched: Instant,
@@ -617,6 +656,8 @@ impl CausalLmRunner {
             launched: 0,
             flights: VecDeque::new(),
             lander: None,
+            prepared: None,
+            kept: None,
         };
 
         // Every input tensor lies inside the block the graphs were made for.
@@ -883,6 +924,236 @@ impl CausalLmRunner {
 
         self.scratch = scratch;
         Ok(())
+    }
+
+    /// The shape of `options` (module documentation, "Shapes"), over the graphs `graphs` makes
+    /// for the bytes of its input tensors: its config, its buckets (their capacity classes for a
+    /// member of an expert union), its input layout, its ban masks, its samplers, a speculating
+    /// runner's kept outputs and the feature buffer, each of the serving shape's that the
+    /// options leave as they are shared. On the `device`, what differs is allocated on the
+    /// runner's stream; otherwise it is made of meta tensors, for a measurement.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a catalog of a bucket that is no causal forward, of more tokens
+    /// than a member of an expert union sends, or a verification longer than the recurrent
+    /// state's trail; [`Error::Unsupported`] for drafts where the runner speculates nothing or
+    /// none where it does, and for other drafts of a model whose state keeps a slot per
+    /// verified token; what `graphs` and the allocations refuse.
+    fn shape(
+        &self,
+        options: &GraphOptions,
+        device: bool,
+        graphs: impl FnOnce(u64) -> Result<Graphs>,
+    ) -> Result<Form> {
+        let config = CausalLmConfig {
+            buckets: options.buckets.clone(),
+            candidates: options.candidates,
+            drafts: options.drafts,
+            ..self.config.clone()
+        };
+        for bucket in config.buckets.iter() {
+            bucket.causal_lm()?;
+        }
+        if (config.drafts == 0) != (self.config.drafts == 0) {
+            return Err(Error::Unsupported(format!(
+                "a runner that verifies {} drafts takes {} in place: its cache lays the draft \
+                 cache out with the drafter's weights, which only an epoch loads or releases",
+                self.config.drafts, config.drafts
+            )));
+        }
+        if config.drafts != self.config.drafts && owned_slots(&*self.model, &self.config)?.is_some()
+        {
+            return Err(Error::Unsupported(format!(
+                "a model whose state keeps a slot per verified token holds {} rows a slot, and \
+                 {} drafts take another state region",
+                self.config.drafts + 1,
+                config.drafts
+            )));
+        }
+        let (mut buckets, layout) = stated(&config, &*self.model)?;
+
+        // A member of an expert union captures every bucket at each capacity class, which bound
+        // what the member sends a step.
+        if let Some(member) = &self.union {
+            let (_, tokens) = config.buckets.bounds();
+            if member.capacity() < tokens {
+                return Err(Error::Invalid(format!(
+                    "an expert union whose members send at most {} rows a step, for buckets of up \
+                     to {tokens} tokens",
+                    member.capacity()
+                )));
+            }
+            buckets = experts::classes(&config.buckets, member.capacity(), member.beside());
+        }
+
+        // The trail of a recurrent state holds the state after every token of the largest
+        // verification, at the rows the cache lent it.
+        if let Some(trail) = self
+            .speculation
+            .as_ref()
+            .and_then(|speculation| speculation.trail.as_ref())
+        {
+            let tokens = buckets
+                .iter()
+                .filter(|bucket| verifies(bucket.variant))
+                .map(|bucket| bucket.tokens as usize)
+                .max()
+                .unwrap_or(0);
+            let held = trail
+                .iter()
+                .flatten()
+                .filter_map(|field| field.dims().first().copied())
+                .min()
+                .unwrap_or(usize::MAX);
+            if tokens > held {
+                return Err(Error::Invalid(format!(
+                    "a verification of {tokens} tokens, and the recurrent state's trail holds {held}"
+                )));
+            }
+        }
+
+        let stream = if device { self.stream.as_ref() } else { None };
+        let slots = match device {
+            true => self.slots.with_rows(layout.rows() as u32)?,
+            false => self.slots.shared().with_rows(layout.rows() as u32)?,
+        };
+        let sampler = Sampler::new(
+            SamplerConfig {
+                candidates: config.candidates,
+                ..*self.sampler.config()
+            },
+            slots.counts().clone(),
+            slots.bias().clone(),
+        )?;
+        let speculation = match &self.speculation {
+            Some(serving) => Some(Speculation {
+                drafts: config.drafts,
+                pool: serving.pool,
+                kept: Kept::new(
+                    stream,
+                    layout.rows(),
+                    layout.tokens(),
+                    config.candidates,
+                    self.model.stream_width(),
+                    self.model.dtype(),
+                )?,
+                verifier: Sampler::new(
+                    SamplerConfig {
+                        extras: config.drafts,
+                        ..*sampler.config()
+                    },
+                    slots.counts().clone(),
+                    slots.bias().clone(),
+                )?,
+                ..serving.clone()
+            }),
+            None => None,
+        };
+        let features = self
+            .features
+            .as_ref()
+            .map(|features| features.with_tokens(&*self.model, layout.tokens(), stream))
+            .transpose()?;
+
+        let graphs = graphs(layout.bytes())?;
+        // Every input tensor of the shape lies inside the block its graphs were made for.
+        if graphs.input(0, layout.bytes() as usize, DType::U8).is_err() {
+            return Err(Error::Invalid(format!(
+                "the shape's graphs hold fewer than the {} bytes of its input tensors",
+                layout.bytes()
+            )));
+        }
+
+        Ok(Form {
+            config,
+            graphs,
+            layout,
+            slots,
+            sampler,
+            buckets,
+            speculation,
+            features,
+        })
+    }
+
+    /// The device bytes `shape` allocates beside its graphs' region: its ban masks when they
+    /// are not the serving shape's, a speculating runner's kept outputs, and a feature buffer
+    /// larger than the serving one.
+    fn shape_bytes(&self, shape: &Form) -> Result<u64> {
+        let vocabulary = self.model.vocabulary();
+        let rows = shape.layout.rows() as u32;
+        let bans = if rows == self.layout.rows() as u32 {
+            0
+        } else {
+            Slots::ban_bytes(vocabulary, rows)
+        };
+        let kept = Self::kept_bytes(&shape.config, &*self.model)?;
+        let features = match &self.features {
+            Some(_) if shape.layout.tokens() > self.layout.tokens() => {
+                Features::bytes(&*self.model, shape.layout.tokens())?
+            }
+            _ => 0,
+        };
+
+        Ok(bans + kept + features)
+    }
+
+    /// A forward instance of the runner computing with `shape` (`Runner::capturer`): the model,
+    /// the slot state, the cache and the state buffers, the scratch page set and the union's
+    /// regions are the runner's own, and it holds nothing that serves (no stream, page work,
+    /// union member, readback or lander).
+    fn instance(&self, shape: Form) -> Self {
+        let Form {
+            config,
+            graphs,
+            layout,
+            slots,
+            sampler,
+            buckets,
+            speculation,
+            features,
+        } = shape;
+
+        Self {
+            model: Arc::clone(&self.model),
+            config,
+            graphs,
+            layout,
+            slots,
+            sampler,
+            cache: self.cache.clone(),
+            state: self.state.clone(),
+            page_work: None,
+            scratch: self.scratch.clone(),
+            paired: Cell::new(false),
+            buckets,
+            union: None,
+            regions: self.regions.clone(),
+            speculation,
+            stream: None,
+            features,
+            staged: Vec::new(),
+            readback: None,
+            launched: 0,
+            flights: VecDeque::new(),
+            lander: None,
+            prepared: None,
+            kept: None,
+        }
+    }
+
+    /// Exchanges the serving shape's fields with `shape`'s: the runner serves `shape` from its
+    /// next step on, and `shape` holds what served.
+    fn exchange(&mut self, shape: &mut Form) {
+        std::mem::swap(&mut self.config, &mut shape.config);
+        std::mem::swap(&mut self.graphs, &mut shape.graphs);
+        std::mem::swap(&mut self.layout, &mut shape.layout);
+        std::mem::swap(&mut self.slots, &mut shape.slots);
+        std::mem::swap(&mut self.sampler, &mut shape.sampler);
+        std::mem::swap(&mut self.buckets, &mut shape.buckets);
+        std::mem::swap(&mut self.speculation, &mut shape.speculation);
+        std::mem::swap(&mut self.features, &mut shape.features);
     }
 
     /// The head of input tensor `column`, as `shape`.
@@ -1356,6 +1627,7 @@ impl CausalLmRunner {
             refused,
             pending,
             proposals: proposals.len(),
+            candidates: self.config.candidates,
             started,
             launched,
         })
@@ -1372,6 +1644,7 @@ impl CausalLmRunner {
             refused,
             pending,
             proposals,
+            candidates,
             started,
             launched,
             ..
@@ -1396,7 +1669,6 @@ impl CausalLmRunner {
 
         let proposals = outputs.split_off(outputs.len().saturating_sub(proposals));
         let vocabulary = self.model.vocabulary();
-        let candidates = self.config.candidates;
 
         let mut calls = if verifies(bucket.variant) {
             output::verification_output(&batch.columns, &bucket, vocabulary, candidates, &outputs)?
@@ -1829,38 +2101,153 @@ impl Runner for CausalLmRunner {
     /// fixed addresses, are the runner's own beside its graphs and the instance's own for a
     /// rehearsal.
     fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
-        let speculation = match &self.speculation {
-            Some(speculation) if graphs.rehearses() => Some(Speculation {
-                kept: speculation.kept.alike(graphs.stream())?,
-                ..speculation.clone()
-            }),
-            other => other.clone(),
-        };
-
-        Ok(Box::new(Self {
-            model: Arc::clone(&self.model),
+        let speculation = instance_speculation(self.speculation.as_ref(), &graphs)?;
+        let shape = Form {
             config: self.config.clone(),
             graphs,
             layout: self.layout.clone(),
             slots: self.slots.shared(),
             sampler: self.sampler.clone(),
-            cache: self.cache.clone(),
-            state: self.state.clone(),
-            page_work: None,
-            scratch: self.scratch.clone(),
-            paired: Cell::new(false),
             buckets: self.buckets.clone(),
-            union: None,
-            regions: self.regions.clone(),
             speculation,
-            stream: None,
             features: self.features.clone(),
-            staged: Vec::new(),
-            readback: None,
-            launched: 0,
-            flights: VecDeque::new(),
-            lander: None,
+        };
+
+        Ok(Box::new(self.instance(shape)))
+    }
+
+    /// The forward of a shape of `options` over graphs that hold no device, for the profile run
+    /// that measures it before anything of it is allocated: its peak, its input values and its
+    /// kernels. Every shape of options the runner serves is measured so (module documentation,
+    /// "Shapes"), and so is one of options it serves now.
+    ///
+    /// # Errors
+    ///
+    /// As [`CausalLmRunner::shape`].
+    fn measure(&self, options: &GraphOptions) -> Result<Option<Measure>> {
+        let shape = self.shape(options, false, |inputs| {
+            self.graphs.measuring(self.graphs.kernels(), inputs)
+        })?;
+        let storage = self.shape_bytes(&shape)?;
+
+        Ok(Some(Measure {
+            storage,
+            instance: Box::new(self.instance(shape)),
         }))
+    }
+
+    /// Prepares the shape of `options` for generation `number`, whose kernels are `kernels`,
+    /// beside the serving one: its graphs over `region` (the runner's own when `None`) with an
+    /// input buffer of `values` bytes a slot ([`Graphs::over`]), and every storage of the shape
+    /// that differs from the serving one's allocated on the runner's device.
+    ///
+    /// # Errors
+    ///
+    /// As [`CausalLmRunner::shape`]; [`Error::State`] while another shape is prepared or kept.
+    fn reshape(
+        &mut self,
+        number: u64,
+        options: &GraphOptions,
+        kernels: Arc<ops::Generation>,
+        (region, values): (Option<platform::DeviceRange>, u64),
+    ) -> Result<bool> {
+        if self.prepared.is_some() || self.kept.is_some() {
+            return Err(Error::State(
+                "a runner prepares one shape at a time: a generation's shape is held",
+            ));
+        }
+
+        let shape = self.shape(options, true, |inputs| {
+            self.graphs.over(kernels, region, inputs, values)
+        })?;
+        self.prepared = Some((number, shape));
+        Ok(true)
+    }
+
+    fn reshaped(&self) -> Option<(u64, &Graphs)> {
+        self.prepared
+            .as_ref()
+            .map(|(number, shape)| (*number, &shape.graphs))
+    }
+
+    /// The forward of the prepared shape over `graphs`, as [`Runner::capturer`] makes the
+    /// serving shape's.
+    fn reshaped_capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        let Some((_, prepared)) = &self.prepared else {
+            return Err(Error::State("the runner prepares no shape"));
+        };
+        let speculation = instance_speculation(prepared.speculation.as_ref(), &graphs)?;
+        let shape = Form {
+            config: prepared.config.clone(),
+            graphs,
+            layout: prepared.layout.clone(),
+            slots: prepared.slots.shared(),
+            sampler: prepared.sampler.clone(),
+            buckets: prepared.buckets.clone(),
+            speculation,
+            features: prepared.features.clone(),
+        };
+
+        Ok(Box::new(self.instance(shape)))
+    }
+
+    fn switch_shape(&mut self, number: u64) -> Result<bool> {
+        let Some((prepared, mut shape)) = self.prepared.take() else {
+            return Ok(false);
+        };
+        if prepared != number {
+            self.prepared = Some((prepared, shape));
+            return Err(Error::Invariant(format!(
+                "generation {number} switches, and the runner prepared the shape of generation \
+                 {prepared}"
+            )));
+        }
+
+        shape.graphs.take_over(&self.graphs)?;
+        self.exchange(&mut shape);
+        self.kept = Some((number, shape));
+        Ok(true)
+    }
+
+    fn commit_shape(&mut self, number: u64) -> Result<bool> {
+        match self.kept.take() {
+            Some((kept, shape)) if kept == number => {
+                // The kept shape's graphs are released once the device passed their last replay.
+                shape.graphs.wait()?;
+                drop(shape);
+                Ok(true)
+            }
+            other => {
+                self.kept = other;
+                Ok(false)
+            }
+        }
+    }
+
+    fn rollback_shape(&mut self, number: u64) -> Result<bool> {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|(prepared, _)| *prepared == number)
+        {
+            self.prepared = None;
+            return Ok(false);
+        }
+
+        match self.kept.take() {
+            Some((kept, mut shape)) if kept == number => {
+                shape.graphs.take_over(&self.graphs)?;
+                self.exchange(&mut shape);
+                // The rolled-back shape's graphs are released once the device passed them.
+                shape.graphs.wait()?;
+                drop(shape);
+                Ok(true)
+            }
+            other => {
+                self.kept = other;
+                Ok(false)
+            }
+        }
     }
 
     /// Prepares the inputs of a step of `batch` over `tables`.
@@ -2139,6 +2526,22 @@ fn stated(config: &CausalLmConfig, model: &dyn TextModel) -> Result<(Buckets, La
     let layout = Layout::of(buckets.iter(), config.drafts, pages, history)?;
 
     Ok((buckets, layout))
+}
+
+/// What a forward instance over `graphs` holds of `speculation`, a runner's (`Runner::capturer`):
+/// the same, and for a rehearsal's graphs kept outputs of its own, so a rehearsal writes nothing
+/// a served step reads.
+fn instance_speculation(
+    speculation: Option<&Speculation>,
+    graphs: &Graphs,
+) -> Result<Option<Speculation>> {
+    match speculation {
+        Some(speculation) if graphs.rehearses() => Ok(Some(Speculation {
+            kept: speculation.kept.alike(graphs.stream())?,
+            ..speculation.clone()
+        })),
+        other => Ok(other.cloned()),
+    }
 }
 
 /// Whether a bucket of `variant` is a verification.

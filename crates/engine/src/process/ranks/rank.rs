@@ -130,6 +130,60 @@ pub(crate) struct ModelRunner {
     condition_rows: Option<u32>,
 }
 
+/// The bucket catalog every rank of a deployment of `config` captures under the sizes of
+/// `cuda_graph`, before a speculating deployment's drafts make its decode buckets verifications
+/// (`Buckets::with_drafts`): the sizes within the bounds a batch may reach, the requests in
+/// flight and the context a prefill chunk cannot exceed, since a bucket above either would be
+/// captured and never filled. What the epoch's ranks start with, and what a kernel generation of
+/// other sizes captures the ranks' graphs for.
+///
+/// # Errors
+///
+/// A configuration whose context length was not resolved, a stated token tier above the bound
+/// that admits it ([`tier_refusal`]), or sizes of which no bucket fits.
+pub(crate) fn catalog(
+    config: &proto::config::EngineConfig,
+    cuda_graph: &proto::config::CudaGraphConfig,
+) -> Result<Buckets> {
+    let rows: Option<Vec<u32>> = cuda_graph
+        .decode_batch_sizes
+        .as_ref()
+        .map(|sizes| sizes.iter().map(|size| size.get()).collect());
+    let tokens: Option<Vec<u32>> = cuda_graph
+        .prefill_token_sizes
+        .as_ref()
+        .map(|sizes| sizes.iter().map(|size| size.get()).collect());
+    let rows_bound = u32::try_from(config.max_running_requests.get())
+        .context("more request slots than the protocol addresses")?;
+    // The leader resolved the context length from the checkpoint before it launched this
+    // process; a configuration that states none was not resolved.
+    if config.model.max_model_len == 0 {
+        bail!("the engine configuration states no resolved `max_model_len`");
+    }
+    let tokens_bound = config.model.max_model_len;
+    // A stated token tier above the bound that admits it is refused here, before the
+    // catalogue is built and long before any weight is mapped; a stated decode tier above the
+    // request bound only sizes a batch. `tier_refusal` is where that asymmetry is stated and
+    // argued.
+    if let Some(sizes) = &tokens
+        && let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, tokens_bound)
+    {
+        bail!("{refusal}");
+    }
+
+    let buckets = Buckets::for_batch(
+        rows.as_deref(),
+        tokens.as_deref(),
+        rows_bound,
+        tokens_bound,
+        true,
+    )?;
+    if buckets.is_empty() {
+        bail!("the build config captures no graph bucket");
+    }
+    Ok(buckets)
+}
+
 /// The collective groups one kind of a deployment's parallel groups forms over the host group, and
 /// this rank's place among them.
 pub(crate) struct Collective {
@@ -164,48 +218,12 @@ impl ModelRunner {
             })?;
             devices.push(DeviceId(ordinal));
         }
-        let rows: Option<Vec<u32>> = build
-            .cuda_graph
-            .decode_batch_sizes
-            .as_ref()
-            .map(|sizes| sizes.iter().map(|size| size.get()).collect());
-        let tokens: Option<Vec<u32>> = build
-            .cuda_graph
-            .prefill_token_sizes
-            .as_ref()
-            .map(|sizes| sizes.iter().map(|size| size.get()).collect());
-        // The bounds a batch may reach: requests in flight, and the context a prefill chunk
-        // cannot exceed. A bucket above either would be captured and never filled.
-        let rows_bound = u32::try_from(build.max_running_requests.get())
-            .context("more request slots than the protocol addresses")?;
-        // The leader resolved the context length from the checkpoint before it launched this
-        // process; a configuration that states none was not resolved.
-        if build.model.max_model_len == 0 {
-            bail!("the engine configuration states no resolved `max_model_len`");
-        }
-        let tokens_bound = build.model.max_model_len;
-        // A stated token tier above the bound that admits it is refused here, before the
-        // catalogue is built and long before any weight is mapped; a stated decode tier above the
-        // request bound only sizes a batch. `tier_refusal` is where that asymmetry is stated and
-        // argued.
-        if let Some(sizes) = &tokens
-            && let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, tokens_bound)
-        {
-            bail!("{refusal}");
-        }
         // A speculating deployment's decode steps are verifications, each prefill and
         // verification followed by its drafter's bucket.
-        let buckets = Buckets::for_batch(
-            rows.as_deref(),
-            tokens.as_deref(),
-            rows_bound,
-            tokens_bound,
-            true,
-        )?
-        .with_drafts(build.speculative.num_draft_tokens);
-        if buckets.is_empty() {
-            bail!("the build config captures no graph bucket");
-        }
+        let buckets =
+            catalog(build, &build.cuda_graph)?.with_drafts(build.speculative.num_draft_tokens);
+        let rows_bound = u32::try_from(build.max_running_requests.get())
+            .context("more request slots than the protocol addresses")?;
         let mut runner = Self {
             family,
             launch: Arc::new(launch.clone()),

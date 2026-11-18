@@ -178,6 +178,10 @@ pub enum Message {
     RollbackPolicy(Sender<Result<(), Error>>),
     /// Drop the policy kept for rollback.
     CommitPolicy,
+    /// Form every batch from the next step on within what a kernel generation's graphs capture
+    /// (`GraphLimits`): the generation of other graph options that switches, or the one a
+    /// rollback serves again. The reply is sent once the scheduler took them.
+    SetGraphs(Arc<GraphLimits>, Sender<()>),
     /// Evict every cached block the scheduler knows of; the requests it holds keep theirs. The
     /// reply is sent once the evictions are submitted.
     Flush(Sender<()>),
@@ -226,6 +230,22 @@ pub enum Output {
     Handoff(RequestId, scheduling::kv::Handoff),
     /// The scheduler stopped.
     Failed(Error),
+}
+
+/// What a kernel generation's graphs bound a scheduler's steps to (`Message::SetGraphs`): the
+/// configuration a scheduler resolves against its groups, of the generation's batched tokens,
+/// drafts and graph tiers ([`SchedulerConfig::of`]); each group's captured shapes under the
+/// generation, by the group's number; and the candidates a request may ask for at a position.
+/// A generation of other graph options switches every scheduler to its own, and a rollback to
+/// the one the kept generation captured.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphLimits {
+    /// The scheduler configuration before it is lowered to the groups ([`resolved`]).
+    pub config: SchedulerConfig,
+    /// The shapes each group's workers captured, which replace its capacity's.
+    pub buckets: Vec<(GroupId, Vec<crate::batch::Shape>)>,
+    /// The most likely tokens a request may ask for at a position (`max_logprobs`).
+    pub max_logprobs: u32,
 }
 
 /// What one step may assemble (`specs/configuration.md` §7, step values): the step values of the
@@ -302,6 +322,9 @@ impl Budget {
 /// which is how the layout of a group and a class names it too.
 pub struct Scheduler {
     config: SchedulerConfig,
+    /// The configuration `config` was resolved from against the groups ([`resolved`]), which a
+    /// kernel generation's graphs replace ([`Scheduler::set_graphs`]).
+    stated: SchedulerConfig,
     /// The engine's current step values, which every scheduler of the engine shares and the
     /// control thread replaces when a change of them arrives (`Tune`).
     tuning: Arc<ArcSwap<Tuning>>,
@@ -573,6 +596,7 @@ impl Scheduler {
                 .ok_or_else(|| Error::Storage(format!("the session states no group {}", id.0)))?;
             workers.push(WorkerGroup::new(config, capacity, group.clone())?);
         }
+        let given = config.clone();
         let config = resolved(config, &workers)?;
 
         // A scheduler that holds no request and knows no cached block yet is told its groups.
@@ -628,6 +652,7 @@ impl Scheduler {
         };
         let mut scheduler = Self {
             config,
+            stated: given,
             tuning,
             budget,
             ceilings: bounds,
@@ -956,6 +981,10 @@ impl Scheduler {
                 let _ = reply.send(self.policy.rollback(snapshot));
             }
             Message::CommitPolicy => self.policy.commit(),
+            Message::SetGraphs(limits, reply) => {
+                self.set_graphs(&limits);
+                let _ = reply.send(());
+            }
             Message::Flush(reply) => {
                 self.flush();
                 let _ = reply.send(());
@@ -964,6 +993,55 @@ impl Scheduler {
             Message::Bound(region, units, reply) => self.bound(region, units, reply),
             Message::Demote(region, units, reply) => self.demote(region, units, reply),
             Message::Shutdown => self.shutdown(),
+        }
+    }
+
+    /// Forms every batch from the next step on within `limits`, a kernel generation's graphs:
+    /// each group the limits name captured their shapes, which bound its batches' rows and its
+    /// call window; the scheduler's configuration is `limits`' lowered to the groups again, so
+    /// the step's tokens and calls and the graph tiers are the generation's, and so are the
+    /// drafts of a verification, which no request held here exceeds from now on; the ceilings
+    /// follow the shapes; and a request may ask for the generation's candidates at a position.
+    /// A configuration the groups refuse leaves the one that served, which the generation's
+    /// preparation checked.
+    fn set_graphs(&mut self, limits: &GraphLimits) {
+        for group in &mut self.groups {
+            let Some((_, buckets)) = limits.buckets.iter().find(|(id, _)| *id == group.layout.id)
+            else {
+                continue;
+            };
+            group.capacity.buckets.clone_from(buckets);
+            let calls = buckets.iter().map(|shape| shape.rows).max();
+            let window = crate::memory::division::call_window(
+                group.config.queue_depth,
+                calls.unwrap_or(1).max(1) as usize,
+            );
+            if let Ok(window) = window {
+                group.capacity.call_window = u32::try_from(window).unwrap_or(u32::MAX);
+            }
+        }
+
+        let mut stated = limits.config.clone();
+        stated.report_period = self.config.report_period;
+        match resolved(stated.clone(), &self.groups) {
+            Ok(config) => {
+                self.stated = stated;
+                self.config = config;
+            }
+            Err(error) => {
+                tracing::error!(%error, "a generation's graphs give no configuration");
+            }
+        }
+        self.ceilings = ceilings(
+            self.groups.iter().map(|group| &group.capacity),
+            &self.config.policy_budget,
+        );
+        self.limits.max_logprobs = limits.max_logprobs;
+
+        // A verification carries at most the generation's drafts, which its graphs hold.
+        let drafts = u32::try_from(self.config.draft_tokens).unwrap_or(u32::MAX);
+        for request in self.requests.values_mut() {
+            request.draft_limit = request.draft_limit.min(drafts);
         }
     }
 

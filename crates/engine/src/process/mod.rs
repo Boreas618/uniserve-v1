@@ -44,6 +44,7 @@ mod operations;
 pub(crate) mod ranks;
 mod reports;
 mod requests;
+mod shapes;
 mod start;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -107,6 +108,23 @@ pub(crate) enum Input {
 /// The `Done` of a job that applies `apply`.
 fn done(apply: impl FnOnce(&mut MainProcess) + Send + 'static) -> Input {
     Input::Done(Box::new(apply))
+}
+
+/// A prepared generation's graph options where they differ from the serving ones, with the
+/// bounds they hold the engine to ([`shapes::Bounds`]).
+struct Shaped {
+    options: proto::config::GraphOptions,
+    bounds: shapes::Bounds,
+}
+
+/// What a preparation made ready: the generation's packages (the kernels' and, under
+/// [`policy_slot`], the policy's), its policy module and arguments, and its graph options where
+/// they differ from the serving ones.
+struct Prepared {
+    packages: Packages,
+    module: Arc<wasmtime::Module>,
+    parameters: Parameters,
+    shaped: Option<Shaped>,
 }
 
 /// The slot the scheduling policy's package is kept under in the packages a generation is made
@@ -326,12 +344,16 @@ pub(crate) struct MainProcess {
     lifecycle: Lifecycle,
     update: Update,
     /// The generation that executes, and its packages (the kernels' and, under
-    /// [`policy_slot`], the policy's); the packages a trial keeps; and a prepared generation's
-    /// packages with its policy module and arguments.
+    /// [`policy_slot`], the policy's); the packages a trial keeps; and what a preparation made
+    /// ready.
     generation: u64,
     serving: Packages,
     kept: Option<Packages>,
-    prepared: Option<(Packages, Arc<wasmtime::Module>, Parameters)>,
+    prepared: Option<Prepared>,
+    /// The graph options the executing generation's graphs are captured for, and those a trial
+    /// of a generation of other options keeps, with the bounds they held the engine to.
+    options: proto::config::GraphOptions,
+    kept_options: Option<(proto::config::GraphOptions, shapes::Bounds)>,
     /// Whether the KV cache gave segments back for the graphs of the generation update in
     /// flight, which it grows back into once the update ends.
     update_yielded: Arc<std::sync::atomic::AtomicBool>,
@@ -410,6 +432,7 @@ impl MainProcess {
         // (`started`).
         let serving = Packages::from([(policy_slot(), launch.modules.policy.clone())]);
         let report_period = launch.engine_config.worker.report_period;
+        let options = launch.engine_config.graph_options();
         Ok(Self {
             inbox,
             fronts: vec![Some(front)],
@@ -424,6 +447,8 @@ impl MainProcess {
             serving,
             kept: None,
             prepared: None,
+            options,
+            kept_options: None,
             update_yielded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine: None,
             streams: HashMap::new(),
@@ -893,7 +918,8 @@ impl MainProcess {
     /// `Prepare`: the next generation is made ready beside the one that executes, on a thread
     /// of its own: its kernels selected, installed and prepared on every worker, its policy
     /// instantiated once against the ceilings, and, when a kernel package changed, a shadow pass
-    /// of every scheduler.
+    /// of every scheduler. A generation of other graph options prepares every runner's shape
+    /// under them, and the bounds they hold the engine to.
     fn prepare(&mut self, prepare: proto::process::Prepare) {
         let generation = match lifecycle::prepare(self.lifecycle, &mut self.update, self.generation)
         {
@@ -911,6 +937,13 @@ impl MainProcess {
                 .map(|modules| modules.patterns.clone());
             markers.place_classes(generation, classes);
         }
+        let shaped = match self.shaped(prepare.graphs.clone()) {
+            Ok(shaped) => shaped,
+            Err(reason) => {
+                lifecycle::prepare_ended(&mut self.update, generation);
+                return self.report(lifecycle::prepare_failed(reason));
+            }
+        };
         let parts = match generation::named(prepare) {
             Ok((packages, policy)) => self
                 .engine
@@ -944,11 +977,18 @@ impl MainProcess {
         let parts = self.segment_parts().ok();
         let yielded = Arc::clone(&self.update_yielded);
         let room_workers = workers.clone();
-        let room = move |operators: &BTreeSet<String>| -> Result<()> {
+        let options = shaped.as_ref().map(|(options, _)| options.clone());
+        let stated = options.as_ref().map(|options| options.stated.clone());
+        let room = move |operators: &BTreeSet<String>, shapes: &generation::Shapes| -> Result<()> {
             let Some((schedulers, head, binding)) = &parts else {
                 return Ok(());
             };
-            let rooms = generation::update_room(&room_workers, binding, operators)?;
+            let rooms = generation::update_room(
+                &room_workers,
+                binding,
+                operators,
+                (shapes, stated.as_ref()),
+            )?;
             let lacking: BTreeMap<[u8; 16], u64> = rooms
                 .iter()
                 .filter(|room| room.kv_units > 0)
@@ -962,35 +1002,145 @@ impl MainProcess {
             yielded.store(true, std::sync::atomic::Ordering::Release);
             operations::make_room(schedulers, head, binding, 0, &lacking, true)
         };
+        let shaped = shaped.map(|(options, bounds)| Shaped {
+            options: options.stated,
+            bounds,
+        });
+        // A generation that switches CUPTI's PC sampling captures every graph under the mode
+        // it serves in, which the devices take before its captures and give back with it.
+        let sampling = options
+            .as_ref()
+            .filter(|options| options.recapture)
+            .map(|options| {
+                let devices: Vec<platform::DeviceId> = workers
+                    .iter()
+                    .filter_map(|worker| worker.device())
+                    .collect();
+                (
+                    options.stated.graph_pc_sampling,
+                    devices,
+                    Arc::clone(&engine.counters),
+                    Arc::clone(&engine.streams),
+                )
+            });
         self.work(Box::new(move || {
-            let prepared =
-                generation::kernels(&workers, &build, (&named, &serving), generation, &room)
-                    .and_then(|kernels| {
-                        let (module, parameters) =
-                            generation::policy(&build.0, &policy, (&ceilings, &budget))?;
-                        // Only an operator whose package changed has an old kernel to compare with.
-                        // Every peer prepares the generation from its own daemon's command.
-                        let changed = changed_operators(&kernels, &serving);
-                        let uncompared = generation::compare(
-                            &shadows, &workers, &binding, generation, &changed, bound,
-                        )?;
-                        let mut packages = kernels;
-                        packages.insert(policy_slot(), policy);
-                        Ok(((packages, module, parameters), uncompared))
-                    });
+            if let Some((on, devices, counters, streams)) = &sampling {
+                let profiled = workers.iter().any(|worker| worker.profiled());
+                let switched = match profiled {
+                    true => Err(anyhow::anyhow!(
+                        "a profiling session records a device, whose collectors were chosen \
+                         against CUPTI's mode: end it before profiling_config.graph_pc_sampling \
+                         changes"
+                    )),
+                    false => {
+                        crate::profiling::pc_sampling::switch(devices, *on, (counters, streams))
+                            .map_err(anyhow::Error::from)
+                    }
+                };
+                if let Err(error) = switched {
+                    return done(move |main| main.prepared(generation, Err(error)));
+                }
+            }
+            let prepared = generation::kernels(
+                &workers,
+                &build,
+                (&named, &serving),
+                (generation, options.as_ref()),
+                &binding,
+                &room,
+            )
+            .and_then(|kernels| {
+                let (module, parameters) =
+                    generation::policy(&build.0, &policy, (&ceilings, &budget))?;
+                // Only an operator whose package changed has an old kernel to compare with.
+                // Every peer prepares the generation from its own daemon's command.
+                let changed = changed_operators(&kernels, &serving);
+                let uncompared =
+                    generation::compare(&shadows, &workers, &binding, generation, &changed, bound)?;
+                let mut packages = kernels;
+                packages.insert(policy_slot(), policy);
+                let prepared = Prepared {
+                    packages,
+                    module,
+                    parameters,
+                    shaped,
+                };
+                Ok((prepared, uncompared))
+            });
+            if let (Err(_), Some((on, devices, counters, streams))) = (&prepared, &sampling) {
+                let back = crate::profiling::pc_sampling::switch(devices, !on, (counters, streams));
+                if let Err(error) = back {
+                    tracing::warn!(%error, "CUPTI's PC sampling was not switched back");
+                }
+            }
             done(move |main| main.prepared(generation, prepared))
         }));
     }
 
-    #[expect(
-        clippy::type_complexity,
-        reason = "the result of one preparation, as its job returns it"
-    )]
-    fn prepared(
-        &mut self,
-        generation: u64,
-        prepared: Result<((Packages, Arc<wasmtime::Module>, Parameters), Vec<String>)>,
-    ) {
+    /// The graph options `stated`, a `Prepare`'s, where they differ from the serving ones: as
+    /// this process's runners take them, and with the bounds they hold the engine to. `None`
+    /// for a generation of the serving options, and for one that states none.
+    ///
+    /// # Errors
+    ///
+    /// Options of a catalog of a size of zero, options the engine does not serve in place
+    /// (`shapes::checked_options`), or an engine that has not started.
+    fn shaped(
+        &self,
+        stated: Option<proto::process::GraphOptions>,
+    ) -> std::result::Result<Option<(generation::Options, shapes::Bounds)>, String> {
+        let Some(stated) = stated else {
+            return Ok(None);
+        };
+        let stated = proto::config::GraphOptions::try_from(stated)
+            .map_err(|error| format!("the generation's graph options: {error}"))?;
+        if stated == self.options {
+            return Ok(None);
+        }
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| format!("{:#}", starting()))?;
+        let config = &self.launch.engine_config;
+        let runners = shapes::checked_options(config, &self.options, &stated)
+            .map_err(|error| format!("the generation's graph options: {error:#}"))?;
+        let bounds = engine.bounds().under(config, &runners, stated.max_logprobs);
+        let recapture = stated.graph_pc_sampling != self.options.graph_pc_sampling;
+        Ok(Some((
+            generation::Options {
+                stated,
+                runners,
+                recapture,
+            },
+            bounds,
+        )))
+    }
+
+    /// Switches CUPTI's PC sampling of this process's devices' graphs to `on` on the operations
+    /// thread, for a generation given back whose graphs were captured under the other mode
+    /// (`crate::profiling::pc_sampling::switch`).
+    fn sample_graphs(&mut self, on: bool) {
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let devices: Vec<platform::DeviceId> = engine
+            .workers
+            .iter()
+            .filter_map(|worker| worker.device())
+            .collect();
+        let (counters, streams) = (Arc::clone(&engine.counters), Arc::clone(&engine.streams));
+        self.serial(Box::new(move || {
+            let switched =
+                crate::profiling::pc_sampling::switch(&devices, on, (&counters, &streams));
+            done(move |_| {
+                if let Err(error) = switched {
+                    tracing::warn!(%error, on, "CUPTI's PC sampling was not switched back");
+                }
+            })
+        }));
+    }
+
+    fn prepared(&mut self, generation: u64, prepared: Result<(Prepared, Vec<String>)>) {
         // A peer's preparation is what the scheduler node's waits for before its shadow pass.
         if let Some(told) = self
             .engine
@@ -1026,22 +1176,31 @@ impl MainProcess {
         }
     }
 
-    /// Discards `generation`, prepared or being prepared, on the operations thread.
+    /// Discards `generation`, prepared or being prepared, on the operations thread. A prepared
+    /// generation that switched CUPTI's PC sampling switches it back.
     fn discard(&mut self, generation: u64) {
-        self.prepared = None;
+        let switched = self
+            .prepared
+            .take()
+            .and_then(|prepared| prepared.shaped)
+            .filter(|shaped| shaped.options.graph_pc_sampling != self.options.graph_pc_sampling);
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
         let shadows = engine.shadows();
         let workers = engine.workers.clone();
+        let binding = Arc::clone(&engine.binding);
         self.serial(Box::new(move || {
-            let discarded = generation::discard(&shadows, &workers, generation);
+            let discarded = generation::discard(&shadows, &workers, &binding, generation);
             done(move |_| {
                 if let Err(error) = discarded {
                     tracing::warn!(generation, %error, "a discarded generation was not released");
                 }
             })
         }));
+        if switched.is_some() {
+            self.sample_graphs(self.options.graph_pc_sampling);
+        }
     }
 
     /// `Switch`: the prepared generation's policy executes from one batch boundary of every
@@ -1052,9 +1211,7 @@ impl MainProcess {
         if let Err(report) = lifecycle::switch(self.lifecycle, &mut self.update, generation) {
             return self.report(report);
         }
-        let (Some(engine), Some((packages, module, parameters))) =
-            (self.engine.as_ref(), self.prepared.take())
-        else {
+        let (Some(engine), Some(prepared)) = (self.engine.as_ref(), self.prepared.take()) else {
             lifecycle::switch_failed(&mut self.update, generation);
             let reason = format!("generation {generation} holds nothing prepared to switch to");
             return self.report(lifecycle::prepare_failed(reason));
@@ -1062,15 +1219,27 @@ impl MainProcess {
 
         // A peer's ranks switch between the scheduler node's batches, on its frame: its own
         // daemon's command is acknowledged at once.
+        let Prepared {
+            packages,
+            module,
+            parameters,
+            shaped,
+        } = prepared;
         let policy = (module, parameters);
         if engine.upstream.is_some() {
-            return self.switched(generation, packages, Ok(()));
+            return self.switched(generation, (packages, shaped), Ok(()));
         }
         let schedulers = engine.inboxes();
         let route = engine.groups.clone();
         let binding = Arc::clone(&engine.binding);
         let served = Arc::clone(&engine.served);
         let workers = engine.workers.clone();
+        let limits = shaped.as_ref().map(|shaped| {
+            (
+                Arc::clone(&shaped.bounds.scheduling),
+                Arc::clone(&engine.graphs),
+            )
+        });
         self.serial(Box::new(move || {
             let switched = generation::switch(
                 &schedulers,
@@ -1080,12 +1249,18 @@ impl MainProcess {
                 &served,
                 generation,
                 &policy,
+                limits.as_ref().map(|(next, kept)| (next, kept)),
             );
-            done(move |main| main.switched(generation, packages, switched))
+            done(move |main| main.switched(generation, (packages, shaped), switched))
         }));
     }
 
-    fn switched(&mut self, generation: u64, packages: Packages, switched: Result<()>) {
+    fn switched(
+        &mut self,
+        generation: u64,
+        (packages, shaped): (Packages, Option<Shaped>),
+        switched: Result<()>,
+    ) {
         if let Err(error) = switched {
             if lifecycle::switch_failed(&mut self.update, generation) {
                 let reason = format!("the switch to generation {generation} failed: {error:#}");
@@ -1096,6 +1271,17 @@ impl MainProcess {
 
         self.kept = Some(std::mem::replace(&mut self.serving, packages));
         self.generation = generation;
+        // The engine holds its requests to the generation's graphs from its switch on, and
+        // states them to its daemons.
+        if let (Some(shaped), Some(engine)) = (shaped, self.engine.as_mut()) {
+            let kept = (
+                std::mem::replace(&mut self.options, shaped.options),
+                engine.bounds(),
+            );
+            engine.set_bounds(shaped.bounds);
+            self.kept_options = Some(kept);
+            self.announce(true);
+        }
         self.report(lifecycle::report(proto::process::report::Kind::Switched(
             proto::process::Switched { generation },
         )));
@@ -1111,15 +1297,27 @@ impl MainProcess {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
-        // A peer's ranks commit on the scheduler node's frame.
+        // A peer's ranks commit on the scheduler node's frame, which switched them before the
+        // trial began: the regions the generation replaced on its devices are given back.
+        let binding = Arc::clone(&engine.binding);
         if engine.upstream.is_some() {
-            return self.committed(generation, Ok(()));
+            return self.serial(Box::new(move || {
+                let committed = binding
+                    .commit_regions(generation)
+                    .map_err(anyhow::Error::from);
+                done(move |main| main.committed(generation, committed))
+            }));
         }
         let schedulers = engine.inboxes();
         let route = engine.groups.clone();
         let workers = engine.workers.clone();
         self.serial(Box::new(move || {
-            let committed = generation::commit(&schedulers, route.as_deref(), &workers, generation);
+            let committed = generation::commit(
+                &schedulers,
+                route.as_deref(),
+                (&workers, &binding),
+                generation,
+            );
             done(move |main| main.committed(generation, committed))
         }));
     }
@@ -1133,6 +1331,7 @@ impl MainProcess {
             );
         }
         self.kept = None;
+        self.kept_options = None;
         self.grow_after_update();
         self.report(lifecycle::committed());
     }
@@ -1150,7 +1349,9 @@ impl MainProcess {
         // The trial kept the generation before it: generations are numbered one past the one
         // that executed when each was prepared.
         let kept = generation - 1;
-        // A peer's ranks roll back between the scheduler node's batches, on its frame.
+        // A peer's ranks roll back between the scheduler node's batches, on its frame; the
+        // regions the generation mapped on its devices are given back at its next preparation,
+        // once those ranks no longer address them.
         if engine.upstream.is_some() {
             return self.rolled_back(kept, reason, Ok(()));
         }
@@ -1158,14 +1359,18 @@ impl MainProcess {
         let route = engine.groups.clone();
         let binding = Arc::clone(&engine.binding);
         let served = Arc::clone(&engine.served);
+        let limits = self
+            .kept_options
+            .as_ref()
+            .map(|(_, bounds)| Arc::clone(&bounds.scheduling));
         self.serial(Box::new(move || {
             let rolled = generation::rollback(
                 &schedulers,
                 route.as_deref(),
                 &binding,
                 &served,
-                generation,
-                kept,
+                (generation, kept),
+                limits.as_ref(),
             );
             done(move |main| main.rolled_back(kept, reason, rolled))
         }));
@@ -1210,6 +1415,17 @@ impl MainProcess {
         if let Some(packages) = self.kept.take() {
             self.serving = packages;
             self.generation = kept;
+        }
+        if let (Some((options, bounds)), Some(engine)) =
+            (self.kept_options.take(), self.engine.as_mut())
+        {
+            let sampled = options.graph_pc_sampling != self.options.graph_pc_sampling;
+            self.options = options;
+            engine.set_bounds(bounds);
+            self.announce(true);
+            if sampled {
+                self.sample_graphs(self.options.graph_pc_sampling);
+            }
         }
         self.grow_after_update();
         self.report(lifecycle::rolled_back(reason));
@@ -1594,20 +1810,48 @@ impl MainProcess {
         let binding = Arc::clone(&engine.binding);
         let serving = kernels_of(&self.serving);
         let (id, recapture) = (measure.id, measure.recapture);
+        let stated = measure
+            .graphs
+            .map(proto::config::GraphOptions::try_from)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("the generation's graph options: {error}"));
+        let options = stated.and_then(|stated| match stated {
+            Some(stated) if stated != self.options => {
+                let runners =
+                    shapes::checked_options(&self.launch.engine_config, &self.options, &stated)?;
+                let recapture = stated.graph_pc_sampling != self.options.graph_pc_sampling;
+                Ok(Some(generation::Options {
+                    stated,
+                    runners,
+                    recapture,
+                }))
+            }
+            _ => Ok(None),
+        });
+        let options = match options {
+            Ok(options) => options,
+            Err(error) => return self.operated(front, id, Err(error)),
+        };
         self.work(Box::new(move || {
-            let rooms = generation::room(&workers, &build, (&named, &serving), &binding, recapture)
-                .map(|rooms| {
-                    let devices = rooms
-                        .into_iter()
-                        .map(|room| wire::DeviceRoom {
-                            gpu: room.gpu.to_vec(),
-                            extra: room.extra,
-                            room: room.room,
-                            kv_units: room.kv_units,
-                        })
-                        .collect();
-                    Some(wire::operated::Reports::Rooms(wire::Rooms { devices }))
-                });
+            let rooms = generation::room(
+                &workers,
+                &build,
+                (&named, &serving),
+                &binding,
+                (recapture, options.as_ref()),
+            )
+            .map(|rooms| {
+                let devices = rooms
+                    .into_iter()
+                    .map(|room| wire::DeviceRoom {
+                        gpu: room.gpu.to_vec(),
+                        extra: room.extra,
+                        room: room.room,
+                        kv_units: room.kv_units,
+                    })
+                    .collect();
+                Some(wire::operated::Reports::Rooms(wire::Rooms { devices }))
+            });
             done(move |main| main.operated(front, id, rooms))
         }));
     }

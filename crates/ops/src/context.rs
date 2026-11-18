@@ -215,6 +215,52 @@ impl Context {
         })
     }
 
+    /// A launching context over another region in this one's place: the same GPU, stream,
+    /// kernels, groups, axes, expert exchange and expert load, and an allocator of its own over
+    /// `region`. It is what a runner's forwards compute under once their input tensors and their
+    /// allocations are laid out otherwise (a kernel generation that captures its graphs for other
+    /// buckets, candidates or drafts): its forwards and this one's issue on one stream through
+    /// the same communicators, so the runner runs them in turn, never at once. It holds no
+    /// route, break taker, profiler or input buffer, and setting one on either context leaves
+    /// the other's as it is.
+    ///
+    /// The caller keeps `region` mapped for as long as any tensor of the context, or any graph
+    /// captured under it, is in use.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a meta context or a rehearsal.
+    pub fn over(&self, region: DeviceRange) -> Result<Self> {
+        let device = match &self.device {
+            Some(device) if !self.rehearsal => device.clone(),
+            _ => {
+                return Err(Error::Unsupported {
+                    operation: "a context over another region",
+                    reason: "only a launching context that is no rehearsal has one".to_owned(),
+                });
+            }
+        };
+
+        let state = {
+            let held = self.state();
+            let mut state = State::new(held.kernels.clone());
+            state.group = held.group.clone();
+            state.split = held.split;
+            state.axes = held.axes.clone();
+            state.exchange = held.exchange;
+            state.meet = held.meet.clone();
+            state.load = held.load.clone();
+            state
+        };
+
+        Ok(Self {
+            device: Some(device),
+            allocator: Arc::new(allocator(region)),
+            state: Arc::new(Mutex::new(state)),
+            rehearsal: false,
+        })
+    }
+
     /// A rehearsal of this launching context: the same GPU, kernels and splits, launching on
     /// `stream` and allocating in `region`, with no group, no expert exchange and no expert load,
     /// so its idle forwards count no route. Its collectives check their buffers against the split

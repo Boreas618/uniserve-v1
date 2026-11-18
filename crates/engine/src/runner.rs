@@ -172,6 +172,33 @@ pub trait Forward: Send {
     fn graphs(&self) -> &Graphs;
 }
 
+/// The options a kernel generation captures a causal runner's graphs for: the deployment's
+/// bucket catalog (`cuda_graph_config`, with the bounds of the deployment's batches), the
+/// candidates a scored row reports (`max_logprobs`) and the drafts a verification holds at most
+/// (`speculative_config.num_draft_tokens`). A runner's shape follows from them
+/// ([`Runner::reshape`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphOptions {
+    /// The catalog of a rank outside an expert union, before the drafts make its decode buckets
+    /// verifications (`Buckets::for_batch`).
+    pub buckets: buckets::Buckets,
+    /// The most likely tokens a scored row reports beside its own.
+    pub candidates: u32,
+    /// The drafts a verification holds at most; zero for a runner that speculates nothing.
+    pub drafts: u32,
+}
+
+/// A runner's shape under a generation's options, measured before anything of it is made
+/// ([`Runner::measure`]).
+pub struct Measure {
+    /// The shape's forward over graphs that hold no device, whose profile run states the
+    /// shape's kernels, its region's peak and its input values ([`Graphs::profile_run`]).
+    pub instance: Box<dyn Forward>,
+    /// The device bytes the shape allocates beside its region and its graphs: what it does not
+    /// share of the serving shape's storage.
+    pub storage: u64,
+}
+
 /// One stage a rank holds, as the worker and [`Graphs`] drive it.
 pub trait Runner: Forward {
     /// The phases this runner serves, as the scheduler names them in a batch.
@@ -195,6 +222,96 @@ pub trait Runner: Forward {
     ///
     /// What allocating the instance's own tensors fails with.
     fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>>;
+
+    /// The forward of the runner's shape under `options` over graphs that hold no device, and
+    /// the device bytes the shape allocates beside its region: what a kernel generation of those
+    /// options measures by a profile run of the forward ([`Graphs::profile_run`]) before anything
+    /// of it is made (`Runner::reshape`). `None` for a runner whose computation no option of a
+    /// generation shapes: it takes a generation's kernels in its graphs as they are.
+    ///
+    /// # Errors
+    ///
+    /// Options the runner cannot serve in place. The default measures nothing.
+    fn measure(&self, options: &GraphOptions) -> Result<Option<Measure>> {
+        let _ = options;
+        Ok(None)
+    }
+
+    /// Prepares the runner's shape under `options` for kernel generation `number`, whose
+    /// kernels are `kernels`, beside the serving shape: its graphs over the given region (the
+    /// runner's own for `None`) with input slots of the given value bytes
+    /// ([`Graphs::over`]), and what else of it differs, allocated. Every bucket of the shape is
+    /// then captured for its graphs ([`Runner::reshaped`], [`Runner::reshaped_capturer`]).
+    /// Returns whether the runner prepared a shape: `false` for one whose computation no option
+    /// shapes, which takes the generation in its graphs ([`Graphs::prepare`]).
+    ///
+    /// # Errors
+    ///
+    /// Options the runner cannot serve in place, another shape held, or an allocation refused.
+    /// The default prepares nothing.
+    fn reshape(
+        &mut self,
+        number: u64,
+        options: &GraphOptions,
+        kernels: std::sync::Arc<ops::Generation>,
+        region: (Option<platform::DeviceRange>, u64),
+    ) -> Result<bool> {
+        let _ = (number, options, kernels, region);
+        Ok(false)
+    }
+
+    /// The number of the generation whose shape [`Runner::reshape`] prepared, and the shape's
+    /// graphs, which its captures are installed in; `None` while none is prepared.
+    fn reshaped(&self) -> Option<(u64, &Graphs)> {
+        None
+    }
+
+    /// A forward instance of the prepared shape over `graphs`, as [`Runner::capturer`] makes the
+    /// serving shape's: over graphs beside the shape's ([`Graphs::beside`]) or a rehearsal's.
+    ///
+    /// # Errors
+    ///
+    /// No shape prepared, or what allocating the instance's own tensors fails with.
+    fn reshaped_capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        let _ = graphs;
+        Err(crate::worker::Error::State("the runner prepares no shape"))
+    }
+
+    /// Switches to the shape generation `number` prepared, whole: the runner serves it from its
+    /// next step on, its graphs counting what the serving graphs counted
+    /// ([`Graphs::take_over`]), and keeps the shape that served until the generation commits or
+    /// rolls back. Returns whether it switched: `false` for a runner that prepared no shape.
+    ///
+    /// # Errors
+    ///
+    /// A shape prepared for another generation, or a device that cannot be waited for.
+    fn switch_shape(&mut self, number: u64) -> Result<bool> {
+        let _ = number;
+        Ok(false)
+    }
+
+    /// Releases the shape the switch to generation `number` kept, once the device passed its
+    /// last replay. Returns whether the runner kept one.
+    ///
+    /// # Errors
+    ///
+    /// A device that cannot be waited for.
+    fn commit_shape(&mut self, number: u64) -> Result<bool> {
+        let _ = number;
+        Ok(false)
+    }
+
+    /// Gives back the shape of generation `number`: one prepared and never switched to is
+    /// released, and after a switch to it the kept shape serves again from the next step on and
+    /// the generation's is released. Returns whether the kept shape serves again.
+    ///
+    /// # Errors
+    ///
+    /// A device that cannot be waited for.
+    fn rollback_shape(&mut self, number: u64) -> Result<bool> {
+        let _ = number;
+        Ok(false)
+    }
 
     /// Chooses the smallest bucket that holds `batch`, fills the input tensors from the batch's
     /// columns, with every address of a request's memory taken from `tables`, and writes the

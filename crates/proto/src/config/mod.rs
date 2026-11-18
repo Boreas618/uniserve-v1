@@ -1021,6 +1021,122 @@ impl CudaGraphConfig {
     }
 }
 
+/// The options a kernel generation captures the engines' CUDA graphs for: the bucket catalog
+/// (`cuda_graph_config`), the candidates every sampling graph computes for a scored row
+/// (`max_logprobs`), the drafts a verification holds at most
+/// (`speculative_config.num_draft_tokens`), and whether CUPTI samples the program counters of
+/// the graphs, which it attributes only in graphs captured while it samples
+/// (`profiling_config.graph_pc_sampling`). A generation whose options differ from the serving
+/// one's captures every graph again, for the shapes they give the engines' runners
+/// ([`EngineConfig::graph_options`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphOptions {
+    pub cuda_graph: CudaGraphConfig,
+    pub max_logprobs: u32,
+    pub num_draft_tokens: u32,
+    pub graph_pc_sampling: bool,
+}
+
+/// The sizes of a wire catalog: `sizes` when `stated`, every one nonzero, and the worker's own
+/// catalog otherwise.
+fn stated_sizes(
+    sizes: Vec<u32>,
+    stated: bool,
+    what: &str,
+) -> Result<Option<Vec<NonZeroU32>>, String> {
+    if !stated {
+        return Ok(None);
+    }
+    sizes
+        .into_iter()
+        .map(|size| NonZeroU32::new(size).ok_or_else(|| format!("a {what} of zero")))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// The wire catalog of `sizes`: the sizes, and whether the catalog states them.
+fn wire_sizes(sizes: Option<&Vec<NonZeroU32>>) -> (Vec<u32>, bool) {
+    match sizes {
+        Some(sizes) => (sizes.iter().map(|size| size.get()).collect(), true),
+        None => (Vec::new(), false),
+    }
+}
+
+impl From<&GraphOptions> for crate::process::GraphOptions {
+    fn from(options: &GraphOptions) -> Self {
+        let (decode_batch_sizes, decode_stated) =
+            wire_sizes(options.cuda_graph.decode_batch_sizes.as_ref());
+        let (prefill_token_sizes, prefill_stated) =
+            wire_sizes(options.cuda_graph.prefill_token_sizes.as_ref());
+        Self {
+            decode_batch_sizes,
+            decode_stated,
+            prefill_token_sizes,
+            prefill_stated,
+            max_logprobs: options.max_logprobs,
+            num_draft_tokens: options.num_draft_tokens,
+            graph_pc_sampling: options.graph_pc_sampling,
+        }
+    }
+}
+
+impl TryFrom<crate::process::GraphOptions> for GraphOptions {
+    type Error = String;
+
+    /// The options a `Prepare` states; a catalog of a size of zero is refused.
+    fn try_from(wire: crate::process::GraphOptions) -> Result<Self, String> {
+        Ok(Self {
+            cuda_graph: CudaGraphConfig {
+                decode_batch_sizes: stated_sizes(
+                    wire.decode_batch_sizes,
+                    wire.decode_stated,
+                    "decode batch size",
+                )?,
+                prefill_token_sizes: stated_sizes(
+                    wire.prefill_token_sizes,
+                    wire.prefill_stated,
+                    "prefill token size",
+                )?,
+            },
+            max_logprobs: wire.max_logprobs,
+            num_draft_tokens: wire.num_draft_tokens,
+            graph_pc_sampling: wire.graph_pc_sampling,
+        })
+    }
+}
+
+impl From<&GraphOptions> for crate::request::wire::GraphOptions {
+    fn from(options: &GraphOptions) -> Self {
+        let process = crate::process::GraphOptions::from(options);
+        Self {
+            decode_batch_sizes: process.decode_batch_sizes,
+            decode_stated: process.decode_stated,
+            prefill_token_sizes: process.prefill_token_sizes,
+            prefill_stated: process.prefill_stated,
+            max_logprobs: process.max_logprobs,
+            num_draft_tokens: process.num_draft_tokens,
+            graph_pc_sampling: process.graph_pc_sampling,
+        }
+    }
+}
+
+impl TryFrom<crate::request::wire::GraphOptions> for GraphOptions {
+    type Error = String;
+
+    /// The options a `MeasureRoom` states, as a `Prepare`'s are read.
+    fn try_from(wire: crate::request::wire::GraphOptions) -> Result<Self, String> {
+        Self::try_from(crate::process::GraphOptions {
+            decode_batch_sizes: wire.decode_batch_sizes,
+            decode_stated: wire.decode_stated,
+            prefill_token_sizes: wire.prefill_token_sizes,
+            prefill_stated: wire.prefill_stated,
+            max_logprobs: wire.max_logprobs,
+            num_draft_tokens: wire.num_draft_tokens,
+            graph_pc_sampling: wire.graph_pc_sampling,
+        })
+    }
+}
+
 /// The worker processes (`worker_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
@@ -2120,6 +2236,17 @@ impl EngineConfig {
             .fence_modules
             .clone_from(&target.profiling.fence_modules);
         self.moe.microbatches = target.moe.microbatches;
+    }
+
+    /// The options this configuration's kernel generations capture the CUDA graphs for
+    /// ([`GraphOptions`]).
+    pub fn graph_options(&self) -> GraphOptions {
+        GraphOptions {
+            cuda_graph: self.cuda_graph.clone(),
+            max_logprobs: self.max_logprobs,
+            num_draft_tokens: self.speculative.num_draft_tokens,
+            graph_pc_sampling: self.profiling.graph_pc_sampling,
+        }
     }
 
     /// The layout this configuration lays an epoch's device memory out in ([`Layout`]).

@@ -885,6 +885,7 @@ impl EngineClient {
                     id,
                     kernels,
                     recapture,
+                    graphs: None,
                 })
             })
             .await?

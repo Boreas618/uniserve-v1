@@ -119,8 +119,12 @@ pub struct GraphPool {
     allocator: Allocator,
     /// What the pools map, as their reservation publishes it.
     usage: Arc<Usage>,
-    /// Each runner's region, mapped for the life of the pool.
+    /// Each runner's region, mapped for the life of the pool or until a kernel generation that
+    /// replaced it committed.
     regions: Vec<(RunnerId, Buffer)>,
+    /// The regions kernel generations mapped for shapes of their runners beside the runners'
+    /// own ([`GraphPool::open_region`]), each with the generation's number.
+    spare: Vec<(RunnerId, u64, Buffer)>,
 }
 
 impl GraphPool {
@@ -204,7 +208,109 @@ impl GraphPool {
             allocator,
             usage,
             regions: mapped,
+            spare: Vec::new(),
         })
+    }
+
+    /// Maps a region of `bytes` for `runner`'s shape under kernel generation `generation` beside
+    /// the runner's own, whose peak the shape's forwards exceed (`Graphs::over`): it stays at its
+    /// address until the generation commits, when it becomes the runner's region and the one it
+    /// replaces is given back ([`GraphPool::commit_regions`]), or is given back itself
+    /// ([`GraphPool::release_regions`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a runner the pool holds no region for or that holds a region of
+    /// the generation already; the driver's error when the region cannot be mapped, which
+    /// carries the quota's refusal.
+    pub fn open_region(
+        &mut self,
+        runner: RunnerId,
+        generation: u64,
+        bytes: u64,
+    ) -> Result<DeviceRange> {
+        self.region(runner)?;
+        if self
+            .spare
+            .iter()
+            .any(|(held, number, _)| *held == runner && *number == generation)
+        {
+            return Err(Error::Invalid(format!(
+                "runner {} holds a region of generation {generation} already",
+                runner.0
+            )));
+        }
+
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| Error::Resource("a runner's region is larger than the address space"))?;
+        let buffer = self.allocator.allocate(PoolKind::Graph, bytes)?;
+        let range = DeviceRange::from(&buffer);
+        self.spare.push((runner, generation, buffer));
+        Ok(range)
+    }
+
+    /// Generation `generation` committed: each region it mapped becomes its runner's, and the
+    /// region it replaces, which no graph addresses once the generation's kept shapes were
+    /// released, is given back to the device.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal to unmap a region; the rest are given back all the same.
+    pub fn commit_regions(&mut self, generation: u64) -> Result<()> {
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.spare)
+            .into_iter()
+            .partition(|(_, number, _)| *number == generation);
+        self.spare = kept;
+
+        let mut released = Ok(());
+        for (runner, _, buffer) in taken {
+            let Some(held) = self.regions.iter_mut().find(|(held, _)| *held == runner) else {
+                continue;
+            };
+            let replaced = std::mem::replace(&mut held.1, buffer);
+            let result = self.allocator.release(replaced);
+            if released.is_ok() {
+                released = result;
+            }
+        }
+        Ok(released?)
+    }
+
+    /// Gives back every region generation `generation` mapped, which it never served from or
+    /// rolled back from: no graph addresses them once the generation's shapes were released.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal to unmap a region; the rest are given back all the same.
+    pub fn release_regions(&mut self, generation: u64) -> Result<()> {
+        self.release_where(|number| number == generation)
+    }
+
+    /// Gives back every region a kernel generation before `generation` mapped, whose update
+    /// ended: one a peer's process kept past its rollback while its ranks still addressed it.
+    ///
+    /// # Errors
+    ///
+    /// As [`GraphPool::release_regions`].
+    pub fn release_regions_before(&mut self, generation: u64) -> Result<()> {
+        self.release_where(|number| number < generation)
+    }
+
+    /// Gives back every region of a generation `given` names.
+    fn release_where(&mut self, given: impl Fn(u64) -> bool) -> Result<()> {
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.spare)
+            .into_iter()
+            .partition(|(_, number, _)| given(*number));
+        self.spare = kept;
+
+        let mut released = Ok(());
+        for (_, _, buffer) in taken {
+            let result = self.allocator.release(buffer);
+            if released.is_ok() {
+                released = result;
+            }
+        }
+        Ok(released?)
     }
 
     /// The region of `runner`: what [`Graphs::new`](crate::runner::graphs::Graphs::new) takes. It

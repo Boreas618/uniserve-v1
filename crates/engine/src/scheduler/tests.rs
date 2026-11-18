@@ -1383,3 +1383,89 @@ impl Scheduler {
         self.budget = super::Budget::of(&self.tuning.load(), &self.ceilings, &self.config);
     }
 }
+
+/// A kernel generation's graphs bound the steps from the next one on (`Message::SetGraphs`): the
+/// group they name forms its batches within their shapes, a step's tokens and calls stay within
+/// them, a verification carries their drafts at most, and a request may ask for their candidates
+/// at a position; the serving graphs' limits, given back, bound the steps again.
+#[test]
+fn a_generation_s_graphs_bound_the_steps_from_the_next_one_on() {
+    use proto::request::SamplingParams;
+
+    let mut bench = bench(1024);
+    let scheduler = &mut bench.scheduler;
+    scheduler.groups[0].capacity.kv_cache = Some(proto::config::KvCacheConfig::default());
+    scheduler.limits.features = proto::request::GenerationFeatures::all();
+    scheduler.groups[0].capacity.buckets = vec![
+        Shape::decode(8, Variant::DecodeGreedy),
+        Shape::prefill(8, 512, Variant::PrefillGreedy),
+    ];
+    let serving = Arc::new(super::GraphLimits {
+        config: SchedulerConfig::default(),
+        buckets: vec![(A, scheduler.groups[0].capacity.buckets.clone())],
+        max_logprobs: 0,
+    });
+    let asking = |logprobs: u32| {
+        let sampling = SamplingParams {
+            return_logprobs: true,
+            n_logprobs: logprobs,
+            ..SamplingParams::default()
+        };
+        proto::request::Request::from(GenerationRequest {
+            trace: 0,
+            request_id: proto::request::RequestId(7),
+            prompt_token_ids: vec![1; 4],
+            multimodal_inputs: Default::default(),
+            sampling,
+            max_und_tokens: 4,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            cache: Default::default(),
+            include_stop_token: false,
+            generated_token_ids: Vec::new(),
+            adapter: 0,
+            hand_off: false,
+            lend: None,
+        })
+    };
+    let take = |scheduler: &mut Scheduler, limits: &Arc<super::GraphLimits>| {
+        let (reply, replied) = crossbeam_channel::bounded(1);
+        scheduler.apply(Message::SetGraphs(Arc::clone(limits), reply));
+        replied.recv_timeout(Duration::from_secs(1)).unwrap();
+    };
+    assert!(scheduler.validate(&asking(3)).is_err());
+
+    // The generation's graphs capture decodes of four rows and prefills of 128 tokens, with
+    // verifications of two drafts and three candidates a position.
+    let next = Arc::new(super::GraphLimits {
+        config: SchedulerConfig {
+            max_num_batched_tokens: 1024,
+            draft_tokens: 2,
+            ..SchedulerConfig::default()
+        },
+        buckets: vec![(
+            A,
+            vec![
+                Shape::decode(4, Variant::DecodeGreedy),
+                Shape::prefill(4, 128, Variant::PrefillGreedy),
+            ],
+        )],
+        max_logprobs: 3,
+    });
+    take(scheduler, &next);
+    assert_eq!(scheduler.validate(&asking(3)), Ok(()));
+    assert!(scheduler.validate(&asking(4)).is_err());
+    assert_eq!(scheduler.ceilings.tokens, 128);
+    assert_eq!(scheduler.ceilings.rows, 4);
+    assert_eq!(scheduler.config.max_num_batched_tokens, 128);
+    assert_eq!(scheduler.config.draft_tokens, 2);
+    assert_eq!(scheduler.groups[0].capacity.buckets, next.buckets[0].1);
+
+    // The serving graphs' limits, given back, bound the steps as before.
+    take(scheduler, &serving);
+    assert!(scheduler.validate(&asking(3)).is_err());
+    assert_eq!(scheduler.ceilings.tokens, 512);
+    assert_eq!(scheduler.ceilings.rows, 8);
+    assert_eq!(scheduler.config.draft_tokens, 0);
+}

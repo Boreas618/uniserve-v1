@@ -21,6 +21,16 @@
 //! - **Trial**: [`commit`] releases the kept generation after its last batch; [`rollback`] serves
 //!   the kept generation again from one boundary.
 //!
+//! A generation of other graph options (`proto::config::GraphOptions`: the bucket catalog, the
+//! candidates, the drafts) shapes the runners otherwise: [`kernels`] measures every runner's
+//! shape under them (`Worker::measure`), selects and installs the kernels their buckets launch
+//! with the serving ones, makes the room their graphs and storage take beside what serves, maps
+//! a region for a shape whose peak the runner's region does not hold, and has every worker
+//! prepare the shapes, whose every bucket its capture thread captures. Such a generation switches
+//! whole, at the boundary its policy switches at, with every scheduler's limits
+//! ([`Message::SetGraphs`]); its commit releases the regions it replaced, and its rollback the
+//! ones it mapped.
+//!
 //! The ranks of the epoch's peers switch, commit and roll back with this process's, in the order
 //! of every group's jobs, through the node's route (`Route::switch`); each peer prepares from its
 //! own daemon's command and its own host's Build Server, and a shadow pass waits for every
@@ -43,7 +53,9 @@ use scheduling::view::Snapshot;
 use service::lock;
 
 use crate::batch::Generations;
-use crate::worker::Worker;
+use crate::runner::{GraphOptions, RunnerId};
+use crate::scheduler::GraphLimits;
+use crate::worker::{Measured, Reshape, Worker};
 
 use super::operations::{ask, at_boundary, every, stopped};
 use crate::executor::{Route, Shadow};
@@ -73,6 +85,22 @@ pub(crate) fn named(prepare: proto::process::Prepare) -> Result<(Packages, Packa
     Ok((packages, policy))
 }
 
+/// Each worker's runners' shapes under a generation's graph options, in the workers' order
+/// ([`Worker::measure`]); empty for a generation of the serving options.
+pub(crate) type Shapes = Vec<Vec<Option<Measured>>>;
+
+/// A generation's graph options where they differ from the serving ones: as the daemon states
+/// them, which every peer's process is told with what it measures, and as this process's runners
+/// take them, of the deployment's catalog bounds (`crate::process::shapes::runner_options`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Options {
+    pub(crate) stated: proto::config::GraphOptions,
+    pub(crate) runners: GraphOptions,
+    /// Whether CUPTI samples the graphs' program counters otherwise than for the serving ones,
+    /// so every bucket of every runner is captured again.
+    pub(crate) recapture: bool,
+}
+
 /// Makes generation `generation` of kernels ready beside the serving one on every worker and
 /// returns the packages it is built from (`Prepare`, `specs/updates.md` §3.1).
 ///
@@ -87,39 +115,61 @@ pub(crate) fn named(prepare: proto::process::Prepare) -> Result<(Packages, Packa
 /// operator's package changed, the generation changes no kernel: no worker prepares anything,
 /// and the generation's switch takes no graph.
 ///
-/// Before any worker begins, `room` is given the operators whose kernels change, so the device
-/// memory the update takes beside the serving graphs is made ([`update_room`]).
+/// With `options`, the generation's graph options where they differ from the serving ones, every
+/// runner they shape is measured under them first ([`Worker::measure`]): the kernels its buckets
+/// launch join the keys asked of the Build Server, an operator that launches under a key the
+/// serving generation holds no kernel for is installed again with all of its keys, and every
+/// worker prepares its runners' shapes, whose every bucket is captured ([`Worker::prepare`]). A
+/// shape whose region's peak the runner's region does not hold computes in a region of its own,
+/// which `binding` maps for the generation once the room is made.
+///
+/// Before any worker begins, `room` is given the operators whose kernels change and the
+/// measured shapes, so the device memory the update takes beside the serving graphs is made
+/// ([`update_room`]).
 ///
 /// # Errors
 ///
-/// The Build Server's refusal, an install that failed, the room that could not be made, or a
-/// device that did not prepare the generation: what was prepared is given back on every device,
-/// and serving is untouched.
+/// The Build Server's refusal, options a runner cannot serve in place, an install that failed,
+/// the room or a region that could not be made, or a device that did not prepare the generation:
+/// what was prepared is given back on every device, and serving is untouched.
 pub(crate) fn kernels(
     workers: &[Arc<Worker>],
     build: &(Arc<Mutex<Client>>, Vec<Target>),
     (named, serving): (&Packages, &Packages),
-    generation: u64,
-    room: &dyn Fn(&BTreeSet<String>) -> Result<()>,
+    (generation, options): (u64, Option<&Options>),
+    binding: &WeightBinding,
+    room: &dyn Fn(&BTreeSet<String>, &Shapes) -> Result<()>,
 ) -> Result<Packages> {
     let (client, targets) = build;
+    // A region of a generation before this one that a peer's process could not give back as its
+    // rollback was told, since its ranks still addressed it, is given back now.
+    binding
+        .release_regions_before(generation)
+        .context("giving back the regions of earlier generations")?;
     let held = serving_kernels(workers)?;
-    let keys = launched_keys(&held);
+    let serving_keys = launched_keys(&held);
+    let shapes = match options {
+        Some(options) => measure(workers, &options.runners)?,
+        None => Shapes::new(),
+    };
+    let keys = shaped_keys(&serving_keys, &shapes);
+    let reshaping = shapes.iter().flatten().any(Option::is_some);
 
     let mut client = lock(client);
     let (selected, routes) = select(&mut client, targets, named, &keys)
         .context("selecting the generation's packages at the Build Server")?;
-    let replaced = replaced_operators(&selected, serving);
+    let mut replaced = replaced_operators(&selected, serving);
+    replaced.extend(grown(&serving_keys, &keys));
     // A generation that places the probes elsewhere captures every bucket again, whatever
     // kernels it replaces.
     let moved = held.first().is_some_and(|serving| {
         crate::profiling::markers::Markers::installed()
             .is_some_and(|markers| markers.moved(serving.number(), generation))
     });
-    if replaced.is_empty() && !moved {
+    if replaced.is_empty() && !moved && !reshaping {
         return Ok(serving.clone());
     }
-    let recaptured: BTreeSet<String> = if moved {
+    let recaptured: BTreeSet<String> = if moved || reshaping {
         keys.keys().cloned().collect()
     } else {
         replaced.clone()
@@ -147,20 +197,24 @@ pub(crate) fn kernels(
         });
     }
     drop(client);
-    room(&recaptured).context("making the room the generation's graphs take")?;
+    room(&recaptured, &shapes).context("making the room the generation's graphs take")?;
+    let reshapes = match options {
+        Some(options) if reshaping => regions(workers, binding, generation, options, &shapes)?,
+        _ => vec![None; workers.len()],
+    };
 
     // One generation per device: a kernel belongs to the context that loaded it. Beginning a
     // preparation runs no forward, so every worker begins at once.
     let submitted = held
         .iter()
         .zip(installed)
-        .zip(workers)
-        .map(|((kernels, entries), worker)| {
-            worker.prepare(Arc::new(kernels.replace(generation, entries)))
+        .zip(workers.iter().zip(reshapes))
+        .map(|((kernels, entries), (worker, reshape))| {
+            worker.prepare(Arc::new(kernels.replace(generation, entries)), reshape)
         })
         .collect();
     if let Err(failure) = ended(submitted, &format!("preparing generation {generation}")) {
-        if let Err(error) = discard(&[], workers, generation) {
+        if let Err(error) = discard(&[], workers, binding, generation) {
             tracing::warn!(%error, generation, "a preparation that failed was not given back");
         }
         return Err(failure);
@@ -177,8 +231,111 @@ pub(crate) fn kernels(
     Ok(prepared)
 }
 
+/// Every worker's runners' shapes under `options`, in the workers' order ([`Worker::measure`]).
+///
+/// # Errors
+///
+/// Options a runner cannot serve in place, or a worker that closed.
+pub(crate) fn measure(workers: &[Arc<Worker>], options: &GraphOptions) -> Result<Shapes> {
+    workers
+        .iter()
+        .enumerate()
+        .map(|(rank, worker)| {
+            worker
+                .measure(options)
+                .with_context(|| format!("measuring the shapes of worker {rank}'s runners"))
+        })
+        .collect()
+}
+
+/// The keys a generation's devices launch: `serving`'s, and those of every shape of `shapes`.
+fn shaped_keys(
+    serving: &BTreeMap<String, BTreeSet<String>>,
+    shapes: &Shapes,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut keys = serving.clone();
+    for measured in shapes.iter().flatten().flatten() {
+        for (operator, key) in &measured.keys {
+            keys.entry((*operator).to_owned())
+                .or_default()
+                .insert(key.clone());
+        }
+    }
+    keys
+}
+
+/// The operators that launch under a key of `keys` the serving generation, which launches
+/// `serving`, holds no kernel for: a generation replaces an operator's kernels whole, so each is
+/// installed again with every key it launches.
+fn grown(
+    serving: &BTreeMap<String, BTreeSet<String>>,
+    keys: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<String> {
+    keys.iter()
+        .filter(|(operator, launched)| {
+            serving
+                .get(*operator)
+                .is_none_or(|held| !launched.is_subset(held))
+        })
+        .map(|(operator, _)| operator.clone())
+        .collect()
+}
+
+/// What each worker prepares of a generation of `options` whose shapes `shapes` measured: the
+/// options, and for each runner the region its shape computes in with the bytes of a replay's
+/// input values. A shape whose peak its runner's region holds computes there; any other in a
+/// region of its own, which `binding` maps on the runner's device for `generation` until the
+/// generation commits, which replaces the runner's region with it, or is given back.
+///
+/// # Errors
+///
+/// A region the device or its quota cannot map: the regions mapped before it are given back.
+fn regions(
+    workers: &[Arc<Worker>],
+    binding: &WeightBinding,
+    generation: u64,
+    options: &Options,
+    shapes: &Shapes,
+) -> Result<Vec<Option<Arc<Reshape>>>> {
+    let mut reshapes = Vec::with_capacity(workers.len());
+    for (worker, measured) in workers.iter().zip(shapes) {
+        let mut regions = Vec::with_capacity(measured.len());
+        for (index, shape) in measured.iter().enumerate() {
+            let Some(shape) = shape else {
+                regions.push((None, 0));
+                continue;
+            };
+            let region = if shape.peak > shape.region {
+                let runner = RunnerId(u32::try_from(index).unwrap_or(u32::MAX));
+                let opened = binding.open_region(worker, runner, generation, shape.peak);
+                if let Err(error) = &opened
+                    && let Err(released) = binding.release_regions(generation)
+                {
+                    tracing::warn!(%error, %released, generation, "a region was not given back");
+                }
+                Some(opened.with_context(|| {
+                    format!(
+                        "mapping a region of {} bytes for runner {index}'s shape",
+                        shape.peak
+                    )
+                })?)
+            } else {
+                None
+            };
+            regions.push((region, shape.values));
+        }
+        reshapes.push(Some(Arc::new(Reshape {
+            options: options.runners.clone(),
+            regions,
+            recapture: options.recapture,
+        })));
+    }
+    Ok(reshapes)
+}
+
 /// Every descriptor key the devices' forwards launch, by operator: the keys of the generations
-/// `held` serve. An update changes implementations and never the keys.
+/// `held` serve. A kernel update changes implementations and keeps the keys; a generation of
+/// other graph options adds its shapes' keys ([`shaped_keys`]).
 fn launched_keys(held: &[Arc<ops::Generation>]) -> BTreeMap<String, BTreeSet<String>> {
     let mut keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for kernels in held {
@@ -196,25 +353,33 @@ fn launched_keys(held: &[Arc<ops::Generation>]) -> BTreeMap<String, BTreeSet<Str
 /// the Build Server selects the packages of every key the devices launch as the update's
 /// preparation would ([`kernels`]), and the operators whose packages differ from `serving`'s
 /// are those whose graphs it captures again; with `recapture`, a generation that places the
-/// probes elsewhere, every graph is. None when it replaces no operator and captures nothing
-/// again. What a validation of a change reports before the change begins (`MeasureRoom`).
+/// probes elsewhere, every graph is; with `options`, the generation's graph options where they
+/// differ from the serving ones, so are the graphs of every shape they give the runners, beside
+/// the storage and the regions those take ([`kernels`]). None when it replaces no operator and
+/// captures nothing again. What a validation of a change reports before the change begins
+/// (`MeasureRoom`).
 ///
 /// # Errors
 ///
-/// The Build Server's refusal, a worker that closed, or a rank's quota or device that cannot be
-/// read, here or on a peer.
+/// The Build Server's refusal, options a runner cannot serve in place, a worker that closed, or
+/// a rank's quota or device that cannot be read, here or on a peer.
 pub(crate) fn room(
     workers: &[Arc<Worker>],
     build: &(Arc<Mutex<Client>>, Vec<Target>),
     (named, serving): (&Packages, &Packages),
     binding: &WeightBinding,
-    recapture: bool,
+    (recapture, options): (bool, Option<&Options>),
 ) -> Result<Vec<UpdateRoom>> {
     let (client, targets) = build;
     let keys = launched_keys(&serving_kernels(workers)?);
-    if recapture {
-        let every: BTreeSet<String> = keys.keys().cloned().collect();
-        return update_room(workers, binding, &every);
+    let shapes = match options {
+        Some(options) => measure(workers, &options.runners)?,
+        None => Shapes::new(),
+    };
+    let stated = options.map(|options| &options.stated);
+    if recapture || shapes.iter().flatten().any(Option::is_some) {
+        let every: BTreeSet<String> = shaped_keys(&keys, &shapes).keys().cloned().collect();
+        return update_room(workers, binding, &every, (&shapes, stated));
     }
     let (selected, _) = select(&mut lock(client), targets, named, &keys)
         .context("selecting the generation's packages at the Build Server")?;
@@ -222,7 +387,7 @@ pub(crate) fn room(
     if replaced.is_empty() {
         return Ok(Vec::new());
     }
-    update_room(workers, binding, &replaced)
+    update_room(workers, binding, &replaced, (&shapes, stated))
 }
 
 /// The generation of kernels each worker's device serves, in the workers' order: what the
@@ -389,10 +554,14 @@ pub(crate) fn shadow(
 /// device until its commit, this process's ranks then every peer's, in rank order: the device
 /// bytes its graphs and rehearsals take beside the serving graphs, the room the device has, and
 /// the KV units the rank's cache gives up while the update holds both generations' graphs when
-/// the room does not hold them (`binding::UpdateRoom`). What a validation of the update states
-/// before it begins; the KV policy demotes those units' pages to host memory and the ranks give
-/// their segments back (`WeightBinding::release_segments`) before the update's captures, and
-/// create them again once it committed or rolled back (`WeightBinding::create_segments`).
+/// the room does not hold them (`binding::UpdateRoom`). A generation of other graph options
+/// (`stated`, which every peer measures its own runners under) counts, for each runner its
+/// options shape, what `shapes` measured of it in place of its graphs' own figure: every graph
+/// of the shape, its rehearsal, its storage and its region. What a validation of the update
+/// states before it begins; the KV policy demotes those units' pages to host memory and the
+/// ranks give their segments back (`WeightBinding::release_segments`) before the update's
+/// captures, and create them again once it committed or rolled back
+/// (`WeightBinding::create_segments`).
 ///
 /// # Errors
 ///
@@ -401,9 +570,10 @@ pub(crate) fn update_room(
     workers: &[Arc<Worker>],
     binding: &WeightBinding,
     operators: &BTreeSet<String>,
+    (shapes, stated): (&Shapes, Option<&proto::config::GraphOptions>),
 ) -> Result<Vec<UpdateRoom>> {
-    let extra = update_bytes(workers, operators)?;
-    Ok(binding.update_rooms(operators, |device| {
+    let extra = update_bytes(workers, operators, shapes)?;
+    Ok(binding.update_rooms(operators, stated, |device| {
         extra.get(&device.0).copied().unwrap_or(0)
     })?)
 }
@@ -417,24 +587,31 @@ pub(crate) fn update_room_here(
     workers: &[Arc<Worker>],
     binding: &WeightBinding,
     operators: &BTreeSet<String>,
+    shapes: &Shapes,
 ) -> Result<Vec<UpdateRoom>> {
-    let extra = update_bytes(workers, operators)?;
+    let extra = update_bytes(workers, operators, shapes)?;
     Ok(binding.update_rooms_here(|device| extra.get(&device.0).copied().unwrap_or(0))?)
 }
 
 /// The bytes a generation update that replaces `operators` takes on each device beside what
-/// serves, by CUDA ordinal, over the workers on it.
+/// serves, by CUDA ordinal, over the workers on it: each runner's graphs' figure
+/// (`Graphs::update_bytes`), or, for a runner a generation of other graph options shapes,
+/// what `shapes` measured of its shape.
 fn update_bytes(
     workers: &[Arc<Worker>],
     operators: &BTreeSet<String>,
+    shapes: &Shapes,
 ) -> Result<BTreeMap<i32, u64>> {
     let mut extra: BTreeMap<i32, u64> = BTreeMap::new();
-    for worker in workers {
+    for (index, worker) in workers.iter().enumerate() {
         let Some(device) = worker.device() else {
             continue;
         };
-        let bytes = worker.update_bytes(operators.clone())?;
-        *extra.entry(device.0).or_default() += bytes;
+        let measured = shapes.get(index).map(Vec::as_slice).unwrap_or_default();
+        let shaped: Vec<bool> = measured.iter().map(Option::is_some).collect();
+        let graphs = worker.update_bytes(operators.clone(), shaped)?;
+        let shaped: u64 = measured.iter().flatten().map(|shape| shape.extra).sum();
+        *extra.entry(device.0).or_default() += graphs + shaped;
     }
     Ok(extra)
 }
@@ -457,6 +634,9 @@ const SWITCHED_TOGETHER: usize = 16;
 /// and state launch their own work from it, and its trial begins. The control thread's route
 /// instance switches after.
 ///
+/// A generation of other graph options switches whole ([`switch_whole`]): `limits` are its
+/// schedulers' limits and the serving ones, which a failed switch restores.
+///
 /// # Errors
 ///
 /// A device that did not switch or whose capture failed, or a scheduler that refused the
@@ -464,6 +644,10 @@ const SWITCHED_TOGETHER: usize = 16;
 /// worker the generation that served (the prepared one is given back), and the stamps are the
 /// previous generation's; or a rank whose cache and state did not take the kernels, with the
 /// switch made.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a switch moves the schedulers, the ranks, their memories and the stamps together"
+)]
 pub(crate) fn switch(
     schedulers: &[Sender<Message>],
     route: Option<&Route>,
@@ -472,7 +656,18 @@ pub(crate) fn switch(
     served: &Generations,
     generation: u64,
     policy: &(Arc<wasmtime::Module>, Parameters),
+    limits: Option<(&Arc<GraphLimits>, &Arc<GraphLimits>)>,
 ) -> Result<()> {
+    if let Some(limits) = limits {
+        return switch_whole(
+            schedulers,
+            route,
+            binding,
+            served,
+            (generation, policy),
+            limits,
+        );
+    }
     let kept = served.policy();
     let set = at_boundary(schedulers, || {
         let (module, parameters) = policy;
@@ -535,6 +730,112 @@ pub(crate) fn switch(
     Ok(())
 }
 
+/// [`switch`] of a generation of other graph options, whose runners' shapes switch whole: once
+/// every rank installed every bucket of the generation, every scheduler instantiates the policy
+/// at one batch boundary, every rank switches to the generation whole, its shapes included, and
+/// the batches formed from there on carry `generation` as their stamps and fit `next`, the
+/// generation's limits ([`Message::SetGraphs`]). The trial begins with the boundary's end.
+///
+/// # Errors
+///
+/// As [`switch`]: a rank that did not prepare or switch, or a scheduler that refused the policy,
+/// rolls the switch back, every scheduler serving its previous policy within `kept`, the
+/// serving limits, and every rank the generation and the shapes that served.
+fn switch_whole(
+    schedulers: &[Sender<Message>],
+    route: Option<&Route>,
+    binding: &WeightBinding,
+    served: &Generations,
+    (generation, policy): (u64, &(Arc<wasmtime::Module>, Parameters)),
+    (next, kept): (&Arc<GraphLimits>, &Arc<GraphLimits>),
+) -> Result<()> {
+    let kept_policy = served.policy();
+    let give_back = || {
+        let rolled = ended(
+            on_ranks(route, |route| route.rollback(generation)),
+            &format!("rolling generation {generation} back"),
+        );
+        if let Err(error) = rolled {
+            tracing::error!(%error, generation, "a device did not give the generation back");
+        }
+    };
+
+    // Every rank's buckets are captured before the boundary, which holds the schedulers for the
+    // switch alone.
+    let ready = match route {
+        Some(route) => ended(
+            vec![route.ready(generation, None)],
+            &format!("capturing the buckets of generation {generation}"),
+        ),
+        None => Ok(()),
+    };
+    if let Err(failure) = ready {
+        give_back();
+        return Err(failure.context(format!("switching to generation {generation}")));
+    }
+
+    let switched = at_boundary(schedulers, || {
+        let (module, parameters) = policy;
+        let replies = ask(schedulers, |reply| {
+            Message::SetPolicy(Arc::clone(module), parameters.clone(), reply)
+        })?;
+        let took: Vec<Sender<Message>> = schedulers
+            .iter()
+            .zip(&replies)
+            .filter(|(_, reply)| reply.is_ok())
+            .map(|(inbox, _)| inbox.clone())
+            .collect();
+        let back = |failure: anyhow::Error| {
+            let previous = ask(&took, Message::RollbackPolicy)
+                .and_then(|replies| every(replies, "the previous policy"));
+            if let Err(error) = previous {
+                tracing::error!(%error, generation, "a scheduler did not serve its policy again");
+            }
+            Err(failure)
+        };
+        if let Err(failure) = every(replies, "the generation's policy") {
+            return back(failure);
+        }
+
+        // Nothing is in flight: every rank's runners switch their shapes between the same two
+        // batches, the last of the serving shapes and the first of the generation's.
+        let devices = ended(
+            on_ranks(route, |route| route.switch(generation)),
+            &format!("switching to generation {generation}"),
+        );
+        if let Err(failure) = devices {
+            return back(failure);
+        }
+        served.set_policy(generation);
+        served.set_kernels(generation);
+        ask(schedulers, |reply| {
+            Message::SetGraphs(Arc::clone(next), reply)
+        })
+        .map(drop)
+    });
+    if let Err(failure) = switched {
+        let back = at_boundary(schedulers, || {
+            give_back();
+            served.set_policy(kept_policy);
+            served.set_kernels(kept_policy);
+            let limits = ask(schedulers, |reply| {
+                Message::SetGraphs(Arc::clone(kept), reply)
+            });
+            let policies = ask(schedulers, Message::RollbackPolicy)
+                .and_then(|replies| every(replies, "the previous policy"));
+            limits.map(drop).and(policies)
+        });
+        if let Err(error) = back {
+            tracing::error!(%error, generation, "a switch that failed was not rolled back");
+        }
+        return Err(failure.context(format!("switching to generation {generation}")));
+    }
+
+    binding
+        .set_kernels()
+        .with_context(|| format!("the ranks' memories under generation {generation}"))
+}
+
 /// The kernels' half of [`switch`]: each bucket as every rank installed it, then the generation
 /// whole. Nothing when no worker of this process prepared the generation, which then changes no
 /// kernel.
@@ -572,15 +873,16 @@ fn switch_kernels(
 
 /// Ends the trial of generation `generation` in its favour (`Commit`): every worker releases the
 /// generation it kept, behind the batches it holds and so after the kept generation's last one,
-/// and every scheduler drops the policy it kept.
+/// the regions of the shapes the generation replaced are given back (`binding`), and every
+/// scheduler drops the policy it kept.
 ///
 /// # Errors
 ///
-/// A device that did not commit, or a scheduler that stopped.
+/// A device that did not commit, a region that was not given back, or a scheduler that stopped.
 pub(crate) fn commit(
     schedulers: &[Sender<Message>],
     route: Option<&Route>,
-    workers: &[Arc<Worker>],
+    (workers, binding): (&[Arc<Worker>], &WeightBinding),
     generation: u64,
 ) -> Result<()> {
     // A generation that changed no kernel holds nothing on the ranks to commit.
@@ -593,6 +895,9 @@ pub(crate) fn commit(
             &format!("committing generation {generation}"),
         )?;
     }
+    binding
+        .commit_regions(generation)
+        .with_context(|| format!("giving back the regions generation {generation} replaced"))?;
 
     for (index, inbox) in schedulers.iter().enumerate() {
         inbox
@@ -607,6 +912,10 @@ pub(crate) fn commit(
 /// graphs, the batches formed from here on carry `kept`, every rank's cache and state launch
 /// their own work from it, and every scheduler serves the policy it kept again.
 ///
+/// A generation of other graph options rolls the runners' shapes back with it, and every
+/// scheduler forms its batches within `limits`, the kept generation's, from the boundary on; the
+/// regions the generation mapped are given back.
+///
 /// # Errors
 ///
 /// A device that did not roll back, which has no consistent generation, so the epoch must end;
@@ -617,8 +926,8 @@ pub(crate) fn rollback(
     route: Option<&Route>,
     binding: &WeightBinding,
     served: &Generations,
-    generation: u64,
-    kept: u64,
+    (generation, kept): (u64, u64),
+    limits: Option<&Arc<GraphLimits>>,
 ) -> Result<()> {
     at_boundary(schedulers, || {
         let devices = ended(
@@ -631,36 +940,52 @@ pub(crate) fn rollback(
         let memories = binding
             .set_kernels()
             .with_context(|| format!("the ranks' memories under generation {kept}"));
+        let shaped = match limits {
+            Some(limits) => ask(schedulers, |reply| {
+                Message::SetGraphs(Arc::clone(limits), reply)
+            })
+            .map(drop),
+            None => Ok(()),
+        };
         let policies = ask(schedulers, Message::RollbackPolicy)
             .and_then(|replies| every(replies, "the previous policy"));
-        devices.and(memories).and(policies)
+        let regions = binding
+            .release_regions(generation)
+            .with_context(|| format!("giving back the regions of generation {generation}"));
+        devices.and(memories).and(shaped).and(policies).and(regions)
     })
 }
 
 /// Gives back what was prepared of generation `generation`, which never served (a `Rollback`
 /// before the switch, or a preparation that failed or was abandoned): every scheduler's shadow
-/// pass ends unanswered, and every worker releases the generation's graphs and the kernels only
-/// they held. The policy was only tried, and nothing of it is held.
+/// pass ends unanswered, every worker releases the generation's graphs, its runners' shapes and
+/// the kernels only they held, and `binding` the regions the shapes mapped. The policy was only
+/// tried, and nothing of it is held.
 ///
 /// # Errors
 ///
-/// A device that did not release the generation.
+/// A device that did not release the generation, or a region that was not given back.
 pub(crate) fn discard(
     shadows: &[Arc<Mutex<Shadow>>],
     workers: &[Arc<Worker>],
+    binding: &WeightBinding,
     generation: u64,
 ) -> Result<()> {
     for shadow in shadows {
         lock(shadow).end();
     }
 
-    ended(
+    let released = ended(
         workers
             .iter()
             .map(|worker| worker.rollback(generation))
             .collect(),
         &format!("discarding generation {generation}"),
-    )
+    );
+    let regions = binding
+        .release_regions(generation)
+        .with_context(|| format!("giving back the regions of generation {generation}"));
+    released.and(regions)
 }
 
 /// The submission of `job` on every rank of `route`, this node's and its peers' (`Route::switch`);

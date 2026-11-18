@@ -2,7 +2,9 @@
 //! step continues from it, also when it is launched while the step before it is in flight; a
 //! slot whose first step is a decode starts from its batch's row;
 //! a batch's page work is issued around the replay; a runner that speculates commits the
-//! prefix a verification's samples agree with and proposes the drafts after it.
+//! prefix a verification's samples agree with and proposes the drafts after it; a kernel
+//! generation of other graph options (candidates, buckets, drafts) serves its shape from its
+//! switch on, the slots' state carried across, and the kept shape again after a rollback.
 //!
 //! Every case needs GPU 0 and this host's Build Server (`uniserve build-server serve`). Run them
 //! on a GPU host:
@@ -28,7 +30,7 @@ use engine::runner::buckets::Buckets;
 use engine::runner::causal_lm::speculation::DraftPool;
 use engine::runner::causal_lm::{CausalLmConfig, PageWork};
 use engine::runner::graphs::Graphs;
-use engine::runner::{CausalLmRunner, Forward, Runner};
+use engine::runner::{CausalLmRunner, Forward, GraphOptions, Runner};
 use nn::capability::Drafter;
 use nn::family::{CacheShape, ExpertShape, StateShape, TextModel, TokenHistory};
 use nn::functional::{WeightOrder, embedding, rms_norm};
@@ -259,10 +261,11 @@ fn config(drafts: u32) -> CausalLmConfig {
 /// A runner on the device with every bucket captured, and the memory its graphs address.
 struct Bench {
     runner: CausalLmRunner,
-    _kernels: Kernels,
-    _region: DeviceAllocation,
-    /// The memory of the tensors the runner was lent.
-    _memory: Vec<DeviceAllocation>,
+    kernels: Kernels,
+    region: DeviceAllocation,
+    /// The memory of the tensors the runner was lent, and the regions of the shapes it was
+    /// given beside its own.
+    memory: Vec<DeviceAllocation>,
 }
 
 impl Bench {
@@ -356,10 +359,62 @@ impl Bench {
 
         Ok(Self {
             runner,
-            _kernels: kernels,
-            _region: region,
-            _memory: memory,
+            kernels,
+            region,
+            memory,
         })
+    }
+
+    /// Prepares the runner's shape under `options` for generation `number`, as a worker
+    /// prepares a kernel generation of other graph options: the shape is measured over graphs
+    /// that hold no device, its kernels are taken from the Build Server for the keys it
+    /// launches, it computes in the runner's region when that holds its peak and in a region of
+    /// its own otherwise, and every bucket of it is captured beside the serving graphs and
+    /// installed in its graphs. Nothing switches.
+    fn reshape(&mut self, number: u64, options: &GraphOptions) -> Outcome {
+        let measure = self
+            .runner
+            .measure(options)?
+            .ok_or("a causal runner takes graph options")?;
+        let instance = &*measure.instance;
+        instance.graphs().profile_run(instance)?;
+        let (peak, values) = (instance.graphs().peak(), instance.graphs().input_peak());
+        let next = self.kernels.generation(number, &instance.graphs().keys())?;
+
+        let region = if peak as usize > self.region.len() {
+            let own = DeviceAllocation::linear(DEVICE, peak as usize)?;
+            let range =
+                DeviceRange::new(platform::DevicePtr::from_address(own.address()), own.len());
+            self.memory.push(own);
+            Some(range)
+        } else {
+            None
+        };
+        self.runner.reshape(
+            number,
+            options,
+            Arc::clone(&next),
+            (region, values.max(256)),
+        )?;
+
+        let (_, graphs) = self
+            .runner
+            .reshaped()
+            .ok_or("the runner prepared no shape")?;
+        let capture = self.runner.reshaped_capturer(graphs.beside()?)?;
+        let rehearsal = self.runner.reshaped_capturer(graphs.rehearsal()?)?;
+        for bucket in capture.buckets() {
+            let plan = capture
+                .graphs()
+                .examine(&*capture, &bucket, None, None, &next)?;
+            if plan.rehearse {
+                rehearsal.graphs().rehearse(&*rehearsal, &bucket, &next)?;
+            }
+            let graph = capture.graphs().capture(&*capture, &bucket, &next)?;
+            graphs.install(&bucket, number, Some(graph))?;
+        }
+        rehearsal.graphs().release_rehearsal();
+        Ok(())
     }
 }
 
@@ -687,5 +742,116 @@ fn a_prompt_of_a_speculating_runner_proposes_the_drafts_after_its_first_token() 
 
     let output = bench.runner.execute(&verified, &tables())?;
     assert_eq!(output.calls[0].tokens.len(), 3);
+    Ok(())
+}
+
+/// The options of [`config`]'s runner with `candidates` and `drafts`, over decodes of `decode`
+/// rows and prefills of `prefill` tokens.
+fn options(decode: &[u32], prefill: &[u32], candidates: u32, drafts: u32) -> GraphOptions {
+    GraphOptions {
+        buckets: Buckets::causal_lm(decode, prefill, true),
+        candidates,
+        drafts,
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_generation_of_other_candidates_reports_them_from_its_switch_on() -> Outcome {
+    let mut bench = Bench::open()?;
+    let output = bench.runner.execute(&prompt(2, &[5, 6, 7]), &tables())?;
+    assert_eq!(output.calls[0].token_logprobs[0].len(), 1 + 2);
+
+    // Prepared and captured, the shape of four candidates serves nothing until the switch.
+    bench.reshape(2, &options(&[2, 4], &[8], 4, 0))?;
+    let output = bench.runner.execute(&step(2, 0, 3), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(next(7))]);
+    assert_eq!(output.calls[0].token_logprobs[0].len(), 1 + 2);
+
+    // From the switch on a scored row reports four candidates, and the slot continues from the
+    // token the serving shape committed into it.
+    assert!(bench.runner.switch_shape(2)?);
+    let output = bench.runner.execute(&step(2, 0, 4), &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(next(next(7)))]);
+    assert_eq!(call.token_logprobs[0].len(), 1 + 4);
+    // Tokens `t` and `t + 16` have one logit, so the candidates rank in tied pairs.
+    let ranks: Vec<u32> = call.token_logprobs[0][1..]
+        .iter()
+        .map(|entry| entry.rank)
+        .collect();
+    assert_eq!(ranks, [1, 1, 3, 3]);
+    assert_eq!((call.cache_computed_len, call.step_index), (5, 3));
+
+    // A rollback serves the kept shape again, over the same slot.
+    assert!(bench.runner.rollback_shape(2)?);
+    let output = bench.runner.execute(&step(2, 0, 5), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(next(next(next(7))))]);
+    assert_eq!(output.calls[0].token_logprobs[0].len(), 1 + 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_generation_of_other_buckets_serves_them_whole_from_its_switch_on() -> Outcome {
+    let mut bench = Bench::open()?;
+    let long: Vec<i32> = (3..15).collect();
+
+    // No bucket of eight tokens holds a prompt of twelve.
+    let refused = bench.runner.execute(&prompt(2, &long), &tables());
+    assert!(refused.is_err(), "{:?}", refused.map(|output| output.calls));
+
+    // The catalog of decodes of one and eight rows and prefills of up to sixteen tokens
+    // computes in a region of its own when the runner's cannot hold its peak.
+    let catalog = options(&[1, 8], &[8, 16], 2, 0);
+    bench.reshape(2, &catalog)?;
+    assert!(bench.runner.switch_shape(2)?);
+    let decodes = |rows: u32| {
+        bench
+            .runner
+            .buckets()
+            .iter()
+            .any(|bucket| bucket.variant == Variant::DecodeGreedy && bucket.rows == rows)
+    };
+    assert!(decodes(1) && decodes(8) && !decodes(2) && !decodes(4));
+
+    let output = bench.runner.execute(&prompt(2, &long), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(14)]);
+    let output = bench.runner.execute(&step(2, 0, 12), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(next(14))]);
+
+    // Committed, the shape serves on alone.
+    assert!(bench.runner.commit_shape(2)?);
+    let output = bench.runner.execute(&step(2, 0, 13), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(next(next(14)))]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_generation_of_other_drafts_verifies_them_from_its_switch_on() -> Outcome {
+    let mut bench = Bench::speculating(2)?;
+
+    // A verification of three drafts is held by no bucket of a runner of two.
+    let three = verification(2, &[7, 6, 5, 4], 3);
+    assert!(bench.runner.execute(&three, &tables()).is_err());
+
+    bench.reshape(2, &options(&[2, 4], &[8], 2, 3))?;
+    assert!(bench.runner.switch_shape(2)?);
+    let output = bench
+        .runner
+        .execute(&verification(3, &[7, 6, 5, 4], 3), &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(7), next(6), next(5), next(4)]);
+    assert_eq!(call.token_logprobs.len(), 4);
+    assert_eq!(call.draft_token_ids, [next(next(4)), next(next(next(4)))]);
+    assert_eq!((call.cache_computed_len, call.step_index), (7, 7));
+
+    // Rolled back, the runner verifies two drafts again.
+    assert!(bench.runner.rollback_shape(2)?);
+    let output = bench
+        .runner
+        .execute(&verification(4, &[7, 6, 5], 3), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(7), next(6), next(5)]);
     Ok(())
 }

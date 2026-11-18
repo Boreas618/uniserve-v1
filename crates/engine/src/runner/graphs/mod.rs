@@ -469,6 +469,118 @@ impl Graphs {
         Ok(graphs)
     }
 
+    /// Graphs of another shape of the runner, in these graphs' place (`Runner::reshape`): a
+    /// kernel generation that captures the runner's graphs for other buckets, candidates or
+    /// drafts lays its input tensors and its allocations out otherwise. Their forwards issue on
+    /// the same stream, through the same groups, expert exchange and expert load, under
+    /// `kernels`, the generation's; `inputs` is the bytes of the shape's input tensors, which lie
+    /// at the start of `region`, the allocator's region following them, and `values` and the
+    /// input buffer are as [`Graphs::new`] takes them.
+    ///
+    /// `region` is these graphs' own when it is `None`: the two shapes' graphs replay on one
+    /// stream, in turn, so they address one region as two generations' graphs of a bucket do.
+    /// The new graphs hold no graph: each bucket of the shape is captured for them under
+    /// `kernels` and installed as a warm-up installs one ([`Graphs::install`]), and they serve once
+    /// the runner switched to the shape ([`Graphs::take_over`]). Graphs that hold no device give
+    /// graphs that hold none.
+    ///
+    /// # Errors
+    ///
+    /// When the region cannot hold the input tensors, or the page-locked input buffer cannot be
+    /// allocated.
+    pub fn over(
+        &self,
+        kernels: Arc<Generation>,
+        region: Option<DeviceRange>,
+        inputs: u64,
+        values: u64,
+    ) -> Result<Self> {
+        let Some(cuda) = &self.device else {
+            return self.measuring(kernels, inputs);
+        };
+
+        let region = region.unwrap_or(cuda.region);
+        let (base, allocator) = split_region(region, inputs)?;
+        let buffer = InputBuffer::pinned(cuda.stream.device(), inputs, values, self.slots)?;
+        let launching = cuda.launching.over(allocator)?;
+        launching.set_kernels(Arc::clone(&kernels));
+
+        let graphs = Self {
+            device: Some(Cuda {
+                launching,
+                stream: cuda.stream.clone(),
+                replays_on: cuda.replays_on.clone(),
+                region,
+                done: Event::new(EventFlags::default()),
+                rehearsal: RefCell::new(None),
+                load: RefCell::new(None),
+            }),
+            profile: Context::meta(None),
+            preparing: Context::meta(Some(allocator)),
+            inputs,
+            slots: self.slots,
+            rehearses: false,
+            inputs_at: Cell::new(base),
+            state: RefCell::new(State::new(kernels, Some(buffer))),
+        };
+        graphs.profile.set_axes(self.splits()?)?;
+        graphs.preparing.set_axes(self.splits()?)?;
+        Ok(graphs)
+    }
+
+    /// Graphs that hold no device, serving `kernels`, for a forward instance of another shape of
+    /// the runner whose input tensors take `inputs` bytes: what a profile run measures that
+    /// shape over ([`Graphs::profile_run`]) before anything of it is allocated. Their meta
+    /// contexts take these graphs' splits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Graphs::set_axes`].
+    pub fn measuring(&self, kernels: Arc<Generation>, inputs: u64) -> Result<Self> {
+        let graphs = Self::meta(kernels, inputs);
+        graphs.profile.set_axes(self.splits()?)?;
+        graphs.preparing.set_axes(self.splits()?)?;
+        Ok(graphs)
+    }
+
+    /// The bytes of the runner's region: what a forward of any shape these graphs' region serves
+    /// allocates in, input tensors included ([`Graphs::peak`]). Zero for graphs that hold no
+    /// device.
+    pub(crate) fn region_bytes(&self) -> u64 {
+        self.device
+            .as_ref()
+            .map_or(0, |cuda| cuda.region.bytes() as u64)
+    }
+
+    /// Takes over from `from`, the graphs of the shape the runner served until now, what counts
+    /// the runner's serving forwards across shapes: the expert load's counters, the shadow region
+    /// of paired forwards, the replays of each bucket, and the launches and forwards counted so
+    /// far. These graphs serve from here on, and a later [`Graphs::take_over`] gives it back.
+    ///
+    /// # Errors
+    ///
+    /// When the device cannot be waited for: `from`'s forwards are counted once the device
+    /// passed them.
+    pub(crate) fn take_over(&self, from: &Self) -> Result<()> {
+        from.settle()?;
+
+        if let (Some(cuda), Some(held)) = (&self.device, &from.device) {
+            let counters = held.load.borrow_mut().take();
+            *cuda.load.borrow_mut() = counters;
+        }
+
+        let mut held = from.state.borrow_mut();
+        held.settle();
+        let mut state = self.state.borrow_mut();
+        state.shadow = held.shadow.take();
+        state.uses = std::mem::take(&mut held.uses);
+        state.kernels = std::mem::take(&mut held.kernels);
+        state.launches = held.launches;
+        state.replays = held.replays;
+        state.eager = held.eager;
+        Ok(())
+    }
+
     /// Whether these are a rehearsal's graphs ([`Graphs::rehearsal`]): their input tensors lie
     /// in memory of their own, so what a forward over them writes at a fixed address a served
     /// step reads must be the forward instance's own.
@@ -1375,6 +1487,40 @@ impl Graphs {
         Ok(order)
     }
 
+    /// Begins preparing `next` beside the serving generation for paired forwards alone, when the
+    /// generation captures the runner's graphs for another shape of it (`Runner::reshape`): no
+    /// bucket of these graphs is examined, since the shape's graphs are captured for graphs of
+    /// their own ([`Graphs::over`]), and a paired forward of a bucket of these graphs compares
+    /// each kernel the generation replaces with the serving one ([`Graphs::shadow`]). The
+    /// preparation ends with [`Graphs::rollback`] of `next`, at the switch to the shape as when
+    /// the generation is given back. Beginning runs no forward.
+    ///
+    /// # Errors
+    ///
+    /// As [`Graphs::prepare`].
+    pub fn pair(&self, next: Arc<Generation>) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        if !matches!(state.update, Update::Steady) {
+            return Err(Error::State(
+                "a generation update is in flight: commit or roll it back first",
+            ));
+        }
+        if state.serving.number() == next.number() {
+            return Err(Error::Invariant(format!(
+                "generation {} serves and cannot be prepared beside itself",
+                next.number()
+            )));
+        }
+
+        state.uncompared.clear();
+        state.update = Update::Preparing {
+            next,
+            pending: BTreeSet::new(),
+            switched: BTreeSet::new(),
+        };
+        Ok(())
+    }
+
     /// The buckets of the generation being prepared whose outcome is not installed yet, in
     /// ascending order; empty when every one is, or no generation is being prepared.
     pub(crate) fn pending(&self) -> Vec<Bucket> {
@@ -1675,6 +1821,25 @@ impl Graphs {
             _ => 0,
         };
         graphs + rehearsal
+    }
+
+    /// The device bytes one graph of these graphs' instantiations takes, at the mean of the
+    /// serving graphs' (`Costs::bytes`): what a generation that captures the buckets of another
+    /// shape of the runner counts for each of them beside the serving graphs until it commits.
+    /// Zero for graphs that hold no device or no graph.
+    pub(crate) fn graph_bytes(&self) -> u64 {
+        let state = self.state.borrow();
+        let serving = state.serving.number();
+
+        let (mut bytes, mut graphs) = (0_u64, 0_u64);
+        for ((bucket, generation), graph) in &state.graphs {
+            let served = served(&state.graphs, serving, bucket).map(|(newest, _)| newest);
+            if served == Some(*generation) {
+                bytes += graph.costs.bytes;
+                graphs += 1;
+            }
+        }
+        bytes.checked_div(graphs).unwrap_or(0)
     }
 
     // ---- What the public operations share ----

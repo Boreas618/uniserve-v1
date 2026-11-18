@@ -52,7 +52,7 @@ pub(super) fn tier_refusal(
 /// variant. The drafter's bucket and an expert join serve no phase: the worker issues the first
 /// behind the batch it follows, and a union member's join batch states the phase of the member
 /// that asks for it.
-pub(super) fn served_phases(buckets: &Buckets) -> Vec<Phase> {
+pub(crate) fn served_phases(buckets: &Buckets) -> Vec<Phase> {
     Phase::ALL
         .into_iter()
         .filter(|phase| {

@@ -69,6 +69,13 @@ fn trace_whole_graphs() {
     set_graph_trace(true);
 }
 
+/// States how CUPTI records a graph's launch with no timeline running: whole, as the counters
+/// record it, or by its nodes, as it does beside PC sampling (`pc_sampling::switch`).
+pub(crate) fn set_whole_by_default(whole: bool) {
+    WHOLE_BY_DEFAULT.store(whole, Ordering::Release);
+    set_graph_trace(whole);
+}
+
 /// How CUPTI records a graph's launch with no timeline running.
 pub(crate) fn graphs_whole_by_default() -> bool {
     WHOLE_BY_DEFAULT.load(Ordering::Acquire)

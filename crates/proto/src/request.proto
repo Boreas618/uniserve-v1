@@ -617,6 +617,22 @@ message MeasureRoom {
   // The generation places the probes elsewhere, so every bucket is captured
   // again whatever kernels it replaces.
   bool recapture = 3;
+  // The options the generation's graphs are captured for; the serving
+  // generation's when absent. Other options capture every bucket of the
+  // shapes they give the runners, beside the storage those take.
+  optional GraphOptions graphs = 4;
+}
+
+// The options a generation's CUDA graphs are captured for, as the process
+// interface's `Prepare` states them (`proto::config::GraphOptions`).
+message GraphOptions {
+  repeated uint32 decode_batch_sizes = 1;
+  bool decode_stated = 2;
+  repeated uint32 prefill_token_sizes = 3;
+  bool prefill_stated = 4;
+  uint32 max_logprobs = 5;
+  uint32 num_draft_tokens = 6;
+  bool graph_pc_sampling = 7;
 }
 
 message RoomKernel {

@@ -449,7 +449,9 @@ fn a_shadow_pass_shadows_each_shape_once_and_answers_once_its_shadow_batches_end
     let (groups, messages) = groups(&route, &shadow);
 
     // Generation 2 is prepared beside the serving one.
-    let prepared = ranks[0].prepare(Arc::new(Generation::new(2, []))).unwrap();
+    let prepared = ranks[0]
+        .prepare(Arc::new(Generation::new(2, [])), None)
+        .unwrap();
     assert!(matches!(
         prepared.wait_timeout(LONG),
         Some(Outcome::Success(_))

@@ -1818,7 +1818,7 @@ fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared()
         .filter(|(operator, _)| *operator == "paged_attention");
     let next = Arc::new(serving.replace(2, entries(attention, &unlaunched_kernel())));
     assert!(matches!(
-        ended(worker.prepare(next)),
+        ended(worker.prepare(next, None)),
         Some(Outcome::Success(_))
     ));
 
@@ -2409,6 +2409,172 @@ fn over(cache: &KvCacheMemory, state: Option<&StateMemory>) -> CausalLmRunner {
         crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
     runner
+}
+
+/// The worker of one rank over a runner of [`Tiny`] over `cache`, serving generation 1, which
+/// holds a kernel for every key the runner launches, with every bucket captured.
+fn serving_worker(cache: &Arc<Mutex<KvCacheMemory>>) -> (Worker, Arc<Generation>) {
+    use testkit::LONG;
+
+    let keys = over(&lock(cache), None).graphs().keys();
+    let serving = Arc::new(Generation::new(1, entries(&keys, &unlaunched_kernel())));
+    let mut runner = CausalLmRunner::over(
+        Arc::new(Tiny::new(false)),
+        config(),
+        Graphs::meta(
+            Arc::clone(&serving),
+            CausalLmRunner::input_bytes(&config(), &Tiny::new(false)).unwrap(),
+        ),
+        None,
+        &lock(cache),
+        None,
+    )
+    .unwrap();
+    runner.set_page_work(wiring::page_work(Arc::clone(cache), None, None));
+
+    let sequences = Sequences::new(GroupId(0), 1, Vec::new());
+    let worker = Worker::spawn(
+        None,
+        vec![Box::new(runner)],
+        Arc::clone(&serving),
+        held(&[1, 2, 3]),
+        sequences,
+        0,
+    )
+    .unwrap();
+    let warmed = worker.warm_up().unwrap().wait_timeout(LONG);
+    assert!(matches!(warmed, Some(Outcome::Success(_))), "{warmed:?}");
+    (worker, serving)
+}
+
+/// The buckets the worker's runner serves from, and the candidates of its shape's samplers.
+fn served(worker: &Worker) -> Vec<Bucket> {
+    worker
+        .call("reading the served buckets", |runners| {
+            Ok(runners[0].graphs().buckets())
+        })
+        .unwrap()
+}
+
+/// Prepares on `worker` generation `number` of `options`, built from `serving` with a kernel
+/// for every key the options' shape launches, and waits until every bucket of the shape is
+/// installed.
+fn reshaped(
+    worker: &Worker,
+    serving: &Generation,
+    number: u64,
+    options: &crate::runner::GraphOptions,
+) {
+    use testkit::LONG;
+
+    let measured = worker.measure(options).unwrap();
+    let shape = measured[0]
+        .clone()
+        .expect("a causal runner takes graph options");
+    let next = Arc::new(serving.replace(number, entries(&shape.keys, &unlaunched_kernel())));
+    let reshape = Arc::new(crate::worker::Reshape {
+        options: options.clone(),
+        regions: vec![(None, shape.values)],
+        recapture: false,
+    });
+    let prepared = worker
+        .prepare(next, Some(reshape))
+        .unwrap()
+        .wait_timeout(LONG);
+    assert!(
+        matches!(prepared, Some(Outcome::Success(_))),
+        "{prepared:?}"
+    );
+    let ready = worker.ready(number, None).wait_timeout(LONG);
+    assert!(matches!(ready, Some(Outcome::Success(_))), "{ready:?}");
+}
+
+#[test]
+fn a_generation_of_other_graph_options_switches_the_runner_to_its_buckets_whole() {
+    use testkit::LONG;
+
+    let cache = Arc::new(Mutex::new(
+        KvCacheMemory::meta(cache_config(false)).unwrap(),
+    ));
+    let (worker, serving) = serving_worker(&cache);
+    let before = served(&worker);
+    let ended = |submission: crate::worker::Result<crate::worker::completion::Submission>| {
+        submission.unwrap().wait_timeout(LONG)
+    };
+
+    // The catalog drops the decode bucket of four rows and the prefill of eighty tokens, and
+    // gains a decode bucket of eight rows; a scored row reports one candidate fewer.
+    let options = crate::runner::GraphOptions {
+        buckets: Buckets::causal_lm(&[2, 8], &[8], true),
+        candidates: CANDIDATES - 1,
+        drafts: 0,
+    };
+    let after: Vec<Bucket> = Buckets::causal_lm(&[2, 8], &[8], true)
+        .iter()
+        .copied()
+        .collect();
+    reshaped(&worker, &serving, 2, &options);
+
+    // Prepared and captured, the shape serves nothing until the switch.
+    assert_eq!(served(&worker), before);
+    assert!(matches!(ended(worker.switch(2)), Some(Outcome::Success(_))));
+    assert_eq!(served(&worker), after);
+
+    // A rollback serves the kept shape again, whole.
+    assert!(matches!(
+        ended(worker.rollback(2)),
+        Some(Outcome::Success(_))
+    ));
+    assert_eq!(served(&worker), before);
+
+    // Prepared again and committed, the shape serves on, and a later generation of the same
+    // options captures its buckets again as any kernel generation does.
+    reshaped(&worker, &serving, 3, &options);
+    assert!(matches!(ended(worker.switch(3)), Some(Outcome::Success(_))));
+    assert!(matches!(ended(worker.commit(3)), Some(Outcome::Success(_))));
+    assert_eq!(served(&worker), after);
+    let next = Arc::new(Generation::new(
+        4,
+        entries(
+            &worker
+                .call("reading the served keys", |runners| {
+                    Ok(runners[0].graphs().keys())
+                })
+                .unwrap(),
+            &unlaunched_kernel(),
+        ),
+    ));
+    assert!(matches!(
+        ended(worker.prepare(next, None)),
+        Some(Outcome::Success(_))
+    ));
+    let order = worker.order(4).unwrap();
+    let examined: Vec<Bucket> = {
+        let mut buckets: Vec<Bucket> = order.into_iter().map(|(_, bucket)| bucket).collect();
+        buckets.sort();
+        buckets
+    };
+    assert_eq!(examined, after);
+    worker.close().unwrap();
+}
+
+#[test]
+fn options_the_runner_cannot_serve_in_place_prepare_nothing() {
+    let cache = Arc::new(Mutex::new(
+        KvCacheMemory::meta(cache_config(false)).unwrap(),
+    ));
+    let (worker, _) = serving_worker(&cache);
+
+    // A runner that speculates nothing takes no drafts in place: its cache lays out no draft
+    // cache.
+    let drafting = crate::runner::GraphOptions {
+        buckets: Buckets::causal_lm(&[2, 4], &[8, 80], true),
+        candidates: CANDIDATES,
+        drafts: 2,
+    };
+    let refused = worker.measure(&drafting).unwrap_err().to_string();
+    assert!(refused.contains("in place"), "{refused}");
+    worker.close().unwrap();
 }
 
 #[test]

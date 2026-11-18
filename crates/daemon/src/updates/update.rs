@@ -636,6 +636,7 @@ impl Update {
                 .fence_modules
                 .clone()
                 .map(|patterns| process::FenceModules { patterns }),
+            graphs: None,
         }));
         for node in &self.nodes {
             processes.command(&node.host, node.launch, prepare.clone());

@@ -653,6 +653,29 @@ message Prepare {
   // (`profiling_config.fence_modules`); the family's step stack when absent.
   // A bucket whose serving graph probes other classes is captured again.
   optional FenceModules fence_modules = 4;
+  // The options the generation's graphs are captured for; the serving
+  // generation's when absent. A generation of other options captures every
+  // bucket of the shapes they give the runners.
+  optional GraphOptions graphs = 5;
+}
+
+// The options a generation's CUDA graphs are captured for: the bucket catalog
+// (`cuda_graph_config`), the candidates a scored row reports
+// (`max_logprobs`), the drafts a verification holds at most
+// (`speculative_config.num_draft_tokens`), and whether CUPTI samples the
+// graphs' program counters (`profiling_config.graph_pc_sampling`).
+message GraphOptions {
+  // The decode batch sizes, when `decode_stated`; the worker's catalog
+  // otherwise.
+  repeated uint32 decode_batch_sizes = 1;
+  bool decode_stated = 2;
+  // The prefill token counts, when `prefill_stated`; the worker's catalog
+  // otherwise.
+  repeated uint32 prefill_token_sizes = 3;
+  bool prefill_stated = 4;
+  uint32 max_logprobs = 5;
+  uint32 num_draft_tokens = 6;
+  bool graph_pc_sampling = 7;
 }
 
 message FenceModules {

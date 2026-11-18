@@ -17,6 +17,11 @@
 //!    runner's graphs between two batches ([`Graphs::install`]) and states the bucket ready
 //!    ([`Readiness`]).
 //!
+//! A generation of other graph options hands, with its buckets, forward instances of the shapes
+//! it prepared (`Runner::reshaped_capturer`), which capture them in place of the runners' own for
+//! that work; once the shapes committed, the worker gives the thread instances of them, which
+//! capture every later generation ([`Capturer::renew`]).
+//!
 //! The thread touches nothing of the runners' graphs, which the worker thread alone does: it
 //! captures over its own instances, and a graph reaches the runner only through the worker's
 //! queue. Its device work is a rehearsal's, on streams no serving forward uses. A capture records
@@ -46,9 +51,12 @@ use crate::worker::{Error, Job, Result};
 /// so a key names one bucket on every rank.
 pub(crate) type Key = (usize, Bucket);
 
-/// Each runner's two forward instances on the capture thread: the capture instance and the
+/// A runner's two forward instances on the capture thread: the capture instance and the
 /// rehearsal instance (`Runner::capturer`).
-pub(crate) type Instances = Vec<(Box<dyn Forward>, Box<dyn Forward>)>;
+pub(crate) type Pair = (Box<dyn Forward>, Box<dyn Forward>);
+
+/// Forward instances of runners, by each runner's index among its worker's.
+pub(crate) type Instances = BTreeMap<usize, Pair>;
 
 /// A launch table, as a graph's serving table is handed to the capture thread.
 pub(crate) type Table = Vec<(&'static str, String, String)>;
@@ -60,15 +68,30 @@ pub(crate) struct Work {
     /// The generation that serves beside it, `None` at warm-up, when no bucket has a graph.
     pub(crate) serving: Option<Arc<Generation>>,
     /// The buckets in the order they are examined, each with the launch table of the graph it
-    /// serves from (`None` at warm-up).
+    /// serves from (`None` at warm-up, and for a bucket of a shape the generation prepared).
     pub(crate) buckets: Vec<(Key, Option<Table>)>,
+    /// The forward instances of the shapes the generation prepared, which capture their
+    /// runners' buckets in place of the thread's own for this work.
+    pub(crate) instances: Instances,
+    /// Whether every bucket is captured again, whatever its examination finds: CUPTI samples
+    /// the generation's graphs otherwise than the serving ones.
+    pub(crate) recapture: bool,
     /// Set once the generation was rolled back: the thread examines no further bucket of it.
     pub(crate) cancelled: Arc<AtomicBool>,
 }
 
+/// What a worker hands its capture thread, in order.
+enum Handed {
+    /// A generation's buckets to capture.
+    Work(Work),
+    /// The forward instances a runner's buckets are captured over from here on: those of the
+    /// shape it serves once a generation that reshaped it committed.
+    Renew(usize, Pair),
+}
+
 /// A worker's capture thread.
 pub(crate) struct Capturer {
-    work: Option<Sender<Work>>,
+    work: Option<Sender<Handed>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -85,7 +108,8 @@ impl Capturer {
         instances: Instances,
         queue: Arc<Queue>,
     ) -> Result<Self> {
-        let (work, handed) = crossbeam_channel::unbounded::<Work>();
+        let (work, handed) = crossbeam_channel::unbounded::<Handed>();
+        let mut instances = instances;
         let name = match device {
             Some(device) => format!("capture-{}", device.0),
             None => "capture-host".to_owned(),
@@ -102,8 +126,13 @@ impl Capturer {
                     _ => None,
                 };
 
-                for work in handed {
-                    capture(device, &instances, &queue, &work);
+                for handed in handed {
+                    match handed {
+                        Handed::Work(work) => capture(device, &instances, &queue, &work),
+                        Handed::Renew(runner, pair) => {
+                            instances.insert(runner, pair);
+                        }
+                    }
                 }
             })
             .map_err(|error| Error::transport_source("starting a capture thread", error))?;
@@ -120,9 +149,23 @@ impl Capturer {
     ///
     /// When the thread has stopped.
     pub(crate) fn submit(&self, work: Work) -> Result<()> {
+        self.send(Handed::Work(work))
+    }
+
+    /// Has the thread capture runner `runner`'s buckets over `pair` from here on, behind the
+    /// work handed before.
+    ///
+    /// # Errors
+    ///
+    /// When the thread has stopped.
+    pub(crate) fn renew(&self, runner: usize, pair: Pair) -> Result<()> {
+        self.send(Handed::Renew(runner, pair))
+    }
+
+    fn send(&self, handed: Handed) -> Result<()> {
         self.work
             .as_ref()
-            .and_then(|sender| sender.send(work).ok())
+            .and_then(|sender| sender.send(handed).ok())
             .ok_or(Error::State("the worker's capture thread has stopped"))
     }
 }
@@ -149,7 +192,7 @@ fn capture(device: Option<DeviceId>, instances: &Instances, queue: &Queue, work:
             break;
         }
 
-        let outcome = match instances.get(*runner) {
+        let outcome = match work.instances.get(runner).or_else(|| instances.get(runner)) {
             Some((capture, rehearsal)) => bucket_outcome(
                 device,
                 (&**capture, &**rehearsal),
@@ -176,7 +219,7 @@ fn capture(device: Option<DeviceId>, instances: &Instances, queue: &Queue, work:
     }
 
     // A rehearsal's memory is held only while its generation is captured.
-    for (_, rehearsal) in instances {
+    for (_, rehearsal) in instances.values().chain(work.instances.values()) {
         rehearsal.graphs().release_rehearsal();
     }
 }
@@ -202,7 +245,7 @@ fn bucket_outcome(
         &work.kernels,
     )?;
     let examined = began.elapsed();
-    if !plan.capture {
+    if !plan.capture && !work.recapture {
         return Ok(None);
     }
 

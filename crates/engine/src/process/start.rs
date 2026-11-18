@@ -105,6 +105,9 @@ pub struct Engine {
     /// What every group's captured buckets bound a step to, and the bounds a policy of this
     /// engine declares its limits within.
     pub(crate) ceilings: Ceilings,
+    /// What the serving generation's graphs bound every scheduler to (`Message::SetGraphs`):
+    /// what a rollback of a generation of other graph options restores.
+    pub(crate) graphs: Arc<crate::scheduler::GraphLimits>,
     /// The step values every scheduler reads from its next step on, which a `Tune` replaces.
     pub(crate) tuning: Arc<ArcSwap<Tuning>>,
     /// The requests every scheduler runs at once as it started: the deployment's
@@ -144,8 +147,11 @@ pub struct Engine {
     pub(crate) liveness: Option<Arc<Liveness>>,
     /// CUPTI's always-on counters of the ranks' streams and of the threads that wait for the
     /// devices, for as long as the engine serves; `None` without devices, or when the process is
-    /// not subscribed to CUPTI.
-    pub(crate) counters: Option<Counters>,
+    /// not subscribed to CUPTI. A kernel generation that switches PC sampling restarts them in
+    /// the mode it leaves (`crate::profiling::pc_sampling::switch`).
+    pub(crate) counters: Arc<Mutex<Option<Counters>>>,
+    /// The streams the counters record, by the name they state (`device`, `copy`).
+    pub(crate) streams: Arc<Vec<(&'static str, platform::Stream)>>,
     /// The video denoiser of a denoising rank of this process as its family describes it to
     /// request processing (`nn::family::Description::details`), which the daemon binds the video
     /// processor with; empty for an engine that generates no video.
@@ -165,6 +171,26 @@ pub(crate) struct SchedulerThread {
 }
 
 impl Engine {
+    /// What the engine holds its steps and its requests to under the serving generation's
+    /// graphs ([`super::shapes::Bounds`]).
+    pub(crate) fn bounds(&self) -> super::shapes::Bounds {
+        super::shapes::Bounds {
+            capacities: self.capacities.clone(),
+            ceilings: self.ceilings,
+            limits: self.limits.clone(),
+            scheduling: Arc::clone(&self.graphs),
+        }
+    }
+
+    /// Holds the engine's steps and requests to `bounds` from here on: what its schedulers took
+    /// with a generation's switch or rollback.
+    pub(crate) fn set_bounds(&mut self, bounds: super::shapes::Bounds) {
+        self.capacities = bounds.capacities;
+        self.ceilings = bounds.ceilings;
+        self.limits = bounds.limits;
+        self.graphs = bounds.scheduling;
+    }
+
     /// Each scheduler's inbox, in the order of the session's schedulers: what a job sends its
     /// messages to.
     pub(crate) fn inboxes(&self) -> Vec<Sender<Message>> {
@@ -325,12 +351,16 @@ impl Engine {
         }
 
         limits.features = features;
+        let graphs =
+            super::shapes::Bounds::of(capacities.clone(), ceilings, limits.clone(), scheduling)
+                .scheduling;
 
         Ok(Self {
             schedulers,
             limits,
             capacities,
             ceilings,
+            graphs,
             tuning,
             max_running_requests,
             served,
@@ -349,7 +379,8 @@ impl Engine {
             upstream: None,
             prepared: None,
             liveness: None,
-            counters: None,
+            counters: Arc::new(Mutex::new(None)),
+            streams: Arc::new(Vec::new()),
             video: Vec::new(),
         })
     }
@@ -408,7 +439,7 @@ impl Engine {
             }
         }
         // The counters record the streams the workers issue on, and stop before they close.
-        drop(counters);
+        drop(service::lock(&counters).take());
 
         // A worker's thread holds its runners, and an expert union's runners reach the other
         // members' workers: every queue closes before any worker is joined.
@@ -726,7 +757,8 @@ pub(crate) fn start(
     engine.workers = workers;
     engine.groups = Some(route);
     engine.binding = binding;
-    engine.counters = counters;
+    engine.counters = Arc::new(Mutex::new(counters));
+    engine.streams = Arc::new(streams);
     engine.head = Some(head);
     engine.kernels = kernels;
     engine.video = video;
@@ -899,10 +931,10 @@ fn start_peer(
         launch.revision,
     )));
     let operate = operations::operator(
-        Arc::clone(&binding),
-        workers.clone(),
+        (Arc::clone(&binding), workers.clone()),
         preparations,
         Arc::clone(&tuning),
+        launch.engine_config.clone(),
     );
     let upstream = Upstream::serve(channel, Arc::clone(&route), Arc::clone(&liveness), operate)?;
 
@@ -913,11 +945,26 @@ fn start_peer(
         capacities.iter().map(|(_, capacity)| capacity),
         &launch.engine_config.scheduler.policy_budget,
     );
+    let limits = launch.engine_config.model.generation_limits.clone();
+    // A peer runs no scheduler, whose limits a generation would move: its own are the launch's.
+    let graphs = super::shapes::Bounds::of(
+        capacities.clone(),
+        ceilings,
+        limits.clone(),
+        SchedulerConfig::of(
+            &launch.engine_config,
+            launch.engine_config.scheduler.max_batch.get(),
+            step_budget(&launch.engine_config, &ceilings),
+            Vec::new(),
+        ),
+    )
+    .scheduling;
     Ok(Engine {
         schedulers: Vec::new(),
-        limits: launch.engine_config.model.generation_limits.clone(),
+        limits,
         capacities,
         ceilings,
+        graphs,
         tuning,
         // A peer runs no scheduler: the scheduler node serves the deployment's requests within
         // its ranks' slots, and the peer states the launch's bound.
@@ -936,7 +983,8 @@ fn start_peer(
         upstream: Some(upstream),
         prepared: Some(prepared),
         liveness: Some(liveness),
-        counters,
+        counters: Arc::new(Mutex::new(counters)),
+        streams: Arc::new(streams),
     })
 }
 
@@ -968,7 +1016,7 @@ pub(crate) fn step_budget(config: &EngineConfig, ceilings: &Ceilings) -> usize {
 /// into the cache, so its grid takes at most the tokens a step's budget holds, and its features
 /// the bytes of that many tokens of the widest row a group of that kind writes
 /// (`Capacity::feature_bytes`).
-fn lowered(
+pub(super) fn lowered(
     configured: GenerationLimits,
     capacities: &[(GroupId, Capacity)],
     ceilings: &Ceilings,

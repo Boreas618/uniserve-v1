@@ -731,7 +731,8 @@ impl WeightBinding {
 
     /// What a generation update that replaces `operators` asks of every rank's device, this
     /// process's (`extra`, each rank's bytes beside what serves, by its device) then each
-    /// peer's, in rank order ([`UpdateRoom`]).
+    /// peer's, in rank order ([`UpdateRoom`]); a peer measures its own runners under `options`,
+    /// the generation's graph options where they differ from the serving ones.
     ///
     /// # Errors
     ///
@@ -739,10 +740,12 @@ impl WeightBinding {
     pub(crate) fn update_rooms(
         &self,
         operators: &BTreeSet<String>,
+        options: Option<&proto::config::GraphOptions>,
         extra: impl Fn(DeviceId) -> u64,
     ) -> Result<Vec<UpdateRoom>> {
         let answers = self.ask_peers(None, || DataOperation::UpdateRoom {
             operators: operators.iter().cloned().collect(),
+            options: options.cloned(),
         })?;
         let here = self.update_rooms_here(extra);
         let (mut rooms, peers) = both(here, answered::<Vec<UpdateRoom>>(answers))?;
@@ -1946,6 +1949,80 @@ impl WeightBinding {
 
         tracing::info!("the ranks sleep: their graph storage and KV planes are given back");
         Ok(tables)
+    }
+
+    /// Maps on the device of `worker`'s rank a region of `bytes` for its runner `runner`'s shape
+    /// under kernel generation `generation` (`GraphPool::open_region`).
+    ///
+    /// # Errors
+    ///
+    /// A worker of no rank of this process, or the pool's refusal.
+    pub(crate) fn open_region(
+        &self,
+        worker: &Arc<Worker>,
+        runner: crate::runner::RunnerId,
+        generation: u64,
+        bytes: u64,
+    ) -> Result<platform::DeviceRange> {
+        let rank = self
+            .ranks
+            .iter()
+            .map(|rank| lock(rank))
+            .find(|rank| {
+                rank.worker
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, worker))
+            })
+            .ok_or(Error::State("the worker serves no rank of this process"))?;
+        let graphs = Arc::clone(&rank.graphs);
+        drop(rank);
+
+        lock(&graphs).open_region(runner, generation, bytes)
+    }
+
+    /// Kernel generation `generation` committed: on every rank of this process, each region it
+    /// mapped becomes its runner's and the replaced one is given back
+    /// (`GraphPool::commit_regions`). A peer gives its own back as its process commits.
+    ///
+    /// # Errors
+    ///
+    /// The first pool's refusal; every rank's are given back all the same.
+    pub(crate) fn commit_regions(&self, generation: u64) -> Result<()> {
+        self.each_pool(|pool| pool.commit_regions(generation))
+    }
+
+    /// Gives back every region kernel generation `generation` mapped on this process's ranks
+    /// (`GraphPool::release_regions`).
+    ///
+    /// # Errors
+    ///
+    /// The first pool's refusal; every rank's are given back all the same.
+    pub(crate) fn release_regions(&self, generation: u64) -> Result<()> {
+        self.each_pool(|pool| pool.release_regions(generation))
+    }
+
+    /// Gives back every region a kernel generation before `generation` mapped on this process's
+    /// ranks (`GraphPool::release_regions_before`).
+    ///
+    /// # Errors
+    ///
+    /// The first pool's refusal; every rank's are given back all the same.
+    pub(crate) fn release_regions_before(&self, generation: u64) -> Result<()> {
+        self.each_pool(|pool| pool.release_regions_before(generation))
+    }
+
+    /// Calls `operation` on every rank's graph pool, whatever an earlier one returned, and
+    /// returns the first error.
+    fn each_pool(&self, operation: impl Fn(&mut GraphPool) -> Result<()>) -> Result<()> {
+        let mut first = Ok(());
+        for rank in &self.ranks {
+            let graphs = Arc::clone(&lock(rank).graphs);
+            let result = operation(&mut lock(&graphs));
+            if first.is_ok() {
+                first = result;
+            }
+        }
+        first
     }
 
     /// Has each rank's cache and state launch their own work from the generation the rank's

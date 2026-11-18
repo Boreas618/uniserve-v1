@@ -359,11 +359,12 @@ pub(crate) fn prefill_row_buckets(rows: u32) -> Vec<u32> {
 
 /// The buckets one runner captures, in the order it captures them.
 ///
-/// The set is fixed when its runner is built, from the build config's graph sizes
-/// (`cuda_graph_config`): a bucket the set does not hold is a configuration error found at
-/// startup, not a scheduling surprise at the first odd-sized batch. The vector is kept sorted
-/// ascending and scanned backwards for capture, so both hot paths are a single scan.
-#[derive(Clone, Default, Debug)]
+/// The set is fixed for each shape of its runner, from the build config's graph sizes
+/// (`cuda_graph_config`) at the start and from a kernel generation's own sizes after it: a bucket
+/// the set does not hold is a configuration error found when the set is made, not a scheduling
+/// surprise at the first odd-sized batch. The vector is kept sorted ascending and scanned
+/// backwards for capture, so both hot paths are a single scan.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Buckets {
     /// Every bucket, ascending by size.
     ascending: Vec<Bucket>,

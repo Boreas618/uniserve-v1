@@ -445,16 +445,18 @@ pub(crate) type Preparation = (u64, std::result::Result<(), String>);
 /// (`crate::executor::peers::Upstream::serve`): [`operate`] on `binding` and `workers`, this
 /// process's, reading the ends of this process's own preparations from `preparations`, which it
 /// waits for at most the comparison bound of `tuning`, the peer's step values, which a relayed
-/// `Tune` replaces.
+/// `Tune` replaces. `config` is the epoch's engine configuration, whose bounds the graph
+/// options of a measured generation are resolved against.
 pub(crate) fn operator(
-    binding: Arc<WeightBinding>,
-    workers: Vec<Arc<Worker>>,
+    (binding, workers): (Arc<WeightBinding>, Vec<Arc<Worker>>),
     preparations: Receiver<Preparation>,
     tuning: Arc<ArcSwap<Tuning>>,
+    config: proto::config::EngineConfig,
 ) -> Operate {
     Box::new(move |operation| {
         let preparations = (&preparations, &*tuning);
-        operate(&binding, &workers, preparations, operation).map_err(|error| format!("{error:#}"))
+        operate((&binding, &workers, &config), preparations, operation)
+            .map_err(|error| format!("{error:#}"))
     })
 }
 
@@ -465,8 +467,11 @@ pub(crate) fn operator(
 ///
 /// What the operation fails with.
 fn operate(
-    binding: &Arc<WeightBinding>,
-    workers: &[Arc<Worker>],
+    (binding, workers, config): (
+        &Arc<WeightBinding>,
+        &[Arc<Worker>],
+        &proto::config::EngineConfig,
+    ),
     (preparations, tuning): (&Receiver<Preparation>, &ArcSwap<Tuning>),
     operation: DataOperation,
 ) -> Result<Vec<u8>> {
@@ -500,10 +505,17 @@ fn operate(
             encoded(&binding.device_rooms(&groups, region)?)
         }
         Operation::WarmSegments { groups, region } => encoded(&binding.warm_here(&groups, region)?),
-        Operation::UpdateRoom { operators } => {
+        Operation::UpdateRoom { operators, options } => {
             let operators = operators.into_iter().collect();
+            let shapes = match &options {
+                Some(options) => super::generation::measure(
+                    workers,
+                    &super::shapes::runner_options(config, options)?,
+                )?,
+                None => super::generation::Shapes::new(),
+            };
             encoded(&super::generation::update_room_here(
-                workers, binding, &operators,
+                workers, binding, &operators, &shapes,
             )?)
         }
         Operation::LoweredLimits { fractions } => encoded(&binding.lowered_here(&fractions)?),

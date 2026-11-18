@@ -59,6 +59,13 @@
 //! its kernel stamp (`Batch::kernels`), so every rank replays it with graphs of one
 //! generation.
 //!
+//! A generation of other graph options (other buckets, candidates or drafts) prepares each
+//! runner's shape under them beside the serving one ([`Runner::reshape`]) and hands the capture
+//! thread every bucket of the shape, with forward instances of the shape for the work; every
+//! runner then switches to its shape whole, at one job ([`Worker::switch`]), keeps the shape it
+//! replaced until the commit and serves it again after a rollback. Once a shape committed, the
+//! capture thread captures over instances of it.
+//!
 //! ## The device block tables and the sequences
 //!
 //! The worker thread owns the rank's [`BlockTables`]. A completion the scheduler maps and a
@@ -192,9 +199,9 @@ pub use self::sequences::Sequences;
 use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::profiling;
 use crate::profiling::session::{Change, ProfileAnswer, Session};
-use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::runner::graphs::Graph;
+use crate::runner::{GraphOptions, Runner};
 
 use self::capture::{Capturer, Key, Readiness, Work};
 
@@ -207,6 +214,38 @@ type Started = (Vec<(RequestId, bool)>, Vec<usize>);
 /// batches: their operator launches (`ForwardStats::kernel_launches`) and the tokens their routed
 /// layers' experts took (`ForwardStats::expert_tokens`). The daemon's statistics period.
 const COUNT_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a kernel generation of other graph options prepares of a worker's runners
+/// ([`Worker::prepare`], [`Runner::reshape`]): the options, and for each runner, by its index
+/// among the worker's, the region its shape's graphs take (`None` for the runner's own) and the
+/// bytes of the input values of one replay of the shape ([`Measured`]). A runner whose
+/// computation no option shapes takes the generation in its graphs.
+pub(crate) struct Reshape {
+    pub(crate) options: GraphOptions,
+    pub(crate) regions: Vec<(Option<platform::DeviceRange>, u64)>,
+    /// Whether every bucket of the runners the options shape nothing of is captured again as
+    /// well: CUPTI samples the graphs' program counters otherwise than for the serving ones.
+    pub(crate) recapture: bool,
+}
+
+/// One runner's shape under a generation's graph options, measured by a profile run of its
+/// forward over graphs that hold no device ([`Worker::measure`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Measured {
+    /// The kernels the shape launches, as `(operator, key)`.
+    pub(crate) keys: BTreeSet<(&'static str, String)>,
+    /// The bytes of the region the shape's forwards allocate in, its input tensors included
+    /// (`Graphs::peak`).
+    pub(crate) peak: u64,
+    /// The bytes of host values one replay of the shape copies (`Graphs::input_peak`).
+    pub(crate) values: u64,
+    /// The bytes of the runner's region now: a shape whose peak it holds computes in it.
+    pub(crate) region: u64,
+    /// The device bytes the shape takes beside what serves until its generation commits: its
+    /// graphs' instantiations at the serving graphs' mean, a rehearsal's memory, the storage it
+    /// does not share, and its region when the runner's does not hold it.
+    pub(crate) extra: u64,
+}
 
 /// A control operation: what the worker calls with its runners at a batch boundary, with
 /// nothing in flight on the device. The runners are in the order the worker was given them,
@@ -260,8 +299,9 @@ pub(crate) enum Job {
     /// the serving generation: the warm-up.
     Capture,
     /// Begin preparing a generation beside the serving one on every runner and hand its buckets
-    /// to the capture thread, the most replayed first.
-    Prepare(Arc<Generation>),
+    /// to the capture thread, the most replayed first; with a reshape, a generation of other
+    /// graph options, whose runners capture every bucket of their shapes under them.
+    Prepare(Arc<Generation>, Option<Arc<Reshape>>),
     /// Install what the capture thread made of one bucket for the generation of this number:
     /// its graph, `None` for a bucket that keeps the graph it serves from, or the failure that
     /// ended the generation's captures.
@@ -335,7 +375,7 @@ impl Job {
             Self::Map { .. } => c"uniserve.worker.map",
             Self::Stamp(_) => c"uniserve.worker.stamp",
             Self::Capture => c"uniserve.worker.capture",
-            Self::Prepare(_) => c"uniserve.worker.prepare",
+            Self::Prepare(..) => c"uniserve.worker.prepare",
             Self::Captured { .. } => c"uniserve.worker.captured",
             Self::SwitchBuckets(..) => c"uniserve.worker.switch_buckets",
             Self::Switch(_) => c"uniserve.worker.switch",
@@ -381,7 +421,7 @@ impl std::fmt::Display for Job {
                 requests.len()
             ),
             Self::Capture => formatter.write_str("warming up: capturing the runners' buckets"),
-            Self::Prepare(next) => write!(formatter, "preparing generation {}", next.number()),
+            Self::Prepare(next, _) => write!(formatter, "preparing generation {}", next.number()),
             Self::Captured {
                 generation, key, ..
             } => write!(
@@ -487,6 +527,8 @@ pub struct Worker {
     counters: Arc<Counters>,
     /// What the generation update in flight has no comparison for; see [`Worker::uncompared`].
     uncompared: Arc<Mutex<Vec<String>>>,
+    /// Whether the device records a profiling session; see [`Worker::profiled`].
+    profiled: Arc<std::sync::atomic::AtomicBool>,
     /// The device's fault, which the worker thread settles; see [`Worker::on_fault`].
     fault: Arc<Fault>,
     thread: Option<JoinHandle<()>>,
@@ -540,19 +582,23 @@ impl Worker {
 
         // Each runner's forward is instanced twice for the capture thread: over graphs beside
         // the runner's, which capture, and over a rehearsal's, which run kernels' first uses.
-        let mut instances = Vec::with_capacity(runners.len());
-        for runner in &runners {
+        let mut instances = capture::Instances::new();
+        for (index, runner) in runners.iter().enumerate() {
             let graphs = runner.graphs();
-            instances.push((
-                runner.capturer(graphs.beside()?)?,
-                runner.capturer(graphs.rehearsal()?)?,
-            ));
+            instances.insert(
+                index,
+                (
+                    runner.capturer(graphs.beside()?)?,
+                    runner.capturer(graphs.rehearsal()?)?,
+                ),
+            );
         }
         let capturer = Capturer::spawn(device, instances, Arc::clone(&queue))?;
         let readiness = Arc::new(Readiness::default());
         let first = kernels.number();
         let counters = Arc::new(Counters::default());
         let uncompared = Arc::new(Mutex::new(Vec::new()));
+        let profiled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fault = Arc::new(Fault::default());
 
         let state = Thread {
@@ -565,6 +611,7 @@ impl Worker {
             cancelled: BTreeMap::new(),
             counters: Arc::clone(&counters),
             uncompared: Arc::clone(&uncompared),
+            profiled: Arc::clone(&profiled),
             unmeasured: Vec::new(),
             sticky: None,
             fault: Arc::clone(&fault),
@@ -596,6 +643,7 @@ impl Worker {
             queue,
             counters,
             uncompared,
+            profiled,
             fault,
             thread: Some(thread),
         })
@@ -750,8 +798,66 @@ impl Worker {
     /// # Errors
     ///
     /// Once the queue is closed.
-    pub(crate) fn prepare(&self, next: Arc<Generation>) -> Result<Submission> {
-        self.queue.submit(Job::Prepare(next))
+    pub(crate) fn prepare(
+        &self,
+        next: Arc<Generation>,
+        reshape: Option<Arc<Reshape>>,
+    ) -> Result<Submission> {
+        self.queue.submit(Job::Prepare(next, reshape))
+    }
+
+    /// Each runner's shape under `options`, in the worker's order, measured by a profile run of
+    /// its forward over graphs that hold no device on the calling thread, so the worker thread
+    /// only builds the forwards (`Runner::measure`); `None` for a runner whose computation no
+    /// option shapes. Nothing is allocated. A work thread's call, never the control thread's.
+    ///
+    /// # Errors
+    ///
+    /// Options a runner cannot serve in place, a profile run that fails, or the close of the
+    /// queue.
+    pub(crate) fn measure(&self, options: &GraphOptions) -> Result<Vec<Option<Measured>>> {
+        let asked = options.clone();
+        let measures = self.call("measuring the runners' shapes", move |runners| {
+            runners
+                .iter()
+                .map(|runner| {
+                    let graphs = runner.graphs();
+                    Ok(runner
+                        .measure(&asked)?
+                        .map(|measure| (measure, graphs.region_bytes(), graphs.graph_bytes())))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+
+        measures
+            .into_iter()
+            .map(|measured| {
+                let Some((measure, region, graph)) = measured else {
+                    return Ok(None);
+                };
+                let instance = &*measure.instance;
+                let graphs = instance.graphs();
+                graphs.profile_run(instance)?;
+
+                let peak = graphs.peak();
+                let buckets = instance.buckets().len() as u64;
+                // The shape's graphs and its rehearsal's memory, as large as its region, sit
+                // beside what serves; so does its region, when the runner's cannot hold it.
+                let own = if peak > region { peak } else { 0 };
+                let extra = graph
+                    .saturating_mul(buckets)
+                    .saturating_add(peak.max(region))
+                    .saturating_add(own)
+                    .saturating_add(measure.storage);
+                Ok(Some(Measured {
+                    keys: graphs.keys(),
+                    peak,
+                    values: graphs.input_peak(),
+                    region,
+                    extra,
+                }))
+            })
+            .collect()
     }
 
     /// A submission that completes once the outcome of every bucket of `keys` (every bucket the
@@ -763,17 +869,25 @@ impl Worker {
     }
 
     /// The device bytes a generation update that replaces `operators` takes on this worker's
-    /// device beside what serves, summed over its runners (`Graphs::update_bytes`). A work
-    /// thread's call, never the control thread's.
+    /// device beside what serves, summed over its runners (`Graphs::update_bytes`) but those
+    /// `shaped` names by their index, which the generation's graph options shape and whose
+    /// measure counts them instead (`Measured::extra`). A work thread's call, never the control
+    /// thread's.
     ///
     /// # Errors
     ///
     /// The close of the queue.
-    pub(crate) fn update_bytes(&self, operators: BTreeSet<String>) -> Result<u64> {
+    pub(crate) fn update_bytes(
+        &self,
+        operators: BTreeSet<String>,
+        shaped: Vec<bool>,
+    ) -> Result<u64> {
         self.call("reading what a generation update takes", move |runners| {
             Ok(runners
                 .iter()
-                .map(|runner| runner.graphs().update_bytes(&operators))
+                .enumerate()
+                .filter(|(index, _)| !shaped.get(*index).copied().unwrap_or(false))
+                .map(|(_, runner)| runner.graphs().update_bytes(&operators))
                 .sum())
         })
     }
@@ -822,6 +936,13 @@ impl Worker {
     /// Once the queue is closed.
     pub(crate) fn rollback(&self, number: u64) -> Result<Submission> {
         self.queue.submit(Job::Rollback(number))
+    }
+
+    /// Whether the device records a profiling session now: what a kernel generation that
+    /// switches CUPTI's PC sampling waits for the end of, since a session's collectors were
+    /// chosen against the mode it started under.
+    pub(crate) fn profiled(&self) -> bool {
+        self.profiled.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Changes the device's profiling session between two batches and returns the rank's
@@ -1008,6 +1129,8 @@ struct Thread {
     cancelled: BTreeMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     counters: Arc<Counters>,
     uncompared: Arc<Mutex<Vec<String>>>,
+    /// Whether `session` holds a session, as [`Worker::profiled`] states it.
+    profiled: Arc<std::sync::atomic::AtomicBool>,
     /// The kernels the generation being prepared adds, which nothing serving is compared with.
     unmeasured: Vec<String>,
     /// The context's sticky error, once one was seen: every launch after it fails, so the
@@ -1279,8 +1402,8 @@ impl Thread {
                 self.capture()?;
                 Ok(done)
             }
-            Job::Prepare(next) => {
-                self.prepare(&next)?;
+            Job::Prepare(next, reshape) => {
+                self.prepare(&next, reshape.as_deref())?;
                 Ok(done)
             }
             Job::Captured {
@@ -1314,7 +1437,10 @@ impl Thread {
 
                 // A session's collectors start and stop with nothing of the device in flight.
                 self.settle()?;
-                let changed = Session::change(&mut self.session, change, device)?;
+                let changed = Session::change(&mut self.session, change, device);
+                self.profiled
+                    .store(self.session.is_some(), std::sync::atomic::Ordering::Release);
+                let changed = changed?;
 
                 // A caller that stopped waiting has nothing to be told.
                 let _ = response.send(changed);
@@ -1771,43 +1897,48 @@ impl Thread {
             "warming up: {} buckets handed to the capture thread",
             buckets.len()
         ));
-        self.hand(kernels, None, buckets)
+        self.hand(kernels, None, buckets, (capture::Instances::new(), false))
             .inspect_err(|error| self.readiness.fail(number, error.to_string()))
     }
 
     /// Begins the preparation of `next` on every runner and hands its buckets to the capture
     /// thread: each runner's captured buckets, the most replayed first, with the launch table of
-    /// the graph each serves from.
-    fn prepare(&mut self, next: &Arc<Generation>) -> Result<()> {
+    /// the graph each serves from. Under `reshape`, a runner whose computation the options shape
+    /// prepares its shape under them instead and hands every bucket of the shape, which has no
+    /// graph yet, with forward instances of the shape for the capture thread; its serving graphs
+    /// prepare the generation for paired forwards alone (`Graphs::pair`).
+    fn prepare(&mut self, next: &Arc<Generation>, reshape: Option<&Reshape>) -> Result<()> {
         let number = next.number();
         let serving = self.serving()?;
 
         // The device prepares a generation on all of its runners or on none: a runner that
         // refuses it ends the preparation of the runners before it.
         let mut buckets = Vec::new();
-        for (index, runner) in self.runners.iter().enumerate() {
-            let order = match runner.graphs().prepare(&**runner, Arc::clone(next)) {
-                Ok(order) => order,
+        let mut instances = capture::Instances::new();
+        for index in 0..self.runners.len() {
+            let prepared = self.prepare_runner(index, next, reshape);
+            let (handed, shaped) = match prepared {
+                Ok(prepared) => prepared,
                 Err(error) => {
-                    for earlier in &self.runners[..index] {
-                        if let Err(error) = earlier.graphs().rollback(number) {
-                            tracing::warn!(
+                    for earlier in &mut self.runners[..=index] {
+                        let given_back = earlier
+                            .rollback_shape(number)
+                            .and_then(|_| earlier.graphs().rollback(number));
+                        if let Err(error) = given_back {
+                            tracing::debug!(
                                 %error,
                                 generation = number,
-                                "a refused preparation was not ended"
+                                "a refused preparation left nothing to end"
                             );
                         }
                     }
                     return Err(error);
                 }
             };
-
-            let graphs = runner.graphs();
-            buckets.extend(
-                order
-                    .into_iter()
-                    .map(|bucket| ((index, bucket), graphs.launch_table(&bucket))),
-            );
+            buckets.extend(handed);
+            if let Some(shaped) = shaped {
+                instances.insert(index, shaped);
+            }
         }
 
         // The update's evidence starts empty, but for the kernels it adds: nothing serving
@@ -1820,9 +1951,74 @@ impl Thread {
             device = ?self.device,
             generation = number,
             buckets = buckets.len(),
+            reshaped = instances.len(),
             "a generation's buckets were handed to the capture thread"
         );
-        self.hand(Arc::clone(next), Some(serving), buckets)
+        let recapture = reshape.is_some_and(|reshape| reshape.recapture);
+        self.hand(
+            Arc::clone(next),
+            Some(serving),
+            buckets,
+            (instances, recapture),
+        )
+    }
+
+    /// Begins `next` on runner `index` ([`Thread::prepare`]): the buckets it hands the capture
+    /// thread, and when it prepared a shape under `reshape`, the forward instances the capture
+    /// thread captures the shape's buckets over.
+    #[expect(
+        clippy::type_complexity,
+        reason = "one runner's part of a preparation, as its caller collects it"
+    )]
+    fn prepare_runner(
+        &mut self,
+        index: usize,
+        next: &Arc<Generation>,
+        reshape: Option<&Reshape>,
+    ) -> Result<(
+        Vec<(Key, Option<capture::Table>)>,
+        Option<(
+            Box<dyn crate::runner::Forward>,
+            Box<dyn crate::runner::Forward>,
+        )>,
+    )> {
+        let number = next.number();
+        let runner = self
+            .runners
+            .get_mut(index)
+            .ok_or_else(|| Error::Invariant(format!("the worker holds no runner {index}")))?;
+
+        let region = reshape.map(|reshape| reshape.regions.get(index).copied().unwrap_or_default());
+        let shaped = match (reshape, region) {
+            (Some(reshape), Some(region)) => {
+                runner.reshape(number, &reshape.options, Arc::clone(next), region)?
+            }
+            _ => false,
+        };
+        if !shaped {
+            let order = runner.graphs().prepare(&**runner, Arc::clone(next))?;
+            let graphs = runner.graphs();
+            let handed = order
+                .into_iter()
+                .map(|bucket| ((index, bucket), graphs.launch_table(&bucket)))
+                .collect();
+            return Ok((handed, None));
+        }
+
+        // The serving graphs compare the generation's kernels with their own in paired
+        // forwards; the shape's graphs take its captures, none of which they hold yet.
+        runner.graphs().pair(Arc::clone(next))?;
+        let (_, graphs) = runner
+            .reshaped()
+            .ok_or(Error::State("a runner that reshaped holds no shape"))?;
+        let capture = runner.reshaped_capturer(graphs.beside()?)?;
+        let rehearsal = runner.reshaped_capturer(graphs.rehearsal()?)?;
+        let handed = capture
+            .buckets()
+            .into_iter()
+            .map(|bucket| ((index, bucket), None))
+            .collect();
+        Ok((handed, Some((capture, rehearsal))))
     }
 
     /// Hands `buckets` of generation `kernels` to the capture thread, beside `serving`, and
@@ -1832,6 +2028,7 @@ impl Thread {
         kernels: Arc<Generation>,
         serving: Option<Arc<Generation>>,
         buckets: Vec<(Key, Option<capture::Table>)>,
+        (instances, recapture): (capture::Instances, bool),
     ) -> Result<()> {
         let number = kernels.number();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1843,6 +2040,8 @@ impl Thread {
             kernels,
             serving,
             buckets,
+            instances,
+            recapture,
             cancelled,
         })
     }
@@ -1864,7 +2063,13 @@ impl Thread {
             let runner = self.runners.get(index).ok_or_else(|| {
                 Error::Invariant(format!("the capture thread names runner {index}"))
             })?;
-            runner.graphs().install(&bucket, number, graph)
+            // A bucket of a shape the generation prepared is installed in the shape's graphs.
+            match runner.reshaped() {
+                Some((shaped, graphs)) if shaped == number => {
+                    graphs.install(&bucket, number, graph)
+                }
+                _ => runner.graphs().install(&bucket, number, graph),
+            }
         });
         match installed {
             Ok(()) => {
@@ -1914,8 +2119,18 @@ impl Thread {
             }
         }
 
-        for runner in &self.runners {
-            runner.graphs().switch(number)?;
+        // A runner that prepared a shape switches to it whole: its serving graphs end the
+        // pairing, which switched nothing, and the shape's graphs serve.
+        for runner in &mut self.runners {
+            if runner
+                .reshaped()
+                .is_some_and(|(shaped, _)| shaped == number)
+            {
+                runner.graphs().rollback(number)?;
+                runner.switch_shape(number)?;
+            } else {
+                runner.graphs().switch(number)?;
+            }
         }
         Ok(())
     }
@@ -1923,7 +2138,15 @@ impl Thread {
     /// Commits the trial of generation `number` on every runner, and drops the generations it
     /// replaced.
     fn commit(&mut self, number: u64) -> Result<()> {
-        let committed = self.on_every_runner(|runner| runner.graphs().commit(number));
+        // A runner that switched to a shape releases the one it kept, and the capture thread
+        // captures over instances of the shape that serves from here on.
+        let mut committed = Ok(());
+        for index in 0..self.runners.len() {
+            let result = self.commit_runner(index, number);
+            if committed.is_ok() {
+                committed = result;
+            }
+        }
 
         if committed.is_ok() {
             self.kernels.retain(|held, _| *held >= number);
@@ -1931,6 +2154,24 @@ impl Thread {
             self.readiness.forget(number);
         }
         committed
+    }
+
+    /// Commits generation `number` on runner `index` ([`Thread::commit`]).
+    fn commit_runner(&mut self, index: usize, number: u64) -> Result<()> {
+        let runner = self
+            .runners
+            .get_mut(index)
+            .ok_or_else(|| Error::Invariant(format!("the worker holds no runner {index}")))?;
+        if !runner.commit_shape(number)? {
+            return runner.graphs().commit(number);
+        }
+
+        let graphs = runner.graphs();
+        let instances = (
+            runner.capturer(graphs.beside()?)?,
+            runner.capturer(graphs.rehearsal()?)?,
+        );
+        self.capturer.renew(index, instances)
     }
 
     /// Rolls generation `number` back on every runner: the capture thread examines no further
@@ -1947,7 +2188,20 @@ impl Thread {
         self.readiness
             .fail(number, format!("generation {number} was rolled back"));
 
-        let rolled_back = self.on_every_runner(|runner| runner.graphs().rollback(number));
+        // A runner that switched to the generation's shape serves the kept one again; one that
+        // prepared a shape gives it back, and its serving graphs end the pairing.
+        let mut rolled_back = Ok(());
+        for runner in &mut self.runners {
+            let result = runner
+                .rollback_shape(number)
+                .and_then(|served| match served {
+                    true => Ok(()),
+                    false => runner.graphs().rollback(number),
+                });
+            if rolled_back.is_ok() {
+                rolled_back = result;
+            }
+        }
 
         // The generation's kernels go with its graphs, unless it is the one that still serves:
         // a rollback the graphs refused.
@@ -1962,20 +2216,6 @@ impl Thread {
             self.readiness.forget(number);
         }
         rolled_back
-    }
-
-    /// Calls `operation` on every runner, whatever an earlier one returned, so a failure on one
-    /// does not leave the others holding what the operation releases. Returns the first error.
-    fn on_every_runner(&self, operation: impl Fn(&dyn Runner) -> Result<()>) -> Result<()> {
-        let mut first = Ok(());
-
-        for runner in &self.runners {
-            let result = operation(&**runner);
-            if first.is_ok() {
-                first = result;
-            }
-        }
-        first
     }
 
     /// The generation the runners serve whole; a worker of no runner serves the one it started

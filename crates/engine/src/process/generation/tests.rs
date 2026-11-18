@@ -33,7 +33,7 @@ fn serving(node: &Node) -> Vec<u64> {
 fn prepares(node: &Node, generation: u64) -> bool {
     node.workers.iter().all(|worker| {
         let submission = worker
-            .prepare(Arc::new(Generation::new(generation, [])))
+            .prepare(Arc::new(Generation::new(generation, [])), None)
             .unwrap();
         matches!(submission.wait_timeout(LONG), Some(Outcome::Success(_)))
     })
@@ -77,6 +77,7 @@ fn on_trial() -> Node {
         &node.served,
         2,
         &policy(),
+        None,
     )
     .unwrap();
     node
@@ -96,7 +97,13 @@ fn a_switch_moves_the_schedulers_and_every_worker_to_the_generation() {
 fn a_commit_leaves_the_generation_on_trial_alone() {
     let node = on_trial();
 
-    commit(&node.schedulers, Some(&node.route), &node.workers, 2).unwrap();
+    commit(
+        &node.schedulers,
+        Some(&node.route),
+        (&node.workers, &node.binding),
+        2,
+    )
+    .unwrap();
     assert_eq!(node.served.kernels(), 2);
     assert_eq!(serving(&node), [2]);
     assert!(holds_one(&node));
@@ -112,8 +119,8 @@ fn a_rollback_leaves_the_kept_generation_alone() {
         Some(&node.route),
         &node.binding,
         &node.served,
-        2,
-        1,
+        (2, 1),
+        None,
     )
     .unwrap();
     assert_eq!(node.served.kernels(), 1);
@@ -136,6 +143,7 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
         &node.served,
         2,
         &refused,
+        None,
     );
     assert!(failed.is_err());
 
@@ -167,6 +175,7 @@ fn a_preparation_names_its_packages_with_their_arguments() {
     let prepare = Prepare {
         kernel_instance: None,
         fence_modules: None,
+        graphs: None,
         kernels: vec![
             kernel_to_wire(&every_key, &attention),
             kernel_to_wire(&pinned, &norm),
