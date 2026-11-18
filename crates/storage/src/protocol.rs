@@ -29,8 +29,9 @@
 //! deployment's head; the claim lasts while it is connected, and its token
 //! is what the deployment's workers state in their [`Role`]. Storage belongs
 //! to epochs: an epoch is the set of processes that executes one
-//! configuration of a deployment, and a deployment runs at most two at once
-//! while it updates. Each claim is made by one [`Claimant`] of its epoch (an
+//! configuration of a deployment, and a deployment runs several at once: each
+//! replica serves the epoch that last moved it, and an update adds its target
+//! beside them. Each claim is made by one [`Claimant`] of its epoch (an
 //! engine of the epoch, or the head on the epoch's behalf) and names the
 //! scopes that claimant places on the host and the epochs it retires: the
 //! server retains an epoch's storage of every scope some claimant of the
@@ -1153,6 +1154,10 @@ pub enum Request {
         epoch: u64,
         retire: Vec<u64>,
     },
+    /// End `epoch`'s retention of `scopes` on the host, whichever of its claimants named them:
+    /// the scopes of the replicas an update moved to another epoch while `epoch` serves the
+    /// deployment's other replicas. A tensor no epoch retains then is released.
+    Unclaim { epoch: u64, scopes: Vec<Scope> },
     /// Publish all listed committed epochs together. Claimed epochs remain
     /// private until this request, including during preparation and trial.
     /// Every listed epoch must be claimed by the head's deployment.
@@ -1686,6 +1691,10 @@ pub enum Response {
     Published,
     Claimed {
         claim: Claim,
+    },
+    /// What a [`Request::Unclaim`] released: the tensors no epoch retains any more.
+    Unclaimed {
+        released: u64,
     },
     Retained {
         released: u64,

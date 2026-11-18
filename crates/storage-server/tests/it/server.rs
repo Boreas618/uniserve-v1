@@ -672,6 +672,56 @@ fn a_claimant_s_claim_never_ends_another_claimant_s_retention() {
     assert!(retained_names(&mut daemon).is_empty());
 }
 
+/// An epoch that serves on after an update moved one of its replicas ends that replica's storage
+/// alone: `Unclaim` ends the epoch's retention of the moved scope whichever claimant named it,
+/// and the other replica's storage, and a later claim of the same claimant, keep the epoch's
+/// other scope.
+#[test]
+fn an_unclaim_ends_an_epochs_scope_and_keeps_its_others() {
+    let server = Running::start();
+    let mut claim = ::storage::ClaimClient::connect(&server.socket, "model").unwrap();
+    let mut observer = head(&server.socket);
+    let token = claim
+        .claim(
+            Claimant::Engine(1),
+            1,
+            vec![scope("model-0", 0)],
+            Vec::new(),
+        )
+        .unwrap();
+    claim
+        .claim(
+            Claimant::Engine(2),
+            1,
+            vec![scope("model-1", 0)],
+            Vec::new(),
+        )
+        .unwrap();
+    for (index, name, group) in [(1, "moved", "model-0"), (2, "staying", "model-1")] {
+        let mut worker = epoch_worker(&server.socket, scope(group, 0), 1, token);
+        let planes = memfd(&[1; 4]);
+        worker
+            .put(
+                vec![tensor(key(index), name, 0, 0, Access::Exclusive)],
+                &[(host(4), planes.as_fd())],
+            )
+            .unwrap();
+    }
+    assert_eq!(retained_names(&mut observer), vec!["moved", "staying"]);
+
+    assert_eq!(claim.unclaim(1, vec![scope("model-0", 0)]).unwrap(), 1);
+    assert_eq!(retained_names(&mut observer), vec!["staying"]);
+    claim
+        .claim(
+            Claimant::Engine(2),
+            1,
+            vec![scope("model-1", 0)],
+            Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(retained_names(&mut observer), vec!["staying"]);
+}
+
 /// Two epochs of one deployment share a scope without touching each other's
 /// storage: the head keeps one claim token for both, each epoch's `retain`
 /// releases its own tensors alone, and a claim that retires an epoch releases

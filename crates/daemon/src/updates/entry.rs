@@ -82,6 +82,101 @@ fn tunes(changes: &[proto::reload::Change]) -> bool {
     })
 }
 
+/// The serving engines of `replicas`, one node each ([`Leader::serving_nodes`]), each executing
+/// the epoch its replica serves.
+///
+/// # Errors
+///
+/// As [`Leader::serving_nodes`].
+fn serving_nodes_of(replicas: &[Arc<Replica>]) -> Result<Vec<Node>, UpdateError> {
+    let mut nodes: Vec<Node> = Vec::new();
+    for replica in replicas {
+        let Some(client) = replica.hold().client() else {
+            continue;
+        };
+        let config = service::lock(&replica.config)
+            .engine_config()
+            .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+        // The layout the replica serves in and its epoch, from what its engines were launched
+        // with.
+        let (layout, epoch) = service::lock(&replica.served)
+            .as_ref()
+            .map(|served| (served.engine_config.layout(), served.epoch))
+            .ok_or_else(|| {
+                UpdateError::Refused("a replica with an engine serves no launch".to_owned())
+            })?;
+        let ranks = crate::engine::control::world_hosts(&config)
+            .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+        let first_of = |host: &str| {
+            ranks
+                .iter()
+                .find(|ranks| ranks.host == host)
+                .map(|ranks| ranks.first)
+                .ok_or_else(|| {
+                    UpdateError::Refused(format!(
+                        "an engine serves on {host}, where its world places no rank"
+                    ))
+                })
+        };
+        let processes = client.processes();
+        let mut placed = Vec::with_capacity(processes.len());
+        for process in processes {
+            placed.push((first_of(&process.host)?, process));
+        }
+        let head = placed
+            .iter()
+            .find(|(first, _)| *first == 0)
+            .map(|(_, process)| process.engine)
+            .ok_or_else(|| {
+                UpdateError::Refused("no engine holds its world's first rank".to_owned())
+            })?;
+        for (rank, process) in placed {
+            let scopes = crate::engine::control::host_scopes(&config, &process.host);
+            nodes.push(Node::new(
+                process.host,
+                rank,
+                process.engine,
+                head,
+                scopes,
+                layout.clone(),
+                epoch,
+            ));
+        }
+    }
+    Ok(nodes)
+}
+
+/// The indices of the replicas an epoch change to `targets`, the launch of each target replica,
+/// running `modules`, moves to a new epoch: every replica when the change gives the deployment
+/// another number of replicas, and otherwise each replica whose launch the change touches: one
+/// that serves no launch, runs another engine package, or whose build part
+/// ([`EngineConfig::build_part`]) the target's differs from. A change that touches none, a
+/// change of the module set's build alone, moves them all.
+fn moved_replicas(
+    replicas: &[Arc<Replica>],
+    targets: &[proto::config::EngineArgs],
+    modules: &crate::epoch::ModuleSet,
+) -> Vec<usize> {
+    let every = (0..targets.len()).collect();
+    if targets.len() != replicas.len() {
+        return every;
+    }
+    let moved: Vec<usize> = replicas
+        .iter()
+        .zip(targets)
+        .enumerate()
+        .filter(|(_, (replica, target))| {
+            let served = service::lock(&replica.served);
+            served.as_ref().is_none_or(|served| {
+                served.modules.engine != modules.engine
+                    || served.engine_config.build_part() != target.engine_config.build_part()
+            })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if moved.is_empty() { every } else { moved }
+}
+
 /// Keeps an existing replica's assigned devices when an update changes its
 /// execution options without requesting a different set of ranks: each
 /// group of `target` that `served` places with as many ranks keeps the
@@ -377,59 +472,7 @@ impl Leader {
     /// Refuses a replica whose configuration does not place its world, an engine on a host its
     /// world places no rank on, or a world whose first rank no engine holds.
     fn serving_nodes(&self) -> Result<Vec<Node>, UpdateError> {
-        let mut nodes: Vec<Node> = Vec::new();
-        for replica in self.replicas() {
-            let Some(client) = replica.hold().client() else {
-                continue;
-            };
-            let config = service::lock(&replica.config)
-                .engine_config()
-                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-            // The layout the replica serves in, from what its engines were launched with.
-            let layout = service::lock(&replica.served)
-                .as_ref()
-                .map(|served| served.engine_config.layout())
-                .ok_or_else(|| {
-                    UpdateError::Refused("a replica with an engine serves no launch".to_owned())
-                })?;
-            let ranks = crate::engine::control::world_hosts(&config)
-                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-            let first_of = |host: &str| {
-                ranks
-                    .iter()
-                    .find(|ranks| ranks.host == host)
-                    .map(|ranks| ranks.first)
-                    .ok_or_else(|| {
-                        UpdateError::Refused(format!(
-                            "an engine serves on {host}, where its world places no rank"
-                        ))
-                    })
-            };
-            let processes = client.processes();
-            let mut placed = Vec::with_capacity(processes.len());
-            for process in processes {
-                placed.push((first_of(&process.host)?, process));
-            }
-            let head = placed
-                .iter()
-                .find(|(first, _)| *first == 0)
-                .map(|(_, process)| process.engine)
-                .ok_or_else(|| {
-                    UpdateError::Refused("no engine holds its world's first rank".to_owned())
-                })?;
-            for (rank, process) in placed {
-                let scopes = crate::engine::control::host_scopes(&config, &process.host);
-                nodes.push(Node::new(
-                    process.host,
-                    rank,
-                    process.engine,
-                    head,
-                    scopes,
-                    layout.clone(),
-                ));
-            }
-        }
-        Ok(nodes)
+        serving_nodes_of(&self.replicas())
     }
 
     /// Starts an update in its epoch form: `next`'s engines start beside the
@@ -454,8 +497,8 @@ impl Leader {
         let refused = |error: anyhow::Error| UpdateError::Refused(format!("{error:#}"));
         let replicas = self.replicas();
         let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
-        // Every engine process that serves, of every replica and on every
-        // node: each is drained by its launch generation.
+        // Every engine process that serves the deployment, on every node: those of the replicas
+        // the update moves are each drained by its launch generation, and the others serve on.
         let nodes = self.serving_nodes()?;
         if nodes.is_empty() {
             return Err(UpdateError::Refused(format!(
@@ -519,6 +562,39 @@ impl Leader {
         let launches =
             crate::leader::epoch_launches(&engine, &next.modules, target_epoch, revision)
                 .map_err(refused)?;
+        // The update moves the replicas the change touches, and the others serve on in the
+        // epochs they serve.
+        let moved = moved_replicas(&replicas, &launches, &next.modules);
+        let (moving, staying): (Vec<_>, Vec<_>) = replicas
+            .iter()
+            .enumerate()
+            .partition(|(index, _)| moved.contains(index));
+        let moving: Vec<Arc<Replica>> = moving.into_iter().map(|(_, r)| Arc::clone(r)).collect();
+        let staying: Vec<Arc<Replica>> = staying.into_iter().map(|(_, r)| Arc::clone(r)).collect();
+        let nodes = serving_nodes_of(&moving)?;
+        let bystanders = serving_nodes_of(&staying)?;
+        let predecessors: Vec<u64> = moved
+            .iter()
+            .map(|index| {
+                replicas
+                    .get(*index)
+                    .and_then(|replica| service::lock(&replica.served).as_ref().map(|s| s.epoch))
+                    .unwrap_or(serving.number())
+            })
+            .collect();
+        let launches: Vec<_> = launches
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| moved.contains(index))
+            .map(|(_, args)| args)
+            .collect();
+        if moved.len() < replicas.len() {
+            info!(
+                moved = ?moved,
+                replicas = replicas.len(),
+                "the epoch change moves the replicas it touches, and the others serve on"
+            );
+        }
         let configs: Vec<_> = launches
             .iter()
             .map(|args| args.engine_config.clone())
@@ -542,10 +618,10 @@ impl Leader {
         // names the epoch it succeeds.
         let mut launches = Vec::new();
         let mut targets = Vec::with_capacity(worlds.len());
-        for (args, _, numbers) in worlds {
+        for ((args, _, numbers), predecessor) in worlds.into_iter().zip(&predecessors) {
             let mut parked = args.clone();
             parked.predecessor = Some(proto::request::wire::Predecessor {
-                epoch: serving.number(),
+                epoch: *predecessor,
             });
             let (placing, numbering) = (Arc::clone(control), numbers.clone());
             let world =
@@ -594,6 +670,7 @@ impl Leader {
                 complete: processes_otherwise,
                 target_layouts,
                 retire: self.updates.take_retire(),
+                bystanders,
             },
             options.trial,
         );
@@ -608,6 +685,7 @@ impl Leader {
             crate::leader::Following::Epoch(crate::leader::EpochTarget {
                 control: Arc::clone(control),
                 targets,
+                moved,
                 config: Box::new(target.clone()),
                 epoch: target_epoch,
                 keep: options.in_flight == InFlight::Keep,

@@ -130,6 +130,7 @@ pub(crate) fn claim(
                 storage: None,
                 epoch: launch.epoch,
                 retire: Vec::new(),
+                release: Vec::new(),
             })),
         })),
     })?;

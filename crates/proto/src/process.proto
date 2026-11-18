@@ -324,6 +324,10 @@ message Claim {
   // Epochs of the deployment whose storage on the node ends: an epoch the
   // claiming one superseded at a commit, or one a rollback discarded.
   repeated uint64 retire = 6;
+  // Scopes `epoch` keeps no more on the node, whichever of its claimants
+  // named them: the replicas an update moved to another epoch while `epoch`
+  // serves the deployment's other replicas (`Request::Unclaim`).
+  repeated Scope release = 7;
 }
 
 message Scope {

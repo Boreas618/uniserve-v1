@@ -75,14 +75,17 @@ pub(crate) struct Node {
     /// ([`proto::config::EngineConfig::layout`]), which names its device regions: two engines of
     /// one layout share their regions and the segments in them.
     layout: proto::config::Layout,
+    /// The epoch it executes: the one its replica served when the update began, or the epoch
+    /// form's target.
+    epoch: u64,
 }
 
 impl Node {
     /// The engine of launch generation `launch` on `host`, whose first rank
     /// is group rank `rank`, of the world whose scheduler node's main
     /// process is of launch generation `head`, whose epoch's ranks on
-    /// `host` have the storage scopes `scopes`, and whose replica lays its
-    /// device memory out in `layout`.
+    /// `host` have the storage scopes `scopes`, whose replica lays its
+    /// device memory out in `layout`, and that executes epoch `epoch`.
     pub(crate) fn new(
         host: String,
         rank: u32,
@@ -90,6 +93,7 @@ impl Node {
         head: u64,
         scopes: Vec<process::Scope>,
         layout: proto::config::Layout,
+        epoch: u64,
     ) -> Self {
         Self {
             host,
@@ -99,6 +103,7 @@ impl Node {
             generation: None,
             scopes,
             layout,
+            epoch,
         }
     }
 
@@ -147,6 +152,10 @@ pub(crate) struct EpochSwitch {
     pub(crate) target_layouts: Vec<proto::config::Layout>,
     /// Epochs an earlier update dropped whose storage the next claim retires.
     pub(crate) retire: Vec<u64>,
+    /// The serving engines of the replicas the update leaves as they are, which go on serving
+    /// their epochs through it: a claim of an epoch they execute keeps their scopes, and the
+    /// update retires an epoch only once none of them executes it.
+    pub(crate) bystanders: Vec<Node>,
 }
 
 /// What `Preparing` and `Switching` do.
@@ -497,18 +506,75 @@ impl Update {
         keeping: &[Node],
         retire: &[u64],
     ) -> Result<(), String> {
-        for host in self.hosts() {
+        self.claim_releasing(processes, epoch, keeping, retire, &[])
+    }
+
+    /// [`Self::claim_everywhere`], also ending `epoch`'s retention of the scopes of `releasing`'s
+    /// engines on each host: the replicas the update moved off an epoch that still serves the
+    /// others.
+    fn claim_releasing(
+        &self,
+        processes: &mut Processes,
+        epoch: u64,
+        keeping: &[Node],
+        retire: &[u64],
+        releasing: &[Node],
+    ) -> Result<(), String> {
+        let scopes_on = |nodes: &[Node], host: &str| {
             let mut scopes: Vec<process::Scope> = Vec::new();
-            for node in keeping.iter().filter(|node| node.host == host) {
+            for node in nodes.iter().filter(|node| node.host == host) {
                 for scope in &node.scopes {
                     if !scopes.contains(scope) {
                         scopes.push(scope.clone());
                     }
                 }
             }
-            processes.claim(host, epoch, &scopes, retire)?;
+            scopes
+        };
+        for host in self.hosts() {
+            let scopes = scopes_on(keeping, host);
+            let released: Vec<process::Scope> = scopes_on(releasing, host)
+                .into_iter()
+                .filter(|scope| !scopes.contains(scope))
+                .collect();
+            processes.claim(host, epoch, &scopes, retire, &released)?;
         }
         Ok(())
+    }
+
+    /// The epochs the update's serving engines execute, each once, ascending.
+    fn previous_epochs(&self) -> BTreeSet<u64> {
+        self.nodes.iter().map(|node| node.epoch).collect()
+    }
+
+    /// The records of [`Self::previous_epochs`], which a generation update moves together; the
+    /// serving epoch's when no engine states one the daemon records.
+    fn previous_records(&self) -> Vec<Recorded> {
+        let recorded: Vec<Recorded> = self
+            .previous_epochs()
+            .into_iter()
+            .filter_map(|epoch| self.epochs.recorded(epoch))
+            .collect();
+        if recorded.is_empty() {
+            vec![self.serving]
+        } else {
+            recorded
+        }
+    }
+
+    /// The engines that execute `epoch` and go on serving through the update: the serving
+    /// engines of the replicas it leaves as they are.
+    fn bystanders_of(&self, epoch: u64) -> Vec<Node> {
+        match &self.form {
+            Form::Generation => Vec::new(),
+            Form::Epoch(trial) => trial
+                .switch
+                .bystanders
+                .iter()
+                .filter(|node| node.epoch == epoch)
+                .cloned()
+                .collect(),
+        }
     }
 
     /// Publishes the committed `epoch` at every node that claimed it
@@ -613,6 +679,7 @@ impl Update {
                         .map_or(launch.engine, |world| world.scheduler),
                     crate::engine::control::host_scopes(&launch.engine_config, &launch.host),
                     launch.engine_config.layout(),
+                    launch.epoch,
                 ));
             }
         }
@@ -835,7 +902,7 @@ impl Update {
         };
         match (self.phase, self.back, report.kind) {
             (Phase::Switching, back, Some(report::Kind::Drained(drained)))
-                if drained.epoch == self.serving.number() =>
+                if drained.epoch == self.nodes[node].epoch =>
             {
                 trial.drained.insert(node);
                 // Its drain was under way when the switch turned back: it is
@@ -860,8 +927,14 @@ impl Update {
     /// The previous epoch's engine `node` serves again for the rollback: new
     /// requests return to the previous epoch from the first such engine.
     fn previous_serves(&mut self, processes: &mut Processes, node: usize) {
-        if self.acknowledged.is_empty() && matches!(self.form, Form::Epoch(_)) {
-            processes.serve(self.serving.number());
+        // Each epoch the update's serving engines execute serves again from its first such engine.
+        let epoch = self.nodes[node].epoch;
+        let first = !self
+            .acknowledged
+            .iter()
+            .any(|acknowledged| self.nodes[*acknowledged].epoch == epoch);
+        if first && matches!(self.form, Form::Epoch(_)) {
+            processes.serve(epoch);
         }
         self.acknowledged.insert(node);
     }
@@ -928,7 +1001,13 @@ impl Update {
     /// refuses, or fails to keep them, keeps them on its GPUs: nothing else
     /// of the trial depends on it, and the status says why.
     fn keep_weights(&mut self, processes: &mut Processes, node: usize) {
-        let serving = self.serving.number();
+        let serving = self.nodes[node].epoch;
+        // An epoch that serves other replicas on the host keeps its storage there: what it
+        // keeps alone would release theirs.
+        let shared = self
+            .bystanders_of(serving)
+            .iter()
+            .any(|bystander| bystander.host == self.nodes[node].host);
         let Form::Epoch(trial) = &mut self.form else {
             return;
         };
@@ -944,6 +1023,13 @@ impl Update {
             .any(|kept| self.nodes[*kept].host == *host);
         trial.weights_kept.insert(node);
         if asked {
+            return;
+        }
+        if shared {
+            trial.kept = PreviousEpoch::Parked;
+            trial.host_refused.push(format!(
+                "{host}: epoch {serving} serves other replicas on the host, which keep its storage"
+            ));
             return;
         }
         let to_host = trial.switch.keeps == PreviousEpoch::Host;
@@ -999,7 +1085,11 @@ impl Update {
         // The decision first: an engine lost from here on is replaced by one
         // of the committed modules.
         match &mut self.form {
-            Form::Generation => self.epochs.committed(self.serving),
+            Form::Generation => {
+                for epoch in self.previous_records() {
+                    self.epochs.committed(epoch);
+                }
+            }
             Form::Epoch(trial) => {
                 trial.switch.record.status = EpochState::Serving;
                 self.epochs
@@ -1027,11 +1117,30 @@ impl Update {
                 for node in &self.nodes {
                     processes.stop(&self.group, Some(node.launch));
                 }
-                // The previous epoch's storage ends on every node while the
-                // target keeps its own.
-                self.claim_failed = self
-                    .claim_everywhere(processes, epoch, &targets, &[self.serving.number()])
+                // The previous epochs' storage ends on every node while the target keeps its
+                // own: an epoch no other replica executes is retired, and one that serves other
+                // replicas keeps their scopes and ends the moved replicas'.
+                let (retired, shared): (Vec<u64>, Vec<u64>) = self
+                    .previous_epochs()
+                    .into_iter()
+                    .partition(|previous| self.bystanders_of(*previous).is_empty());
+                let mut failed = self
+                    .claim_everywhere(processes, epoch, &targets, &retired)
                     .err();
+                for previous in shared {
+                    let moved: Vec<Node> = self
+                        .nodes
+                        .iter()
+                        .filter(|node| node.epoch == previous)
+                        .cloned()
+                        .collect();
+                    let staying = self.bystanders_of(previous);
+                    let released = self
+                        .claim_releasing(processes, previous, &staying, &[], &moved)
+                        .err();
+                    failed = failed.or(released);
+                }
+                self.claim_failed = failed;
             }
         }
     }
@@ -1229,14 +1338,13 @@ impl Update {
     /// The forward switch: once every target serves the serving engines are
     /// drained, and once every engine acknowledged the trial begins.
     fn progress_switch(&mut self, processes: &mut Processes) {
-        let serving = self.serving.number();
         if let Form::Epoch(trial) = &mut self.form {
             if !trial.draining && trial.serving.len() == trial.targets.len() {
                 trial.draining = true;
                 for (index, node) in self.nodes.iter().enumerate() {
                     if !trial.drained.contains(&index) {
                         let shrink = node.moves_across(&trial.switch.target_layouts);
-                        let drain = drain(serving, &trial.switch, shrink);
+                        let drain = drain(node.epoch, &trial.switch, shrink);
                         processes.command(&node.host, node.launch, drain);
                     }
                 }
@@ -1251,8 +1359,9 @@ impl Update {
         self.switched_in = self.switch_began.map(|began| began.elapsed());
         match &mut self.form {
             Form::Generation => {
-                self.epochs
-                    .switched(self.serving, self.target.modules.clone());
+                for epoch in self.previous_records() {
+                    self.epochs.switched(epoch, self.target.modules.clone());
+                }
             }
             Form::Epoch(trial) => {
                 trial.switch.record.status = EpochState::Trial;
@@ -1293,7 +1402,9 @@ impl Update {
                 }
                 // The record took the new modules only once they served.
                 if self.trial_began.is_some() {
-                    self.epochs.rolled_back(self.serving);
+                    for epoch in self.previous_records() {
+                        self.epochs.rolled_back(epoch);
+                    }
                 }
             }
             Form::Epoch(trial) => {
@@ -1319,10 +1430,23 @@ impl Update {
                 }
                 trial.switch.retire.push(trial.switch.epoch);
                 let retire = std::mem::take(&mut trial.switch.retire);
-                let nodes = self.nodes.clone();
-                self.claim_failed = self
-                    .claim_everywhere(processes, self.serving.number(), &nodes, &retire)
-                    .err();
+                // Each previous epoch keeps every scope it executes: the update's serving
+                // engines' and the replicas' it left as they were.
+                let mut failed = None;
+                for previous in self.previous_epochs() {
+                    let mut keeping: Vec<Node> = self
+                        .nodes
+                        .iter()
+                        .filter(|node| node.epoch == previous)
+                        .cloned()
+                        .collect();
+                    keeping.extend(self.bystanders_of(previous));
+                    let claimed = self
+                        .claim_everywhere(processes, previous, &keeping, &retire)
+                        .err();
+                    failed = failed.or(claimed);
+                }
+                self.claim_failed = failed;
             }
         }
         self.enter(Phase::RolledBack);

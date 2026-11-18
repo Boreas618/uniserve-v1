@@ -908,9 +908,10 @@ async fn prepared_successor(
         )
         .context("finishing the deployment the takeover names")?,
     );
-    // The successor adopts the epoch that serves.
+    // The successor adopts the epoch that serves, and below the epoch each other replica serves.
     {
-        let (record, process) = adopted_epoch(served_epoch, handoff.engine, &options, modules)?;
+        let (record, process) =
+            adopted_epoch(served_epoch, handoff.engine, &options, modules.clone())?;
         epoch_records.record(served_epoch, record);
         // The successor's observation store starts empty: the process it adopted is its first
         // `process` event.
@@ -947,6 +948,14 @@ async fn prepared_successor(
             Arc::clone(&leader.replicas.adapters),
         );
         let _ = replica.control.set(Arc::clone(&control));
+        // A replica an epoch update moved apart from the first serves an epoch of its own.
+        if epoch_records.recorded(served.epoch).is_none() {
+            let (record, process) =
+                adopted_epoch(served.epoch, handoff.engine, &options, modules.clone())?;
+            epoch_records.record(served.epoch, record);
+            recorder.process(&options.leader_host(), &process);
+            epoch_records.adopt_process(process);
+        }
         *service::lock(&replica.served) = Some(served);
         replica.adopt_pause(handoff.paused, handoff.asleep, handoff.sleep_paused);
         leader.updates.adopt_unavailable(handoff.unavailable);

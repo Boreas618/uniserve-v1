@@ -111,6 +111,7 @@ impl Deployment {
             PREVIOUS,
             scopes(0..1),
             self.layout(),
+            SERVING,
         )];
         if engines == 2 {
             self.engines.serve(SECOND);
@@ -121,6 +122,7 @@ impl Deployment {
                 SECOND,
                 scopes(1..2),
                 self.layout(),
+                SERVING,
             ));
         }
         nodes
@@ -176,6 +178,7 @@ impl Deployment {
             PREVIOUS,
             scopes(0..1),
             self.layout(),
+            SERVING,
         )];
         self.epoch_over(number, nodes, switch, trial)
     }
@@ -204,6 +207,7 @@ impl Deployment {
             complete: false,
             target_layouts: vec![self.layout()],
             retire: Vec::new(),
+            bystanders: Vec::new(),
         }
     }
 
@@ -663,6 +667,7 @@ fn a_switch_to_files_that_process_requests_otherwise_drains_completely() {
         PREVIOUS,
         scopes(0..1),
         deployment.layout(),
+        SERVING,
     )];
     let update = deployment.epoch_over(1, nodes, switch, LONG);
     deployment
@@ -912,6 +917,7 @@ fn an_epoch_update_covers_every_node_of_both_epochs() {
             PREVIOUS,
             scopes(0..2),
             deployment.layout(),
+            SERVING,
         ),
         Node::new(
             OTHER.to_owned(),
@@ -920,6 +926,7 @@ fn an_epoch_update_covers_every_node_of_both_epochs() {
             PREVIOUS,
             scopes(2..4),
             deployment.layout(),
+            SERVING,
         ),
     ];
     let switch = deployment.switch(vec![
@@ -1083,6 +1090,58 @@ fn an_epoch_update_moves_two_replicas_to_one() {
     );
     assert_eq!(deployment.status()["phase"], "trial");
     assert_eq!(*deployment.epochs.served().borrow(), TARGET);
+}
+
+/// An epoch update that moves one replica leaves the other serving its epoch: only the moved
+/// replica's engine drains and stops, the commit retires no epoch the other still executes, and
+/// it claims that epoch again with the other replica's scopes while ending the moved replica's;
+/// a rollback claims the epoch with both replicas' scopes.
+#[test]
+fn an_epoch_update_moves_one_replica_and_the_other_serves_on() {
+    let moving = |deployment: &mut Deployment| {
+        let mut nodes = deployment.nodes(2);
+        let staying = nodes.pop().expect("two serving engines");
+        let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
+        switch.bystanders = vec![staying];
+        let update = deployment.epoch_over(1, nodes, switch, LONG);
+        deployment.apply(update);
+        assert_eq!(names(&deployment.engines.received(PREVIOUS)), ["drain"]);
+        assert!(deployment.engines.received(SECOND).is_empty());
+        assert_eq!(deployment.status()["phase"], "trial");
+    };
+
+    let mut deployment = Deployment::new(Refusals::default());
+    moving(&mut deployment);
+    assert!(deployment.updater.commit().is_some());
+    deployment.run();
+    assert_eq!(deployment.engines.stops(), vec![Some(PREVIOUS)]);
+    let claims = deployment.engines.claims();
+    assert!(
+        claims.iter().all(|claim| !claim.retire.contains(&SERVING)),
+        "the epoch another replica executes is retired: {claims:?}"
+    );
+    let serving: Vec<_> = claims
+        .iter()
+        .filter(|claim| claim.epoch == SERVING)
+        .map(|claim| (claim.scopes.clone(), claim.release.clone()))
+        .collect();
+    assert_eq!(serving, [(scopes(1..2), scopes(0..1))]);
+
+    let mut deployment = Deployment::new(Refusals::default());
+    moving(&mut deployment);
+    deployment
+        .updater
+        .rollback(decision("the target answers worse"))
+        .expect("an update is on trial");
+    deployment.run();
+    assert_eq!(deployment.status()["phase"], "rolled_back");
+    let claims = deployment.engines.claims();
+    let kept: Vec<_> = claims
+        .iter()
+        .filter(|claim| claim.epoch == SERVING && claim.retire.contains(&TARGET))
+        .map(|claim| claim.scopes.clone())
+        .collect();
+    assert_eq!(kept, [scopes(0..2)]);
 }
 
 /// A replica added on another host leaves the layout of the replica already serving: the

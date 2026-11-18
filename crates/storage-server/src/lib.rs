@@ -1004,6 +1004,9 @@ impl Server {
             (Request::Publish { epochs }, Role::Head { deployment, .. }) => {
                 self.publish_epochs(id, &deployment, epochs)
             }
+            (Request::Unclaim { epoch, scopes }, Role::Head { deployment, .. }) => {
+                self.unclaim(id, &deployment, *epoch, scopes)
+            }
             (Request::KeepWeights { epochs, cache_keys }, Role::Head { deployment, .. }) => {
                 self.keep_weights(id, &deployment, epochs, cache_keys)
             }
@@ -1350,6 +1353,54 @@ impl Server {
             "a head claimed the deployment"
         );
         Ok(Handling::Response(Response::Claimed { claim }, Vec::new()))
+    }
+
+    /// `unclaim`: see [`Request::Unclaim`]. Every claimant of `epoch` stops naming `scopes`, and
+    /// the epoch's retention of them ends.
+    fn unclaim(
+        &mut self,
+        id: ClientId,
+        deployment: &str,
+        epoch: u64,
+        scopes: &[Scope],
+    ) -> Result<Handling, (ErrorKind, String)> {
+        let entry = self
+            .deployments
+            .get_mut(deployment)
+            .filter(|entry| entry.head == Some(id))
+            .ok_or_else(|| invalid("only the claiming head ends an epoch's scopes"))?;
+        if let Some(claimants) = entry.claimed.get_mut(&epoch) {
+            for named in claimants.values_mut() {
+                named.retain(|scope| !scopes.contains(scope));
+            }
+        }
+        let released: Vec<TensorId> = self
+            .tensors
+            .iter_mut()
+            .filter_map(|(tensor_id, tensor)| {
+                tensor.retainers.retain(|retainer| {
+                    retainer.scope.deployment != deployment
+                        || retainer.epoch != epoch
+                        || !scopes.contains(&retainer.scope)
+                });
+                tensor.retainers.is_empty().then_some(*tensor_id)
+            })
+            .collect();
+        let count = released.len() as u64;
+        for tensor_id in released {
+            self.remove_tensor(&tensor_id);
+        }
+        tracing::info!(
+            deployment,
+            epoch,
+            scopes = scopes.len(),
+            released = count,
+            "a head ended an epoch's retention of scopes"
+        );
+        Ok(Handling::Response(
+            Response::Unclaimed { released: count },
+            Vec::new(),
+        ))
     }
 
     /// Publish a committed set atomically before any reader can observe it.

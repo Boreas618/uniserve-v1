@@ -251,7 +251,8 @@ impl Processes {
     }
 
     /// Claims `epoch`'s storage on `host` for `scopes`, retiring `retire`'s
-    /// epochs, and holds the claim when it returns `Ok`: the claim is held
+    /// epochs and ending the epoch's retention of `release`'s scopes, and holds the claim when it
+    /// returns `Ok`: the claim is held
     /// before an engine of the epoch maps storage, so it is synchronous and
     /// has no matching report. `Err` says the node refused and holds nothing.
     pub(crate) fn claim(
@@ -260,6 +261,7 @@ impl Processes {
         epoch: u64,
         scopes: &[process::Scope],
         retire: &[u64],
+        release: &[process::Scope],
     ) -> Result<(), String> {
         let reply = self.request(process::request::Kind::Claim(process::Claim {
             host: host.to_owned(),
@@ -269,6 +271,7 @@ impl Processes {
             storage: None,
             epoch,
             retire: retire.to_vec(),
+            release: release.to_vec(),
         }))?;
         if reply.error.is_empty() {
             Ok(())
@@ -618,7 +621,7 @@ mod tests {
             rank: 0,
         }];
         processes
-            .claim("n0", 12, &scopes, &[11])
+            .claim("n0", 12, &scopes, &[11], &[])
             .expect("the node claims the epoch");
         let claims = engines.claims();
         assert_eq!(claims.len(), 1);

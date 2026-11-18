@@ -392,6 +392,15 @@ impl Client {
         }
     }
 
+    /// See [`Request::Unclaim`]: end `epoch`'s retention of `scopes`. Returns how many tensors
+    /// were released.
+    pub fn unclaim(&mut self, epoch: u64, scopes: Vec<Scope>) -> Result<u64> {
+        match self.request(&Request::Unclaim { epoch, scopes }, &[])?.0 {
+            Response::Unclaimed { released } => Ok(released),
+            other => Err(unexpected("unclaim", &other)),
+        }
+    }
+
     /// See [`Request::KeepWeights`]. Returns how many tensors were released.
     pub fn keep_weights(&mut self, epochs: Vec<u64>, cache_keys: Vec<Key>) -> Result<u64> {
         match self
@@ -1076,6 +1085,19 @@ impl ClaimClient {
     /// See [`Request::Publish`]: publish the committed `epochs` together.
     pub fn publish(&mut self, epochs: Vec<u64>) -> Result<()> {
         self.client.publish(epochs)
+    }
+
+    /// See [`Request::Unclaim`]: end `epoch`'s retention of `scopes`, which no claim of this
+    /// client names from now on. Returns how many tensors were released.
+    pub fn unclaim(&mut self, epoch: u64, mut scopes: Vec<Scope>) -> Result<u64> {
+        scopes.sort();
+        scopes.dedup();
+        for ((claimed, _), named) in &mut self.claimed {
+            if *claimed == epoch {
+                named.retain(|scope| !scopes.contains(scope));
+            }
+        }
+        self.client.unclaim(epoch, scopes)
     }
 
     /// See [`Request::KeepWeights`]: `epochs` keep their weights and the

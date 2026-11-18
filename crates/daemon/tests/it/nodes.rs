@@ -465,6 +465,7 @@ fn claim(engine: &mut Engine, host: &str, epoch: u64, rank: u32) {
         storage: None,
         epoch,
         retire: Vec::new(),
+        release: Vec::new(),
     }));
     assert!(
         matches!(claimed.kind, Some(reply::Kind::Claimed(_))),

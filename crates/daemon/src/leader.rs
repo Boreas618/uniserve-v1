@@ -342,6 +342,10 @@ pub(crate) struct EpochTarget {
     /// longer an engine that succeeds another, and its world's engines
     /// by host and launch generation, the scheduler node's first.
     pub(crate) targets: Vec<(proto::config::EngineArgs, Vec<(String, u64)>)>,
+    /// The deployment's replicas the targets replace, by index, in the order of `targets`: every
+    /// replica when the change gives the deployment another number of them, and otherwise the
+    /// replicas the change touches, the others serving on in their epochs.
+    pub(crate) moved: Vec<usize>,
     /// The configuration the target serves.
     pub(crate) config: Box<Config>,
     /// The epoch the target serves.
@@ -2470,8 +2474,9 @@ impl Replica {
         }
     }
 
-    /// [`Self::follow`] for the epoch form, for the deployment's every
-    /// replica.
+    /// [`Self::follow`] for the epoch form, for the deployment's replicas the update moves
+    /// (`EpochTarget::moved`): every replica, or the ones the change touches, the others serving
+    /// on in their epochs untouched.
     ///
     /// The two epochs need not have as many replicas: target replica `j` is
     /// served under the deployment's replica `j`, made when the serving epoch
@@ -2490,6 +2495,7 @@ impl Replica {
         let EpochTarget {
             control,
             targets,
+            moved,
             config,
             epoch,
             keep,
@@ -2499,7 +2505,18 @@ impl Replica {
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
-        let previous: Vec<Arc<Replica>> = registry.serving.borrow().clone();
+        // The replicas the update moves: every replica, or those the change touches, which their
+        // targets replace one for one while the others serve on as they are.
+        let deployment: Vec<Arc<Replica>> = registry.serving.borrow().clone();
+        let partial = moved.len() == targets.len() && moved.len() < deployment.len();
+        let previous: Vec<Arc<Replica>> = if partial {
+            moved
+                .iter()
+                .filter_map(|index| deployment.get(*index).cloned())
+                .collect()
+        } else {
+            deployment.clone()
+        };
         let mut phases = updater.watch();
 
         // While the targets prepare, their transfers yield to the serving
@@ -2547,7 +2564,8 @@ impl Replica {
                 .zip(&observers)
                 .enumerate()
                 .map(|(index, (target, observer))| {
-                    let sink = stats_sink(Arc::clone(observer), self.recorder.clone(), index);
+                    let ordinal = previous.get(index).map_or(index, |replica| replica.ordinal);
+                    let sink = stats_sink(Arc::clone(observer), self.recorder.clone(), ordinal);
                     let (control, processes) = (Arc::clone(&control), target.1.clone());
                     tokio::task::spawn_blocking(move || {
                         control.join_target(&processes, epoch, sink)
@@ -2674,7 +2692,13 @@ impl Replica {
                     replica.hold.serve(client);
                 }
             }
-            registry.serving.send_replace(serving.to_vec());
+            // A partial update replaces the moved replicas' engines in place: the deployment's
+            // replicas stay the same.
+            if partial {
+                registry.serving.send_replace(deployment.clone());
+            } else {
+                registry.serving.send_replace(serving.to_vec());
+            }
         };
         let target_clients: Vec<_> = clients.iter().cloned().map(Some).collect();
         let mut everyone = routed.clone();
@@ -3026,11 +3050,11 @@ impl Replica {
         });
     }
 
-    /// Whether the epoch this replica's engine executes is still the epoch the
-    /// deployment serves. A switch moves service to its target through the
-    /// frontend, and the replica's own engine is then the drained previous
-    /// epoch's: it keeps no standby and is not promoted, because nothing routes
-    /// to it and a promoted process would be a second engine of a released epoch.
+    /// Whether the epoch this replica's launch states is an epoch the deployment serves: each
+    /// replica serves the epoch that last moved it, which is serving or on trial. A switch moves
+    /// the replica's launch to its target, and its own engine is then the drained previous
+    /// epoch's: it keeps no standby and is not promoted, because nothing routes to it and a
+    /// promoted process would be a second engine of a released epoch.
     ///
     /// A replica whose deployment is ending, or that runs no engine of its own, serves no epoch;
     /// before the deployment recorded its first epoch, the epoch the replica starts is the one it
@@ -3046,10 +3070,16 @@ impl Replica {
         let Some(served) = service::lock(&self.served).as_ref().map(|args| args.epoch) else {
             return false;
         };
-        updater
-            .epochs()
-            .serving()
-            .is_none_or(|(epoch, _)| epoch.number() == served)
+        let epochs = updater.epochs();
+        if epochs.serving().is_none() {
+            return true;
+        }
+        epochs.get(served).is_some_and(|record| {
+            matches!(
+                record.status,
+                proto::admin::EpochState::Serving | proto::admin::EpochState::Trial
+            )
+        })
     }
 
     /// The failure-domain rules over `serving`'s engines: the rules this replica keeps, or

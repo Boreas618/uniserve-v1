@@ -369,6 +369,21 @@ impl ClaimHolder {
         let token = client
             .claim(claimant, claim.epoch, scopes, claim.retire.clone())
             .with_context(|| format!("claiming deployment {}", claim.deployment))?;
+        // The scopes of the replicas another epoch serves now end in this one.
+        if !claim.release.is_empty() {
+            let released = claim
+                .release
+                .iter()
+                .map(|scope| storage::Scope {
+                    deployment: claim.deployment.clone(),
+                    group: scope.group.clone(),
+                    rank: scope.rank,
+                })
+                .collect();
+            client
+                .unclaim(claim.epoch, released)
+                .with_context(|| format!("ending scopes of epoch {}", claim.epoch))?;
+        }
         restore(client, claim.epoch)?;
         tracing::info!(
             deployment = %claim.deployment,
