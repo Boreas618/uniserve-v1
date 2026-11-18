@@ -56,7 +56,8 @@ struct uniserve_dense_attention_call {
   int64_t kv_tokens;
   /// Rows of the longest query sequence: the module pads to at least this.
   int64_t max_q_len;
-  /// Rows of the longest key sequence, which the descriptor bounds.
+  /// The descriptor's [`DenseDescriptor::max_kv_len`]: the bound on the key rows a call packs,
+  /// which `kv_tokens` is within.
   int64_t max_kv_len;
   /// Query heads.
   int64_t q_heads;

@@ -189,7 +189,8 @@ pub struct DenseCall {
     pub kv_tokens: i64,
     /// Rows of the longest query sequence: the module pads to at least this.
     pub max_q_len: i64,
-    /// Rows of the longest key sequence, which the descriptor bounds.
+    /// The descriptor's [`DenseDescriptor::max_kv_len`]: the bound on the key rows a call packs,
+    /// which `kv_tokens` is within.
     pub max_kv_len: i64,
     /// Query heads.
     pub q_heads: i64,

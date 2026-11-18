@@ -133,6 +133,11 @@ def call_of(
 ):
     """A call over packed `[tokens, heads, head_dim]` rows; `offsets` are the
     two `[batch + 1]` tables, or `None` for a call that carries none.
+
+    `max_kv_len` is what `dense.rs::launch` hands the module: the descriptor's
+    bound on the key rows a call packs, which `DenseAttention::check` holds
+    every launch's `kv_tokens` to. The tightest descriptor that admits the
+    call states exactly its packed key rows.
     """  # noqa: D205
     q_tokens, q_heads, head_dim = query.shape
     kv_tokens, kv_heads, _ = key.shape
@@ -147,7 +152,7 @@ def call_of(
     call.q_tokens = q_tokens
     call.kv_tokens = kv_tokens
     call.max_q_len = max_q_len
-    call.max_kv_len = int(lengths.max())
+    call.max_kv_len = kv_tokens
     call.q_heads = q_heads
     call.kv_heads = kv_heads
     call.head_dim = head_dim
@@ -530,7 +535,7 @@ def fa4_reference(query, key, value, cu_seqlens_q, cu_seqlens_k, scale, causal):
         grouped = rows.shape[0] // keys.shape[0]
         keys = keys.repeat_interleave(grouped, dim=0)
         values = values.repeat_interleave(grouped, dim=0)
-        logits = torch.einsum("thd,hkd->thk", rows, keys) * scale
+        logits = torch.einsum("htd,hkd->htk", rows, keys) * scale
         if causal:
             queries = torch.arange(q_end - q_start, device=query.device)
             keyed = torch.arange(k_end - k_start, device=query.device)
@@ -540,7 +545,7 @@ def fa4_reference(query, key, value, cu_seqlens_q, cu_seqlens_k, scale, causal):
             logits = logits.masked_fill(hidden[None, :, :], float("-inf"))
         weights = torch.softmax(logits, dim=-1)
         out[q_start:q_end] = torch.einsum(
-            "thk,hkd->thd", weights, values
+            "htk,hkd->htd", weights, values
         ).transpose(0, 1)
     return out
 
