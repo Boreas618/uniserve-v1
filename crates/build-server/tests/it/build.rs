@@ -430,6 +430,7 @@ fn the_release_programs_are_built_from_their_installed_snapshots() {
             "chunk",
             "expert-order",
             "layout",
+            "role",
             "ttft"
         ]
     );
