@@ -120,7 +120,7 @@ def test_the_cache_makes_room_for_a_session_and_grows_back(
     assert _room(during) >= 0, during
 
     stopped = profiling.stop(served, started)
-    assert stopped["end_reason"] == "operator", stopped
+    assert stopped["end_reason"] == "changed", stopped
     after = _quota(served, after=admin.now(served))
     assert _bytes(after, "process") == _bytes(before, "process"), after
     assert _bytes(after, "cache_segment") == _bytes(before, "cache_segment"), (
