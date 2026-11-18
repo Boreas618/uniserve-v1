@@ -8,7 +8,7 @@
 use proto::config::WorkerGroupConfig;
 
 /// FastH3 on one host of eight devices: the `text` group's eight ranks encode prompts eight-way
-/// tensor parallel, and eight one-rank `flow` replicas serve every other phase, replica `i` on
+/// tensor parallel, and eight one-rank `flow` copies serve every other phase, copy `i` on
 /// the device of text rank `i`, each reading and muxing its own requests.
 const FASTH3_DP8_TEXT_TP8: &str = r#"
 [[worker_groups]]
@@ -22,7 +22,7 @@ tensor_parallel_size = 8
 
 [[worker_groups]]
 id = "flow"
-replicas = 8
+copies = 8
 ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.81
@@ -54,7 +54,7 @@ ranks = [0]
 const FASTH3_ULYSSES4X2_TWO_HOST: &str = r#"
 [[worker_groups]]
 id = "text"
-replicas = 2
+copies = 2
 ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
 queue_depth = 6
 mem_fraction_static = 0.26
@@ -64,7 +64,7 @@ tensor_parallel_size = 4
 
 [[worker_groups]]
 id = "flow"
-replicas = 2
+copies = 2
 ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
 queue_depth = 6
 mem_fraction_static = 0.73
