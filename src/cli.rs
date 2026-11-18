@@ -3,8 +3,8 @@
 //! One executable runs every UniServe process, each as a command. The public
 //! commands are `serve` (a node's daemon, and on the leader the application),
 //! `keys` (the key list a deployment's main processes launch),
-//! `storage-server` (a host's Storage Server) and `build-server` (a host's
-//! Build Server); the host services' commands are their crates' own
+//! `storage-server` (a deployment's Storage Server on a node) and `build-server`
+//! (a deployment's Build Server on a node); their commands are their crates' own
 //! (`storage_server::command`, `build_server::command`). `engine` (a node's
 //! main process for one epoch) is started by the daemon and hidden from the
 //! help. The binary's own options, its log levels, are global; each command

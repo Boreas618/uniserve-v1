@@ -188,6 +188,7 @@ fn offset(gpu: u32) -> u64 {
 /// Takes the open file description lock of `gpu`'s slot in `file` without waiting; whether it
 /// was taken, `false` when another open file description holds it.
 fn lock(file: &File, gpu: u32) -> io::Result<bool> {
+    // SAFETY: `flock` is a plain C struct of integers, for which all zero bytes are a value.
     let mut range: libc::flock = unsafe { std::mem::zeroed() };
     range.l_type = libc::F_WRLCK as libc::c_short;
     range.l_whence = libc::SEEK_SET as libc::c_short;

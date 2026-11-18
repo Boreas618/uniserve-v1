@@ -29,7 +29,7 @@ service.workspace = true
 # The one phase vocabulary of operator calls and package slots (`module::Phase`).
 scheduling.workspace = true
 sha2.workspace = true
-# The settings of the host services a deployment states: the Mooncake connector of its Storage
+# The settings of the servers a deployment states: the Mooncake connector of its Storage
 # Servers (`kv_cache_config.mooncake`).
 storage.workspace = true
 thiserror.workspace = true

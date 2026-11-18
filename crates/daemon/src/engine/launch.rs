@@ -148,6 +148,7 @@ mod tests {
             "revision",
             "predecessor",
             "expert_order",
+            "deployment",
             "host",
             "requests",
             "processes",
@@ -168,6 +169,7 @@ mod tests {
         .collect::<BTreeSet<_>>();
         assert_eq!(keys, expected);
         assert_eq!(value["engine"], json!(7));
+        assert_eq!(value["deployment"], json!("model"));
         assert_eq!(value["epoch"], json!(12));
         assert_eq!(value["devices"], json!([0, 1]));
         assert_eq!(value["queue_depth"], json!(4));

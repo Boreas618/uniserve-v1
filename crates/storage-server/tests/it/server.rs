@@ -646,59 +646,6 @@ fn scope_of(deployment: &str) -> Scope {
     }
 }
 
-#[test]
-fn a_claim_retires_every_deployment_whose_head_is_gone() {
-    let server = Running::start();
-    // A deployment whose head leaves keeps a tensor.
-    let mut gone = head_of(&server.socket, "gone");
-    let claim = gone
-        .claim(Claimant::Head, 0, vec![scope_of("gone")], Vec::new())
-        .unwrap();
-    let mut gone_worker = worker(&server.socket, scope_of("gone"), 1, claim);
-    let storage = memfd(&[1; 4]);
-    gone_worker
-        .put(
-            vec![tensor(key(1), "gone", 0, 0, Access::ReadOnly)],
-            &[(host(4), storage.as_fd())],
-        )
-        .unwrap();
-    gone_worker.close().unwrap();
-    gone.close().unwrap();
-    // A deployment whose head stays keeps its tensor.
-    let mut kept = head_of(&server.socket, "kept");
-    let kept_claim = kept
-        .claim(Claimant::Head, 0, vec![scope_of("kept")], Vec::new())
-        .unwrap();
-    let mut kept_worker = worker(&server.socket, scope_of("kept"), 1, kept_claim);
-    let kept_storage = memfd(&[2; 4]);
-    kept_worker
-        .put(
-            vec![tensor(key(2), "kept", 0, 0, Access::ReadOnly)],
-            &[(host(4), kept_storage.as_fd())],
-        )
-        .unwrap();
-
-    // A new deployment's claim retires the one whose head left.
-    let mut operator = Client::connect(&server.socket, Role::Operator).unwrap();
-    head_of(&server.socket, "new")
-        .claim(Claimant::Head, 0, vec![scope_of("new")], Vec::new())
-        .unwrap();
-    let listing = operator.list().unwrap();
-    let tensors: Vec<&str> = listing
-        .tensors
-        .iter()
-        .map(|listed| listed.name.as_str())
-        .collect();
-    assert_eq!(tensors, ["kept"]);
-    let deployments: Vec<String> = listing
-        .deployments
-        .into_iter()
-        .map(|listed| listed.deployment)
-        .collect();
-    assert!(!deployments.contains(&"gone".to_owned()));
-    assert!(deployments.contains(&"kept".to_owned()));
-}
-
 /// A worker of `scope` in `epoch`.
 pub(crate) fn epoch_worker(socket: &Path, scope: Scope, epoch: u64, claim: Claim) -> Client {
     Client::connect(
@@ -1159,6 +1106,46 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
         assert_eq!(head.keep_weights(vec![1], Vec::new()).unwrap(), 1);
         assert!(head.list().unwrap().tensors.is_empty());
     }
+}
+
+/// A running server takes the settings it reads when it acts: new host storage its reserve
+/// refused is admitted once the operator lowers the reserve, and the server states the settings
+/// it serves with from then on. A setting fixed when its processes start is refused, and the
+/// server serves on with the settings it had.
+#[test]
+fn a_running_server_takes_the_settings_it_reads_when_it_acts() {
+    let server = Running::reserving(u64::MAX);
+    let mut head = head(&server.socket);
+    let claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
+    let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
+    let refused = worker.allocate_host(key(42), "staged cache".into(), 4096);
+    assert_eq!(server_error(refused), ErrorKind::Resource);
+
+    let mut operator = Client::connect(&server.socket, Role::Operator).unwrap();
+    let lowered = ::storage::ServerSettings {
+        host_reserve_gib: 0,
+        transfer_deadline_s: 5,
+        shoot_down_s: 5,
+        ..::storage::ServerSettings::default()
+    };
+    operator.configure(lowered.clone()).unwrap();
+    let (admitted, _) = worker
+        .allocate_host(key(42), "staged cache".into(), 4096)
+        .unwrap();
+    assert_eq!(admitted.tensors[0].shape, [4096]);
+    assert_eq!(operator.status().unwrap().settings.server, lowered);
+
+    let listening = ::storage::ServerSettings {
+        tcp: Some("127.0.0.1:0".parse().unwrap()),
+        ..lowered.clone()
+    };
+    assert_eq!(
+        server_error(operator.configure(listening)),
+        ErrorKind::Invalid
+    );
+    assert_eq!(operator.status().unwrap().settings.server, lowered);
 }
 
 /// A server serves a client of its own protocol version alone: such a client

@@ -79,8 +79,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use storage::ServerSettings;
 use storage::protocol::{
-    ErrorKind, Event, HostCopy, Key, Location, PageShape, Priority, Region, RegionPart,
-    Response, Role, Segment, Span, StorageRecord, UnitRun,
+    ErrorKind, Event, HostCopy, Key, Location, PageShape, Priority, Region, RegionPart, Response,
+    Role, Segment, Span, StorageRecord, UnitRun,
 };
 use storage::runtime::{Open, RequestId, Source, Tier};
 
@@ -2034,5 +2034,4 @@ impl Server {
         let number = *number;
         self.cancel_pool_transfer(number);
     }
-
 }

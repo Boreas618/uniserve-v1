@@ -240,7 +240,7 @@ crates/models/          The model families, one crate with a module per family, 
 crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, the HTTP server and its connections, metrics, the served model, the engine's client, and the API server: the OpenAI-compatible API, input processing (templates, tokenization, media) and output processing (detokenization, parsers, response bodies)
 crates/service/         Host services: the per-user socket, its owner lock, a detached start and the start of an absent service; the one connection every process interface runs on
 crates/media/           H.264/AAC output encoding and MP4 muxing, conditional media reading and host resamplers
-crates/build-server/  The Build Server: builds packages into modules, keeps them and hands them out; one host service per host and user
+crates/build-server/  The Build Server: builds packages into modules, keeps them and hands them out; one per deployment and node
 crates/testkit/         Test doubles at the engine's seams: the executor of a worker group (`FakeExecutor`), the Storage Server's buffer pool in process (`InProcessPool`) and a fake engine over both; never in a serving build
 crates/manager/         `uniserve-manager`: an optional multi-node manager, a client of each node's `/admin`
 tools/eval/             `uniserve-eval`, the serving evaluator

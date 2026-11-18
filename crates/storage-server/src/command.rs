@@ -48,7 +48,10 @@ const PREDECESSOR_OPTION: &str = "predecessor";
 
 /// The `storage-server` command's arguments.
 #[derive(Debug, clap::Parser)]
-#[command(name = "storage-server", about = "A deployment's Storage Server on one node")]
+#[command(
+    name = "storage-server",
+    about = "A deployment's Storage Server on one node"
+)]
 pub struct Args {
     #[command(subcommand)]
     pub command: Command,
@@ -271,11 +274,7 @@ pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> 
             } else {
                 crate::Rendering::Text
             };
-            crate::list(
-                &server.socket()?,
-                rendering,
-                &mut std::io::stdout().lock(),
-            )
+            crate::list(&server.socket()?, rendering, &mut std::io::stdout().lock())
         }
         Command::Restart { server } => {
             let socket = server.socket()?;

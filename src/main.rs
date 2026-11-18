@@ -9,12 +9,12 @@
 //!
 //! `main` parses the command line and runs its command: `serve` (a node's
 //! daemon, and on the leader the application, [`serve`]), `keys` (a
-//! deployment's recorded key list, [`keys`]), and the host services
+//! deployment's recorded key list, [`keys`]), and a deployment's servers
 //! `storage-server` and `build-server`, whose commands are their crates' own.
 //! `serve` installs tracing and builds the Tokio runtime; its module hands the
 //! policy package it reads to `daemon::serve` with a cancellation token that
-//! fires on Ctrl-C or SIGTERM. The host services run before any thread exists,
-//! because a service started with `--daemon` forks.
+//! fires on Ctrl-C or SIGTERM. A deployment's servers run before any thread exists,
+//! because a server started with `--daemon` forks.
 //!
 //! The runtime and the cancellation token are the executable's own: every
 //! command that starts threads takes them from here.
