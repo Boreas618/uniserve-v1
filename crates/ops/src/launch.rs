@@ -51,12 +51,13 @@ where
     let context = context::current("a launch")?;
     O::check(descriptor, &args).map_err(refused)?;
 
-    let (kernels, route, recording) = {
+    let (kernels, route, recording, profiler) = {
         let state = context.state();
         (
             state.kernels.clone(),
             state.route.clone(),
             state.launches.is_some(),
+            state.profiler.clone(),
         )
     };
 
@@ -75,6 +76,19 @@ where
         }
         .map_err(refused)?;
 
+        // A profiler is set only on a context that captures, which records the launch table:
+        // the key and the innermost range's path are the table's.
+        let probe = match (&profiler, key) {
+            (Some(profiler), Some(key)) => {
+                let path = profiler::path(&context.state().paths);
+                profiler
+                    .launch(O::NAME, key, &path, stream)
+                    .map_err(|source| refused(Error::Probe(source)))?
+                    .map(|site| (profiler, site))
+            }
+            _ => None,
+        };
+
         let routed = match route {
             Some(route) => route
                 .launch(
@@ -88,6 +102,12 @@ where
 
         if !routed {
             O::launch(kernel, descriptor, args, stream).map_err(refused)?;
+        }
+
+        if let Some((profiler, site)) = probe {
+            profiler
+                .launched(site, stream)
+                .map_err(|source| refused(Error::Probe(source)))?;
         }
     }
 

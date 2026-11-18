@@ -7,7 +7,9 @@
 //! - while a launch table is being recorded, the innermost range's path is the module path of
 //!   every launch inside it;
 //! - when execution set a [`Profiler`] on a context that launches, the range's body runs between
-//!   two range markers on the stream, which a captured graph keeps and every replay runs.
+//!   two range markers on the stream, which a captured graph keeps and every replay runs, and
+//!   the profiler may place a probe before and after each kernel launched inside it
+//!   ([`Profiler::launch`]).
 
 use std::error::Error as StdError;
 
@@ -44,6 +46,40 @@ pub trait Profiler: Send + Sync {
         instance: u32,
         stream: &Stream,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>>;
+
+    /// A kernel of `operator` under descriptor `key` is about to launch on `stream` inside the
+    /// innermost range at `path` (empty outside every range): launches a probe before it and
+    /// returns the site [`Profiler::launched`] is given, or `None` when the launch carries no
+    /// probe. The default places none.
+    ///
+    /// # Errors
+    ///
+    /// When the probe could not be launched.
+    fn launch(
+        &self,
+        operator: &'static str,
+        key: &str,
+        path: &str,
+        stream: &Stream,
+    ) -> std::result::Result<Option<u32>, Box<dyn StdError + Send + Sync>> {
+        let _ = (operator, key, path, stream);
+        Ok(None)
+    }
+
+    /// The launch [`Profiler::launch`] returned `site` for was issued on `stream`: launches the
+    /// probe behind it.
+    ///
+    /// # Errors
+    ///
+    /// When the probe could not be launched.
+    fn launched(
+        &self,
+        site: u32,
+        stream: &Stream,
+    ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        let _ = (site, stream);
+        Ok(())
+    }
 }
 
 /// Runs `body`, the forward of the module instance at `path` of `class`, as a profiler range.
@@ -84,7 +120,14 @@ pub fn range<T, E: From<Error>>(
 
     // The path is kept only for the launch table, and comes off whether or not the body failed.
     if recording {
-        context.state().paths.push(path.to_owned());
+        let mut state = context.state();
+        let depth = state.paths.len();
+        state.ranges.push(crate::context::Range {
+            class: class.to_owned(),
+            path: path.to_owned(),
+            depth,
+        });
+        state.paths.push(path.to_owned());
     }
     let output = body();
     if recording {
@@ -139,6 +182,42 @@ mod tests {
             paths(&context),
             ["", "layers.0", "layers.0.mlp", "layers.0", ""]
         );
+    }
+
+    /// A recording states every range the forward entered, in entry order, with the ranges that
+    /// enclosed it, and starts over with the next recording.
+    #[test]
+    fn a_recording_states_the_ranges_entered_and_their_nesting() {
+        let context = Context::meta(None);
+        context.record_launches();
+        let _guard = context.enter();
+
+        range("Stack", "model", || {
+            range("Layer", "model.layers.0", || {
+                range("Mlp", "model.layers.0.mlp", launch_rms_norm)
+            })?;
+            range("Layer", "model.layers.1", launch_rms_norm)
+        })
+        .unwrap();
+
+        let ranges: Vec<(String, String, usize)> = context
+            .take_ranges()
+            .into_iter()
+            .map(|range| (range.class, range.path, range.depth))
+            .collect();
+        let named = |class: &str, path: &str, depth| (class.to_owned(), path.to_owned(), depth);
+        assert_eq!(
+            ranges,
+            [
+                named("Stack", "model", 0),
+                named("Layer", "model.layers.0", 1),
+                named("Mlp", "model.layers.0.mlp", 2),
+                named("Layer", "model.layers.1", 1),
+            ]
+        );
+
+        context.record_launches();
+        assert!(context.take_ranges().is_empty());
     }
 
     #[test]

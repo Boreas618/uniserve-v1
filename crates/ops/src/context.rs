@@ -97,6 +97,9 @@ pub(crate) struct State {
     /// The paths of the profiler ranges the forward is inside, outermost first. A range adds its
     /// path only while a launch table is being recorded, the table being its one reader.
     pub(crate) paths: Vec<String>,
+    /// The profiler ranges the forward entered while a launch table is being recorded, in entry
+    /// order ([`Context::take_ranges`]).
+    pub(crate) ranges: Vec<Range>,
 
     /// The page-locked host memory lent as the input buffer: its address and size in bytes.
     pub(crate) input_memory: Option<(u64, u64)>,
@@ -107,6 +110,18 @@ pub(crate) struct State {
     /// The input copies of this forward, as `(buffer offset, device address, bytes)`: the
     /// host-to-device copies made while the stream was being captured, or under a meta context.
     pub(crate) input_copies: Vec<(u64, u64, u64)>,
+}
+
+/// A profiler range a forward entered while its launch table was recorded
+/// ([`Context::take_ranges`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Range {
+    /// The module's class.
+    pub class: String,
+    /// The module instance's path, the prefix of the paths of the ranges it encloses.
+    pub path: String,
+    /// The ranges that enclosed it as it was entered: zero for an outermost range.
+    pub depth: usize,
 }
 
 /// One axis of a forward's partition: the group its collectives go through and this rank's place
@@ -317,7 +332,16 @@ impl Context {
     /// Execution starts and takes a table outside the forward it records, so a profiler range
     /// lies wholly inside or wholly outside the recording.
     pub fn record_launches(&self) {
-        self.state().launches = Some(Vec::new());
+        let mut state = self.state();
+        state.launches = Some(Vec::new());
+        state.ranges.clear();
+    }
+
+    /// The profiler ranges the forward entered since the recording of its launch table began
+    /// ([`Context::record_launches`]), in entry order, each with its class, its path and how many
+    /// ranges enclosed it: the module tree whose paths the table's launches name.
+    pub fn take_ranges(&self) -> Vec<Range> {
+        std::mem::take(&mut self.state().ranges)
     }
 
     /// Ends the recording and returns the launch table; empty when none was being recorded.
@@ -528,6 +552,7 @@ impl State {
             breaks: None,
             launches: None,
             paths: Vec::new(),
+            ranges: Vec::new(),
             input_memory: None,
             input_cursor: 0,
             input_peak: 0,

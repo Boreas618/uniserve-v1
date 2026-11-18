@@ -170,6 +170,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The profiler could not launch a kernel's probe ([`Profiler::launch`](crate::Profiler::launch)).
+    #[error("kernel probe: {0}")]
+    Probe(Box<dyn std::error::Error + Send + Sync>),
+
     /// A tensor or a device of another backend, or of the CPU, where one of this backend's is
     /// needed.
     #[error("{operation} needs a tensor of the CUDA backend, and was given one on {location:?}")]
