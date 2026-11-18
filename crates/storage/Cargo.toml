@@ -18,6 +18,8 @@ rmp-serde.workspace = true
 # The host's monotonic clock, which every instant of the runtime interface is stated in
 # (`runtime::monotonic_nanos`).
 rustix = { workspace = true, features = ["time"] }
+# The KV program's handoff, path and log level the protocol carries (`scheduling::kv`).
+scheduling.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true

@@ -4785,6 +4785,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "program-kv-read"
+version = "2.0.0"
+dependencies = [
+ "scheduling",
+ "serde",
+]
+
+[[package]]
 name = "prometheus-client"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5900,6 +5908,7 @@ dependencies = [
  "libc",
  "rmp-serde",
  "rustix",
+ "scheduling",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5922,8 +5931,10 @@ dependencies = [
  "libloading",
  "mooncake_store",
  "platform",
+ "program",
  "rmp-serde",
  "rustix",
+ "scheduling",
  "serde",
  "serde_bytes",
  "serde_json",

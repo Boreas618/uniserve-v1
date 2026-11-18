@@ -1108,6 +1108,18 @@ impl Pools {
         }
     }
 
+    /// What `deployment`'s pool holds on each tier ([`BufferPool::holdings`]); nothing for a
+    /// deployment without a pool here.
+    pub(crate) fn holdings(
+        &self,
+        deployment: &str,
+    ) -> Vec<(storage::runtime::Tier, Vec<Key>, u64)> {
+        self.deployments
+            .get(deployment)
+            .map(|hosted| hosted.pool.holdings())
+            .unwrap_or_default()
+    }
+
     /// Every pool as an operator's listing states it.
     pub(crate) fn listing(&self) -> Vec<BufferPoolListing> {
         let listed = |(deployment, hosted): (&String, &Hosted)| BufferPoolListing {

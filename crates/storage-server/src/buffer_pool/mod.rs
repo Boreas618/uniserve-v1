@@ -52,7 +52,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use storage::ServerSettings;
 use storage::protocol::Key;
-use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Segments, Stamps};
+use storage::runtime::{
+    Cause, Completion, GroupId, OwnerId, Request, RequestId, Segments, Stamps, Tier,
+};
 
 pub(crate) use image::FORMAT;
 use region::{Region, Run};
@@ -1664,6 +1666,60 @@ impl BufferPool {
             (at, listed.0)
         });
         Completion::Listing { keys }
+    }
+
+    /// What the pool holds on each of its tiers, for the deployment's KV program's directory
+    /// (`scheduling::kv::Directory`): per tier, the device's then the host's, the keys of the
+    /// committed copies on it, those its schedulers would evict first first (their installed
+    /// orders, a key at its earliest place in any of them) and the others after them by key, and
+    /// the units of the tier's open regions that hold blocks of a class: the device regions the
+    /// groups take blocks from, which leaves out their slot rows, and every host region. A copy
+    /// an epoch on trial made is no epoch's to share yet and is left out.
+    pub fn holdings(&self) -> Vec<(Tier, Vec<Key>, u64)> {
+        let blocks: HashSet<u8> = self
+            .groups
+            .values()
+            .flat_map(|group| group.regions.iter().flatten().copied())
+            .collect();
+        [Tier::Device, Tier::Host]
+            .into_iter()
+            .map(|tier| {
+                let regions = self.regions.iter().enumerate().filter(|(number, region)| {
+                    let holds = tier == Tier::Host || blocks.contains(&(*number as u8));
+                    region.tier == tier && !region.closed && holds
+                });
+                let capacity = regions
+                    .clone()
+                    .map(|(_, region)| u64::from(region.units()))
+                    .sum();
+                let regions = regions.map(|(_, region)| region);
+
+                let mut place: HashMap<&Key, usize> = HashMap::new();
+                for order in regions.flat_map(|region| region.orders.values()) {
+                    for (index, key) in order.iter().enumerate() {
+                        let earliest = place.entry(key).or_insert(index);
+                        *earliest = (*earliest).min(index);
+                    }
+                }
+                let mut keys: Vec<Key> = self
+                    .cache
+                    .iter()
+                    .filter(|(_, entry)| match tier {
+                        Tier::Device => entry.device.iter().any(|(_, maker)| maker.is_none()),
+                        Tier::Host => entry
+                            .host
+                            .as_ref()
+                            .is_some_and(|(_, maker, _)| maker.is_none()),
+                        Tier::Remote => false,
+                    })
+                    .map(|(key, _)| *key)
+                    .collect();
+                keys.sort_unstable_by_key(|key| {
+                    (place.get(key).copied().unwrap_or(usize::MAX), *key)
+                });
+                (tier, keys, capacity)
+            })
+            .collect()
     }
 
     fn resize(&mut self, queue: QueueId, region: u8, units: u32) -> Taken {

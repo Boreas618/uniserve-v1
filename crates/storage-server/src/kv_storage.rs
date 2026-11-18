@@ -42,6 +42,10 @@ pub(super) enum Owner {
     /// A head of another host, which receives the results under the
     /// connector task's number.
     Client(ClientId),
+    /// A move of a deployment's KV program ([`crate::programs`]): the
+    /// pages of host copies its pool holds for `holder` until every task of
+    /// the move ended.
+    Program { holder: u64 },
 }
 
 /// The connector process and its connection.
@@ -57,6 +61,10 @@ pub(super) struct KvStorage {
     /// that connector's process, the head and the task's pages: each fails
     /// once the process has exited, since until then it may move pages.
     pub(super) lost: Vec<(u32, ClientId, u64, usize)>,
+    /// The KV program's tasks a connector lost, each with that connector's
+    /// process, the move's holder and the task's pages: each ends once the
+    /// process has exited, since until then it may read the held copies.
+    pub(super) lost_moves: Vec<(u32, u64, Vec<Key>)>,
 }
 
 impl KvStorage {
@@ -68,6 +76,7 @@ impl KvStorage {
             next: 1,
             offered: BTreeSet::new(),
             lost: Vec::new(),
+            lost_moves: Vec::new(),
         }
     }
 

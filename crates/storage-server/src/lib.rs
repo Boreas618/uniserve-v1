@@ -40,6 +40,7 @@ mod kv_storage;
 mod memory;
 pub mod mooncake;
 mod moves;
+mod programs;
 mod quota;
 mod restart;
 mod serve;
@@ -261,6 +262,8 @@ pub struct Server {
     /// The operator whose [`Request::Stop`] stops the server: the loop ends once its response
     /// is written.
     stopping: Option<ClientId>,
+    /// The deployments' KV programs ([`programs`]).
+    programs: programs::Programs,
 }
 
 impl Server {
@@ -299,6 +302,7 @@ impl Server {
             sessions: sessions::Sessions::new(&settings.server)?,
             readiness: None,
             stopping: None,
+            programs: programs::Programs::default(),
             settings,
         };
         let trace = server.settings.server.buffer_pool_trace.clone();
@@ -458,6 +462,10 @@ impl Server {
         if let Some(timer) = self.shootdowns.timer() {
             fds.push(PollFd::from_borrowed_fd(timer, PollFlags::IN));
         }
+        // The KV programs' periods.
+        for timer in self.programs.timers() {
+            fds.push(PollFd::from_borrowed_fd(timer, PollFlags::IN));
+        }
         // Every wait is a descriptor's: the loop sleeps until one is ready.
         match poll(&mut fds, None) {
             Ok(_) | Err(rustix::io::Errno::INTR) => {}
@@ -497,6 +505,7 @@ impl Server {
         self.kv_storage.process.reap();
         self.transfers.process.reap();
         self.start_children();
+        self.step_programs();
         self.take_notices();
         self.settle_lost();
         self.send_events();
@@ -1050,6 +1059,37 @@ impl Server {
                 None,
                 reservations,
             ),
+            (Request::Program { program }, Role::Head { deployment, .. }) => {
+                let start = self
+                    .programs
+                    .set(&deployment, program.clone())
+                    .map_err(|reason| invalid(&reason))?;
+                Ok(Handling::Response(
+                    Response::Programmed { start },
+                    Vec::new(),
+                ))
+            }
+            (Request::Handoff { handoff }, Role::Head { deployment, .. })
+            | (
+                Request::Handoff { handoff },
+                Role::Worker {
+                    scope: Scope { deployment, .. },
+                    ..
+                },
+            ) => {
+                let path = self
+                    .programs
+                    .handoff(&deployment, handoff)
+                    .map_err(|reason| invalid(&reason))?;
+                Ok(Handling::Response(Response::Handoff { path }, Vec::new()))
+            }
+            (Request::ProgramRecords, Role::Head { deployment, .. }) => {
+                let records = self.programs.drain(&deployment);
+                Ok(Handling::Response(
+                    Response::ProgramRecords { records },
+                    Vec::new(),
+                ))
+            }
             (
                 request,
                 Role::Worker {
@@ -2361,6 +2401,83 @@ impl Server {
                 };
                 self.events.push((client, event, Vec::new()));
             }
+            kv_storage::Owner::Program { holder } => {
+                let pages: Vec<Key> = task.pages.iter().map(|(key, _)| *key).collect();
+                self.program_moved(holder, &pages, &moved);
+            }
+        }
+    }
+
+    /// A connector task of the KV program's move under `holder` ended: once its last did, the
+    /// pool holds its copies no more.
+    fn program_moved(&mut self, holder: u64, pages: &[Key], moved: &[bool]) {
+        if let Some(deployment) = self.programs.moved(holder, pages, moved) {
+            self.sessions.thread.send(move |pools| {
+                pools.release_peer(&deployment, holder);
+            });
+        }
+    }
+
+    /// Steps the KV programs whose period came: each saves its state, and on the leader's node
+    /// steps its tiering hook over the directory of this node's pool, whose moves into Mooncake
+    /// Store the server makes ([`programs`]): it holds the host copies, has its connector write
+    /// their pages, and lets them go once every page's task ended.
+    fn step_programs(&mut self) {
+        let node = rustix::system::uname()
+            .nodename()
+            .to_string_lossy()
+            .into_owned();
+        for deployment in self.programs.due() {
+            let named = deployment.clone();
+            let holdings = match self
+                .sessions
+                .thread
+                .call(move |pools| pools.holdings(&named))
+            {
+                Ok(holdings) => holdings,
+                Err(error) => {
+                    tracing::warn!(deployment, %error, "the buffer pool's holdings are not read");
+                    Vec::new()
+                }
+            };
+            let upload = self
+                .programs
+                .tiering(&deployment, programs::directory(node.clone(), holdings));
+            if upload.keys.is_empty() {
+                continue;
+            }
+
+            let holder = self.programs.holder();
+            let (named, keys) = (deployment.clone(), upload.keys.clone());
+            let held = match self
+                .sessions
+                .thread
+                .call(move |pools| pools.hold(&named, holder, &keys))
+            {
+                Ok(held) => held,
+                Err(error) => {
+                    tracing::warn!(deployment, %error, "the KV program's copies are not held");
+                    Vec::new()
+                }
+            };
+            for key in &upload.keys {
+                if !held.iter().any(|(copy, _)| copy.key == *key) {
+                    let reason = "this node holds no committed host copy of it";
+                    self.programs.skipped(&deployment, key, reason);
+                }
+            }
+            let (tasks, skipped) = self.upload_held(&deployment, holder, held);
+            for (key, reason) in skipped {
+                self.programs.skipped(&deployment, &key, &reason);
+            }
+            if tasks == 0 {
+                let named = deployment.clone();
+                self.sessions.thread.send(move |pools| {
+                    pools.release_peer(&named, holder);
+                });
+            } else {
+                self.programs.moving(&deployment, holder, tasks);
+            }
         }
     }
 
@@ -2385,6 +2502,14 @@ impl Server {
                     let results = vec![false; task.pages.len()];
                     let event = Event::PagesMoved { task: id, results };
                     self.events.push((client, event, Vec::new()));
+                }
+                (kv_storage::Owner::Program { holder }, Some(pid)) => {
+                    let pages = task.pages.iter().map(|(key, _)| *key).collect();
+                    self.kv_storage.lost_moves.push((pid, holder, pages));
+                }
+                (kv_storage::Owner::Program { holder }, None) => {
+                    let pages: Vec<Key> = task.pages.iter().map(|(key, _)| *key).collect();
+                    self.program_moved(holder, &pages, &[]);
                 }
             }
         }

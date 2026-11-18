@@ -19,6 +19,10 @@ clap.workspace = true
 platform.workspace = true
 libc.workspace = true
 mooncake_store.workspace = true
+# The program host the deployment's KV program runs in (`programs`), and the SDK's types of its
+# hooks' inputs and outputs.
+program.workspace = true
+scheduling.workspace = true
 # NIXL's C API library, which the Transfer Server opens at run time (`transfer::nixl`).
 libloading.workspace = true
 rmp-serde.workspace = true

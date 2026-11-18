@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ANSWER, Claim, Claimant, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing,
-    Location, Mode, Priority, Quota, Refusal, Region, RegionPart, Registration, Request, Response,
-    Role, Scope, Segment, ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors,
-    Throttle, UnitRun, Usage, VERSION, Welcome,
+    ANSWER, Claim, Claimant, ClientMessage, Event, Hello, HostCopy, Item, Key, KvProgram, Link,
+    Listing, Location, Mode, Priority, ProgramRecord, ProgramStart, Quota, Refusal, Region,
+    RegionPart, Registration, Request, Response, Role, Scope, Segment, ServerMessage, Span,
+    StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitRun, Usage, VERSION, Welcome,
 };
 use crate::queue::QueueDescriptors;
 use crate::runtime::{Open, Opened};
@@ -890,6 +890,36 @@ impl Client {
             other => Err(unexpected("pages", &other)),
         }
     }
+
+    /// See [`Request::Program`]: run `program` as the deployment's KV program on this server, or
+    /// none. Returns how its instance started, `None` when none runs.
+    pub fn program(&mut self, program: Option<KvProgram>) -> Result<Option<ProgramStart>> {
+        match self.request(&Request::Program { program }, &[])?.0 {
+            Response::Programmed { start } => Ok(start),
+            other => Err(unexpected("program", &other)),
+        }
+    }
+
+    /// See [`Request::Handoff`]: how the full pages of `handoff` reach the decode replica, as
+    /// the deployment's KV program, or the default rule, decides.
+    pub fn handoff_path(
+        &mut self,
+        handoff: scheduling::kv::Handoff,
+    ) -> Result<scheduling::kv::Path> {
+        match self.request(&Request::Handoff { handoff }, &[])?.0 {
+            Response::Handoff { path } => Ok(path),
+            other => Err(unexpected("handoff", &other)),
+        }
+    }
+
+    /// See [`Request::ProgramRecords`]: what the deployment's KV program logged and how its
+    /// outputs fared since the last call, oldest first.
+    pub fn program_records(&mut self) -> Result<Vec<ProgramRecord>> {
+        match self.request(&Request::ProgramRecords, &[])?.0 {
+            Response::ProgramRecords { records } => Ok(records),
+            other => Err(unexpected("program_records", &other)),
+        }
+    }
 }
 
 /// The tensors of a response to a `Get`, with one descriptor per storage.
@@ -1056,6 +1086,18 @@ impl ClaimClient {
     /// endpoint other hosts reach it at when it accepts them, and its settings.
     pub fn status(&mut self) -> Result<crate::settings::Readiness> {
         self.client.status()
+    }
+
+    /// Runs `program` as the deployment's KV program on this server, or none
+    /// ([`Client::program`]).
+    pub fn program(&mut self, program: Option<KvProgram>) -> Result<Option<ProgramStart>> {
+        self.client.program(program)
+    }
+
+    /// What the deployment's KV program logged and how its outputs fared since the last call
+    /// ([`Client::program_records`]).
+    pub fn program_records(&mut self) -> Result<Vec<ProgramRecord>> {
+        self.client.program_records()
     }
 
     /// Passes the claim to another process ([`ClaimClient::resume`]): its

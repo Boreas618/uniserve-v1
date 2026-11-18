@@ -171,6 +171,9 @@ struct Handoff {
     /// The processes followed for a session whose engine is gone: each
     /// process's id, its pidfd's index and the GPUs it must leave.
     followed: Vec<(i32, usize, Vec<[u8; 16]>)>,
+    /// Each deployment's KV program as its head set it, whose state the
+    /// server saved before it handed over: the successor restores it.
+    programs: Vec<(String, ::storage::protocol::KvProgram)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -510,6 +513,10 @@ impl Server {
             task_totals: self.transfers.task_totals(),
             sessions,
             followed,
+            programs: {
+                self.programs.save_all();
+                self.programs.setups()
+            },
         };
 
         let Pending {
@@ -782,6 +789,7 @@ impl Server {
             sessions,
             readiness: None,
             stopping: None,
+            programs: crate::programs::Programs::resume(handoff.programs),
             settings: handoff.settings.clone(),
         };
         server.watch_pools(handoff.settings.server.buffer_pool_trace.clone());

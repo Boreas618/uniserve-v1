@@ -1144,6 +1144,66 @@ impl Server {
         Ok(Handling::Response(Response::Submitted { task }, Vec::new()))
     }
 
+    /// Writes the host copies `held` of `deployment`'s pool, which the pool holds for `holder`,
+    /// to the KV storage: a move of the KV program's tiering hook from this node's host memory
+    /// to Mooncake Store. Each copy's pages are those of every part of its region, each unit one
+    /// object as a pool's own upload writes it, so a later read of the key finds it whole; a
+    /// copy with a part on another host is not written. Returns the connector tasks started, one
+    /// per part, and each copy not written with why.
+    pub(crate) fn upload_held(
+        &mut self,
+        deployment: &str,
+        holder: u64,
+        held: Vec<(HostCopy, Vec<HostPart>)>,
+    ) -> (usize, Vec<(Key, String)>) {
+        let mut skipped = Vec::new();
+        if self.kv_storage.client.is_none() {
+            let reason = "no Mooncake connector is connected";
+            let keys = held
+                .into_iter()
+                .map(|(copy, _)| (copy.key, reason.to_owned()));
+            return (0, keys.collect());
+        }
+
+        // Per connector pool (a part of a host region on this host), its pages.
+        let mut pages: BTreeMap<u64, Vec<(Key, u32)>> = BTreeMap::new();
+        for (copy, holding) in held {
+            let (count, hosts) = self.parts_at(deployment, None, &copy.region, &holding);
+            let local: BTreeSet<u32> = hosts
+                .iter()
+                .filter(|(_, host, _)| host.is_none())
+                .map(|(part, ..)| *part)
+                .collect();
+            if count == 0 || (0..count).any(|part| !local.contains(&part)) {
+                let reason = format!("a part of {} lies on another host", copy.region);
+                skipped.push((copy.key, reason));
+                continue;
+            }
+            for part in local {
+                let held = (deployment.to_owned(), copy.region.clone(), part);
+                let Some(pool) = self.sessions.parts.get(&held).map(|held| held.pool) else {
+                    continue;
+                };
+                let of = pages.entry(pool).or_default();
+                of.extend(
+                    (0..copy.count).map(|unit| (unit_key(&copy.key, unit), copy.first + unit)),
+                );
+            }
+        }
+
+        self.offer_parts();
+        let tasks = pages.len();
+        for (pool, pages) in pages {
+            self.assign(Task {
+                owner: Owner::Program { holder },
+                pool,
+                pages,
+                upload: true,
+            });
+        }
+        (tasks, skipped)
+    }
+
     /// See [`Request::PeerHold`], from the peer `id`. The peer reads every
     /// copy of a region from the same parts, one of each part index: those
     /// the region's first held copy lies in, this host's where it holds one,
@@ -2011,6 +2071,14 @@ impl Server {
             let results = vec![false; pages];
             let event = Event::PagesMoved { task, results };
             self.events.push((client, event, Vec::new()));
+        }
+
+        let (still, out): (Vec<_>, Vec<_>) = std::mem::take(&mut self.kv_storage.lost_moves)
+            .into_iter()
+            .partition(|(pid, ..)| connector == Some(*pid));
+        self.kv_storage.lost_moves = still;
+        for (_, holder, pages) in out {
+            self.program_moved(holder, &pages, &[]);
         }
     }
 

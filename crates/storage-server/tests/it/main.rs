@@ -4,6 +4,7 @@
 
 mod claim;
 mod hosts;
+mod programs;
 mod remote;
 mod restart;
 mod server;

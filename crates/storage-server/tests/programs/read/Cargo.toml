@@ -1,0 +1,20 @@
+[package]
+name = "program-kv-read"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A KV program that reads every handoff over Mooncake Transfer Engine and moves every page one tier down: the Storage Server's test of a KV program's refused and skipped outputs, and of a state carried over from another program."
+
+[lib]
+# A program is compiled to `wasm32-unknown-unknown` and run by the program host; the library
+# form is what the workspace's native checks read.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The program SDK.
+scheduling.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

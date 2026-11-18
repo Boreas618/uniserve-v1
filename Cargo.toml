@@ -30,6 +30,7 @@ members = [
     "crates/service",
     "crates/storage",
     "crates/storage-server",
+    "crates/storage-server/tests/programs/read",
     "crates/tensor",
     "crates/testkit",
     "tools/eval",

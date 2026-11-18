@@ -110,6 +110,16 @@
 //! ([`Request::Pages`]), each asked by this server as a head of the
 //! deployment.
 //!
+//! **Program.** The deployment's KV program, a wasm32 module of its policy
+//! package that decides how KV moves (`scheduling::kv`). Its head sets it on
+//! every Storage Server of the deployment ([`Request::Program`]), each server
+//! running one instance: at every prefill-to-decode handoff, the decode side's
+//! engine asks its own server how the full pages arrive
+//! ([`Request::Handoff`]), and on the leader's node the server steps the
+//! program every period with the directory of what its node holds and carries
+//! out the moves it can. What the program logged and how its outputs were
+//! refused or skipped is drained by the head ([`Request::ProgramRecords`]).
+//!
 //! A span's source may lie on another host ([`Region::Remote`]): the
 //! destination host's Transfer Server READs it through NIXL. It asks the
 //! source host's server, over that server's TCP endpoint as a
@@ -135,7 +145,7 @@ use crate::runtime::{Open, Opened};
 /// speaks: the one version either accepts. Each process that talks to the
 /// server checks it at its own `Hello`, independently of the other
 /// interfaces it speaks.
-pub const VERSION: u32 = 27;
+pub const VERSION: u32 = 28;
 
 /// How long a server of another host may take to answer a request it answers from what it holds
 /// (a hello, a peer's hold and release, a task's submission or cancellation, a connector's pages):
@@ -1422,6 +1432,100 @@ pub enum Request {
         pages: Vec<(Key, u32)>,
         upload: bool,
     },
+    /// From a head: run `program` as its deployment's KV program on this
+    /// server from now on, or none. The module must be a KV program
+    /// (`scheduling::program::Kind::Kv`) of this build's program interface.
+    /// The same module with the same name and arguments keeps the running
+    /// instance and takes the new period and hooks; any other is a new
+    /// instance, restored from the state the program saved under its name in
+    /// [`KvProgram::state`] when that state decodes as the program's type, and
+    /// created from its arguments otherwise. The instance it replaces saves
+    /// its state there first. Responded with [`Response::Programmed`];
+    /// refused, changing nothing, when the module does not load or the
+    /// arguments are not the program's.
+    Program { program: Option<KvProgram> },
+    /// From a head or a worker of the deployment, on the decode side of a
+    /// prefill-to-decode handoff: how its full pages reach the decode
+    /// replica. The deployment's KV program decides; an output the handoff
+    /// cannot take (a transport `handoff.transports` lacks, a pull from a
+    /// tier that does not hold every full page, a pull from the device), a
+    /// program that failed or none at all takes the default rule: push over
+    /// the first transport both sides have. Responded with
+    /// [`Response::Handoff`]; refused when the sides have no transport in
+    /// common, since the tail is pushed or read whatever the full pages do.
+    Handoff { handoff: scheduling::kv::Handoff },
+    /// From a head: what the deployment's KV program logged and how its
+    /// outputs fared since the last such request, oldest first; the server
+    /// keeps them no longer. Responded with [`Response::ProgramRecords`].
+    ProgramRecords,
+}
+
+/// A deployment's KV program as its head sets it on a Storage Server
+/// ([`Request::Program`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvProgram {
+    /// The program's name in its package (`[programs.<name>]`), which its
+    /// saved state is filed under.
+    pub name: String,
+    /// The wasm32 module.
+    #[serde(with = "serde_bytes")]
+    pub module: Vec<u8>,
+    /// The package's `args` table for it, which its `new` reads.
+    pub args: serde_json::Value,
+    /// How often the program's periodic work runs, in milliseconds: the
+    /// tiering hook on the node that runs it, and the save of the program's
+    /// state on every node.
+    pub period_ms: u64,
+    /// Whether this server steps the tiering hook: the leader's node does.
+    pub tiering: bool,
+    /// The directory the program's state is saved in: the node's
+    /// `program-state/` of the deployment.
+    pub state: std::path::PathBuf,
+}
+
+/// How a [`Request::Program`] started the program's instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStart {
+    /// The running instance goes on: the module, name and arguments are
+    /// the ones it runs.
+    Kept,
+    /// A new instance, restored from the program's saved state.
+    Restored,
+    /// A new instance, created from the arguments: no saved state, or one
+    /// that does not decode as the program's type.
+    Created,
+}
+
+/// One thing the deployment's KV program did or had done to it
+/// ([`Request::ProgramRecords`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramRecord {
+    /// When, in nanoseconds since the Unix epoch.
+    pub time: u64,
+    /// The program's name.
+    pub program: String,
+    pub event: ProgramEvent,
+}
+
+/// What a [`ProgramRecord`] records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramEvent {
+    /// A record the program wrote with the `log` crate.
+    Log {
+        level: scheduling::program::Level,
+        text: String,
+    },
+    /// The instance ended: it panicked, ran past its fuel or memory,
+    /// trapped or broke the call convention. The default rules take over
+    /// until the head sets a program again.
+    Ended { reason: String },
+    /// An output the server did not take, at the hook named `handoff` or
+    /// `tiering`, and why; the default rule decided instead.
+    Refused { hook: String, reason: String },
+    /// A move of the tiering hook the server cannot carry out, and why.
+    Skipped { reason: String },
 }
 
 /// Why a request failed.
@@ -1552,6 +1656,19 @@ pub enum Response {
     Valid,
     /// The connection held nothing to release.
     Gone,
+    /// The KV program a [`Request::Program`] set runs, started as `start`;
+    /// `None` when it set none.
+    Programmed {
+        start: Option<ProgramStart>,
+    },
+    /// How a [`Request::Handoff`]'s full pages reach the decode replica.
+    Handoff {
+        path: scheduling::kv::Path,
+    },
+    /// What a [`Request::ProgramRecords`] drained.
+    ProgramRecords {
+        records: Vec<ProgramRecord>,
+    },
     Error {
         kind: ErrorKind,
         message: String,
