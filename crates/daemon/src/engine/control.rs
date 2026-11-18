@@ -718,10 +718,12 @@ impl EngineControl {
             connection.deliver(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
                     id: index as u64 + 1,
-                    kind: Some(request::Kind::ProgramRecords(process::ProgramRecordsQuery {
-                        host: node.host.clone(),
-                        deployment: self.deployment.clone(),
-                    })),
+                    kind: Some(request::Kind::ProgramRecords(
+                        process::ProgramRecordsQuery {
+                            host: node.host.clone(),
+                            deployment: self.deployment.clone(),
+                        },
+                    )),
                 })),
             })?;
             let reply = await_reply(&mut connection, index as u64 + 1)

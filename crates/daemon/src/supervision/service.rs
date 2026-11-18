@@ -41,9 +41,9 @@ use proto::process::refusal::Reason;
 use proto::process::{
     self, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface, Node,
     NodesKnown, ProgramConfigured, ProgramRecords, Refusal, Released, Replied, Reply, Request,
-    Spawned, Stopped, StorageConfigured,
-    ToMember, TransfersThrottled, Unnumbered, Unserved, Upstream, UsageReport, Welcome, downstream,
-    event, from_member, hello, reply, request, to_member, upstream,
+    Spawned, Stopped, StorageConfigured, ToMember, TransfersThrottled, Unnumbered, Unserved,
+    Upstream, UsageReport, Welcome, downstream, event, from_member, hello, reply, request,
+    to_member, upstream,
 };
 use service::{Connection, Handed, Listener, Waker};
 

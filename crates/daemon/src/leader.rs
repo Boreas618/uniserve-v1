@@ -802,7 +802,11 @@ impl Leader {
             .await
             .context("setting the KV program did not complete")??;
         for (host, start) in started {
-            info!(host, ?start, "the node's Storage Server runs the KV program");
+            info!(
+                host,
+                ?start,
+                "the node's Storage Server runs the KV program"
+            );
         }
         Ok(())
     }

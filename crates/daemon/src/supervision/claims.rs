@@ -266,7 +266,8 @@ impl ClaimHolder {
                 self.head()?.program_records()
             }
         };
-        records.with_context(|| format!("reading the KV program records of deployment {deployment}"))
+        records
+            .with_context(|| format!("reading the KV program records of deployment {deployment}"))
     }
 
     /// A connection to the deployment's Storage Server on this node as a head of the deployment
