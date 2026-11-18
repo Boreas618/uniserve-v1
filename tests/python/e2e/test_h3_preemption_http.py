@@ -13,8 +13,9 @@ that continues it:
   waits in the hold until the wake, after which the engine restores the
   stored step and denoises the steps left;
 - by an epoch change whose denoising computes the same (a change of the
-  workers' watchdog): the switch promotes the target and drains the serving
-  engine with a deadline of zero (``update_config.drain_s``), which ends the
+  workers' watchdog, applied with ``PUT /admin/policy``): the switch
+  promotes the target and drains the serving engine with the deadline of
+  zero its package states (``update_config.drain_s``), which ends the
   request in flight at its next step boundary with its trajectory saved; the
   daemon resubmits it to the target, which restores it and continues
   (``specs/updates.md`` §3.7). A FastH3 request denoises in seconds while a
@@ -51,17 +52,16 @@ from __future__ import annotations
 
 import os
 import signal
-import tomllib
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from uniserve_testing import admin, assets, client, media, updates
+from uniserve_testing import admin, assets, client, media
 from uniserve_testing.deployments import Deployments
+from uniserve_testing.packages import merged
 from uniserve_testing.servers import Server
 
 pytestmark = [
@@ -83,10 +83,11 @@ SECONDS = 4.0
 FRAMES = 107
 SEED = 4242
 
-# The drain's deadline every change of the tests states: the serving
-# engine ends its running request as migratable at the drain, at the
-# request's next denoising step boundary.
-DRAIN_AT_ONCE = "update_config.drain_s=0"
+# How every deployment of the module changes: a drain of no deadline, at
+# which the serving engine ends its running request as migratable at the
+# request's next denoising step boundary, and a short trial, after which a
+# change commits by itself once the case read what it observes.
+UPDATES = {"update_config": {"drain_s": 0.0, "trial": "5s"}}
 
 # The model group's share of each GPU while an epoch change of the
 # denoiser's parallel configuration runs: both epochs lie on the two GPUs
@@ -97,9 +98,9 @@ DRAIN_AT_ONCE = "update_config.drain_s=0"
 CHANGE_FRACTION = 0.85
 
 
-def _deployment(
-    directory: Path, denoising_ranks: int = 2, fraction: float | None = None
-) -> Path:
+def _layout(
+    denoising_ranks: int = 2, fraction: float | None = None
+) -> dict[str, Any]:
     """One group on two GPUs: the denoiser Ulysses-2 on both GPUs, or on the
     first alone for one denoising rank, beside the encoders, the decoders and
     the media stages; `fraction` is the group's share of each GPU
@@ -107,9 +108,8 @@ def _deployment(
 
     The media stages run on the host inside the main process, which serves
     CUDA devices only, so they are placed on the group's CUDA ranks as the
-    deployment files of ``configs/minimax_h3`` place them.
+    packages of ``configs/minimax_h3`` place them.
     """  # noqa: D205
-    directory.mkdir(parents=True, exist_ok=True)
     transformer = (
         {"sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2}}
         if denoising_ranks == 2
@@ -132,33 +132,34 @@ def _deployment(
     }
     if fraction is not None:
         model["mem_fraction_static"] = fraction
-    return client.written_deployment(directory, [model])
+    return client.layout([model])
 
 
 def _serve(
-    deployments: Deployments, deployment: Path
+    deployments: Deployments, layout: dict[str, Any]
 ) -> AbstractContextManager[Server]:
-    """The deployment the file `deployment` places, admitting one request
-    of up to :data:`SECONDS` at :data:`SIZE`.
+    """The deployment `layout` places, admitting one request of up to
+    :data:`SECONDS` at :data:`SIZE`.
     """  # noqa: D205
     return deployments.serve(
-        "--served-model-name",
-        NAME,
-        "--config",
-        str(deployment),
-        "--max-running-requests",
-        "1",
-        "--max-model-len",
-        "1024",
-        # The default prompt-capacity ladder holds capacities below the
-        # admitted length only, so the deployment states its one capacity.
-        "--set",
-        "video_config.text_capacities=[1024]",
-        "--set",
-        f'video_config.sizes=["{SIZE}"]',
-        "--set",
-        f"video_config.max_seconds={SECONDS:g}",
-        model=assets.CHECKPOINTS["fasth3"].model,
+        merged(
+            {
+                "model": assets.CHECKPOINTS["fasth3"].model,
+                "served_model_name": NAME,
+                "max_running_requests": 1,
+                "max_model_len": 1024,
+                # The default prompt-capacity ladder holds capacities below
+                # the admitted length only, so the deployment states its one
+                # capacity.
+                "video_config": {
+                    "text_capacities": [1024],
+                    "sizes": [SIZE],
+                    "max_seconds": SECONDS,
+                },
+            },
+            UPDATES,
+            layout,
+        )
     )
 
 
@@ -202,11 +203,11 @@ def _denoised(steps: int) -> Callable[[dict[str, Any]], bool]:
 
 
 def _change_under_a_denoising_request(
-    server: Server, *assignments: str, **fields: object
+    server: Server, changes: dict[str, Any]
 ) -> tuple[str, dict]:
-    """Applies `assignments` and the request's other `fields` (a target
-    ``config``) as an epoch change while a video job denoises on the serving
-    epoch; returns the job and the update as its trial began.
+    """Applies `changes` over the deployment's package as an epoch change
+    while a video job denoises on the serving epoch; returns the job and the
+    update as its trial began, once the change committed.
 
     The job starts once the target prepares. The serving engine's process
     is paused after the job's first denoising step and continued once the
@@ -215,10 +216,7 @@ def _change_under_a_denoising_request(
     while the serving engine is paused.
     """  # noqa: D205
     after = admin.next_event(server)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        change = pool.submit(
-            admin.apply, server, *assignments, DRAIN_AT_ONCE, **fields
-        )
+    with admin.changing(server, changes) as change:
         admin.wait_for_phase(server, "preparing", after=after)
         job = _start_job(server)
         media.wait_for_job(server, job, _denoised(1), "the job did not denoise")
@@ -228,18 +226,17 @@ def _change_under_a_denoising_request(
             admin.wait_for_phase(server, "switching", after=after)
         finally:
             os.kill(engine, signal.SIGCONT)
-        changed = change.result()
-    assert changed.status_code == 200, changed.text
-    result = changed.json()["result"]
-    assert result["change"] == "epoch", result
-    return job, result["update"]
+        trial = admin.wait_for_phase(server, "trial", after=after)
+        record = admin.revision(change.result())
+    assert record["effect"] == "epoch", record
+    return job, trial
 
 
 @pytest.mark.gpus(2)
 def test_a_preempted_video_request_continues_its_trajectory_exactly(
-    deployments: Deployments, tmp_path: Path
+    deployments: Deployments,
 ) -> None:
-    with _serve(deployments, _deployment(tmp_path)) as server:
+    with _serve(deployments, _layout()) as server:
         reference = _reference(server)
 
         # A sleep preempts the request at a step boundary; the wake resumes
@@ -259,37 +256,27 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         # its drain ends the request at a step boundary and the target
         # continues the trajectory.
         job, update = _change_under_a_denoising_request(
-            server, 'worker_config.watchdog_timeout="6m"'
+            server, {"worker_config": {"watchdog_timeout": "6m"}}
         )
         assert update["shrink"] is False, update
         media.assert_same_media(
             media.job_video(server, job).content, reference, tolerance=0
         )
-        committed = admin.operation(server, "config/commit")
-        assert committed.status_code == 200, committed.text
 
 
 @pytest.mark.gpus(2)
 def test_a_video_request_continues_under_another_parallel_configuration(
     deployments: Deployments, tmp_path: Path
 ) -> None:
-    serving = _deployment(tmp_path, fraction=CHANGE_FRACTION)
-    with _serve(deployments, serving) as server:
+    with _serve(deployments, _layout(fraction=CHANGE_FRACTION)) as server:
         reference = _reference(server)
 
         # The drain ends the Ulysses-2 epoch's request at a step boundary, as
         # the epoch change of the other test does; the target, another
-        # layout, denoises on the first GPU alone.
-        # The target is the served configuration with the target's worker
-        # groups, assigned as one TOML value: with assignments alone, the
-        # drain is this update's own option and the daemon's stay as served.
-        target = _deployment(
-            tmp_path / "target", denoising_ranks=1, fraction=CHANGE_FRACTION
-        )
-        groups = tomllib.loads(target.read_text())["worker_groups"]
-        job, update = _change_under_a_denoising_request(
-            server, f"worker_groups={updates.inline(groups)}"
-        )
+        # layout, denoises on the first GPU alone: the served package with
+        # the target's worker groups in place of its own.
+        target = _layout(denoising_ranks=1, fraction=CHANGE_FRACTION)
+        job, update = _change_under_a_denoising_request(server, target)
         assert update["shrink"] is True, update
         video = media.job_video(server, job).content
         # Kept beside the server's log, for comparison with the reference.
@@ -306,5 +293,3 @@ def test_a_video_request_continues_under_another_parallel_configuration(
                     frames, reference_frames, strict=True
                 )
             ), kind
-        committed = admin.operation(server, "config/commit")
-        assert committed.status_code == 200, committed.text

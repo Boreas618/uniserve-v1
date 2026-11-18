@@ -28,18 +28,18 @@ pytestmark = [
     pytest.mark.gpus(1),
 ]
 
-OPTIONS = (
-    "--set",
-    "kv_cache_config.max_tokens=32768",
-    "--set",
-    "profiling_config.graph_pc_sampling=true",
-)
+#: The module's options over the profiling deployment's: a small KV cache,
+#: and PC sampling enabled before the workers capture their graphs.
+OPTIONS = {
+    "kv_cache_config": {"max_tokens": 32768},
+    "profiling_config": {"graph_pc_sampling": True},
+}
 
 
 @pytest.fixture(scope="module")
 def served(module_deployments: Deployments) -> Iterator[Server]:
     """A Qwen3 deployment whose workers keep PC sampling enabled."""
-    with profiling.serve(module_deployments, *OPTIONS) as server:
+    with profiling.serve(module_deployments, OPTIONS) as server:
         yield server
 
 

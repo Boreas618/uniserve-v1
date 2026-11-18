@@ -3,7 +3,7 @@
 One worker group of two ranks serves Qwen3 with a parallel degree of two
 along one axis, its ranks listed in descending device order: the order of a
 group's ranks assigns each rank its position in the parallel degrees
-(``docs/configuration.md``, Deployment files). Each configuration's greedy
+(``worker_groups``, ``docs/configuration.md``). Each configuration's greedy
 chat outputs agree with the outputs of the same model on one device by the
 rule of vLLM's ``check_logprobs_close``
 (:func:`uniserve_testing.chat.assert_logprobs_close`): the tokens are equal,
@@ -16,7 +16,6 @@ that agree on every position both reached have the same length.
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -45,20 +44,17 @@ Ranked = list[tuple[str, set[str]]]
 
 
 def _serve(
-    deployments: Deployments,
-    directory: Path,
-    group: dict[str, Any],
-    name: str,
+    deployments: Deployments, group: dict[str, Any], name: str
 ) -> AbstractContextManager[Server]:
-    """Serve the model as the one worker group `group`, its deployment file
-    in `directory` and its log named `name`, until the block ends.
+    """Serve the model as the one worker group `group`, as the deployment
+    `name`, until the block ends.
     """  # noqa: D205
     return deployments.serve(
-        "--served-model-name",
-        SERVED_MODEL,
-        "--config",
-        str(client.written_deployment(directory, [group])),
-        model=CHECKPOINTS["qwen3"].model,
+        {
+            "model": CHECKPOINTS["qwen3"].model,
+            "served_model_name": SERVED_MODEL,
+            **client.layout([group]),
+        },
         name=name,
     )
 
@@ -85,10 +81,7 @@ def _ranked(base_url: str) -> Ranked:
 
 
 @pytest.fixture(scope="module")
-def one_device(
-    module_deployments: Deployments,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Ranked:
+def one_device(module_deployments: Deployments) -> Ranked:
     """The model's ranked output on one device, served once for the module."""
     group = {
         "id": "model",
@@ -96,19 +89,13 @@ def one_device(
         "blocks": {"model": {"ranks": [0]}},
         "queue_depth": 2,
     }
-    with _serve(
-        module_deployments,
-        tmp_path_factory.mktemp("one-device"),
-        group,
-        "one-device",
-    ) as server:
+    with _serve(module_deployments, group, "one-device") as server:
         return _ranked(server.base_url)
 
 
 @pytest.mark.parametrize("parallel_axis", ["tensor", "pipeline", "sequence"])
 def test_ranks_out_of_order_generate_the_one_device_outputs(
     deployments: Deployments,
-    tmp_path: Path,
     parallel_axis: str,
     one_device: Ranked,
 ):
@@ -124,7 +111,7 @@ def test_ranks_out_of_order_generate_the_one_device_outputs(
         "blocks": {"model": {"ranks": [1, 0], **parallel}},
         "queue_depth": 2,
     }
-    with _serve(deployments, tmp_path, group, parallel_axis) as server:
+    with _serve(deployments, group, parallel_axis) as server:
         result = chat.complete(
             server.base_url,
             chat.body(SERVED_MODEL, PROMPT, MAX_TOKENS, temperature=0),

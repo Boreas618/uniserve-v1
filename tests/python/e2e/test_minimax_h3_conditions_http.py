@@ -28,8 +28,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from uniserve_testing import assets, media
+from uniserve_testing import assets, media, packages
 from uniserve_testing.deployments import Deployments
+from uniserve_testing.packages import Config, merged
 from uniserve_testing.servers import Server
 
 pytestmark = [
@@ -107,35 +108,32 @@ def _serve(
     checkpoint: str,
     deployment: str,
     inputs: Path,
-    *options: str,
+    options: Config,
 ) -> AbstractContextManager[Server]:
-    """The deployment file `deployment` of ``configs/minimax_h3`` serving
-    the checkpoint `checkpoint` (:data:`assets.CHECKPOINTS`) with `options`,
+    """The package `deployment` of ``configs/minimax_h3`` serving the
+    checkpoint `checkpoint` (:data:`assets.CHECKPOINTS`) with `options`,
     reading reference media from `inputs`.
     """  # noqa: D205
     return deployments.serve(
-        "--served-model-name",
-        "MiniMax-H3",
-        "--config",
-        str(repository / "configs" / "minimax_h3" / deployment),
-        "--set",
-        f'media_config.directory="{inputs}"',
-        *options,
-        model=assets.CHECKPOINTS[checkpoint].model,
+        merged(
+            packages.read(repository / "configs" / "minimax_h3" / deployment),
+            {
+                "model": assets.CHECKPOINTS[checkpoint].model,
+                "served_model_name": "MiniMax-H3",
+                "media_config": {"directory": str(inputs)},
+            },
+            options,
+        )
     )
 
 
 # The official first-frame presentation holds 1935 text rows and its
 # keyframe 1008 condition rows; without a stated condition capacity the
 # deployment provisions the two keyframes a request may bring.
-FIRST_FRAME_OPTIONS = (
-    "--set",
-    "video_config.max_seconds=8",
-    "--max-model-len",
-    "2048",
-    "--set",
-    "video_config.text_capacities=[2048]",
-)
+FIRST_FRAME_OPTIONS: dict[str, Any] = {
+    "max_model_len": 2048,
+    "video_config": {"max_seconds": 8, "text_capacities": [2048]},
+}
 
 
 @pytest.mark.gpus(4)
@@ -148,9 +146,9 @@ def test_base_first_frame_request(
             deployments,
             repository,
             "minimax-h3",
-            "ulysses4.toml",
+            "ulysses4",
             inputs,
-            *FIRST_FRAME_OPTIONS,
+            FIRST_FRAME_OPTIONS,
         ) as server,
         media.api(server) as api,
     ):
@@ -180,11 +178,9 @@ def test_fasth3_first_frame_request(
             deployments,
             repository,
             "fasth3",
-            "ulysses4.toml",
+            "ulysses4",
             inputs,
-            "--set",
-            f'video_config.sizes=["{SIZE}"]',
-            *FIRST_FRAME_OPTIONS,
+            merged(FIRST_FRAME_OPTIONS, {"video_config": {"sizes": [SIZE]}}),
         ) as server,
         media.api(server) as api,
     ):
@@ -229,16 +225,14 @@ def _reference_requests(
 
 # The official video-plus-audio presentation holds 6913 text rows and its
 # references about 38k condition rows.
-REFERENCE_OPTIONS = (
-    "--set",
-    "video_config.max_seconds=5",
-    "--max-model-len",
-    "8192",
-    "--set",
-    "video_config.text_capacities=[8192]",
-    "--set",
-    "video_config.max_condition_rows=40960",
-)
+REFERENCE_OPTIONS: dict[str, Any] = {
+    "max_model_len": 8192,
+    "video_config": {
+        "max_seconds": 5,
+        "text_capacities": [8192],
+        "max_condition_rows": 40960,
+    },
+}
 
 
 @pytest.mark.gpus(4)
@@ -252,9 +246,9 @@ def test_base_reference_requests(
         deployments,
         repository,
         "minimax-h3",
-        "ulysses4-reference.toml",
+        "ulysses4-reference",
         inputs,
-        *REFERENCE_OPTIONS,
+        REFERENCE_OPTIONS,
     ) as server:
         _reference_requests(server, requests, tmp_path)
 
@@ -264,16 +258,14 @@ def test_base_reference_requests(
 # same video-plus-audio request takes 47,104 rows there: its 37 x 24 x 42
 # reference video fills 10 x 6 x 6 tiles and its soundtrack and audio
 # reference 4 tiles each, against 38,124 rows packed densely.
-OMNIREF_OPTIONS = (
-    "--set",
-    "video_config.max_seconds=5",
-    "--max-model-len",
-    "8192",
-    "--set",
-    "video_config.text_capacities=[8192]",
-    "--set",
-    "video_config.max_condition_rows=49152",
-)
+OMNIREF_OPTIONS: dict[str, Any] = {
+    "max_model_len": 8192,
+    "video_config": {
+        "max_seconds": 5,
+        "text_capacities": [8192],
+        "max_condition_rows": 49152,
+    },
+}
 
 
 @pytest.mark.gpus(4)
@@ -289,9 +281,9 @@ def test_omniref_reference_requests(
         deployments,
         repository,
         "fasth3-omniref",
-        "ulysses4-reference.toml",
+        "ulysses4-reference",
         inputs,
-        *OMNIREF_OPTIONS,
+        OMNIREF_OPTIONS,
     ) as server:
         _reference_requests(server, requests, tmp_path)
 
@@ -303,18 +295,15 @@ def test_omniref_reference_requests(
 # four (two tracks of 207 rows, 414 rows of audio latents). This deployment
 # states a 7,680-row condition capacity: each of W4's condition products fits
 # it and their packed rows do not. W4's image without its voice fits.
-SMALL_CAPACITY_OPTIONS = (
-    "--set",
-    "mm_processor_kwargs.enlarge_references=true",
-    "--set",
-    "video_config.max_seconds=5",
-    "--max-model-len",
-    "8192",
-    "--set",
-    "video_config.text_capacities=[8192]",
-    "--set",
-    "video_config.max_condition_rows=7680",
-)
+SMALL_CAPACITY_OPTIONS: dict[str, Any] = {
+    "mm_processor_kwargs": {"enlarge_references": True},
+    "max_model_len": 8192,
+    "video_config": {
+        "max_seconds": 5,
+        "text_capacities": [8192],
+        "max_condition_rows": 7680,
+    },
+}
 
 
 @pytest.mark.gpus(4)
@@ -334,9 +323,9 @@ def test_omniref_refuses_conditions_above_capacity(
             deployments,
             repository,
             "fasth3-omniref",
-            "ulysses4-reference.toml",
+            "ulysses4-reference",
             inputs,
-            *SMALL_CAPACITY_OPTIONS,
+            SMALL_CAPACITY_OPTIONS,
         ) as server,
         media.api(server) as api,
     ):

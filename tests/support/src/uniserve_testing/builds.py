@@ -24,12 +24,10 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-
-import tomli_w
 
 from uniserve_testing.servers import Server, environment, launch, socket_path
 
@@ -172,16 +170,16 @@ class BuildServer:
         return json.loads(completed.stdout)
 
 
-def build_config(settings: dict[str, Any]) -> str:
-    """The serving options, as a ``--config`` file holds them, that state a
-    Build Server's `settings` as a deployment's ``build_config``.
+def build_config(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """The options of a package's ``config.toml`` that state a Build
+    Server's `settings` as a deployment's ``build_config``.
 
     The deployment states its host's Build Server, and its daemon refuses a
     server that serves with other settings (decision D15), so a deployment
     at a server a test started states exactly the settings that server's
     readiness record states.
     """  # noqa: D205
-    return tomli_w.dumps({"build_config": settings})
+    return {"build_config": dict(settings)}
 
 
 @contextmanager

@@ -5,19 +5,25 @@ modules serve (:data:`uniserve_testing.updates.PROFILE`), while the cases
 replace kernel packages and the scheduling policy under it:
 
 - one kernel package swapped by **rebind**, one by **recapture** together with
-  the **policy**, then **rolled back**, with no request failing at any step;
+  the **policy**, and a policy swap **rolled back** by its trial's throughput
+  threshold, with no request failing at any step;
 - a deliberately **wrong kernel** refused by the shadow while the update
   prepares: the update is abandoned, the serving generation does not change
   and requests keep succeeding;
 - the allocator's mapped bytes stay within the device's budget while both
   generations' graphs exist.
 
-Each case installs a revision at the run's Build Server and applies the
-unchanged deployment configuration, which is what moves a newly installed
-revision into a generation update (``docs/admin.md``, Updates). Phases are
-asserted on the daemon's events, never on sleeps. The revisions are derived
-from the serving packages by the mutations ``tests/python/e2e/packages``
-declares (:func:`uniserve_testing.updates.derived`):
+Each case installs a revision at the module's Build Server and applies the
+deployment's package with a bound no request of the module reaches changed
+(:func:`_reselect`): a change selects the Build Servers' latest revisions,
+which moves a newly installed one into a generation update, while a package
+equal to the current revision is no change (``docs/admin.md``, Updates). An
+update commits by itself once it stood its trial (``update_config.trial``),
+and one whose throughput falls past the deployment's threshold rolls back.
+Phases are asserted on the daemon's events, never on sleeps. The revisions
+are derived from the serving packages by the mutations
+``tests/python/e2e/packages`` declares
+(:func:`uniserve_testing.updates.derived`):
 
 - ``rms_norm`` ``rebind``: a package of an operator the slice launches every
   step, with the serving descriptor key and the same launch structure (a
@@ -33,11 +39,11 @@ The Build Server is the run's, so the module installs the serving packages
 it replaced again when it ends: their latest revisions are then the tree's
 kernels, which every later deployment of the run serves.
 
-The admin surface is the operator socket's: `POST /admin/config/commit` and
-`/admin/config/rollback`, events whose `kind` is `update` and whose `data` is
-the update as it stood, its `phase` among them, and `/admin/config`'s `epochs`
-array whose elements carry `kernels` and `previous_kernels` as a list of
-`{op, phase, package: {backend, revision, arguments}}`.
+The admin surface is the operator socket's: `PUT /admin/policy`, answered
+once the change committed or ended, events whose `kind` is `update` and whose
+`data` is the update as it stood, its `phase` among them, and the status
+report's `epochs` array whose elements carry `kernels` and `previous_kernels`
+as a list of `{op, phase, package: {backend, revision, arguments}}`.
 """
 
 from __future__ import annotations
@@ -45,7 +51,9 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -54,6 +62,7 @@ from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.builds import BuildServer
 from uniserve_testing.client import metric
 from uniserve_testing.deployments import Deployments, Settings
+from uniserve_testing.packages import merged
 from uniserve_testing.servers import Server
 from uniserve_testing.updates import Stream
 
@@ -94,6 +103,34 @@ RESIDENT_TOKENS = 512
 COMPARED = "differ beyond tolerance"
 IDLE = "no running request ran a step"
 
+#: The span a trial's throughput is averaged over, in seconds.
+TRIAL_WINDOW_S = 5
+
+#: How every update of the module stands its trial: half a minute, after which
+#: it commits by itself, and a rollback once the trial's token throughput falls
+#: below half of the throughput before it. The closed loop of requests
+#: (:class:`Traffic`) holds the throughput through a committed update; the
+#: rollback case slows it.
+UPDATES = {
+    "update_config": {
+        "trial": "30s",
+        "rollback": {
+            "throughput_regression": 0.5,
+            "window": f"{TRIAL_WINDOW_S}s",
+        },
+    }
+}
+
+#: The pause each request of the loop waits for while the rollback case slows
+#: it, in seconds: far fewer tokens per second than the loop computes, so the
+#: trial's throughput falls past its threshold, while each scheduler still
+#: steps requests the trial reads.
+TRICKLE_S = 5
+
+#: The queue bound :func:`_reselect` changes, before the module changed it:
+#: far above what the module's requests ever queue.
+QUEUE_BOUND = 4096
+
 
 @pytest.fixture(scope="module")
 def server(module_deployments: Deployments) -> Iterator[Server]:
@@ -101,14 +138,18 @@ def server(module_deployments: Deployments) -> Iterator[Server]:
 
     Module-scoped because the cases are one epoch history — a rebind, a
     recapture with its policy, a rollback and a refusal — each read back
-    through ``/admin/config`` and ``/metrics`` against the same deployment's
+    through the status report and ``/metrics`` against the same deployment's
     records.
     """
     with module_deployments.serve(
-        "--served-model-name",
-        NAME,
-        *updates.assigned(*updates.PROFILE),
-        model=CHECKPOINTS["qwen3"].model,
+        merged(
+            {
+                "model": CHECKPOINTS["qwen3"].model,
+                "served_model_name": NAME,
+            },
+            updates.PROFILE,
+            UPDATES,
+        ),
         name="deployment",
     ) as served:
         yield served
@@ -173,6 +214,9 @@ class Traffic:
         # wakes a caller waiting for the loop's progress.
         self._progress = threading.Condition()
         self._stop = threading.Event()
+        # The pause each request waits for before it is asked, while the
+        # loop is slowed (`slowed`).
+        self._pause_s = 0.0
         self._threads = [
             threading.Thread(target=self._loop, args=(prompt,), daemon=True)
             for prompt in PROMPTS[:CONCURRENCY]
@@ -213,8 +257,21 @@ class Traffic:
             self.completed += 1
             self._progress.notify_all()
 
+    @contextmanager
+    def slowed(self, pause_s: float) -> Iterator[None]:
+        """Each request waits `pause_s` seconds before it is asked while the
+        block runs.
+        """  # noqa: D205
+        self._pause_s = pause_s
+        try:
+            yield
+        finally:
+            self._pause_s = 0.0
+
     def _loop(self, prompt: str) -> None:
         while not self._stop.is_set():
+            if self._pause_s and self._stop.wait(self._pause_s):
+                return
             try:
                 self._one(prompt)
             except Exception as error:  # noqa: BLE001 - a request that cannot be
@@ -239,40 +296,40 @@ def traffic(server: Server) -> Iterator[Traffic]:
         loop.stop()
 
 
-def _to_trial(server: Server) -> None:
-    """Apply the unchanged configuration, which moves the newly installed
-    revisions into a generation update, and see it reach its trial.
+def _reselect(server: Server) -> dict[str, Any]:
+    """The change that moves the newly installed revisions into a generation
+    update: the deployment's queue bound, a step option no request of the
+    module reaches, one above the current revision's.
+
+    A change selects the Build Servers' latest revision of every package the
+    deployment runs, and a package equal to the current revision is no
+    change, so each update of the module states a bound of its own.
+    """  # noqa: D205
+    current = admin.policy(server).config.get("scheduler_config", {})
+    bound = current.get("max_queued_requests", QUEUE_BOUND) + 1
+    return {"scheduler_config": {"max_queued_requests": bound}}
+
+
+def _update(server: Server) -> None:
+    """Apply the newly installed revisions as a generation update, answered
+    once it stood its trial and committed.
     """  # noqa: D205
     before = admin.next_event(server)
-    applied = admin.apply(server)
-    assert applied.status_code == 200, applied.text
+    admin.revision(admin.change(server, _reselect(server)))
     update = admin.wait_for_phase(
-        server, "trial", "abandoned", "rolled_back", after=before
+        server, "committed", "abandoned", "rolled_back", after=before
     )
-    assert update["phase"] == "trial", update
-
-
-def _end_update(server: Server, action: str, phase: str) -> None:
-    """Commit or roll back the update on trial (`action`), and see it enter
-    `phase`.
-    """  # noqa: D205
-    before = admin.next_event(server)
-    response = admin.operation(server, f"config/{action}")
-    assert response.status_code == 200, (
-        f"POST /admin/config/{action} answered {response.status_code}: "
-        f"{response.text[:500]}"
-    )
-    admin.wait_for_phase(server, phase, after=before)
+    assert update["phase"] == "committed", update
 
 
 def epoch_record(server: Server) -> dict:
     """The epoch the deployment serves, as the daemon records it.
 
-    `/admin/config` reports every epoch, ascending; the one that serves is the
-    highest-numbered epoch in `serving` or `trial`, and `/admin/events` names
-    it by number (`data.epoch`).
+    The status report states every epoch, ascending; the one that serves is
+    the highest-numbered epoch in `serving` or `trial`, and `/admin/events`
+    names it by number (`data.epoch`).
     """
-    epochs = admin.config(server)["epochs"]
+    epochs = admin.report(server)["epochs"]
     live = [
         epoch for epoch in epochs if epoch.get("status") in ("serving", "trial")
     ]
@@ -309,7 +366,7 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
     before = epoch_record(server)
     revision = build_server.install(package).revision
 
-    _to_trial(server)
+    _update(server)
     after = epoch_record(server)
     assert after["kernels"] != before["kernels"], (
         "the generation update did not change the recorded kernel packages"
@@ -322,8 +379,6 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
     assert revision in revisions, (
         f"the recorded modules name no revision {revision}: {after['kernels']}"
     )
-
-    _end_update(server, "commit", "committed")
     assert_no_failures("the rebind swap", traffic)
     mapped_within_budget(server)
 
@@ -346,7 +401,7 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
     # update that compared nothing.
     resident = _resident(server.base_url, PROMPTS[0])
     try:
-        _to_trial(server)
+        _update(server)
     finally:
         # Closed after the update answered and before any failure is read: a
         # request in flight here would race `assert_no_failures` below.
@@ -361,23 +416,50 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
     assert_no_failures("the recapture and policy swap", traffic)
     mapped_within_budget(server)
 
-    # The update stays on trial for the rollback below.
-    assert after["status"] == "trial", f"expected trial, got {after['status']}"
-
 
 def test_a_rollback_restores_the_previous_generation(
-    server: Server, traffic: Traffic
+    server: Server,
+    build_server: BuildServer,
+    repository: Path,
+    traffic: Traffic,
 ) -> None:
+    """A policy swap whose trial's throughput falls past the threshold rolls
+    back to the generation it replaced.
+    """  # noqa: D205
     before = epoch_record(server)
-    _end_update(server, "rollback", "rolled_back")
-    assert before["previous_kernels"] is not None, (
-        "the epoch on trial kept no previous kernel packages to roll back to"
-    )
+    # The serving policy installed again: its next revision, the same code.
+    build_server.install(repository / builds.POLICY_PACKAGE)
+
+    after_event = admin.next_event(server)
+    with admin.changing(server, _reselect(server)) as change:
+        admin.wait_for_phase(server, "trial", after=after_event)
+        on_trial = epoch_record(server)
+        assert on_trial["policy"] != before["policy"], (
+            "the policy swap did not change the recorded policy"
+        )
+        assert on_trial["previous_policy"] is not None, (
+            "the epoch on trial kept no previous policy to roll back to"
+        )
+        # The loop slowed computes a fraction of the tokens per second it
+        # computed before the switch, which the trial reads at its next
+        # window.
+        with traffic.slowed(TRICKLE_S):
+            update = admin.wait_for_phase(
+                server, "committed", "rolled_back", after=after_event
+            )
+        response = change.result()
+    print("rolled back:", json.dumps(update))
+    assert update["phase"] == "rolled_back", update
+    assert update["failure"]["kind"] == "throughput_regression", update
+    # The change answers with the reason it did not converge.
+    assert response.status_code == 409, response.text
+    assert "throughput_regression" in response.text, response.text
+
     after = epoch_record(server)
-    assert after["kernels"] == before["previous_kernels"], (
+    assert after["kernels"] == before["kernels"], (
         "the rollback did not restore the previous kernel packages"
     )
-    assert after["policy"] == before["previous_policy"], (
+    assert after["policy"] == before["policy"], (
         "the rollback did not restore the previous policy"
     )
     assert_no_failures("the rollback", traffic)
@@ -401,12 +483,13 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
     resident = _resident(server.base_url, PROMPTS[1])
     try:
         # The update is abandoned while it prepares, which the answer states
-        # with the update as it ended (`409`).
-        response = admin.apply(server)
+        # with its reason (`409`), and the report with the update as it
+        # ended.
+        response = admin.change(server, _reselect(server))
     finally:
         resident.close()
     assert response.status_code == 409, response.text
-    update = response.json()["result"]["update"]
+    update = admin.report(server)["update"]
     assert update["phase"] == "abandoned", update
     assert update["failure"]["kind"] == "prepare_failed", update
     refusal = update["failure"]["reason"]

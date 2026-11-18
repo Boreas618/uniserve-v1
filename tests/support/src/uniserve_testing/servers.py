@@ -100,6 +100,10 @@ class Server:
         self.log_path = log_path
         self.scale = scale
         self.record: dict[str, Any] = {}
+        #: The policy package a daemon serves, its directory, as its starter
+        #: wrote it (:meth:`uniserve_testing.deployments.Deployments.serve`);
+        #: ``None`` for another server.
+        self.package: Path | None = None
         self._records = records
         self._pending = b""
         self._address = address

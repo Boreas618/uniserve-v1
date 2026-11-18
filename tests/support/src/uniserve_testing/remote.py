@@ -2,9 +2,9 @@
 
 A two-host case runs a deployment across this host and another one, which
 ``--peer-host`` names as an ssh destination reachable without a password
-prompt; ``--peer-address`` is the address this host reaches it at and
-``--leader-address`` the address it reaches this host at. The other host
-runs the ``uniserve`` its login installs, with its own environment: a
+prompt. A deployment names its hosts by their host names (``uname -n``,
+the package's ``hosts``), and each host resolves the other's name. The other
+host runs the ``uniserve`` its login installs, with its own environment: a
 command is an argument vector of installed programs, run over ssh with no
 variable of this host's environment and no shell text.
 """
@@ -28,11 +28,20 @@ COMMAND_S = 120.0
 
 @dataclasses.dataclass(frozen=True)
 class RemoteHost:
-    """The other host of a two-host case, as the run's options state it."""
+    """The other host of a two-host case: its ssh destination, as the run's
+    options state it, and its host name, as it states it itself.
+    """  # noqa: D205
 
     destination: str
-    address: str
-    leader_address: str
+    name: str
+
+    @classmethod
+    def of(cls, destination: str) -> RemoteHost:
+        """The host at the ssh destination `destination`, its name read
+        there (``uname -n``).
+        """  # noqa: D205
+        named = cls(destination, "")
+        return cls(destination, named.run("uname", "-n").strip())
 
     def _ssh(self, argv: Sequence[str]) -> list[str]:
         """The ssh command that runs `argv` there.

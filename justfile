@@ -1,7 +1,7 @@
 # The repository's checks and test suites. cargo is rustup's, at the release
 # `rust-toolchain.toml` pins; every Python command runs in the repository's
 # environment, which installs the `uniserve` executable the tests run. Serving
-# is `uniserve serve <model> --served-model-name <name>`.
+# is `uniserve serve <package>`, a policy package directory (docs/configuration.md).
 
 # A recipe's arguments reach its command as the shell's positional arguments,
 # so `"$@"` passes each one as it was given, a marker expression's spaces
@@ -54,12 +54,13 @@ test-python-gpu *pytest:
         --junitxml "{{ e2e }}/junit.xml" -m "e2e and gpu" "$@"
 
 # Every deployment runs the engine package `memcheck` (tests/python/sanitizer),
-# with more of each device left free and every wait stretched; the package
-# awaits a declared engine launcher (docs/testing.md).
+# with more of each device left free (tests/python/sanitizer/config.toml) and
+# every wait stretched; the package awaits a declared engine launcher
+# (docs/testing.md).
 [doc("The missing-state tests (GPU) under compute-sanitizer's memcheck; arguments go to pytest")]
 test-python-sanitizer *pytest:
     {{ just_executable() }} e2e="{{ e2e }}" test-python-gpu --engine memcheck --time-scale 20 \
-        --serve-set mem_fraction_static=0.6 --serve-set 'worker_config.watchdog_timeout="2h"' \
+        --serve-config tests/python/sanitizer/config.toml \
         -m "e2e and gpu and missing_state" "$@"
 
 [doc("Run all checks")]

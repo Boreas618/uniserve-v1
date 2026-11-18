@@ -21,10 +21,10 @@ transfer failed.
 
 The one-host case places both groups on the module's two GPUs. The two-host
 case places the decode group on the first GPU of the run's second host
-(``--peer-host``, ``uniserve_testing.plugin``): the leader, node ``rank-0``
-here, binds its join endpoint at the address the second host reaches this
-host at (``--leader-address``) on a port it picks, and the second host's
-daemon joins it as ``rank-1``
+(``--peer-host``, ``uniserve_testing.plugin``): the package lists this host,
+the leader, and the second host by their host names
+(:func:`uniserve_testing.deployments.two_hosts`), and the second host's
+daemon serves the same package there and joins the leader
 (:meth:`uniserve_testing.deployments.Deployments.follower`), at a Build
 Server there that installs the tree's packages from this repository's path,
 which the second host must mount at the same path. Its Transfer Server reads
@@ -35,11 +35,13 @@ the prefill rank's planes through the NIXL package each host has installed
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from uniserve_testing import chat, client
 from uniserve_testing.assets import CHECKPOINTS
-from uniserve_testing.deployments import Deployments, two_host_leader
+from uniserve_testing.deployments import Deployments, two_hosts
+from uniserve_testing.packages import merged
 from uniserve_testing.remote import RemoteHost
 from uniserve_testing.servers import Server
 
@@ -65,14 +67,14 @@ PROMPTS = (
 # Every deployment of the module serves these options: the divided
 # deployments capture the graphs the undivided one does, so that each group
 # computes its part of a request as the undivided deployment computes it.
-OPTIONS = (
-    "--served-model-name",
-    SERVED_MODEL,
-    "--set",
-    "cuda_graph_config.prefill_token_sizes=[1024]",
-    "--set",
-    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-)
+OPTIONS: dict[str, Any] = {
+    "model": CHECKPOINTS["qwen3"].model,
+    "served_model_name": SERVED_MODEL,
+    "cuda_graph_config": {
+        "prefill_token_sizes": [1024],
+        "decode_batch_sizes": [1, 2, 4, 8],
+    },
+}
 
 # The scheduler's transfer counters (``specs/scheduler-design.md`` §7.5): the
 # transfers answered ``Transferred`` and those answered ``Failed``.
@@ -89,13 +91,12 @@ Decoded = list[list[tuple[str, set[str]]]]
 REPORTED_S = 30
 
 
-def _split(directory: Path, decode_host: str | None) -> Path:
-    """A deployment file of a prefill group on this host's first GPU and a
-    decode group on the next one, or on `decode_host`'s first.
+def _split(decode_host: str | None) -> dict[str, Any]:
+    """The layout of a prefill group on this host's first GPU and a decode
+    group on the next one, or on `decode_host`'s first.
     """  # noqa: D205
     decode = "cuda:1" if decode_host is None else f"{decode_host}/cuda:0"
-    return client.written_deployment(
-        directory,
+    return client.layout(
         [
             {
                 "id": "prefill",
@@ -167,22 +168,16 @@ def _failed_transfers(server: Server, requests: int) -> float:
 @pytest.fixture(scope="module")
 def reference(module_deployments: Deployments) -> Decoded:
     """Each prompt's greedy tokens on an undivided deployment of one GPU."""
-    with module_deployments.serve(
-        *OPTIONS, model=CHECKPOINTS["qwen3"].model, name="undivided"
-    ) as server:
+    with module_deployments.serve(OPTIONS, name="undivided") as server:
         return _decoded(server.base_url)
 
 
 def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
     deployments: Deployments,
-    tmp_path: Path,
     reference: Decoded,
 ):
     with deployments.serve(
-        *OPTIONS,
-        "--config",
-        str(_split(tmp_path, None)),
-        model=CHECKPOINTS["qwen3"].model,
+        merged(OPTIONS, _split(None)),
         calibration=deployments.calibration(),
     ) as server:
         decoded = _decoded(server.base_url)
@@ -196,7 +191,6 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
     repository: Path,
     deployments: Deployments,
     peer_host: RemoteHost,
-    tmp_path: Path,
     reference: Decoded,
 ):
     # The decode group's Transfer Server reads the prefill rank's cache on
@@ -204,11 +198,7 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
     calibration = deployments.calibration(reads=True)
     with (
         deployments.serve(
-            *OPTIONS,
-            "--config",
-            str(_split(tmp_path, "rank-1")),
-            *two_host_leader(peer_host),
-            model=CHECKPOINTS["qwen3"].model,
+            merged(OPTIONS, _split(peer_host.name), two_hosts(peer_host)),
             serving=False,
             calibration=calibration,
         ) as server,

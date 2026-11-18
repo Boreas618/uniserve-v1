@@ -3,18 +3,16 @@ read its answers.
 
 One helper per question, shared by every case: a deployment's metrics
 (``/metrics``, read with Prometheus' own text parser), a streamed answer's
-events, and the deployment files a case writes.
+events, and the deployment layouts a case's packages state.
 """  # noqa: D205
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import httpx
-import tomli_w
 from prometheus_client.parser import text_string_to_metric_families
 
 
@@ -81,24 +79,19 @@ def post_sse(
     return events
 
 
-def written_deployment(
-    directory: Path, groups: list[Mapping[str, Any]]
-) -> Path:
-    """Write the deployment file a ``serve`` invocation is given with
-    ``--config``: each entry of `groups` is one ``[[worker_groups]]`` table,
-    such as ``{"id": "model", "ranks": ["cuda:0-1"], "queue_depth": 2,
-    "blocks": {"model": {"tensor_parallel_size": 2}}}``.
+def layout(groups: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """The options of a deployment layout: each entry of `groups` is one
+    ``[[worker_groups]]`` table of the package's ``config.toml``, such as
+    ``{"id": "model", "ranks": ["cuda:0-1"], "queue_depth": 2, "blocks":
+    {"model": {"tensor_parallel_size": 2}}}``.
     """  # noqa: D205
-    path = directory / "deployment.toml"
-    path.write_text(tomli_w.dumps({"worker_groups": list(groups)}))
-    return path
+    return {"worker_groups": [dict(group) for group in groups]}
 
 
-def dedicated_experts(directory: Path) -> tuple[str, ...]:
+def dedicated_experts() -> dict[str, Any]:
     """The options of an expert epoch of two worker groups on a case's two
     GPUs: attention on the first and the routed experts on the second,
-    exchanging tokens through DeepEP, whose deployment file is written into
-    `directory`.
+    exchanging tokens through DeepEP.
     """  # noqa: D205
     groups = [
         {
@@ -114,9 +107,4 @@ def dedicated_experts(directory: Path) -> tuple[str, ...]:
             "queue_depth": 2,
         },
     ]
-    return (
-        "--config",
-        str(written_deployment(directory, groups)),
-        "--set",
-        'moe_config.exchange="deepep"',
-    )
+    return {**layout(groups), "moe_config": {"exchange": "deepep"}}

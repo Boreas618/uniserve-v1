@@ -64,16 +64,16 @@ def _ask(base_url: str, prompt: str, max_tokens: int) -> dict:
 def test_a_restarted_engine_loads_a_prompts_blocks_from_the_host_tier(
     uniserve: Path, deployments: Deployments, tmp_path: Path
 ):
-    model = CHECKPOINTS["qwen3"].model
-    options = ("--served-model-name", SERVED_MODEL)
+    config = {
+        "model": CHECKPOINTS["qwen3"].model,
+        "served_model_name": SERVED_MODEL,
+    }
     with runtime_directory(uniserve, tmp_path / "storage") as runtime:
-        with deployments.serve(
-            *options, model=model, name="first", runtime=runtime
-        ) as server:
+        with deployments.serve(config, name="first", runtime=runtime) as server:
             cold = _ask(server.base_url, PROMPT, MAX_TOKENS)
             warm = _ask(server.base_url, PROMPT, MAX_TOKENS)
         with deployments.serve(
-            *options, model=model, name="restarted", runtime=runtime
+            config, name="restarted", runtime=runtime
         ) as server:
             loaded = _ask(server.base_url, PROMPT, MAX_TOKENS)
 
@@ -90,15 +90,15 @@ def test_a_restarted_engine_loads_a_prompts_blocks_from_the_host_tier(
 def test_a_stopping_engine_stores_its_last_blocks_to_the_host_tier(
     uniserve: Path, deployments: Deployments, tmp_path: Path
 ):
-    model = CHECKPOINTS["qwen3"].model
-    options = ("--served-model-name", SERVED_MODEL)
+    config = {
+        "model": CHECKPOINTS["qwen3"].model,
+        "served_model_name": SERVED_MODEL,
+    }
     with runtime_directory(uniserve, tmp_path / "storage") as runtime:
-        with deployments.serve(
-            *options, model=model, name="first", runtime=runtime
-        ) as server:
+        with deployments.serve(config, name="first", runtime=runtime) as server:
             first = _ask(server.base_url, PROMPT, 1)
         with deployments.serve(
-            *options, model=model, name="restarted", runtime=runtime
+            config, name="restarted", runtime=runtime
         ) as server:
             loaded = _ask(server.base_url, PROMPT, 1)
             # The prompt asked again finds every block on the device, which

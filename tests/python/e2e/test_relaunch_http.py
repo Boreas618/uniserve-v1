@@ -18,7 +18,7 @@ prefill of them cannot change it. The deployment captures few graphs (decode
 batches up to 8, prefill buckets of 512 tokens and the batch bound), so that
 the engine starts again while the count streams.
 
-Two schedulers that share their experts (``--data-parallel-size 2`` with
+Two schedulers that share their experts (``data_parallel_size = 2`` with
 expert parallelism), or attention and expert workers exchanging through
 DeepEP, form one expert epoch, whose main process keeps a parked standby
 (``worker_config.standby``): once it serves, a second main process of the
@@ -34,7 +34,7 @@ request continues on it.
 Which main process serves before and after a kill is what ``GET
 /admin/status`` reports: the serving process's launch generation
 (``generation``) and the parked standby's (``standby``), which a promotion
-makes the serving one; ``GET /admin/config`` names the process of each
+makes the serving one; the status's ``report`` names the process of each
 launch generation (``processes``). Each test's deployment runs a Storage
 Server of its own.
 """
@@ -44,7 +44,6 @@ from __future__ import annotations
 import os
 import signal
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -52,6 +51,7 @@ import pytest
 from uniserve_testing import admin, chat, client
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.deployments import Deployments
+from uniserve_testing.packages import Config, merged
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
@@ -72,20 +72,18 @@ COUNT = chat.body(
     **chat.NO_THINKING,
 )
 
-#: Few captured graphs, so that an engine starts again while the count
-#: streams, and a small KV cache.
-OPTIONS = (
-    "--served-model-name",
-    NAME,
-    "--set",
-    "kv_cache_config.max_tokens=32768",
-    "--set",
-    'chat_config.reasoning_parser="none"',
-    "--set",
-    "cuda_graph_config.prefill_token_sizes=[512]",
-    "--set",
-    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-)
+#: Qwen3 under :data:`NAME` with few captured graphs, so that an engine
+#: starts again while the count streams, and a small KV cache.
+OPTIONS: dict[str, Any] = {
+    "model": CHECKPOINTS["qwen3"].model,
+    "served_model_name": NAME,
+    "kv_cache_config": {"max_tokens": 32768},
+    "chat_config": {"reasoning_parser": "none"},
+    "cuda_graph_config": {
+        "prefill_token_sizes": [512],
+        "decode_batch_sizes": [1, 2, 4, 8],
+    },
+}
 
 #: How long a standby takes to park, in seconds (scaled): it starts as the
 #: deployment's engine did, but maps the weights the serving epoch holds
@@ -117,20 +115,18 @@ class Killed:
 
 
 def _stream_through_a_kill(
-    deployments: Deployments, *options: str, standby: bool = False
+    deployments: Deployments, options: Config, standby: bool = False
 ) -> Killed:
     """Stream the count, killing the serving engine's process after the
     first tokens.
 
-    The deployment serves with `options` beside :data:`OPTIONS`; with
+    The deployment serves with `options` over :data:`OPTIONS`; with
     `standby`, the stream starts once the deployment reports its standby
     parked.
     """  # noqa: D205
     streamed: list[str] = []
     usage = None
-    with deployments.serve(
-        *OPTIONS, *options, model=CHECKPOINTS["qwen3"].model
-    ) as server:
+    with deployments.serve(merged(OPTIONS, options)) as server:
         if standby:
             # No event of the node's log announces a standby that parks: the
             # status states it once it parked.
@@ -188,7 +184,7 @@ def _continued(killed: Killed) -> None:
 def test_a_request_continues_after_its_engine_process_is_lost(
     deployments: Deployments,
 ):
-    killed = _stream_through_a_kill(deployments)
+    killed = _stream_through_a_kill(deployments, {})
     _continued(killed)
     # The daemon started another engine process, which serves.
     assert killed.after["generation"] not in (
@@ -197,18 +193,17 @@ def test_a_request_continues_after_its_engine_process_is_lost(
     ), (killed.before, killed.after)
 
 
-def _expert_epoch(topology: str, directory: Path) -> tuple[str, ...]:
+def _expert_epoch(topology: str) -> dict[str, Any]:
     """The options of an expert epoch of two groups on the case's two GPUs.
 
     ``replicas``: two schedulers sharing their experts over the all-to-all.
     ``dedicated``: attention on the first GPU and the routed experts on the
     second, exchanging through DeepEP, whose windows a suspended standby
-    frees and its promotion rebuilds; its deployment file is written into
-    `directory`.
+    frees and its promotion rebuilds.
     """
     if topology == "replicas":
-        return ("--data-parallel-size", "2")
-    return client.dedicated_experts(directory)
+        return {"data_parallel_size": 2}
+    return client.dedicated_experts()
 
 
 @pytest.mark.gpus(2)
@@ -216,21 +211,20 @@ def _expert_epoch(topology: str, directory: Path) -> tuple[str, ...]:
 @pytest.mark.parametrize("standby_storage", ["resident", "suspended"])
 def test_an_expert_epoch_promotes_its_standby_when_its_engine_is_lost(
     deployments: Deployments,
-    tmp_path: Path,
     standby_storage: str,
     topology: str,
 ):
-    killed = _stream_through_a_kill(
-        deployments,
-        *_expert_epoch(topology, tmp_path),
-        "--set",
-        "moe_config.expert_parallel=true",
-        "--set",
-        "worker_config.standby=true",
-        "--set",
-        f'worker_config.standby_storage="{standby_storage}"',
-        standby=True,
+    options = merged(
+        _expert_epoch(topology),
+        {
+            "moe_config": {"expert_parallel": True},
+            "worker_config": {
+                "standby": True,
+                "standby_storage": standby_storage,
+            },
+        },
     )
+    killed = _stream_through_a_kill(deployments, options, standby=True)
     _continued(killed)
     # The parked standby serves now, rather than an engine launched anew.
     standby = killed.before["standby"]

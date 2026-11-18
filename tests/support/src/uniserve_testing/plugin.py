@@ -15,14 +15,13 @@ Options:
   every GPU the driver reports by default (:mod:`uniserve_testing.devices`).
 - ``--engine``: the engine package every test deployment runs, by its backend
   name; the tree's own engine package by default.
-- ``--serve-set``: a ``PATH=VALUE`` assignment every test deployment adds
-  (repeatable), such as a run under compute-sanitizer states.
+- ``--serve-config``: a TOML file of options every test deployment's
+  ``config.toml`` states over its own, such as a run under compute-sanitizer
+  states.
 - ``--time-scale``: the factor every wait of an end-to-end case is stretched
   by, for a run whose processes run under a tool.
-- ``--peer-host``, ``--peer-address`` and ``--leader-address``: the second
-  host of a two-host case (an ssh destination that has ``uniserve``
-  installed), the address this host reaches it at, and the address it reaches
-  this host at.
+- ``--peer-host``: the second host of a two-host case, an ssh destination
+  that has ``uniserve`` installed and whose host name this host resolves.
 
 With pytest-xdist, ``-n auto`` starts one worker per GPU the run may lease
 (:func:`pytest_xdist_auto_num_workers`).
@@ -34,6 +33,7 @@ import os
 import shutil
 import sys
 import sysconfig
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -69,12 +69,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "name; the tree's own engine package when unset",
     )
     e2e.addoption(
-        "--serve-set",
-        action="append",
-        default=[],
-        metavar="PATH=VALUE",
-        help="an option every test deployment adds, as `serve --set` takes "
-        "it; repeatable",
+        "--serve-config",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="a TOML file of options every test deployment's config.toml "
+        "states over its own",
     )
     e2e.addoption(
         "--time-scale",
@@ -86,17 +86,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--peer-host",
         default=None,
         help="the second host of a two-host case: an ssh destination whose "
-        "login has `uniserve` installed",
-    )
-    e2e.addoption(
-        "--peer-address",
-        default=None,
-        help="the address this host reaches the second host at",
-    )
-    e2e.addoption(
-        "--leader-address",
-        default=None,
-        help="the address the second host reaches this host at",
+        "login has `uniserve` installed, and whose host name this host "
+        "resolves as it resolves this host's",
     )
     e2e.addoption(
         "--mooncake-master",
@@ -193,9 +184,10 @@ def repository(pytestconfig: pytest.Config) -> Path:
 @pytest.fixture(scope="session")
 def e2e_settings(pytestconfig: pytest.Config) -> Settings:
     """What the run's options state for every deployment of the run."""
+    path = pytestconfig.getoption("serve_config")
     return Settings(
         time_scale=pytestconfig.getoption("time_scale"),
-        serve_set=tuple(pytestconfig.getoption("serve_set")),
+        config=tomllib.loads(path.read_text()) if path is not None else {},
         engine=pytestconfig.getoption("engine"),
     )
 
@@ -234,17 +226,12 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
 @pytest.fixture(scope="session")
 def peer_host(pytestconfig: pytest.Config) -> RemoteHost:
     """The second host of a two-host case; the case is skipped when the run
-    names none (``--peer-host``, ``--peer-address``, ``--leader-address``).
+    names none (``--peer-host``).
     """  # noqa: D205
     destination = pytestconfig.getoption("peer_host")
-    address = pytestconfig.getoption("peer_address")
-    leader = pytestconfig.getoption("leader_address")
-    if not (destination and address and leader):
-        pytest.skip(
-            "a two-host case needs --peer-host, --peer-address and "
-            "--leader-address"
-        )
-    return RemoteHost(destination, address, leader)
+    if not destination:
+        pytest.skip("a two-host case needs --peer-host")
+    return RemoteHost.of(destination)
 
 
 @pytest.fixture(scope="session")

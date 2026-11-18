@@ -1,0 +1,9 @@
+# The options every deployment of the sanitizer suite states over its own
+# (`just test-python-sanitizer`, pytest's `--serve-config`): memcheck's own
+# device storage takes more of each GPU than a deployment's default share
+# leaves free, and its slower kernels outlast the default watchdog.
+
+mem_fraction_static = 0.6
+
+[worker_config]
+watchdog_timeout = "2h"

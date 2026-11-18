@@ -5,8 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from uniserve_testing import assets, media
+from uniserve_testing import assets, media, packages
 from uniserve_testing.deployments import Deployments
+from uniserve_testing.packages import merged
 
 pytestmark = [
     pytest.mark.e2e,
@@ -19,9 +20,9 @@ SIZE = "1344x768"
 # Every output length the [4, 15] second API range produces at 24 fps.
 FRAME_COUNTS = tuple(107 + 17 * index for index in range(16))
 # Prompt lengths around and between the text capacities: the listed 1024 and
-# the prompt capacity `--max-model-len`, 16384.
+# the prompt capacity `max_model_len`, 16384.
 PROMPT_TOKENS = (1, 777, 1024, 1025, 3000, 16384, 9000, 64)
-TEXT_CAPACITIES = "[1024]"
+TEXT_CAPACITIES = [1024]
 
 
 def _request(prompt: str, seconds: float, seed: int) -> dict[str, object]:
@@ -56,19 +57,21 @@ def test_every_admitted_duration_and_prompt_length_replays(
 
     with (
         deployments.serve(
-            "--served-model-name",
-            "FastH3",
-            "--config",
-            str(repository / "configs" / "minimax_h3" / "ulysses4.toml"),
-            "--max-running-requests",
-            "2",
-            "--max-model-len",
-            "16384",
-            "--set",
-            "video_config.max_seconds=15",
-            "--set",
-            f"video_config.text_capacities={TEXT_CAPACITIES}",
-            model=assets.CHECKPOINTS["fasth3"].model,
+            merged(
+                packages.read(
+                    repository / "configs" / "minimax_h3" / "ulysses4"
+                ),
+                {
+                    "model": assets.CHECKPOINTS["fasth3"].model,
+                    "served_model_name": "FastH3",
+                    "max_running_requests": 2,
+                    "max_model_len": 16384,
+                    "video_config": {
+                        "max_seconds": 15,
+                        "text_capacities": TEXT_CAPACITIES,
+                    },
+                },
+            )
         ) as server,
         media.api(server) as api,
     ):

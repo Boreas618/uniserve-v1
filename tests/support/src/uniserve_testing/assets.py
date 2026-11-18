@@ -42,7 +42,7 @@ class Checkpoint:
 
     @property
     def model(self) -> str:
-        """The asset as ``uniserve serve`` and ``--lora`` name it.
+        """The asset as a package's ``model`` and ``lora`` name it.
 
         Skips the calling case when no repository publishes the asset.
         """
@@ -122,14 +122,14 @@ CHECKPOINTS: dict[str, Checkpoint] = {
 }
 
 #: The file a video family reads an adapter's weights from, and the student
-#: contract it reads beside them (``--lora``, ``docs/configuration.md``).
+#: contract it reads beside them (``lora``, ``docs/configuration.md``).
 ADAPTER_WEIGHTS = "adapter_model.safetensors"
 STUDENT_CONTRACT = "fastvideo_inference.json"
 
 
 def adapter_directory(directory: Path) -> Path:
     """A directory holding the FastH3 adapter's weights beside its
-    student's inference contract, which ``--lora-dir`` serves.
+    student's inference contract, which a package's ``lora_dir`` serves.
 
     The adapter release ships its weights alone, and the family reads the
     contract of the student the adapter is trained for beside them, so the

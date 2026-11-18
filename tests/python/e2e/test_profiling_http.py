@@ -4,8 +4,8 @@ Qwen3 serves on the GPU the module's lease holds:
 
 - The fence probes are always on: every decode step's span and its
   transformer layers' time reach the Prometheus histogram, and switching
-  the probes off through ``PUT /admin/config`` is a change in place that
-  stops them, until they are switched on again.
+  the probes off through ``PUT /admin/policy`` is a change at the next step
+  that stops them, until they are switched on again.
 - Sessions record their windows of decode steps into one file per
   worker, together running every collector: CUPTI's activity records and
   API calls with the fence records and PC sampling's counts (its records
@@ -50,12 +50,15 @@ pytestmark = [
 #: keep: its transformer layers, as a pattern of their class names.
 LAYERS = "*.TransformerLayer"
 
-OPTIONS = (
-    "--set",
-    "kv_cache_config.max_tokens=32768",
-    "--set",
-    f'profiling_config.fence_modules=["{LAYERS}"]',
-)
+#: The module's options over the profiling deployment's: a small KV cache,
+#: fence probes on the transformer layers, and a short trial, which the epoch
+#: change of a case stands before it commits by itself and which nothing of
+#: the module observes.
+OPTIONS = {
+    "kv_cache_config": {"max_tokens": 32768},
+    "profiling_config": {"fence_modules": [LAYERS]},
+    "update_config": {"trial": "5s"},
+}
 
 #: How long the workers take to report the forwards or fence steps of the
 #: load's decode steps, in seconds (scaled): each report carries the steps
@@ -68,15 +71,15 @@ def served(module_deployments: Deployments) -> Iterator[Server]:
     """A Qwen3 deployment serving with fence probes on its transformer
     layers, which the module's tests share.
     """  # noqa: D205
-    with profiling.serve(module_deployments, *OPTIONS) as server:
+    with profiling.serve(module_deployments, OPTIONS) as server:
         yield server
 
 
-def _apply(server: Server, *assignments: str) -> dict[str, Any]:
-    """The result of applying `assignments` (``PUT /admin/config``)."""
-    response = admin.apply(server, *assignments)
-    assert response.status_code == 200, response.text
-    return response.json()["result"]
+def _change(server: Server, changes: dict[str, Any]) -> dict[str, Any]:
+    """The revision record of `changes` applied over the deployment's
+    package (``PUT /admin/policy``), once the deployment converged to it.
+    """  # noqa: D205
+    return admin.revision(admin.change(server, changes))
 
 
 def _forwards(server: Server) -> float:
@@ -124,8 +127,8 @@ def test_fence_probes_report_steps_and_switch_in_place(served: Server):
         )
     print(f"decode steps {steps()}, layer steps {layer_steps()}")
 
-    off = _apply(served, "profiling_config.fence_probes=false")
-    assert off["change"] == "in_place", off
+    off = _change(served, {"profiling_config": {"fence_probes": False}})
+    assert off["effect"] == "step", off
     try:
         # The steps whose probes ran before the switch are read with the next
         # results; none is counted after them, while the workers report the
@@ -138,8 +141,8 @@ def test_fence_probes_report_steps_and_switch_in_place(served: Server):
     finally:
         # The module's server goes on to the sessions of the tests after this
         # one with its probes as it was started, whatever this one found.
-        on = _apply(served, "profiling_config.fence_probes=true")
-    assert on["change"] == "in_place", on
+        on = _change(served, {"profiling_config": {"fence_probes": True}})
+    assert on["effect"] == "step", on
     with Load(served, streams=1):
         served.wait_until(
             lambda: steps() > settled,
@@ -280,18 +283,19 @@ def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
                 "output_dir": str(tmp_path / "profiles"),
             },
         )
-        changed = _apply(
-            served, "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
+        # The change answers once the new epoch stood its trial and
+        # committed; the session ended with the switch to it.
+        changed = _change(
+            served,
+            {"cuda_graph_config": {"decode_batch_sizes": [1, 2, 4, 8, 16]}},
         )
-        assert changed["change"] == "epoch", changed
+        assert changed["effect"] == "epoch", changed
         session = profiling.session(served)
         assert session["state"] == "ended", session
         assert session["end_reason"] == "epoch change", session
         # A rank's file is `written` with its rows by table, or `failed`.
         file = session["files"][0]["file"]["written"]
         assert file["rows"]["kernel"] > 0, session
-        committed = admin.operation(served, "config/commit")
-        assert committed.status_code == 200, committed.text
 
 
 #: The span before a guarded session whose average step time its guard

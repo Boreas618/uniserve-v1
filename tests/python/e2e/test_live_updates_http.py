@@ -5,24 +5,28 @@ modules serve (:data:`uniserve_testing.updates.PROFILE`), with a Storage
 Server of the case's own: a case that reads or restarts it names the runtime
 directory it serves under (the ``runtime`` fixture).
 
-- A node (``uniserve serve`` without a model) brings deployments up
-  (``PUT /admin/config``) and down through its admin API without
-  restarting: each deployment's storage belongs to it, so the Storage Server
-  holds nothing of a deployment brought down, and a deployment whose host
-  regions the host's available storage cannot hold is refused with the sizes
-  that decided it.
+- A deployment's storage belongs to it: once the deployment comes down
+  (``POST /admin/shutdown``), its Storage Server holds nothing of it, and a
+  deployment whose host regions the host's available storage cannot hold
+  does not come up, with the sizes that decided it.
 - A serving deployment answers its admin API, on the daemon's operator
   socket: new requests wait while generation is paused and are served once
   it continues; a flush evicts the device copies of the cached blocks;
-  scheduling limits within the batch the workers were started for change in
-  place while a request streams, and a change of the decode batch sizes is
-  an epoch change under the same stream, which the operator commits; the
-  manager attaches to the node, follows its events and detaches while it
-  serves.
+  scheduling limits change at the next step while a request streams, and a
+  change of the decode batch sizes is an epoch change under the same
+  stream, which commits once its trial (``update_config.trial``) passed;
+  the manager applies a package to the node, follows its events and
+  detaches while it serves.
 - A hot restart hands the deployment and its responses in flight to a
   successor daemon, and a Storage Server restart keeps it serving.
-- A target that finds no storage, a lost main process, a rollback and a
-  regression on trial leave the requests in flight whole.
+- A target that finds no storage, a lost main process, a fault on trial and
+  a regression on trial leave the requests in flight whole.
+
+Every change is a policy package ``PUT /admin/policy`` applies
+(:mod:`uniserve_testing.admin`): the options a case changes over the
+deployment's current package. The options of how an update proceeds
+(``update_config``) are the daemon's own, so a case states them in the
+package it starts with.
 - A sleeping deployment gives back its KV cache, holds new requests and
   recomputes the ones it ran once it wakes, and answers as before.
 - The host tier keeps a prompt's blocks across flushes, devices, cache
@@ -44,7 +48,7 @@ from typing import Any
 
 import httpx
 import pytest
-from uniserve_testing import admin, builds, chat, updates
+from uniserve_testing import admin, builds, chat, packages, updates
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.builds import BuildServer
 from uniserve_testing.caching import cached_tokens
@@ -57,14 +61,28 @@ from uniserve_testing.deployments import (
     storage_status,
 )
 from uniserve_testing.devices import Lease
+from uniserve_testing.packages import Config, merged
 from uniserve_testing.plugin import environment_program
 from uniserve_testing.servers import Server, environment
 from uniserve_testing.updates import Stream, numbers
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
+#: How long a trial lasts in a case that does not act in it: the update
+#: commits soon after its switch, so a case that changes the deployment
+#: several times spends no GPU time waiting.
+TRIAL = "5s"
+
+#: A trial no case outlasts, for a case that ends it by a fault or a
+#: threshold of its own and reads what the trial keeps meanwhile.
+HELD_TRIAL = "10m"
+
+#: A trial a case causes a fault in once it began, short enough that the
+#: other updates of the same deployment commit soon after it.
+FAULT_TRIAL = "60s"
+
 #: The options every deployment of the module serves with.
-OPTIONS = updates.PROFILE
+OPTIONS = merged(updates.PROFILE, {"update_config": {"trial": TRIAL}})
 
 
 @pytest.fixture(scope="module")
@@ -91,15 +109,13 @@ def build_server(
 
 #: A change of the options that only a new epoch executes: graphs of other
 #: decode batch sizes.
-CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 8]"
+CHANGE = {"cuda_graph_config": {"decode_batch_sizes": [1, 2, 8]}}
 
 #: The options of a deployment whose KV cache takes the device storage its
 #: share leaves, rather than a fixed token count.
-SIZED_OPTIONS = tuple(
-    option
-    for option in OPTIONS
-    if not option.startswith("kv_cache_config.max_tokens")
-)
+SIZED_OPTIONS = {
+    key: value for key, value in OPTIONS.items() if key != "kv_cache_config"
+}
 
 #: The count a case streams while it acts on the deployment: long enough to
 #: be in flight across what the case does.
@@ -188,16 +204,22 @@ def runtime(uniserve: Path, tmp_path: Path) -> Iterator[Path]:
 def _serve(
     deployments: Deployments,
     name: str,
-    options: tuple[str, ...] = OPTIONS,
+    options: Config = OPTIONS,
     runtime: Path | None = None,
+    host_gib: int | None = HOST_CACHE_GIB,
 ) -> AbstractContextManager[Server]:
-    """A deployment of Qwen3 serving `name` with `options`."""
+    """The deployment `name` of Qwen3 serving `name` with `options`."""
     return deployments.serve(
-        "--served-model-name",
-        name,
-        *updates.assigned(*options),
-        model=CHECKPOINTS["qwen3"].model,
+        merged(
+            {
+                "model": CHECKPOINTS["qwen3"].model,
+                "served_model_name": name,
+            },
+            options,
+        ),
+        name=name,
         runtime=runtime,
+        host_gib=host_gib,
     )
 
 
@@ -286,33 +308,64 @@ def _assert_counts_from_one(stream: Stream, count: int) -> None:
     assert written[:count] == list(range(1, count + 1)), stream.text[:400]
 
 
-def _apply(server: Server, *assignments: str, **fields: object) -> dict:
-    """Apply `assignments` (``PUT /admin/config``); its result, once an
-    update reached its trial or the change was made.
+def _apply(server: Server, changes: Config) -> dict:
+    """Apply `changes` over the deployment's package; the revision's record
+    once the deployment converged to it: an update's once its trial passed
+    and it committed.
     """  # noqa: D205
-    response = admin.apply(server, *assignments, **fields)
-    assert response.status_code == 200, response.text
-    return response.json()["result"]
+    return admin.revision(admin.change(server, changes))
 
 
-def _commit(server: Server) -> dict:
-    """Commit the update on trial; the update once it entered ``committed``,
-    which releases its kept side.
+def _change_epoch(server: Server, changes: Config) -> dict:
+    """Apply `changes` as an epoch switch, which commits once its trial
+    passed; the update as the report states it then.
     """  # noqa: D205
-    before = admin.next_event(server)
-    committed = admin.operation(server, "config/commit")
-    assert committed.status_code == 200, committed.text
-    return admin.wait_for_phase(server, "committed", after=before)
+    record = _apply(server, changes)
+    assert record["effect"] == "epoch", record
+    update = admin.report(server)["update"]
+    assert update["phase"] == "committed", update
+    return update
 
 
-def _change_epoch(server: Server, *assignments: str) -> dict:
-    """Apply `assignments` as an epoch switch and commit its target; the
-    update as it stood on trial.
+def _successor(server: Server, previous: int) -> int:
+    """The daemon that took the deployment over from daemon `previous` in a
+    hot restart a change of the daemon's own options started, once its
+    readiness record in the status names it.
+
+    The change answers ``202`` as soon as the restart began, and the
+    successor states its record as it begins to serve; no event carries the
+    record, so the status is read until it names another daemon.
     """  # noqa: D205
-    result = _apply(server, *assignments)
-    assert result["change"] == "epoch", result
-    _commit(server)
-    return result["update"]
+
+    def serving() -> int | None:
+        try:
+            readiness = admin.status(server).get("readiness")
+        except (httpx.HTTPError, OSError):
+            return None
+        if not readiness or readiness["pid"] == previous:
+            return None
+        return int(readiness["pid"])
+
+    server.wait_until(
+        lambda: serving() is not None,
+        TAKEOVER_S,
+        f"no daemon took the deployment over from {previous}",
+    )
+    pid = serving()
+    assert pid is not None
+    return pid
+
+
+def _restarted(response: httpx.Response) -> dict:
+    """The record of a change whose daemon options a hot restart applies:
+    answered ``202`` once the restart began, its successor converging the
+    rest.
+    """  # noqa: D205
+    assert response.status_code == 202, response.text
+    record = response.json()
+    assert record["effect"] == "daemon", record
+    assert record["result"] == "converging", record
+    return record
 
 
 def _held_requests(server: Server) -> int:
@@ -342,20 +395,6 @@ def _flush(server: Server) -> None:
     assert flushed.status_code == 200, flushed.text
 
 
-def _deployment(
-    deployments: Deployments, name: str, *assignments: str
-) -> list[str]:
-    """The assignments that bring the deployment `name` up on an idle node."""
-    return [
-        f'model="{CHECKPOINTS["qwen3"].model}"',
-        f'served_model_name="{name}"',
-        f"kv_cache_config.host_gib={HOST_CACHE_GIB}",
-        *OPTIONS,
-        *deployments.assignments(),
-        *assignments,
-    ]
-
-
 def _held_of(listing: dict[str, Any], name: str) -> dict[str, list]:
     """What a Storage Server's listing holds of the deployment `name`: its
     claim, its tensors, its quotas and its buffer pool.
@@ -382,77 +421,58 @@ def _held_of(listing: dict[str, Any], name: str) -> dict[str, list]:
     }
 
 
-def test_a_node_serves_deployments_one_after_another_and_releases_their_storage(
+def test_a_deployment_releases_its_storage_and_one_too_large_does_not_come_up(
     deployments: Deployments, uniserve: Path, runtime: Path
 ):
-    # The node states no deployment of its own, so no host tier either: each
-    # deployment it brings up states its own.
-    with deployments.serve(name="node", host_gib=None, runtime=runtime) as node:
-        available = 0
-        for index in range(3):
-            name = f"qwen3-live-{index}"
-            # A bring-up answers once the deployment serves.
-            brought = admin.apply(
-                node, *_deployment(deployments, name), config=""
-            )
-            assert brought.status_code == 200, brought.text
-            assert brought.json()["result"]["change"] == "deployment", (
-                brought.text
-            )
-            status = admin.status(node)
-            assert status["state"] == "serving", status
-            assert status["deployment"]["deployment"] == name, status
-            assert _ask(node.base_url, name, "Say hello.")
+    name = "qwen3-live-storage-owner"
+    with _serve(deployments, name, runtime=runtime) as server:
+        assert _ask(server.base_url, name, "Say hello.")
 
-            # The host's Storage Server holds the deployment: its claim and
-            # the weights its quota reserves.
-            held = _held_of(updates.listing(uniserve, runtime), name)
-            assert held["deployments"], held
-            reserved = {
-                entry["item"]
-                for quota in held["quotas"]
-                for entry in quota["reservations"]
-            }
-            assert "weights" in reserved, held
-            # The host's available storage, as the Storage Server reads it.
-            (usage,) = admin.config(node)["quotas"]
-            available = usage["host_storage"]["available"]
+        # The host's Storage Server holds the deployment: its claim and the
+        # weights its quota reserves.
+        held = _held_of(updates.listing(uniserve, runtime), name)
+        assert held["deployments"], held
+        reserved = {
+            entry["item"]
+            for quota in held["quotas"]
+            for entry in quota["reservations"]
+        }
+        assert "weights" in reserved, held
+        # The host's available storage, as the Storage Server reads it.
+        (usage,) = admin.report(server)["quotas"]
+        available = usage["host_storage"]["available"]
 
-            # The shutdown answers at once, and the deployment comes down
-            # after it: the node's status states it idle once it did, and
-            # the node's event log records the change with no data that
-            # tells it apart from the shutdown's own.
-            down = admin.operation(node, "shutdown")
-            assert down.status_code == 202, down.text
-            node.wait_until(
-                lambda: admin.status(node)["state"] == "idle",
-                DOWN_S,
-                f"{name} did not come down",
-            )
-            status = admin.status(node)
-            assert status["last_error"] is None, status
-            released = _held_of(updates.listing(uniserve, runtime), name)
-            assert not any(released.values()), released
+        # The shutdown answers at once, and the deployment comes down after
+        # it: the daemon, whose node serves this deployment alone, ends
+        # with it, having released what the deployment held.
+        down = admin.operation(server, "shutdown")
+        assert down.status_code == 202, down.text
+        assert server.process.wait() == 0, "the daemon ended in an error"
+    released = _held_of(updates.listing(uniserve, runtime), name)
+    assert not any(released.values()), released
 
-        # A host tier the host's available storage cannot hold.
-        too_large = 2 * available // GIB
-        refused = admin.apply(
-            node,
-            *_deployment(
-                deployments,
-                "qwen3-live-too-large",
-                f"kv_cache_config.host_gib={too_large}",
-            ),
-            config="",
-        )
-        assert refused.status_code != 200, refused.text
-        status = admin.status(node)
-        assert status["state"] == "idle", status
-        error = status["last_error"] or ""
-        print(f"refused: {error}")
-        assert "available" in error and "reserve" in error, error
-        # The node is the same process throughout.
-        assert node.process.poll() is None
+    # A host tier the host's available storage cannot hold, at the same
+    # Storage Server: the deployment does not come up, and its daemon's log
+    # states the sizes that decided it.
+    too_large = "qwen3-live-too-large"
+    with (
+        pytest.raises(RuntimeError, match="ended before it was serving"),
+        _serve(
+            deployments,
+            too_large,
+            runtime=runtime,
+            host_gib=2 * available // GIB,
+        ),
+    ):
+        pass
+    log = (deployments.directory / f"{too_large}.log").read_text()
+    refusal = [
+        line
+        for line in log.splitlines()
+        if "available" in line and "reserve" in line
+    ]
+    print(f"refused: {refusal}")
+    assert refusal, log[-4000:]
 
 
 def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
@@ -460,7 +480,7 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
     # The deployment keeps no host tier: what a request finds cached is on the
     # device, so the tokens its answer states as cached say what a flush
     # evicted.
-    options = (*OPTIONS, "kv_cache_config.host_tier=false")
+    options = merged(OPTIONS, {"kv_cache_config": {"host_tier": False}})
     with _serve(deployments, name, options=options) as server:
         status = admin.status(server)
         assert status["deployment"]["deployment"] == name, status
@@ -497,12 +517,12 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
         after_flush = _cached(server.base_url, name, prompt)
         assert after_flush == 0, after_flush
 
-        # Scheduling limits change in place under a streaming request, and
-        # other decode batch sizes by an epoch change under the same stream.
+        # Scheduling limits change at the next step under a streaming
+        # request, and other decode batch sizes by an epoch change under the
+        # same stream.
         stream = _streaming(server, name)
-        update = _apply(server, "scheduler_config.max_batch=4")
-        assert update["change"] == "generation", update
-        _commit(server)
+        limits = _apply(server, {"scheduler_config": {"max_batch": 4}})
+        assert limits["effect"] == "step", limits
         before_update = len(stream.deltas)
         report = _change_epoch(server, CHANGE)
         print(f"epoch switch: {report['switch_ms']} ms")
@@ -511,23 +531,31 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
             "the stream ended before the update"
         )
 
-        # The manager attaches to the node by its operator socket, reads its
-        # configuration status, follows its events and detaches. It names
+        # The manager attaches to the node by its operator socket, applies a
+        # package directory to it, follows its events and detaches. It names
         # the node by its address at the head of each line it prints, and
         # prints what the node answers as JSON after it.
         manager = str(environment_program("uniserve-manager"))
         node = server.endpoint("admin")
-        configured = subprocess.run(
-            [manager, "--node", node, "config"],
+        current = admin.policy(server)
+        package = packages.write(
+            deployments.directory / "manager-package",
+            merged(current.config, {"scheduler_config": {"max_batch": 8}}),
+        )
+        applied = subprocess.run(
+            [manager, "--node", node, "apply", str(package)],
             env=environment(),
             check=True,
             capture_output=True,
             text=True,
         ).stdout
-        configuration = json.loads(configured.removeprefix(f"{node}: "))
-        assert configuration["executing"]["state"] == "serving", configuration
-        served = tomllib.loads(configuration["config"])
-        assert served["served_model_name"] == name, served
+        record = json.loads(applied.removeprefix(f"{node}: "))
+        assert record["result"] == "converged", record
+        assert record["revision"] == current.revision + 1, record
+        served = admin.policy(server)
+        assert served.revision == record["revision"], served
+        assert served.config["scheduler_config"]["max_batch"] == 8, served
+        assert served.config["served_model_name"] == name, served
 
         # The watch replays the events from the start, the config operations
         # among them, and detaches at an interrupt.
@@ -676,7 +704,7 @@ def _restart_while_streaming(
     # the successor reads the configuration the old process served rather than
     # a command line of its own (design 7.5).
     assert build_server is not None
-    inherited = tomllib.loads(admin.config(server)["config"])
+    inherited = tomllib.loads(admin.report(server)["config"])
     assert inherited["build_config"]["socket"] == str(build_server.socket), (
         f"the successor did not inherit the modules' server: {inherited}"
     )
@@ -741,58 +769,70 @@ def _restart_while_streaming(
     assert ("operation", "restart") in recorded, recorded
     assert ("deployment", None) in recorded, recorded
 
-    # The successor restarts in turn, and takes a change in place.
+    # The successor restarts in turn, and takes a change at the next step.
     again = admin.operation(server, "restart")
     assert again.status_code == 200, again.text
     successors.append(again.json()["result"]["pid"])
     updates.wait_for_end(successor)
     assert _ask(server.base_url, name, "Say hello.")
-    # A scheduling limit is a parameter of the policy package, so it reaches
-    # the serving epoch as a generation update; `max_running_requests` is build
-    # config and would switch the epoch.
-    update = _apply(server, "scheduler_config.max_batch=4")
-    assert update["change"] == "generation", update
-    _commit(server)
+    # A scheduling limit takes effect at a scheduler's next step;
+    # `max_running_requests` sizes what the engine is started for and would
+    # switch the epoch.
+    limits = _apply(server, {"scheduler_config": {"max_batch": 4}})
+    assert limits["effect"] == "step", limits
 
     # A change of the listening address restarts the daemon on it: the new
     # address serves, and the old one closes once the replaced daemon exits.
     previous = successors[-1]
-    moved = _apply(server, 'admin_config.host="localhost"')
-    assert moved["change"] == "daemon", moved
-    successors.append(moved["pid"])
+    moved = _restarted(
+        admin.change(server, {"admin_config": {"host": "localhost"}})
+    )
+    successors.append(_successor(server, previous))
     # The successor binds the new address, on a port it picks, once it holds
-    # the deployment.
-    moved_url = _taken_over(server, moved["pid"])
+    # the deployment, and records the revision converged.
+    moved_url = _taken_over(server, successors[-1])
     assert _ask(moved_url, name, "Say hello.")
     updates.wait_for_end(previous)
     with pytest.raises(httpx.ConnectError):
         httpx.get(f"{server.base_url}/health", timeout=5)
-    served = tomllib.loads(admin.config(server)["config"])["admin_config"]
+    served = tomllib.loads(admin.report(server)["config"])["admin_config"]
     assert served["host"] == "localhost", served
+    server.wait_until(
+        lambda: admin.policy(server).revision == moved["revision"],
+        TAKEOVER_S,
+        "the successor did not record the address's revision converged",
+    )
 
     # A change of both the daemon's options and what an epoch executes
     # restarts the daemon on its new options first, and its successor then
-    # changes the epoch in an operation of its own.
+    # changes the epoch in an operation of its own, which commits once its
+    # trial passed.
     previous = successors[-1]
     before = admin.next_event(server)
-    both = _apply(server, 'admin_config.host="127.0.0.1"', CHANGE)
-    assert both["change"] == "daemon", both
-    assert both["then"] == "update", both
-    successors.append(both["pid"])
-    both_url = _taken_over(server, both["pid"])
-    trial = admin.wait_for_phase(
-        server, "trial", "abandoned", "rolled_back", after=before
+    both = _restarted(
+        admin.change(
+            server, merged({"admin_config": {"host": "127.0.0.1"}}, CHANGE)
+        )
     )
-    assert trial["phase"] == "trial", trial
-    assert trial["change"] == "epoch", trial
-    # The update the successor's operation started is numbered by it.
+    successors.append(_successor(server, previous))
+    both_url = _taken_over(server, successors[-1])
+    update = admin.wait_for_phase(
+        server, "committed", "abandoned", "rolled_back", after=before
+    )
+    assert update["phase"] == "committed", update
+    assert update["change"] == "epoch", update
+    # The revision becomes current once the deployment converged to it, and
+    # the update the successor's operation started is numbered by it.
+    server.wait_until(
+        lambda: admin.policy(server).revision == both["revision"],
+        TAKEOVER_S,
+        "the successor did not record the change's revision converged",
+    )
     last = admin.status(server)["last_operation"]
     assert last["kind"] == "config" and last["state"] == "succeeded", last
-    assert trial["update"] == last["id"], (trial, last)
-    # The commit releases the previous epoch, and the configuration is the
-    # target's from then on.
-    _commit(server)
-    served = tomllib.loads(admin.config(server)["config"])
+    assert update["update"] == last["id"], (update, last)
+    # The configuration is the target's from then on.
+    served = tomllib.loads(admin.report(server)["config"])
     assert served["cuda_graph_config"]["decode_batch_sizes"] == [1, 2, 8]
     # `127.0.0.1` is the host's default, which the configuration, stating only
     # what differs from the defaults, leaves out.
@@ -950,26 +990,26 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
     process holding all of it but ``TARGET_ROOM``, room for the target's CUDA
     context and no more, the target finds no room for its graph pool, so its
     start fails, the update is abandoned before any
-    switch (the apply answers ``409`` with the abandoned update,
-    ``docs/admin.md``), and the stream goes on with the serving epoch's regions
-    as they were.
+    switch (the ``PUT`` answers ``409`` with the reason, the report states
+    the abandoned update and the revision stays the current one,
+    ``docs/admin.md``), and the stream goes on with the serving epoch's
+    regions as they were.
     """  # noqa: E501
     name = "qwen3-live-pressure"
     prompt = "Describe the sea in one sentence."
     with _serve(deployments, name, options=SIZED_OPTIONS) as server:
         before = _ask(server.base_url, name, prompt, 32)
-        serving = admin.config(server)["executing"]["epoch"]
+        serving = admin.report(server)["executing"]["epoch"]
+        current = admin.policy(server).revision
         cache = _bytes_of(server, "cache_segment", serving)
         stream = _streaming(server, name)
         with updates.ballast(lease, leave=TARGET_ROOM) as held:
             print(f"ballast holds {held / GIB:.1f} GiB")
-            # The apply waits until the update reached its trial or ended
-            # before it: abandoned, it answers 409 with the update.
-            response = admin.apply(server, CHANGE)
+            # The change answers once the update ended: abandoned, with 409
+            # and its reason.
+            response = admin.change(server, CHANGE)
             assert response.status_code == 409, response.text
-            result = response.json()["result"]
-            assert result["change"] == "epoch", result
-            update = result["update"]
+            update = admin.report(server)["update"]
             print("epoch switch under pressure:", json.dumps(update))
             # The target's start failed before it joined: a failed
             # preparation, whose reason names the storage it did not find.
@@ -977,8 +1017,10 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
             assert update["failure"]["kind"] == "prepare_failed", update
             assert "graph pool" in update["failure"]["reason"], update
         _assert_counts_from_one(stream, 200)
-        # The serving epoch's quota reserves at least the KV cache it held.
-        assert admin.config(server)["executing"]["epoch"] == serving
+        # The serving epoch's quota reserves at least the KV cache it held,
+        # and its revision is still the current one.
+        assert admin.report(server)["executing"]["epoch"] == serving
+        assert admin.policy(server).revision == current
         assert _bytes_of(server, "cache_segment", serving) >= cache, (
             "the abandoned update shrank the serving epoch's KV regions"
         )
@@ -992,7 +1034,7 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
     prompt = "Describe the sea in one sentence."
     with _serve(deployments, name, options=SIZED_OPTIONS) as server:
         before = _ask(server.base_url, name, prompt, 32)
-        epoch = admin.config(server)["executing"]["epoch"]
+        epoch = admin.report(server)["executing"]["epoch"]
         awake = _bytes_of(server, "cache_segment", epoch)
         assert awake > 0, admin.reservations(server)
         stream = _streaming(server, name)
@@ -1179,7 +1221,7 @@ def test_a_lost_main_process_is_promoted_from_its_standby(
     parked rather than by one that starts now.
     """
     name = "qwen3-live-standby"
-    options = (*OPTIONS, "worker_config.standby=true")
+    options = merged(OPTIONS, {"worker_config": {"standby": True}})
     with _serve(deployments, name, options=options) as server:
         evidence = _lose_the_serving_engine(
             server, name, "standby-promoted", standby=True
@@ -1214,7 +1256,7 @@ def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
     and takes over when the target's process is lost.
     """
     name = "qwen3-live-standby-switch"
-    options = (*OPTIONS, "worker_config.standby=true")
+    options = merged(OPTIONS, {"worker_config": {"standby": True}})
     revision = updates.engine_revision(deployments.build_server, repository)
     with _serve(deployments, name, options=options) as server:
         first = _wait_for_standby(server)
@@ -1226,14 +1268,23 @@ def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
         assert evidence["promoted"]
 
 
-def _rollback(server: Server) -> dict:
-    """Roll the update on trial back; the update once it entered
-    ``rolled_back``, which serves its kept side again.
+def _fail_the_target(server: Server, after: int) -> dict:
+    """End the update on trial by a fault: the target's serving main process
+    ends, which rolls a trial back whatever its thresholds; the update once
+    it entered ``rolled_back``, which serves its kept side again. `after` is
+    the event the case read before it applied the change.
     """  # noqa: D205
-    before = admin.next_event(server)
-    rolled = admin.operation(server, "config/rollback", {"reason": "the check"})
-    assert rolled.status_code == 200, rolled.text
-    return admin.wait_for_phase(server, "rolled_back", after=before)
+    admin.wait_for_phase(server, "trial", after=after)
+    updates.terminate(admin.serving_engine(server)["pid"])
+    return admin.wait_for_phase(server, "rolled_back", after=after)
+
+
+def _rolled_back(response: httpx.Response) -> None:
+    """The answer of a change its trial rolled back: refused, with the
+    reason, and no revision converged.
+    """  # noqa: D205
+    assert response.status_code == 409, response.text
+    print("rolled back:", response.text)
 
 
 def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
@@ -1243,24 +1294,28 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
 
     The epoch that replaces it maps that storage. So it does after a target's
     process is lost, when the first epoch's storage is gone with it, and after a
-    rollback that started the epoch again on the weights it kept.
+    rollback that started the epoch again on the weights it kept: the target
+    of the second update is lost on trial, which rolls it back.
     """
     name = "qwen3-live-relaunched-storage"
     revisions = [
         updates.engine_revision(deployments.build_server, repository)
         for _ in range(3)
     ]
-    with _serve(deployments, name) as server:
+    options = merged(
+        OPTIONS,
+        {"update_config": {"previous_epoch": "weights", "trial": FAULT_TRIAL}},
+    )
+    with _serve(deployments, name, options=options) as server:
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         _change_epoch(server, revisions[0])
         _lose_the_serving_engine(
             server, name, "relaunched-after-a-switch", standby=False
         )
-        result = _apply(
-            server, revisions[1], 'update_config.previous_epoch="weights"'
-        )
-        assert result["change"] == "epoch", result
-        _rollback(server)
+        before = admin.next_event(server)
+        with admin.changing(server, revisions[1]) as applied:
+            _fail_the_target(server, before)
+        _rolled_back(applied.result())
         # The rollback released the target, so the next update starts.
         _change_epoch(server, revisions[2])
         assert _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32) == (
@@ -1314,27 +1369,24 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
         assert _failed_requests(server.base_url) == failed, "a request failed"
 
 
-def _slower_target(
+def _repeated_attention(
     build_server: BuildServer, repository: Path, directory: Path
-) -> tuple[str, ...]:
-    """Installs what makes an epoch step slower under the same stream.
+) -> dict[str, Any]:
+    """Installs a decode attention that steps slower under the same stream.
 
-    The target is a new revision of the tree's engine whose decode attention
-    is a package of its own: the tree's trtllm-gen paged attention package
-    under the backend name ``trtllm_repeated``, whose entry runs the kernel
-    several times per call (``packages/paged_attention.toml``, ``repeated``).
-    The target computes the same tokens, later, with no fault to report. The
-    engine revision is what makes the change an epoch (a package selection
-    alone is a generation update).
+    It is a package of its own: the tree's trtllm-gen paged attention
+    package under the backend name ``trtllm_repeated``, whose entry runs the
+    kernel several times per call (``packages/paged_attention.toml``,
+    ``repeated``). It computes the same tokens, later, with no fault to
+    report; selected alone, it is a kernel generation of the serving epoch.
 
-    Both modules are built here, for the decode keys the serving deployment's
-    attention runs: an update's preparation then builds nothing, and a stream
-    started after this still runs when the switch comes.
+    Its modules are built here, for the decode keys the deployments of the
+    module's Build Server ran: an update's preparation then builds nothing,
+    and a stream started after this still runs when the switch comes.
 
     Returns:
-        The assignments that select the target.
+        The options that select it.
     """
-    engine = updates.engine_revision(build_server, repository)
     repeated = build_server.install(
         updates.derived(repository, "paged_attention", "repeated", directory)
     )
@@ -1361,83 +1413,105 @@ def _slower_target(
             key=key,
             target=target,
         )
-    return (engine, f'decode_attention_backend="{repeated.backend}"')
+    return {"decode_attention_backend": repeated.backend}
+
+
+def _slower_target(
+    build_server: BuildServer, repository: Path, directory: Path
+) -> dict[str, Any]:
+    """Installs what makes an epoch step slower under the same stream: a new
+    revision of the tree's engine whose decode attention is
+    :func:`_repeated_attention`. The engine revision is what makes the
+    change an epoch.
+
+    Returns:
+        The options that select the target.
+    """  # noqa: D205
+    engine = updates.engine_revision(build_server, repository)
+    return merged(
+        engine, _repeated_attention(build_server, repository, directory)
+    )
 
 
 @pytest.mark.parametrize("previous_epoch", ["parked", "weights", "host"])
-def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
+def test_a_fault_on_trial_returns_to_the_previous_epoch_under_a_request(
     deployments: Deployments, repository: Path, previous_epoch: str
 ):
-    """A rollback by hand ends the trial with no request lost.
+    """A target lost on trial rolls back with no request lost.
 
     The previous epoch is kept as ``update_config.previous_epoch`` states: its
     drained processes stay alive through the trial, or they exit with its
-    weights kept, and the rollback starts them again on those.
+    weights kept, and the rollback starts them again on those. The trial
+    outlasts the case, which ends it by ending the target's main process.
     """
     name = "qwen3-live-rollback"
     revision = updates.engine_revision(deployments.build_server, repository)
-    with _serve(deployments, name) as server:
+    options = merged(
+        OPTIONS,
+        {
+            "update_config": {
+                "previous_epoch": previous_epoch,
+                "trial": HELD_TRIAL,
+            }
+        },
+    )
+    with _serve(deployments, name, options=options) as server:
         before = admin.engine_pids(server)
-        previous = admin.config(server)["executing"]["epoch"]
+        previous = admin.report(server)["executing"]["epoch"]
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         stream = _start_count(server, name)
-        result = _apply(
-            server, revision, f'update_config.previous_epoch="{previous_epoch}"'
-        )
-        assert result["change"] == "epoch", result
-        if previous_epoch != "parked":
-            # The previous epoch's processes end.
-            for pid in before:
-                updates.wait_for_end(pid)
-        else:
-            assert all(updates.running(pid) for pid in before)
+        applying = admin.next_event(server)
+        with admin.changing(server, revision) as applied:
+            trial = admin.wait_for_phase(server, "trial", after=applying)
+            assert trial["change"] == "epoch", trial
+            if previous_epoch != "parked":
+                # The previous epoch's processes end.
+                for pid in before:
+                    updates.wait_for_end(pid)
+            else:
+                assert all(updates.running(pid) for pid in before)
 
-        # A node that cannot move the weights keeps them on its GPUs, and says
-        # why.
-        trial = admin.config(server)["update"]
-        print("kept:", json.dumps(trial))
-        if not trial["host_refused"]:
-            assert trial["previous_epoch_kept"] == previous_epoch, trial
-        if previous_epoch == "weights":
-            # The previous epoch keeps its weights alone: each GPU's quota
-            # reserves nothing else of it once its processes exited, the
-            # segments the target maps being the target's. The Storage Server
-            # releases a process's reservations once it saw the process end,
-            # and no event states a quota's change.
-            def kept() -> set[str]:
-                return {
-                    entry["item"]
-                    for entry in admin.reservations(server)
-                    if previous in entry["epochs"]
-                }
+            # A node that cannot move the weights keeps them on its GPUs, and
+            # says why.
+            trial = admin.report(server)["update"]
+            print("kept:", json.dumps(trial))
+            if not trial["host_refused"]:
+                assert trial["previous_epoch_kept"] == previous_epoch, trial
+            if previous_epoch == "weights":
+                # The previous epoch keeps its weights alone: each GPU's
+                # quota reserves nothing else of it once its processes
+                # exited, the segments the target maps being the target's.
+                # The Storage Server releases a process's reservations once
+                # it saw the process end, and no event states a quota's
+                # change.
+                def kept() -> set[str]:
+                    return {
+                        entry["item"]
+                        for entry in admin.reservations(server)
+                        if previous in entry["epochs"]
+                    }
 
-            try:
-                server.wait_until(
-                    lambda: kept() == {"weights"},
-                    ADMITTED_S,
-                    "the previous epoch kept more than its weights",
-                )
-            except TimeoutError as timeout:
-                held = [
-                    entry
-                    for entry in admin.reservations(server)
-                    if previous in entry["epochs"]
-                ]
-                raise AssertionError(
-                    f"the previous epoch keeps {json.dumps(held)}"
-                ) from timeout
-        before_rollback = admin.next_event(server)
-        rolled = admin.operation(
-            server, "config/rollback", {"reason": "the check"}
-        )
-        assert rolled.status_code == 200, rolled.text
+                try:
+                    server.wait_until(
+                        lambda: kept() == {"weights"},
+                        ADMITTED_S,
+                        "the previous epoch kept more than its weights",
+                    )
+                except TimeoutError as timeout:
+                    held = [
+                        entry
+                        for entry in admin.reservations(server)
+                        if previous in entry["epochs"]
+                    ]
+                    raise AssertionError(
+                        f"the previous epoch keeps {json.dumps(held)}"
+                    ) from timeout
+            # The previous epoch serves again once its processes stopped for
+            # the trial started again; the target serves until it is lost.
+            update = _fail_the_target(server, applying)
+            print("rolled back:", json.dumps(update))
+        _rolled_back(applied.result())
         _assert_whole(stream)
-        # The previous epoch serves again once its processes stopped for the
-        # trial started again; the target serves until then.
-        update = admin.wait_for_phase(
-            server, "rolled_back", after=before_rollback
-        )
-        assert update["failure"]["reason"] == "the check", update
         assert _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32) == (
             answer
         )
@@ -1452,32 +1526,40 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
     (:func:`_slower_target`), so the same stream steps slower on it with no
     fault. The stream crosses the switch and the rollback whole, the update
     ends unavailable with the threshold's reason, the status states the rates
-    that decided it, and applying it again needs ``force``. Forced without
-    the threshold, the same slower target stands its trial: the threshold,
-    and nothing else, rolled it back.
+    that decided it, and applying it again needs ``force``. A deployment
+    without the threshold takes the same slower target through a trial of
+    several windows: the threshold, and nothing else, rolled it back.
     """
     name = "qwen3-live-regression"
     # The step time past which the trial rolls back, as a fraction of the
     # previous epoch's steps up to the switch: above what the target's loading
     # and capture on the same GPU add to those steps, below what the repeated
-    # attention adds to the target's.
+    # attention adds to the target's. The trial outlasts the decision.
     regression = 0.2
-    thresholds = (
-        f"update_config.rollback.step_time_regression={regression}",
-        f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
+    thresholds = merged(
+        OPTIONS,
+        {
+            "update_config": {
+                "trial": HELD_TRIAL,
+                "rollback": {
+                    "step_time_regression": regression,
+                    "window": f"{TRIAL_WINDOW_S}s",
+                },
+            }
+        },
     )
     slower = _slower_target(deployments.build_server, repository, tmp_path)
-    with _serve(deployments, name) as server:
+    with _serve(deployments, name, options=thresholds) as server:
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
+        current = admin.policy(server).revision
         # The stream runs through the preparation, the switch, a whole window
         # of the trial and the rollback's drain, which the count outlasts only
         # when it starts with the update. The preparation's own seconds give
         # the baseline its window.
         stream = _start_count(server, name)
-        before = admin.next_event(server)
-        result = _apply(server, *slower, *thresholds)
-        assert result["change"] == "epoch", result
-        update = admin.wait_for_phase(server, "rolled_back", after=before)
+        _rolled_back(admin.change(server, slower))
+        update = admin.report(server)["update"]
+        assert update["phase"] == "rolled_back", update
         assert update["failure"]["kind"] == "step_time_regression", update
         print("rolled back:", json.dumps(update))
         # The status states the rates the decision read.
@@ -1489,50 +1571,58 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
         assert _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32) == (
             answer
         )
+        assert admin.policy(server).revision == current
 
         # The rollback marked the target unavailable, the deployment's only
         # one: applying it again is refused without `force`.
-        again = admin.apply(server, *slower)
+        again = admin.change(server, slower)
         assert again.status_code != 200, again.text
-        unavailable = admin.config(server)["unavailable"]
+        unavailable = admin.report(server)["unavailable"]
         assert len(unavailable) == 1, unavailable
 
-        stream = _start_count(server, name)
-        forced = _apply(server, *slower, force=True)
-        assert forced["update"]["phase"] == "trial", forced
-
-        def stood_or_ended() -> bool:
-            report = admin.config(server)["update"]
-            return (
-                report["phase"] != "trial"
-                or (report["trial_s"] or 0) >= 2 * TRIAL_WINDOW_S
-            )
-
-        # The forced target stands two windows of its trial, which its report
-        # states (`trial_s`); no event marks a trial's age. The report reads
-        # two windows once two windows passed, and a third bounds the reading.
-        server.wait_until(
-            stood_or_ended,
-            3 * TRIAL_WINDOW_S,
-            "the forced target's trial reported no two windows",
-        )
-        unthresholded = admin.config(server)["update"]
-        assert unthresholded["phase"] == "trial", unthresholded
-        _commit(server)
+    # Without the threshold, the same target stands a trial of three windows
+    # under a stream and commits.
+    control = f"{name}-unthresholded"
+    options = merged(
+        OPTIONS, {"update_config": {"trial": f"{3 * TRIAL_WINDOW_S}s"}}
+    )
+    with _serve(deployments, control, options=options) as server:
+        stream = _start_count(server, control)
+        record = _change_epoch(server, slower)
+        assert record["trial_s"] >= 2 * TRIAL_WINDOW_S, record
         _assert_whole(stream)
 
 
 def test_a_package_update_past_a_threshold_rolls_back_in_its_epoch(
-    deployments: Deployments,
+    deployments: Deployments, repository: Path, tmp_path: Path
 ):
     """A generation update stands the same trial as an epoch switch.
 
-    The serving epoch computes a stream before the update and a trickle after
-    it, so its token throughput falls past the threshold. The update rolls
-    back in the same main process, with the threshold as its failure.
+    The update selects another decode attention package
+    (:func:`_repeated_attention`), a kernel generation of the serving epoch.
+    The serving epoch computes a stream before the update and a trickle
+    after it, so its token throughput falls past the threshold. The update
+    rolls back in the same main process, with the threshold as its failure.
     """
     name = "qwen3-live-package-trial"
-    with _serve(deployments, name) as server:
+    options = merged(
+        OPTIONS,
+        {
+            "update_config": {
+                "trial": HELD_TRIAL,
+                "rollback": {
+                    "throughput_regression": 0.5,
+                    "window": f"{TRIAL_WINDOW_S}s",
+                },
+            }
+        },
+    )
+    with _serve(deployments, name, options=options) as server:
+        # The package is built for the decode keys this deployment ran.
+        repeated = _repeated_attention(
+            deployments.build_server, repository, tmp_path
+        )
+        engines = admin.engine_pids(server)
         stream = _start_count(server, name)
         # The baseline is the window of steps before the switch: the count's
         # own deltas say when it has streamed for one.
@@ -1543,34 +1633,35 @@ def test_a_package_update_past_a_threshold_rolls_back_in_its_epoch(
             "the count did not stream for a window",
         )
         before = admin.next_event(server)
-        result = _apply(
-            server,
-            "scheduler_config.max_batch=4",
-            "update_config.rollback.throughput_regression=0.5",
-            f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
-        )
-        assert result["change"] == "generation", result
-        _assert_whole(stream)
+        with admin.changing(server, repeated) as applied:
+            _assert_whole(stream)
 
-        # A trickle of small requests keeps the trial reading steps, one
-        # between two reads of the event log, which end at the update's end.
-        deadline = time.monotonic() + server.scaled(ROLLBACK_S)
-        update = None
-        while update is None:
-            assert time.monotonic() < deadline, "the update was not rolled back"
-            _ask(server.base_url, name, RECOVERY_PROMPT, tokens=2)
-            page = admin.events(server, before, TRICKLE_S)
-            assert not page["gap"], page
-            for event in page["events"]:
-                if event["kind"] == "update" and event["data"]["phase"] in (
-                    "committed",
-                    "rolled_back",
-                ):
-                    update = event["data"]
-            before = page["next"]
+            # A trickle of small requests keeps the trial reading steps, one
+            # between two reads of the event log, which end at the update's
+            # end.
+            deadline = time.monotonic() + server.scaled(ROLLBACK_S)
+            update = None
+            while update is None:
+                assert time.monotonic() < deadline, (
+                    "the update was not rolled back"
+                )
+                _ask(server.base_url, name, RECOVERY_PROMPT, tokens=2)
+                page = admin.events(server, before, TRICKLE_S)
+                assert not page["gap"], page
+                for event in page["events"]:
+                    if event["kind"] == "update" and event["data"]["phase"] in (
+                        "committed",
+                        "rolled_back",
+                    ):
+                        update = event["data"]
+                before = page["next"]
+        _rolled_back(applied.result())
         print("rolled back:", json.dumps(update))
+        assert update["change"] == "generation", update
         assert update["phase"] == "rolled_back", update
         assert update["failure"]["kind"] == "throughput_regression", update
+        # The update ran in the serving main processes.
+        assert admin.engine_pids(server) == engines
 
 
 def test_a_request_that_ends_at_once_leaves_its_blocks_in_the_host_tier(
@@ -1654,13 +1745,19 @@ def test_host_hits_beyond_the_device_cache_all_finish(
 @pytest.mark.parametrize(
     "parallel",
     [
-        ("expert", ("data_parallel_size=2", "moe_config.expert_parallel=true")),
-        ("data", ("data_parallel_size=2",)),
+        (
+            "expert",
+            {
+                "data_parallel_size": 2,
+                "moe_config": {"expert_parallel": True},
+            },
+        ),
+        ("data", {"data_parallel_size": 2}),
     ],
     ids=lambda parallel: parallel[0],
 )
 def test_a_process_of_two_devices_keeps_the_host_kv_cache(
-    deployments: Deployments, parallel: tuple[str, tuple[str, ...]]
+    deployments: Deployments, parallel: tuple[str, Config]
 ):
     """A main process over two devices finds a prompt's blocks in the host
     tier.
@@ -1674,7 +1771,7 @@ def test_a_process_of_two_devices_keeps_the_host_kv_cache(
     kind, options = parallel
     name = f"qwen3-live-host-{kind}"
     prompt = " ".join(f"item {index} of the list" for index in range(800))
-    with _serve(deployments, name, options=(*OPTIONS, *options)) as server:
+    with _serve(deployments, name, options=merged(OPTIONS, options)) as server:
         answer = _ask(server.base_url, name, prompt, tokens=16)
         time.sleep(server.scaled(STORE_S))
         _flush(server)
@@ -1690,14 +1787,14 @@ def test_a_process_of_two_devices_keeps_the_host_kv_cache(
 @pytest.mark.parametrize(
     "tiers",
     [
-        (),
-        ("kv_cache_config.host_tier=false",),
-        ("kv_cache_config.prefix_caching=false",),
+        {},
+        {"host_tier": False},
+        {"prefix_caching": False},
     ],
     ids=["host", "device", "uncached"],
 )
 def test_requests_that_outgrow_the_cache_in_decode_all_finish(
-    deployments: Deployments, tiers: tuple[str, ...]
+    deployments: Deployments, tiers: Config
 ):
     """A cache that fills while its requests decode gives one of them up.
 
@@ -1709,7 +1806,9 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
     reason ``cache_capacity`` (``specs/scheduler-design.md`` §3.6).
     """
     name = "qwen3-live-decode-growth"
-    options = (*SIZED_OPTIONS, "kv_cache_config.max_tokens=8192", *tiers)
+    options = merged(
+        SIZED_OPTIONS, {"kv_cache_config": {"max_tokens": 8192, **tiers}}
+    )
     # About 3400 tokens each (a number of three digits, its comma and its
     # space are five tokens), so eight of them need more than three caches of
     # 8192 tokens by their ends, and the cache fills while every one decodes.
@@ -1846,41 +1945,49 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
 
     A target of other model files maps none of the serving epoch's weights, so
     the weights that epoch alone retains leave its GPU for host storage while
-    the target serves. The rollback returns them and starts the epoch on them,
-    under a stream that crosses both moves whole, and it answers as it did.
+    the target serves. The target is lost on trial, and the rollback returns
+    the weights and starts the epoch on them, under a stream that crosses
+    both moves whole, and it answers as it did.
     """
     other = CHECKPOINTS["qwen3-other-weights"].model
     name = "qwen3-live-host-weights"
     # The target loads its checkpoint beside the serving one, and the
     # deployment's quota of the GPU holds both only past the default share.
-    options = (*OPTIONS, "mem_fraction_static=0.9")
+    options = merged(
+        OPTIONS,
+        {
+            "mem_fraction_static": 0.9,
+            "update_config": {"previous_epoch": "host", "trial": HELD_TRIAL},
+        },
+    )
     with _serve(deployments, name, options=options) as server:
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         stream = _start_count(server, name)
-        result = _apply(
-            server, f'model="{other}"', 'update_config.previous_epoch="host"'
-        )
-        assert result["change"] == "epoch", result
+        before = admin.next_event(server)
+        with admin.changing(server, {"model": other}) as applied:
+            trial = admin.wait_for_phase(server, "trial", after=before)
+            assert trial["change"] == "epoch", trial
 
-        def moved_or_refused() -> bool:
-            report = admin.config(server)["update"]
-            return report["moved_to_host_bytes"] > 0 or bool(
-                report["host_refused"]
+            def moved_or_refused() -> bool:
+                report = admin.report(server)["update"]
+                return report["moved_to_host_bytes"] > 0 or bool(
+                    report["host_refused"]
+                )
+
+            # The weights move once the previous epoch's processes exited,
+            # during the trial; its report states the bytes moved, and no
+            # event states the move.
+            server.wait_until(
+                moved_or_refused,
+                ADMITTED_S,
+                "the previous epoch's weights did not move",
             )
-
-        # The weights move once the previous epoch's processes exited, during
-        # the trial; its report states the bytes moved, and no event states
-        # the move.
-        server.wait_until(
-            moved_or_refused,
-            ADMITTED_S,
-            "the previous epoch's weights did not move",
-        )
-        trial = admin.config(server)["update"]
-        print("kept:", json.dumps(trial))
-        assert not trial["host_refused"], trial
-        assert trial["previous_epoch_kept"] == "host", trial
-        update = _rollback(server)
+            trial = admin.report(server)["update"]
+            print("kept:", json.dumps(trial))
+            assert not trial["host_refused"], trial
+            assert trial["previous_epoch_kept"] == "host", trial
+            update = _fail_the_target(server, before)
+        _rolled_back(applied.result())
         _assert_whole(stream)
         assert _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32) == (
             answer
@@ -1888,16 +1995,17 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
         assert update["phase"] == "rolled_back", update
 
 
-def test_package_updates_under_a_request_keep_its_stream_whole(
+def test_step_changes_under_a_request_keep_its_stream_whole(
     deployments: Deployments,
 ):
-    """In-place switches under a request leave its stream as a run without them.
+    """Changes at a step boundary under a request leave its stream as a run
+    without them.
 
-    A generation update reaches a process that serves: its switch captures
-    nothing a batch of the running request can be mistaken for, so every token
-    the request computes is the one its stream delivers. The count crosses as
-    many switches as fit under it, each one committed before the next starts.
-    """
+    A scheduling limit takes effect at a scheduler's next step, each step
+    reading one configuration, so every token the request computes is the
+    one its stream delivers. The count crosses as many changes as fit under
+    it, each one converged before the next is applied.
+    """  # noqa: D205
     name = "qwen3-live-switches"
     switches = 0
     with _serve(deployments, name) as server:
@@ -1906,9 +2014,10 @@ def test_package_updates_under_a_request_keep_its_stream_whole(
             while not stream.ended:
                 switches += 1
                 size = 4 if switches % 2 else 8
-                result = _apply(server, f"scheduler_config.max_batch={size}")
-                assert result["change"] == "generation", result
-                _commit(server)
+                record = _apply(
+                    server, {"scheduler_config": {"max_batch": size}}
+                )
+                assert record["effect"] == "step", record
             _assert_whole(stream)
     print("switches:", switches)
     assert switches >= 20, switches

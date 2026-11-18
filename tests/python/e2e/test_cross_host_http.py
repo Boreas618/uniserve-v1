@@ -15,12 +15,13 @@ promoted epoch: it migrates after every token it generated, and the client
 reads one uninterrupted stream, which matches the count asked again afterwards.
 
 The second host is the run's peer host (``--peer-host``,
-:mod:`uniserve_testing.remote`); without one the test is skipped. The leader
-binds its join endpoint at this host's address as the peer reaches it, and the
-second host's daemon joins it at the endpoint its readiness record states
-(``Deployments.follower``). The case needs one free GPU on each host: the
-leased one here and the first of the second host, which runs no other main
-process of the user.
+:mod:`uniserve_testing.remote`); without one the test is skipped. The
+deployment's package lists both hosts by their host names, this host first
+(:func:`uniserve_testing.deployments.two_hosts`), so the leader accepts the
+second host's daemon at its join port, and the second host's daemon serves
+the same package there and joins it (``Deployments.follower``). The case
+needs one free GPU on each host: the leased one here and the first of the
+second host, which runs no other main process of the user.
 """
 
 from __future__ import annotations
@@ -31,7 +32,8 @@ import httpx
 import pytest
 from uniserve_testing import admin, chat
 from uniserve_testing.assets import CHECKPOINTS
-from uniserve_testing.deployments import Deployments, two_host_leader
+from uniserve_testing.deployments import Deployments, two_hosts
+from uniserve_testing.packages import merged
 from uniserve_testing.remote import RemoteHost
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -81,38 +83,31 @@ def _kill_serving_peer(host: RemoteHost) -> None:
 def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
     deployments: Deployments, peer_host: RemoteHost, repository: Path
 ):
-    leader_options = (
-        "--served-model-name",
-        NAME,
-        *two_host_leader(peer_host),
-        # Rank 0 on this host and rank 1 on the second: the shorthand
-        # spreads the group's ranks over this host and the hosts after it in
-        # equal blocks.
-        "--tensor-parallel-size",
-        "2",
-        "--set",
-        'device_config.worker_hosts=["rank-1"]',
-        # Few captured graphs, so that the standby epoch parks soon, and a
-        # small KV cache.
-        "--set",
-        "kv_cache_config.max_tokens=32768",
-        "--set",
-        'chat_config.reasoning_parser="none"',
-        "--set",
-        "cuda_graph_config.prefill_token_sizes=[512]",
-        "--set",
-        "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-        "--set",
-        "worker_config.standby=true",
+    config = merged(
+        two_hosts(peer_host),
+        {
+            "model": CHECKPOINTS["qwen3"].model,
+            "served_model_name": NAME,
+            # Rank 0 on this host and rank 1 on the second: the shorthand
+            # spreads the group's ranks over this host and the hosts after
+            # it in equal blocks.
+            "tensor_parallel_size": 2,
+            "device_config": {"worker_hosts": [peer_host.name]},
+            # Few captured graphs, so that the standby epoch parks soon, and
+            # a small KV cache.
+            "kv_cache_config": {"max_tokens": 32768},
+            "chat_config": {"reasoning_parser": "none"},
+            "cuda_graph_config": {
+                "prefill_token_sizes": [512],
+                "decode_batch_sizes": [1, 2, 4, 8],
+            },
+            "worker_config": {"standby": True},
+        },
     )
     streamed: list[str] = []
     usage = None
     with (
-        deployments.serve(
-            *leader_options,
-            model=CHECKPOINTS["qwen3"].model,
-            serving=False,
-        ) as server,
+        deployments.serve(config, serving=False) as server,
         deployments.follower(peer_host, server, repository),
     ):
         # The standby epoch over both hosts parked with its graphs. No event

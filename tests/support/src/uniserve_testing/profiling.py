@@ -2,7 +2,7 @@
 the session calls of its admin API (``/admin/profile``, ``docs/profiling.md``).
 
 A profiling module serves one deployment for all of its cases (:func:`serve`,
-on the module's lease, with the module's own options beside
+on the module's lease, with the module's own options over
 :data:`OPTIONS`); its cases keep decode steps running with :class:`Load`,
 start sessions with :func:`start`, end them with :func:`stop` or wait for
 their windows to end with :func:`ended`, read the fence probes' counts
@@ -26,26 +26,27 @@ from prometheus_client.parser import text_string_to_metric_families
 from uniserve_testing import admin, chat
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.deployments import Deployments
+from uniserve_testing.packages import Config, merged
 from uniserve_testing.servers import Server
 
 #: The model name the deployment serves under.
 NAME = "qwen3-profiling"
 
-#: The options of every profiling deployment, before its module's own: few
-#: captured graphs (decode batches up to 8, prefill buckets of 512 tokens,
-#: which bound a step's token work), so that it starts quickly and a
-#: session's decode steps replay them, and the reasoning delimiters streamed
-#: as content.
-OPTIONS = (
-    "--set",
-    "max_num_batched_tokens=512",
-    "--set",
-    'chat_config.reasoning_parser="none"',
-    "--set",
-    "cuda_graph_config.prefill_token_sizes=[512]",
-    "--set",
-    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-)
+#: The options of every profiling deployment, below its module's own: Qwen3
+#: under :data:`NAME`, few captured graphs (decode batches up to 8, prefill
+#: buckets of 512 tokens, which bound a step's token work), so that it starts
+#: quickly and a session's decode steps replay them, and the reasoning
+#: delimiters streamed as content.
+OPTIONS: dict[str, Any] = {
+    "model": CHECKPOINTS["qwen3"].model,
+    "served_model_name": NAME,
+    "max_num_batched_tokens": 512,
+    "chat_config": {"reasoning_parser": "none"},
+    "cuda_graph_config": {
+        "prefill_token_sizes": [512],
+        "decode_batch_sizes": [1, 2, 4, 8],
+    },
+}
 
 #: The admin route of the profiling sessions.
 PROFILE = "/admin/profile"
@@ -70,17 +71,9 @@ LOAD_REQUEST = chat.body(
 
 
 @contextmanager
-def serve(deployments: Deployments, *options: str) -> Iterator[Server]:
-    """Serve Qwen3 with :data:`OPTIONS` and then `options` until the block
-    ends.
-    """  # noqa: D205
-    with deployments.serve(
-        "--served-model-name",
-        NAME,
-        *OPTIONS,
-        *options,
-        model=CHECKPOINTS["qwen3"].model,
-    ) as server:
+def serve(deployments: Deployments, config: Config) -> Iterator[Server]:
+    """Serve Qwen3 with `config` over :data:`OPTIONS` until the block ends."""
+    with deployments.serve(merged(OPTIONS, config)) as server:
         yield server
 
 

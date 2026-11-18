@@ -5,7 +5,7 @@ deployment, serving the 768p size of every aspect ratio the model names, and
 requests one 124-frame ``t2va`` video at each. Every response is a complete
 MP4 at the requested size whose headers report the generated shape; the
 capabilities report the handshake's schedule, and a body naming a task is
-refused. With ``--lora-dir`` naming a FastH3 adapter's directory, the same
+refused. With ``lora_dir`` naming a FastH3 adapter's directory, the same
 root serves the student's schedule, and a fixed-seed request answers the same
 video twice.
 """
@@ -16,14 +16,18 @@ import json
 from pathlib import Path
 
 import pytest
-from uniserve_testing import assets, media
+from uniserve_testing import assets, media, packages
 from uniserve_testing.deployments import Deployments
+from uniserve_testing.packages import merged
 
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.gpu,
     pytest.mark.model("minimax_h3"),
 ]
+
+#: The published Ulysses-4 deployment's package.
+ULYSSES4 = Path("configs", "minimax_h3", "ulysses4")
 
 PROMPT = (
     "A red fox trots across a snowy meadow at sunrise, its breath steaming, "
@@ -47,24 +51,24 @@ def test_base_text_to_video_at_every_768p_size(
     ]
     with (
         deployments.serve(
-            "--served-model-name",
-            "MiniMax-H3",
-            "--config",
-            str(repository / "configs" / "minimax_h3" / "ulysses4.toml"),
-            # Five seconds bound the layouts startup prepares: two frame
-            # counts at each of the six sizes and one text capacity.
-            "--set",
-            f"video_config.sizes={json.dumps(sizes)}",
-            "--set",
-            "video_config.max_seconds=5",
-            "--max-model-len",
-            "1024",
-            # The default prompt-capacity ladder holds capacities below the
-            # admitted length only, so the deployment states its one
-            # capacity.
-            "--set",
-            "video_config.text_capacities=[1024]",
-            model=assets.CHECKPOINTS["minimax-h3"].model,
+            merged(
+                packages.read(repository / ULYSSES4),
+                {
+                    "model": assets.CHECKPOINTS["minimax-h3"].model,
+                    "served_model_name": "MiniMax-H3",
+                    "max_model_len": 1024,
+                    # Five seconds bound the layouts startup prepares: two
+                    # frame counts at each of the six sizes and one text
+                    # capacity. The default prompt-capacity ladder holds
+                    # capacities below the admitted length only, so the
+                    # deployment states its one capacity.
+                    "video_config": {
+                        "sizes": sizes,
+                        "max_seconds": 5,
+                        "text_capacities": [1024],
+                    },
+                },
+            )
         ) as server,
         media.api(server) as api,
     ):
@@ -135,21 +139,20 @@ def test_a_fasth3_adapter_over_the_base_release_serves_its_student(
     adapter = assets.adapter_directory(tmp_path / "adapter")
     with (
         deployments.serve(
-            "--served-model-name",
-            "FastH3",
-            "--lora-dir",
-            str(adapter),
-            "--config",
-            str(repository / "configs" / "minimax_h3" / "ulysses4.toml"),
-            "--set",
-            'video_config.sizes=["1344x768"]',
-            "--set",
-            "video_config.max_seconds=5",
-            "--max-model-len",
-            "1024",
-            "--set",
-            "video_config.text_capacities=[1024]",
-            model=assets.CHECKPOINTS["minimax-h3"].model,
+            merged(
+                packages.read(repository / ULYSSES4),
+                {
+                    "model": assets.CHECKPOINTS["minimax-h3"].model,
+                    "served_model_name": "FastH3",
+                    "lora_dir": str(adapter),
+                    "max_model_len": 1024,
+                    "video_config": {
+                        "sizes": ["1344x768"],
+                        "max_seconds": 5,
+                        "text_capacities": [1024],
+                    },
+                },
+            )
         ) as server,
         media.api(server) as api,
     ):

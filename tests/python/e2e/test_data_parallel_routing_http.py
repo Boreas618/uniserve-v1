@@ -1,7 +1,7 @@
 """Requests are served by the data-parallel replica the policy routes them to.
 
 Qwen3 is served by two data-parallel schedulers whose ranks share their
-experts (``--data-parallel-size 2`` with expert parallelism): one main
+experts (``data_parallel_size = 2`` with expert parallelism): one main
 process, one scheduler per replica, each on its own GPU. The control thread
 asks the epoch's scheduling policy where each request goes (its ``route``),
 and the policy the deployment serves names the live replica with the fewest
@@ -129,13 +129,12 @@ def test_requests_are_served_by_the_replicas_the_policy_routes_them_to(
     deployments: Deployments,
 ):
     with deployments.serve(
-        "--served-model-name",
-        SERVED_MODEL,
-        "--data-parallel-size",
-        "2",
-        "--set",
-        "moe_config.expert_parallel=true",
-        model=CHECKPOINTS["qwen3"].model,
+        {
+            "model": CHECKPOINTS["qwen3"].model,
+            "served_model_name": SERVED_MODEL,
+            "data_parallel_size": 2,
+            "moe_config": {"expert_parallel": True},
+        }
     ) as server:
         base_url = server.base_url
         # Idle replicas: the policy rotates, and each admits half.

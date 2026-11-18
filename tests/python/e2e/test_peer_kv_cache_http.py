@@ -40,25 +40,26 @@ blocks written token by token round differently, so the two are not
 required to be identical.
 
 The second host is the run's ``--peer-host`` (``uniserve_testing.plugin``):
-B's leader, node ``rank-0`` here, binds its join endpoint at the address the
-second host reaches this host at (``--leader-address``) on a port it picks,
-and the second host's daemon joins it as ``rank-1``
+B's package lists this host, its leader, and the second host by their host
+names (:func:`uniserve_testing.deployments.two_hosts`), and the second
+host's daemon serves the same package there and joins the leader
 (:meth:`uniserve_testing.deployments.Deployments.follower`), at a Build
 Server there that installs the tree's packages from this repository's path,
 which the second host must mount at the same path, and on its first GPU.
 B's engine there opens the checkpoint's snapshot at the path the leader
 resolved, which the second host's Hugging Face cache must hold. Both hosts'
 Storage Servers are their daemons' own, which they start with the settings
-the deployments state: A's accepts other hosts at the leader address on a
-port it picks, which A's readiness record states as the peer endpoint B
-names, and both read through the NIXL package each host has installed
-(``docs/nixl.md``). The peer endpoints are unauthenticated: the hosts share
-an isolated network.
+the deployments state: A's accepts other hosts at this host's name, which
+the second host resolves, on a port it picks, which A's readiness record
+states as the peer endpoint B names, and both read through the NIXL
+package each host has installed (``docs/nixl.md``). The peer endpoints are
+unauthenticated: the hosts share an isolated network.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from uniserve_testing import admin, chat
@@ -68,8 +69,10 @@ from uniserve_testing.deployments import (
     Deployments,
     runtime_directory,
     stop_storage_server,
-    two_host_leader,
+    this_host,
+    two_hosts,
 )
+from uniserve_testing.packages import merged
 from uniserve_testing.remote import RemoteHost
 from uniserve_testing.servers import Server
 
@@ -145,32 +148,31 @@ def _stored(server: Server, prompt: str) -> tuple[dict, dict]:
     return computed, answers[-1]
 
 
-def _writer(peer_host: RemoteHost) -> tuple[str, ...]:
+def _writer() -> dict[str, Any]:
     """Deployment A's options: a Storage Server that also accepts other
-    hosts at the address the second host reaches this host at, on a port it
+    hosts at this host's name, which the second host resolves, on a port it
     picks, which A's readiness record states as its peer endpoint.
     """  # noqa: D205
-    return (
-        "--served-model-name",
-        SERVED_MODEL,
-        "--set",
-        f'storage_config.tcp="{peer_host.leader_address}:0"',
-    )
+    return {
+        "model": CHECKPOINTS["qwen3"].model,
+        "served_model_name": SERVED_MODEL,
+        "storage_config": {"tcp": f"{this_host()}:0"},
+    }
 
 
-def _reader(peer_host: RemoteHost, peer: str) -> tuple[str, ...]:
-    """Deployment B's options: a leader here, node ``rank-0`` of two, whose
-    engine runs on the second host, node ``rank-1``, and whose peers are the
-    Storage Server at `peer`.
+def _reader(peer_host: RemoteHost, peer: str) -> dict[str, Any]:
+    """Deployment B's options: a leader here, the first of two hosts, whose
+    engine runs on the second host, and whose peers are the Storage Server
+    at `peer`.
     """  # noqa: D205
-    return (
-        "--served-model-name",
-        SERVED_MODEL,
-        *two_host_leader(peer_host),
-        "--set",
-        'engine_host="rank-1"',
-        "--set",
-        f'kv_cache_config.peers=["{peer}"]',
+    return merged(
+        two_hosts(peer_host),
+        {
+            "model": CHECKPOINTS["qwen3"].model,
+            "served_model_name": SERVED_MODEL,
+            "engine_host": peer_host.name,
+            "kv_cache_config": {"peers": [peer]},
+        },
     )
 
 
@@ -181,7 +183,6 @@ def test_a_host_loads_a_prompts_blocks_from_a_peer_hosts_host_tier(
     peer_host: RemoteHost,
     tmp_path: Path,
 ):
-    model = CHECKPOINTS["qwen3"].model
     shared = _prompt("Shared")
     dropped = _prompt("Dropped")
     unseen = _prompt("Unseen")
@@ -191,11 +192,7 @@ def test_a_host_loads_a_prompts_blocks_from_a_peer_hosts_host_tier(
     with (
         runtime_directory(uniserve, tmp_path / "a.storage") as runtime,
         deployments.serve(
-            *_writer(peer_host),
-            model=model,
-            name="a",
-            runtime=runtime,
-            calibration=calibration,
+            _writer(), name="a", runtime=runtime, calibration=calibration
         ) as a,
     ):
         # A computes both prompts and stores their full blocks to its host
@@ -209,8 +206,7 @@ def test_a_host_loads_a_prompts_blocks_from_a_peer_hosts_host_tier(
 
         with (
             deployments.serve(
-                *_reader(peer_host, a.endpoint("peer")),
-                model=model,
+                _reader(peer_host, a.endpoint("peer")),
                 name="b",
                 serving=False,
                 calibration=calibration,
@@ -250,22 +246,19 @@ def test_an_fp8_host_loads_a_bf16_hosts_blocks_by_converting_them(
     deployments: Deployments,
     peer_host: RemoteHost,
 ):
-    model = CHECKPOINTS["qwen3"].model
     shared = _prompt("Converted")
     calibration = deployments.calibration(reads=True)
-    with deployments.serve(
-        *_writer(peer_host), model=model, name="a", calibration=calibration
-    ) as a:
+    with deployments.serve(_writer(), name="a", calibration=calibration) as a:
         # A computes the prompt in BF16 and stores its full blocks to its
         # host tier.
         _, bf16 = _stored(a, shared)
 
         with (
             deployments.serve(
-                *_reader(peer_host, a.endpoint("peer")),
-                "--set",
-                'kv_cache_config.dtype="float8_e4m3fn"',
-                model=model,
+                merged(
+                    _reader(peer_host, a.endpoint("peer")),
+                    {"kv_cache_config": {"dtype": "float8_e4m3fn"}},
+                ),
                 name="b",
                 serving=False,
                 calibration=calibration,

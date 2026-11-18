@@ -44,7 +44,7 @@ def served(module_deployments: Deployments) -> Iterator[Server]:
     ``kv_cache_config.max_tokens``, so the KV region takes the quota's rest
     beside the graph pool the profile run sized.
     """  # noqa: D205
-    with profiling.serve(module_deployments) as server:
+    with profiling.serve(module_deployments, {}) as server:
         yield server
 
 

@@ -17,6 +17,7 @@ import pytest
 from uniserve_testing import chat
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.deployments import Deployments
+from uniserve_testing.packages import Config, merged
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
@@ -37,20 +38,21 @@ TOP_LOGPROBS = 5
 
 
 def _generate(
-    deployments: Deployments, name: str, *options: str
+    deployments: Deployments, name: str, options: Config
 ) -> list[list[tuple[str, set[str]]]]:
     """Serve the model with `options` and decode every prompt.
 
     Returns each prompt's generated tokens, each with the set of its
     position's most likely tokens, as ``token_id:<id>`` strings.
     """
-    with deployments.serve(
-        "--served-model-name",
-        SERVED_MODEL,
-        *options,
-        model=CHECKPOINTS["qwen3"].model,
-        name=name,
-    ) as server:
+    config = merged(
+        {
+            "model": CHECKPOINTS["qwen3"].model,
+            "served_model_name": SERVED_MODEL,
+        },
+        options,
+    )
+    with deployments.serve(config, name=name) as server:
         return [
             chat.ranked_tokens(
                 chat.complete(
@@ -75,12 +77,11 @@ def _generate(
 def test_an_fp16_cache_serves_a_bf16_model_like_a_bf16_cache(
     deployments: Deployments,
 ):
-    reference = _generate(deployments, "bfloat16-cache")
+    reference = _generate(deployments, "bfloat16-cache", {})
     converted = _generate(
         deployments,
         "float16-cache",
-        "--set",
-        'kv_cache_config.dtype="float16"',
+        {"kv_cache_config": {"dtype": "float16"}},
     )
 
     for prompt, expected, actual in zip(

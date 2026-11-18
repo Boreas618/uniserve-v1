@@ -1,19 +1,24 @@
 """The deployments an end-to-end case starts.
 
 A case asks the ``deployments`` fixture (``tests/python/e2e/conftest.py``)
-for a :class:`Deployments`, which starts each deployment with
-``uniserve serve`` and stops it with the case:
+for a :class:`Deployments`, which writes each deployment's policy package
+(:mod:`uniserve_testing.packages`) into the case's directory, starts it with
+``uniserve serve <package>`` and stops it with the case:
 
 - on the GPUs the case leases, which the daemon sees as ``cuda:0`` onwards
   (CUDA's device visibility, stated in its environment);
-- at the run's Build Server (``build_config.socket``), which holds the
-  tree's packages;
+- at the run's Build Server (``build_config``), which holds the tree's
+  packages;
 - under a runtime directory of its own (``XDG_RUNTIME_DIR``, which the
   caller of a UniServe server creates and names), where its daemon starts a
   Storage Server that serves this deployment alone and that the case stops
   when the deployment ends;
-- with the run's engine package (``--engine``) and assignments
-  (``--serve-set``), and the waits stretched by its time scale.
+- with the persistent state of its deployments (``XDG_STATE_HOME``, which
+  holds each deployment's revisions under the package directory's name) in
+  the case's directory, so that no case starts from a revision another case
+  left;
+- with the run's engine package (``--engine``) and options
+  (``--serve-config``), and the waits stretched by its time scale.
 
 The daemon binds port 0 and reports what it bound in its readiness record
 (:class:`uniserve_testing.servers.Server`).
@@ -23,16 +28,20 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import shutil
+import socket
 import subprocess
 import tempfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import Any
 
-from uniserve_testing import builds
+from uniserve_testing import builds, packages
 from uniserve_testing.builds import BuildServer
 from uniserve_testing.devices import Lease
+from uniserve_testing.packages import Config, merged
 from uniserve_testing.remote import RemoteHost
 from uniserve_testing.servers import (
     Server,
@@ -70,29 +79,40 @@ class Follower:
 
 @dataclasses.dataclass(frozen=True)
 class Settings:
-    """What the run's options state for every deployment of the run."""
+    """What the run's options state for every deployment of the run: the
+    wait scale (``--time-scale``), the options every package states over its
+    own (``--serve-config``) and the engine package (``--engine``).
+    """  # noqa: D205
 
     time_scale: float
-    serve_set: tuple[str, ...]
+    config: Mapping[str, Any]
     engine: str | None
 
 
-def two_host_leader(host: RemoteHost) -> tuple[str, ...]:
-    """The options of the leader of a deployment over this host and `host`:
-    node ``rank-0`` of two, which binds its join endpoint at the address
-    `host` reaches this host at on a port it picks, and reports it in its
-    listening record (:meth:`Deployments.follower`).
+def this_host() -> str:
+    """This host's name, ``uname -n``: how a node finds itself in a
+    package's ``hosts``.
     """  # noqa: D205
-    return (
-        "--nnodes",
-        "2",
-        "--node-rank",
-        "0",
-        "--dist-init-addr",
-        f"{host.leader_address}:0",
-        "--host-identity",
-        "rank-0",
-    )
+    return os.uname().nodename
+
+
+def free_port() -> int:
+    """A TCP port no listener of this host holds now, which the kernel picks."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("", 0))
+        return int(probe.getsockname()[1])
+
+
+def two_hosts(host: RemoteHost) -> dict[str, Any]:
+    """The options of a deployment over this host, its leader, and `host`:
+    both by their host names (``hosts``), and a join port of its own
+    (``admin_config.join``), so that concurrent cases' leaders bind no port
+    one another holds.
+    """  # noqa: D205
+    return {
+        "hosts": [this_host(), host.name],
+        "admin_config": {"join": free_port()},
+    }
 
 
 @contextmanager
@@ -170,7 +190,8 @@ class Deployments:
         directory: Path,
     ) -> None:
         """Deployments of the executable `uniserve` at `build_server`, on
-        the GPUs of `lease`, with their logs under `directory`.
+        the GPUs of `lease`, with their packages, state and logs under
+        `directory`.
         """  # noqa: D205
         self.uniserve = uniserve
         self.build_server = build_server
@@ -178,63 +199,50 @@ class Deployments:
         self.lease = lease
         self.directory = directory
 
-    def assignments(self) -> list[str]:
-        """The ``PATH=VALUE`` assignments every deployment of the run
-        states: its engine package (``--engine``) and its ``--serve-set``,
-        as a deployment that a model-less node brings up (``PUT
-        /admin/config``) states them too.
+    def run_config(self) -> dict[str, Any]:
+        """The options every deployment of the run states over its own: its
+        engine package (``--engine``) and the run's ``--serve-config``.
         """  # noqa: D205
-        engine = (
-            [f'worker_config.engine="{self.settings.engine}"']
+        engine: Config = (
+            {"worker_config": {"engine": self.settings.engine}}
             if self.settings.engine is not None
-            else []
+            else {}
         )
-        return [*engine, *self.settings.serve_set]
+        return merged(engine, self.settings.config)
 
-    def options(self, build_config: str | None = None) -> list[str]:
-        """The options every deployment of the run states after its own: its
-        host's Build Server, stated by the ``--config`` file `build_config`
-        (the run's server's, :meth:`build_config`, by default), and the run's
-        :meth:`assignments`.
+    def config(
+        self, config: Config, build_settings: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """The ``config.toml`` of a deployment of the run whose own options
+        are `config`: its host's Build Server, stated by the settings
+        `build_settings` (the run's server's by default,
+        :func:`uniserve_testing.builds.build_config`), and the run's
+        :meth:`run_config` over `config`.
         """  # noqa: D205
-        if build_config is None and self.build_server is not None:
-            build_config = str(self.build_config())
-        stated = ["--config", build_config] if build_config is not None else []
-        for assignment in self.assignments():
-            stated += ["--set", assignment]
-        return stated
+        if build_settings is None and self.build_server is not None:
+            build_settings = self.build_server.settings
+        build = (
+            builds.build_config(build_settings)
+            if build_settings is not None
+            else {}
+        )
+        return merged(config, build, self.run_config())
 
-    def build_config(self) -> Path:
-        """The ``--config`` file that states the run's Build Server as the
-        deployments' ``build_config``: exactly the settings its readiness
-        record states (:func:`uniserve_testing.builds.build_config`), which
-        a deployment's daemon holds the server it is given to.
+    def package(self, name: str, config: Config) -> Path:
+        """Write the package of the deployment `name` whose own options are
+        `config` (:meth:`config`) into the case's directory; its directory,
+        whose name is the deployment's.
         """  # noqa: D205
-        assert self.build_server is not None, "the run has no Build Server"
-        path = self.directory / "build-server.toml"
-        if not path.exists():
-            self.directory.mkdir(parents=True, exist_ok=True)
-            path.write_text(builds.build_config(self.build_server.settings))
-        return path
-
-    def command(self, *options: str, model: str | None = None) -> list[str]:
-        """The ``uniserve serve`` command of a deployment of `model` (a
-        repository, :mod:`uniserve_testing.assets`) with `options`, as this
-        run starts it.
-        """  # noqa: D205
-        return [
-            str(self.uniserve),
-            "serve",
-            *([model] if model is not None else []),
-            *options,
-            *self.options(),
-        ]
+        return packages.write(self.directory / name, self.config(config))
 
     def environment(self, runtime: Path) -> dict[str, str]:
         """The environment of a daemon under the runtime directory
-        `runtime`: on the leased GPUs.
+        `runtime`: on the leased GPUs, with the case's own state directory.
         """  # noqa: D205
-        declared = {"XDG_RUNTIME_DIR": str(runtime)}
+        declared = {
+            "XDG_RUNTIME_DIR": str(runtime),
+            "XDG_STATE_HOME": str(self.directory / "state"),
+        }
         if self.lease is not None:
             declared["CUDA_VISIBLE_DEVICES"] = self.lease.visible
         return environment(**declared)
@@ -242,8 +250,8 @@ class Deployments:
     @contextmanager
     def serve(
         self,
-        *options: str,
-        model: str | None = None,
+        config: Config,
+        *,
         timeout_s: float | None = None,
         name: str = "server",
         serving: bool = True,
@@ -251,40 +259,40 @@ class Deployments:
         runtime: Path | None = None,
         calibration: Path | None = None,
     ) -> Iterator[Server]:
-        """Serve a deployment of `model` with `options` until the block ends,
-        once its readiness record states it serves (with `serving` unset,
-        once it states its listeners, for a leader whose members join it
-        next: :meth:`follower`).
+        """Serve the deployment `name` of the options `config` until the
+        block ends, once its readiness record states it serves (with
+        `serving` unset, once it states its listeners, for a leader whose
+        members join it next: :meth:`follower`).
 
         Args:
-            options: The deployment's own options.
-            model: The repository it serves; unset when `options` name a
-                checkpoint directory or none.
+            config: The deployment's own options, its ``model`` among them.
             timeout_s: A bound on its start, in seconds (scaled); none by
                 default: the server states its record or ends.
-            name: The name of its log (``<name>.log``) in the case's
-                directory.
+            name: The deployment's name: its package's directory in the
+                case's directory, and its log's (``<name>.log``).
             serving: Whether to wait for its serving record.
             host_gib: Its host tier in GiB (:data:`HOST_CACHE_GIB`); ``None``
-                for a case whose `options` size it.
+                for a case whose `config` sizes it.
             runtime: A runtime directory the caller owns
                 (:func:`runtime_directory`), for a case whose deployments
                 share their Storage Server; a fresh one by default.
             calibration: The transfer calibration its Storage Server copies
                 by (:meth:`calibration`), for a deployment that transfers;
                 without one its Storage Server runs no Transfer Server.
+
+        The yielded server's ``package`` is the package's directory.
         """  # noqa: D205
-        sized = (
-            ("--set", f"kv_cache_config.host_gib={host_gib}")
+        sized: dict[str, Any] = (
+            {"kv_cache_config": {"host_gib": host_gib}}
             if host_gib is not None
-            else ()
+            else {}
         )
         if calibration is not None:
-            sized = (
-                *sized,
-                "--set",
-                f'storage_config.transfer_calibration="{calibration}"',
+            sized = merged(
+                sized,
+                {"storage_config": {"transfer_calibration": str(calibration)}},
             )
+        package = self.package(name, merged(config, sized))
         with ExitStack() as owned:
             if runtime is None:
                 runtime = owned.enter_context(
@@ -293,11 +301,12 @@ class Deployments:
                     )
                 )
             server = launch(
-                self.command(*options, *sized, model=model),
+                [str(self.uniserve), "serve", str(package)],
                 self.directory / f"{name}.log",
                 self.environment(runtime),
                 scale=self.settings.time_scale,
             )
+            server.package = package
             owned.callback(server.stop)
             server.wait("serving" if serving else "listening", timeout_s)
             yield server
@@ -333,40 +342,54 @@ class Deployments:
         host: RemoteHost,
         leader: Server,
         repository: Path,
-        *options: str,
+        *,
         timeout_s: float | None = None,
         devices: Sequence[int] | None = None,
         calibration: Path | None = None,
         reads: bool = False,
         name: str = "follower",
     ) -> Iterator[Follower]:
-        """The daemon of a deployment's second host, joining `leader` as
-        node ``rank-1`` with `options` after its own, until the block ends.
+        """The daemon of a deployment's second host, serving the package of
+        `leader` there until the block ends.
 
-        `leader` is a leader started with ``serving=False``: its listening
-        record states the endpoint its members join at, and it serves once
-        this member joined (within `timeout_s` seconds, scaled, when
-        stated), which this waits for before the block begins. The daemon
-        runs on `devices` of the host (all of its GPUs without them) under a
-        runtime directory of its own there, at a Build Server of its own
-        there (:func:`remote_build_server`). A deployment that names a
+        `leader` is a leader started with ``serving=False`` whose package
+        lists this host and `host` (:func:`two_hosts`): the second host's
+        daemon finds itself in the package's ``hosts`` by its host name and
+        joins the leader at the first host's ``admin_config.join``, and the
+        leader serves once it joined (within `timeout_s` seconds, scaled,
+        when stated), which this waits for before the block begins. Each
+        host resolves the other's name (``docs/testing.md``, Two hosts).
+
+        The second host serves the leader's package with its own Build
+        Server (:func:`remote_build_server`) as ``build_config``, in a
+        package directory of the same name, so the deployment is the same
+        on both hosts. Its daemon runs on `devices` of the host (all of its
+        GPUs without them) under a runtime directory of its own there,
+        which also holds its state directory. A deployment that names a
         transfer calibration names it on every host it serves on, so with
-        `calibration` (the path the leader's options name) the host's own is
-        measured at that path there first, with NIXL's READs when `reads`.
-        On exit the leader stops first; the daemon ends when the leader's
-        connection closes, which this waits for, and a daemon that outlives
-        its leader fails the case.
+        `calibration` (the path the leader's package names) the host's own
+        is measured at that path there first, with NIXL's READs when
+        `reads`. On exit the leader stops first; the daemon ends when the
+        leader's connection closes, which this waits for, and a daemon that
+        outlives its leader fails the case. Its log is ``<name>.log`` in
+        the case's directory.
         """  # noqa: D205
+        assert leader.package is not None, "the leader serves no package"
         with ExitStack() as owned:
             runtime = owned.enter_context(host.runtime_directory())
             settings = owned.enter_context(
                 remote_build_server(host, repository, runtime)
             )
-            # The member states its host's Build Server as the leader states
-            # this host's: by a `--config` file of the server's settings.
-            build_config = f"{runtime}/build-server.toml"
-            host.write(build_config, builds.build_config(settings))
-            declared = {"XDG_RUNTIME_DIR": runtime}
+            config = merged(
+                packages.read(leader.package), builds.build_config(settings)
+            )
+            package = f"{runtime}/{leader.package.name}"
+            host.run("mkdir", "-p", package)
+            host.write(f"{package}/{packages.CONFIG}", packages.text(config))
+            declared = {
+                "XDG_RUNTIME_DIR": runtime,
+                "XDG_STATE_HOME": f"{runtime}/state",
+            }
             if devices is not None:
                 declared["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))
             if calibration is not None:
@@ -383,22 +406,10 @@ class Deployments:
                     timeout_s=CALIBRATION_S,
                 )
                 owned.callback(host.run, "rm", "-f", str(calibration))
-            argv = [
-                "uniserve",
-                "serve",
-                "--nnodes",
-                "2",
-                "--node-rank",
-                "1",
-                "--dist-init-addr",
-                leader.join,
-                "--host-identity",
-                "rank-1",
-                *options,
-                *self.options(build_config=build_config),
-            ]
             member = host.start(
-                argv, self.directory / f"{name}.log", environment=declared
+                ["uniserve", "serve", package],
+                self.directory / f"{name}.log",
+                environment=declared,
             )
             owned.callback(stop_remote_storage_server, host, runtime)
             try:

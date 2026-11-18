@@ -4,10 +4,8 @@ The update modules (``test_live_updates_http.py`` and
 ``test_generation_update_http.py``) serve one Qwen3 deployment and change it
 while it serves. They share:
 
-- :data:`PROFILE`, the deployment they serve, so the two modules' numbers
-  describe one deployment, and :func:`assigned`, its options as ``serve``
-  takes them; :func:`run_assignments` adds the run's own assignments to a
-  deployment an idle node brings up;
+- :data:`PROFILE`, the options of the deployment they serve, so the two
+  modules' numbers describe one deployment;
 - :func:`derived`, a revision of a serving package that a checked-in
   mutation of ``tests/python/e2e/packages`` declares, and
   :func:`engine_revision`, a new revision of the tree's engine built at the
@@ -48,18 +46,20 @@ from uniserve_testing.builds import BuildServer
 from uniserve_testing.devices import Lease
 from uniserve_testing.servers import environment
 
-#: The deployment both update modules serve, as ``PATH=VALUE`` assignments:
-#: few captured graphs, so that an epoch's engines start in about a minute,
-#: and a small device KV cache. Its attention package and its step budget
-#: are the deployment's defaults: the installed package of the highest
-#: priority for each key, and the widest prefill graph it captures.
-PROFILE = (
-    'dtype="bfloat16"',
-    "kv_cache_config.max_tokens=32768",
-    'chat_config.reasoning_parser="none"',
-    "cuda_graph_config.prefill_token_sizes=[512]",
-    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
-)
+#: The options of the deployment both update modules serve: few captured
+#: graphs, so that an epoch's engines start in about a minute, and a small
+#: device KV cache. Its attention package and its step budget are the
+#: deployment's defaults: the installed package of the highest priority for
+#: each key, and the widest prefill graph it captures.
+PROFILE: dict[str, Any] = {
+    "dtype": "bfloat16",
+    "kv_cache_config": {"max_tokens": 32768},
+    "chat_config": {"reasoning_parser": "none"},
+    "cuda_graph_config": {
+        "prefill_token_sizes": [512],
+        "decode_batch_sizes": [1, 2, 4, 8],
+    },
+}
 
 #: The checked-in package mutations, relative to the repository: a TOML file
 #: per serving package, each declaring the revisions a case derives from it
@@ -68,36 +68,6 @@ MUTATIONS = Path("tests", "python", "e2e", "packages")
 
 #: The program :func:`ballast` runs.
 BALLAST = "uniserve_testing.updates.ballast"
-
-
-def assigned(*assignments: str) -> list[str]:
-    """`assignments` as ``uniserve serve`` takes them: ``--set`` each."""
-    return [option for value in assignments for option in ("--set", value)]
-
-
-def inline(value: object) -> str:
-    """`value` written as one TOML value, the form an assignment's right side
-    takes: a table inline, an array of tables an array of inline tables.
-
-    Raises:
-        TypeError: For a value TOML has no form of.
-    """  # noqa: D205
-    # A bool is an int to Python, so it is matched first.
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int | float):
-        return repr(value)
-    if isinstance(value, str):
-        # A JSON string is a TOML basic string: the same quotes and escapes.
-        return json.dumps(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(inline(item) for item in value) + "]"
-    if isinstance(value, dict):
-        fields = (
-            f"{json.dumps(key)} = {inline(item)}" for key, item in value.items()
-        )
-        return "{ " + ", ".join(fields) + " }"
-    raise TypeError(f"TOML has no value of {type(value).__name__}")
 
 
 def derived(
@@ -114,8 +84,10 @@ def derived(
     )
 
 
-def engine_revision(build_server: BuildServer, repository: Path) -> str:
-    """An assignment that selects a new revision of the tree's engine.
+def engine_revision(
+    build_server: BuildServer, repository: Path
+) -> dict[str, Any]:
+    """The options that select a new revision of the tree's engine.
 
     The revision is installed and its executable built now, at
     `build_server`. It runs the same code as the serving one under another
@@ -125,7 +97,7 @@ def engine_revision(build_server: BuildServer, repository: Path) -> str:
     """
     installed = build_server.install(repository / builds.ENGINE_PACKAGE)
     build_server.resolve(installed.op, installed.backend, installed.revision)
-    return f"worker_config.engine_revision={installed.revision}"
+    return {"worker_config": {"engine_revision": installed.revision}}
 
 
 def listing(uniserve: Path, runtime: Path) -> dict[str, Any]:

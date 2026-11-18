@@ -12,8 +12,9 @@ from typing import Any
 
 import httpx
 import pytest
-from uniserve_testing import admin, assets, client, media
-from uniserve_testing.deployments import Deployments, two_host_leader
+from uniserve_testing import admin, assets, client, media, packages
+from uniserve_testing.deployments import Deployments, this_host, two_hosts
+from uniserve_testing.packages import merged
 from uniserve_testing.remote import RemoteHost
 from uniserve_testing.servers import Server
 
@@ -32,7 +33,7 @@ SIZE = "1344x768"
 
 #: The request shapes the layouts serve, as (seconds, prompt tokens, frames):
 #: the shortest admitted duration at the smallest text capacity, and the
-#: longest at the prompt capacity, `--max-model-len`.
+#: longest at the prompt capacity, `max_model_len`.
 SHORT = (5, 1000, 124)
 LONG = (15, 16384, 362)
 
@@ -209,7 +210,7 @@ def _workers(
     blocks["latent_encoder"] = {"ranks": blocks["video_decoder"]["ranks"][:1]}
     # The media blocks encode and assemble on the host inside the main
     # process, which serves CUDA devices only, so they are placed on CUDA
-    # ranks as the deployment files of `configs/minimax_h3` place them: each
+    # ranks as the packages of `configs/minimax_h3` place them: each
     # decoded unit's codec slot on its decoder's rank, and the muxer and the
     # media reader on rank 0, which every layout places on the leader's host.
     blocks["video_codec"] = {
@@ -248,41 +249,34 @@ def _workers(
 
 
 def _options(
-    directory: Path,
     workers: list[dict[str, Any]],
     max_running_requests: int,
     shapes: tuple[tuple[int, int, int], ...],
-) -> list[str]:
-    """The options of a deployment of `workers` admitting
+) -> dict[str, Any]:
+    """The options of a FastH3 deployment of `workers` admitting
     `max_running_requests` requests of up to the longest of `shapes`.
     """  # noqa: D205
     max_seconds = max(seconds for seconds, _, _ in shapes)
-    return [
-        "--served-model-name",
-        "MiniMax-H3",
-        "--config",
-        str(client.written_deployment(directory, workers)),
-        "--max-running-requests",
-        str(max_running_requests),
-        "--max-model-len",
-        "16384",
-        "--set",
-        f"video_config.max_seconds={max_seconds}",
+    return {
+        "model": assets.CHECKPOINTS["fasth3"].model,
+        "served_model_name": "MiniMax-H3",
+        **client.layout(workers),
+        "max_running_requests": max_running_requests,
+        "max_model_len": 16384,
         # Two text capacities bound the startup capture of every admitted
         # duration; the requests below exercise both.
-        "--set",
-        "video_config.text_capacities=[1024]",
+        "video_config": {
+            "max_seconds": max_seconds,
+            "text_capacities": [1024],
+        },
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
         # deployment the default share is sized for.
-        "--mem-fraction-static",
-        "0.92",
-        "--set",
-        'dtype="bfloat16"',
-        "--set",
-        'quantization.mode="balanced"',
-    ]
+        "mem_fraction_static": 0.92,
+        "dtype": "bfloat16",
+        "quantization": {"mode": "balanced"},
+    }
 
 
 def _payloads(shapes: tuple[tuple[int, int, int], ...]) -> list[dict]:
@@ -403,8 +397,7 @@ def test_block_bindings_release_cancelled_requests(
     payloads = _payloads(shapes)
 
     with deployments.serve(
-        *_options(tmp_path, workers, max_running_requests, shapes),
-        model=assets.CHECKPOINTS["fasth3"].model,
+        _options(workers, max_running_requests, shapes)
     ) as server:
         _exercise(server, payloads, shapes, tmp_path)
 
@@ -433,8 +426,7 @@ def test_block_bindings_on_two_hosts_release_cancelled_requests(
     its ranks on one host write and its ranks on the other read is copied
     between the hosts by the reading host's Storage Server
     (docs/minimax_h3/minimax_h3.md, Two hosts). The second host's daemon
-    joins this host's leader as node ``rank-1`` and runs the ranks placed on
-    its devices.
+    joins this host's leader and runs the ranks placed on its devices.
     """  # noqa: D205
     shapes = (SHORT, LONG)
     devices, blocks = TWO_HOST_LAYOUTS[layout]
@@ -443,16 +435,14 @@ def test_block_bindings_on_two_hosts_release_cancelled_requests(
         # The ranks past this host's devices run on the second host's.
         if device < HOST_GPUS:
             return f"cuda:{device}"
-        return f"rank-1/cuda:{device - HOST_GPUS}"
+        return f"{peer_host.name}/cuda:{device - HOST_GPUS}"
 
     workers = _workers(devices, blocks, grouping, place)
     payloads = _payloads(shapes)
 
     with (
         deployments.serve(
-            *_options(tmp_path, workers, 2, shapes),
-            *two_host_leader(peer_host),
-            model=assets.CHECKPOINTS["fasth3"].model,
+            merged(_options(workers, 2, shapes), two_hosts(peer_host)),
             serving=False,
         ) as server,
         deployments.follower(peer_host, server, repository),
@@ -464,7 +454,7 @@ def test_block_bindings_on_two_hosts_release_cancelled_requests(
 def test_replicas_on_two_hosts_serve_complete_media(
     deployments: Deployments, peer_host: RemoteHost, repository: Path
 ) -> None:
-    """`fasth3-ulysses4x2-two-host.toml` serves across two hosts of four GPUs.
+    """`fasth3-ulysses4x2-two-host` serves across two hosts of four GPUs.
 
     Each Ulysses4 replica, with its text encoder, decoders, codecs, muxer and
     media reader, lies on one host, so no product passes between the hosts'
@@ -486,29 +476,31 @@ def test_replicas_on_two_hosts_serve_complete_media(
         )
         for index in range(2 * max_running_requests)
     ]
-    deployment = (
-        repository
-        / "configs"
-        / "minimax_h3"
-        / "fasth3-ulysses4x2-two-host.toml"
+    # The package lists the hosts it was written for: it serves on this host
+    # and the second one, in its hosts' places.
+    package = packages.on_hosts(
+        packages.read(
+            repository / "configs" / "minimax_h3" / "fasth3-ulysses4x2-two-host"
+        ),
+        [this_host(), peer_host.name],
     )
 
     with (
         deployments.serve(
-            "--served-model-name",
-            "FastH3",
-            "--config",
-            str(deployment),
-            "--max-running-requests",
-            str(max_running_requests),
-            "--max-model-len",
-            "1024",
-            "--set",
-            "video_config.max_seconds=5",
-            "--set",
-            "video_config.text_capacities=[1024]",
-            *two_host_leader(peer_host),
-            model=assets.CHECKPOINTS["fasth3"].model,
+            merged(
+                package,
+                two_hosts(peer_host),
+                {
+                    "model": assets.CHECKPOINTS["fasth3"].model,
+                    "served_model_name": "FastH3",
+                    "max_running_requests": max_running_requests,
+                    "max_model_len": 1024,
+                    "video_config": {
+                        "max_seconds": 5,
+                        "text_capacities": [1024],
+                    },
+                },
+            ),
             serving=False,
         ) as server,
         deployments.follower(peer_host, server, repository),
@@ -536,22 +528,24 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     """
     with (
         deployments.serve(
-            "--served-model-name",
-            "FastH3",
-            "--config",
-            str(repository / "configs" / "minimax_h3" / "ulysses4.toml"),
-            # A media deployment states the prompt length it admits; one
-            # text capacity of that length bounds the startup capture of
-            # every admitted duration.
-            "--max-model-len",
-            "1024",
-            "--set",
-            "video_config.text_capacities=[1024]",
-            # Full-duration decoder graphs beside BF16 weights and two
-            # resident request slots need more than the default share.
-            "--mem-fraction-static",
-            "0.92",
-            model=assets.CHECKPOINTS["fasth3"].model,
+            merged(
+                packages.read(
+                    repository / "configs" / "minimax_h3" / "ulysses4"
+                ),
+                {
+                    "model": assets.CHECKPOINTS["fasth3"].model,
+                    "served_model_name": "FastH3",
+                    # A media deployment states the prompt length it admits;
+                    # one text capacity of that length bounds the startup
+                    # capture of every admitted duration.
+                    "max_model_len": 1024,
+                    "video_config": {"text_capacities": [1024]},
+                    # Full-duration decoder graphs beside BF16 weights and
+                    # two resident request slots need more than the default
+                    # share.
+                    "mem_fraction_static": 0.92,
+                },
+            )
         ) as server,
         media.api(server) as api,
     ):

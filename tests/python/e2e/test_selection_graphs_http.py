@@ -67,13 +67,12 @@ def graphs(module_deployments: Deployments) -> Iterator[str]:
     chunks of tokens and prefills a prompt one chunk at a time.
     """  # noqa: D205
     with module_deployments.serve(
-        "--served-model-name",
-        SERVED_MODEL,
-        "--set",
-        f"max_num_batched_tokens={2 * CHUNK}",
-        "--set",
-        f"scheduler_config.chunked_prefill_size={CHUNK}",
-        model=CHECKPOINTS["qwen3"].model,
+        {
+            "model": CHECKPOINTS["qwen3"].model,
+            "served_model_name": SERVED_MODEL,
+            "max_num_batched_tokens": 2 * CHUNK,
+            "scheduler_config": {"chunked_prefill_size": CHUNK},
+        }
     ) as server:
         yield server.base_url
 
