@@ -14,8 +14,8 @@ ASSUME Finite == IsFiniteSet(Units) /\ IsFiniteSet(Slots) /\ IsFiniteSet(HostUni
 LEMMA SharedHeld == \A u : ObservedShared(u) => Held(u)
   BY DEF ObservedShared, CacheKeys, Held, HeldIn
 
-LEMMA PrivateHeld == \A u : ObservedPrivate(u) => Held(u)
-<1> SUFFICES ASSUME NEW u, ObservedPrivate(u) PROVE Held(u)
+LEMMA PrivateHeld == IndInv => \A u : ObservedPrivate(u) => Held(u)
+<1> SUFFICES ASSUME IndInv, NEW u, ObservedPrivate(u) PROVE Held(u)
   OBVIOUS
 <1>1. CASE TableHolders(u) # {}
   <2>1. PICK x \in TableHolders(u) : TRUE
@@ -32,9 +32,12 @@ LEMMA PrivateHeld == \A u : ObservedPrivate(u) => Held(u)
   BY <1>3 DEF Held, HeldIn
 <1>4. CASE \E t \in tasks :
              /\ t.held
-             /\ \/ t.kind = "transfer" /\ t.slot = u /\ ostate[t.o] = "live"
+             /\ \/ t.kind = "import" /\ u \in t.writes /\ ostate[t.o] = "live"
                 \/ t.kind = "prefetch" /\ t.h = u
-  BY <1>4 DEF Held, HeldIn
+  <2>1. \A t \in tasks : t.kind = "import" => t.writes \subseteq t.units
+    BY DEF IndInv, TasksOk
+  <2> QED
+    BY <1>4, <2>1 DEF Held, HeldIn
 <1> QED
   BY <1>1, <1>2, <1>3, <1>4 DEF ObservedPrivate
 

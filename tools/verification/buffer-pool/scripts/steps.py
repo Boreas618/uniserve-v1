@@ -301,17 +301,21 @@ def stamps(text):
 # ---------------------------------------------------------------------------
 # A state: its facts, and what holds what.
 
-RECORDS = ("copy", "commit", "finish", "release", "transfer", "replicate", "task")
+RECORDS = ("copy", "commit", "finish", "release", "lend", "replicate", "task", "lent", "borrow")
+# The position an import's block is for: `p<position>=<unit>`.
+PLACE = re.compile(r"^p(\d+)$")
 
 
 def record(line):
-    """A piece of waiting work, a copy or a task: its kind, units, owners
-    with the positions it names, and keys."""
+    """A piece of waiting work, a copy, a task, a lend or a borrow: its kind,
+    units, owners with the positions it names, and keys."""
     word, _, rest = line.partition(" ")
     found = fields(rest)
     units = {f"{region}:{unit}" for region, unit in UNIT.findall(rest)}
     owner = found.get("o", "-")
-    owners = {} if owner == "-" else {owner: {found["p"]} if found.get("p", "-") != "-" else set()}
+    positions = {found["p"]} if found.get("p", "-") != "-" else set()
+    positions |= {match.group(1) for match in map(PLACE.match, found) if match}
+    owners = {} if owner == "-" else {owner: positions}
     key = found.get("k", "-")
     kind = word if word != "task" else "task " + rest.split()[0]
     return kind, units, owners, set() if key == "-" else {key}
@@ -536,13 +540,17 @@ def outside_state(state, regions):
 # ---------------------------------------------------------------------------
 # The inputs.
 
-ARRIVE = {"release", "detach", "commit", "finish", "transfer", "replicate"}
+ARRIVE = {"release", "detach", "commit", "finish", "lend", "replicate"}
 STUTTER = {"victims", "list", "unreadable", "limits", "hold", "release-holds", "grant", "withdraw"}
 OUTSIDE = {"open", "image"}
 ACTS = {"attach": ["Attach"], "allocate": ["Allocate"], "pin": ["Pin"], "clone": ["Clone"],
         "load": ["Load"], "save": ["Save", "EvictHost"], "restore": ["Restore"], "evict": ["Evict"],
-        "completed": ["Advance"], "tick": ["Deadline"], "done": ["PrefetchEnd", "PutEnd"],
-        "ended": ["TransferEnd", "ReplicateEnd", "PrefetchEnd", "PutEnd"], "publish": ["CommitUpdate"],
+        # A tick passes the deadlines of tasks and the leases of lends.
+        "completed": ["Advance"], "tick": ["Deadline", "GiveBack"], "done": ["PrefetchEnd", "PutEnd"],
+        "ended": ["ImportEnd", "ReplicateEnd", "PrefetchEnd", "PutEnd"], "publish": ["CommitUpdate"],
+        # An import takes the room it lacks by evicting, in the one step.
+        "import": ["Import"], "borrow": ["Borrow"], "give-back": ["GiveBack"],
+        "release-borrows": ["ReleaseBorrow"],
         "roll-back": ["Rollback", "Evict", "EvictHost"],
         # A session's end: its engine is lost (every stamp of its groups
         # counts as reached, as `Advance`s of their words), and the device
@@ -630,8 +638,11 @@ def named(text):
         owner = found["o"]
         facts |= {("h", owner), ("r", owner)}
         facts |= {("e", owner, position) for position in filter(None, found.get("ps", "").split(","))}
-        if kind in ("detach", "transfer"):
+        if kind in ("detach", "lend", "give-back", "borrow"):
             facts.add(("f", owner))
+    # An import reads the entries of its lender, of this pool.
+    if found.get("lender", "-") != "-":
+        facts |= {("f", found["lender"]), ("h", found["lender"]), ("r", found["lender"])}
     for key in filter(None, found.get("ks", "").split(",")):
         facts |= {("k", key), ("K", key)}
     return facts
@@ -685,7 +696,7 @@ def closure(fact, states, partners):
             for owner, positions in owners.items():
                 found.add(("h", owner))
                 found |= {("e", owner, position) for position in positions}
-                if word in ("transfer", "task transfer"):
+                if word in ("lend", "lent", "borrow"):
                     found |= {("f", owner), ("r", owner)}
             found |= {("k", key) for key in keys}
             if word.startswith("task"):
@@ -808,6 +819,8 @@ def rename_record(line, rename):
             return f"o={rename(value, 'o')}"
         if name == "p":
             return f"p={rename(value, 'p')}"
+        if PLACE.match(name):
+            return f"p{rename(name[1:], 'p')}={rename_units(value, rename)}"
         if name == "k":
             return f"k={rename(value, 'k')}"
         if name == "to":
@@ -824,7 +837,7 @@ def rename_input(text, rename):
     kind, found = text.split(" ")[0], fields(text)
     parts = [kind]
     for name, value in found.items():
-        if name == "o":
+        if name == "o" or (name == "lender" and value != "-"):
             value = rename(value, "o")
         elif name in ("g", "to"):
             value = rename(value, "g")
@@ -890,6 +903,7 @@ def window(step, before, after, text, part, witnesses, layout, chunks):
     positions = {fact[2] for fact in part if fact[0] == "e"}
     found = fields(text)
     owners |= {found["o"]} if "o" in found else set()
+    owners |= {found["lender"]} if found.get("lender", "-") != "-" else set()
     keys |= set(filter(None, found.get("ks", "").split(",")))
     positions |= set(filter(None, found.get("ps", "").split(",")))
     for state in (before, after):
@@ -1153,7 +1167,7 @@ def split(path, jobs):
 def parse_lines(lines, rank):
     """A window's lines as the record KvTrace's `Matches` compares."""
     state = Rec(ncopy=0, completed=Fn(), free=Set(), epochs=Fn(), owners=Fn(), keys=Set(), valid=Set(),
-                copies=Set(), commits=Set(), transfers=Set(), replicates=Set(), finishes=Set(),
+                copies=Set(), commits=Set(), lends=Set(), replicates=Set(), finishes=Set(),
                 releases=Set(), tasks=Set())
     after = lambda text: Fn((group, rank[at]) for group, at in stamps(text).items())
     for line in lines:
@@ -1187,9 +1201,16 @@ def parse_lines(lines, rank):
             found = fields(rest)
             state["commits"].append(Rec(o=found["o"], p=found["p"], u=found["u"], k=found["k"],
                                         after=after(found["after"])))
-        elif word == "transfer":
+        elif word == "lend":
             found = fields(rest)
-            state["transfers"].append(Rec(o=found["o"], to=found["to"], after=after(found["after"])))
+            state["lends"].append(Rec(o=found["o"], after=after(found["after"])))
+        elif word in ("lent", "borrow"):
+            # A lend that stands, and a borrow of one with the blocks it holds.
+            found = fields(rest)
+            held = Set(f"{region}:{unit}" for region, unit in UNIT.findall(rest))
+            state["tasks"].append(Rec(kind="lend" if word == "lent" else "borrow", o=found["o"], p="-", to="-",
+                                      places=Set(), units=held, writes=Set(), h="-", expired=0, k="-",
+                                      parts=Set(), s="-"))
         elif word == "replicate":
             found = fields(rest)
             state["replicates"].append(Rec(o=found["o"], p=found["p"], to=found["to"], u=found["u"],
@@ -1203,20 +1224,24 @@ def parse_lines(lines, rank):
             state["releases"].append(Rec(after=after(waits[len("after="):]), units=Set(units.split())))
         elif word == "task":
             kind, _, rest = rest.partition(" ")
-            if kind == "transfer":
-                match = re.match(r"o=(\S+) to=(\S+) slot=(\S+) units=(.*?) ?writes=(.*)$", rest)
-                o, to, slot, units, writes = match.groups()
-                state["tasks"].append(Rec(kind=kind, o=o, p="-", to=to, slot=slot, units=Set(units.split()),
-                                          writes=Set(writes.split()), h="-", expired=0, k="-", parts=Set(),
-                                          s="-"))
+            if kind == "import":
+                # The block each position takes, and the lent blocks it reads.
+                found = fields(rest)
+                places = Set((match.group(1), unit) for match, unit in
+                             ((PLACE.match(name), unit) for name, unit in found.items()) if match)
+                writes = Set(unit for _, unit in places)
+                reads = [unit for unit in found["reads"].split(",") if unit != "-"]
+                state["tasks"].append(Rec(kind=kind, o=found["o"], p="-", to="-", places=places,
+                                          units=Set(sorted(set(reads) | set(writes))), writes=writes, h="-",
+                                          expired=0, k="-", parts=Set(), s="-"))
             elif kind == "replicate":
                 found = fields(rest)
-                state["tasks"].append(Rec(kind=kind, o=found["o"], p=found["p"], to=found["to"], slot="-",
+                state["tasks"].append(Rec(kind=kind, o=found["o"], p=found["p"], to=found["to"], places=Set(),
                                           units=Set([found["u"]]), writes=Set([found["u"]]), h="-",
                                           expired=0, k="-", parts=Set(), s="-"))
             else:
                 found = fields(rest)
-                state["tasks"].append(Rec(kind=kind, o="-", p="-", to="-", slot="-", units=Set(), writes=Set(),
+                state["tasks"].append(Rec(kind=kind, o="-", p="-", to="-", places=Set(), units=Set(), writes=Set(),
                                           h=found["h"], expired=int(found["expired"]), k=found["k"],
                                           parts=Set(filter(None, found["parts"].split(","))), s=found["s"]))
         else:
@@ -1384,7 +1409,7 @@ def check(job):
     constants = {
         "Units": "<- TraceUnits", "Slots": "<- TraceSlots", "HostUnits": "<- TraceHostUnits",
         "Keys": "<- TraceKeys", "Owners": "<- TraceOwners", "Groups": "<- TraceGroups",
-        "Positions": "<- TracePositions", "Epochs": "<- TraceEpochs", "Transfers": "= TRUE",
+        "Positions": "<- TracePositions", "Epochs": "<- TraceEpochs", "Handoffs": "= TRUE",
         "Stamping": "<- TraceGroups", "SlotGroup": "<- TraceSlotGroup",
         "GroupEpoch": "<- TraceGroupEpoch", "OwnerEpoch": "<- TraceOwnerEpoch",
         "GroupMemory": "<- TraceGroupMemory", "UnitRegion": "<- TraceUnitRegion",
@@ -1446,9 +1471,17 @@ def input_record(item, groups, owners, positions, keys, rank):
                 completed[group] = max(rank.values())
     order, korder = Seq(item["order"]), Seq(item["korder"])
     evict, evicthost = Seq(item["evict"]), Seq(item["evicthost"])
+    # An import names exactly its positions, none among them; and its lender, an owner of this
+    # pool, or none for one of another host's pool.
+    if kind == "import":
+        named_positions = Set(filter(None, named_values.get("ps", "").split(",")))
+    else:
+        named_positions = listed("ps", positions)
+    lender = named_values.get("lender", "-")
     return Rec(acts=Set(acts(text)), os=Set([named_values["o"]]) if "o" in named_values else Set(owners),
                gs=Set([named_values["g"]]) if "g" in named_values else Set(groups),
-               ps=listed("ps", positions), ks=listed("ks", keys), order=order, korder=korder,
+               ps=named_positions, ks=listed("ks", keys), order=order, korder=korder,
+               lender="none" if lender == "-" else lender,
                evict=evict, evicthost=evicthost,
                req=request, completed=completed)
 

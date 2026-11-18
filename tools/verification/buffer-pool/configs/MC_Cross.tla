@@ -33,7 +33,7 @@ Symmetry == Permutations(Units)
 NeverReadAcross ==
     ~\E b \in inflight : b.g = gb /\ \E r \in b.reads : r[2] \in Units /\ ogroup[r[1]] = ga
 (* The crossing's arm of P1's TaskIsolation alone, so that a run checking  *)
-(* it is not stopped first by the release's or the transfer's arm.          *)
+(* it is not stopped first by the release's or the import's arm.            *)
 CrossingTaskIsolation ==
     \A t \in tasks : t.kind = "replicate" =>
         \A u \in t.writes :

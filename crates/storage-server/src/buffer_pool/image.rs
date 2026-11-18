@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use storage::protocol::Key;
 use storage::runtime::{Completion, GroupId, OwnerId, RequestId, Segments};
 
+use super::lends::Importing;
 use super::{
     Block, BufferPool, Class, ClientId, Copy, Deferred, Entry, Group, Held, Owner, QueueId, Region,
 };
@@ -32,7 +33,7 @@ use super::{
 /// written are records of this build's runtime interface
 /// (`storage::runtime::VERSION`). A change of the image or of those records
 /// is a new format.
-pub(crate) const FORMAT: u32 = 8;
+pub(crate) const FORMAT: u32 = 9;
 
 /// The image of a pool, over the regions `R` and the blocks `B`: borrowed
 /// from a pool to write it, owned to make a pool of it. Maps keyed by more
@@ -66,6 +67,10 @@ struct Image<R, B> {
     holds: Vec<(u64, Vec<u32>)>,
     /// The lent owners, each with the end of its lease.
     lends: Vec<(ClientId, u64, u64)>,
+    /// What each import keeps beside its copies, by the request that asked for it.
+    imports: Vec<(QueueId, u64, Importing)>,
+    /// The blocks each borrow of a lend holds, by the peer's connection and the lend.
+    borrows: Vec<(u64, ClientId, u64, Vec<u32>)>,
 }
 
 impl Serialize for BufferPool {
@@ -119,6 +124,14 @@ impl Serialize for BufferPool {
                 mapped.push(named::<_, S::Error>(name(block))?);
             }
             holds.push((*holder, mapped));
+        }
+        let mut borrows = Vec::with_capacity(self.borrows.len());
+        for ((peer, client, owner), blocks) in &self.borrows {
+            let mut mapped = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                mapped.push(named::<_, S::Error>(name(block))?);
+            }
+            borrows.push((*peer, *client, owner.0, mapped));
         }
 
         let completions = self.completions.iter().map(|(queue, request, completion)| {
@@ -184,6 +197,12 @@ impl Serialize for BufferPool {
                 .iter()
                 .map(|((client, owner), deadline)| (*client, owner.0, *deadline))
                 .collect(),
+            imports: self
+                .imports
+                .iter()
+                .map(|((queue, request), importing)| (*queue, request.0, importing.clone()))
+                .collect(),
+            borrows,
         };
         image.serialize(serializer)
     }
@@ -252,6 +271,18 @@ impl BufferPool {
             .into_iter()
             .map(|(client, owner, deadline)| ((client, OwnerId(owner)), deadline))
             .collect();
+        pool.imports = image
+            .imports
+            .into_iter()
+            .map(|(queue, request, importing)| ((queue, RequestId(request)), importing))
+            .collect();
+        for (peer, client, owner, held) in image.borrows {
+            let mut holds = Vec::with_capacity(held.len());
+            for index in &held {
+                holds.push(block(index)?);
+            }
+            pool.borrows.insert((peer, client, OwnerId(owner)), holds);
+        }
         pool.answers = image
             .answers
             .into_iter()

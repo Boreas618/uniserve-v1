@@ -30,7 +30,7 @@ name = "Integrity"
 kind = "safety"
 statement = """A block is committed only after `completed` has reached the stamp of its `Commit`, \
 the destination of a copy becomes shared only after the stamp of its `Finish`, and a block is \
-stored, loaded, cloned or transferred only as a shared block or as its owner's private one, \
+stored, loaded or cloned only as a shared block or as its owner's private one, \
 held for as long as it is read. A shared block is never the destination of a copy and never private again; its key never changes."""
 formulas = ["KeyStable", "PinsCached", "OneKey", "SharedUnwritten", "CopiesReadShared", "SourcesHeld"]
 rules = ["R3", "R4", "R5", "R6"]
@@ -114,8 +114,10 @@ name = "Placement"
 kind = "safety"
 statement = """A copy reads a block only in a memory that holds it: a device block in its group's \
 memory, a host block on host parts that hold it; a crossing reads its block where it is valid \
-once no batch in flight writes it; a copy fills only host parts that do not hold its block."""
-formulas = ["CopiesPlaced", "CrossingsPlaced"]
+once no batch in flight writes it; an import, and another host's import through a borrow, reads \
+the blocks of a lend, which no batch in flight writes; a copy fills only host parts that do not \
+hold its block."""
+formulas = ["CopiesPlaced", "CrossingsPlaced", "ImportsPlaced"]
 rules = ["R3", "R5", "R11"]
 assumptions = ["A1", "A2", "A4", "A9"]
 violated_by = "A group on one host loads the host copy a group on another host stored, reading a host part that does not hold it (R11 left out): `CopiesPlaced`."

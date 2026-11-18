@@ -860,9 +860,11 @@ impl BufferPool {
         // pool frees and stops follows its inputs alone (§18).
         mine.sort_unstable();
         for task in mine {
-            let run_by_worker = self.copies[&task]
-                .iter()
-                .all(|copy| copy.deadline.is_none());
+            // An import is a task whatever it copies, of no page too.
+            let run_by_worker = !self.imports.contains_key(&task)
+                && self.copies[&task]
+                    .iter()
+                    .all(|copy| copy.deadline.is_none());
             if run_by_worker {
                 self.finished(task.0, task.1, false);
             } else if self.answers.remove(&task).is_some() {

@@ -15,7 +15,7 @@ mkdir -p "$TLC_LOGS"
 results="$TLC_LOGS/suite.txt"; : > "$results"
 
 # The configurations of the design.
-design="MC_Core MC_Copies MC_Transfer MC_TransferPair MC_Trial MC_TrialTiers MC_Resize MC_Tiers MC_Loss MC_LossCopies MC_Finality MC_Cross MC_HostParts MC_HostSplit"
+design="MC_Core MC_Copies MC_Handoff MC_Trial MC_TrialTiers MC_Resize MC_Tiers MC_Loss MC_LossCopies MC_Finality MC_Cross MC_HostParts MC_HostSplit"
 
 # configuration, rule left out, the invariants one of which is reported.
 mutations="
@@ -28,7 +28,7 @@ MC_Core NoR6 WriteIsolation|SharedUnwritten
 MC_Core NoR7 KeyStable
 MC_Trial NoR8 TrialVisibility
 MC_TrialTiers NoR8 TrialVisibility
-MC_Transfer NoR9 TaskIsolation
+MC_Handoff NoR9 TaskIsolation
 MC_Tiers NoR9 TaskIsolation
 MC_Resize NoR10 OneRegion
 MC_Cross NoR5 TaskIsolation
@@ -38,7 +38,7 @@ MC_HostSplit NoR11 CopiesPlaced
 
 # configuration, hazard switched on, the properties one of which is reported.
 hazards="
-MC_Transfer H1 TaskIsolation
+MC_Handoff H1 TaskIsolation
 MC_Copies H3 CopyIsolation
 MC_Tiers H4 Exactness
 MC_Copies H5 CopyIsolation|FreeUnheld
@@ -62,6 +62,7 @@ MC_Core NoR2 CapacityIdentity
 MC_Cross NoR3 CrossingsPlaced
 MC_Cross NoR9 CrossingTaskIsolation
 MC_HostSplit NoR5 CopiesPlaced
+MC_Handoff NoR3 ImportsPlaced
 "
 
 # Runs one configuration and records whether it ended as `expected`: "none" for

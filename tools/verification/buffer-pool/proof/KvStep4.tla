@@ -27,11 +27,11 @@ LEMMA PlaneFrame ==
   PROVE  /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
          /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
          /\ TasksOk' /\ TrialVisibility' /\ NoBad' /\ CrossingsOk' /\ CopiesPlaced'
-         /\ CrossingsPlaced'
-  BY TransfersFrame, FreeCleanFrame, NoLeakFrame, OutsideFrame, RegionsFrame, AllocOwnerFrame,
+         /\ CrossingsPlaced' /\ ImportsPlaced'
+  BY HandoffTasksFrame, FreeCleanFrame, NoLeakFrame, OutsideFrame, RegionsFrame, AllocOwnerFrame,
      SharedIffFrame, SharedCachedFrame, CacheSharedFrame, TablesFrame, OwnersOkFrame,
      DeferredOkFrame, CopiesOkFrame, TasksOkFrame, TrialVisibilityFrame, NoBadFrame,
-     CrossingsOkFrame, CopiesPlacedFrame, CrossingsPlacedFrame DEF IndInv
+     CrossingsOkFrame, CopiesPlacedFrame, CrossingsPlacedFrame, ImportsPlacedFrame DEF IndInv
 
 -----------------------------------------------------------------------------
 (* Issue                                                                   *)
@@ -42,7 +42,7 @@ LEMMA PlaneFrame ==
 IssuedOk(x) ==
     /\ x = [kind |-> x.kind, e |-> x.e, o |-> x.o, ps |-> x.ps, p |-> x.p, k |-> x.k,
             c |-> x.c, ok |-> x.ok, to |-> x.to, after |-> x.after, by |-> x.by, sg |-> x.sg]
-    /\ x.kind \in {"release", "detach", "commit", "transfer", "replicate", "finish"}
+    /\ x.kind \in {"release", "detach", "commit", "lend", "replicate", "finish"}
     /\ x.e \in Epochs /\ x.e \notin lost
     /\ x.after = NoStamp /\ x.by = {}
     /\ x.sg = {g \in Groups :
@@ -55,7 +55,6 @@ IssuedOk(x) ==
     /\ x.kind # "finish" => x.o \in Owners /\ x.c = 0
     /\ x.kind = "finish" => x.o = NONE /\ x.c \in 1 .. ncopy
     /\ x.kind = "commit" => x.p \in Positions /\ x.k \in Keys
-    /\ x.kind = "transfer" => x.to \in Groups
     /\ x.kind = "replicate" => x.p \in Positions /\ x.to \in Groups
 
 LEMMA Issue_Effect ==
@@ -75,9 +74,9 @@ LEMMA Issue_Effect ==
                \/ requests' = requests \cup {Issued(Request("detach", e, o, {}, NONE, NONE, 0, FALSE))}
                \/ \E p \in Positions, k \in Keys :
                     requests' = requests \cup {Issued(Request("commit", e, o, {}, p, k, 0, FALSE))}
-               \/ \E g \in Groups :
-                    requests' = requests \cup
-                      {Issued([Request("transfer", e, o, {}, NONE, NONE, 0, FALSE) EXCEPT !.to = g])}
+               \/ /\ Handoffs
+                  /\ requests' = requests \cup
+                       {Issued(Request("lend", e, o, {}, NONE, NONE, 0, FALSE))}
                \/ \E p \in Positions, g \in Groups :
                     /\ Crosses
                     /\ requests' = requests \cup
@@ -115,14 +114,14 @@ LEMMA Issue_Effect ==
         BY DEF IssuedOk, Issued, Request, NoStamp
       <3> QED
         BY <3>1, <3>2
-    <2>4. CASE \E o \in Owners, g \in Groups :
+    <2>4. CASE \E o \in Owners :
                  requests' = requests \cup
-                   {Issued([Request("transfer", e, o, {}, NONE, NONE, 0, FALSE) EXCEPT !.to = g])}
-      <3>1. PICK o \in Owners, g \in Groups :
+                   {Issued(Request("lend", e, o, {}, NONE, NONE, 0, FALSE))}
+      <3>1. PICK o \in Owners :
               requests' = requests \cup
-                {Issued([Request("transfer", e, o, {}, NONE, NONE, 0, FALSE) EXCEPT !.to = g])}
+                {Issued(Request("lend", e, o, {}, NONE, NONE, 0, FALSE))}
         BY <2>4
-      <3>2. IssuedOk(Issued([Request("transfer", e, o, {}, NONE, NONE, 0, FALSE) EXCEPT !.to = g]))
+      <3>2. IssuedOk(Issued(Request("lend", e, o, {}, NONE, NONE, 0, FALSE)))
         BY DEF IssuedOk, Issued, Request, NoStamp
       <3> QED
         BY <3>1, <3>2
@@ -167,7 +166,6 @@ LEMMA Issue_Inv ==
             /\ x.c \in 0 .. MaxCopies /\ x.to \in Groups \cup {NONE}
             /\ x.kind # "finish" => x.o \in Owners
             /\ x.kind = "commit" => x.p \in Positions /\ x.k \in Keys
-            /\ x.kind = "transfer" => x.to \in Groups
             /\ x.kind = "replicate" => x.p \in Positions /\ x.to \in Groups
         BY <1>1, PlaneTypes DEF IssuedOk, PlaneTyped, NoStamp, Stamps, NONE
       <3> QED
@@ -178,10 +176,10 @@ LEMMA Issue_Inv ==
   <1>4. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
         /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
         /\ TasksOk' /\ TrialVisibility' /\ NoBad' /\ CrossingsOk' /\ CopiesPlaced'
-        /\ CrossingsPlaced'
+        /\ CrossingsPlaced' /\ ImportsPlaced'
     BY <1>2, PlaneFrame
-  <1>5. MovingUnmapped' /\ TablesMapped'
-    BY <1>2, TransfersFrame, MovingUnmappedFrame, TablesMappedFrame DEF IndInv
+  <1>5. LendingUnmapped' /\ TablesMapped'
+    BY <1>2, HandoffTasksFrame, LendingUnmappedFrame, TablesMappedFrame DEF IndInv
   <1>6. LostOk' /\ HandoffOk'
     BY <1>1, <1>2 DEF IndInv, LostOk, HandoffOk, IssuedOk, Live, HoldsAt
   (* The new request names entries only in the table of the group its      *)
@@ -190,7 +188,7 @@ LEMMA Issue_Inv ==
     <2>1. /\ x.by \subseteq x.sg /\ x.sg \subseteq Groups
           /\ \A g \in x.sg : GroupEpoch[g] = x.e
           /\ \A g \in Groups : x.after[g] <= launched[g] /\ (g \notin x.by => x.after[g] = 0)
-          /\ x.kind \in {"release", "detach", "commit", "transfer", "replicate", "finish"}
+          /\ x.kind \in {"release", "detach", "commit", "lend", "replicate", "finish"}
       BY <1>1, PlaneTypes DEF IssuedOk, NoStamp, PlaneTyped
     <2>2. x.kind # "finish" =>
             \A g \in Groups, p \in Rows :
@@ -248,8 +246,8 @@ LEMMA Issue_Inv ==
                       /\ \A r \in requests :
                            TakesRow(r, o, p) =>
                                b.g \in r.sg /\ (b.g \in r.by => r.after[b.g] >= b.seq)
-                 /\ \A d \in deferred : (d.kind = "transfer" /\ d.o = o) => d.after[b.g] >= b.seq
-                 /\ ~\E t \in tasks : t.kind = "transfer" /\ t.o = o
+                 /\ \A d \in deferred : (d.kind = "lend" /\ d.o = o) => d.after[b.g] >= b.seq
+                 /\ ~\E t \in tasks : t.kind = "lend" /\ t.o = o
         BY <1>1, <1>2, <2>3, <3>1 DEF Covered, Live, HoldsAt
       <3>2. CASE \E d \in deferred : d.kind = "release" /\ u \in d.units /\ d.after[b.g] >= b.seq
         BY <1>2, <3>2 DEF Covered
@@ -293,7 +291,7 @@ Stamped(g, r) == [r EXCEPT !.after[g] = launched[g], !.by = r.by \cup {g}]
 StampRows(g, r) ==
     [p \in Rows |->
        CASE r.kind = "release" /\ p \in r.ps -> NoEntry
-         [] r.kind \in {"detach", "transfer"} -> NoEntry
+         [] r.kind \in {"detach", "lend"} -> NoEntry
          [] r.kind \in {"commit", "replicate"} /\ p = r.p -> [u |-> dbt[g][r.o][p].u, w |-> FALSE]
          [] OTHER -> dbt[g][r.o][p]]
 Stop(n, c) == IF c.id = n THEN [c EXCEPT !.stopped = TRUE] ELSE c
@@ -394,8 +392,8 @@ LEMMA ExecStamp_Covered ==
                     /\ HoldsAt(o, p, u)
                     /\ \A x \in requests :
                          TakesRow(x, o, p) => b.g \in x.sg /\ (b.g \in x.by => x.after[b.g] >= b.seq)
-               /\ \A d \in deferred : (d.kind = "transfer" /\ d.o = o) => d.after[b.g] >= b.seq
-               /\ ~\E t \in tasks : t.kind = "transfer" /\ t.o = o
+               /\ \A d \in deferred : (d.kind = "lend" /\ d.o = o) => d.after[b.g] >= b.seq
+               /\ ~\E t \in tasks : t.kind = "lend" /\ t.o = o
       BY <1>2, <2>1 DEF Covered, Live, HoldsAt
     <2>2. CASE \E d \in deferred : d.kind = "release" /\ u \in d.units /\ d.after[b.g] >= b.seq
       BY <2>2 DEF Covered
@@ -422,10 +420,10 @@ LEMMA ExecStamp_Drop ==
   <1>3. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
         /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
         /\ TasksOk' /\ TrialVisibility' /\ NoBad' /\ CrossingsOk' /\ CopiesPlaced'
-        /\ CrossingsPlaced'
+        /\ CrossingsPlaced' /\ ImportsPlaced'
     BY <1>1, PlaneFrame
-  <1>4. MovingUnmapped' /\ TablesMapped'
-    BY <1>1, TransfersFrame, MovingUnmappedFrame, TablesMappedFrame DEF IndInv
+  <1>4. LendingUnmapped' /\ TablesMapped'
+    BY <1>1, HandoffTasksFrame, LendingUnmappedFrame, TablesMappedFrame DEF IndInv
   <1>5. \A h : (\E x \in requests' : Names(x, h)) = (\E x \in requests : Names(x, h))
     BY DEF Names
   <1>6. LostOk' /\ HandoffOk' /\ RequestsOk'
@@ -518,11 +516,11 @@ LEMMA ExecStamp_Give ==
       BY <1>2, <2>1, <2>2, UnitTypes, OwnerTypes, PlaneTypes, UnitTypedFrame, OwnerTypedFrame,
          PlaneTypedFrame, TypeInvNext
   <1>8. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
-        /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ MovingUnmapped'
+        /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ LendingUnmapped'
         /\ TablesMapped' /\ NoBad'
     BY <1>2, <1>6, OutsideFrame, RegionsFrame, AllocOwnerFrame, SharedIffFrame,
-       SharedCachedFrame, CacheSharedFrame, TablesFrame, OwnersOkFrame, MovingUnmappedFrame,
-       TablesMappedFrame, NoBadFrame, TransfersFrame DEF IndInv, FreeClean, NoLeak, InRegion
+       SharedCachedFrame, CacheSharedFrame, TablesFrame, OwnersOkFrame, LendingUnmappedFrame,
+       TablesMappedFrame, NoBadFrame, HandoffTasksFrame DEF IndInv, FreeClean, NoLeak, InRegion
   <1>9. CopiesOk'
     <2>1. \A y \in copies' : y.seq <= launched'[y.g] /\ (y.done => y.seq > 0)
       BY <1>2, <1>5 DEF IndInv, CopiesOk, SameCopy
@@ -534,19 +532,35 @@ LEMMA ExecStamp_Give ==
     <2>2. DeferOk(d)
       BY DeferredOkEach DEF IndInv
     <2> QED
-      BY <1>2, <1>5, <2>2 DEF DeferOk, SameCopy
-  <1>11. TasksOk' /\ TrialVisibility' /\ CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+      BY <1>2, <1>5, <2>2 DEF DeferOk, SameCopy, Importing
+  <1>11. /\ TasksOk' /\ TrialVisibility' /\ CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+         /\ ImportsPlaced'
     <2>1. TasksOk'
       <3>1. SUFFICES ASSUME NEW t \in tasks PROVE TaskOk(t)'
         BY <1>2, TasksOkEach
       <3>2. TaskOk(t)
         BY TasksOkEach DEF IndInv
+      <3>3. \A o, p : CopyFor(o, p)' = CopyFor(o, p)
+        <4>1. \A y \in copies' : \E c \in copies : SameCopy(y, c)
+          BY <1>5
+        <4>2. \A c \in copies : \E y \in copies' : SameCopy(y, c)
+          BY <1>5
+        <4> QED
+          BY <4>1, <4>2 DEF CopyFor, SameCopy
+      <3>4. \A u : (\E c \in copies' : c.read = u \/ c.write = u)
+                     = (\E c \in copies : c.read = u \/ c.write = u)
+        <4>1. \A y \in copies' : \E c \in copies : SameCopy(y, c)
+          BY <1>5
+        <4>2. \A c \in copies : \E y \in copies' : SameCopy(y, c)
+          BY <1>5
+        <4> QED
+          BY <4>1, <4>2 DEF SameCopy
       <3> QED
-        BY <1>2, <1>5, <3>2 DEF TaskOk, SameCopy, Live, TableUnits, Mem
+        BY <1>2, <3>2, <3>3, <3>4, TaskOkCopies
     <2>2. TrialVisibility'
       BY <1>2, <1>5 DEF IndInv, TrialVisibility, SameCopy, MadeBy
-    <2>3. \A o \in Owners : Moving(o)' = Moving(o)
-      BY <1>2 DEF Moving
+    <2>3. \A o \in Owners : Lending(o)' = Lending(o)
+      BY <1>2 DEF Lending
     <2>4. CrossingsOk'
       <3>1. \A d \in deferred : CrossWaitOk(d)'
         <4> SUFFICES ASSUME NEW d \in deferred PROVE CrossWaitOk(d)'
@@ -574,9 +588,11 @@ LEMMA ExecStamp_Give ==
       <3> QED
         BY <1>2, <3>2, <3>3 DEF CopyPlaced, SameCopy, Mem
     <2>6. CrossingsPlaced'
-      BY <1>2, TransfersFrame, CrossingsPlacedFrame DEF IndInv
+      BY <1>2, HandoffTasksFrame, CrossingsPlacedFrame DEF IndInv
+    <2>7. ImportsPlaced'
+      BY <1>2, HandoffTasksFrame, ImportsPlacedFrame DEF IndInv
     <2> QED
-      BY <2>1, <2>2, <2>4, <2>5, <2>6
+      BY <2>1, <2>2, <2>4, <2>5, <2>6, <2>7
   <1>12. \A h : (\E y \in requests' : Names(y, h)) = (\E y \in requests : Names(y, h))
     BY <1>2, <1>3
   <1>13. LostOk' /\ HandoffOk'
@@ -598,7 +614,7 @@ LEMMA ExecStamp_Give ==
     <2>3. /\ x.by \subseteq x.sg /\ x.sg \subseteq Groups
           /\ \A y \in x.sg : GroupEpoch[y] = x.e
           /\ \A y \in Groups : x.after[y] <= launched[y] /\ (y \notin x.by => x.after[y] = 0)
-          /\ x.kind \in {"release", "detach", "commit", "transfer", "replicate", "finish"}
+          /\ x.kind \in {"release", "detach", "commit", "lend", "replicate", "finish"}
           /\ x.kind = "finish" => x.c \in 1 .. ncopy
           /\ x.kind = "finish" =>
                \A y \in copies' :
@@ -639,7 +655,7 @@ LEMMA ExecStamp_Give ==
   <1> QED
     BY <1>7, <1>8, <1>9, <1>10, <1>11, <1>13, <1>14, <1>15 DEF IndInv
 
-(* The executor applies a release, a detach, a transfer or a commit.        *)
+(* The executor applies a release, a detach, a lend or a commit.            *)
 LEMMA ExecStamp_Apply ==
   ASSUME IndInv, NEW g \in Groups, NEW r \in requests, ExecStamp(g, r), UNCHANGED rare,
          r.kind # "finish",
@@ -697,10 +713,10 @@ LEMMA ExecStamp_Apply ==
   <1>7. /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
         /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
         /\ TasksOk' /\ TrialVisibility' /\ NoBad' /\ CrossingsOk' /\ CopiesPlaced'
-        /\ CrossingsPlaced'
+        /\ CrossingsPlaced' /\ ImportsPlaced'
     BY <1>2, PlaneFrame
-  <1>8. MovingUnmapped' /\ TablesMapped'
-    BY <1>2, <1>5 DEF IndInv, MovingUnmapped, TablesMapped, Live, HoldsAt
+  <1>8. LendingUnmapped' /\ TablesMapped'
+    BY <1>2, <1>5 DEF IndInv, LendingUnmapped, Lending, TablesMapped, Live, HoldsAt
   <1>9. \A h : (\E y \in requests' : Names(y, h)) = (\E y \in requests : Names(y, h))
     BY <1>2, <1>3
   <1>10. LostOk' /\ HandoffOk'
@@ -709,7 +725,7 @@ LEMMA ExecStamp_Apply ==
     <2>1. /\ x.by \subseteq x.sg /\ x.sg \subseteq Groups
           /\ \A y \in x.sg : GroupEpoch[y] = x.e
           /\ \A y \in Groups : x.after[y] <= launched[y] /\ (y \notin x.by => x.after[y] = 0)
-          /\ x.kind \in {"release", "detach", "commit", "transfer", "replicate", "finish"}
+          /\ x.kind \in {"release", "detach", "commit", "lend", "replicate", "finish"}
           /\ x.kind # "finish"
       BY <1>0, <1>2, <1>3 DEF IndInv, RequestsOk, PlaneTyped
     <2>2. \A y \in Groups, p \in Rows :
@@ -785,13 +801,13 @@ LEMMA Handoff_Common ==
          /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk' /\ DeferredOk' /\ CopiesOk'
          /\ TasksOk' /\ TrialVisibility' /\ NoBad' /\ BatchesOk' /\ HandoffOk'
          /\ UnitTyped' /\ OwnerTyped' /\ WorkTyped' /\ RequestTyped'
-         /\ CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+         /\ CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced' /\ ImportsPlaced'
   <1>1. UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy,
                     tasks, valid, vis, trial, member, launched, inflight, requests, alloc,
                     sharedKey, remote, lost, bad>>
     BY DEF rare
   <1>2. BatchesOk'
-    BY <1>1, TransfersFrame, BatchesOkFrame DEF IndInv
+    BY <1>1, HandoffTasksFrame, BatchesOkFrame DEF IndInv
   <1>3. HandoffOk'
     BY <1>1 DEF IndInv, HandoffOk, Live, HoldsAt
   <1>4. UnitTyped' /\ OwnerTyped' /\ WorkTyped' /\ RequestTyped'
@@ -810,9 +826,9 @@ LEMMA DropCompletion_Inv ==
     BY DEF DropCompletion, pool, rare
   <1>2. TypeInv'
     BY <1>1, Handoff_Common, PlaneTypes, PlaneTypedFrame, TypeInvNext
-  <1>3. MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ RequestsOk'
-    BY <1>1, TransfersFrame, TablesMappedFrame, RequestsOkFrame
-       DEF IndInv, MovingUnmapped, LostOk
+  <1>3. LendingUnmapped' /\ LostOk' /\ TablesMapped' /\ RequestsOk'
+    BY <1>1, HandoffTasksFrame, TablesMappedFrame, RequestsOkFrame
+       DEF IndInv, LendingUnmapped, Lending, LostOk
   <1> QED
     BY <1>1, <1>2, <1>3, Handoff_Common DEF IndInv
 
@@ -838,9 +854,8 @@ LEMMA ExecMap_Inv ==
              /\ ~\E t \in tasks : t.kind = "replicate" /\ h.u \in t.units
     BY <1>0, <1>1 DEF IndInv, HandoffOk, RequestTyped
   <1>3. /\ GroupEpoch[h.g] \notin lost
-        /\ ~\E t \in tasks : t.kind = "transfer" /\ t.o = h.o
-        /\ ~\E d \in deferred : d.kind = "transfer" /\ d.o = h.o
-    BY <1>2 DEF IndInv, LostOk, MovingUnmapped
+        /\ ~Lending(h.o)
+    BY <1>2 DEF IndInv, LostOk, LendingUnmapped
   (* The row the completion names is written; every other row is unchanged. *)
   <1>4. \A y \in Groups, o \in Owners, p \in Rows :
           dbt'[y][o][p] = IF y = h.g /\ o = h.o /\ p = h.p THEN [u |-> h.u, w |-> h.w]
@@ -851,8 +866,8 @@ LEMMA ExecMap_Inv ==
       BY <1>0, <1>1, <1>2, <1>4 DEF PlaneTyped
     <2> QED
       BY <1>1, <2>1, Handoff_Common, TypeInvNext
-  <1>6. MovingUnmapped'
-    BY <1>1, <1>3, <1>4 DEF IndInv, MovingUnmapped
+  <1>6. LendingUnmapped'
+    BY <1>1, <1>3, <1>4 DEF IndInv, LendingUnmapped, Lending
   <1>7. LostOk'
     BY <1>1, <1>3, <1>4 DEF IndInv, LostOk
   <1>8. TablesMapped'

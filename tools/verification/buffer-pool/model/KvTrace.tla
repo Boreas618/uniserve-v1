@@ -61,18 +61,19 @@ CopyLine(c) ==
      \* The session whose request asked for the copy.
      s |-> GroupEpoch[c.g]]
 
-\* A task in flight, as a `task` line states it.
+\* A task in flight, as a `task` line states it, and a lend or a borrow, as a
+\* `lent` or a `borrow` line does.
 TaskLine(t) ==
-    CASE t.kind = "transfer" ->
-           [kind |-> "transfer", o |-> t.o, p |-> "-", to |-> t.to, slot |-> t.slot,
+    CASE t.kind \in {"import", "lend", "borrow"} ->
+           [kind |-> t.kind, o |-> t.o, p |-> "-", to |-> "-", places |-> t.places,
             units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-", parts |-> {},
             s |-> "-"]
       [] t.kind = "replicate" ->
-           [kind |-> "replicate", o |-> t.o, p |-> t.p, to |-> t.to, slot |-> "-",
+           [kind |-> "replicate", o |-> t.o, p |-> t.p, to |-> t.to, places |-> {},
             units |-> t.units, writes |-> t.writes, h |-> "-", expired |-> 0, k |-> "-", parts |-> {},
             s |-> "-"]
       [] OTHER ->
-           [kind |-> t.kind, o |-> "-", p |-> "-", to |-> "-", slot |-> "-", units |-> {},
+           [kind |-> t.kind, o |-> "-", p |-> "-", to |-> "-", places |-> {}, units |-> {},
             writes |-> {}, h |-> t.h, expired |-> IF t.expired THEN 1 ELSE 0, k |-> t.k,
             \* The host parts of the group a prefetch writes for, and its session.
             parts |-> IF t.kind = "prefetch" THEN GroupParts[t.to] ELSE {},
@@ -125,7 +126,7 @@ Matches(st) ==
     /\ st.commits =
          {[o |-> d.o, p |-> d.p, u |-> CHOOSE b \in d.units : TRUE, k |-> d.k, after |-> Pending(d.after)] :
             d \in Waiting("commit")}
-    /\ st.transfers = {[o |-> d.o, to |-> d.to, after |-> Pending(d.after)] : d \in Waiting("transfer")}
+    /\ st.lends = {[o |-> d.o, after |-> Pending(d.after)] : d \in Waiting("lend")}
     /\ st.replicates =
          {[o |-> d.o, p |-> d.p, to |-> d.to, u |-> CHOOSE b \in d.units : TRUE, after |-> Pending(d.after)] :
             d \in Waiting("replicate")}
@@ -225,9 +226,9 @@ Start(x) ==
             {[kind |-> "commit", units |-> {cm.u}, after |-> Stamp(cm.after), o |-> cm.o, p |-> cm.p,
               k |-> cm.k, c |-> 0, ok |-> FALSE, g |-> ogroup[cm.o], to |-> NONE] :
                cm \in st.commits}
-            \cup {[kind |-> "transfer", units |-> {}, after |-> Stamp(tr.after), o |-> tr.o, p |-> NONE,
-                   k |-> NONE, c |-> 0, ok |-> FALSE, g |-> NONE, to |-> tr.to] :
-                    tr \in st.transfers}
+            \cup {[kind |-> "lend", units |-> {}, after |-> Stamp(ln.after), o |-> ln.o, p |-> NONE,
+                   k |-> NONE, c |-> 0, ok |-> FALSE, g |-> NONE, to |-> NONE] :
+                    ln \in st.lends}
             \cup {[kind |-> "replicate", units |-> {rp.u}, after |-> Stamp(rp.after), o |-> rp.o,
                    p |-> rp.p, k |-> NONE, c |-> 0, ok |-> FALSE,
                    g |-> IF live(rp.o) THEN st.owners[rp.o].g ELSE NONE, to |-> rp.to] :
@@ -239,14 +240,14 @@ Start(x) ==
                    p |-> NONE, k |-> NONE, c |-> 0, ok |-> FALSE, g |-> NONE, to |-> NONE] :
                     rl \in st.releases}
        /\ tasks =
-              {CASE tl.kind = "transfer" ->
-                      [kind |-> "transfer", k |-> NONE, h |-> NONE,
-                       expired |-> FALSE, p |-> NONE, o |-> tl.o, to |-> tl.to, slot |-> tl.slot,
-                       held |-> TRUE, units |-> tl.units, writes |-> tl.writes]
+              {CASE tl.kind \in {"import", "lend", "borrow"} ->
+                      [kind |-> tl.kind, k |-> NONE, h |-> NONE,
+                       expired |-> FALSE, p |-> NONE, o |-> tl.o, to |-> NONE, held |-> TRUE,
+                       units |-> tl.units, writes |-> tl.writes, places |-> tl.places]
                  [] tl.kind = "replicate" ->
                       [kind |-> "replicate", k |-> NONE, h |-> NONE,
-                       expired |-> FALSE, p |-> tl.p, o |-> tl.o, to |-> tl.to, slot |-> NONE,
-                       held |-> TRUE, units |-> tl.units, writes |-> tl.writes]
+                       expired |-> FALSE, p |-> tl.p, o |-> tl.o, to |-> tl.to, held |-> TRUE,
+                       units |-> tl.units, writes |-> tl.writes, places |-> {}]
                  [] OTHER ->
                       [kind |-> tl.kind, k |-> tl.k, h |-> tl.h,
                        expired |-> tl.expired = 1, p |-> NONE, o |-> NONE,
@@ -254,8 +255,7 @@ Start(x) ==
                        to |-> IF tl.kind = "prefetch"
                               THEN CHOOSE g \in Groups : GroupEpoch[g] = tl.s /\ GroupParts[g] = tl.parts
                               ELSE NONE,
-                       slot |-> NONE,
-                       held |-> TRUE, units |-> {}, writes |-> {}] :
+                       held |-> TRUE, units |-> {}, writes |-> {}, places |-> {}] :
                  tl \in st.tasks}
        /\ vis = [y \in Keys |-> IF keyed(y) = {} THEN [d |-> NONE, h |-> NONE]
                                 ELSE LET e == CHOOSE f \in keyed(y) : TRUE
@@ -286,7 +286,6 @@ Asked(q) ==
         /\ r.kind # "finish" => r.o = q.o
         /\ r.kind = "release" => r.ps = q.ps
         /\ r.kind = "commit" => r.p = q.p /\ r.k = q.k
-        /\ r.kind = "transfer" => r.to = q.to
         /\ r.kind = "replicate" => r.p = q.p /\ r.to = q.to
         /\ r.kind = "finish" => r.ok = q.ok
 
@@ -310,10 +309,9 @@ ArriveAs(q) ==
               \/ \E p \in Positions \cap {q.p}, k \in Keys \cap {q.k} :
                    requests' = {[Request("commit", e, o, {}, p, k, 0, FALSE)
                                    EXCEPT !.after = after]}
-              \/ \E g \in Groups \cap {q.to} :
-                   /\ Transfers
-                   /\ requests' = {[Request("transfer", e, o, {}, NONE, NONE, 0, FALSE)
-                                      EXCEPT !.after = after, !.to = g]}
+              \/ /\ Handoffs
+                 /\ requests' = {[Request("lend", e, o, {}, NONE, NONE, 0, FALSE)
+                                    EXCEPT !.after = after]}
               \/ \E p \in Positions \cap {q.p}, g \in Groups \cap {q.to} :
                    /\ Crosses
                    /\ requests' = {[Request("replicate", e, o, {}, p, NONE, 0, FALSE)
@@ -380,13 +378,21 @@ Step(in) ==
     \/ "Advance" \in in.acts /\ \E g \in Groups : Advance(g) /\ launched'[g] <= in.completed[g]
                                                  /\ UNCHANGED rare
     \/ \E r \in requests :
-         (TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+         (TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeLend(r)
           \/ TakeReplicate(r))
          /\ UNCHANGED rare
     \/ \E d \in deferred :
-         (ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d) \/ ReplicateDue(d))
+         (ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ LendDue(d) \/ ReplicateDue(d))
          /\ UNCHANGED rare
-    \/ "TransferEnd" \in in.acts /\ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) /\ UNCHANGED rare
+    \* An import of the positions the input names, from the lend it names
+    \* (`in.lender`, NONE for one of another host's pool).
+    \/ "Import" \in in.acts /\ \E o \in in.os : Import(o, in.ps, in.lender) /\ UNCHANGED rare
+    \/ "Borrow" \in in.acts /\ \E o \in in.os : Borrow(o) /\ UNCHANGED rare
+    \* A lend ends, given back or its lease passed; a borrow is returned.
+    \/ "GiveBack" \in in.acts /\ \E t \in tasks : t.o \in in.os /\ GiveBack(t) /\ UNCHANGED rare
+    \/ "ReleaseBorrow" \in in.acts /\ \E t \in tasks : t.o \in in.os /\ ReleaseBorrow(t)
+                                     /\ UNCHANGED rare
+    \/ "ImportEnd" \in in.acts /\ \E t \in tasks, ok \in BOOLEAN : ImportEnd(t, ok) /\ UNCHANGED rare
     \/ "ReplicateEnd" \in in.acts /\ \E t \in tasks, ok \in BOOLEAN : ReplicateEnd(t, ok)
                                     /\ UNCHANGED rare
     \/ "CommitUpdate" \in in.acts /\ \E e \in Epochs : CommitUpdate(e) /\ UNCHANGED rare

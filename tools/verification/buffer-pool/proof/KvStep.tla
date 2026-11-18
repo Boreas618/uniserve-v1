@@ -19,12 +19,12 @@ LEMMA Stutter ==
                     alloc, sharedKey, remote, lost, bad>>
     BY DEF vars, pool, plane, rare
   <1> QED
-    BY <1>1, TransfersFrame, TypeInvFrame, FreeCleanFrame, NoLeakFrame, OutsideFrame,
+    BY <1>1, HandoffTasksFrame, TypeInvFrame, FreeCleanFrame, NoLeakFrame, OutsideFrame,
        RegionsFrame, AllocOwnerFrame, SharedIffFrame, SharedCachedFrame, CacheSharedFrame,
        TablesFrame, OwnersOkFrame, DeferredOkFrame, CopiesOkFrame, TasksOkFrame,
-       MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, RequestsOkFrame,
+       LendingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, RequestsOkFrame,
        BatchesOkFrame, CrossingsOkFrame, TrialVisibilityFrame, CopiesPlacedFrame,
-       CrossingsPlacedFrame, NoBadFrame DEF IndInv
+       CrossingsPlacedFrame, ImportsPlacedFrame, NoBadFrame DEF IndInv
 
 (* Every step of Serving is a step of one of the groups 1 to 8 and 11;   *)
 (* the action of the hazard H14 is not a step of the design.              *)
@@ -58,36 +58,40 @@ LEMMA ServingStep ==
              \/ \E c \in copies, ok \in BOOLEAN : ExecFinish(c, ok)
     BY <1>7, Step5
   <1>8. CASE \E r \in requests :
-               \/ TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+               \/ TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeLend(r)
                \/ TakeReplicate(r)
     <2>1. CASE \E r \in requests :
-                 TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+                 TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeLend(r)
       BY <2>1, Step6
     <2>2. CASE \E r \in requests : TakeReplicate(r)
       BY <2>2, Step11
     <2> QED
       BY <1>8, <2>1, <2>2
   <1>9. CASE \E d \in deferred :
-               ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d) \/ ReplicateDue(d)
+               ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ LendDue(d) \/ ReplicateDue(d)
     <2>1. CASE \E d \in deferred : ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d)
       BY <2>1, Step7
-    <2>2. CASE \E d \in deferred : TransferDue(d)
+    <2>2. CASE \E d \in deferred : LendDue(d)
       BY <2>2, Step8
     <2>3. CASE \E d \in deferred : ReplicateDue(d)
       BY <2>3, Step11
     <2> QED
       BY <1>9, <2>1, <2>2, <2>3
-  <1>10. CASE \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) \/ ReplicateEnd(t, ok)
-    <2>1. CASE \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok)
+  <1>10. CASE \E t \in tasks, ok \in BOOLEAN : ImportEnd(t, ok) \/ ReplicateEnd(t, ok)
+    <2>1. CASE \E t \in tasks, ok \in BOOLEAN : ImportEnd(t, ok)
       BY <2>1, Step8
     <2>2. CASE \E t \in tasks, ok \in BOOLEAN : ReplicateEnd(t, ok)
       BY <2>2, Step11
     <2> QED
       BY <1>10, <2>1, <2>2
+  <1>12. CASE \/ \E o \in Owners, ps \in SUBSET Positions, l \in Owners \cup {NONE} : Import(o, ps, l)
+              \/ \E o \in Owners : Borrow(o)
+              \/ \E t \in tasks : GiveBack(t) \/ ReleaseBorrow(t)
+    BY <1>12, Step8
   <1>11. ~\E g \in Groups, o \in Owners, p \in Positions : MapEarly(g, o, p)
     BY DEF MapEarly
   <1> QED
-    BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11 DEF Serving
+    BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12 DEF Serving
 
 THEOREM Step == IndInv /\ [Next]_vars => IndInv'
   <1> SUFFICES ASSUME IndInv, [Next]_vars PROVE IndInv'

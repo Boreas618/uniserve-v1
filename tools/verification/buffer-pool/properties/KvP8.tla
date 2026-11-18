@@ -20,5 +20,11 @@ CrossingsPlaced ==
             /\ Mem(ogroup[t.o]) \in valid[u]
             /\ \A b \in inflight : \A w \in b.writes : w[2] # u
 
-P8 == CopiesPlaced /\ CrossingsPlaced
+(* An import, and another host's import through a borrow, reads the blocks  *)
+(* of a lend, which no batch in flight writes.                              *)
+ImportsPlaced ==
+    \A t \in tasks : t.kind \in {"import", "borrow"} =>
+        \A u \in t.units \ t.writes : \A b \in inflight : \A w \in b.writes : w[2] # u
+
+P8 == CopiesPlaced /\ CrossingsPlaced /\ ImportsPlaced
 =============================================================================

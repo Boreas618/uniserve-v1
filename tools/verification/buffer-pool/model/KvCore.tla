@@ -12,6 +12,8 @@
 (* entries, the cache, deferred work, copies and tasks. Each handler is one atomic       *)
 (* action, because the buffer pool is one value changed through one        *)
 (* thread; what is not atomic is three actions: taken, due, finished.      *)
+(* A handoff between replicas is a lend of one owner's blocks and an       *)
+(* import of them into another owner's, of this pool or of another host's. *)
 (*                                                                         *)
 (* Each rule R1 to R11 of §9 is one guard, in force when its name is in    *)
 (* `Rules`; a configuration that leaves one out is that rule's mutation.   *)
@@ -79,8 +81,10 @@ CONSTANTS
     \* @type: Str -> Set(Str);
     GroupParts,  \* [Groups -> SUBSET HostParts]: the host parts a group's ranks copy with
     \* @type: Str -> Set(Str);
-    Readers      \* [Groups -> SUBSET Groups]: the groups that read the class an owner of
+    Readers,     \* [Groups -> SUBSET Groups]: the groups that read the class an owner of
                  \* the group holds, in a memory of their own
+    \* @type: Bool;
+    Handoffs     \* whether the control plane lends owners and imports blocks from lends
 
 VARIABLES
     \* The buffer pool.
@@ -99,14 +103,16 @@ VARIABLES
     \* @type: Str -> Str;
     hcache,      \* [Keys -> HostUnits \cup {NONE}]: the host block cached under a key
     \* @type: Set({kind: Str, units: Set(Str), after: Str -> Int, o: Str, p: Str, k: Str, c: Int, ok: Bool, g: Str, to: Str});
-    deferred,    \* work that waits for stamps: releases, commits and the ends of copies
+    deferred,    \* work that waits for stamps: releases, commits, lends, crossings and the
+                 \* ends of copies
     \* @type: Set({id: Int, kind: Str, o: Str, p: Str, k: Str, g: Str, read: Str, write: Str, fill: Bool, parts: Set(Str), seq: Int, done: Bool, stopped: Bool});
     copies,      \* the copies in flight, each holding the block it reads and the one it writes
     \* @type: Int;
     ncopy,       \* the copies ever asked for
-    \* @type: Set({kind: Str, k: Str, h: Str, expired: Bool, p: Str, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)});
-    tasks,       \* the transfers, crossings, prefetches and remote puts in flight, each
-                 \* holding the blocks it copies
+    \* @type: Set({kind: Str, k: Str, h: Str, expired: Bool, p: Str, o: Str, to: Str, held: Bool, units: Set(Str), writes: Set(Str), places: Set(<<Str, Str>>)});
+    tasks,       \* the imports, crossings, prefetches and remote puts in flight, each
+                 \* holding the blocks it copies, and the lends and the borrows of lends
+                 \* that stand
     \* @type: Str -> Set(Str);
     valid,       \* [Units \cup HostUnits -> SUBSET (memories \cup HostParts)]: the memories
                  \* that hold a device block's content, and the host parts that hold a
@@ -157,7 +163,7 @@ vars == <<pool, plane, alloc, sharedKey, rare>>
 \* @typeAlias: req = {kind: Str, e: Str, o: Str, ps: Set(Str), p: Str, k: Str, c: Int, ok: Bool, to: Str, after: Str -> Int, by: Set(Str), sg: Set(Str)};
 \* @typeAlias: def = {kind: Str, units: Set(Str), after: Str -> Int, o: Str, p: Str, k: Str, c: Int, ok: Bool, g: Str, to: Str};
 \* @typeAlias: copy = {id: Int, kind: Str, o: Str, p: Str, k: Str, g: Str, read: Str, write: Str, fill: Bool, parts: Set(Str), seq: Int, done: Bool, stopped: Bool};
-\* @typeAlias: task = {kind: Str, k: Str, h: Str, expired: Bool, p: Str, o: Str, to: Str, slot: Str, held: Bool, units: Set(Str), writes: Set(Str)};
+\* @typeAlias: task = {kind: Str, k: Str, h: Str, expired: Bool, p: Str, o: Str, to: Str, held: Bool, units: Set(Str), writes: Set(Str), places: Set(<<Str, Str>>)};
 \* @typeAlias: batch = {g: Str, seq: Int, reads: Set(<<Str, Str>>), writes: Set(<<Str, Str>>), cr: Set(Str), cw: Set(Str)};
 \* @typeAlias: hand = {g: Str, o: Str, p: Str, u: Str, w: Bool};
 KvAliases == TRUE
@@ -209,7 +215,7 @@ HeldIn(u, tbl, slt, cch, hch, dfr, cps, tsk) ==
     \/ \E k \in Keys : cch[k] = u \/ hch[k] = u
     \/ \E d \in dfr : u \in d.units
     \/ \E c \in cps : u = c.read \/ u = c.write
-    \/ \E t \in tsk : t.held /\ (u \in t.units \/ u = t.slot \/ u = t.h)
+    \/ \E t \in tsk : t.held /\ (u \in t.units \/ u = t.h)
 
 (* Every unit the given holders hold: a unit is in this set exactly when   *)
 (* `HeldIn` holds of it (KvFrame's `HeldUnitsIn`).                         *)
@@ -218,7 +224,7 @@ HeldUnits(tbl, slt, cch, hch, dfr, cps, tsk) ==
     (UNION {{tbl[o][p].u : p \in Positions} : o \in Owners}) \cup {slt[o] : o \in Owners}
         \cup {cch[k] : k \in Keys} \cup {hch[k] : k \in Keys}
         \cup (UNION {d.units : d \in dfr}) \cup (UNION {{c.read, c.write} : c \in cps})
-        \cup (UNION {t.units \cup {t.slot, t.h} : t \in {x \in tsk : x.held}})
+        \cup (UNION {t.units \cup {t.h} : t \in {x \in tsk : x.held}})
 
 (* R2: runs return to a region only when the last reference is dropped.    *)
 (* What is still held is gathered once, not looked up per dropped unit: an *)
@@ -285,11 +291,15 @@ MadeBy(e) == IF trial[e] = "no" THEN NONE ELSE e
 (* Whether a copy writes for position p of owner o.                        *)
 CopyFor(o, p) == \E c \in copies : c.o = o /\ c.p = p
 
-(* Whether owner o's transfer waits or runs. R1 refuses every request that *)
-(* names such an owner but its `Detach`.                                   *)
-Moving(o) ==
-    \/ \E t \in tasks : t.kind = "transfer" /\ t.o = o
-    \/ \E d \in deferred : d.kind = "transfer" /\ d.o = o
+(* Whether owner o's lend waits for its stamps or stands.                  *)
+Lending(o) ==
+    \/ \E t \in tasks : t.kind = "lend" /\ t.o = o
+    \/ \E d \in deferred : d.kind = "lend" /\ d.o = o
+(* Whether owner o's import runs.                                          *)
+Importing(o) == \E t \in tasks : t.kind = "import" /\ t.o = o
+(* R1 refuses every request that names an owner whose lend waits or stands *)
+(* or whose import runs, but its `Detach`.                                 *)
+Moving(o) == Lending(o) \/ Importing(o)
 
 (* Whether stamped request r takes away the entry completion h fills.      *)
 \* @type: ($req, $hand) => Bool;
@@ -297,7 +307,7 @@ Names(r, h) ==
     /\ r.e = OwnerEpoch[h.o]
     /\ r.o = h.o
     /\ CASE r.kind = "release" -> h.p \in r.ps
-         [] r.kind \in {"detach", "transfer"} -> TRUE
+         [] r.kind \in {"detach", "lend"} -> TRUE
          [] r.kind \in {"commit", "replicate"} -> h.p = r.p
          [] OTHER -> FALSE
 
@@ -315,6 +325,21 @@ Give(h) ==
                    THEN dbt
                    ELSE [dbt EXCEPT ![h.g][h.o][h.p] = [u |-> h.u, w |-> h.w]]
     ELSE /\ handoff' = handoff \cup {h}
+         /\ dbt' = dbt
+
+(* `Give` of one completion that states several entries: each is handed on *)
+(* as `Give` hands one on, or kept to be handed on later.                  *)
+\* @type: (Set($hand)) => Bool;
+GiveAll(hs) ==
+    IF Eager
+    THEN /\ handoff' = handoff
+         /\ dbt' = [g \in Groups |-> [o \in Owners |-> [p \in Rows |->
+                      IF \E h \in hs : /\ h.g = g /\ h.o = o /\ h.p = p
+                                      /\ ~\E r \in requests : Names(r, h)
+                      THEN LET h == CHOOSE x \in hs : x.g = g /\ x.o = o /\ x.p = p
+                           IN [u |-> h.u, w |-> h.w]
+                      ELSE dbt[g][o][p]]]]
+    ELSE /\ handoff' = handoff \cup hs
          /\ dbt' = dbt
 
 -----------------------------------------------------------------------------
@@ -398,6 +423,13 @@ Copy(kind, o, p, k, g, read, write) ==
      done |-> FALSE,      \* whether its executor returned its `Finish`
      stopped |-> FALSE]   \* whether the scheduler gave it up
 
+(* A task, or a lend or a borrow, of the given kind; the fields of a kind's *)
+(* own are set where it starts.                                            *)
+\* @type: (Str, Str, Str) => $task;
+Task(kind, k, h) ==
+    [kind |-> kind, k |-> k, h |-> h, expired |-> FALSE, p |-> NONE,
+     o |-> NONE, to |-> NONE, held |-> TRUE, units |-> {}, writes |-> {}, places |-> {}]
+
 (* R5: a clone is a new private block that the executor fills from the     *)
 (* cached one. Without the rule the cached block itself becomes private.   *)
 Clone(o, p, k) ==
@@ -442,10 +474,10 @@ Load(o, p, k) ==
            \* The owner can pin the key's device block instead.
            pins == cache[k] # NONE /\ here \in valid[cache[k]] /\ VisibleDevice(k, o)
        IN IF fills
-          THEN \* Nothing else fills that memory: no other load, no transfer.
+          THEN \* Nothing else fills that memory: no other load, no crossing.
                /\ ~\E c \in copies : c.write = cache[k] /\ Mem(c.g) = here
                /\ ~\E t \in tasks :
-                    t.kind \in {"transfer", "replicate"} /\ Mem(t.to) = here /\ cache[k] \in t.writes
+                    t.kind = "replicate" /\ Mem(t.to) = here /\ cache[k] \in t.writes
                /\ copies' = copies \cup
                     {[Copy("load", o, p, k, ogroup[o], hcache[k], cache[k]) EXCEPT !.fill = TRUE]}
                /\ UNCHANGED <<free, cache, alloc, sharedKey>>
@@ -550,10 +582,9 @@ Issue ==
               \/ requests' = requests \cup {Issued(Request("detach", e, o, {}, NONE, NONE, 0, FALSE))}
               \/ \E p \in Positions, k \in Keys :
                    requests' = requests \cup {Issued(Request("commit", e, o, {}, p, k, 0, FALSE))}
-              \/ \E g \in Groups :
-                   requests' = requests \cup
-                     {Issued([Request("transfer", e, o, {}, NONE, NONE, 0, FALSE)
-                                EXCEPT !.to = g])}
+              \/ /\ Handoffs
+                 /\ requests' = requests \cup
+                      {Issued(Request("lend", e, o, {}, NONE, NONE, 0, FALSE))}
               \/ \E p \in Positions, g \in Groups :
                    /\ Crosses
                    /\ requests' = requests \cup
@@ -571,9 +602,8 @@ Issue ==
 StampGroups(r) == r.sg
 
 (* The executor applies r: it removes the entries of a release, a detach   *)
-(* or a transfer, marks the entry of a commit read-only, and attaches a    *)
-(* copy that is                                                            *)
-(* given up to no further batch. Then it stamps r with the last batch it   *)
+(* or a lend, marks the entry of a commit or a crossing read-only, and     *)
+(* attaches a copy that is given up to no further batch. Then it stamps r with the last batch it   *)
 (* launched. A give-up for a copy whose own `Finish` it has returned is    *)
 (* discarded.                                                              *)
 \* @type: (Str, $req) => Bool;
@@ -592,7 +622,7 @@ ExecStamp(g, r) ==
             /\ dbt' = IF "H8" \in Hazards THEN dbt ELSE [dbt EXCEPT ![g][r.o] =
                         [p \in Rows |->
                            CASE r.kind = "release" /\ p \in r.ps -> NoEntry
-                             [] r.kind \in {"detach", "transfer"} -> NoEntry
+                             [] r.kind \in {"detach", "lend"} -> NoEntry
                              [] r.kind \in {"commit", "replicate"} /\ p = r.p ->
                                   [u |-> dbt[g][r.o][p].u, w |-> FALSE]
                              [] OTHER -> dbt[g][r.o][p]]]
@@ -713,14 +743,15 @@ TakeDetach(r) ==
        THEN UNCHANGED <<pool, alloc, sharedKey>>
        ELSE \* R9: a block a task holds is released only on the task's
             \* completion. Without the rule the detach releases what the
-            \* owner's task holds, the task's slot row included, which is the
-            \* hazard H1 of the system as built. Hazard H5: the detach also
-            \* lets go of what the owner's copies hold while they run.
-            LET mine == {t \in tasks : t.kind \in {"transfer", "replicate"} /\ t.o = r.o /\ t.held}
+            \* owner's task holds, the blocks its import writes included, which
+            \* is the hazard H1 of the system as built. Hazard H5: the detach also
+            \* lets go of what the owner's copies hold while they run. The
+            \* owner's lend, which holds nothing, ends with it.
+            LET mine == {t \in tasks : t.kind \in {"import", "replicate"} /\ t.o = r.o /\ t.held}
                 keeps == On("R9") /\ "H1" \notin Hazards
-                tsk == IF keeps THEN tasks
-                       ELSE {IF t \in mine THEN [t EXCEPT !.held = FALSE] ELSE t : t \in tasks}
-                extra == IF keeps THEN {} ELSE {t.slot : t \in mine} \ {NONE}
+                tsk == {IF t \in mine /\ ~keeps THEN [t EXCEPT !.held = FALSE] ELSE t :
+                          t \in {x \in tasks : ~(x.kind = "lend" /\ x.o = r.o)}}
+                extra == IF keeps THEN {} ELSE UNION {t.units : t \in mine}
                 cps == IF "H5" \in Hazards THEN {c \in copies : c.o # r.o} ELSE copies
                 let == UNION {{c.read, c.write} : c \in copies \ cps}
             IN /\ tasks' = tsk
@@ -775,24 +806,23 @@ TakeFinish(r) ==
     /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, tasks, trial, member, valid, vis, dbt, launched,
                    inflight, handoff, alloc, sharedKey>>
 
-(* A transfer waits for its stamps: until then the source group's batches  *)
-(* may still write the owner's blocks.                                     *)
+(* A lend waits for its stamps: until then the owner's group's batches    *)
+(* may still write the owner's blocks. R1: an owner that does not move,    *)
+(* that no copy writes for and whose crossing neither waits nor runs.      *)
 \* @type: ($req) => Bool;
-TakeTransfer(r) ==
-    /\ r \in requests /\ r.kind = "transfer" /\ Submittable(r)
+TakeLend(r) ==
+    /\ r \in requests /\ r.kind = "lend" /\ Submittable(r)
     /\ requests' = requests \ {r}
     /\ IF ~(/\ ostate[r.o] = "live"
             /\ On("R1") => /\ OwnSession(r.o, r.e)
-                           /\ GroupEpoch[r.to] = r.e
-                           /\ r.to # ogroup[r.o]
                            /\ ~Moving(r.o)
                            /\ ~Replicating(r.o)
                            /\ ~\E c \in copies : c.o = r.o)
        THEN UNCHANGED deferred
        ELSE deferred' = deferred \cup
-              {[kind |-> "transfer", units |-> {}, after |-> r.after,
+              {[kind |-> "lend", units |-> {}, after |-> r.after,
                 o |-> r.o, p |-> NONE, k |-> NONE, c |-> 0, ok |-> FALSE,
-                g |-> NONE, to |-> r.to]}
+                g |-> NONE, to |-> NONE]}
     /\ handoff' = Kept(r)
     /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, tasks, trial, member, valid, vis,
                    dbt, launched, inflight, alloc, sharedKey>>
@@ -927,82 +957,122 @@ FinishDue(d) ==
                            /\ UNCHANGED <<table, cache, dbt, handoff>>
     /\ UNCHANGED <<ostate, ogroup, oslot, ncopy, tasks, trial, member, launched, inflight, requests>>
 
-(* A transfer comes due: a task starts that copies into the target group's *)
-(* memory the owner's blocks that are not valid there. It holds every      *)
-(* block of the owner and a slot row of the target group.                  *)
-(* Without a free row there the transfer fails and nothing changes.        *)
+(* The lend takes effect (R3: once `completed` of every stamping group     *)
+(* reached its stamp, so no batch writes the owner's blocks any more): it   *)
+(* stands, and an import may read the owner's blocks until it ends. An      *)
+(* owner detached meanwhile is lent no more.                                *)
 \* @type: ($def) => Bool;
-TransferDue(d) ==
-    /\ d \in deferred /\ d.kind = "transfer"
+LendDue(d) ==
+    /\ d \in deferred /\ d.kind = "lend"
     /\ On("R3") => Reached(d.after)
-    /\ LET units == {table[d.o][p].u : p \in Positions} \ {NONE}
-           rows == {s \in free \cap Slots : SlotGroup[s] = d.to}
-       IN \* It waits while a load or another owner's transfer fills the target
-          \* group's memory of a block it holds: when that has ended the block
-          \* is valid there, or is copied by this transfer alone.
-          /\ ~\E c \in copies : c.fill /\ Mem(c.g) = Mem(d.to) /\ c.write \in units
-          /\ ~\E t \in tasks :
-               t.kind \in {"transfer", "replicate"} /\ Mem(t.to) = Mem(d.to) /\ t.writes \cap units # {}
-          /\ deferred' = deferred \ {d}
-          /\ IF ostate[d.o] # "live" \/ rows = {}
-             THEN UNCHANGED <<free, tasks, alloc>>
-             ELSE \E s \in rows :
-                    /\ free' = free \ {s}
-                    /\ alloc' = [alloc EXCEPT ![s] = d.o]
-                    /\ tasks' = tasks \cup
-                         {[kind |-> "transfer", k |-> NONE, h |-> NONE,
-                            expired |-> FALSE, p |-> NONE,
-                           o |-> d.o, to |-> d.to, slot |-> s, held |-> TRUE,
-                           units |-> units \cup {oslot[d.o]},
-                           writes |-> {u \in units : Mem(d.to) \notin valid[u]}]}
-    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, valid, vis, trial, member,
-                   plane, sharedKey>>
+    /\ deferred' = deferred \ {d}
+    /\ IF ostate[d.o] = "live"
+       THEN tasks' = tasks \cup {[Task("lend", NONE, NONE) EXCEPT !.o = d.o]}
+       ELSE UNCHANGED tasks
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, valid, vis, trial,
+                   member, plane, alloc, sharedKey>>
 
-(* A5: a task's completion is produced only after it stopped touching its  *)
-(* blocks. It may come at any time, as a success or a failure.             *)
+(* A lend ends: its importer returns it, or its lease passes. The owner is *)
+(* released as a `Detach` releases it, every stamp being reached: what     *)
+(* nothing else holds is reclaimed at once, and an import's task or a      *)
+(* borrow keeps what it reads (R2).                                        *)
+\* @type: ($task) => Bool;
+GiveBack(t) ==
+    /\ t \in tasks /\ t.kind = "lend"
+    /\ LET o == t.o
+           tsk == tasks \ {t}
+           tbl == [table EXCEPT ![o] = [p \in Positions |-> Empty]]
+           slt == [oslot EXCEPT ![o] = NONE]
+       IN /\ tasks' = tsk
+          /\ table' = tbl
+          /\ oslot' = slt
+          /\ ostate' = [ostate EXCEPT ![o] = "gone"]
+          /\ DropWith(({table[o][p].u : p \in Positions} \cup {oslot[o]}) \ {NONE},
+                      tbl, slt, cache, hcache, deferred, copies, tsk)
+    /\ UNCHANGED <<ogroup, cache, hcache, deferred, copies, ncopy, valid, vis, trial, member, plane>>
+
+(* Another host's Storage Server borrows a lend for its import: it holds   *)
+(* the lent owner's blocks under its connection until it returns them or   *)
+(* the connection closes (R9).                                             *)
+Borrow(o) ==
+    /\ \E t \in tasks : t.kind = "lend" /\ t.o = o
+    /\ tasks' = tasks \cup
+         {[Task("borrow", NONE, NONE)
+             EXCEPT !.o = o, !.units = {table[o][p].u : p \in Positions} \ {NONE}]}
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
+                   member, valid, vis, plane, alloc, sharedKey>>
+
+(* The borrow ends: what nothing else holds is reclaimed.                  *)
+\* @type: ($task) => Bool;
+ReleaseBorrow(t) ==
+    /\ t \in tasks /\ t.kind = "borrow"
+    /\ tasks' = tasks \ {t}
+    /\ DropWith(t.units, table, oslot, cache, hcache, deferred, copies, tasks')
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, trial,
+                   member, valid, vis, plane>>
+
+(* `Import`: the blocks of owner o at the positions ps are new private     *)
+(* blocks that a task of the Transfer Server writes from the blocks at the *)
+(* same positions of the lend of owner l, a lend of this pool whose blocks *)
+(* the task holds (R9), or with l = NONE from a lend of another host's    *)
+(* pool, which that pool's server lends (`Borrow` there). A lend of this   *)
+(* pool must stand and hold every position, or the import fails at once.   *)
+(* R1: the positions are free and the owner takes no other request until   *)
+(* the task ends. All or none of the blocks are taken, each a free unit of *)
+(* the owner's region or, once the region has none free, an evictable one, *)
+(* which leaves the cache.                                                 *)
+Import(o, ps, l) ==
+    /\ Handoffs
+    /\ ostate[o] = "live"
+    /\ On("R1") => /\ ~Moving(o)
+                   /\ \A p \in ps : table[o][p] = Empty /\ ~CopyFor(o, p)
+    /\ l # NONE => /\ \E t \in tasks : t.kind = "lend" /\ t.o = l
+                   /\ \A p \in ps : table[l][p] # Empty
+    /\ \E w \in [ps -> RegionUnits(o)] :
+         LET taken == {w[p] : p \in ps}
+             reads == IF l = NONE THEN {} ELSE {table[l][p].u : p \in ps}
+         IN /\ \A p, q \in ps : p # q => w[p] # w[q]
+            /\ \/ taken \subseteq free /\ cache' = cache
+               \/ /\ free \cap RegionUnits(o) \subseteq taken
+                  /\ \A u \in taken \ free : EvictableFor(u, OwnerEpoch[o])
+                  /\ cache' = [k \in Keys |-> IF cache[k] \in taken THEN NONE ELSE cache[k]]
+            /\ free' = free \ taken
+            /\ alloc' = [u \in AllUnits |-> IF u \in taken THEN o ELSE alloc[u]]
+            /\ sharedKey' = [u \in AllUnits |-> IF u \in taken THEN NONE ELSE sharedKey[u]]
+            /\ tasks' = tasks \cup
+                 {[Task("import", NONE, NONE)
+                     EXCEPT !.o = o, !.units = reads \cup taken, !.writes = taken,
+                            !.places = {<<p, w[p]>> : p \in ps}]}
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, hcache, deferred, copies, ncopy, trial, member, valid,
+                   vis, plane>>
+
+(* A5: the import's task ends after it stopped touching its blocks. When   *)
+(* it copied every page and the owner is still there, the new blocks enter *)
+(* the owner's table, private and valid in its group's memory, and the     *)
+(* group's executor is handed them (`Imported`); otherwise they retire.    *)
+(* Either way the task lets go of what it read.                            *)
 \* @type: ($task, Bool) => Bool;
-TransferEnd(t, ok) ==
-    /\ t \in tasks /\ t.kind = "transfer"
+ImportEnd(t, ok) ==
+    /\ t \in tasks /\ t.kind = "import"
     /\ tasks' = tasks \ {t}
     /\ IF ok /\ ostate[t.o] = "live"
-       THEN \* The owner is attached to the target group with its new slot row;
-            \* the executor of that group is handed every entry of the owner.
-            /\ ogroup' = [ogroup EXCEPT ![t.o] = t.to]
-            /\ oslot' = [oslot EXCEPT ![t.o] = t.slot]
-            \* The target group's memory holds what the task copied. A private
-            \* block that no commit froze is written there from now on, so the
-            \* source group's memory of it is stale.
-            /\ valid' = [u \in DOMAIN valid |->
-                           IF u \notin t.writes THEN valid[u]
-                           ELSE IF alloc[u] = "shared"
-                                   \/ \E d \in deferred : d.kind = "commit" /\ u \in d.units
-                                THEN valid[u] \cup {Mem(t.to)}
-                                ELSE {Mem(t.to)}]
-            /\ DropWith(t.units, table, oslot', cache, hcache, deferred, copies, tasks')
-            \* A1: an entry a stamped request under way names is not handed on.
-            /\ LET entries ==
-                     {[g |-> t.to, o |-> t.o, p |-> p, u |-> table[t.o][p].u,
-                       w |-> /\ table[t.o][p].k = "private"
-                             /\ ~\E d \in deferred :
-                                   d.kind = "commit" /\ d.o = t.o /\ d.p = p] :
-                        p \in {q \in Positions : table[t.o][q] # Empty}}
-                     \cup {[g |-> t.to, o |-> t.o, p |-> SLOT, u |-> t.slot, w |-> TRUE]}
-                   given == {h \in entries : ~\E r \in requests : Names(r, h)}
-               IN IF Eager
-                  THEN /\ handoff' = handoff
-                       /\ dbt' = [dbt EXCEPT ![t.to][t.o] =
-                                    [p \in Rows |->
-                                       IF \E h \in given : h.p = p
-                                       THEN LET h == CHOOSE x \in given : x.p = p
-                                            IN [u |-> h.u, w |-> h.w]
-                                       ELSE NoEntry]]
-                  ELSE /\ handoff' = handoff \cup given
-                       /\ dbt' = dbt
-       ELSE \* Failed, or the owner was detached meanwhile: what the task held retires.
-            /\ DropWith(t.units \cup {t.slot}, table, oslot, cache, hcache, deferred, copies, tasks')
-            /\ UNCHANGED <<ogroup, oslot, valid, dbt, handoff>>
-    /\ UNCHANGED <<ostate, table, cache, hcache, deferred, copies, ncopy, vis, trial, member, launched,
-                   inflight, requests>>
+       THEN LET at(p) == CHOOSE x \in t.places : x[1] = p
+                tbl == [table EXCEPT ![t.o] =
+                          [p \in Positions |->
+                             IF \E x \in t.places : x[1] = p THEN Private(at(p)[2])
+                             ELSE table[t.o][p]]]
+            IN /\ table' = tbl
+               /\ valid' = [u \in DOMAIN valid |->
+                              IF u \in t.writes THEN {Mem(ogroup[t.o])} ELSE valid[u]]
+               /\ DropWith(t.units, tbl, oslot, cache, hcache, deferred, copies, tasks')
+               \* A1: an entry a stamped request under way names is not handed on.
+               /\ GiveAll({[g |-> ogroup[t.o], o |-> t.o, p |-> x[1], u |-> x[2], w |-> TRUE] :
+                              x \in t.places})
+       ELSE \* Failed, or the owner was detached meanwhile: its blocks retire.
+            /\ DropWith(t.units, table, oslot, cache, hcache, deferred, copies, tasks')
+            /\ UNCHANGED <<table, valid, dbt, handoff>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, cache, hcache, deferred, copies, ncopy, vis, trial, member,
+                   launched, inflight, requests>>
 
 (* A crossing (`Replicate`): the block at an owner's position reaches the  *)
 (* memory of a group that reads the owner's class. It is taken holding the *)
@@ -1064,14 +1134,14 @@ ReplicateDue(d) ==
            there == On("R5") /\ Mem(d.to) \in valid[u]
        IN /\ ~\E c \in copies : c.fill /\ c.write = u /\ Mem(c.g) = Mem(d.to)
           /\ ~\E t \in tasks :
-               t.kind \in {"transfer", "replicate"} /\ Mem(t.to) = Mem(d.to) /\ u \in t.writes
+               t.kind = "replicate" /\ Mem(t.to) = Mem(d.to) /\ u \in t.writes
           /\ deferred' = deferred \ {d}
           /\ IF held /\ ~there
              THEN /\ tasks' = tasks \cup
                        {[kind |-> "replicate", k |-> NONE, h |-> NONE,
-                          expired |-> FALSE, p |-> d.p,
-                         o |-> d.o, to |-> d.to, slot |-> NONE, held |-> TRUE,
-                         units |-> {u}, writes |-> {u}]}
+                         expired |-> FALSE, p |-> d.p,
+                         o |-> d.o, to |-> d.to, held |-> TRUE,
+                         units |-> {u}, writes |-> {u}, places |-> {}]}
                   /\ UNCHANGED <<free, alloc, sharedKey, dbt, handoff>>
              ELSE /\ Drop(d.units, table, oslot, cache, hcache, deferred', copies)
                   /\ UNCHANGED tasks
@@ -1113,11 +1183,6 @@ MapEarly(g, o, p) ==
 
 (* The prefetches and remote stores in flight.                             *)
 TierTasks == {t \in tasks : t.kind \in {"prefetch", "put"}}
-
-\* @type: (Str, Str, Str) => $task;
-Task(kind, k, h) ==
-    [kind |-> kind, k |-> k, h |-> h, expired |-> FALSE, p |-> NONE,
-     o |-> NONE, to |-> NONE, slot |-> NONE, held |-> TRUE, units |-> {}, writes |-> {}]
 
 (* `Prefetch`: a task brings a key into a new host block from the remote   *)
 (* store, on the host parts of the group whose admission asked for it      *)
@@ -1214,9 +1279,10 @@ StoreOffered(k) ==
 
 (* A7: an engine whose processes have exited runs no batch. The buffer     *)
 (* pool sees them exit: its batches and copies are over, the copies as     *)
-(* failed; every stamp of its groups counts as reached; its commits and    *)
-(* transfers that waited are dropped; its owners are detached. What it     *)
-(* committed stays cached, and what its tasks hold stays held (R9).        *)
+(* failed; every stamp of its groups counts as reached; its commits, lends *)
+(* and crossings that waited are dropped; its owners are detached and      *)
+(* their lends end. What it committed stays cached, and what its tasks and *)
+(* the borrows of its lends hold stays held (R9).                          *)
 Lose(e) ==
     /\ e \in Losable \ lost
     /\ lost' = lost \cup {e}
@@ -1229,7 +1295,8 @@ Lose(e) ==
            cps == {c \in copies : ~mine(c.g)}
            dfr == {d \in deferred :
                      /\ ~(d.kind = "finish" /\ \E c \in copies \ cps : c.id = d.c)
-                     /\ ~(d.kind \in {"commit", "transfer", "replicate"} /\ OwnerEpoch[d.o] = e)}
+                     /\ ~(d.kind \in {"commit", "lend", "replicate"} /\ OwnerEpoch[d.o] = e)}
+           tsk == {t \in tasks : ~(t.kind = "lend" /\ OwnerEpoch[t.o] = e)}
            tbl == [o \in Owners |-> IF goes(o) THEN [p \in Positions |-> Empty] ELSE table[o]]
            slt == [o \in Owners |-> IF goes(o) THEN NONE ELSE oslot[o]]
            dropped == (UNION {{table[o][p].u : p \in Positions} \cup {oslot[o]} : o \in gone})
@@ -1245,8 +1312,9 @@ Lose(e) ==
           /\ table' = tbl
           /\ oslot' = slt
           /\ ostate' = [o \in Owners |-> IF goes(o) THEN "gone" ELSE ostate[o]]
-          /\ DropWith(dropped \ {NONE}, tbl, slt, cache, hcache, dfr, cps, tasks)
-    /\ UNCHANGED <<ogroup, cache, hcache, ncopy, tasks, trial, member, valid, vis, launched,
+          /\ tasks' = tsk
+          /\ DropWith(dropped \ {NONE}, tbl, slt, cache, hcache, dfr, cps, tsk)
+    /\ UNCHANGED <<ogroup, cache, hcache, ncopy, trial, member, valid, vis, launched,
                    remote, bad>>
 
 (* `Resize`, a shrink: a free unit leaves its region. A device unit's      *)
@@ -1337,11 +1405,14 @@ Serving ==
     \/ \E b \in inflight : EndBatch(b)
     \/ \E c \in copies, ok \in BOOLEAN : ExecFinish(c, ok)
     \/ \E r \in requests :
-         TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+         TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeLend(r)
            \/ TakeReplicate(r)
     \/ \E d \in deferred :
-         ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d) \/ ReplicateDue(d)
-    \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) \/ ReplicateEnd(t, ok)
+         ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ LendDue(d) \/ ReplicateDue(d)
+    \/ \E o \in Owners, ps \in SUBSET Positions, l \in Owners \cup {NONE} : Import(o, ps, l)
+    \/ \E o \in Owners : Borrow(o)
+    \/ \E t \in tasks : GiveBack(t) \/ ReleaseBorrow(t)
+    \/ \E t \in tasks, ok \in BOOLEAN : ImportEnd(t, ok) \/ ReplicateEnd(t, ok)
     \/ \E g \in Groups, o \in Owners, p \in Positions : MapEarly(g, o, p)
     \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
     \/ \E u \in AllUnits : Shrink(u) \/ Grow(u)

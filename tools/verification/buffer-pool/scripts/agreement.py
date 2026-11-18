@@ -29,7 +29,7 @@ import sys
 NAMES = {
     "core": {"u1": "0:1", "u2": "0:2", "sa": "1:1", "sb": "1:2"},
     "copies": {"u1": "0:1", "u2": "0:2", "sa": "1:1", "sb": "1:2", "h1": "2:0"},
-    "transfer": {"u1": "0:1", "sa": "1:1", "sb": "1:2", "sc": "2:1", "sd": "2:2"},
+    "handoff": {"u1": "0:1", "u2": "0:2", "sa": "1:1", "sc": "2:1"},
     "tiers": {"u1": "0:1", "sa": "1:1", "h1": "2:0"},
     "cross": {"u1": "0:1", "sa": "1:1", "sc": "2:1"},
     "parts": {"u1": "0:1", "sa": "1:1", "sc": "2:1", "h1": "3:0"},
@@ -42,7 +42,7 @@ NAMES = {
 MEMORIES = {
     "core": {"ga": "m0", "hp": "m1"},
     "copies": {"ga": "m0", "hp": "m1"},
-    "transfer": {"ga": "m0", "gb": "m1", "hp": "m2"},
+    "handoff": {"ga": "m0", "gb": "m1", "hp": "m2"},
     "tiers": {"ga": "m0", "hp": "m1"},
     "cross": {"ga": "m0", "gb": "m1", "hp": "m2"},
     "parts": {"ga": "m0", "gb": "m1", "pa": "m2", "pb": "m3"},
@@ -51,7 +51,7 @@ MEMORIES = {
 # The host parts each group's ranks copy with in each shape (the model's
 # `GroupParts`): the one part in all but `parts`.
 GROUP_PARTS = {shape: {"ga": ["hp"], "gb": ["hp"]}
-               for shape in ("core", "copies", "transfer", "tiers", "cross", "trial")}
+               for shape in ("core", "copies", "handoff", "tiers", "cross", "trial")}
 GROUP_PARTS["parts"] = {"ga": ["pa"], "gb": ["pa", "pb"]}
 # The enumeration's session is of the epoch 1 (the model's `e1`), its groups
 # and owners named under it; in `trial` the target's session is of the epoch
@@ -252,8 +252,8 @@ def project(state, shape):
         elif kind == "commit":
             (block,) = item["units"]
             lines.append(f"commit o={owners_of[item['o']]} p=0 u={unit(block)} k={KEY} after={after}")
-        elif kind == "transfer":
-            lines.append(f"transfer o={owners_of[item['o']]} to={group(item['to'])} after={after}")
+        elif kind == "lend":
+            lines.append(f"lend o={owners_of[item['o']]} after={after}")
         elif kind == "replicate":
             (block,) = item["units"]
             lines.append(f"replicate o={owners_of[item['o']]} p=0 to={group(item['to'])} u={unit(block)} "
@@ -265,10 +265,18 @@ def project(state, shape):
 
     for task in state["tasks"]:
         expired = int(task["expired"] == "TRUE")
-        if task["kind"] == "transfer":
-            line = (f"task transfer o={owners_of[task['o']]} to={group(task['to'])} slot={unit(task['slot'])} "
-                    f"units={units(task['units'])} writes={units(task['writes'])}")
-            lines.append(line.rstrip())
+        if task["kind"] == "import":
+            # The block each position takes, in the order of the positions (the
+            # one position p1 is the Rust buffer pool's 0), and the lent blocks
+            # it reads.
+            places = " ".join(f"p0={unit(block)}" for _, block in task["places"])
+            reads = sorted(unit(name) for name in task["units"] if name not in task["writes"])
+            lines.append(" ".join(filter(None, [f"task import o={owners_of[task['o']]}", places,
+                                                f"reads={','.join(reads) or '-'}"])))
+        elif task["kind"] == "lend":
+            lines.append(f"lent o={owners_of[task['o']]}")
+        elif task["kind"] == "borrow":
+            lines.append(f"borrow o={owners_of[task['o']]} {units(task['units'])}".rstrip())
         elif task["kind"] == "replicate":
             (block,) = task["units"]
             lines.append(f"task replicate o={owners_of[task['o']]} p=0 to={group(task['to'])} u={unit(block)}")

@@ -7,12 +7,13 @@
 EXTENDS KvCore, TLC
 
 CONSTANTS ga, gb, sa, sb, sc, sd, e1,
-          Transfers,   \* whether `Transfer` requests arrive
           Stamping     \* the groups whose stamp a request may carry
 
 (* A prefill group, and where the configuration has it a decode group, of  *)
 (* one epoch over one unit space, each with a memory of its own. The slot  *)
 (* rows sa and sb are the prefill group's, sc and sd the decode group's.   *)
+(* With `Handoffs`, lends arrive and owners import from lends of this pool *)
+(* and of another host's.                                                  *)
 MCSlotGroup == [s \in Slots |-> IF s \in {sa, sb} THEN ga ELSE gb]
 MCGroupEpoch == [g \in Groups |-> e1]
 MCOwnerEpoch == [o \in Owners |-> e1]
@@ -39,10 +40,9 @@ Arrive ==
               \/ \E p \in Positions, k \in Keys :
                    requests' = {[Request("commit", e, o, {}, p, k, 0, FALSE)
                                    EXCEPT !.after = after]}
-              \/ \E g \in Groups :
-                   /\ Transfers
-                   /\ requests' = {[Request("transfer", e, o, {}, NONE, NONE, 0, FALSE)
-                                      EXCEPT !.after = after, !.to = g]}
+              \/ /\ Handoffs
+                 /\ requests' = {[Request("lend", e, o, {}, NONE, NONE, 0, FALSE)
+                                    EXCEPT !.after = after]}
               \/ \E p \in Positions, g \in Groups :
                    /\ Crosses
                    /\ requests' = {[Request("replicate", e, o, {}, p, NONE, 0, FALSE)
@@ -68,11 +68,14 @@ PoolServing ==
     \/ Arrive
     \/ \E g \in Groups : Advance(g)
     \/ \E r \in requests :
-         TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+         TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeLend(r)
            \/ TakeReplicate(r)
     \/ \E d \in deferred :
-         ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d) \/ ReplicateDue(d)
-    \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) \/ ReplicateEnd(t, ok)
+         ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ LendDue(d) \/ ReplicateDue(d)
+    \/ \E o \in Owners, ps \in SUBSET Positions, l \in Owners \cup {NONE} : Import(o, ps, l)
+    \/ \E o \in Owners : Borrow(o)
+    \/ \E t \in tasks : GiveBack(t) \/ ReleaseBorrow(t)
+    \/ \E t \in tasks, ok \in BOOLEAN : ImportEnd(t, ok) \/ ReplicateEnd(t, ok)
     \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
     \/ \E u \in AllUnits : Shrink(u) \/ Grow(u)
 

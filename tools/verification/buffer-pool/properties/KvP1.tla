@@ -28,14 +28,12 @@ CopyIsolation ==
         /\ \A u \in b.cr : \E c \in copies : c.read = u /\ c.g = b.g /\ c.seq = b.seq
 
 (* A task in flight writes only blocks of its owner, and of a shared block *)
-(* only the target group's memory while the block is not valid there.      *)
+(* only a memory in which the block is not valid.                          *)
 TaskIsolation ==
     \A t \in tasks :
-        CASE t.kind = "transfer" ->
-               /\ t.slot \notin free /\ alloc[t.slot] = t.o
-               /\ \A u \in t.writes :
-                    /\ u \notin free
-                    /\ alloc[u] = t.o \/ (alloc[u] = "shared" /\ Mem(t.to) \notin valid[u])
+        CASE t.kind = "import" -> \A u \in t.writes : u \notin free /\ alloc[u] = t.o
+          \* A lend writes nothing; a borrow reads the lent blocks for another host.
+          [] t.kind \in {"lend", "borrow"} -> t.writes = {}
           \* A prefetch writes a host block that is its own until it ends.
           [] t.kind = "prefetch" -> t.h \notin free /\ alloc[t.h] = "task"
           \* A remote put reads a host block that stays its key's copy.

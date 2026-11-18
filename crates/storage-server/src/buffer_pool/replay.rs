@@ -322,7 +322,7 @@ pub(crate) fn stated_input(pool: &BufferPool, names: &SessionNames, input: &Inpu
         Input::Open(..) => "open".into(),
         Input::Close(client) => format!("close e={}", session(*client)),
         Input::Request(queue, record) => match Request::decode(record) {
-            Ok((_, request)) => stated_request(&request, &session(queue.0)),
+            Ok((_, request)) => stated_request(&request, &session(queue.0), &session),
             Err(_) => "unreadable".into(),
         },
         Input::Completed(client, group, value) => format!(
@@ -340,13 +340,19 @@ pub(crate) fn stated_input(pool: &BufferPool, names: &SessionNames, input: &Inpu
         Input::ReleaseHolds(_) => "release-holds".into(),
         Input::Grant(..) => "grant".into(),
         Input::Withdraw(..) => "withdraw".into(),
-        Input::Borrow(..) => "borrow".into(),
-        Input::GiveBack(..) => "give-back".into(),
-        Input::ReleaseBorrows(..) => "release-borrows".into(),
+        Input::Borrow(_, client, owner) => format!("borrow o={}.{}", session(*client), owner.0),
+        Input::GiveBack(client, owner) => format!("give-back o={}.{}", session(*client), owner.0),
+        // The borrows of one lend, or every borrow of the peer.
+        Input::ReleaseBorrows(_, Some((client, owner))) => {
+            format!("release-borrows o={}.{}", session(*client), owner.0)
+        }
+        Input::ReleaseBorrows(_, None) => "release-borrows".into(),
     }
 }
 
-fn stated_request(request: &Request, session: &str) -> String {
+/// A request as [`stated_input`] states it, on a queue pair of the session named `session`;
+/// `of` names the session of another client, as a lender's.
+fn stated_request(request: &Request, session: &str, of: &dyn Fn(ClientId) -> String) -> String {
     let owned = |owner: &OwnerId| format!("{session}.{}", owner.0);
     let keys = |keys: &[Key]| {
         let named: Vec<String> = keys.iter().map(Key::hex).collect();
@@ -439,11 +445,36 @@ fn stated_request(request: &Request, session: &str) -> String {
             after: stamps,
             ..
         } => format!("lend o={} after={}", owned(owner), after(stamps)),
-        Request::Import { owner, tables, .. } => format!(
-            "import o={} pages={}",
-            owned(owner),
-            tables.iter().map(|(_, _, count)| count).sum::<u32>()
-        ),
+        Request::Import {
+            owner,
+            tables,
+            lender,
+            ..
+        } => {
+            // The positions of the KV class; a table of another class names its class.
+            let class = tables
+                .iter()
+                .map(|(class, ..)| *class)
+                .find(|class| *class != 0)
+                .unwrap_or(0);
+            let positions: Vec<String> = tables
+                .iter()
+                .filter(|(class, ..)| *class == 0)
+                .flat_map(|(_, at, count)| *at..at.saturating_add(*count))
+                .map(|position| position.to_string())
+                .collect();
+            // A lend of this pool by its owner; one of another host's pool as `-`.
+            let lent = if lender.endpoint.is_none() {
+                format!("{}.{}", of(lender.session), lender.owner.0)
+            } else {
+                "-".to_owned()
+            };
+            format!(
+                "import o={} class={class} ps={} lender={lent}",
+                owned(owner),
+                positions.join(",")
+            )
+        }
         Request::Evict { keys: named } => format!("evict ks={}", keys(named)),
         Request::Victims { .. } => "victims".into(),
         Request::List => "list".into(),
@@ -667,9 +698,11 @@ pub(crate) fn layout(pool: &BufferPool, names: &SessionNames) -> String {
 /// and the host parts that hold each host copy, the copies in flight with
 /// their keys and the host parts a store or a save writes, what waits for a
 /// stamp with the stamps it still waits for (`after=g<n>:<sequence>,...`,
-/// one `release` line per group and stamp a release waits for), and the
+/// one `release` line per group and stamp a release waits for), the lends
+/// that stand (`lent`) and the blocks each borrow of a lend holds, and the
 /// tasks with their keys and the host parts a prefetch writes, a task of
-/// several keys as one per key. A block a waiting commit holds states its
+/// several keys as one per key, an import with the block each position takes
+/// (`p<position>=`) and the lent blocks it reads. A block a waiting commit holds states its
 /// memories too. A unit is `region:unit`, a key its 32 bytes in hex. `tools/verification/buffer-pool/scripts/agreement.py` writes the
 /// model's states in the same lines.
 pub(crate) fn stated(
@@ -1027,14 +1060,53 @@ pub(crate) fn stated(
         }
     }
 
+    // A lend that stands, of an owner that is there: a lend of an owner that is gone lends
+    // nothing, as none stands.
+    for (client, owner) in pool.lends.keys() {
+        if pool.sessions.contains_key(client) && pool.owners.contains_key(&(*client, *owner)) {
+            lines.push(format!("lent o={}", owner_name(*client, *owner)));
+        }
+    }
+    // A borrow of a lend holds the lent blocks for another host's import, whichever peer holds
+    // it.
+    for ((_, client, owner), blocks) in &pool.borrows {
+        let held: BTreeSet<String> = blocks.iter().map(&unit).collect();
+        lines.push(
+            format!("borrow o={} {}", owner_name(*client, *owner), units(held))
+                .trim_end()
+                .to_owned(),
+        );
+    }
+
     for (task, copies) in &pool.copies {
         let expired = u8::from(!pool.answers.contains_key(task));
+        // An import, of pages or of none: the block each position takes, and the lent blocks
+        // it reads.
+        if let Some(importing) = pool.imports.get(task) {
+            let mut line = format!("task import o={}", owner_name(task.0.0, importing.owner));
+            let mut reads = BTreeSet::new();
+            for copy in copies {
+                if let Target::Import { class, at, .. } = copy.to {
+                    let place = if class == 0 {
+                        format!("p{at}")
+                    } else {
+                        format!("c{class}p{at}")
+                    };
+                    let _ = write!(line, " {place}={}", unit(&copy.write));
+                }
+                reads.extend(copy.reads.iter().map(&unit));
+            }
+            let reads: Vec<String> = reads.into_iter().collect();
+            let reads = if reads.is_empty() {
+                "-".to_owned()
+            } else {
+                reads.join(",")
+            };
+            let _ = write!(line, " reads={reads}");
+            lines.push(line);
+            continue;
+        }
         match copies.first().map(|copy| &copy.to) {
-            Some(Target::Import { owner, .. }) => lines.push(format!(
-                "task import o={} units={}",
-                owner_name(task.0.0, *owner),
-                units(copies.iter().map(|copy| unit(&copy.write)).collect())
-            )),
             Some(Target::Memory {
                 owner, at, group, ..
             }) => lines.push(format!(

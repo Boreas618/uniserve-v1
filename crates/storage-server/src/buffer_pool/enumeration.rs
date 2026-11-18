@@ -9,7 +9,7 @@
 //!
 //! The configurations are those of `MC_Pool` there, one per [`Shape`]: one
 //! key and one position, one or two owners, a prefill group and for
-//! crossings and host parts a decode group, with a memory each
+//! handoffs, crossings and host parts a decode group, with a memory each
 //! and the host parts the shape states; or, for an update, two sessions of
 //! two layouts, the second on trial, each with a group and a region of its
 //! own over one device memory. The bounds are the model's: `completed` goes
@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use storage::protocol::Key;
-use storage::runtime::{GroupId, OwnerId, Request, RequestId, Stamps, Tier};
+use storage::runtime::{GroupId, Lender, OwnerId, Request, RequestId, Stamps, Tier};
 
 use super::replay::{SessionNames, apply, classes, copies_asked, layout, stated, stated_input};
 use super::trace::Input;
@@ -44,6 +44,9 @@ const TARGET_UNITS: u8 = 2;
 
 /// The model's bound `MaxBatch`.
 const MAX_COMPLETED: u64 = 1;
+/// The connection of another host's Storage Server that borrows the lends of the shape
+/// `handoff`.
+const PEER: u64 = 7;
 
 /// A configuration of `MC_Pool`: what exists, and which requests arrive.
 #[derive(Clone, Copy)]
@@ -59,6 +62,9 @@ struct Shape {
     copies: u32,
     /// Whether prefetches and puts to the remote store arrive.
     tiers: bool,
+    /// Whether owners are lent and import from lends, of this pool or of another host's, and
+    /// another host's server borrows the lends: the model's `Handoffs`.
+    handoffs: bool,
     /// Whether the decode group reads, in its own memory, the class an
     /// owner of the prefill group holds: crossings into it arrive (the
     /// model's `Readers`).
@@ -74,7 +80,7 @@ struct Shape {
     trial: bool,
 }
 
-const SHAPES: [Shape; 6] = [
+const SHAPES: [Shape; 7] = [
     Shape {
         name: "core",
         owners: 2,
@@ -84,6 +90,7 @@ const SHAPES: [Shape; 6] = [
         host_units: 0,
         copies: 0,
         tiers: false,
+        handoffs: false,
         crossings: false,
         parts: [&[1], &[]],
         trial: false,
@@ -97,8 +104,26 @@ const SHAPES: [Shape; 6] = [
         host_units: 1,
         copies: 2,
         tiers: false,
+        handoffs: false,
         crossings: false,
         parts: [&[1], &[]],
+        trial: false,
+    },
+    // A prefill group and a decode group of one session, each with a memory of its own and a
+    // slot row: an owner is lent, and an owner imports the lent blocks or those of a lend of
+    // another host's pool, which this pool's lends another host's server borrows.
+    Shape {
+        name: "handoff",
+        owners: 2,
+        groups: 2,
+        rows: 1,
+        units: 2,
+        host_units: 0,
+        copies: 0,
+        tiers: false,
+        handoffs: true,
+        crossings: false,
+        parts: [&[2], &[2]],
         trial: false,
     },
     Shape {
@@ -110,6 +135,7 @@ const SHAPES: [Shape; 6] = [
         host_units: 1,
         copies: 2,
         tiers: true,
+        handoffs: false,
         crossings: false,
         parts: [&[1], &[]],
         trial: false,
@@ -127,6 +153,7 @@ const SHAPES: [Shape; 6] = [
         host_units: 0,
         copies: 0,
         tiers: false,
+        handoffs: false,
         crossings: true,
         parts: [&[2], &[2]],
         trial: false,
@@ -143,6 +170,7 @@ const SHAPES: [Shape; 6] = [
         host_units: 1,
         copies: 2,
         tiers: false,
+        handoffs: false,
         crossings: false,
         parts: [&[2], &[2, 3]],
         trial: false,
@@ -162,6 +190,7 @@ const SHAPES: [Shape; 6] = [
         host_units: 0,
         copies: 0,
         tiers: false,
+        handoffs: false,
         crossings: false,
         parts: [&[2], &[2]],
         trial: true,
@@ -186,6 +215,16 @@ enum Step {
     Commit(u64, u8),
     /// A crossing of the owner's block into the decode group's memory.
     Replicate(u64, u8),
+    /// A lend of the owner.
+    Lend(u64, u8),
+    /// An import into the owner's position, or of no position (`false`), from the lend of an
+    /// owner of this pool or of another host's pool (`None`).
+    Import(u64, Option<u64>, bool),
+    /// The owner's lend ends; another host's server borrows it.
+    GiveBack(u64),
+    Borrow(u64),
+    /// The peer's borrows end: of the owner's lend, or every one.
+    ReleaseBorrows(Option<u64>),
     /// The `Finish` of the n-th copy a worker runs, with its result.
     Finish(usize, bool, u8),
     /// The `completed` word of a session's group.
@@ -503,18 +542,21 @@ impl Driver {
     }
 
     /// The copies in flight by the request that started each: those an
-    /// worker runs, or the tasks.
+    /// worker runs, or the tasks, an import of no page among them.
     fn in_flight(&self, tasks: bool) -> Vec<((u32, u16), RequestId)> {
-        let of_kind = |copies: &Vec<Copy>| {
-            copies
-                .first()
-                .is_some_and(|copy| copy.deadline.is_some() == tasks)
+        let of_kind = |id: &((u32, u16), RequestId), copies: &Vec<Copy>| {
+            let import = self.pool.imports.contains_key(id);
+            if tasks {
+                import || copies.first().is_some_and(|copy| copy.deadline.is_some())
+            } else {
+                !import && copies.first().is_some_and(|copy| copy.deadline.is_none())
+            }
         };
         let mut found: Vec<_> = self
             .pool
             .copies
             .iter()
-            .filter(|(_, copies)| of_kind(copies))
+            .filter(|(id, copies)| of_kind(id, copies))
             .map(|(id, _)| *id)
             .collect();
         found.sort_unstable();
@@ -566,7 +608,27 @@ impl Driver {
                 if shape.crossings {
                     steps.push(Step::Replicate(owner, mask));
                 }
+                if shape.handoffs {
+                    steps.push(Step::Lend(owner, mask));
+                }
             }
+            if shape.handoffs {
+                let other = shape.owners + 1 - owner;
+                for pages in [true, false] {
+                    steps.extend([
+                        Step::Import(owner, Some(other), pages),
+                        Step::Import(owner, None, pages),
+                    ]);
+                }
+                steps.extend([
+                    Step::GiveBack(owner),
+                    Step::Borrow(owner),
+                    Step::ReleaseBorrows(Some(owner)),
+                ]);
+            }
+        }
+        if shape.handoffs {
+            steps.push(Step::ReleaseBorrows(None));
         }
         for group in 0..shape.groups {
             if room {
@@ -619,12 +681,12 @@ impl Driver {
                 steps.extend([Step::Prefetch, Step::Put]);
             }
         }
-        for task in 0..self.in_flight(true).len() {
-            steps.extend([
-                Step::Done(task),
-                Step::Ended(task, true),
-                Step::Ended(task, false),
-            ]);
+        for (index, task) in self.in_flight(true).into_iter().enumerate() {
+            // An import's task copies no keys: it ends.
+            if !self.pool.imports.contains_key(&task) {
+                steps.push(Step::Done(index));
+            }
+            steps.extend([Step::Ended(index, true), Step::Ended(index, false)]);
         }
         steps
     }
@@ -645,7 +707,12 @@ impl Driver {
             | Step::Release(o, _)
             | Step::Detach(o, _)
             | Step::Commit(o, _)
-            | Step::Replicate(o, _) => Some(self.queue_of(o)),
+            | Step::Replicate(o, _)
+            | Step::Lend(o, _)
+            | Step::Import(o, ..)
+            | Step::GiveBack(o)
+            | Step::Borrow(o)
+            | Step::ReleaseBorrows(Some(o)) => Some(self.queue_of(o)),
             _ => None,
         };
         let queue = match step {
@@ -726,6 +793,38 @@ impl Driver {
                 group: GroupId(1),
                 after: stamps(mask),
             },
+            Step::Lend(o, mask) => Request::Lend {
+                owner: owner(o),
+                lease: 1_000,
+                after: stamps(mask),
+            },
+            Step::Import(o, lender, pages) => Request::Import {
+                owner: owner(o),
+                tables: if pages { vec![(KV, 0, 1)] } else { Vec::new() },
+                // A lend of this pool is its owner's in this session; another host's is
+                // reached at its server's endpoint.
+                lender: match lender {
+                    Some(lender) => Lender {
+                        endpoint: None,
+                        session: SESSION,
+                        owner: self.queue_of(lender).1,
+                    },
+                    None => Lender {
+                        endpoint: Some("peer:1".to_owned()),
+                        session: SESSION,
+                        owner: OwnerId(1),
+                    },
+                },
+                push: false,
+                transport: scheduling::kv::Transport::Nixl,
+                trace: 0,
+            },
+            Step::GiveBack(o) => return self.acted(Input::GiveBack(queue.0, owner(o))),
+            Step::Borrow(o) => return self.acted(Input::Borrow(PEER, queue.0, owner(o))),
+            Step::ReleaseBorrows(lend) => {
+                let lend = lend.map(|o| (queue.0, owner(o)));
+                return self.acted(Input::ReleaseBorrows(PEER, lend));
+            }
             Step::Finish(copy, ok, mask) => Request::Finish {
                 copy: self.in_flight(false)[copy].1,
                 ok,

@@ -29,7 +29,7 @@ ObservedPrivate(u) ==
     \/ \E c \in copies : c.write = u /\ (c.kind \in {"store", "save"} \/ ostate[c.o] = "live")
     \/ \E t \in tasks :
          /\ t.held
-         /\ \/ t.kind = "transfer" /\ t.slot = u /\ ostate[t.o] = "live"
+         /\ \/ t.kind = "import" /\ u \in t.writes /\ ostate[t.o] = "live"
             \/ t.kind = "prefetch" /\ t.h = u
 
 FreeIn(r) == free \cap UnitsIn(r)

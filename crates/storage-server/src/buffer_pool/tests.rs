@@ -3030,6 +3030,48 @@ fn a_pool_made_again_from_its_image_carries_a_waiting_crossing() {
     assert_eq!(fixture.free(UNITS), 4);
 }
 
+/// A pool's image carries an import under way and a borrow of a lend: the pool made again
+/// puts the imported blocks in the owner's table when the task ends, and keeps the borrowed
+/// blocks held after the lend ends, until the peer lets them go.
+#[test]
+fn a_pool_made_again_from_its_image_carries_an_import_and_a_borrow() {
+    let mut fixture = Fixture::new();
+    let before = fixture.free(UNITS);
+    fixture.attach(1, PREFILL);
+    fixture.allocate(1, 0, 1);
+    let lend = Request::Lend {
+        owner: OwnerId(1),
+        lease: 1_000,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(lend), Some(Completion::Done));
+    fixture.attach(2, DECODE);
+    let id = fixture.submit(QUEUE, import(2, 0, 1, 1));
+    assert_eq!(fixture.pool.started(), [(QUEUE, id)]);
+    assert!(fixture.pool.borrow(7, SERVING, OwnerId(1)).is_some());
+
+    let image = rmp_serde::to_vec(&fixture.pool).unwrap();
+    fixture.pool = rmp_serde::from_slice(&image).unwrap();
+    fixture.checked();
+
+    // The lend ends; the import's task and the borrow still hold the lent block.
+    assert!(fixture.pool.give_back(SERVING, OwnerId(1)));
+    fixture.checked();
+    assert_eq!(fixture.free(UNITS), before - 2);
+    fixture.pool.ended((QUEUE, id), true);
+    fixture.checked();
+    assert!(matches!(
+        fixture.answer(id),
+        Some(Completion::Imported { .. })
+    ));
+    assert_eq!(fixture.free(UNITS), before - 2);
+    assert!(fixture.pool.release_borrows(7, None));
+    fixture.checked();
+    assert_eq!(fixture.free(UNITS), before - 1);
+    assert_eq!(fixture.release(2, 0, 1, Vec::new()), Some(Completion::Done));
+    assert_eq!(fixture.free(UNITS), before);
+}
+
 /// Each region an admission states takes a number of its own, a region stated with no unit yet
 /// (a KV region stated before its memory exists) among them; a region's number goes to a new
 /// region only once the region closed with the last session that named it, and a closed region

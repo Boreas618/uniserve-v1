@@ -19,7 +19,7 @@ LEMMA Evict_Effect ==
          /\ \A o \in Owners : oslot[o] # u
          /\ \A d \in deferred : u \notin d.units
          /\ \A c \in copies : c.read # u /\ c.write # u
-         /\ \A t \in tasks : u \notin t.units /\ t.slot # u /\ t.h # u
+         /\ \A t \in tasks : u \notin t.units /\ t.h # u
          /\ \A j \in Keys : cache[j] = u => j = k
          /\ \A j \in Keys : hcache[j] # u
          /\ \A v \in AllUnits : alloc'[v] = IF v = u THEN NONE ELSE alloc[v]
@@ -49,7 +49,7 @@ LEMMA Evict_Effect ==
     BY <1>1 DEF Evictable, EvictableFor, PinnedFor, Pinned, On, AllRules
   <1>4. \A o \in Owners, p \in Positions : table[o][p].u # u
     BY <1>0, <1>2, <1>3 DEF IndInv, Tables, OwnerTyped, Empty, Private, Shared
-  <1>5. \A t \in tasks : u \notin t.units /\ t.slot # u /\ t.h # u
+  <1>5. \A t \in tasks : u \notin t.units /\ t.h # u
     BY <1>0, <1>2, <1>3 DEF IndInv, TasksOk, WorkTyped
   <1>6. \A j \in Keys : cache[j] = u => j = k
     BY <1>2 DEF IndInv, CacheShared
@@ -144,50 +144,54 @@ LEMMA Evict_Owners ==
   <1>2. OwnersOk'
     BY <1>0, Evict_Effect DEF IndInv, OwnersOk, Live, AllUnits, rare
   <1>3. DeferredOk'
-    BY <1>0, Evict_Effect DEF IndInv, DeferredOk, WorkTyped, AllUnits, rare
+    BY <1>0, Evict_Effect DEF IndInv, DeferredOk, Importing, WorkTyped, AllUnits, rare
   <1>4. CopiesOk'
     <2>1. \A c \in copies : (c.fill /\ c.kind = "load") => c.k # k
       BY Evict_Effect DEF IndInv, CopiesOk
     <2>2. \A c \in copies : c.read \in AllUnits /\ c.write \in AllUnits /\ c.k \in Keys
       BY <1>0 DEF WorkTyped
     <2> QED
-      BY <2>1, <2>2, Evict_Effect DEF IndInv, CopiesOk, Live, Moving, Mem, rare
+      BY <2>1, <2>2, Evict_Effect DEF IndInv, CopiesOk, Live, Lending, Mem, rare
   <1>5. TasksOk'
-    <2>1. \A t \in tasks : t.units \subseteq AllUnits /\ t.writes \subseteq AllUnits
-                           /\ (t.slot # NONE => t.slot \in AllUnits)
-                           /\ (t.h # NONE => t.h \in AllUnits)
+    <2>1. \A t \in tasks : t.units \subseteq AllUnits /\ (t.h # NONE => t.h \in AllUnits)
       BY <1>0 DEF WorkTyped, AllUnits
-    <2>2. \A t \in tasks : \A u \in t.units \cup {t.slot, t.h} : u # NONE => alloc'[u] = alloc[u]
+    <2>2. \A t \in tasks : \A x \in t.units : alloc'[x] = alloc[x]
       BY <2>1, Evict_Effect
-    <2>3. \A t \in tasks :
-            /\ t.kind = "transfer" =>
-                 /\ alloc'[t.slot] = alloc[t.slot]
-                 /\ \A u \in t.writes : alloc'[u] = alloc[u] /\ valid'[u] = valid[u]
-                 /\ ostate[t.o] = "live" =>
-                      /\ TableUnits(t.o)' = TableUnits(t.o)
-                      /\ \A u \in TableUnits(t.o) : valid'[u] = valid[u]
-            /\ t.kind = "prefetch" => alloc'[t.h] = alloc[t.h]
-      <3>1. \A t \in tasks : /\ t.kind = "transfer" => t.writes \subseteq t.units /\ t.slot # NONE
-                             /\ t.kind = "prefetch" => t.h # NONE
+    <2>3. \A t \in tasks : t.kind = "import" =>
+            \A x \in t.writes :
+              /\ \A o \in Owners, p \in Positions : table'[o][p].u # x
+              /\ \A j \in Keys : cache'[j] # x
+      <3> SUFFICES ASSUME NEW t \in tasks, t.kind = "import", NEW x \in t.writes
+                   PROVE  /\ \A o \in Owners, p \in Positions : table'[o][p].u # x
+                          /\ \A j \in Keys : cache'[j] # x
+        OBVIOUS
+      <3>1. /\ \A o \in Owners, p \in Positions : table[o][p].u # x
+            /\ \A j \in Keys : cache[j] # x
+            /\ x \in Units
+        BY TasksOkEach DEF IndInv, TaskOk
+      <3> QED
+        BY <3>1, Evict_Effect
+    <2>4. \A t \in tasks : t.kind = "prefetch" => alloc'[t.h] = alloc[t.h]
+      <3>1. \A t \in tasks : t.kind = "prefetch" => t.h # NONE
         BY DEF IndInv, TasksOk
       <3> QED
-        BY <2>1, <2>2, <3>1, Evict_Effect DEF TableUnits, AllUnits
+        BY <2>1, <3>1, Evict_Effect
     <2> QED
-      BY <2>3, Evict_Effect, TasksKeep DEF IndInv
+      BY <2>2, <2>3, <2>4, Evict_Effect, TasksKeep DEF IndInv, TableUnits
   <1> QED
     BY <1>1, <1>2, <1>3, <1>4, <1>5
 
 LEMMA Evict_Plane ==
   ASSUME IndInv, NEW k \in Keys, Evict(k), UNCHANGED rare
-  PROVE  /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
+  PROVE  /\ LendingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
          /\ BatchesOk'
   <1> DEFINE u == cache[k]
   <1>1. UNCHANGED <<ostate, ogroup, oslot, table, hcache, deferred, copies, ncopy, tasks, trial,
                     member, valid, vis, dbt, launched, inflight, handoff, requests, remote, lost, bad>>
     BY Evict_Effect DEF rare
-  <1>2. MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
-    BY <1>1, MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, RequestsOkFrame,
-       NoBadFrame, TransfersFrame DEF IndInv
+  <1>2. LendingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
+    BY <1>1, LendingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, RequestsOkFrame,
+       NoBadFrame, HandoffTasksFrame DEF IndInv
   <1>3. \A b \in inflight : \A x \in b.reads : x[2] \notin {u} /\ alloc'[x[2]] = alloc[x[2]]
     <2>1. \A b \in inflight : \A x \in b.reads : x[2] \in AllUnits
       BY RequestTypes DEF RequestTyped
@@ -202,17 +206,17 @@ LEMMA Evict_Plane ==
 (* copy, and no validity changes.                                          *)
 LEMMA Evict_Cross ==
   ASSUME IndInv, NEW k \in Keys, Evict(k), UNCHANGED rare
-  PROVE  CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+  PROVE  CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced' /\ ImportsPlaced'
   <1> DEFINE u == cache[k]
   <1>0. WorkTyped
     BY WorkTypes
   <1>1. UNCHANGED <<ostate, ogroup, oslot, table, hcache, deferred, copies, ncopy, tasks, trial,
                     member, valid, vis, dbt, launched, inflight, handoff, requests, remote, lost, bad>>
     BY Evict_Effect DEF rare
-  <1>2. CopiesPlaced' /\ CrossingsPlaced'
-    BY <1>1, TransfersFrame, CopiesPlacedFrame, CrossingsPlacedFrame DEF IndInv
-  <1>3. \A o \in Owners : Moving(o)' = Moving(o)
-    BY <1>1 DEF Moving
+  <1>2. CopiesPlaced' /\ CrossingsPlaced' /\ ImportsPlaced'
+    BY <1>1, HandoffTasksFrame, CopiesPlacedFrame, CrossingsPlacedFrame, ImportsPlacedFrame DEF IndInv
+  <1>3. \A o \in Owners : Lending(o)' = Lending(o)
+    BY <1>1 DEF Lending
   <1>4. \A x \in AllUnits \ {u} : alloc'[x] = alloc[x]
     BY Evict_Effect
   <1>5. \A j \in Keys : cache'[j] # NONE => cache'[j] = cache[j]
@@ -254,7 +258,7 @@ LEMMA HostValidBatches ==
                      tasks, copies, lost>>
   PROVE  BatchesOk'
   <1>1. \A b, o, u : Covered(b, o, u)' = Covered(b, o, u)
-    BY CoveredFrame, TransfersFrame
+    BY CoveredFrame, HandoffTasksFrame
   <1>2. \A b \in inflight : b.writes \subseteq b.reads
     BY DEF BatchesOk
   <1> QED
@@ -269,7 +273,7 @@ LEMMA EvictHost_Effect ==
          /\ \A o \in Owners : oslot[o] # h
          /\ \A d \in deferred : h \notin d.units
          /\ \A c \in copies : c.read # h /\ c.write # h
-         /\ \A t \in tasks : h \notin t.units /\ t.slot # h /\ t.h # h
+         /\ \A t \in tasks : h \notin t.units /\ t.h # h
          /\ \A j \in Keys : hcache[j] = h => j = k
          /\ \A j \in Keys : cache[j] # h
          /\ \A v \in AllUnits : alloc'[v] = IF v = h THEN NONE ELSE alloc[v]
@@ -299,7 +303,7 @@ LEMMA EvictHost_Effect ==
     BY <1>0, <1>1 DEF IndInv, CacheShared, SharedIff, UnitTyped, AllUnits
   <1>3. \A d \in deferred : h \notin d.units
     BY <1>2 DEF IndInv, DeferredOk, CrossingsOk
-  <1>4. \A t \in tasks : h \notin t.units /\ t.slot # h /\ t.h # h
+  <1>4. \A t \in tasks : h \notin t.units /\ t.h # h
     BY <1>0, <1>1, <1>2 DEF IndInv, TasksOk, CrossingsOk, WorkTyped
   <1>5. \A j \in Keys : hcache[j] = h => j = k
     BY <1>2 DEF IndInv, CacheShared
@@ -413,7 +417,7 @@ LEMMA EvictHost_Owners ==
   <1>2. OwnersOk'
     BY <1>0, EvictHost_Effect DEF IndInv, OwnersOk, Live, AllUnits, rare
   <1>3. DeferredOk'
-    BY <1>0, EvictHost_Effect DEF IndInv, DeferredOk, WorkTyped, AllUnits, rare
+    BY <1>0, EvictHost_Effect DEF IndInv, DeferredOk, Importing, WorkTyped, AllUnits, rare
   <1>4. CopiesOk'
     <2>1. SUFFICES ASSUME NEW c \in copies PROVE CopyOk(c)'
       BY EvictHost_Effect, CopiesOkEach
@@ -426,69 +430,48 @@ LEMMA EvictHost_Owners ==
       BY <2>2, <1>0, EvictHost_Valid DEF CopyOk, UnitTyped, AllUnits
     <2>5. (c.fill /\ c.kind = "store") => hcache'[c.k] = hcache[c.k]
       BY <2>2, <2>3, EvictHost_Effect DEF CopyOk
-    <2>6. \A q \in Owners : Moving(q)' = Moving(q)
-      BY EvictHost_Effect DEF Moving
+    <2>6. \A q \in Owners : Lending(q)' = Lending(q)
+      BY EvictHost_Effect DEF Lending
     <2> QED
       BY <2>2, <2>3, <2>4, <2>5, <2>6, EvictHost_Effect DEF CopyOk, Live, Mem, rare
   <1>5. TasksOk'
-    <2>1. \A t \in tasks : t.units \subseteq AllUnits /\ t.writes \subseteq AllUnits
-                           /\ (t.slot # NONE => t.slot \in AllUnits)
-                           /\ (t.h # NONE => t.h \in AllUnits) /\ t.k \in Keys \cup {NONE}
+    <2>1. \A t \in tasks : t.units \subseteq AllUnits /\ (t.h # NONE => t.h \in AllUnits)
+                           /\ t.k \in Keys \cup {NONE}
       BY <1>0 DEF WorkTyped, AllUnits
     <2>2. \A t \in tasks : t.kind = "put" => t.k # k /\ t.k \in Keys
       BY <1>0, EvictHost_Effect DEF IndInv, TasksOk, WorkTyped
-    <2>3. \A t \in tasks : \A u \in t.units \cup {t.slot, t.h} : u # NONE => alloc'[u] = alloc[u]
+    <2>3. \A t \in tasks : \A x \in t.units : alloc'[x] = alloc[x]
       BY <2>1, EvictHost_Effect
-    <2>4. \A t \in tasks :
-            /\ t.kind = "transfer" =>
-                 /\ alloc'[t.slot] = alloc[t.slot]
-                 /\ \A u \in t.writes : alloc'[u] = alloc[u] /\ valid'[u] = valid[u]
-                 /\ ostate[t.o] = "live" =>
-                      /\ TableUnits(t.o)' = TableUnits(t.o)
-                      /\ \A u \in TableUnits(t.o) : valid'[u] = valid[u]
-            /\ t.kind = "prefetch" => alloc'[t.h] = alloc[t.h]
-      <3> SUFFICES ASSUME NEW t \in tasks
-                   PROVE  /\ t.kind = "transfer" =>
-                               /\ alloc'[t.slot] = alloc[t.slot]
-                               /\ \A u \in t.writes : alloc'[u] = alloc[u] /\ valid'[u] = valid[u]
-                               /\ ostate[t.o] = "live" =>
-                                    /\ TableUnits(t.o)' = TableUnits(t.o)
-                                    /\ \A u \in TableUnits(t.o) : valid'[u] = valid[u]
-                          /\ t.kind = "prefetch" => alloc'[t.h] = alloc[t.h]
-        OBVIOUS
-      <3>1. /\ t.kind = "transfer" =>
-                 t.writes \subseteq t.units /\ t.slot # NONE /\ t.writes \subseteq Units
-                 /\ t.o \in Owners
-            /\ t.kind = "prefetch" => t.h # NONE
+    <2>4. \A t \in tasks : t.kind = "prefetch" => alloc'[t.h] = alloc[t.h]
+      <3>1. \A t \in tasks : t.kind = "prefetch" => t.h # NONE
         BY DEF IndInv, TasksOk
-      <3>2. t.o \in Owners => TableUnits(t.o) \subseteq Units /\ TableUnits(t.o)' = TableUnits(t.o)
-        BY <1>0, EvictHost_Effect DEF TableUnits, OwnerTyped, Empty, Private, Shared
-      <3>3. \A u \in Units : valid'[u] = valid[u]
-        BY EvictHost_Valid
-      <3>4. \A u \in t.units \cup {t.slot, t.h} : u # NONE => alloc'[u] = alloc[u]
-        BY <2>3
       <3> QED
-        BY <3>1, <3>2, <3>3, <3>4
+        BY <2>1, <3>1, EvictHost_Effect
     <2>5. \A t \in tasks : t.kind = "put" => hcache'[t.k] = hcache[t.k]
       BY <2>2, EvictHost_Effect
+    <2>6. \A t \in tasks : t.kind = "import" =>
+            \A x \in t.writes :
+              /\ \A o \in Owners, p \in Positions : table'[o][p].u # x
+              /\ \A j \in Keys : cache'[j] # x
+      BY EvictHost_Effect, TasksOkEach DEF IndInv, TaskOk
     <2> QED
-      BY <2>4, <2>5, EvictHost_Effect, TasksKeep DEF IndInv
+      BY <2>3, <2>4, <2>5, <2>6, EvictHost_Effect, TasksKeep DEF IndInv, TableUnits
   <1> QED
     BY <1>1, <1>2, <1>3, <1>4, <1>5
 
 LEMMA EvictHost_Plane ==
   ASSUME IndInv, NEW k \in Keys, EvictHost(k), UNCHANGED rare
-  PROVE  /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
+  PROVE  /\ LendingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk' /\ NoBad'
          /\ BatchesOk'
   <1> DEFINE h == hcache[k]
   <1>1. UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, tasks, trial,
                     member, vis, dbt, launched, inflight, handoff, requests, remote, lost, bad>>
     BY EvictHost_Effect DEF rare
-  <1>2. MovingUnmapped' /\ LostOk' /\ RequestsOk' /\ NoBad'
-    BY <1>1, MovingUnmappedFrame, LostOkFrame, RequestsOkFrame, NoBadFrame, TransfersFrame
+  <1>2. LendingUnmapped' /\ LostOk' /\ RequestsOk' /\ NoBad'
+    BY <1>1, LendingUnmappedFrame, LostOkFrame, RequestsOkFrame, NoBadFrame, HandoffTasksFrame
        DEF IndInv
   <1>3. TablesMapped' /\ HandoffOk'
-    BY <1>1, TransfersFrame, EvictHost_Valid, HostValidMapped
+    BY <1>1, HandoffTasksFrame, EvictHost_Valid, HostValidMapped
   <1>4. \A b \in inflight : \A x \in b.reads : x[2] \notin {h} /\ alloc'[x[2]] = alloc[x[2]]
     <2>1. \A b \in inflight : \A x \in b.reads : x[2] \in AllUnits
       BY RequestTypes DEF RequestTyped
@@ -503,15 +486,15 @@ LEMMA EvictHost_Plane ==
 (* no copy, and the validity of every block they hold stays.               *)
 LEMMA EvictHost_Cross ==
   ASSUME IndInv, NEW k \in Keys, EvictHost(k), UNCHANGED rare
-  PROVE  CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced'
+  PROVE  CrossingsOk' /\ CopiesPlaced' /\ CrossingsPlaced' /\ ImportsPlaced'
   <1> DEFINE h == hcache[k]
   <1>0. WorkTyped /\ h \in HostUnits
     BY WorkTypes, EvictHost_Effect
   <1>1. UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, tasks, trial,
                     member, vis, dbt, launched, inflight, handoff, requests, remote, lost, bad>>
     BY EvictHost_Effect DEF rare
-  <1>2. \A o \in Owners : Moving(o)' = Moving(o)
-    BY <1>1 DEF Moving
+  <1>2. \A o \in Owners : Lending(o)' = Lending(o)
+    BY <1>1 DEF Lending
   <1>3. \A x \in AllUnits \ {h} : alloc'[x] = alloc[x]
     BY EvictHost_Effect
   <1>4. CopiesPlaced'
@@ -546,8 +529,10 @@ LEMMA EvictHost_Cross ==
       BY <2>1 DEF CrossTaskOk
     <2> QED
       BY <1>1, <1>2, <1>3, <2>1, <2>2, EvictHost_Valid DEF CrossTaskOk, ReadersOf, Mem
+  <1>8. ImportsPlaced'
+    BY <1>1, HandoffTasksFrame, ImportsPlacedFrame DEF IndInv
   <1> QED
-    BY <1>1, <1>4, <1>5, <1>6, <1>7, CrossingsOkEach
+    BY <1>1, <1>4, <1>5, <1>6, <1>7, <1>8, CrossingsOkEach
 
 LEMMA EvictHost_Inv ==
   ASSUME IndInv, NEW k \in Keys, EvictHost(k), UNCHANGED rare
@@ -567,12 +552,13 @@ LEMMA TrialFrame ==
                      sharedKey, remote, lost, bad>>
   PROVE  /\ FreeClean' /\ NoLeak' /\ Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
          /\ SharedCached' /\ CacheShared' /\ Tables' /\ DeferredOk' /\ CopiesOk'
-         /\ MovingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
-         /\ BatchesOk' /\ NoBad' /\ CopiesPlaced' /\ CrossingsPlaced'
+         /\ LendingUnmapped' /\ LostOk' /\ TablesMapped' /\ HandoffOk' /\ RequestsOk'
+         /\ BatchesOk' /\ NoBad' /\ CopiesPlaced' /\ CrossingsPlaced' /\ ImportsPlaced'
   BY FreeCleanFrame, NoLeakFrame, OutsideFrame, RegionsFrame, AllocOwnerFrame, SharedIffFrame,
      SharedCachedFrame, CacheSharedFrame, TablesFrame, DeferredOkFrame, CopiesOkFrame,
-     MovingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, RequestsOkFrame,
-     BatchesOkFrame, NoBadFrame, CopiesPlacedFrame, CrossingsPlacedFrame, TransfersFrame DEF IndInv
+     LendingUnmappedFrame, LostOkFrame, TablesMappedFrame, HandoffOkFrame, RequestsOkFrame,
+     BatchesOkFrame, NoBadFrame, CopiesPlacedFrame, CrossingsPlacedFrame, ImportsPlacedFrame,
+     HandoffTasksFrame DEF IndInv
 
 LEMMA CommitUpdate_Inv ==
   ASSUME IndInv, NEW e \in Epochs, CommitUpdate(e), UNCHANGED rare
@@ -603,7 +589,8 @@ LEMMA CommitUpdate_Inv ==
     <2>1. \A t \in tasks : t.kind = "put" => t.k \in Keys
       BY WorkTypes DEF IndInv, TasksOk, WorkTyped
     <2> QED
-      BY <1>1, <1>2, <2>1 DEF IndInv, TasksOk, Live, TableUnits, Mem, NONE
+      BY <1>1, <1>2, <2>1 DEF IndInv, TasksOk, Live, TableUnits, Mem, NONE, Reads, Lending,
+                            Importing, CopyFor
   <1>6. \A x \in Epochs : MadeBy(x)' = IF x = e THEN NONE ELSE MadeBy(x)
     BY <1>1, <1>2 DEF MadeBy
   (* A copy of a key's visibility that MadeBy of an epoch states keeps it.  *)
@@ -655,9 +642,9 @@ LEMMA CommitUpdate_Inv ==
               \A k \in Keys : cache[k] \in d.units => vis'[k].d = MadeBy(OwnerEpoch[d.o])'
         BY <1>7, <3>1 DEF CrossWaitOk
       <3> QED
-        BY <1>1, <3>1, <3>2 DEF CrossWaitOk, Moving, ReadersOf
+        BY <1>1, <3>1, <3>2 DEF CrossWaitOk, Lending, ReadersOf
     <2>2. \A t \in tasks : CrossTaskOk(t)'
-      BY <1>1, CrossingsOkEach DEF IndInv, CrossTaskOk, Moving, ReadersOf, Mem
+      BY <1>1, CrossingsOkEach DEF IndInv, CrossTaskOk, Lending, ReadersOf, Mem
     <2> QED
       BY <1>1, <2>1, <2>2, CrossingsOkEach
   <1> QED
@@ -700,7 +687,7 @@ LEMMA Rollback_Inv ==
     <2>1. \A d \in deferred : d.kind = "replicate" => OwnerEpoch[d.o] \in Epochs
       BY CrossingsOkEach DEF IndInv, CrossWaitOk
     <2> QED
-      BY <1>1, <1>6, <2>1 DEF IndInv, CrossingsOk, Moving, ReadersOf, Mem
+      BY <1>1, <1>6, <2>1 DEF IndInv, CrossingsOk, Lending, ReadersOf, Mem
   <1> QED
     BY <1>1, <1>3, <1>4, <1>5, <1>7, <1>8, TrialFrame DEF IndInv
 
@@ -715,16 +702,16 @@ LEMMA ResizeFrame ==
                      valid, vis, trial, dbt, launched, inflight, handoff, requests, alloc,
                      sharedKey, remote, lost, bad>>
   PROVE  /\ AllocOwner' /\ SharedIff' /\ SharedCached' /\ CacheShared' /\ Tables' /\ OwnersOk'
-         /\ DeferredOk' /\ CopiesOk' /\ TasksOk' /\ MovingUnmapped' /\ LostOk' /\ TablesMapped'
+         /\ DeferredOk' /\ CopiesOk' /\ TasksOk' /\ LendingUnmapped' /\ LostOk' /\ TablesMapped'
          /\ HandoffOk' /\ RequestsOk' /\ TrialVisibility' /\ NoBad' /\ CrossingsOk'
-         /\ CopiesPlaced' /\ CrossingsPlaced'
+         /\ CopiesPlaced' /\ CrossingsPlaced' /\ ImportsPlaced'
   <1>1. CrossingsOk'
-    BY DEF IndInv, CrossingsOk, Moving, ReadersOf, Mem, MadeBy
+    BY DEF IndInv, CrossingsOk, Lending, ReadersOf, Mem, MadeBy
   <1> QED
     BY <1>1, AllocOwnerFrame, SharedIffFrame, SharedCachedFrame, CacheSharedFrame, TablesFrame,
-       OwnersOkFrame, DeferredOkFrame, CopiesOkFrame, TasksOkFrame, MovingUnmappedFrame, LostOkFrame,
+       OwnersOkFrame, DeferredOkFrame, CopiesOkFrame, TasksOkFrame, LendingUnmappedFrame, LostOkFrame,
        TablesMappedFrame, HandoffOkFrame, RequestsOkFrame, TrialVisibilityFrame, NoBadFrame,
-       CopiesPlacedFrame, CrossingsPlacedFrame, TransfersFrame DEF IndInv
+       CopiesPlacedFrame, CrossingsPlacedFrame, ImportsPlacedFrame, HandoffTasksFrame DEF IndInv
 
 LEMMA Shrink_Inv ==
   ASSUME IndInv, NEW u \in AllUnits, Shrink(u), UNCHANGED rare

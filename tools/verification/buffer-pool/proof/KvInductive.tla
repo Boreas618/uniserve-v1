@@ -21,7 +21,7 @@ HoldsAt(o, p, u) == IF p = SLOT THEN oslot[o] = u ELSE table[o][p].u = u
 TakesRow(r, o, p) ==
     /\ r.e = OwnerEpoch[o] /\ r.o = o
     /\ CASE r.kind = "release" -> p \in r.ps
-         [] r.kind \in {"detach", "transfer"} -> TRUE
+         [] r.kind \in {"detach", "lend"} -> TRUE
          [] OTHER -> FALSE
 (* Whether stamped request r, of owner o's session, makes row p of o read- *)
 (* only: it commits it, or it replicates it.                               *)
@@ -64,9 +64,10 @@ TypeInv ==
     /\ \A t \in tasks :
          /\ t.units \subseteq AllUnits /\ t.writes \subseteq AllUnits
          /\ t.k \in Keys \cup {NONE} /\ t.h \in HostUnits \cup {NONE}
-         /\ t.slot \in Slots \cup {NONE} /\ t.o \in Owners \cup {NONE} /\ t.to \in Groups \cup {NONE}
+         /\ t.o \in Owners \cup {NONE} /\ t.to \in Groups \cup {NONE}
          /\ t.p \in Positions \cup {NONE}
-         /\ t.kind \in {"transfer", "replicate"} <=> t.k = NONE
+         /\ t.places \subseteq Positions \X Units
+         /\ t.kind \in {"import", "lend", "borrow", "replicate"} <=> t.k = NONE
          /\ t.kind = "prefetch" => t.to \in Groups
     /\ \A r \in requests :
          /\ r.e \in Epochs /\ r.after \in Stamps /\ r.ps \subseteq Positions
@@ -74,7 +75,6 @@ TypeInv ==
          /\ r.c \in 0 .. MaxCopies /\ r.to \in Groups \cup {NONE}
          /\ r.kind # "finish" => r.o \in Owners
          /\ r.kind = "commit" => r.p \in Positions /\ r.k \in Keys
-         /\ r.kind = "transfer" => r.to \in Groups
          /\ r.kind = "replicate" => r.p \in Positions /\ r.to \in Groups
     /\ \A b \in inflight :
          /\ b.reads \subseteq Owners \X AllUnits
@@ -89,8 +89,8 @@ TypeInv ==
               seq |-> c.seq, done |-> c.done, stopped |-> c.stopped]
     /\ \A t \in tasks :
          t = [kind |-> t.kind, k |-> t.k, h |-> t.h,
-              expired |-> t.expired, p |-> t.p, o |-> t.o, to |-> t.to, slot |-> t.slot,
-              held |-> t.held, units |-> t.units, writes |-> t.writes]
+              expired |-> t.expired, p |-> t.p, o |-> t.o, to |-> t.to, held |-> t.held,
+              units |-> t.units, writes |-> t.writes, places |-> t.places]
     /\ \A r \in requests :
          r = [kind |-> r.kind, e |-> r.e, o |-> r.o, ps |-> r.ps, p |-> r.p, k |-> r.k,
               c |-> r.c, ok |-> r.ok, to |-> r.to, after |-> r.after, by |-> r.by, sg |-> r.sg]
@@ -142,9 +142,9 @@ OwnersOk ==
 
 DeferredOk ==
     \A d \in deferred :
-        /\ d.kind \in {"release", "commit", "finish", "transfer", "replicate"}
+        /\ d.kind \in {"release", "commit", "finish", "lend", "replicate"}
         \* A release holds device blocks and slot rows; the end of a copy and a
-        \* transfer that waits hold nothing; a crossing that waits, CrossingsOk.
+        \* lend that waits hold nothing; a crossing that waits, CrossingsOk.
         /\ d.kind = "release" =>
              /\ d.units \subseteq Units \cup Slots
              \* What a release holds left its owner: no owner holds it as a private
@@ -154,7 +154,7 @@ DeferredOk ==
                   /\ \A p \in Positions : table[o][p].k = "private" => table[o][p].u \notin d.units
              \* Nor the new block a clone or a load writes, which is the copy's alone.
              /\ \A c \in copies : ~c.fill => c.write \notin d.units
-        /\ d.kind \in {"finish", "transfer"} => d.units = {}
+        /\ d.kind \in {"finish", "lend"} => d.units = {}
         /\ d.kind = "commit" =>
              /\ d.o \in Owners /\ d.p \in Positions /\ d.k \in Keys
              /\ OwnerEpoch[d.o] \notin lost
@@ -173,9 +173,10 @@ DeferredOk ==
                   /\ c.seq > 0 => d.after[c.g] >= c.seq
                   /\ c.seq = 0 => c.stopped
              /\ \A e \in deferred : (e.kind = "finish" /\ e.c = d.c) => e = d
-        /\ d.kind = "transfer" =>
-             /\ d.o \in Owners /\ d.to \in Groups /\ GroupEpoch[d.to] = OwnerEpoch[d.o]
-             /\ ostate[d.o] # "new"
+        \* A lend that waits is of an owner that does not import.
+        /\ d.kind = "lend" =>
+             /\ d.o \in Owners /\ ostate[d.o] # "new"
+             /\ ~Importing(d.o)
 
 CopiesOk ==
     \A c \in copies :
@@ -204,8 +205,6 @@ CopiesOk ==
                 /\ Mem(c.g) \notin valid[c.write]
                 \* Nothing else fills that memory.
                 /\ \A x \in copies : (x.write = c.write /\ Mem(x.g) = Mem(c.g)) => x = c
-                /\ \A t \in tasks :
-                     (t.kind = "transfer" /\ Mem(t.to) = Mem(c.g)) => c.write \notin t.writes
              \/ c.kind = "restore" /\ c.write \in Slots /\ alloc[c.write] = c.o
              \* A store fills host parts of its key's host block, which nothing
              \* else fills.
@@ -218,52 +217,70 @@ CopiesOk ==
              /\ \A x \in copies : (x.o = c.o /\ x.p = c.p) => x = c
         /\ c.kind \in {"save", "restore"} => c.o \in Owners
         /\ c.o \in Owners => ostate[c.o] # "new"
-        \* An owner a copy writes for does not move.
-        /\ (c.o \in Owners /\ Live(c.o)) => ogroup[c.o] = c.g /\ ~Moving(c.o)
+        \* An owner a copy writes for is not lent.
+        /\ (c.o \in Owners /\ Live(c.o)) => ogroup[c.o] = c.g /\ ~Lending(c.o)
+
+(* The blocks an import or a borrow reads: those of a lend.                *)
+\* @type: ($task) => Set(Str);
+Reads(t) == IF t.kind \in {"import", "borrow"} THEN t.units \ t.writes ELSE {}
 
 TasksOk ==
     \A t \in tasks :
         /\ t.held
         \* A crossing's task, CrossingsOk.
-        /\ t.kind \in {"transfer", "prefetch", "put", "replicate"}
-        /\ t.kind = "transfer" =>
-             /\ t.h = NONE
-             /\ t.o \in Owners /\ t.to \in Groups /\ GroupEpoch[t.to] = OwnerEpoch[t.o]
-             /\ t.slot \in Slots /\ alloc[t.slot] = t.o /\ SlotGroup[t.slot] = t.to
-             \* Its slot row in the target group is held by nothing else.
-             /\ \A o \in Owners : oslot[o] # t.slot
-             /\ \A d \in deferred : t.slot \notin d.units
-             /\ \A c \in copies : c.read # t.slot /\ c.write # t.slot
-             /\ \A x \in tasks : t.slot \notin x.units
-             /\ t.units \subseteq Units \cup Slots
-             /\ t.writes \subseteq t.units \cap Units
+        /\ t.kind \in {"import", "lend", "borrow", "prefetch", "put", "replicate"}
+        /\ t.kind \in {"import", "lend", "borrow"} =>
+             /\ t.h = NONE /\ t.p = NONE /\ t.to = NONE
+             /\ t.o \in Owners /\ ostate[t.o] # "new"
+             /\ t.units \subseteq Units
+        /\ t.kind \in {"lend", "borrow"} => t.writes = {} /\ t.places = {}
+        \* A lend stands for a live owner, once, holds nothing, and its owner
+        \* neither imports nor waits for another lend.
+        /\ t.kind = "lend" =>
+             /\ Live(t.o) /\ t.units = {}
+             /\ \A x \in tasks : (x.kind = "lend" /\ x.o = t.o) => x = t
+             /\ ~\E d \in deferred : d.kind = "lend" /\ d.o = t.o
+             /\ ~Importing(t.o)
+        \* A borrow holds the blocks of a lent owner's table, which stays as it
+        \* is while the owner is lent.
+        /\ (t.kind = "borrow" /\ Live(t.o)) =>
+             /\ \E x \in tasks : x.kind = "lend" /\ x.o = t.o
+             /\ t.units = TableUnits(t.o)
+        \* An import holds the new blocks it writes, one per position, which are
+        \* its owner's and held by nothing else, for positions its owner keeps
+        \* free; its owner is not lent.
+        /\ t.kind = "import" =>
+             /\ t.writes = {x[2] : x \in t.places} /\ t.writes \subseteq t.units
+             /\ \A x, y \in t.places : (x[1] = y[1] \/ x[2] = y[2]) => x = y
              /\ \A u \in t.writes :
-                  Mem(t.to) \notin valid[u] /\ (alloc[u] = t.o \/ alloc[u] = "shared")
-             /\ \A x \in tasks : (x.kind = "transfer" /\ (x.o = t.o \/ x.slot = t.slot)) => x = t
-             \* One memory of a block is filled by one transfer at a time.
-             /\ \A x \in tasks :
-                  (x.kind = "transfer" /\ x # t /\ Mem(x.to) = Mem(t.to)) => x.writes \cap t.writes = {}
-             /\ ~\E d \in deferred : d.kind = "transfer" /\ d.o = t.o
-             /\ Live(t.o) =>
-                  /\ t.units = TableUnits(t.o) \cup {oslot[t.o]}
-                  /\ ~\E c \in copies : c.o = t.o
-                  \* What it does not copy is valid in the target group already.
-                  /\ \A u \in TableUnits(t.o) \ t.writes : Mem(t.to) \in valid[u]
-        /\ t.kind \in {"prefetch", "put"} => t.units = {} /\ t.writes = {} /\ t.slot = NONE
+                  /\ alloc[u] = t.o
+                  /\ \A o \in Owners, p \in Positions : table[o][p].u # u
+                  /\ \A k \in Keys : cache[k] # u
+                  /\ \A d \in deferred : u \notin d.units
+                  /\ \A c \in copies : c.read # u /\ c.write # u
+                  /\ \A x \in tasks : x # t => u \notin x.units
+             /\ \A x \in tasks : (x.kind = "import" /\ x.o = t.o) => x = t
+             /\ ~Lending(t.o)
+             /\ Live(t.o) => \A x \in t.places : table[t.o][x[1]] = Empty /\ ~CopyFor(t.o, x[1])
+        \* What an import or a borrow reads is shared, or a block of a lent owner
+        \* or of one that is gone.
+        /\ \A u \in Reads(t) :
+             \/ alloc[u] = "shared"
+             \/ alloc[u] \in Owners /\ (Live(alloc[u]) => \E x \in tasks : x.kind = "lend" /\ x.o = alloc[u])
+        /\ t.kind \in {"prefetch", "put"} => t.units = {} /\ t.writes = {} /\ t.places = {}
         /\ t.kind = "prefetch" =>
              /\ t.h \in HostUnits /\ alloc[t.h] = "task"
              /\ \A x \in tasks : (x.kind = "prefetch" /\ x.h = t.h) => x = t
         /\ t.kind = "put" => t.h \in HostUnits /\ hcache[t.k] = t.h /\ vis[t.k].h = NONE
 
-(* An owner whose transfer waits or runs is named in no executor's table.  *)
-MovingUnmapped ==
+(* An owner whose lend waits or stands is named in no executor's table.    *)
+LendingUnmapped ==
     \A o \in Owners :
-        (\/ \E t \in tasks : t.kind = "transfer" /\ t.o = o
-         \/ \E d \in deferred : d.kind = "transfer" /\ d.o = o)
+        Lending(o)
             => /\ \A g \in Groups, p \in Rows : dbt[g][o][p].u = NONE
                /\ \A h \in handoff : h.o # o
                /\ \A d, e \in deferred :
-                    (d.kind = "transfer" /\ e.kind = "transfer" /\ d.o = o /\ e.o = o) => d = e
+                    (d.kind = "lend" /\ e.kind = "lend" /\ d.o = o /\ e.o = o) => d = e
 
 LostOk ==
     /\ \A g \in Groups :
@@ -311,7 +328,7 @@ RequestsOk ==
         /\ r.by \subseteq r.sg /\ r.sg \subseteq Groups
         /\ \A g \in r.sg : GroupEpoch[g] = r.e
         /\ \A g \in Groups : r.after[g] <= launched[g] /\ (g \notin r.by => r.after[g] = 0)
-        /\ r.kind \in {"release", "detach", "commit", "transfer", "replicate", "finish"}
+        /\ r.kind \in {"release", "detach", "commit", "lend", "replicate", "finish"}
         /\ r.kind # "finish" =>
              \A g \in Groups, p \in Rows :
                  (dbt[g][r.o][p].u # NONE /\ (TakesRow(r, r.o, p) \/ FreezesRow(r, r.o, p))) =>
@@ -338,8 +355,8 @@ Covered(b, o, u) ==
             /\ HoldsAt(o, p, u)
             /\ \A r \in requests :
                  TakesRow(r, o, p) => b.g \in r.sg /\ (b.g \in r.by => r.after[b.g] >= b.seq)
-       /\ \A d \in deferred : (d.kind = "transfer" /\ d.o = o) => d.after[b.g] >= b.seq
-       /\ ~\E t \in tasks : t.kind = "transfer" /\ t.o = o
+       /\ \A d \in deferred : (d.kind = "lend" /\ d.o = o) => d.after[b.g] >= b.seq
+       /\ ~\E t \in tasks : t.kind = "lend" /\ t.o = o
     \/ \E d \in deferred : d.kind = "release" /\ u \in d.units /\ d.after[b.g] >= b.seq
 
 BatchesOk ==
@@ -381,23 +398,23 @@ CrossingsOk ==
              /\ ostate[d.o] # "new" /\ OwnerEpoch[d.o] \notin lost
              /\ d.to \in ReadersOf(d.o)
              /\ \E u \in Units : d.units = {u} /\ (alloc[u] = d.o \/ alloc[u] = "shared")
-             /\ ~Moving(d.o)
+             /\ ~Lending(d.o)
              \* No copy writes it as a new block.
              /\ \A c \in copies : ~c.fill => c.write \notin d.units
              \* R8, as TrialVisibility states it of the crossing's task.
              /\ \A k \in Keys : cache[k] \in d.units => vis[k].d = MadeBy(OwnerEpoch[d.o])
     /\ \A t \in tasks :
          t.kind = "replicate" =>
-             /\ t.h = NONE /\ t.slot = NONE
+             /\ t.h = NONE /\ t.places = {}
              /\ t.o \in Owners /\ t.p \in Positions /\ t.to \in Groups
              /\ ostate[t.o] # "new" /\ t.to \in ReadersOf(t.o)
              /\ \E u \in Units : t.units = {u} /\ t.writes = {u}
              /\ \A u \in t.writes :
                   Mem(t.to) \notin valid[u] /\ (alloc[u] = t.o \/ alloc[u] = "shared")
-             /\ ~Moving(t.o)
+             /\ ~Lending(t.o)
              \* One memory of a block is filled by one task or load at a time.
              /\ \A x \in tasks :
-                  (x.kind \in {"transfer", "replicate"} /\ x # t /\ Mem(x.to) = Mem(t.to)) =>
+                  (x.kind = "replicate" /\ x # t /\ Mem(x.to) = Mem(t.to)) =>
                       x.writes \cap t.writes = {}
              /\ \A c \in copies :
                   (c.fill /\ c.kind = "load" /\ Mem(c.g) = Mem(t.to)) => c.write \notin t.writes
@@ -411,9 +428,9 @@ IndInv ==
     /\ FreeClean /\ NoLeak /\ Outside /\ Regions
     /\ AllocOwner /\ SharedIff /\ SharedCached /\ CacheShared
     /\ Tables /\ OwnersOk /\ DeferredOk /\ CopiesOk /\ TasksOk
-    /\ MovingUnmapped /\ LostOk
+    /\ LendingUnmapped /\ LostOk
     /\ TablesMapped /\ HandoffOk /\ RequestsOk /\ BatchesOk
     /\ CrossingsOk
-    /\ TrialVisibility /\ CopiesPlaced /\ CrossingsPlaced
+    /\ TrialVisibility /\ CopiesPlaced /\ CrossingsPlaced /\ ImportsPlaced
     /\ NoBad
 =============================================================================

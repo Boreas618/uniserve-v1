@@ -1,7 +1,7 @@
 ---------------------------- MODULE MC_HostSplit ----------------------------
 (* Host copies per host part: a group on host A (part pa) and a group     *)
 (* whose ranks lie on both hosts, copying with pa and pb (a whole-unit     *)
-(* region's part 0 on each host).                                          *)
+(* region's part 0 on each host). Two owners, each in either group.        *)
 EXTENDS KvInductive, KvP7, KvP8, TLC
 
 CONSTANTS ga, gb, sa, sb, e1, pa, pb
@@ -22,7 +22,7 @@ NoR4 == Without("R4")
 NoR5 == Without("R5")
 NoR11 == Without("R11")
 
-Symmetry == Permutations(Units)
+Symmetry == Permutations(Units) \cup Permutations(Owners)
 
 (* Witnesses: a host copy held on both parts; a load by gb that started.   *)
 NeverBothParts == ~\E k \in Keys : hcache[k] # NONE /\ valid[hcache[k]] = {pa, pb}

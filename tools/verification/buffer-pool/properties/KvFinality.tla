@@ -28,7 +28,7 @@ Fairness ==
     /\ WF_vars((\E g \in Groups, r \in requests : ExecStamp(g, r)) /\ UNCHANGED rare)
     /\ WF_vars((\E r \in requests :
                   TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r)
-                    \/ TakeTransfer(r)) /\ UNCHANGED rare)
+                    \/ TakeLend(r)) /\ UNCHANGED rare)
     /\ WF_vars((\E d \in deferred : FinishDue(d)) /\ UNCHANGED rare)
     /\ WF_vars((\E b \in inflight : EndBatch(b)) /\ UNCHANGED rare)
     /\ WF_vars(\E t \in tasks : Deadline(t))

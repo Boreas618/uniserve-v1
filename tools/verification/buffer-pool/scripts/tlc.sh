@@ -6,7 +6,8 @@
 # the module: the mutation that leaves rule Rn out. With HAZARDS=Hn the hazard
 # Hn of the system as built is switched on. With ONLY="Inv..." the configuration's
 # invariants are replaced by TypeOK and the ones named.
-# The full output is kept in $TLC_LOGS (default: a temporary directory).
+# The full output is kept in $TLC_LOGS (default: a temporary directory); TLC's
+# states are removed when the run ends.
 set -u
 T=${TLA_TOOLS:-/workspace/dev/tools/tla}
 module=$1; config=${2:-$1}; shift; [ $# -gt 0 ] && shift; [ "${1:-}" = "--" ] && shift
@@ -35,6 +36,8 @@ log="$logs/$name.log"
     -DTLA-Library="$here/model:$here/properties:$here/proof:$T/tlaps/lib/tlapm/stdlib" -cp "$T/tla2tools.jar" tlc2.TLC \
     -workers ${TLC_WORKERS:-32} -noGenerateSpecTE -metadir "$logs/states-$name" -config "$cfg" "$@" "$spec" > "$log" 2>&1
 status=$?
+# The states directory is only TLC's working store.
+rm -rf "$logs/states-$name"
 grep -E "^Error: (Invariant|Action property|Temporal|Deadlock|.*is violated)|^State [0-9]+: <|states generated,|Model checking completed|The depth of the complete|Finished in|Error: " "$log" \
     | sed -E 's/^(State [0-9]+: <[A-Za-z]+(\([^)]*\))?).*/\1>/'
 echo "exit $status, log $log"

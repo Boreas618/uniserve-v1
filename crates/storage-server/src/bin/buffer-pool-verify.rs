@@ -24,7 +24,7 @@ use storage_server::buffer_pool::{enumeration, replay};
 #[command(name = "buffer-pool-verify")]
 enum Verify {
     /// Enumerate every request sequence of the named configurations (every one when none is
-    /// named: core, copies, transfer, tiers, cross, parts, trial).
+    /// named: core, copies, handoff, tiers, cross, parts, trial).
     Enumerate {
         /// Write each configuration's states (`<name>.txt`), its transitions with their inputs
         /// (`<name>.steps`) and a transition the model does not allow (`forged.steps`) here.

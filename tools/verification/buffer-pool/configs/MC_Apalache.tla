@@ -42,6 +42,7 @@ ConstInit ==
     /\ HostParts = {"pa", "pb"}
     /\ GroupParts = [g \in {"g1", "g2", "g3"} |-> IF g = "g2" THEN {"pa", "pb"} ELSE {"pa"}]
     /\ Readers = [g \in {"g1", "g2", "g3"} |-> IF g = "g1" THEN {"g2"} ELSE {}]
+    /\ Handoffs = TRUE
 
 (* Any state that satisfies IndInv, with collections of at most three      *)
 (* elements.                                                               *)
@@ -79,12 +80,15 @@ Next5 == /\ \/ \E g \in Groups : Launch(g)
             \/ \E c \in copies, ok \in BOOLEAN : ExecFinish(c, ok)
          /\ UNCHANGED rare
 Next6 == /\ \E r \in requests :
-              TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+              TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeLend(r)
          /\ UNCHANGED rare
 Next7 == /\ \E d \in deferred : ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d)
          /\ UNCHANGED rare
-Next8 == /\ \/ \E d \in deferred : TransferDue(d)
-            \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok)
+Next8 == /\ \/ \E d \in deferred : LendDue(d)
+            \/ \E o \in Owners, ps \in SUBSET Positions, l \in Owners \cup {NONE} : Import(o, ps, l)
+            \/ \E o \in Owners : Borrow(o)
+            \/ \E t \in tasks : GiveBack(t) \/ ReleaseBorrow(t)
+            \/ \E t \in tasks, ok \in BOOLEAN : ImportEnd(t, ok)
          /\ UNCHANGED rare
 Next9 == \/ \E k \in Keys, g \in Groups : Prefetch(k, g)
          \/ \E k \in Keys : StoreRemote(k)

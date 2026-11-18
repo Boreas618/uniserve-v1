@@ -92,14 +92,14 @@ THEOREM InitInv == Init => IndInv
   BY DEF AllocOwner, SharedIff, SharedCached, CacheShared
 <1>4. Tables /\ OwnersOk /\ DeferredOk /\ CopiesOk /\ TasksOk
   BY DEF Tables, OwnersOk, DeferredOk, CopiesOk, TasksOk, Live
-<1>5. MovingUnmapped /\ LostOk
-  BY DEF MovingUnmapped, LostOk
+<1>5. LendingUnmapped /\ LostOk
+  BY DEF LendingUnmapped, Lending, LostOk
 <1>6. TablesMapped /\ HandoffOk /\ RequestsOk /\ BatchesOk
   BY DEF TablesMapped, HandoffOk, RequestsOk, BatchesOk
 <1>7. TrialVisibility /\ NoBad
   BY DEF TrialVisibility, NoBad
-<1>8. CrossingsOk /\ CopiesPlaced /\ CrossingsPlaced
-  BY DEF CrossingsOk, CopiesPlaced, CrossingsPlaced
+<1>8. CrossingsOk /\ CopiesPlaced /\ CrossingsPlaced /\ ImportsPlaced
+  BY DEF CrossingsOk, CopiesPlaced, CrossingsPlaced, ImportsPlaced
 <1> QED
   BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6, <1>7, <1>8 DEF IndInv
 
