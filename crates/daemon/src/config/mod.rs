@@ -310,11 +310,10 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[reload(generation)]
     pub moe_runner_backend: Option<String>,
-    /// This host's Build Server (`build_config`): the socket the daemon
-    /// prepares an epoch's modules at (§5.1, §6.3), the Build Server's
-    /// default socket when unset, and the settings it starts the host's
-    /// Build Server with when none serves there. A host-layer value: the
-    /// daemon reads it alone, and a change of it is a hot restart.
+    /// The deployment's Build Server on each node (`build_config`): the settings the node's
+    /// daemon starts it with, which prepares the epochs' modules (§5.1, §6.3) in the
+    /// deployment's own directories. The daemon reads it alone: a change of it is a hot restart,
+    /// whose successor replaces a Build Server that serves with other settings.
     #[reload(daemon)]
     pub build_config: build_server::command::Settings,
     /// Concurrently resident requests, clamped to what the workers hold.
@@ -369,11 +368,12 @@ pub struct Config {
     /// `server_config`'s.
     #[reload(daemon)]
     pub admin_config: AdminConfig,
-    /// The settings of the Storage Server of every host the deployment
-    /// serves on (`storage_config`): a daemon that starts a host's server
-    /// starts it with them, and one that finds a server serving with others
-    /// refuses to share it.
-    #[reload(storage)]
+    /// The settings of the deployment's Storage Server on every node it serves on
+    /// (`storage_config`). A change of the settings a running server reads when it acts takes
+    /// effect at the next step, in the running servers; one of the settings fixed when a server's
+    /// processes start replaces every node's server, and the engines follow as an epoch
+    /// ([`storage_effect`]).
+    #[reload(by = storage_effect)]
     pub storage_config: storage::ServerSettings,
     #[reload(epoch)]
     pub load_config: LoadConfig,
@@ -654,7 +654,6 @@ impl Config {
                 engine_host,
                 worker_groups,
             },
-            deployment: self.served_model_name().to_owned(),
             max_running_requests: self.max_running_requests,
             max_num_batched_tokens: self.max_num_batched_tokens,
             max_logprobs: self.max_logprobs,
@@ -963,11 +962,21 @@ impl Config {
         instance.join(format!("requests.{}.sock", std::process::id()))
     }
 
-    /// The options of this node's daemon. The leader's process socket lies in the daemon's
-    /// instance directory `instance`; the node's Storage Server, when it has none, starts with the
-    /// deployment's [`Config::storage_settings`].
-    pub fn daemon_options(&self, identity: &Identity, instance: &Path) -> DaemonOptions {
+    /// The options of this node's daemon of the deployment `deployment`, whose runtime directory
+    /// is `runtime`. The leader's process socket lies in the daemon's instance directory
+    /// `instance`; the deployment's Storage Server
+    /// on the node serves with the deployment's [`Config::storage_settings`], and its Build Server
+    /// with `build_config`.
+    pub fn daemon_options(
+        &self,
+        identity: &Identity,
+        instance: &Path,
+        runtime: service::RuntimeDirectory,
+        deployment: &str,
+    ) -> DaemonOptions {
         DaemonOptions {
+            deployment: deployment.to_owned(),
+            runtime,
             nnodes: identity.nodes,
             node_rank: identity.rank,
             host: identity.host.clone(),
@@ -996,6 +1005,19 @@ impl Config {
             server,
             connector: self.kv_cache_config.mooncake.clone(),
         }
+    }
+}
+
+/// How a change of `storage_config` from `previous` to `next` takes effect: at the next step when
+/// the running Storage Servers take every changed setting (`storage::ServerSettings::restarts`),
+/// otherwise by replacing them, which a start always does.
+fn storage_effect(
+    previous: Option<&storage::ServerSettings>,
+    next: &storage::ServerSettings,
+) -> proto::reload::Effect {
+    match previous {
+        Some(previous) if !previous.restarts(next) => proto::reload::Effect::Step,
+        _ => proto::reload::Effect::Storage,
     }
 }
 

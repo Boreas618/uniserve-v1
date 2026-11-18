@@ -678,20 +678,29 @@ impl Client {
     }
 
     /// See [`Request::Restart`]: the successor runs `image`, the descriptor of an executable
-    /// opened for reading, whose `storage-server` command `arguments` select. Returns the
-    /// successor's process id.
-    pub fn restart(&mut self, image: BorrowedFd<'_>, arguments: Vec<String>) -> Result<u32> {
-        match self.request(&Request::Restart { arguments }, &[image])?.0 {
+    /// opened for reading, whose `storage-server` command `arguments` select, and serves with
+    /// `settings`, or with this server's when `None`. Returns the successor's process id.
+    pub fn restart(
+        &mut self,
+        image: BorrowedFd<'_>,
+        arguments: Vec<String>,
+        settings: Option<crate::settings::Settings>,
+    ) -> Result<u32> {
+        let request = Request::Restart {
+            arguments,
+            settings: settings.map(Box::new),
+        };
+        match self.request(&request, &[image])?.0 {
             Response::Restarting { pid } => Ok(pid),
             other => Err(unexpected("restart", &other)),
         }
     }
 
-    /// See [`Request::Retire`]. Returns how many tensors were released.
-    pub fn retire(&mut self, deployment: String) -> Result<u64> {
-        match self.request(&Request::Retire { deployment }, &[])?.0 {
-            Response::Retired { released } => Ok(released),
-            other => Err(unexpected("retire", &other)),
+    /// See [`Request::Configure`]: the running server serves with `settings` from now on.
+    pub fn configure(&mut self, settings: crate::settings::ServerSettings) -> Result<()> {
+        match self.request(&Request::Configure { settings }, &[])?.0 {
+            Response::Configured => Ok(()),
+            other => Err(unexpected("configure", &other)),
         }
     }
 

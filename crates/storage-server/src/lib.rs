@@ -24,8 +24,7 @@
 //! sessions and runs the pools' tasks on the children.
 //!
 //! [`command`] is the `uniserve storage-server` command: [`serve`] runs a
-//! server, and [`list`] and [`retire`] are the operator's commands against a
-//! running one.
+//! server, and [`list`] is the operator's listing of a running one.
 //!
 //! One thread serves every client with `poll(2)`. Requests get their responses in
 //! order on their connection. A request that must wait for a previous
@@ -69,7 +68,7 @@ pub use child::{Children, Program};
 pub use error::Error;
 use kv_storage::{KvStorage, Task};
 pub use restart::Resumed;
-pub use serve::{Rendering, ServeOptions, Start, list, retire, serve};
+pub use serve::{Rendering, ServeOptions, Start, list, serve};
 use service::Connection;
 use shoot::ShootDowns;
 
@@ -326,6 +325,50 @@ impl Server {
     /// `buffer_pool::replay` replays it and checks the pool's tables after every input).
     pub fn watch_pools(&mut self, trace: Option<std::path::PathBuf>) {
         self.sessions.watch_pools(trace);
+    }
+
+    /// `configure`: see [`Request::Configure`]. Every part of the server that reads a setting
+    /// when it acts is given the new value: the admission of host storage reads the settings
+    /// themselves, the buffer pools and their helpers take the deadlines, the shoot-downs their
+    /// deadline, the children's supervisors their waits, and the Transfer Server, when it runs,
+    /// its chunk time and progress period. The published readiness record states the settings
+    /// from then on.
+    fn configure(
+        &mut self,
+        settings: &::storage::ServerSettings,
+    ) -> Result<Handling, (ErrorKind, String)> {
+        if self.settings.server.restarts(settings) {
+            return Err(invalid(
+                "the settings differ in one a running server cannot take: a restart in place \
+                 serves with them",
+            ));
+        }
+        self.sessions.configure(settings);
+        self.shootdowns.set_deadline(settings.shoot_down());
+        self.kv_storage.process.configure(settings);
+        self.transfers.process.configure(settings);
+        if let Some(transfer_server) = self.transfers.client {
+            self.events.push((
+                transfer_server,
+                Event::Pace {
+                    chunk_us: settings.transfer_chunk_us,
+                    progress_ms: settings.transfer_progress_ms,
+                },
+                Vec::new(),
+            ));
+        }
+        self.settings.server = settings.clone();
+        tracing::info!(?settings, "serving with new settings");
+
+        if let Some(record) = &mut self.readiness {
+            record.settings = self.settings.clone();
+            if let Some(service::Endpoint::Unix(socket)) = &record.endpoints.storage
+                && let Err(error) = service::host::publish(socket, record)
+            {
+                tracing::warn!(%error, "the readiness record states the earlier settings");
+            }
+        }
+        Ok(Handling::Response(Response::Configured, Vec::new()))
     }
 
     /// Also accept connections from other hosts on `listener`, which carry no descriptors.
@@ -907,11 +950,21 @@ impl Server {
                 },
                 Role::Head { deployment, .. },
             ) => self.pages_for(id, &deployment, (region, *part), pages, *upload),
-            (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
-            (Request::Restart { arguments }, Role::Operator) => self
-                .begin_restart(descriptors.into_iter().next(), arguments)
+            (
+                Request::Restart {
+                    arguments,
+                    settings,
+                },
+                Role::Operator,
+            ) => self
+                .begin_restart(
+                    descriptors.into_iter().next(),
+                    arguments,
+                    settings.as_deref().cloned(),
+                )
                 .map(|pid| Handling::Response(Response::Restarting { pid }, Vec::new()))
                 .map_err(resource),
+            (Request::Configure { settings }, Role::Operator) => self.configure(settings),
             (
                 Request::Claim {
                     claimant,
@@ -1233,11 +1286,6 @@ impl Server {
             released = count,
             "a head claimed the deployment"
         );
-        // The host serves the deployments whose heads run on it: every
-        // other one is retired, so its weights and caches do not outlive it.
-        for other in self.idle_deployments(deployment) {
-            self.release_deployment(&other);
-        }
         Ok(Handling::Response(Response::Claimed { claim }, Vec::new()))
     }
 
@@ -1266,53 +1314,6 @@ impl Server {
             self.update_committed(deployment, epoch);
         }
         Ok(Handling::Response(Response::Published, Vec::new()))
-    }
-
-    /// The deployments other than `except` that hold a claim or a tensor and
-    /// whose head is not connected.
-    fn idle_deployments(&self, except: &str) -> Vec<String> {
-        let mut named: BTreeSet<String> = self.deployments.keys().cloned().collect();
-        named.extend(self.tensors.values().flat_map(|tensor| {
-            tensor
-                .retainers
-                .iter()
-                .map(|retainer| retainer.scope.deployment.clone())
-        }));
-        named
-            .into_iter()
-            .filter(|deployment| deployment != except)
-            .filter(|deployment| {
-                !self.deployments.get(deployment).is_some_and(|entry| {
-                    entry
-                        .head
-                        .is_some_and(|head| self.clients.contains_key(&head))
-                })
-            })
-            .collect()
-    }
-
-    /// Release every tensor and the buffer pool of `deployment` and forget
-    /// its claim. Returns the tensors released.
-    fn release_deployment(&mut self, deployment: &str) -> u64 {
-        self.deployments.remove(deployment);
-        let released: Vec<TensorId> = self
-            .tensors
-            .iter_mut()
-            .filter_map(|(id, tensor)| {
-                tensor
-                    .retainers
-                    .retain(|retainer| retainer.scope.deployment != deployment);
-                tensor.retainers.is_empty().then_some(*id)
-            })
-            .collect();
-        let count = released.len() as u64;
-        for id in released {
-            self.remove_tensor(&id);
-        }
-        self.release_pools(deployment);
-        self.quotas.release(deployment);
-        tracing::info!(deployment, released = count, "retired a deployment");
-        count
     }
 
     /// Refuse `bytes` of new host storage that the host cannot hold: its
@@ -1514,27 +1515,6 @@ impl Server {
         );
         Ok(Handling::Response(
             Response::Retained { released: count },
-            Vec::new(),
-        ))
-    }
-
-    /// `retire`: see [`Request::Retire`]. Processes that still map the
-    /// deployment's storage keep it alive until they end; nobody takes new
-    /// access to it.
-    fn retire(&mut self, deployment: &str) -> Result<Handling, (ErrorKind, String)> {
-        if let Some(entry) = self.deployments.get(deployment)
-            && entry
-                .head
-                .is_some_and(|head| self.clients.contains_key(&head))
-        {
-            return Err((
-                ErrorKind::Claimed,
-                format!("deployment {deployment} has a connected head"),
-            ));
-        }
-        let count = self.release_deployment(deployment);
-        Ok(Handling::Response(
-            Response::Retired { released: count },
             Vec::new(),
         ))
     }

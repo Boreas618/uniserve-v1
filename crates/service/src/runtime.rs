@@ -11,8 +11,10 @@
 //! the user alone owns and enters ([`fallback`]). Every process of the user without the variable
 //! finds the same directory, so its services and their clients meet there.
 //!
-//! The host services keep their files beside their socket in that directory
-//! ([`crate::host`]). Every other server owns an instance directory there ([`Instance`]): it
+//! A deployment's servers on a node, its Storage Server and its Build Server, keep their files
+//! beside their sockets in the deployment's own directory there
+//! ([`RuntimeDirectory::deployment`], [`crate::host`]). Every other server owns an instance
+//! directory there ([`Instance`]): it
 //! creates the directory under a name no other instance holds, every socket and file of the
 //! instance lives inside it, and its owner removes it when the instance ends. A caller never
 //! derives an instance's paths: the instance reports them in its readiness record
@@ -36,7 +38,8 @@ const PRIVATE: u32 = 0o700;
 
 /// UniServe's directory inside the user's runtime directory: `$XDG_RUNTIME_DIR/uniserve`, mode
 /// 0700.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct RuntimeDirectory(PathBuf);
 
 impl RuntimeDirectory {
@@ -96,9 +99,27 @@ impl RuntimeDirectory {
         &self.0
     }
 
-    /// The socket of the host service `service` in this directory: `<service>.sock`.
+    /// The socket of the server `service` in this directory: `<service>.sock`.
     pub fn socket(&self, service: &str) -> PathBuf {
         self.0.join(format!("{service}.sock"))
+    }
+
+    /// The runtime directory of the deployment `name` inside this one (`deployments/<name>`,
+    /// [`crate::deployment`]), created with mode 0700 when absent: where the deployment's
+    /// Storage Server and Build Server on this node keep their sockets, locks, readiness records
+    /// and logs, apart from every other deployment's.
+    ///
+    /// # Errors
+    ///
+    /// What [`crate::deployment`] refuses `name` with, and what creating or restricting the
+    /// directories fails with.
+    pub fn deployment(&self, name: &str) -> io::Result<Self> {
+        let directory = crate::deployment(&self.0, name)?;
+        if let Some(parent) = directory.parent() {
+            create_private(parent)?;
+        }
+        create_private(&directory)?;
+        Ok(Self(directory))
     }
 }
 
@@ -304,6 +325,35 @@ mod tests {
         let refused = RuntimeDirectory::within(&missing).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::NotFound);
         assert!(!missing.exists());
+    }
+
+    /// A deployment's runtime directory is its own, private to its owner, and holds the sockets
+    /// of its servers.
+    #[test]
+    fn a_deployment_has_a_private_directory_of_its_own() {
+        let session = tempfile::tempdir().unwrap();
+        let runtime = RuntimeDirectory::within(session.path()).unwrap();
+
+        let first = runtime.deployment("first").unwrap();
+        let second = runtime.deployment("second").unwrap();
+        assert_ne!(
+            first.socket("storage-server"),
+            second.socket("storage-server")
+        );
+        assert_eq!(
+            first.socket("storage-server"),
+            runtime.path().join("deployments/first/storage-server.sock")
+        );
+        for directory in [first.path(), runtime.path().join("deployments").as_path()] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().mode() & 0o777,
+                PRIVATE
+            );
+        }
+        assert_eq!(
+            runtime.deployment("../first").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     /// Instances of one kind get directories of their own, private to their owner, which their

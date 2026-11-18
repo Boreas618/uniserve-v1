@@ -23,7 +23,7 @@ fn a_server_whose_successor_ends_without_taking_it_over_goes_on() {
     // A successor that refuses its command line ends before it answers.
     let program = helper();
     let refused = || vec!["--log-level".to_owned(), "unknown".to_owned()];
-    let successor = operator.restart(program.image(), refused()).unwrap();
+    let successor = operator.restart(program.image(), refused(), None).unwrap();
     assert!(successor > 0);
 
     // The pools serve again once the restart is given up.
@@ -36,7 +36,7 @@ fn a_server_whose_successor_ends_without_taking_it_over_goes_on() {
 
     // The restart is no longer under way: another may begin, and is given
     // up alike.
-    operator.restart(program.image(), refused()).unwrap();
+    operator.restart(program.image(), refused(), None).unwrap();
     let attach = Request::Attach {
         owner: OwnerId(2),
         group: DECODE,

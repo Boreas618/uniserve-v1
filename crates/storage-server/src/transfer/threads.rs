@@ -52,6 +52,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -448,17 +449,35 @@ struct Shared {
     calibration: Arc<Calibration>,
     /// Each GPU's UUID, by the device that runs its copy threads.
     gpus: HashMap<DeviceId, [u8; 16]>,
-    /// The time a chunk lasts at its link's bandwidth.
-    chunk: Duration,
-    /// How often a running task reports its progress at most.
-    progress: Duration,
+    /// The time a chunk lasts at its link's bandwidth, in nanoseconds: the server may change it
+    /// while threads run ([`CopyThreads::pace`]), and each thread sizes its next chunk by the
+    /// value it reads then.
+    chunk: AtomicU64,
+    /// How often a running task reports its progress at most, in nanoseconds, read at each
+    /// report.
+    progress: AtomicU64,
     /// The host's page size, which chunks are whole multiples of.
     page: u64,
+}
+
+/// `duration` in whole nanoseconds, the longest a `u64` holds at most.
+fn nanoseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         ::service::lock(&self.state)
+    }
+
+    /// The time a chunk lasts at its link's bandwidth now.
+    fn chunk(&self) -> Duration {
+        Duration::from_nanos(self.chunk.load(Ordering::Relaxed))
+    }
+
+    /// How often a running task reports its progress at most now.
+    fn progress(&self) -> Duration {
+        Duration::from_nanos(self.progress.load(Ordering::Relaxed))
     }
 
     fn wake_main(&self) {
@@ -556,7 +575,7 @@ impl Shared {
                 if let Some(budget) = state.budgets.get_mut(link) {
                     budget.refund(bytes);
                 }
-                let reported = state.abandon(piece.task, now, self.progress);
+                let reported = state.abandon(piece.task, now, self.progress());
                 drop(state);
                 if reported {
                     self.wake_main();
@@ -584,7 +603,7 @@ impl Shared {
             piece.copied(),
             failure,
             Instant::now(),
-            self.progress,
+            self.progress(),
         );
         drop(purged);
         if failed {
@@ -648,8 +667,8 @@ impl CopyThreads {
                 wake,
                 calibration,
                 gpus,
-                chunk: policy.chunk,
-                progress: policy.progress,
+                chunk: AtomicU64::new(nanoseconds(policy.chunk)),
+                progress: AtomicU64::new(nanoseconds(policy.progress)),
                 page: rustix::param::page_size() as u64,
             }),
             network,
@@ -715,13 +734,24 @@ impl CopyThreads {
             entry.end = Some(TaskStatus::Cancelled);
         }
         let purged = state.purge(task);
-        let reported = state.report(task, Instant::now(), self.shared.progress);
+        let reported = state.report(task, Instant::now(), self.shared.progress());
         drop(state);
         drop(purged);
         self.shared.paced.notify_all();
         if reported {
             self.shared.wake_main();
         }
+    }
+
+    /// Cut every chunk from now on by `policy`: each thread sizes its next chunk by the new chunk
+    /// time, and each task reports its progress by the new period from its next report.
+    pub(super) fn pace(&self, policy: &Policy) {
+        self.shared
+            .chunk
+            .store(nanoseconds(policy.chunk), Ordering::Relaxed);
+        self.shared
+            .progress
+            .store(nanoseconds(policy.progress), Ordering::Relaxed);
     }
 
     /// Change the budgets of `links` and of every link a task of `tasks`
@@ -826,9 +856,16 @@ trait Copier {
 /// Run `thread`'s chunks with `copier`, sized by the link's `cost`, until
 /// nothing is queued or in flight.
 fn run<C: Copier>(shared: &Shared, thread: &ThreadKey, copier: &mut C, cost: Cost) {
-    let sizing = Sizing::of(cost, shared.chunk, shared.page, C::ASYNCHRONOUS);
+    let mut chunk = shared.chunk();
+    let mut sizing = Sizing::of(cost, chunk, shared.page, C::ASYNCHRONOUS);
     let mut flight: VecDeque<(Piece, C::Flight)> = VecDeque::with_capacity(sizing.depth);
     loop {
+        // A chunk time the server changed sizes the next chunk; the chunks in flight keep theirs.
+        let paced = shared.chunk();
+        if paced != chunk {
+            chunk = paced;
+            sizing = Sizing::of(cost, chunk, shared.page, C::ASYNCHRONOUS);
+        }
         let piece = match shared.next(thread, sizing.bytes, !flight.is_empty()) {
             Next::Chunk(piece) => piece,
             Next::Busy => {

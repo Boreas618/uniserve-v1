@@ -1,9 +1,13 @@
 //! The Build Server (design section 6): it compiles package revisions, keeps them,
 //! and hands them out.
 //!
-//! One process per host and serving user, beside the Storage Server: a host
-//! service (the `service` crate) on [`default_socket`], started as
-//! `uniserve build-server serve`, and by a daemon whose host has none. It
+//! One process per deployment on each of its nodes, beside the deployment's
+//! daemon and Storage Server there: a server of the deployment (`service::host`)
+//! on its [`socket`], started as `uniserve build-server serve --deployment NAME`
+//! by the deployment's daemon when none serves. It compiles and keeps its
+//! modules in the deployment's own directories, so no deployment builds for or
+//! reads the store of another; a release's read-only stores are read by every
+//! deployment that names them. It
 //! does three things: compile a package into the modules of its descriptors,
 //! keep those modules, and answer `install`, `prepare`, `resolve`, `list` and
 //! `cover` on its Unix socket. It launches no kernel and allocates no device
@@ -76,19 +80,27 @@ pub use store::{ModulePath, Root, Store};
 pub use target::Target;
 pub use toolchain::Toolchains;
 
-/// The socket of this host's Build Server for the calling user: `build-server.sock` in the
-/// user's runtime directory ([`service::RuntimeDirectory`]), where the running server also
-/// publishes its readiness record (`service::host::running`).
+/// The server name of the Build Server: its command and the name of its socket and the files
+/// beside it in its deployment's runtime directory.
+pub const SERVICE: &str = "build-server";
+
+/// The socket of the Build Server of `deployment` in the runtime directory `runtime` (the
+/// user's, [`service::RuntimeDirectory::of_user`], on every node): `build-server.sock` in the
+/// deployment's runtime directory ([`service::RuntimeDirectory::deployment`]), where the running
+/// server also publishes its readiness record (`service::host::running`).
 ///
 /// # Errors
 ///
-/// Fails when the user has no runtime directory.
-pub fn default_socket() -> std::io::Result<std::path::PathBuf> {
-    Ok(service::RuntimeDirectory::of_user()?.socket("build-server"))
+/// Fails when `deployment` names no deployment's directory, or it cannot be created.
+pub fn socket(
+    runtime: &service::RuntimeDirectory,
+    deployment: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    Ok(runtime.deployment(deployment)?.socket(SERVICE))
 }
 
 /// A Build Server's readiness record: its socket (`build`) and the settings it serves with, which
-/// a starter that states settings compares with its own ([`command::Settings::serves`]).
+/// the deployment's daemon compares with the settings its deployment states.
 pub type Readiness = service::Readiness<command::Settings>;
 
 /// The readiness record of a Build Server of this process serving on `socket` with `settings`,
@@ -101,10 +113,7 @@ pub fn readiness(socket: &std::path::Path, settings: &command::Settings) -> Read
             build: Some(service::Endpoint::unix(socket)),
             ..service::Endpoints::default()
         },
-        command::Settings {
-            socket: Some(socket.to_path_buf()),
-            ..settings.clone()
-        },
+        settings.clone(),
     )
 }
 

@@ -55,6 +55,8 @@ use ::storage::protocol::Retainer;
 pub struct Pending {
     successor: Successor,
     channel: Connection,
+    /// The settings the successor serves with: the operator's, or this server's.
+    settings: ::storage::Settings,
     /// Whether the successor said it speaks this server's versions: the server passes itself
     /// on once nothing is in flight from then on.
     agreed: bool,
@@ -283,6 +285,7 @@ impl Server {
         &mut self,
         image: Option<OwnedFd>,
         arguments: &[String],
+        settings: Option<::storage::Settings>,
     ) -> io::Result<u32> {
         if self.restart.is_some() {
             return Err(io::Error::new(
@@ -308,7 +311,8 @@ impl Server {
         let pidfd = Arc::try_unwrap(pidfd)
             .map_err(|_| io::Error::other("the successor's pidfd is shared"))?;
         tracing::info!(pid, "started the successor server");
-        let pending = Pending::new(Successor { pid, pidfd }, Connection::new(ours)?);
+        let settings = settings.unwrap_or_else(|| self.settings.clone());
+        let pending = Pending::new(Successor { pid, pidfd }, Connection::new(ours)?, settings);
         // The buffer pools start no work from now on, and their tasks end.
         self.sessions.thread.send(|pools| pools.freeze());
         self.restart = Some(pending);
@@ -472,7 +476,12 @@ impl Server {
             .collect();
         let (sessions, queue_descriptors) = self.sessions.hand_off(|pidfd| pidfds.index(pidfd))?;
 
-        let tcp = self.tcp.take();
+        // A listener for other hosts the successor's settings state otherwise is the successor's
+        // to bind; this one closes with this server.
+        let tcp = self
+            .tcp
+            .take()
+            .filter(|_| pending.settings.server.tcp == self.settings.server.tcp);
         let mut descriptors: Vec<OwnedFd> = vec![OwnedFd::from(self.listener.try_clone()?), lock];
         if let Some((listener, _)) = &tcp {
             descriptors.push(OwnedFd::from(listener.try_clone()?));
@@ -485,7 +494,7 @@ impl Server {
         descriptors.extend(queue_descriptors);
         let handoff = Handoff {
             socket,
-            settings: self.settings.clone(),
+            settings: pending.settings.clone(),
             tcp: tcp.map(|(_, address)| address),
             pidfds: pidfds.descriptors.len(),
             clients,
@@ -620,13 +629,22 @@ impl Server {
         let listener = UnixListener::from(next()?);
         listener.set_nonblocking(true)?;
         let lock = next()?;
-        let tcp = match handoff.tcp {
-            Some(address) => {
+        let tcp = match (handoff.tcp, &handoff.settings.server.tcp) {
+            (Some(address), _) => {
                 let listener = std::net::TcpListener::from(next()?);
                 listener.set_nonblocking(true)?;
                 Some((listener, address))
             }
-            None => None,
+            // The predecessor accepted other hosts elsewhere or not at all: this server binds
+            // the endpoint its settings state.
+            (None, Some(endpoint)) => {
+                let listener = crate::serve::bind_tcp(endpoint)?;
+                listener.set_nonblocking(true)?;
+                let address = listener.local_addr()?;
+                tracing::info!(%address, "accepting other hosts' connections");
+                Some((listener, address))
+            }
+            (None, None) => None,
         };
         let pidfds: Vec<Arc<OwnedFd>> = (0..handoff.pidfds)
             .map(|_| next().map(Arc::new))
@@ -784,7 +802,7 @@ impl Server {
 impl Pending {
     /// A restart of `successor`, to which this server states the versions it speaks on its end
     /// of the handoff socket, `channel`.
-    fn new(successor: Successor, mut channel: Connection) -> Self {
+    fn new(successor: Successor, mut channel: Connection, settings: ::storage::Settings) -> Self {
         let versions = Message::Versions {
             protocol: VERSION,
             runtime: runtime::VERSION,
@@ -798,6 +816,7 @@ impl Pending {
         Self {
             successor,
             channel,
+            settings,
             agreed: false,
         }
     }
@@ -893,7 +912,11 @@ mod tests {
             pid: pid.as_raw_nonzero().get().unsigned_abs(),
             pidfd: rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).unwrap(),
         };
-        server.restart = Some(Pending::new(this_process, Connection::new(ours).unwrap()));
+        server.restart = Some(Pending::new(
+            this_process,
+            Connection::new(ours).unwrap(),
+            server.settings.clone(),
+        ));
         while server
             .restart
             .as_ref()

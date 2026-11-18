@@ -599,7 +599,7 @@ pub(crate) fn start(
     // same epoch, and maps the regions both name.
     let mut head = StorageClient::connect_head(
         Path::new(&storage.socket),
-        &launch.engine_config.deployment,
+        &launch.deployment,
         launch.epoch,
         launch.engine,
     )?;
@@ -845,7 +845,7 @@ fn start_peer(
     // which follows the epoch's processes for the session's close as for any session.
     let mut hosts = StorageClient::connect_head(
         Path::new(&storage.socket),
-        &launch.engine_config.deployment,
+        &launch.deployment,
         launch.epoch,
         launch.engine,
     )?;

@@ -1,17 +1,18 @@
 //! What every UniServe process shares: its runtime files, the endpoints it binds and the
-//! readiness record that reports them, the host services, the one connection every process
-//! interface runs on, logging and the stop signals.
+//! readiness record that reports them, a deployment's servers on a node, the one connection every
+//! process interface runs on, logging and the stop signals.
 //!
 //! Runtime files live in the user's runtime directory ([`RuntimeDirectory`]); a server that is
-//! not a host service owns an instance directory there ([`Instance`]). Every server binds its
-//! listeners when it starts, port 0 allowed, and reports the [`Endpoint`]s it bound in its
+//! not one of a deployment's servers owns an instance directory there ([`Instance`]). Every
+//! server binds its listeners when it starts, port 0 allowed, and reports the [`Endpoint`]s it bound in its
 //! [`Readiness`] record, written to the descriptor its caller passed ([`ReadyFd`]) and served by
 //! its status route; callers read the record instead of choosing ports or deriving paths.
 //!
-//! The Storage Server and the Build Server are host services ([`host`]): one server per host and
-//! user, owning its socket by a lock, publishing its readiness record beside its socket, started
-//! detached from its starter when absent ([`host::start`]) and stopped by its `stop` request or
-//! SIGTERM. A server logs to standard error in the one convention of every process ([`logging`])
+//! The Storage Server and the Build Server are a deployment's servers on each of its nodes
+//! ([`host`]): one of each per deployment and node, in the deployment's runtime directory
+//! ([`RuntimeDirectory::deployment`]), owning its socket by a lock, publishing its readiness
+//! record beside its socket, started detached from its starter when absent ([`host::start`]) and
+//! stopped by its `stop` request or SIGTERM ([`host::stop`]). A server logs to standard error in the one convention of every process ([`logging`])
 //! and stops on SIGTERM or SIGINT ([`stop_signals`]), the one stop mechanism every process waits
 //! on.
 //!
@@ -34,7 +35,7 @@ pub use connection::{
     Connection, Handed, Hangup, Listener, Liveness, Message, Socket, Wake, Waker,
     receive_buffer_bytes, wait_ready,
 };
-pub use directories::{cache_directory, data_directory};
+pub use directories::{cache_directory, data_directory, deployment};
 pub use endpoint::{Endpoint, EndpointError};
 pub use readiness::{Endpoints, Readiness, ReadyFd, ReadyReader, State};
 pub use runtime::{Instance, RuntimeDirectory};

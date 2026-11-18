@@ -1145,10 +1145,14 @@ mod tests {
     }
 
     /// The `range_marker` package's modules on `device`, as the start installs them: selected and
-    /// built for the device's target at the host's Build Server (`build_server::default_socket`),
-    /// which holds the package.
+    /// built for the device's target at the Build Server of the deployment `device-cases` on this
+    /// host (`build_server::socket`), which holds the package.
     fn kernels(device: DeviceId) -> Vec<KernelEntry> {
-        let socket = build_server::default_socket().unwrap();
+        let socket = build_server::socket(
+            &service::RuntimeDirectory::of_user().unwrap(),
+            "device-cases",
+        )
+        .unwrap();
         let mut client = build_server::Client::connect(&socket).unwrap();
         let targets = [build_server::Target::arch(device.compute_capability().unwrap()).unwrap()];
         let (packages, routes) =

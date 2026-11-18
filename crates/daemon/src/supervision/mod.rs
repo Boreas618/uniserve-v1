@@ -3,8 +3,9 @@
 //!
 //! The daemons are peers. A daemon supervises the processes of its node
 //! (`supervisor`): it starts them as its children, reaps them and reports
-//! their exits. It holds its node's claim at the Storage Server (`claims`), so a
-//! claim outlives every engine.
+//! their exits. It keeps the deployment's Build Server and Storage Server on the
+//! node serving with the deployment's settings, and holds the node's claim at
+//! the Storage Server (`claims`), so a claim outlives every engine.
 //!
 //! The daemons talk the process interface (`proto::process`). Each member
 //! daemon joins the leader at the leader's address; the leader then accepts
@@ -24,8 +25,8 @@ mod supervisor;
 pub(crate) use service::{ServiceHandoff, readable};
 pub(crate) use supervisor::engine_executable;
 
-/// The kernel's name of the executable image this process runs. The host services a daemon starts
-/// (the Build Server and the Storage Server) are commands of the running build, so the daemon
+/// The kernel's name of the executable image this process runs. The servers a daemon starts for
+/// its deployment (the Build Server and the Storage Server) are commands of the running build, so the daemon
 /// starts them from its own image: the path names that image even after the file it was loaded
 /// from is replaced or removed.
 pub(crate) const RUNNING_IMAGE: &str = "/proc/self/exe";
@@ -90,6 +91,13 @@ impl<T> ToService<T> {
 /// Where a daemon runs and how it reaches the other nodes' daemons.
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
+    /// The deployment, by its policy package's name: the daemon's Storage Server and Build
+    /// Server on the node are the deployment's own.
+    pub deployment: String,
+    /// The node's runtime directory, the user's ([`::service::RuntimeDirectory::of_user`]):
+    /// the deployment's Storage Server and Build Server keep their sockets in the deployment's
+    /// directory there.
+    pub runtime: ::service::RuntimeDirectory,
     /// Nodes of the deployment.
     pub nnodes: u32,
     /// This node's rank; the leader is rank 0.
@@ -103,10 +111,10 @@ pub struct DaemonOptions {
     pub socket: PathBuf,
     /// How long the leader waits for the members, and a member for the leader's welcome.
     pub join_timeout: Duration,
-    /// This node's Build Server, which the engines the node starts resolve their
-    /// modules from (`build_config`).
+    /// The settings of the deployment's Build Server on this node, which the engines the node
+    /// starts resolve their modules from (`build_config`).
     pub build_server: build_server::command::Settings,
-    /// The settings of the Storage Server of every node the deployment serves on
+    /// The settings of the deployment's Storage Server on every node it serves on
     /// (`Config::storage_settings`). The leader gives them to every claim of the
     /// deployment, so the Storage Server a node starts for it serves with them.
     pub storage: storage::Settings,
@@ -557,10 +565,20 @@ fn local(
     wake: Wake,
 ) -> anyhow::Result<Local> {
     Ok(Local::new(
-        Supervisor::new(options.host.clone())
-            .context("creating the daemon's lifeline")?
-            .with_build_server(options.build_server.clone()),
-        ClaimHolder::new(remote_pages, address, options.storage.clone()),
+        Supervisor::new(
+            options.host.clone(),
+            options.runtime.clone(),
+            options.deployment.clone(),
+        )
+        .context("creating the daemon's lifeline")?
+        .with_build_server(options.build_server.clone()),
+        ClaimHolder::new(
+            options.runtime.clone(),
+            options.deployment.clone(),
+            remote_pages,
+            address,
+            options.storage.clone(),
+        ),
         address,
         wake,
     ))
@@ -720,6 +738,8 @@ mod tests {
         let join = network.then(|| Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap());
         let mut daemon = Daemon::start(
             DaemonOptions {
+                deployment: "model".to_owned(),
+                runtime: ::service::RuntimeDirectory::within(directory.path()).unwrap(),
                 nnodes: 1,
                 node_rank: 0,
                 host: "localhost".to_owned(),

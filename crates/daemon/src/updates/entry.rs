@@ -190,7 +190,7 @@ impl Leader {
     }
 
     /// Fixes the module set `target` runs: every interface's revision, as
-    /// this host's Build Server's `cover` selects it, with every module built
+    /// the deployment's Build Server on this node selects it with `cover`, with every module built
     /// on every host `target`'s processes run on before anything starts from
     /// it.
     async fn fix_modules(&self, target: &Config) -> Result<crate::epoch::ModuleSet, UpdateError> {
@@ -209,10 +209,7 @@ impl Leader {
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
         let local = crate::engine::control::BuildServer {
             host: control.host().to_owned(),
-            socket: target
-                .build_config
-                .socket()
-                .map_err(|error| UpdateError::Refused(format!("{error}")))?,
+            socket: control.build_server().to_owned(),
             targets: Vec::new(),
         };
         crate::leader::fix_modules(local, Some(control), hosts, named).await

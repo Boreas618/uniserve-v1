@@ -414,6 +414,17 @@ impl Process {
         })
     }
 
+    /// Waits as `settings` state before the child starts again from now on, and starts a
+    /// Transfer Server again with the chunk time and progress period they state, which the
+    /// running one is told apart ([`::storage::protocol::Event::Pace`]).
+    pub(super) fn configure(&mut self, settings: &::storage::ServerSettings) {
+        self.restart_after = Backoff::of(settings);
+        if let Some(Launch::Transfer(options)) = &mut self.launch {
+            options.chunk = settings.transfer_chunk();
+            options.progress = settings.transfer_progress();
+        }
+    }
+
     /// The child the supervisor runs, while it runs one.
     pub(super) fn child(&self) -> Option<Child> {
         self.launch.as_ref().map(Launch::child)

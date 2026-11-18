@@ -750,6 +750,33 @@ impl Leader {
         Ok(results)
     }
 
+    /// The settings of the deployment's Storage Servers as the serving configuration states
+    /// them (`Config::storage_settings`).
+    pub(crate) fn storage_settings(&self) -> storage::Settings {
+        service::lock(&self.replicas()[0].config).storage_settings()
+    }
+
+    /// Has the deployment's Storage Server on every node serve with `settings`
+    /// (`EngineControl::configure_storage`), and returns once each does: what a change of
+    /// `storage_config` or of the Mooncake connector does to the servers, before the engines
+    /// follow. A deployment whose engine has not started has no server to change yet: each node
+    /// starts its server with the settings the claims state.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's server cannot take the settings.
+    pub(crate) async fn configure_storage(
+        &self,
+        settings: storage::Settings,
+    ) -> anyhow::Result<()> {
+        let Some(control) = self.replicas()[0].control.get().cloned() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || control.configure_storage(&settings))
+            .await
+            .context("the change of the Storage Servers' settings did not complete")?
+    }
+
     pub fn flush_cache(&self) -> Result<(), UpdateError> {
         for replica in self.replicas() {
             replica.flush_cache()?;
@@ -786,12 +813,19 @@ impl Leader {
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(families, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
+        // The deployment's name is the updater's: every node's daemon and servers know it by it.
+        let deployment = updates.deployment().to_owned();
+        let build_server = crate::engine::control::ensure_build_server(
+            &service::RuntimeDirectory::of_user()?,
+            &deployment,
+            &config.build_config,
+        )?;
         let control = Arc::new(EngineControl::new(
             &config.request_socket(instance),
             daemon,
             config.leader_host(),
-            config.served_model_name().to_owned(),
-            crate::engine::control::ensure_build_server(&config.build_config)?,
+            deployment,
+            build_server.clone(),
         )?);
 
         // The epoch's whole module set is fixed before any engine starts: the
@@ -803,7 +837,7 @@ impl Leader {
         // apply fixed (`lock`), never what `latest` names by now.
         let local = crate::engine::control::BuildServer {
             host: control.host().to_owned(),
-            socket: config.build_config.socket()?,
+            socket: build_server,
             targets: Vec::new(),
         };
         let hosts = epoch_hosts(&prepared.engine)?;

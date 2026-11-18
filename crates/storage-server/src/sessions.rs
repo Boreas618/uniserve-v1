@@ -79,7 +79,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use storage::ServerSettings;
 use storage::protocol::{
-    Allocation, ErrorKind, Event, HostCopy, Key, Location, PageShape, Priority, Region, RegionPart,
+    ErrorKind, Event, HostCopy, Key, Location, PageShape, Priority, Region, RegionPart,
     Response, Role, Segment, Span, StorageRecord, UnitRun,
 };
 use storage::runtime::{Open, RequestId, Source, Tier};
@@ -279,6 +279,16 @@ impl Sessions {
     /// when `check` is set ([`polling::Pools::watch`]).
     pub(crate) fn watch_pools(&self, trace: Option<PathBuf>) {
         self.thread.send(move |pools| pools.watch(trace));
+    }
+
+    /// Bounds the transfers and puts that start from now on as `settings` state
+    /// (`transfer_deadline_s`, `put_deadline_s`): the pools' tasks, and the waits of the helpers
+    /// that run them on other hosts.
+    pub(crate) fn configure(&mut self, settings: &ServerSettings) {
+        self.transfer_deadline = settings.transfer_deadline();
+        self.put_deadline = settings.put_deadline();
+        let limits = crate::buffer_pool::limits(settings);
+        self.thread.send(move |pools| pools.limit(limits));
     }
 
     fn with(thread: polling::Thread, settings: &ServerSettings) -> std::io::Result<Self> {
@@ -2025,41 +2035,4 @@ impl Server {
         self.cancel_pool_transfer(number);
     }
 
-    /// The deployment is no longer served: its pool goes with every session,
-    /// and so do its host regions' parts and the places of its units.
-    pub(crate) fn release_pools(&mut self, deployment: &str) {
-        let named = deployment.to_owned();
-        self.sessions
-            .thread
-            .send(move |pools| pools.release(&named));
-        self.sessions.open.retain(|(of, ..), _| of != deployment);
-        self.sessions.gone.retain(|(of, ..), _| of != deployment);
-        self.sessions.hosts.retain(|(of, _), _| of != deployment);
-        self.sessions.places.retain(|(of, ..), _| of != deployment);
-        self.sessions.peers.retain(|(of, _), _| of != deployment);
-        self.sessions.remote.retain(|(of, ..), _| of != deployment);
-        let parts: Vec<Part> = self
-            .sessions
-            .parts
-            .iter()
-            .filter(|((of, ..), _)| of == deployment)
-            .map(|(_, part)| *part)
-            .collect();
-        self.sessions.parts.retain(|(of, ..), _| of != deployment);
-        for part in parts {
-            self.storages.remove(&part.storage);
-            self.allocation_released(Allocation::Storage {
-                storage: part.storage,
-            });
-            if self.kv_storage.offered.remove(&part.pool)
-                && let Some(connector) = self.kv_storage.client
-            {
-                self.events.push((
-                    connector,
-                    Event::PoolReleased { pool: part.pool },
-                    Vec::new(),
-                ));
-            }
-        }
-    }
 }

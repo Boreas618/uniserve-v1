@@ -1,11 +1,11 @@
-//! The `uniserve storage-server` command: the Storage Server of one host,
-//! and the operator's commands against it.
+//! The `uniserve storage-server` command: a deployment's Storage Server on one
+//! node, and the operator's commands against it.
 //!
-//! `serve` holds this host's retained storage for the calling user until it
-//! is stopped ([`crate::serve`]), with the settings one document states
-//! (`--settings PATH`, or `-` for standard input; `storage::Settings`): a
-//! deployment's daemon passes its deployment's settings that way when it
-//! starts the Storage Server of a host that has none (`service::host::start`),
+//! `serve --deployment NAME` holds the deployment's retained storage on this
+//! node until it is stopped ([`crate::serve`]), with the settings one document
+//! states (`--settings PATH`, or `-` for standard input; `storage::Settings`):
+//! the deployment's daemon passes its settings that way when it starts the
+//! deployment's Storage Server on a node that has none (`service::host::start`),
 //! and an operator writes the same document to a file. With `--daemon` it
 //! leaves its starter's session first (`service::host::detach`) and the
 //! starter prints the server's readiness record once it serves; `--ready-fd`
@@ -22,10 +22,11 @@
 //! settings name (`transfer_calibration`).
 //!
 //! `status` prints the running server's readiness record (its endpoints and
-//! settings), `stop` stops it and returns once it ended, `list` prints what it
-//! holds, `retire` releases the storage of a deployment that is no longer
-//! served, and `restart` passes the running server to a successor of this
-//! command's own build.
+//! settings), `stop` stops it, releasing everything it holds, and returns once
+//! it ended, `list` prints what it holds, and `restart` passes the running
+//! server to a successor of this command's own build. Each names the server it
+//! reaches by its deployment (`--deployment NAME`) or by its socket
+//! (`--socket PATH`).
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -47,7 +48,7 @@ const PREDECESSOR_OPTION: &str = "predecessor";
 
 /// The `storage-server` command's arguments.
 #[derive(Debug, clap::Parser)]
-#[command(name = "storage-server", about = "The Storage Server of one host")]
+#[command(name = "storage-server", about = "A deployment's Storage Server on one node")]
 pub struct Args {
     #[command(subcommand)]
     pub command: Command,
@@ -56,10 +57,14 @@ pub struct Args {
 /// The `storage-server` subcommands.
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// Serve this host's retained storage until stopped.
+    /// Serve a deployment's retained storage on this node until stopped.
     Serve {
-        /// The socket to listen on; this user's default socket when unset.
-        #[arg(long)]
+        /// The deployment whose storage the server holds: it listens on the deployment's socket
+        /// (`storage::socket`) unless `--socket` names another.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+        /// The socket to listen on.
+        #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
         /// Leave the starter's session, log beside the socket, and return to
         /// the starter once serving, printing the server's readiness record.
@@ -92,39 +97,56 @@ pub enum Command {
     /// Print the running server's readiness record: its endpoints and the
     /// settings it serves with, one JSON line.
     Status {
-        #[arg(long)]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        server: Address,
     },
-    /// Stop the running server and return once it ended.
+    /// Stop the running server, which releases everything it holds, and return once it ended.
     Stop {
-        #[arg(long)]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        server: Address,
     },
     /// Print the tensors, bytes and deployments the running server holds,
     /// and the buffer pool of each deployment.
     List {
-        #[arg(long)]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        server: Address,
         /// Print the listing as one JSON document (`storage::protocol::Listing`) instead of
         /// its text rendering.
         #[arg(long)]
         json: bool,
     },
-    /// Release the storage of a deployment that is no longer served; refused
-    /// while its head is connected.
-    Retire {
-        #[arg(long)]
-        socket: Option<PathBuf>,
-        #[arg(long)]
-        deployment: String,
-    },
     /// Hand the running server to a successor of this command's build, which
     /// goes on with every connection, tensor and buffer pool once nothing is
     /// in flight (a restart in place).
     Restart {
-        #[arg(long)]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        server: Address,
     },
+}
+
+/// The Storage Server an operator's command reaches: the one on the socket it names, or the
+/// Storage Server of the deployment it names on this node (`storage::socket`).
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[group(required = true, multiple = false)]
+pub struct Address {
+    /// The Storage Server's socket.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// The deployment whose Storage Server on this node is meant.
+    #[arg(long, value_name = "NAME")]
+    pub deployment: Option<String>,
+}
+
+impl Address {
+    /// The socket the address names.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a deployment is named and the user has no runtime directory, or the name is
+    /// no deployment's.
+    pub fn socket(&self) -> anyhow::Result<PathBuf> {
+        socket_of(self.socket.clone(), self.deployment.as_deref())
+    }
 }
 
 /// The entry arguments of a restart's successor of the handoff socket at `predecessor`
@@ -157,11 +179,19 @@ pub fn read_settings(path: &Path) -> anyhow::Result<::storage::Settings> {
         .with_context(|| format!("parsing the settings {}", path.display()))
 }
 
-/// `socket`, or this user's default socket.
-fn socket_or_default(socket: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    match socket {
-        Some(socket) => Ok(socket),
-        None => ::storage::default_socket().context("finding this user's Storage Server socket"),
+/// `socket`, or the socket of `deployment`'s Storage Server on this node.
+fn socket_of(socket: Option<PathBuf>, deployment: Option<&str>) -> anyhow::Result<PathBuf> {
+    match (socket, deployment) {
+        (Some(socket), _) => Ok(socket),
+        (None, Some(deployment)) => {
+            let runtime = service::RuntimeDirectory::of_user()
+                .context("finding the user's runtime directory")?;
+            ::storage::socket(&runtime, deployment)
+                .with_context(|| format!("finding the Storage Server socket of {deployment}"))
+        }
+        (None, None) => anyhow::bail!(
+            "name the Storage Server's deployment (--deployment) or its socket (--socket)"
+        ),
     }
 }
 
@@ -183,6 +213,7 @@ fn this_program(levels: &service::logging::Levels) -> anyhow::Result<Program> {
 pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> {
     match args.command {
         Command::Serve {
+            deployment,
             socket,
             daemon,
             ready_fd,
@@ -197,7 +228,7 @@ pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> 
                     crate::Start::Successor(handoff)
                 }
                 None => crate::Start::Fresh {
-                    socket: socket_or_default(socket)?,
+                    socket: socket_of(socket, deployment.as_deref())?,
                     settings: Box::new(match &settings {
                         Some(path) => read_settings(path)?,
                         None => ::storage::Settings::default(),
@@ -219,8 +250,8 @@ pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> 
             crate::child::run(channel, levels)
         }
         Command::Calibrate(arguments) => crate::transfer::calibration::measure::run(&arguments),
-        Command::Status { socket } => {
-            let socket = socket_or_default(socket)?;
+        Command::Status { server } => {
+            let socket = server.socket()?;
             let readiness = ::storage::Client::connect(&socket, ::storage::Role::Operator)
                 .and_then(|mut operator| operator.status())
                 .with_context(|| format!("asking the Storage Server at {}", socket.display()))?;
@@ -228,35 +259,32 @@ pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> 
             std::io::Write::write_all(&mut std::io::stdout().lock(), &line)?;
             Ok(())
         }
-        Command::Stop { socket } => {
-            let socket = socket_or_default(socket)?;
+        Command::Stop { server } => {
+            let socket = server.socket()?;
             ::storage::Client::connect(&socket, ::storage::Role::Operator)
                 .and_then(|operator| operator.stop(STOP_TIMEOUT))
                 .with_context(|| format!("stopping the Storage Server at {}", socket.display()))
         }
-        Command::List { socket, json } => {
+        Command::List { server, json } => {
             let rendering = if json {
                 crate::Rendering::Json
             } else {
                 crate::Rendering::Text
             };
             crate::list(
-                &socket_or_default(socket)?,
+                &server.socket()?,
                 rendering,
                 &mut std::io::stdout().lock(),
             )
         }
-        Command::Retire { socket, deployment } => {
-            crate::retire(&socket_or_default(socket)?, &deployment).map_err(anyhow::Error::from)
-        }
-        Command::Restart { socket } => {
-            let socket = socket_or_default(socket)?;
+        Command::Restart { server } => {
+            let socket = server.socket()?;
             // The successor runs this command's own build: the operator restarts the server
             // into the executable it runs.
             let program = this_program(levels)?;
             let pid = ::storage::Client::connect(&socket, ::storage::Role::Operator)
                 .and_then(|mut operator| {
-                    operator.restart(program.image(), program.prefix().to_vec())
+                    operator.restart(program.image(), program.prefix().to_vec(), None)
                 })
                 .with_context(|| {
                     format!("restarting the Storage Server at {}", socket.display())

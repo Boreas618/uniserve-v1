@@ -1,24 +1,26 @@
-//! Host services: the servers a host runs once per serving user, and their lifetime.
+//! A deployment's servers on a node and their lifetime.
 //!
-//! The Storage Server and the Build Server are host services. Each listens on a Unix socket in the
-//! user's runtime directory ([`crate::RuntimeDirectory`]), so only that user's processes connect,
-//! and outlives the processes that use it. Every file of a service sits beside its socket and is
-//! named after it: `NAME.sock` is the socket, `NAME.lock` the lock that makes one server the
-//! socket's owner for its life, `NAME.start` the lock its owner holds while it starts,
-//! `NAME.ready` the readiness record the owner publishes once it serves (the service's entry in
-//! the host's registry of services), and `NAME.log` the log of a server started detached.
+//! The Storage Server and the Build Server run once per deployment on each of its nodes, beside
+//! the deployment's daemon there. Each listens on a Unix socket in the deployment's runtime
+//! directory ([`crate::RuntimeDirectory::deployment`]), so only that user's processes connect and
+//! no other deployment reaches it, and outlives the processes that use it, the daemon included.
+//! Every file of a server sits beside its socket and is named after it: `NAME.sock` is the socket,
+//! `NAME.lock` the lock that makes one server the socket's owner for its life, `NAME.start` the
+//! lock its owner holds while it starts, `NAME.ready` the readiness record the owner publishes once
+//! it serves, and `NAME.log` the log of a server started detached.
 //!
 //! A server binds with [`bind`]: it becomes the socket's owner, or learns that another server
 //! owns it and reads that server's record. Starts are serialized by the start lock, which a
 //! starting owner holds until it published its record ([`Starting::finish`]), so a second
 //! starter blocks on that lock until the first serves or dies, and never waits by probing.
 //!
-//! A process that needs a service starts it with [`start`]: when no server owns the socket
+//! The deployment's daemon starts a server with [`start`]: when no server owns the socket
 //! ([`running`]), it runs the executable's `NAME serve --socket PATH --daemon` command, which
 //! leaves its starter's session and process tree ([`detach`]) and reports its readiness record
 //! on the starter's standard output; [`start`] returns that record, or the running server's.
-//! The service's settings travel in its record, so a caller compares them with the settings it
-//! states. A server stops on its `stop` request or SIGTERM ([`crate::stop_signals`]).
+//! The server's settings travel in its record, so the daemon compares them with the settings
+//! its deployment states, and replaces a server of its own deployment that serves with others
+//! ([`stop`]). A server stops on its `stop` request or SIGTERM ([`crate::stop_signals`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
@@ -85,20 +87,7 @@ impl SocketLock {
     ///
     /// What serializing, writing or renaming fails with.
     pub fn publish<S: Serialize>(&self, record: &Readiness<S>) -> io::Result<()> {
-        let path = beside(&self.socket, "ready");
-        let staged = beside(&self.socket, &format!("ready.{}", std::process::id()));
-        let written = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(PRIVATE_FILE)
-            .open(&staged)
-            .and_then(|mut file| file.write_all(&record.line()?))
-            .and_then(|()| std::fs::rename(&staged, &path));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&staged);
-        }
-        written
+        publish(&self.socket, record)
     }
 
     /// The lock's file, for a successor that goes on with the server to hold
@@ -128,6 +117,31 @@ impl Drop for SocketLock {
         let _ = std::fs::remove_file(beside(&self.socket, "ready"));
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+/// Publishes `record` as the entry of the server that owns `socket` (`NAME.ready`), replacing
+/// any earlier one at once: the record is written beside and renamed into place, so a reader
+/// never sees part of one. The owner alone calls it: once it serves ([`SocketLock::publish`]),
+/// and again when what its record states changes, as a Storage Server's settings do.
+///
+/// # Errors
+///
+/// What serializing, writing or renaming fails with.
+pub fn publish<S: Serialize>(socket: &Path, record: &Readiness<S>) -> io::Result<()> {
+    let path = beside(socket, "ready");
+    let staged = beside(socket, &format!("ready.{}", std::process::id()));
+    let written = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(PRIVATE_FILE)
+        .open(&staged)
+        .and_then(|mut file| file.write_all(&record.line()?))
+        .and_then(|()| std::fs::rename(&staged, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    written
 }
 
 /// An owner that has bound its socket and not yet published its record: it holds the start lock,
@@ -375,19 +389,80 @@ pub fn detach(socket: &Path, relay: Option<ReadyFd>) -> io::Result<ReadyFd> {
     }
 }
 
-/// Makes sure the host service `name` serves on `socket` and returns its readiness record: the
+/// Stops the server that owns `socket`, when one does, and returns once it ended: it is sent
+/// SIGTERM, which every server stops on, and, when it has not ended `grace` later, SIGKILL. The
+/// end is read from the process's pidfd, never probed; once the process ended the kernel released
+/// its ownership lock, so the socket is free for the next server.
+///
+/// # Errors
+///
+/// Fails when the owner's record cannot be read, or its process cannot be signalled or waited for.
+pub fn stop(socket: &Path, grace: Duration) -> io::Result<()> {
+    let Some(record) = running::<serde::de::IgnoredAny>(socket)? else {
+        return Ok(());
+    };
+    let pid = rustix::process::Pid::from_raw(record.pid as i32).ok_or_else(|| {
+        io::Error::other(format!(
+            "the server on {} names no process",
+            socket.display()
+        ))
+    })?;
+    let pidfd = match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        // It ended between the record's read and now.
+        Err(rustix::io::Errno::SRCH) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for signal in [rustix::process::Signal::TERM, rustix::process::Signal::KILL] {
+        match rustix::process::pidfd_send_signal(&pidfd, signal) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::SRCH) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        if ended(&pidfd, grace)? {
+            tracing::info!(pid = record.pid, socket = %socket.display(), "a server stopped");
+            return Ok(());
+        }
+    }
+    // SIGKILL ends every process; the wait for it is the kernel's.
+    ended(&pidfd, Duration::MAX).map(drop)
+}
+
+/// Whether the process of `pidfd` ended within `timeout`: its pidfd turns readable then.
+fn ended(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
+    let mut descriptors = [libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let milliseconds = libc::c_int::try_from(timeout.as_millis()).unwrap_or(-1);
+    loop {
+        // SAFETY: poll reads and writes the one descriptor entry it is given.
+        match unsafe { libc::poll(descriptors.as_mut_ptr(), 1, milliseconds) } {
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            ready => return Ok(ready > 0),
+        }
+    }
+}
+
+/// Makes sure the server `name` serves on `socket` and returns its readiness record: the
 /// record of the server that owns the socket ([`running`]), or, when none does, of the server
 /// started as `executable name serve --socket SOCKET --daemon ARGUMENTS` with `input` on its
 /// standard input.
 ///
-/// The service runs in a session of its own, not as a child of this process, so this process's
+/// The server runs in a session of its own, not as a child of this process, so this process's
 /// end never ends it. The starter reports the server's records on its standard output once the
 /// server serves ([`detach`]) and exits once the server closes its readiness descriptor, so the
 /// wait for them ends with the server serving or with its end, which is reported with its log.
 ///
 /// # Errors
 ///
-/// Fails when the service cannot be started, or ends before it serves.
+/// Fails when the server cannot be started, or ends before it serves.
 pub fn start<S: DeserializeOwned>(
     executable: &Path,
     name: &str,

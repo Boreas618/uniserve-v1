@@ -95,6 +95,7 @@ mod tests {
             engine_config: Config::default()
                 .engine_config()
                 .expect("the configuration resolves"),
+            deployment: "model".to_owned(),
             epoch: 12,
             predecessor: Some(Predecessor { epoch: 11 }),
             expert_order: [(

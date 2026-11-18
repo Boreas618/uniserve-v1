@@ -2,9 +2,10 @@
 //! Server through the engine's own module load (`engine::modules::load`), and device tensors with
 //! stated values.
 //!
-//! The device is GPU 0 of the process (`CUDA_VISIBLE_DEVICES`' first) and the server this host's
-//! Build Server, which `uniserve build-server serve` starts on its socket in the user's runtime
-//! directory (`build_server::default_socket`).
+//! The device is GPU 0 of the process (`CUDA_VISIBLE_DEVICES`' first) and the server the Build
+//! Server of the deployment [`DEPLOYMENT`] on this host, which `uniserve build-server serve
+//! --deployment device-cases` starts on its socket in the deployment's runtime directory
+//! (`build_server::socket`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,6 +19,9 @@ use tensor::{DType, Tensor};
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
 
+/// The deployment whose Build Server the device cases load their kernels from.
+pub(crate) const DEPLOYMENT: &str = "device-cases";
+
 /// A failure of the bench itself: a missing server, a module that does not load.
 pub(crate) type Outcome<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -28,13 +32,13 @@ pub(crate) struct Kernels {
 }
 
 impl Kernels {
-    /// Connects to this host's Build Server.
+    /// Connects to the Build Server of [`DEPLOYMENT`] on this host.
     pub(crate) fn open() -> Outcome<Self> {
-        let socket = build_server::default_socket()?;
+        let socket = build_server::socket(&service::RuntimeDirectory::of_user()?, DEPLOYMENT)?;
         let client = Client::connect(&socket).map_err(|error| {
             format!(
-                "no Build Server serves on {}: start one with `uniserve build-server serve` \
-                 ({error})",
+                "no Build Server serves on {}: start one with `uniserve build-server serve \
+                 --deployment {DEPLOYMENT}` ({error})",
                 socket.display()
             )
         })?;

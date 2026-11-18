@@ -30,7 +30,7 @@ struct Deployment {
 impl Deployment {
     fn start() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let member = BuildServerStandIn::serve(directory.path().join("member.build"), false, 0);
+        let member = BuildServerStandIn::serve(&directory.path().join("member"), false, 0);
         let mut deployment = Self::with_member_build_server(&member);
         deployment._build_servers.push(member);
         deployment._directories.push(directory);
@@ -40,11 +40,17 @@ impl Deployment {
     /// A deployment whose member's host is served by the Build Server `member`.
     fn with_member_build_server(member: &BuildServerStandIn) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let leader = BuildServerStandIn::serve(directory.path().join("leader.build"), false, 0);
+        let leader = BuildServerStandIn::serve(&directory.path().join("leader"), false, 0);
         // The leader's join listener, bound on a port the kernel picks; the member joins at the
         // endpoint it bound.
         let (join, endpoint) = Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap();
         let options = |node_rank: u32, host: &str| DaemonOptions {
+            deployment: crate::support::DEPLOYMENT.to_owned(),
+            runtime: if host == "member" {
+                member.runtime()
+            } else {
+                leader.runtime()
+            },
             nnodes: 2,
             node_rank,
             host: host.to_owned(),
@@ -154,10 +160,11 @@ fn the_members_processes_end_with_the_leader() {
 #[test]
 fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() {
     let directory = tempfile::tempdir().unwrap();
-    let build_server =
-        BuildServerStandIn::serve(directory.path().join("build-server.sock"), false, 0);
+    let build_server = BuildServerStandIn::serve(directory.path(), false, 0);
     let (join, endpoint) = Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap();
     let options = |nnodes: u32, node_rank: u32, host: &str| DaemonOptions {
+        deployment: crate::support::DEPLOYMENT.to_owned(),
+        runtime: build_server.runtime(),
         nnodes,
         node_rank,
         host: host.to_owned(),
@@ -224,8 +231,7 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
 #[test]
 fn a_node_prepares_the_module_set_at_its_build_server_and_serves_meanwhile() {
     let directory = tempfile::tempdir().unwrap();
-    let modules =
-        BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
+    let modules = BuildServerStandIn::serve(&directory.path().join("member-modules"), true, 0);
     let deployment = Deployment::with_member_build_server(&modules);
     let mut engine = Engine::connect(&deployment.address);
 
@@ -254,8 +260,7 @@ fn a_node_prepares_the_module_set_at_its_build_server_and_serves_meanwhile() {
 #[test]
 fn a_preparation_fails_naming_its_node_when_the_node_is_lost() {
     let directory = tempfile::tempdir().unwrap();
-    let modules =
-        BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
+    let modules = BuildServerStandIn::serve(&directory.path().join("member-modules"), true, 0);
     let mut deployment = Deployment::with_member_build_server(&modules);
     let mut engine = Engine::connect(&deployment.address);
 
@@ -280,9 +285,9 @@ fn a_preparation_fails_naming_its_node_when_the_node_is_lost() {
 fn an_epoch_is_prepared_at_every_host_it_runs_on_at_once() {
     let directory = tempfile::tempdir().unwrap();
     let leader_modules =
-        BuildServerStandIn::serve(directory.path().join("leader/build-server.sock"), true, 0);
+        BuildServerStandIn::serve(&directory.path().join("leader-modules"), true, 0);
     let member_modules =
-        BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
+        BuildServerStandIn::serve(&directory.path().join("member-modules"), true, 0);
     let deployment = Deployment::with_member_build_server(&member_modules);
     let control = EngineControl::new(
         &directory.path().join("requests.sock"),
@@ -317,9 +322,9 @@ fn an_epoch_is_prepared_at_every_host_it_runs_on_at_once() {
 fn a_host_that_prepares_other_modules_fails_the_preparation() {
     let directory = tempfile::tempdir().unwrap();
     let leader_modules =
-        BuildServerStandIn::serve(directory.path().join("leader/build-server.sock"), false, 0);
+        BuildServerStandIn::serve(&directory.path().join("leader-modules"), false, 0);
     let member_modules =
-        BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), false, 1);
+        BuildServerStandIn::serve(&directory.path().join("member-modules"), false, 1);
     let deployment = Deployment::with_member_build_server(&member_modules);
     let control = EngineControl::new(
         &directory.path().join("requests.sock"),
@@ -370,24 +375,20 @@ impl Hosts {
             runtime
         };
         let store = |host: &str| {
-            let socket = service::RuntimeDirectory::within(&runtime(host))
-                .unwrap()
-                .socket(storage::SERVICE);
-            StorageServerStandIn::serve(socket)
+            let runtime = service::RuntimeDirectory::within(&runtime(host)).unwrap();
+            StorageServerStandIn::serve(
+                storage::socket(&runtime, crate::support::DEPLOYMENT).unwrap(),
+            )
         };
-        let build = |host: &str| {
-            BuildServerStandIn::serve(directory.path().join(format!("{host}.build")), false, 0)
-        };
+        let build = |host: &str| BuildServerStandIn::serve(&runtime(host), false, 0);
         let (leader, member) = (store("leader"), store("member"));
         let build_servers = vec![build("leader"), build("member")];
 
         // Each line a node process writes, as it writes it.
-        let node = |node_rank: u32, host: &str, join: &str, build: &BuildServerStandIn| {
+        let node = |node_rank: u32, host: &str, join: &str| {
             let mut process = std::process::Command::new(env!("CARGO_BIN_EXE_daemon-host"))
                 .arg("--socket")
                 .arg(directory.path().join(format!("{host}.sock")))
-                .arg("--build-server")
-                .arg(build.socket())
                 .args(["--host", host, "--nnodes", "2"])
                 .args(["--node-rank", &node_rank.to_string(), "--join", join])
                 .env("XDG_RUNTIME_DIR", runtime(host))
@@ -398,8 +399,7 @@ impl Hosts {
                 std::io::BufRead::lines(std::io::BufReader::new(process.stdout.take().unwrap()));
             (process, lines)
         };
-        let (leader_process, mut leader_lines) =
-            node(0, "leader", "127.0.0.1:0", &build_servers[0]);
+        let (leader_process, mut leader_lines) = node(0, "leader", "127.0.0.1:0");
         let mut next = move |expected: &str| {
             let line = leader_lines.next().unwrap().unwrap();
             line.strip_prefix(expected)
@@ -407,7 +407,7 @@ impl Hosts {
                 .to_owned()
         };
         let join = next("joining ");
-        let (member_process, mut member_lines) = node(1, "member", &join, &build_servers[1]);
+        let (member_process, mut member_lines) = node(1, "member", &join);
         assert_eq!(next("serving"), "", "the leader did not start");
         let address = next("address ");
         assert_eq!(

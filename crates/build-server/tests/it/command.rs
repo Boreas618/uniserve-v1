@@ -14,9 +14,17 @@ use crate::support::{arch, other_arch};
 
 const GIB: u64 = 1 << 30;
 
+/// The deployment the commands of these cases serve.
+const DEPLOYMENT: &str = "qwen3";
+
+/// The `serve` command of [`DEPLOYMENT`]'s Build Server with `arguments`.
 fn serve(arguments: &[&str]) -> ServeArgs {
-    let args = Args::try_parse_from(["build-server", "serve"].iter().chain(arguments))
-        .expect("the serve command parses");
+    let args = Args::try_parse_from(
+        ["build-server", "serve", "--deployment", DEPLOYMENT]
+            .iter()
+            .chain(arguments),
+    )
+    .expect("the serve command parses");
     match args.command {
         Command::Serve(serve) => *serve,
         other => panic!("a serve command, not {other:?}"),
@@ -47,9 +55,10 @@ fn serve_takes_the_roots_the_targets_and_the_limits() {
         "cargo=34359738368",
     ]);
     assert!(!serve.daemon);
+    assert_eq!(serve.deployment, DEPLOYMENT);
     assert_eq!(
-        serve.settings.socket().expect("a named socket"),
-        PathBuf::from("/run/uniserve/build-server.sock")
+        serve.socket,
+        Some(PathBuf::from("/run/uniserve/build-server.sock"))
     );
 
     let targets = serve
@@ -58,7 +67,7 @@ fn serve_takes_the_roots_the_targets_and_the_limits() {
         .expect("named targets need no driver");
     assert_eq!(targets, std::slice::from_ref(&arch));
 
-    let config = serve.settings.config(targets).unwrap();
+    let config = serve.settings.config(Some(DEPLOYMENT), targets).unwrap();
     assert_eq!(
         config.package_root,
         PathBuf::from("/var/lib/uniserve/packages")
@@ -114,7 +123,6 @@ fn serve_without_a_target_builds_for_the_hosts_devices() {
 /// The settings a daemon starts a host's Build Server with.
 fn deployment() -> Settings {
     Settings {
-        socket: None,
         package_root: Some(PathBuf::from("/var/lib/uniserve/packages")),
         store_roots: vec![
             PathBuf::from("/var/lib/uniserve/modules"),
@@ -186,34 +194,40 @@ triton = 12884901888
     }
 }
 
-/// An operator states nothing: the roots and the cache are this user's own.
+/// A Build Server serves one deployment, which it is told; told nothing else, its roots and its
+/// cache are that deployment's own, and two deployments' never meet.
 #[test]
-fn serve_needs_no_flag() {
+fn serve_needs_its_deployment_alone() {
+    assert!(
+        Args::try_parse_from(["build-server", "serve"]).is_err(),
+        "a Build Server serves a deployment it is told"
+    );
     let serve = serve(&[]);
-    // The socket is this user's default one, in the user's runtime directory; a process
-    // without a runtime directory has no default socket and is refused.
-    match (serve.settings.socket(), build_server::default_socket()) {
-        (Ok(socket), Ok(default)) => assert_eq!(socket, default),
-        (socket, default) => assert!(
-            socket.is_err() && default.is_err(),
-            "a default socket without a runtime directory"
-        ),
-    }
+    assert_eq!(serve.socket, None);
 
-    let config = serve.settings.config(Vec::new()).unwrap();
+    let config = serve.settings.config(Some(DEPLOYMENT), Vec::new()).unwrap();
     assert!(
         config
             .package_root
-            .ends_with("uniserve/build-server/packages")
+            .ends_with("uniserve/deployments/qwen3/build-server/packages")
     );
     assert_eq!(config.store_roots.len(), 1);
     assert!(
         config.store_roots[0]
             .path
-            .ends_with("uniserve/build-server/modules")
+            .ends_with("uniserve/deployments/qwen3/build-server/modules")
     );
     assert!(config.store_roots[0].writable);
-    assert!(config.cache.ends_with("uniserve/build-server"));
+    assert!(
+        config
+            .cache
+            .ends_with("uniserve/deployments/qwen3/build-server")
+    );
+
+    let other = serve.settings.config(Some("other"), Vec::new()).unwrap();
+    assert_ne!(other.package_root, config.package_root);
+    assert_ne!(other.store_roots, config.store_roots);
+    assert_ne!(other.cache, config.cache);
 }
 
 /// Every path the command takes is absolute before the server sees it.
@@ -226,8 +240,6 @@ fn serve_needs_no_flag() {
 #[test]
 fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
     let serve = serve(&[
-        "--socket",
-        "relative/build-server.sock",
         "--package-root",
         "relative/packages",
         "--store-root",
@@ -240,11 +252,7 @@ fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
     // The directory this test runs in is the one the paths were typed in.
     let typed_in = std::env::current_dir().unwrap();
 
-    assert_eq!(
-        serve.settings.socket().expect("a named socket"),
-        typed_in.join("relative/build-server.sock")
-    );
-    let config = serve.settings.config(Vec::new()).unwrap();
+    let config = serve.settings.config(Some(DEPLOYMENT), Vec::new()).unwrap();
     assert_eq!(config.package_root, typed_in.join("relative/packages"));
     assert_eq!(
         config.store_roots[0].path,
@@ -303,11 +311,11 @@ fn install_names_a_package_on_the_server_host_and_list_needs_nothing() {
     .unwrap();
     match args.command {
         Command::Install {
-            socket, package, ..
+            server, package, ..
         } => {
             assert_eq!(
-                socket,
-                Some(PathBuf::from("/run/uniserve/build-server.sock"))
+                server.socket().unwrap(),
+                PathBuf::from("/run/uniserve/build-server.sock")
             );
             assert_eq!(
                 package,
@@ -317,14 +325,26 @@ fn install_names_a_package_on_the_server_host_and_list_needs_nothing() {
         other => panic!("an install command, not {other:?}"),
     }
 
-    let args = Args::try_parse_from(["build-server", "list"]).unwrap();
-    assert!(matches!(
-        args.command,
-        Command::List {
-            socket: None,
-            json: false
-        }
-    ));
+    // An operator's command names the server it reaches: a deployment's on this node, or a
+    // socket, and not both.
+    let args = Args::try_parse_from(["build-server", "list", "--deployment", DEPLOYMENT]).unwrap();
+    let Command::List { server, json } = args.command else {
+        panic!("a list command");
+    };
+    assert!(!json);
+    assert_eq!(server.deployment.as_deref(), Some(DEPLOYMENT));
+    assert!(Args::try_parse_from(["build-server", "list"]).is_err());
+    assert!(
+        Args::try_parse_from([
+            "build-server",
+            "list",
+            "--deployment",
+            DEPLOYMENT,
+            "--socket",
+            "/run/uniserve/build-server.sock",
+        ])
+        .is_err()
+    );
 }
 
 #[test]

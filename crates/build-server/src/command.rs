@@ -2,10 +2,10 @@
 //!
 //! Its subcommands:
 //!
-//! - `serve`: runs this host's Build Server until it is stopped. With
-//!   `--daemon` it leaves its starter's session first (`service::host::detach`),
-//!   which is how a daemon starts the Build Server of a host that has none
-//!   (`service::host::start`).
+//! - `serve --deployment NAME`: runs the deployment's Build Server on this node
+//!   until it is stopped. With `--daemon` it leaves its starter's session first
+//!   (`service::host::detach`), which is how the deployment's daemon starts it
+//!   when none serves (`service::host::start`).
 //! - `install <package>`: installs one package on the upstream
 //!   Build Server and prints its revision. Only the upstream accepts it;
 //!   another server names where the upstream is.
@@ -50,7 +50,7 @@ use crate::server::{BuildServer, ServerConfig};
 use crate::store::Root;
 use crate::target::Target;
 use crate::toolchain::{ENVIRONMENT_PROGRAM, Environment, PeakMemory};
-use crate::{Error, Manifest, Result, default_socket};
+use crate::{Error, Manifest, Result};
 
 /// The `build-server` command's arguments.
 #[derive(Debug, clap::Parser)]
@@ -66,13 +66,12 @@ pub struct Args {
 /// The `build-server` subcommands.
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// Run this host's Build Server until stopped.
+    /// Run a deployment's Build Server on this node until stopped.
     Serve(Box<ServeArgs>),
     /// Install a package on the upstream Build Server.
     Install {
-        /// The Build Server's socket; this user's default socket when unset.
-        #[arg(long)]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        server: Address,
         /// The package directory, as the Build Server's host sees it.
         package: PathBuf,
         /// Print the installed package as one JSON object ([`InstalledPackage`])
@@ -82,9 +81,8 @@ pub enum Command {
     },
     /// List the installed packages, revisions and modules.
     List {
-        /// The Build Server's socket; this user's default socket when unset.
-        #[arg(long)]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        server: Address,
         /// Print the listing as one JSON array ([`ListedPackage`]) instead of
         /// its text rendering.
         #[arg(long)]
@@ -93,9 +91,8 @@ pub enum Command {
     /// Resolve one module and print the path of each of its files in the
     /// store, building the module first when the store misses it.
     Resolve {
-        /// The Build Server's socket; this user's default socket when unset.
-        #[arg(long)]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        server: Address,
         /// The interface the package implements, such as `engine`.
         op: String,
         /// The package's implementation name.
@@ -185,9 +182,50 @@ pub struct BuildArgs {
     pub peak_memory: Vec<(ToolchainKind, u64)>,
 }
 
+/// The Build Server an operator's command reaches: the one on the socket it names, or the Build
+/// Server of the deployment it names on this node ([`crate::socket`]).
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[group(required = true, multiple = false)]
+pub struct Address {
+    /// The Build Server's socket.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// The deployment whose Build Server on this node is meant.
+    #[arg(long, value_name = "NAME")]
+    pub deployment: Option<String>,
+}
+
+impl Address {
+    /// The socket the address names, made absolute.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a deployment is named and the user has no runtime directory, or the name is no
+    /// deployment's.
+    pub fn socket(&self) -> std::io::Result<PathBuf> {
+        match (&self.socket, &self.deployment) {
+            (Some(socket), _) => Ok(absolute(socket.clone())),
+            (None, Some(deployment)) => {
+                crate::socket(&service::RuntimeDirectory::of_user()?, deployment)
+            }
+            (None, None) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "name the Build Server's deployment (--deployment) or its socket (--socket)",
+            )),
+        }
+    }
+}
+
 /// The arguments of `serve`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct ServeArgs {
+    /// The deployment this Build Server builds for: its socket, packages, modules and caches are
+    /// the deployment's own on this node.
+    #[arg(long, value_name = "NAME")]
+    pub deployment: String,
+    /// The socket to listen on; the deployment's ([`crate::socket`]) when unset.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
     /// Leave the starter's session, log beside the socket, and return to the
     /// starter once serving, printing the server's readiness record.
     #[arg(long)]
@@ -200,27 +238,22 @@ pub struct ServeArgs {
     pub settings: Settings,
 }
 
-/// How a Build Server serves: its socket, its roots, its upstream, its
-/// source tree, its targets and its limits.
+/// How a Build Server serves: its roots, its upstream, its source tree, its targets and its
+/// limits.
 ///
-/// The same settings are `serve`'s flags and a deployment's `build_config`
-/// table. A daemon prepares an epoch's package revisions at [`Settings::socket`], and
-/// starts the Build Server of a host that serves none there with these
-/// settings ([`Settings::arguments`]).
+/// The same settings are `serve`'s flags and a deployment's `build_config` table. The
+/// deployment's daemon starts the deployment's Build Server on its node with these settings
+/// ([`Settings::arguments`]) when none serves there, and replaces one that serves with others.
 #[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    /// The socket to listen on; this user's default socket when unset.
-    #[arg(long, value_name = "PATH")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub socket: Option<PathBuf>,
     /// The installed packages; writable only on the upstream server.
-    /// `build-server/packages` in this user's data directory when unset.
+    /// `build-server/packages` in the deployment's data directory when unset.
     #[arg(long, value_name = "DIR")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_root: Option<PathBuf>,
     /// A module store root; the first is writable, the rest are read-only
-    /// (design section 5.3). `build-server/modules` in this user's data
+    /// (design section 5.3). `build-server/modules` in the deployment's data
     /// directory when none is given.
     #[arg(long = "store-root", value_name = "DIR")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -307,32 +340,8 @@ fn peak_memory(text: &str) -> std::result::Result<(ToolchainKind, u64), String> 
 }
 
 impl Settings {
-    /// The socket these settings name, made absolute, or this user's default
-    /// socket.
-    ///
-    /// # Errors
-    ///
-    /// Fails when no socket is named and the user has no runtime directory.
-    pub fn socket(&self) -> std::io::Result<PathBuf> {
-        socket_or_default(self.socket.clone())
-    }
-
-    /// Whether a Build Server whose readiness record states `record` serves with these settings:
-    /// the same settings, with the socket these settings name.
-    ///
-    /// # Errors
-    ///
-    /// Fails when no socket is named and the user has no runtime directory.
-    pub fn serves(&self, record: &Settings) -> std::io::Result<bool> {
-        let stated = Settings {
-            socket: Some(self.socket()?),
-            ..self.clone()
-        };
-        Ok(stated == *record)
-    }
-
-    /// The `serve` flags that state these settings, but the socket: a starter
-    /// passes them after `--socket` and `--daemon` (`service::host::start`).
+    /// The `serve` flags that state these settings: a starter passes them after `--socket`
+    /// and `--daemon` (`service::host::start`), with the deployment's name.
     pub fn arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
         let mut push = |flag: &str, value: String| {
@@ -371,19 +380,30 @@ impl Settings {
         arguments
     }
 
-    /// The server configuration these settings describe for a server
-    /// building for `targets`.
+    /// The server configuration these settings describe for a server of `deployment` building
+    /// for `targets`.
     ///
-    /// Every path is made absolute, and an unset root is this user's default
-    /// one: `build-server/packages` and `build-server/modules` in the user's
-    /// data directory. The server's cache is `build-server` in the user's
-    /// cache directory ([`service::cache_directory`]).
+    /// Every path is made absolute, and an unset root is the deployment's own:
+    /// `build-server/packages` and `build-server/modules` in the deployment's directory of the
+    /// user's data directory (`deployments/<name>`, [`service::deployment`]). The server's cache
+    /// (the pinned sources, cargo's target directory and the builds' workspaces) is
+    /// `build-server` in the deployment's directory of the user's cache directory
+    /// ([`service::cache_directory`]): no deployment builds in or reads another's. A server of no
+    /// deployment (`build`, which names its store) keeps its cache in the user's cache directory.
     ///
     /// # Errors
     ///
-    /// Fails when the user's data or cache directory cannot be resolved.
-    pub fn config(&self, targets: Vec<Target>) -> Result<ServerConfig> {
-        let data = service::data_directory()?.join("build-server");
+    /// Fails when the user's data or cache directory cannot be resolved, or `deployment` names
+    /// no deployment's directory.
+    pub fn config(&self, deployment: Option<&str>, targets: Vec<Target>) -> Result<ServerConfig> {
+        let of = |directory: PathBuf| -> std::io::Result<PathBuf> {
+            let directory = match deployment {
+                Some(deployment) => service::deployment(&directory, deployment)?,
+                None => directory,
+            };
+            Ok(directory.join(crate::SERVICE))
+        };
+        let data = of(service::data_directory()?)?;
         let package_root = self
             .package_root
             .clone()
@@ -429,7 +449,7 @@ impl Settings {
                 .collect(),
             limits,
             targets,
-            cache: service::cache_directory()?.join("build-server"),
+            cache: of(service::cache_directory()?)?,
             source: self.source.clone().map(absolute),
         })
     }
@@ -474,11 +494,11 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
     match args.command {
         Command::Serve(serve) => run_serve(*serve, host, levels),
         Command::Install {
-            socket,
+            server,
             package,
             json,
         } => {
-            let mut client = Client::connect(&socket_or_default(socket)?)?;
+            let mut client = Client::connect(&server.socket()?)?;
             let installed = client.install(&absolute(package))?;
             if json {
                 write_line(
@@ -497,8 +517,8 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             }
             Ok(())
         }
-        Command::List { socket, json } => {
-            let mut client = Client::connect(&socket_or_default(socket)?)?;
+        Command::List { server, json } => {
+            let mut client = Client::connect(&server.socket()?)?;
             let listing = client.list()?;
             if json {
                 let packages: Vec<ListedPackage<'_>> = listing
@@ -536,7 +556,7 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             Ok(())
         }
         Command::Resolve {
-            socket,
+            server,
             op,
             backend,
             revision,
@@ -544,7 +564,7 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             key,
             json,
         } => {
-            let mut client = Client::connect(&socket_or_default(socket)?)?;
+            let mut client = Client::connect(&server.socket()?)?;
             let module = client.resolve(
                 &op,
                 &proto::module::PackageRevision {
@@ -896,7 +916,7 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
         Some(_) => settings.targets(host)?,
         None => Vec::new(),
     };
-    let config = settings.config(targets)?;
+    let config = settings.config(None, targets)?;
 
     let single: Vec<PathBuf> = args.package.into_iter().map(absolute).collect();
     let total = keys.len() + single.len();
@@ -946,7 +966,10 @@ fn run_serve(
     host: HostTargets<'_>,
     levels: &service::logging::Levels,
 ) -> Result<()> {
-    let socket = serve.settings.socket()?;
+    let socket = match &serve.socket {
+        Some(socket) => absolute(socket.clone()),
+        None => crate::socket(&service::RuntimeDirectory::of_user()?, &serve.deployment)?,
+    };
     let inherited = serve
         .ready_fd
         // SAFETY: the starter passed this descriptor for the readiness record; nothing else in
@@ -975,7 +998,9 @@ fn run_serve(
         }
     };
 
-    let config = serve.settings.config(serve.settings.targets(host)?)?;
+    let config = serve
+        .settings
+        .config(Some(&serve.deployment), serve.settings.targets(host)?)?;
     let server = std::sync::Arc::new(BuildServer::open(&config)?);
     // The upstream installs its source tree's serving packages before it
     // serves, so the first deployment that asks selects from them.
@@ -991,11 +1016,6 @@ fn run_serve(
     let served = server.serve_on(listener, lock, &stop);
     tracing::info!("build server stopped");
     served
-}
-
-/// `socket`, made absolute, or this user's default socket.
-fn socket_or_default(socket: Option<PathBuf>) -> std::io::Result<PathBuf> {
-    socket.map_or_else(default_socket, |socket| Ok(absolute(socket)))
 }
 
 /// A path made absolute against the directory the command was started in:

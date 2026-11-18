@@ -164,6 +164,11 @@ struct Reservation {
 pub(crate) struct Supervisor {
     /// This node's host identity, which every exit names.
     host: String,
+    /// The node's runtime directory, where the deployment's Build Server keeps its socket.
+    runtime: ::service::RuntimeDirectory,
+    /// The deployment whose processes these are: its Build Server on this node resolves their
+    /// engine package.
+    deployment: String,
     /// The pipe every process inherits the read end of.
     lifeline: Lifeline,
     children: HashMap<Key, Child>,
@@ -175,9 +180,10 @@ pub(crate) struct Supervisor {
     /// another node. The asker of the process's launch is not told: it reads an exit as its
     /// engine's unexpected end, and the stop's reply already ended what it asked for.
     stopped: Vec<(Asker, Exit)>,
-    /// This node's Build Server, which an engine started here resolves its modules from:
-    /// it is started on the first such spawn when it does not serve yet, and its socket is the one
-    /// the launch file names. `None` keeps the socket the launch states.
+    /// The settings of the deployment's Build Server on this node, which an engine started here
+    /// resolves its modules from: it is started on the first such spawn when it does not serve
+    /// yet, and its socket is the one the launch file names. `None` keeps the socket the launch
+    /// states.
     build_server: Option<build_server::command::Settings>,
 }
 
@@ -265,14 +271,21 @@ impl Lifeline {
 }
 
 impl Supervisor {
-    /// The supervisor of host `host`'s processes.
+    /// The supervisor of the processes of `deployment` on host `host`, whose runtime directory
+    /// is `runtime`.
     ///
     /// # Errors
     ///
     /// Fails when the lifeline's pipe cannot be created.
-    pub(crate) fn new(host: String) -> std::io::Result<Self> {
+    pub(crate) fn new(
+        host: String,
+        runtime: ::service::RuntimeDirectory,
+        deployment: String,
+    ) -> std::io::Result<Self> {
         Ok(Self {
             host,
+            runtime,
+            deployment,
             lifeline: Lifeline::new()?,
             children: HashMap::new(),
             reservations: HashMap::new(),
@@ -282,19 +295,29 @@ impl Supervisor {
         })
     }
 
-    /// States this node's Build Server, which the engines started here resolve their
-    /// modules from.
+    /// States the settings of the deployment's Build Server on this node, which the engines
+    /// started here resolve their modules from.
     #[must_use]
     pub(crate) fn with_build_server(mut self, settings: build_server::command::Settings) -> Self {
         self.build_server = Some(settings);
         self
     }
 
-    /// This node's Build Server, which the engines started here resolve their modules from and
-    /// an epoch's module set is prepared at (`Request::PrepareModules`); `None` when the node states
-    /// none.
+    /// The settings of the deployment's Build Server on this node, which the engines started
+    /// here resolve their modules from and an epoch's module set is prepared at
+    /// (`Request::PrepareModules`); `None` when the node states none.
     pub(crate) fn build_server(&self) -> Option<&build_server::command::Settings> {
         self.build_server.as_ref()
+    }
+
+    /// The deployment whose processes these are.
+    pub(crate) fn deployment(&self) -> &str {
+        &self.deployment
+    }
+
+    /// The node's runtime directory.
+    pub(crate) fn runtime(&self) -> &::service::RuntimeDirectory {
+        &self.runtime
     }
 
     /// The executable of the engine `spawn` starts and the launch it reads
@@ -309,8 +332,12 @@ impl Supervisor {
                 format!("reading the launch of engine {}: {error}", spawn.generation)
             })?;
         if let Some(settings) = &self.build_server {
-            let socket = crate::engine::control::ensure_build_server(settings)
-                .map_err(|error| format!("starting this node's Build Server: {error:#}"))?;
+            let socket = crate::engine::control::ensure_build_server(
+                &self.runtime,
+                &self.deployment,
+                settings,
+            )
+            .map_err(|error| format!("starting this node's Build Server: {error:#}"))?;
             launch.build_server = socket.display().to_string();
         }
         let executable = engine_executable(&launch)?;
@@ -627,6 +654,9 @@ impl Supervisor {
         self.children.clear();
         Ok((
             ProcessesHandoff {
+                runtime: self.runtime.clone(),
+                deployment: self.deployment.clone(),
+                build_server: self.build_server.clone(),
                 processes,
                 reservations,
                 next_reservation: self.next_reservation,
@@ -655,7 +685,8 @@ impl Supervisor {
                 )
             })
         };
-        let mut supervisor = Self::new(host)?;
+        let mut supervisor = Self::new(host, handoff.runtime, handoff.deployment)?;
+        supervisor.build_server = handoff.build_server;
         for process in handoff.processes {
             let child = Child::adopt(process.pid, next()?);
             tracing::info!(group = %process.group, rank = process.rank, generation = process.generation, pid = process.pid, "adopted a process");
@@ -707,6 +738,9 @@ impl Drop for Supervisor {
 /// The processes a daemon hands its successor (`Supervisor::hand_over`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProcessesHandoff {
+    pub(crate) runtime: ::service::RuntimeDirectory,
+    pub(crate) deployment: String,
+    pub(crate) build_server: Option<build_server::command::Settings>,
     pub(crate) processes: Vec<ProcessHandoff>,
     pub(crate) reservations: Vec<ReservationHandoff>,
     pub(crate) next_reservation: u64,

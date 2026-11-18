@@ -261,8 +261,8 @@ pub enum Role {
     /// ([`Request::PeerHold`]). A peer states no credential: the
     /// endpoint is unauthenticated and relies on network isolation.
     Peer,
-    /// An operator's client, which lists what the server holds and retires
-    /// deployments that are no longer served.
+    /// An operator's client, which lists what the server holds, changes the settings it serves
+    /// with, and stops or restarts it.
     Operator,
 }
 
@@ -1037,9 +1037,7 @@ pub enum Request {
     /// `retire` ends on the host: its retention of every tensor ends, and a
     /// tensor no epoch retains is released. Refused while a previous head of
     /// the deployment is connected. Every process of the deployment that
-    /// belongs to no current worker is shot down. Every other deployment
-    /// whose head is not connected is retired: a host serves the deployments
-    /// whose heads run on it.
+    /// belongs to no current worker is shot down.
     Claim {
         claimant: Claimant,
         scopes: Vec<Scope>,
@@ -1128,18 +1126,30 @@ pub enum Request {
     },
     /// Every tensor, storage and claim the server holds.
     List,
-    /// Release every tensor and buffer pool of `deployment` and forget its
-    /// claim: the deployment is no longer served. Refused while its head is
-    /// connected.
-    Retire { deployment: String },
     /// Pass the server to a successor server that runs the executable whose descriptor travels
     /// with the request (the build of the operator's command), which goes on with every
     /// connection, the listening sockets, the tensors' storage and the buffer pools once no
     /// request, shoot-down, connector task or transfer is in flight (a hot restart); the server
     /// then exits. `arguments` select the executable's `storage-server` command: its global
-    /// options and the command's path, which the successor's own arguments follow. Responded
-    /// with the successor's process id once it started.
-    Restart { arguments: Vec<String> },
+    /// options and the command's path, which the successor's own arguments follow. The successor
+    /// serves with `settings`, or with this server's when unset: it binds the listener for other
+    /// hosts the settings state when it is not this server's, starts its children with them, and
+    /// starts the buffer pools' trace they name from the pools' images. Responded with the
+    /// successor's process id once it started.
+    Restart {
+        arguments: Vec<String>,
+        settings: Option<Box<crate::settings::Settings>>,
+    },
+    /// Serve with `settings` from now on, every one of which the running server takes
+    /// (`ServerSettings::restarts` holds of none): the host reserve at the next admission, the
+    /// deadlines at the next task's start, the Transfer Server's chunk and progress period at its
+    /// next chunk, the waits before a child starts again and the shoot-down's deadline when they
+    /// next begin. Refused, changing nothing, when a setting differs that needs a new process
+    /// ([`Request::Restart`]). Responded with [`Response::Configured`]; the server's readiness
+    /// record states the settings from then on. An operator's request.
+    Configure {
+        settings: crate::settings::ServerSettings,
+    },
     /// The server's readiness record: its endpoints (its socket, and the TCP endpoint other
     /// hosts connect to when it accepts them) and the settings it serves with. Responded with
     /// [`Response::Status`].
@@ -1469,9 +1479,8 @@ pub enum Response {
     Released,
     Rekeyed,
     Listing(Listing),
-    Retired {
-        released: u64,
-    },
+    /// The server serves with the settings of a [`Request::Configure`].
+    Configured,
     /// The successor of a [`Request::Restart`] started.
     Restarting {
         pid: u32,
@@ -1838,6 +1847,10 @@ pub enum Event {
         throttle: Throttle,
         tasks: Vec<u64>,
     },
+    /// To the Transfer Server: cut its next chunks to last `chunk_us` microseconds at their
+    /// link's bandwidth, and report a running task's progress at most every `progress_ms`
+    /// milliseconds (`storage_config.transfer_chunk_us`, `transfer_progress_ms`).
+    Pace { chunk_us: u64, progress_ms: u64 },
     /// To the Transfer Server: register `allocations`, each given before,
     /// with its NIXL agent for another host's READs, and report with
     /// [`Request::Registered`].

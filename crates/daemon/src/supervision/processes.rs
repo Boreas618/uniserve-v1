@@ -107,6 +107,11 @@ impl Processes {
         }
     }
 
+    /// The deployment's name, which names it at every node's daemon and servers.
+    pub(crate) fn deployment(&self) -> &str {
+        &self.deployment
+    }
+
     /// Sends one request and waits for its reply. The service replies to every request: at once
     /// for this node, once a member replied for another node, and with the member's loss when
     /// that node's daemon is lost; a service that ended drops the reply's sender.

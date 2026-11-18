@@ -239,15 +239,6 @@ impl Quotas {
         self.weights_only.retain(|(of, _)| of != deployment);
     }
 
-    /// Every limit and kept reservation of `deployment` ends: it is no
-    /// longer served.
-    pub(crate) fn release(&mut self, deployment: &str) {
-        self.limits.retain(|(of, _, _), _| of != deployment);
-        self.lost
-            .retain(|(scope, _), _| scope.deployment != deployment);
-        self.weights_only.retain(|(of, _)| of != deployment);
-    }
-
     /// The quotas of the GPUs `gpus` admits and the deployments `deployment`
     /// admits, derived from the retained device storages `retained` and the
     /// processes' reservations, sorted by GPU and deployment, each with the

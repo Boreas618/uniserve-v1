@@ -1,8 +1,8 @@
 //! Running a Storage Server, and the operator's commands against one.
 //!
-//! [`serve`] holds this host's retained storage for the calling user until it
-//! is stopped by its `stop` request, SIGTERM or SIGINT. A process that starts a
-//! server when its host has none starts it with `daemon` set
+//! [`serve`] holds a deployment's retained storage on this node until it is
+//! stopped by its `stop` request, SIGTERM or SIGINT. The deployment's daemon,
+//! which starts the server when the node has none, starts it with `daemon` set
 //! (`service::host::start`): the server then leaves its starter's session and
 //! process tree, writes its log beside its socket and reports its readiness
 //! record to its starter once it serves, so a starter's end never ends it.
@@ -271,22 +271,8 @@ fn list_pool(pool: &BufferPoolListing, out: &mut impl Write) -> std::io::Result<
     Ok(())
 }
 
-/// Release the storage of `deployment`, which is no longer served, at the
-/// server on `socket`.
-///
-/// # Errors
-///
-/// Fails when the server cannot be reached, or refuses because the
-/// deployment's head is connected.
-pub fn retire(socket: &Path, deployment: &str) -> ::storage::Result<()> {
-    let mut client = Client::connect(socket, Role::Operator)?;
-    let released = client.retire(deployment.to_owned())?;
-    println!("released {released} tensors of {deployment}");
-    Ok(())
-}
-
 /// Binds the TCP `endpoint` other hosts reach the server at (port 0 picks one).
-fn bind_tcp(endpoint: &Endpoint) -> std::io::Result<std::net::TcpListener> {
+pub(crate) fn bind_tcp(endpoint: &Endpoint) -> std::io::Result<std::net::TcpListener> {
     match endpoint {
         Endpoint::Tcp { host, port } => std::net::TcpListener::bind((host.as_str(), *port)),
         Endpoint::Unix(_) => Err(std::io::Error::new(
@@ -339,10 +325,8 @@ fn serve_on(
     {
         Bound::Owner { listener, starting } => (listener, starting),
         Bound::Serving(record) => {
-            // The server that owns the socket keeps its settings: a starter that states others
-            // is refused rather than served with settings it did not state.
-            ::storage::settings::Mismatch::check(&record, &settings)
-                .with_context(|| format!("serving on {}", socket.display()))?;
+            // The server that owns the socket goes on with its settings; its starter reads them
+            // in the record and changes them when they are not its own.
             tracing::info!(socket = %socket.display(), pid = record.pid, "another storage server serves this socket");
             report(ready, &record);
             return Ok(());

@@ -110,7 +110,6 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
             engine_host: "localhost".to_owned(),
             worker_groups: groups.clone(),
         },
-        deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
         max_running_requests,
         max_num_batched_tokens: None,
         max_logprobs: 20,
@@ -136,6 +135,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
         profiling: Default::default(),
     };
     let mut args = EngineArgs::new(config, modules);
+    args.deployment = format!("deployment-{}", uuid::Uuid::new_v4().simple());
     // A fake keeps no host tier: it has no Storage Server to keep one in.
     args.engine_config.kv_cache.host_tier = false;
     args.epoch = 1;

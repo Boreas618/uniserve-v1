@@ -92,7 +92,7 @@ pub(crate) fn claim(
         build: proto::BUILD.to_owned(),
         peer: Some(proto::process::hello::Peer::Engine(
             proto::process::Engine {
-                deployment: launch.engine_config.deployment.clone(),
+                deployment: launch.deployment.clone(),
                 engine: launch.engine,
                 interface: proto::process::Interface::Process as i32,
             },
@@ -121,7 +121,7 @@ pub(crate) fn claim(
             id: CLAIM,
             kind: Some(request::Kind::Claim(proto::process::Claim {
                 host: launch.host.clone(),
-                deployment: launch.engine_config.deployment.clone(),
+                deployment: launch.deployment.clone(),
                 scopes: ranks
                     .map(|(group, rank)| proto::process::Scope { group, rank })
                     .collect(),
@@ -171,7 +171,7 @@ pub(crate) fn claim(
     })?;
     let storage = crate::memory::client::StorageLaunch {
         socket: claimed.socket,
-        deployment: launch.engine_config.deployment.clone(),
+        deployment: launch.deployment.clone(),
         claim: token,
         tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
         // The reply names this node's server alone: another node's servers are not stated to

@@ -686,6 +686,15 @@ impl Pools {
         busy
     }
 
+    /// Bounds the tasks every pool starts from now on by `limits` (`BufferPool::set_limits`),
+    /// asked while no trace records, which would hold the pools' limits only from an image.
+    pub(crate) fn limit(&mut self, limits: (u64, u64)) {
+        self.limits = limits;
+        for hosted in self.deployments.values_mut() {
+            hosted.pool.set_limits(limits);
+        }
+    }
+
     /// From now on, records each pool's trace in `trace`; a pool's trace starts again from its
     /// image.
     pub(crate) fn watch(&mut self, trace: Option<PathBuf>) {
@@ -994,15 +1003,6 @@ impl Pools {
         }
     }
 
-    /// Drops the pool of a deployment that is no longer served, with every
-    /// session and queue pair; what its tasks wrote is gone with it.
-    pub(crate) fn release(&mut self, deployment: &str) {
-        // The trace keeps what the pool produced before it is gone.
-        if let Some(mut hosted) = self.deployments.remove(deployment) {
-            hosted.deliver(deployment);
-        }
-    }
-
     /// The next key of a task is done ([`BufferPool::done`]).
     pub(crate) fn done(&mut self, deployment: &str, task: (QueueId, RequestId), tokens: u16) {
         if let Some(hosted) = self.deployments.get_mut(deployment) {
@@ -1190,12 +1190,15 @@ impl Pools {
         let handed: Handed<BufferPool> = rmp_serde::from_slice(bytes).map_err(io::Error::other)?;
         let mut descriptors = descriptors.into_iter();
         let mut deployments = BTreeMap::new();
-        for (deployment, pool, next, queues) in handed.deployments {
+        for (deployment, mut pool, next, queues) in handed.deployments {
             pool.check().map_err(|inconsistency| {
                 io::Error::other(format!(
                     "the buffer pool of {deployment} handed over is inconsistent: {inconsistency}"
                 ))
             })?;
+            // The successor's settings bound the tasks that start from now on, and the trace its
+            // options start once it runs records them in the pool's image.
+            pool.set_limits(limits);
             // The server's options start a watch of the pool once it runs.
             let mut hosted = Hosted::new(&deployment, limits, None);
             hosted.pool = pool;

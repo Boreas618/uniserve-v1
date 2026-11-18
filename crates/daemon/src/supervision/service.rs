@@ -35,13 +35,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
+use anyhow::Context as _;
 use prost::Message as _;
 use proto::process::refusal::Reason;
 use proto::process::{
     self, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface, Node,
-    NodesKnown, Refusal, Released, Replied, Reply, Request, Spawned, Stopped, ToMember,
-    TransfersThrottled, Unnumbered, Unserved, Upstream, UsageReport, Welcome, downstream, event,
-    from_member, hello, reply, request, to_member, upstream,
+    NodesKnown, Refusal, Released, Replied, Reply, Request, Spawned, Stopped, StorageConfigured,
+    ToMember, TransfersThrottled, Unnumbered, Unserved, Upstream, UsageReport, Welcome, downstream,
+    event, from_member, hello, reply, request, to_member, upstream,
 };
 use service::{Connection, Handed, Listener, Waker};
 
@@ -228,6 +229,27 @@ impl Local {
                     Err(error) => reply.error = format!("{error:#}"),
                 }
             }
+            Some(request::Kind::ConfigureStorage(configure)) => {
+                // The service waits while the server takes the settings: a restart in place
+                // hands the server over once nothing is in flight, and the engines' requests
+                // reach the server meanwhile, on their own connections.
+                let configured = configure
+                    .storage
+                    .as_ref()
+                    .context("the request states no settings")
+                    .and_then(|stated| {
+                        storage::Settings::try_from(stated)
+                            .map_err(anyhow::Error::msg)
+                            .context("reading the Storage Server settings")
+                    })
+                    .and_then(|settings| self.claims.configure(&configure.deployment, settings));
+                match configured {
+                    Ok(()) => {
+                        reply.kind = Some(reply::Kind::StorageConfigured(StorageConfigured {}));
+                    }
+                    Err(error) => reply.error = format!("{error:#}"),
+                }
+            }
             Some(request::Kind::Nodes(_)) => {
                 reply.error = "the leader replies for the deployment's nodes".to_owned();
             }
@@ -246,6 +268,8 @@ impl Local {
     /// one: the leader's wait for it ends with the connection that asked.
     fn prepare(&self, asker: Asker, id: u64, prepare: process::PrepareModules) {
         let settings = self.supervisor.build_server().cloned();
+        let deployment = self.supervisor.deployment().to_owned();
+        let runtime = self.supervisor.runtime().clone();
         let finished = self.preparations.clone();
         let started = std::thread::Builder::new()
             .name("prepare".into())
@@ -254,7 +278,12 @@ impl Local {
                     id,
                     ..Reply::default()
                 };
-                match crate::engine::control::prepare_node(settings.as_ref(), &prepare) {
+                match crate::engine::control::prepare_node(
+                    &runtime,
+                    &deployment,
+                    settings.as_ref(),
+                    &prepare,
+                ) {
                     Ok(prepared) => reply.kind = Some(reply::Kind::ModulesPrepared(prepared)),
                     Err(error) => reply.error = error,
                 }
@@ -1065,6 +1094,7 @@ impl LeaderService {
             Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
             Some(request::Kind::PublishEpochs(publish)) => Some(publish.host.as_str()),
             Some(request::Kind::PrepareModules(prepare)) => Some(prepare.host.as_str()),
+            Some(request::Kind::ConfigureStorage(configure)) => Some(configure.host.as_str()),
             Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
         };
         let forwarded = ToMember {

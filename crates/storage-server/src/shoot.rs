@@ -79,6 +79,12 @@ impl ShootDowns {
         })
     }
 
+    /// Allows every shoot-down `deadline` to leave its GPUs from now on, counted from when its
+    /// process was killed or seen to exit: the next check of one that runs reads it too.
+    pub(super) fn set_deadline(&mut self, deadline: Duration) {
+        self.deadline = deadline;
+    }
+
     /// Kill the process behind `pidfd` and follow it until it left `gpus`.
     /// A process already being shot down, or already out, is not killed
     /// again.

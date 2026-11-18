@@ -674,6 +674,15 @@ impl BufferPool {
         }
     }
 
+    /// Bounds every task that starts from now on by `limits`, how long a transfer and a put to
+    /// the remote store may take, in nanoseconds; a task that runs keeps its deadline.
+    ///
+    /// The limits are part of the pool's state, which a trace records only in an image: the
+    /// server changes them while no trace records, or before the image a trace starts from.
+    pub fn set_limits(&mut self, limits: (u64, u64)) {
+        self.limits = limits;
+    }
+
     /// Whether deferred work waits for a group's `completed` word: the
     /// buffer pool's thread then keeps reading the words.
     pub fn deferred(&self) -> bool {

@@ -1,13 +1,20 @@
-//! How a host's Storage Server serves: the one settings document a server reads when it starts
-//! and reports in its readiness record.
+//! How a deployment's Storage Server serves: the one settings document a server reads when it
+//! starts, takes while it runs, and reports in its readiness record.
 //!
-//! A deployment states the settings of the Storage Server it uses ([`ServerSettings`], the
-//! deployment's `storage_config`, with the connector its `kv_cache_config.mooncake` states), and
-//! the daemon that starts the host's server passes them as one document on the server's standard
-//! input (`storage-server serve --settings -`); an operator writes the same document to a file
-//! (`--settings PATH`). A running server reports the settings it serves with in its readiness
-//! record ([`Readiness`]), so a daemon whose deployment states other settings refuses to share
-//! it instead of serving with whichever settings the first starter gave.
+//! A deployment states the settings of its Storage Servers ([`ServerSettings`], the deployment's
+//! `storage_config`, with the connector its `kv_cache_config.mooncake` states), and the daemon
+//! that starts the deployment's server on a node passes them as one document on the server's
+//! standard input (`storage-server serve --settings -`); an operator writes the same document to
+//! a file (`--settings PATH`). A running server reports the settings it serves with in its
+//! readiness record ([`Readiness`]).
+//!
+//! A change of the settings reaches the running server one of two ways, as
+//! [`Settings::restarts`] tells them apart. A setting the server reads each time it acts on it
+//! (a limit, a deadline, a pace, a wait) is taken by the running server at once
+//! (`Request::Configure`); a setting fixed when the server's processes start (its listener for
+//! other hosts, its Transfer Server's calibration and transports, its connector) or recorded in
+//! the buffer pools' trace from its image on needs a new server process, which a restart in place
+//! starts with the new settings (`Request::Restart`).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -138,6 +145,46 @@ impl ServerSettings {
     pub fn shoot_down(&self) -> Duration {
         Duration::from_secs(self.shoot_down_s)
     }
+
+    /// Whether a server serving with these settings needs a new process to serve with `next`;
+    /// otherwise the running server takes `next` at once (`Request::Configure`).
+    ///
+    /// A new process is needed for what is fixed when the server's processes start: the
+    /// listener other hosts reach it at (`tcp`), and its Transfer Server's calibration and NIXL
+    /// transports, which the Transfer Server reads once when it starts. The buffer pools' trace
+    /// (`buffer_pool_trace`) starts from each pool's image, which a pool states faithfully only
+    /// while no task of it is in flight, as at a restart in place; and while a trace records, the
+    /// deadlines of the pools' tasks (`transfer_deadline_s`, `put_deadline_s`) are part of each
+    /// pool's state, which the trace holds only from an image, so they change with a new process
+    /// too. Every other setting the server reads each time it acts on it: the host reserve at an
+    /// admission, the deadlines at a task's start, the chunk and progress period at the Transfer
+    /// Server's next chunk, the waits before a child starts again and the shoot-down's deadline
+    /// when they begin.
+    pub fn restarts(&self, next: &Self) -> bool {
+        // Every setting is named, so a new one does not compile until it is classified here.
+        let Self {
+            tcp,
+            host_reserve_gib: _,
+            transfer_calibration,
+            transfer_chunk_us: _,
+            transfer_progress_ms: _,
+            nixl_transports,
+            transfer_deadline_s,
+            put_deadline_s,
+            buffer_pool_trace,
+            child_restart_s: _,
+            child_restart_max_s: _,
+            shoot_down_s: _,
+        } = self;
+        let traced = buffer_pool_trace.is_some();
+        let deadlines = *transfer_deadline_s != next.transfer_deadline_s
+            || *put_deadline_s != next.put_deadline_s;
+        *tcp != next.tcp
+            || *transfer_calibration != next.transfer_calibration
+            || *nixl_transports != next.nixl_transports
+            || *buffer_pool_trace != next.buffer_pool_trace
+            || (traced && deadlines)
+    }
 }
 
 /// The transports the Transfer Server's NIXL agent (UCX backend) takes between hosts. Either
@@ -173,39 +220,12 @@ impl Settings {
     pub fn document(&self) -> Result<String, toml::ser::Error> {
         toml::to_string(self)
     }
-}
 
-/// A Storage Server serves with other settings than its starter states: the server keeps its
-/// settings, and the starter is refused rather than served with settings it did not state.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "the Storage Server {pid} serves with other settings ({running:?}) than stated ({stated:?}); \
-     stop it (`uniserve storage-server stop`) or state its settings"
-)]
-pub struct Mismatch {
-    /// The serving server's process.
-    pub pid: u32,
-    /// The settings it serves with.
-    pub running: Box<Settings>,
-    /// The settings its starter stated.
-    pub stated: Box<Settings>,
-}
-
-impl Mismatch {
-    /// `Err` naming both when `record` states other settings than `stated`.
-    ///
-    /// # Errors
-    ///
-    /// The mismatch, when the settings differ.
-    pub fn check(record: &Readiness, stated: &Settings) -> Result<(), Self> {
-        if record.settings == *stated {
-            return Ok(());
-        }
-        Err(Self {
-            pid: record.pid,
-            running: Box::new(record.settings.clone()),
-            stated: Box::new(stated.clone()),
-        })
+    /// Whether a server serving with these settings needs a new process to serve with `next`
+    /// ([`ServerSettings::restarts`]): the Mooncake connector, a child process the server starts
+    /// with its settings, is replaced with the server's process too.
+    pub fn restarts(&self, next: &Self) -> bool {
+        self.connector != next.connector || self.server.restarts(&next.server)
     }
 }
 
@@ -234,6 +254,78 @@ mod tests {
         let document = settings.document().unwrap();
         assert_eq!(Settings::parse(&document).unwrap(), settings);
         assert_eq!(Settings::parse("").unwrap(), Settings::default());
+    }
+
+    /// The settings a server reads each time it acts on them change in the running server; the
+    /// settings fixed when its processes start, and the trace with what it records from a pool's
+    /// image on, need a new server process.
+    #[test]
+    fn a_running_server_takes_what_it_reads_when_it_acts() {
+        let serving = ServerSettings::default();
+        let taken = ServerSettings {
+            host_reserve_gib: 4,
+            transfer_chunk_us: 500,
+            transfer_progress_ms: 50,
+            transfer_deadline_s: 30,
+            put_deadline_s: 30,
+            child_restart_s: 1,
+            child_restart_max_s: 10,
+            shoot_down_s: 20,
+            ..serving.clone()
+        };
+        assert!(!serving.restarts(&taken));
+
+        let restarted = [
+            ServerSettings {
+                tcp: Some("0.0.0.0:0".parse().unwrap()),
+                ..serving.clone()
+            },
+            ServerSettings {
+                transfer_calibration: Some("/etc/uniserve/calibration.json".into()),
+                ..serving.clone()
+            },
+            ServerSettings {
+                nixl_transports: Transports::Rdma,
+                ..serving.clone()
+            },
+            ServerSettings {
+                buffer_pool_trace: Some("/var/trace".into()),
+                ..serving.clone()
+            },
+        ];
+        for next in &restarted {
+            assert!(serving.restarts(next), "{next:?}");
+            assert!(next.restarts(&serving), "{next:?}");
+        }
+
+        // While a trace records, the pools' deadlines are part of what it records.
+        let traced = ServerSettings {
+            buffer_pool_trace: Some("/var/trace".into()),
+            ..serving.clone()
+        };
+        let shorter = ServerSettings {
+            transfer_deadline_s: 5,
+            ..traced.clone()
+        };
+        assert!(traced.restarts(&shorter));
+        let paced = ServerSettings {
+            transfer_chunk_us: 250,
+            ..traced.clone()
+        };
+        assert!(!traced.restarts(&paced));
+
+        // The connector is a child the server starts with its settings.
+        let connected = Settings {
+            connector: Some(connector::Settings {
+                master: "10.0.0.1:50051".parse().unwrap(),
+                metadata: connector::Metadata::Server("http://10.0.0.1:8080/metadata".into()),
+                transport: connector::Transport::Tcp,
+                device: String::new(),
+                segment_gib: 4,
+            }),
+            ..Settings::default()
+        };
+        assert!(Settings::default().restarts(&connected));
     }
 
     /// A key no section knows is refused.

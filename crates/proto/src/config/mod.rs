@@ -1596,9 +1596,6 @@ pub struct EngineConfig {
     pub model: ModelConfig,
     /// The ranks' division of the model and the requests.
     pub parallel: ParallelConfig,
-    /// The deployment: its served model name, under which the Storage Servers keep its claims
-    /// and pages.
-    pub deployment: String,
     /// Concurrently resident requests: the request slots every rank holds, or the fewer its share
     /// of its GPU holds.
     pub max_running_requests: NonZeroUsize,
@@ -1669,7 +1666,6 @@ impl EngineConfig {
             executable,
             model,
             parallel,
-            deployment,
             max_running_requests,
             max_num_batched_tokens: _,
             max_logprobs,
@@ -1712,7 +1708,6 @@ impl EngineConfig {
             executable,
             model,
             parallel,
-            deployment,
             max_running_requests: *max_running_requests,
             max_logprobs: *max_logprobs,
             device,
@@ -1751,7 +1746,6 @@ pub struct BuildPart<'a> {
     pub executable: &'a str,
     pub model: &'a ModelConfig,
     pub parallel: &'a ParallelConfig,
-    pub deployment: &'a str,
     pub max_running_requests: NonZeroUsize,
     pub max_logprobs: u32,
     pub device: &'a DeviceConfig,
@@ -1840,6 +1834,10 @@ pub struct EngineArgs {
     /// The expert order each MoE module loads, keyed by module, once the daemon has rebalanced the
     /// experts; empty for the checkpoint's own order.
     pub expert_order: BTreeMap<String, ExpertOrder>,
+    /// The deployment, by its policy package's name: the name its daemon, Storage Server and
+    /// Build Server on every node serve it under, which keys its claims and pages at the
+    /// Storage Server.
+    pub deployment: String,
     /// This node's host identity, which keys this rank's storage claim.
     pub host: String,
     /// The leader daemon's request interface, `unix:<path>` or
@@ -1932,6 +1930,7 @@ impl EngineArgs {
             epoch: 0,
             predecessor: None,
             expert_order: BTreeMap::new(),
+            deployment: String::new(),
             host: String::new(),
             requests: String::new(),
             processes: String::new(),

@@ -54,6 +54,9 @@ fn a_follower_joins_the_first_host() {
     // node starts a model or needs a GPU to establish membership.
     let leader = Daemon::start(
         DaemonOptions {
+            // The deployment is named by its package's directory.
+            deployment: "model".into(),
+            runtime: service::RuntimeDirectory::within(directory.path()).unwrap(),
             nnodes: 2,
             node_rank: 0,
             host: "leader".into(),

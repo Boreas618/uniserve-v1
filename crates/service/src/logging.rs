@@ -2,11 +2,11 @@
 //! compact terminal log formatting.
 //!
 //! Every command calls [`init`] once with its process label and its [`Levels`], before it starts
-//! threads or a Tokio runtime (a host service after it detached). Each event is written as one
-//! line of the form `(<process> pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`,
-//! where the process is the label (`Daemon` for `uniserve serve`, `Engine` for an engine process,
-//! `StorageServer`, `BuildServer` and the Storage Server's helpers for the host services), with
-//! the active spans, if any, written as `outer{..}:inner{..}: ` before the fields.
+//! threads or a Tokio runtime (a deployment's server after it detached). Each event is written as
+//! one line of the form `(<process> pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>]
+//! <fields>`, where the process is the label (`Daemon` for `uniserve serve`, `Engine` for an
+//! engine process, `StorageServer`, `BuildServer` and the Storage Server's helpers for a
+//! deployment's servers), with the active spans, if any, written as `outer{..}:inner{..}: ` before the fields.
 //!
 //! The levels are tracing's (`off`, `error`, `warn`, `info`, `debug`, `trace`) and come from the
 //! command line alone: `--log-level` for every target, and the level a module states for the
@@ -15,8 +15,8 @@
 //! line ([`arguments`]).
 //!
 //! The daemon and the engine log to stdout. A command whose own output is stdout
-//! (`uniserve keys`) and a host service, whose standard error is the log beside its socket,
-//! log to stderr ([`Output`]). ANSI colors follow the `fmt` layer's default: they are on unless
+//! (`uniserve keys`) and a deployment's server, whose standard error is the log beside its
+//! socket, log to stderr ([`Output`]). ANSI colors follow the `fmt` layer's default: they are on unless
 //! `NO_COLOR` is set to a non-empty value, with no terminal detection, so redirected output also
 //! carries escape sequences.
 

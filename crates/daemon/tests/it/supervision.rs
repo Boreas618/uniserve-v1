@@ -21,8 +21,7 @@ struct Node {
 
 impl Node {
     fn start(directory: &tempfile::TempDir, host: &str) -> Self {
-        let build_server =
-            BuildServerStandIn::serve(directory.path().join("build-server.sock"), false, 0);
+        let build_server = BuildServerStandIn::serve(directory.path(), false, 0);
         let daemon = Daemon::start(
             single_node(host, directory.path().join("process.sock"), &build_server),
             None,
@@ -311,8 +310,7 @@ fn a_daemon_serves_engines_of_its_own_version_alone() {
 fn a_killed_daemon_takes_its_processes_with_it() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("process.sock");
-    let build_server =
-        BuildServerStandIn::serve(directory.path().join("build-server.sock"), false, 0);
+    let build_server = BuildServerStandIn::serve(directory.path(), false, 0);
     let mut host = std::process::Command::new(env!("CARGO_BIN_EXE_daemon-host"))
         .arg("--socket")
         .arg(&socket)

@@ -67,6 +67,8 @@ pub(crate) fn target_digest(target: &Epoch) -> String {
 /// flight.
 pub(crate) struct Updater {
     epochs: Arc<Epochs>,
+    /// The deployment's name, which names it at every node's daemon and servers.
+    deployment: String,
     state: Mutex<State>,
     /// The number and phase of the update in flight, `None` when none is:
     /// whoever waits for a phase waits here instead of reading on a clock.
@@ -126,6 +128,7 @@ impl Updater {
         let (transitions, entered) = tokio::sync::mpsc::unbounded_channel();
         Self {
             epochs,
+            deployment: processes.deployment().to_owned(),
             state: Mutex::new(State {
                 processes,
                 update: None,
@@ -140,6 +143,11 @@ impl Updater {
             transitions,
             entered: Mutex::new(Some(entered)),
         }
+    }
+
+    /// The deployment's name, which names it at every node's daemon and servers.
+    pub(crate) fn deployment(&self) -> &str {
+        &self.deployment
     }
 
     /// The epoch records, shared with the rest of the daemon.

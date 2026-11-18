@@ -65,16 +65,16 @@ fn main() -> anyhow::Result<()> {
     };
     let daemon = daemon::Daemon::start(
         daemon::DaemonOptions {
+            // The deployment's servers are the ones its runtime directory, the variable's, holds.
+            deployment: "deployment".to_owned(),
+            runtime: service::RuntimeDirectory::of_user()?,
             nnodes,
             node_rank,
             host,
             dist_init_addr,
             socket: PathBuf::from(required(&arguments, "--socket")?),
             join_timeout: daemon::JOIN_TIMEOUT,
-            build_server: build_server::command::Settings {
-                socket: Some(PathBuf::from(required(&arguments, "--build-server")?)),
-                ..build_server::command::Settings::default()
-            },
+            build_server: build_server::command::Settings::default(),
             storage: storage::Settings::default(),
         },
         listener,

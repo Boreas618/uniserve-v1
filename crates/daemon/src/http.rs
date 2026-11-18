@@ -114,10 +114,11 @@ impl Ready {
         }
     }
 
-    /// Adds the endpoints of the host's Storage Server the deployment uses, as the server
+    /// Adds the endpoints of the Storage Server of `deployment` on this node, as the server
     /// published them, once a claim started it.
-    pub(crate) fn add_storage(&mut self) {
-        let running = storage::default_socket()
+    pub(crate) fn add_storage(&mut self, deployment: &str) {
+        let running = service::RuntimeDirectory::of_user()
+            .and_then(|runtime| storage::socket(&runtime, deployment))
             .and_then(|socket| service::host::running::<storage::Settings>(&socket));
         match running {
             Ok(Some(record)) => {
@@ -125,7 +126,7 @@ impl Ready {
                 self.endpoints.peer = record.endpoints.peer;
             }
             Ok(None) => {}
-            Err(error) => warn!(%error, "the host's Storage Server's record is unreadable"),
+            Err(error) => warn!(%error, "the deployment's Storage Server's record is unreadable"),
         }
     }
 }
@@ -175,7 +176,7 @@ pub async fn serve(
         .context("invalid serving configuration")?;
     let identity = package.config.identity()?;
     if !identity.leads() {
-        return member(package.config, identity, ready, shutdown).await;
+        return member(package.config, deployment, identity, ready, shutdown).await;
     }
 
     let revisions =
@@ -218,6 +219,7 @@ pub async fn serve(
 /// processes until `shutdown`, or until the leader's connection closes and the service ends.
 async fn member(
     config: Config,
+    deployment: String,
     identity: crate::config::Identity,
     ready: Option<service::ReadyFd>,
     shutdown: CancellationToken,
@@ -225,7 +227,9 @@ async fn member(
     let instance = create_instance()?;
     let mut ready = Ready::new(ready, instance.path());
     ready.report(service::State::Listening);
-    let options = config.daemon_options(&identity, instance.path());
+    let runtime =
+        service::RuntimeDirectory::of_user().context("finding the user's runtime directory")?;
+    let options = config.daemon_options(&identity, instance.path(), runtime, &deployment);
     let starting = tokio::task::spawn_blocking(move || Daemon::start(options, None));
     let daemon = tokio::select! {
         daemon = starting => daemon
@@ -246,16 +250,21 @@ async fn member(
         .context("the daemon's service did not complete")?
 }
 
-/// Releases `deployment`'s weights and caches at this host's Storage
-/// Server, whose claim this daemon held until it stopped.
+/// How long the Storage Server of a deployment that is retired may take to stop: it ends its
+/// children and closes its connections.
+const STORAGE_SERVER_STOP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Releases `deployment`'s weights and caches on this node: its Storage Server, whose claim
+/// this daemon held until it stopped, holds nothing but the deployment's, so it stops, and its
+/// storage is released with it.
 pub(crate) fn retire_deployment(deployment: &str) -> Result<()> {
-    let socket = storage::default_socket().context("finding this host's Storage Server socket")?;
-    let mut operator = storage::Client::connect(&socket, storage::Role::Operator)
-        .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
-    let released = operator
-        .retire(deployment.to_owned())
-        .with_context(|| format!("retiring deployment {deployment}"))?;
-    info!(deployment, released, "released the deployment's storage");
+    let runtime =
+        service::RuntimeDirectory::of_user().context("finding the user's runtime directory")?;
+    let socket = storage::socket(&runtime, deployment)
+        .with_context(|| format!("finding the Storage Server socket of {deployment}"))?;
+    service::host::stop(&socket, STORAGE_SERVER_STOP)
+        .with_context(|| format!("stopping the Storage Server of {deployment}"))?;
+    info!(deployment, "released the deployment's storage");
     Ok(())
 }
 

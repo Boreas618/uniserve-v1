@@ -61,8 +61,8 @@ pub struct Readiness<S = ()> {
     pub state: State,
     /// The server's process.
     pub pid: u32,
-    /// The server's instance directory ([`crate::Instance`]); `None` for a host service, whose
-    /// files lie beside its socket.
+    /// The server's instance directory ([`crate::Instance`]); `None` for a deployment's server,
+    /// whose files lie beside its socket.
     pub instance: Option<PathBuf>,
     pub endpoints: Endpoints,
     pub settings: S,

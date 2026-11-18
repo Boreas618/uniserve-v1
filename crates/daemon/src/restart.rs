@@ -721,8 +721,12 @@ async fn prepared_successor(
         prepare.interface,
         proto::ENGINE_INTERFACE_VERSION
     );
-    tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
-        storage_server_speaks(&storage::default_socket()?)
+    let deployment = prepare.deployment.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        storage_server_speaks(&storage::socket(
+            &service::RuntimeDirectory::of_user()?,
+            &deployment,
+        )?)
     })
     .await
     .context("the check of the Storage Server's protocol did not complete")??;
@@ -746,8 +750,12 @@ async fn prepared_successor(
         &config.request_socket(&prepare.instance),
         prepare.processes.clone(),
         config.leader_host(),
-        config.served_model_name().to_owned(),
-        crate::engine::control::ensure_build_server(&config.build_config)?,
+        prepare.deployment.clone(),
+        crate::engine::control::ensure_build_server(
+            &service::RuntimeDirectory::of_user()?,
+            &prepare.deployment,
+            &config.build_config,
+        )?,
     )?;
     send(
         channel,
@@ -830,7 +838,7 @@ async fn prepared_successor(
     )
     .context("resuming the node's daemon service")?;
     let (updates, awake) = daemon
-        .updater(config.served_model_name().to_owned())
+        .updater(prepare.deployment.clone())
         .context("the leader's daemon commands no engine")?;
     let epoch_records = Arc::clone(updates.epochs());
     Daemon::advance_updates(Arc::clone(&updates), awake)

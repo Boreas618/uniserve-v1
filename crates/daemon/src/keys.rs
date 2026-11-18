@@ -5,7 +5,7 @@
 //! resolved into the engine configuration ([`Leader::prepare`]), one configuration per independent
 //! replica (`replica_configs`), and each process placed on this node
 //! (`crate::engine::control::place`). Each launch is run by the engine package the deployment
-//! selects, resolved at this host's Build Server as a serving start resolves it, up to the profile
+//! selects, resolved at the deployment's Build Server on this node as a serving start resolves it, up to the profile
 //! run of every device's runners; the daemon's request and process sockets are left unstated,
 //! because a recorded start connects to neither.
 
@@ -20,9 +20,9 @@ use crate::config::{Config, Stated};
 use crate::engine::control::{BuildServer, Interfaces, ensure_build_server, place};
 use crate::leader::{Leader, fix_modules, replica_configs};
 
-/// The launch of every engine the deployment `config` starts on this node, in replica
-/// order; `stated` holds the option paths the operator set, and `families` the families whose
-/// requests this build processes.
+/// The launch of every engine the deployment `deployment` of `config` starts on this node, in
+/// replica order; `stated` holds the option paths the operator set, and `families` the families
+/// whose requests this build processes.
 ///
 /// # Errors
 ///
@@ -31,6 +31,7 @@ use crate::leader::{Leader, fix_modules, replica_configs};
 /// configuration, the replicas are not independent, or a process cannot be placed on this node.
 pub async fn launches(
     families: &processing::Registry,
+    deployment: &str,
     config: &Config,
     stated: &Stated,
 ) -> anyhow::Result<Vec<EngineArgs>> {
@@ -48,6 +49,7 @@ pub async fn launches(
                 EngineArgs::new(replica, named.clone()),
                 engine,
                 &Interfaces {
+                    deployment,
                     requests: "",
                     processes: "",
                     build_server: Path::new(""),
@@ -57,11 +59,11 @@ pub async fn launches(
         .collect()
 }
 
-/// The kernel keys the deployment `config` launches, by operator: what every engine of it
+/// The kernel keys the deployment `deployment` of `config` launches, by operator: what every engine of it
 /// records in its profile runs, each key once.
 ///
-/// The deployment's module set is fixed and built at this host's Build Server, which is started
-/// when none serves, and each launch is run by the engine's executable with `--keys`.
+/// The deployment's module set is fixed and built at the deployment's Build Server on this node,
+/// which is started when none serves, and each launch is run by the engine's executable with `--keys`.
 /// No weight is read, and no daemon, Storage Server or communicator is started.
 ///
 /// # Errors
@@ -70,15 +72,22 @@ pub async fn launches(
 /// a recording process fails or prints a line that is no `operator<TAB>key`.
 pub async fn record(
     families: &processing::Registry,
+    deployment: &str,
     config: &Config,
     stated: &Stated,
 ) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
-    let launches = launches(families, config, stated).await?;
+    let launches = launches(families, deployment, config, stated).await?;
     let socket = {
-        let settings = config.build_config.clone();
-        tokio::task::spawn_blocking(move || ensure_build_server(&settings))
-            .await
-            .context("starting the Build Server did not complete")??
+        let (deployment, settings) = (deployment.to_owned(), config.build_config.clone());
+        tokio::task::spawn_blocking(move || {
+            ensure_build_server(
+                &service::RuntimeDirectory::of_user()?,
+                &deployment,
+                &settings,
+            )
+        })
+        .await
+        .context("starting the Build Server did not complete")??
     };
     let Some(named) = launches.first().map(|launch| launch.modules.clone()) else {
         return Ok(BTreeMap::new());

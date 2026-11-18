@@ -531,6 +531,20 @@ impl TransferServer {
                 );
                 self.threads.throttle(&links, &tasks, throttle);
             }
+            Event::Pace {
+                chunk_us,
+                progress_ms,
+            } => {
+                tracing::info!(
+                    chunk_us,
+                    progress_ms,
+                    "changing the chunk time and progress period"
+                );
+                self.threads.pace(&Policy {
+                    chunk: Duration::from_micros(chunk_us),
+                    progress: Duration::from_millis(progress_ms),
+                });
+            }
             Event::Register {
                 request,
                 allocations,

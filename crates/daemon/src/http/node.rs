@@ -528,10 +528,12 @@ impl Node {
         join: Option<(::service::Listener, ::service::Endpoint)>,
         lock: Option<crate::epoch::ModuleSet>,
     ) -> Result<Option<Brought>> {
-        let name = config.served_model_name().to_owned();
         let token = self.shutdown.clone();
         let identity = config.identity()?;
-        let mut options = config.daemon_options(&identity, &self.instance);
+        let runtime =
+            service::RuntimeDirectory::of_user().context("finding the user's runtime directory")?;
+        let mut options =
+            config.daemon_options(&identity, &self.instance, runtime, &self.deployment);
         let join = match (join, &identity.join) {
             (Some(join), _) => Some(join),
             (None, Some(endpoint)) => Some(Daemon::bind_join(endpoint)?),
@@ -555,7 +557,7 @@ impl Node {
             .context("the node's daemon leads no deployment")?
             .to_owned();
         let (updates, awake) = daemon
-            .updater(name.clone())
+            .updater(self.deployment.clone())
             .context("the leader's daemon commands no engine")?;
         Daemon::advance_updates(Arc::clone(&updates), awake)
             .context("starting the updater's thread")?;
@@ -666,7 +668,7 @@ impl Node {
         })));
         {
             let mut ready = service::lock(&self.ready);
-            ready.add_storage();
+            ready.add_storage(&self.deployment);
             admin.set_readiness(ready.record(service::State::Serving));
             ready.report(service::State::Serving);
         }
@@ -715,7 +717,7 @@ impl Node {
             let _ = decided.wait_for(Option::is_some).await;
         }
         let handed_over = restarter.handoff_sent.load(Ordering::Acquire);
-        let ended = finish(&name, &leader, daemon, retire, handed_over).await;
+        let ended = finish(&self.deployment, &leader, daemon, retire, handed_over).await;
         match &ended {
             // A successor's journal records what the deployment does from now on.
             Ok(()) if handed_over => {}
@@ -819,8 +821,30 @@ impl Node {
         let id = operation.id;
         let leader = &routes.leader;
         let mut phases = leader.updates.watch();
-        let applied =
-            Box::pin(leader.apply(package.config.clone(), package.stated.clone(), force, id)).await;
+        // The deployment's Storage Servers take a change of their settings before the engines
+        // follow it (`proto::reload::Effect::Storage`): a running server takes what it reads
+        // when it acts at once, and is restarted in place with the rest, so the epoch that
+        // follows claims the servers that serve with the target's settings.
+        let serving_storage = leader.storage_settings();
+        let target_storage = package.config.storage_settings();
+        let storage_changed = serving_storage != target_storage;
+        let configured = if storage_changed {
+            leader.configure_storage(target_storage).await
+        } else {
+            Ok(())
+        };
+        let applied = match configured {
+            Ok(()) => {
+                Box::pin(leader.apply(
+                    package.config.clone(),
+                    package.stated.clone(),
+                    force,
+                    id,
+                ))
+                .await
+            }
+            Err(error) => Err(crate::leader::UpdateError::Refused(format!("{error:#}"))),
+        };
         let ended = match applied {
             Ok(Applied::Unchanged | Applied::InPlace(_)) => Ok(true),
             Ok(Applied::Update(_)) => {
@@ -877,6 +901,15 @@ impl Node {
                 format!("{:#}", anyhow::Error::from(error)),
             )),
         };
+        // A change that did not converge leaves the Storage Servers with the serving settings.
+        if storage_changed
+            && ended.is_err()
+            && let Err(error) = leader.configure_storage(serving_storage).await
+        {
+            warn!(
+                "the Storage Servers keep the settings of the change that did not converge: {error:#}"
+            );
+        }
         let seconds = began.elapsed().as_secs_f64();
         let recorded = match &ended {
             Ok(true) => {
@@ -1114,15 +1147,16 @@ fn adopt_streams(adopted: Vec<crate::restart::streams::Adopted>, server: &super:
     }
 }
 
-/// Ends a deployment's serving: shuts its engines down, stops its daemon and, when `retire` was
-/// set, releases its storage, held at its Storage Servers under the name `storage`; or, when the deployment was handed to a hot restart's successor,
-/// lets go of the engines and leaves the service and the storage to the successor.
+/// Ends the serving of the deployment `deployment`: shuts its engines down, stops its daemon
+/// and, when `retire` was set, stops its Storage Server on this node, which releases its storage;
+/// or, when the deployment was handed to a hot restart's successor, lets go of the engines and
+/// leaves the service and the storage to the successor.
 ///
 /// # Errors
 ///
 /// The first failure of the steps.
 async fn finish(
-    storage: &str,
+    deployment: &str,
     leader: &Arc<Leader>,
     daemon: Arc<Mutex<Option<Daemon>>>,
     retire: Arc<AtomicBool>,
@@ -1136,7 +1170,7 @@ async fn finish(
     let daemon = service::lock(&daemon).take();
     let stopped = stopped.and(stop_daemon(daemon).await);
     if retire.load(Ordering::Acquire) {
-        let deployment = storage.to_owned();
+        let deployment = deployment.to_owned();
         let retired = tokio::task::spawn_blocking(move || retire_deployment(&deployment))
             .await
             .context("the deployment's release did not complete")?;

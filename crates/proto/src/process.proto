@@ -151,6 +151,7 @@ message Request {
     NodesQuery nodes = 9;
     PublishEpochs publish_epochs = 11;
     PrepareModules prepare_modules = 12;
+    ConfigureStorage configure_storage = 13;
   }
 }
 
@@ -172,6 +173,7 @@ message Reply {
     NodesKnown nodes = 10;
     EpochsPublished epochs_published = 12;
     ModulesPrepared modules_prepared = 13;
+    StorageConfigured storage_configured = 14;
   }
 }
 
@@ -292,8 +294,8 @@ message Reserved {
   int32 descriptor = 3;
 }
 
-// Have a node's daemon hold the deployment's claim at its Storage Server,
-// starting the server when the node has none. The claim lasts as long as the
+// Have a node's daemon hold the deployment's claim at the deployment's Storage
+// Server on the node, starting the server when the node has none. The claim lasts as long as the
 // daemon: a later claim of the same scopes returns the claim held. The
 // epoch's weights that an earlier `KeepWeights` moved to host storage return
 // to the GPUs they left before the claim gets its reply (the server's
@@ -305,9 +307,10 @@ message Claim {
   // The `(worker group, rank)` scopes `epoch` keeps on the node; the epoch's
   // retention of every other scope of the deployment ends.
   repeated Scope scopes = 3;
-  // The settings of the node's Storage Server the deployment states: a server
-  // the daemon starts serves with them, and a server already serving with
-  // others is refused. Unset, the leader's daemon states the deployment's.
+  // The settings of the deployment's Storage Server on the node: a server the
+  // daemon starts serves with them, and one that serves with others is
+  // configured or restarted in place with them. Unset, the leader's daemon
+  // states the deployment's.
   StorageSettings storage = 4;
   // The epoch whose scopes these are: the daemon's identity of the
   // processes that execute one configuration of the deployment.
@@ -425,6 +428,20 @@ message ThrottleTransfers {
 }
 
 message TransfersThrottled {}
+
+// Have the deployment's Storage Server on a node serve with `storage` from
+// now on, as the deployment states its settings anew: a server that serves
+// takes the settings it reads when it acts at once, and is restarted in place
+// with the settings otherwise, keeping every connection, tensor and buffer
+// pool; a server the node starts later starts with them, and the leader
+// states them in every claim that states none.
+message ConfigureStorage {
+  string host = 1;
+  string deployment = 2;
+  StorageSettings storage = 3;
+}
+
+message StorageConfigured {}
 
 message UsageReport {
   // The Storage Server's `Usage` response (`storage::protocol::Usage`) in the

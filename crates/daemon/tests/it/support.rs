@@ -28,14 +28,19 @@ pub(crate) mod package {
     pub(crate) const SERVES_STORE: &str = "serves-store";
 }
 
-/// The options of the single node `host`, whose process socket is `socket` and whose host's
-/// Build Server is `build_server`.
+/// The deployment the cases' daemons serve, whose servers the stand-ins are.
+pub(crate) const DEPLOYMENT: &str = "deployment";
+
+/// The options of the single node `host`, whose process socket is `socket` and whose
+/// deployment's Build Server is `build_server`, in the node's runtime directory.
 pub(crate) fn single_node(
     host: &str,
     socket: PathBuf,
     build_server: &BuildServerStandIn,
 ) -> DaemonOptions {
     DaemonOptions {
+        deployment: DEPLOYMENT.to_owned(),
+        runtime: build_server.runtime(),
         nnodes: 1,
         node_rank: 0,
         host: host.to_owned(),
@@ -315,12 +320,14 @@ impl Process {
     }
 }
 
-/// A stand-in for a host's Build Server, the host service a daemon prepares an epoch's module set
-/// at and resolves its engines at: it serves `prepare` at its socket and answers every slot with
+/// A stand-in for the deployment's Build Server on a node, which a daemon prepares an epoch's
+/// module set at and resolves its engines at: it serves `prepare` at its socket and answers every slot with
 /// the package revision the request fixed for it, raised by `raise`, as a Build Server that holds
 /// every module answers; and it resolves every engine package to the stand-in engine. Each
 /// connection is served on a thread of its own, as the Build Server serves them.
 pub(crate) struct BuildServerStandIn {
+    /// The node's runtime directory, which holds the deployment's directory and the socket.
+    runtime: service::RuntimeDirectory,
     socket: PathBuf,
     /// One token per `prepare` that arrived.
     asked: Receiver<()>,
@@ -329,9 +336,14 @@ pub(crate) struct BuildServerStandIn {
 }
 
 impl BuildServerStandIn {
-    /// Serves at `socket`, owning it as a Build Server does; with `held`, each `prepare` answers
-    /// only once [`Self::release`] lets it, as one building the engine's executable does.
-    pub(crate) fn serve(socket: PathBuf, held: bool, raise: u32) -> Self {
+    /// Serves as the Build Server of [`DEPLOYMENT`] in the runtime directory within `node`, a
+    /// node's own directory, owning its socket as a Build Server does; with `held`, each
+    /// `prepare` answers only once [`Self::release`] lets it, as one building the engine's
+    /// executable does.
+    pub(crate) fn serve(node: &std::path::Path, held: bool, raise: u32) -> Self {
+        std::fs::create_dir_all(node).unwrap();
+        let runtime = service::RuntimeDirectory::within(node).unwrap();
+        let socket = build_server::socket(&runtime, DEPLOYMENT).unwrap();
         let (listener, starting) = service::host::bind::<build_server::command::Settings>(&socket)
             .unwrap()
             .owned(&socket)
@@ -365,18 +377,21 @@ impl BuildServerStandIn {
             }
         });
         Self {
+            runtime,
             socket,
             asked,
             release,
         }
     }
 
-    /// The settings of a daemon whose host this Build Server serves.
+    /// The settings of the Build Server a daemon of this node states, which this one serves with.
     pub(crate) fn settings(&self) -> build_server::command::Settings {
-        build_server::command::Settings {
-            socket: Some(self.socket.clone()),
-            ..build_server::command::Settings::default()
-        }
+        build_server::command::Settings::default()
+    }
+
+    /// The runtime directory of the node this Build Server serves.
+    pub(crate) fn runtime(&self) -> service::RuntimeDirectory {
+        self.runtime.clone()
     }
 
     /// Its socket.
@@ -489,7 +504,7 @@ pub(crate) fn module_set() -> proto::module::ModuleSet {
     }
 }
 
-/// A stand-in for a host's Storage Server, which a node's daemon claims the deployment's storage
+/// A stand-in for the deployment's Storage Server on a node, which a node's daemon claims the deployment's storage
 /// at: it owns its socket and states its readiness as a Storage Server serving the default
 /// settings does, and answers the requests a claim and a publication make of it (`Claim`,
 /// `Restore`, `Publish`) as a server that holds no storage does. As the Storage Server, it
@@ -508,8 +523,8 @@ struct StorageState {
 }
 
 impl StorageServerStandIn {
-    /// Serves at `socket`, the Storage Server socket of the runtime directory a daemon claims
-    /// storage in (`storage::default_socket`).
+    /// Serves at `socket`, the socket of the deployment's Storage Server in the runtime directory
+    /// a daemon claims storage in (`storage::socket`).
     pub(crate) fn serve(socket: PathBuf) -> Self {
         let (listener, starting) = service::host::bind::<storage::Settings>(&socket)
             .unwrap()

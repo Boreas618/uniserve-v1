@@ -32,36 +32,52 @@ use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink};
 /// The worker group a daemon supervises an engine process under.
 pub(crate) const ENGINE_GROUP: &str = "engine";
 
-/// Makes sure this host's Build Server serves on the socket `settings` names with `settings`, and
-/// returns that socket: when none serves, the deployment's daemon starts it with `settings` as a
-/// host service of the running build ([`crate::supervision::RUNNING_IMAGE`],
-/// `service::host::start`), which outlives this daemon. The start ends with the server's readiness
-/// record, or with the server's end before it served.
+/// How long a Build Server that is replaced may take to stop once it was asked to: it ends its
+/// builds' compiler processes, which end at once.
+const BUILD_SERVER_STOP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Makes sure the Build Server of `deployment` serves on this node with `settings`, and returns
+/// its socket in the node's runtime directory `runtime` ([`build_server::socket`]): when none
+/// serves, the deployment's daemon starts it with
+/// `settings` from the running build ([`crate::supervision::RUNNING_IMAGE`],
+/// `service::host::start`), and it outlives this daemon. A server of the deployment that serves
+/// with other settings, which an earlier daemon of the deployment started, is the deployment's
+/// own: it is stopped and started again with `settings`. The start ends with the server's
+/// readiness record, or with the server's end before it served.
 ///
 /// # Errors
 ///
-/// Fails when no Build Server serves and none can be started, and when the one that serves states
-/// other settings than `settings` in its record: the deployment states its host's Build Server,
-/// and another starter's settings never stand in for it.
-pub fn ensure_build_server(settings: &build_server::command::Settings) -> anyhow::Result<PathBuf> {
-    let socket = settings
-        .socket()
-        .context("finding this host's Build Server socket")?;
-    let record: build_server::Readiness = ::service::host::start(
-        Path::new(crate::supervision::RUNNING_IMAGE),
-        "build-server",
-        &socket,
-        &settings.arguments(),
-        None,
-    )
-    .context("starting this host's Build Server")?;
-    anyhow::ensure!(
-        settings.serves(&record.settings)?,
-        "the Build Server at {} serves with other settings than the deployment states: it \
-         serves with {:?}, and the deployment states {settings:?}",
-        socket.display(),
-        record.settings
-    );
+/// Fails when the deployment's Build Server cannot be stopped or started.
+pub fn ensure_build_server(
+    runtime: &service::RuntimeDirectory,
+    deployment: &str,
+    settings: &build_server::command::Settings,
+) -> anyhow::Result<PathBuf> {
+    let socket = build_server::socket(runtime, deployment)
+        .with_context(|| format!("finding the Build Server socket of {deployment}"))?;
+    let mut arguments = vec!["--deployment".to_owned(), deployment.to_owned()];
+    arguments.extend(settings.arguments());
+    let start = || -> anyhow::Result<build_server::Readiness> {
+        ::service::host::start(
+            Path::new(crate::supervision::RUNNING_IMAGE),
+            build_server::SERVICE,
+            &socket,
+            &arguments,
+            None,
+        )
+        .with_context(|| format!("starting the Build Server of {deployment}"))
+    };
+    let record = start()?;
+    if record.settings != *settings {
+        tracing::info!(
+            deployment,
+            pid = record.pid,
+            "the deployment's Build Server serves with other settings: it is replaced"
+        );
+        ::service::host::stop(&socket, BUILD_SERVER_STOP)
+            .with_context(|| format!("stopping the Build Server of {deployment}"))?;
+        start()?;
+    }
     Ok(socket)
 }
 
@@ -241,6 +257,7 @@ impl EngineControl {
     ) -> anyhow::Result<(Vec<EngineArgs>, Vec<Vec<u64>>)> {
         let processes = self.processes.to_string();
         let interfaces = Interfaces {
+            deployment: &self.deployment,
             requests: &self.request_address,
             processes: &processes,
             build_server: &self.build_server,
@@ -594,6 +611,45 @@ impl EngineControl {
             hosts.push(node.host);
         }
         Ok(hosts)
+    }
+
+    /// Has every node's daemon have the deployment's Storage Server there serve with
+    /// `settings` (`Request::ConfigureStorage`), and returns once each node's server serves
+    /// with them: a running server takes the settings it reads when it acts at once, and is
+    /// restarted in place with them otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot be reached, and at the first node whose server cannot
+    /// take the settings, naming it.
+    pub(crate) fn configure_storage(&self, settings: &storage::Settings) -> anyhow::Result<()> {
+        let (mut connection, nodes) = self.connect()?;
+        for (index, node) in nodes.iter().enumerate() {
+            connection.deliver(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: index as u64 + 1,
+                    kind: Some(request::Kind::ConfigureStorage(process::ConfigureStorage {
+                        host: node.host.clone(),
+                        deployment: self.deployment.clone(),
+                        storage: Some(settings.into()),
+                    })),
+                })),
+            })?;
+            let reply = await_reply(&mut connection, index as u64 + 1)
+                .context("awaiting the Storage Server's settings")?;
+            anyhow::ensure!(
+                reply.error.is_empty(),
+                "the Storage Server of {}: {}",
+                node.host,
+                reply.error
+            );
+            anyhow::ensure!(
+                matches!(reply.kind, Some(reply::Kind::StorageConfigured(_))),
+                "the daemon of {} answered the settings with no result",
+                node.host
+            );
+        }
+        Ok(())
     }
 
     /// Has the daemon of `host` prepare the module set `filled` at its own Build Server
@@ -1113,6 +1169,8 @@ pub fn prepare_epoch(
 /// The reason the reply states: the request's set does not read, this node's daemon states no
 /// Build Server, or the Build Server cannot be started or refuses or cannot build a module.
 pub(crate) fn prepare_node(
+    runtime: &service::RuntimeDirectory,
+    deployment: &str,
     settings: Option<&build_server::command::Settings>,
     prepare: &process::PrepareModules,
 ) -> Result<process::ModulesPrepared, String> {
@@ -1126,7 +1184,7 @@ pub(crate) fn prepare_node(
         })?;
     let settings =
         settings.ok_or_else(|| "this node's daemon states no Build Server".to_owned())?;
-    let socket = ensure_build_server(settings)
+    let socket = ensure_build_server(runtime, deployment, settings)
         .map_err(|error| format!("starting this node's Build Server: {error:#}"))?;
     let server = BuildServer {
         host: prepare.host.clone(),
@@ -1380,6 +1438,8 @@ impl crate::interference::Throttle for EngineControl {
 
 /// What a node's engine reaches, as its launch file states it.
 pub(crate) struct Interfaces<'a> {
+    /// The deployment the process serves, by its name.
+    pub(crate) deployment: &'a str,
     /// The leader daemon's request interface.
     pub(crate) requests: &'a str,
     /// The daemon's process interface.
@@ -1569,6 +1629,7 @@ fn place_on(
         args.epoch = engine;
     }
     args.world_size = world_size;
+    args.deployment = interfaces.deployment.to_owned();
     args.host = host.host.clone();
     args.requests = interfaces.requests.to_owned();
     args.processes = interfaces.processes.to_owned();
@@ -1643,6 +1704,7 @@ mod tests {
             crate::epoch::modules_of(&options),
         );
         let interfaces = Interfaces {
+            deployment: "",
             requests: "",
             processes: "",
             build_server: Path::new(""),
@@ -1735,6 +1797,7 @@ mod tests {
         config.parallel.worker_groups = groups;
         let args = EngineArgs::new(config, modules());
         let interfaces = Interfaces {
+            deployment: "",
             requests: "",
             processes: "",
             build_server: Path::new(""),

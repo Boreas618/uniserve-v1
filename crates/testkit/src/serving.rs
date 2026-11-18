@@ -212,7 +212,6 @@ pub fn launch() -> EngineArgs {
             engine_host: "localhost".to_owned(),
             worker_groups: vec![group.clone()],
         },
-        deployment: DEPLOYMENT.to_owned(),
         max_running_requests: NonZeroUsize::new(SLOTS as usize).unwrap(),
         max_num_batched_tokens: None,
         max_logprobs: 2,
@@ -238,6 +237,7 @@ pub fn launch() -> EngineArgs {
     };
 
     let mut launch = EngineArgs::new(config, modules);
+    launch.deployment = DEPLOYMENT.to_owned();
     launch.epoch = 1;
     launch.engine = 1;
     launch.host = "localhost".to_owned();

@@ -19,7 +19,7 @@ use service::logging;
 /// Runs the `keys` command for the package in `directory`, logging under `log`.
 pub(crate) fn run(directory: &std::path::Path, log: &LogLevels) -> Result<ExitCode> {
     logging::init("Keys", &log.levels(), logging::Output::Stderr);
-    let (package, _) = crate::serve::read(directory)?;
+    let (package, deployment) = crate::serve::read(directory)?;
     package
         .config
         .validate(&package.stated)
@@ -27,6 +27,7 @@ pub(crate) fn run(directory: &std::path::Path, log: &LogLevels) -> Result<ExitCo
 
     let recorded = crate::runtime()?.block_on(daemon::keys::record(
         &crate::served()?,
+        &deployment,
         &package.config,
         &package.stated,
     ))?;

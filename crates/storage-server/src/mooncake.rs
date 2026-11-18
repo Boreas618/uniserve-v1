@@ -202,6 +202,7 @@ pub fn run(channel: service::Connection, settings: &Settings) -> Result<(), Erro
                 | Event::Task { .. }
                 | Event::Cancel { .. }
                 | Event::Throttle { .. }
+                | Event::Pace { .. }
                 | Event::Register { .. }
                 | Event::Deregister { .. }
                 | Event::Allocate { .. }

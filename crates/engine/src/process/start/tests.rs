@@ -50,7 +50,7 @@ const TARGET_HOST_GIB: u64 = 1;
 fn storage_launch(server: &StorageServer, launch: &EngineArgs) -> StorageLaunch {
     StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
-        deployment: launch.engine_config.deployment.clone(),
+        deployment: launch.deployment.clone(),
         claim: [0; 16],
         tcp: None,
         peers: Vec::new(),
@@ -286,7 +286,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
     let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
-        deployment: launch.engine_config.deployment.clone(),
+        deployment: launch.deployment.clone(),
         claim: [0; 16],
         tcp: None,
         peers: Vec::new(),
@@ -386,7 +386,7 @@ fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region
     let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
     let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
-        deployment: launch.engine_config.deployment.clone(),
+        deployment: launch.deployment.clone(),
         claim: [0; 16],
         tcp: None,
         peers: Vec::new(),
@@ -453,7 +453,7 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
-        deployment: launch.engine_config.deployment.clone(),
+        deployment: launch.deployment.clone(),
         claim: [0; 16],
         tcp: None,
         peers: Vec::new(),
@@ -520,7 +520,7 @@ fn a_meta_start_of_a_model_with_a_vision_tower_encodes_images_beside_its_prefill
     let registry = nn::family::Registry::new([models::qwen3::family::HYBRID_FAMILY]).unwrap();
     let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
-        deployment: launch.engine_config.deployment.clone(),
+        deployment: launch.deployment.clone(),
         claim: [0; 16],
         tcp: None,
         peers: Vec::new(),
