@@ -22,7 +22,7 @@
 //! positions, computed once per forward, and may hold more than one spectrum (a text batch and
 //! an image batch of a Qwen3.5 model turn by different spectra of the same rotary width).
 
-use nn::family::TextPlacement;
+use nn::family::{ExpertOrder, TextPlacement};
 use nn::functional::Rounding;
 use nn::modules::{
     Attention, AttentionConfig, GateUp, GatedDeltaNet, GatedDeltaNetConfig, Mlp, MlpConfig, MoE,
@@ -102,8 +102,10 @@ impl DecoderLayer {
     /// `linear` loads a gated delta network as the mixer in place of attention. `routed` loads
     /// routed experts (and the shared expert the configuration states) in place of the dense
     /// MLP, held at the placement's share of them (its window of the expert group's slots, or
-    /// of the tensor group's when that group holds whole experts) in the slots `order` states,
-    /// or in the checkpoint's order when it states none.
+    /// of the tensor group's when that group holds whole experts). `stack` is the layer's index
+    /// in the model's own decoder stack and the deployment's expert order, which name its routed
+    /// block and its slots ([`nn::causal_lm::MoeConfig::block`]); `None` for a layer outside the
+    /// stack, which holds its experts in the checkpoint's order.
     ///
     /// # Errors
     ///
@@ -115,7 +117,7 @@ impl DecoderLayer {
         linear: bool,
         routed: bool,
         placement: &TextPlacement,
-        order: Option<&Vec<u32>>,
+        stack: Option<(u32, &ExpertOrder)>,
     ) -> Result<Self> {
         let (tensor, sequence) = (placement.tensor, placement.sequence);
         let text = &config.text;
@@ -173,7 +175,7 @@ impl DecoderLayer {
                 .moe
                 .as_ref()
                 .ok_or_else(|| refuse("routed experts"))?;
-            let block = moe.block(text.hidden_size, text.hidden_act, placement, order);
+            let block = moe.block(text.hidden_size, text.hidden_act, placement, stack);
             let shared = match moe.shared_expert_intermediate_size {
                 Some(intermediate) => Some(SharedExpert::load(
                     &SharedExpertConfig {

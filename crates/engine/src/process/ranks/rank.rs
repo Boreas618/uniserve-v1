@@ -84,14 +84,7 @@ impl crate::process::binding::ModelLoad for RankModel {
     }
 
     fn expert_layers(&self) -> BTreeMap<String, u32> {
-        let Model::Text(family) = self.model_runner.family.model else {
-            return BTreeMap::new();
-        };
-        let quantization = &self.model_runner.engine_config().model.quantization;
-        nn::Checkpoint::open(self.model_runner.checkpoint())
-            .and_then(|checkpoint| family.open(&checkpoint, quantization))
-            .map(|checkpoint| checkpoint.expert_layers())
-            .unwrap_or_default()
+        self.model_runner.expert_layers()
     }
 }
 
@@ -760,6 +753,20 @@ impl ModelRunner {
         let checkpoint = family.open(&opened, &self.engine_config().model.quantization)?;
         let mut loader = nn::WeightLoader::new(&opened, weights, None);
         Ok(checkpoint.load(&opened, &mut loader, &self.text_placement()?, experts)?)
+    }
+
+    /// The routed expert layers of this rank's checkpoint, by module path, each with the experts
+    /// its router names; none for a dense model, a media model or a checkpoint whose
+    /// configuration cannot be read.
+    pub(crate) fn expert_layers(&self) -> BTreeMap<String, u32> {
+        let Model::Text(family) = self.family.model else {
+            return BTreeMap::new();
+        };
+        let quantization = &self.engine_config().model.quantization;
+        nn::Checkpoint::open(self.checkpoint())
+            .and_then(|checkpoint| family.open(&checkpoint, quantization))
+            .map(|checkpoint| checkpoint.expert_layers())
+            .unwrap_or_default()
     }
 
     /// The placement this rank's causal language model loads at: its splits of the model and

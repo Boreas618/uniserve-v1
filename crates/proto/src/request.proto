@@ -843,6 +843,8 @@ message ForwardStats {
   map<uint64, ProfileProgress> profile = 29;
   // The operator launches of the rank's serving forwards by operator and descriptor key.
   repeated KernelLaunches kernel_launches = 30;
+  // The tokens each routed layer's experts processed, by layer.
+  repeated ExpertTokens expert_tokens = 31;
 }
 
 // One profiling session's progress on a rank: the steps of its window it
@@ -877,6 +879,13 @@ message KernelLaunches {
   string operator = 1;
   string key = 2;
   uint64 count = 3;
+}
+
+// The tokens one routed layer's experts processed (`ForwardStats.expert_tokens`): the layer's
+// module path, and the count of each of the model's own experts, in expert order.
+message ExpertTokens {
+  string layer = 1;
+  repeated uint64 tokens = 2;
 }
 
 // The driver calls one serving thread made that waited for the device
