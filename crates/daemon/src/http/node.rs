@@ -723,7 +723,7 @@ impl Node {
             then,
         } = brought;
         let name = leader.served_model_name().to_owned();
-        let programs = Arc::clone(&self).run_programs(&leader).await;
+        let programs = Arc::clone(&self).run_programs(&leader);
         let daemon = Arc::new(Mutex::new(daemon));
         let (listener, descriptors) = &self.listener;
         let descriptors = descriptors
@@ -1126,11 +1126,10 @@ impl Node {
         }
     }
 
-    /// Starts the programs of the revision that serves: its package's control and routing
-    /// programs, with the revisions its lock recorded, and the task that writes their outputs
-    /// through [`Node::apply`]. A program that cannot be fixed or started is recorded, and the
-    /// deployment serves without it.
-    async fn run_programs(self: Arc<Self>, leader: &Arc<Leader>) -> Arc<Programs> {
+    /// The programs of the revision that serves, which start in the background
+    /// ([`Node::start_programs`]) so the deployment serves at once, and the task that writes
+    /// their outputs through [`Node::apply`].
+    fn run_programs(self: Arc<Self>, leader: &Arc<Leader>) -> Arc<Programs> {
         let (outputs, written) = tokio::sync::mpsc::unbounded_channel();
         let states = States::new(self.revisions.program_state());
         let stored = self.revisions.current().and_then(|current| {
@@ -1138,23 +1137,13 @@ impl Node {
                 .map(|number| self.revisions.load(number))
                 .transpose()
         });
-        let (current, fixed) = match stored {
+        let (current, lock) = match stored {
             Ok(Some(stored)) => {
-                let fixed = match self
-                    .fix_programs(&stored.package, stored.lock.as_ref())
-                    .await
-                {
-                    Ok(fixed) => fixed,
-                    Err(error) => {
-                        warn!("the deployment's programs do not run: {error:#}");
-                        crate::programs::fix::Fixed::default()
-                    }
-                };
                 let current = Current {
                     revision: stored.record.revision,
                     package: stored.package,
                 };
-                (current, fixed)
+                (current, stored.lock)
             }
             Ok(None) | Err(_) => {
                 if let Err(error) = &stored {
@@ -1162,15 +1151,14 @@ impl Node {
                 }
                 let package = Package::of(crate::config::Config::default(), Default::default())
                     .unwrap_or_else(|_| unreachable!("the default configuration prints"));
-                (
-                    Current {
-                        revision: 0,
-                        package,
-                    },
-                    crate::programs::fix::Fixed::default(),
-                )
+                let current = Current {
+                    revision: 0,
+                    package,
+                };
+                (current, None)
             }
         };
+        let package = current.package.clone();
         let programs = Arc::new(Programs::new(
             self.recorder.store().clone(),
             states,
@@ -1178,13 +1166,45 @@ impl Node {
             outputs,
             Arc::clone(leader.router()),
         ));
-        programs.replace(&fixed.loaded).await;
-        Self::run_kv(leader, &fixed.loaded).await;
-        self.observe_modules(leader, programs.current().revision)
-            .await;
+        tokio::spawn(Arc::clone(&self).start_programs(
+            Arc::clone(leader),
+            Arc::clone(&programs),
+            package,
+            lock,
+        ));
         tokio::spawn(Self::read_kv(Arc::clone(leader), Arc::clone(&programs)));
         tokio::spawn(self.write_outputs(written));
         programs
+    }
+
+    /// Starts `package`'s programs with the revisions `lock` recorded: the control and routing
+    /// programs here, the KV program at the Storage Servers; then states the replicas' modules.
+    /// It holds the turn of a change, so a change that arrives meanwhile replaces the programs
+    /// after they started. A program that cannot be fixed or started is recorded, and the
+    /// deployment serves without it.
+    async fn start_programs(
+        self: Arc<Self>,
+        leader: Arc<Leader>,
+        programs: Arc<Programs>,
+        package: Package,
+        lock: Option<crate::epoch::ModuleSet>,
+    ) {
+        let _turn = self.applying.lock().await;
+        // A deployment that came down meanwhile starts no program.
+        if programs.ended().is_cancelled() {
+            return;
+        }
+        let fixed = match self.fix_programs(&package, lock.as_ref()).await {
+            Ok(fixed) => fixed,
+            Err(error) => {
+                warn!("the deployment's programs do not run: {error:#}");
+                crate::programs::fix::Fixed::default()
+            }
+        };
+        programs.replace(&fixed.loaded).await;
+        Self::run_kv(&leader, &fixed.loaded).await;
+        self.observe_modules(&leader, programs.current().revision)
+            .await;
     }
 
     /// Has every node's Storage Server run the KV program among `loaded`, or none; a failure is

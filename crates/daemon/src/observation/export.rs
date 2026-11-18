@@ -379,7 +379,7 @@ mod tests {
     async fn a_push_sends_each_completed_bucket_and_event_once() {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let clock = Arc::new(Manual(Mutex::new(start)));
-        let store = Store::new(clock.clone(), Retention::default()).unwrap();
+        let store = Store::new(Arc::<Manual>::clone(&clock), Retention::default()).unwrap();
         let mut cursor = Cursor::default();
 
         let labels: Labels = [("replica".to_owned(), "0".to_owned())].into();

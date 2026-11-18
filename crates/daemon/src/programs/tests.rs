@@ -35,6 +35,8 @@ fn wasm(name: &str) -> Arc<[u8]> {
             .args(["build", "--release", "--locked", "--offline", "--lib"])
             .args(["--message-format=json-render-diagnostics"])
             .args(["--target", "wasm32-unknown-unknown"])
+            // A few jobs, so the build leaves the cores to the tests that run beside it.
+            .args(["--jobs", "2"])
             .arg("--target-dir")
             .arg(&target)
             .args(["--package", "program-chunk", "--package", "program-fastest"])
@@ -199,10 +201,17 @@ async fn a_control_program_writes_from_what_it_observes_and_keeps_its_state() {
         .done
         .send(Err("refused for the test".to_owned()))
         .unwrap();
-    programs.stop().await;
 
-    // The refusal is the program's log event, and its `info!` lines are too.
-    assert!(logged(&store, "chunk", "refused for the test"));
+    // The refusal is the program's log event once its task took the answer, and its `info!`
+    // lines are log events too.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !logged(&store, "chunk", "refused for the test") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refusal is recorded");
+    programs.stop().await;
     assert!(logged(&store, "chunk", "8192 -> 4096"));
 
     // The state the program saved counts the changes it made, and the next instance restores it.
