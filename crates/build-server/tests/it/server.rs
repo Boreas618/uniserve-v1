@@ -44,7 +44,7 @@ fn listed(server: &BuildServer) -> Vec<String> {
         .list()
         .unwrap()
         .into_iter()
-        .map(|(package, _)| format!("{} {} {}", package.op, package.backend, package.revision))
+        .map(|(package, _, _)| format!("{} {} {}", package.op, package.backend, package.revision))
         .collect()
 }
 
@@ -70,7 +70,7 @@ fn the_server_opens_over_the_packages_installed_before_it_started() {
     let server = BuildServer::open(&config).unwrap();
     let listing = server.list().unwrap();
     assert_eq!(listed(&server), ["rms_norm vendor 1", "rms_norm vendor 2"]);
-    assert!(listing.iter().all(|(_, modules)| modules.is_empty()));
+    assert!(listing.iter().all(|(_, _, modules)| modules.is_empty()));
 }
 
 #[test]
@@ -93,6 +93,109 @@ fn an_installation_numbers_the_next_revision_of_its_operator_and_backend() {
         assert_eq!(Inputs::read(&directory).unwrap().toolchain, "none");
     }
     assert_eq!(server.list().unwrap().len(), 2);
+}
+
+/// Runs git in `repository` and returns what it printed.
+fn git(repository: &Path, arguments: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args([
+            "-c",
+            "user.name=Build Server",
+            "-c",
+            "user.email=build@server",
+        ])
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Commits everything in `repository` and returns the commit.
+fn commit(repository: &Path) -> String {
+    git(repository, &["add", "--all"]);
+    git(repository, &["commit", "--quiet", "--message", "package"]);
+    git(repository, &["rev-parse", "HEAD"])
+}
+
+/// A revision records the commit of the tree it was installed from and whether that tree held
+/// the commit's files, which the listing and a resolved module state and a server that opens
+/// again reads back; a package outside any repository has no commit. A revision installed from
+/// a modified tree becomes the commit's once the same files are installed from a clean one.
+#[test]
+fn a_revision_records_the_commit_it_was_installed_from() {
+    let _exclusive = support::exclusive();
+    let temporary = tempfile::tempdir().unwrap();
+    let config = support::config(temporary.path());
+    let server = BuildServer::open(&config).unwrap();
+    let origins = |server: &BuildServer| {
+        server
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|(package, origin, _)| (package.revision, origin.commit, origin.clean))
+            .collect::<Vec<_>>()
+    };
+
+    let outside = package(&temporary.path().join("outside"));
+    server.install(&outside).unwrap();
+    assert_eq!(origins(&server), [(1, None, false)]);
+
+    let repository = temporary.path().join("repository");
+    let source = package(&repository.join("rms_norm"));
+    git(&repository, &["init", "--quiet"]);
+    let first = commit(&repository);
+    let installed = server.install_if_changed(&source).unwrap();
+    assert_eq!(
+        installed.revision, 1,
+        "the files are the outside revision's"
+    );
+    server.install(&source).unwrap();
+
+    write(
+        &source,
+        &[("artifact/module_dtype_bf16.cubin", b"\x7fELF edited")],
+    );
+    assert_eq!(server.install_if_changed(&source).unwrap().revision, 3);
+    assert_eq!(
+        origins(&server),
+        [
+            (1, Some(first.clone()), true),
+            (2, Some(first.clone()), true),
+            (3, Some(first.clone()), false),
+        ]
+    );
+
+    let second = commit(&repository);
+    assert_eq!(server.install_if_changed(&source).unwrap().revision, 3);
+    let resolved = server
+        .resolve(
+            "rms_norm",
+            &support::revision("vendor", 3),
+            &arch(),
+            "dtype_bf16",
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(resolved.origin.commit.as_deref(), Some(second.as_str()));
+    assert!(resolved.origin.clean);
+    drop(server);
+
+    let server = BuildServer::open(&config).unwrap();
+    assert_eq!(
+        origins(&server),
+        [
+            (1, Some(first.clone()), true),
+            (2, Some(first), true),
+            (3, Some(second), true),
+        ]
+    );
 }
 
 /// Every installed revision records its build inputs, which name its modules
@@ -339,7 +442,7 @@ fn policy_workspace(root: &Path) -> PathBuf {
                 "policy/package.toml",
                 // The crate's files are the ones cargo packages, so the
                 // manifest lists none.
-                b"op = \"scheduling\"\nbackend = \"fixture\"\ninterface_version = 1\n\n\
+                b"op = \"program\"\nbackend = \"fixture\"\n\n\
                   [source]\nkind = \"wasm\"\n",
             ),
         ],
@@ -357,11 +460,11 @@ fn installed_policy(temporary: &Path) -> (BuildServer, build_server::ServerConfi
     let source = policy_workspace(&temporary.join("workspace"));
     assert_eq!(server.install(&source).unwrap().revision, 1);
 
-    let inputs = Inputs::read(&config.package_root.join("scheduling/fixture/1"))
+    let inputs = Inputs::read(&config.package_root.join("program/fixture/1"))
         .unwrap()
         .digest();
     let path = ModulePath::new(
-        "scheduling",
+        "program",
         "fixture",
         1,
         inputs,
@@ -386,7 +489,7 @@ fn an_installed_policy_holds_its_workspace_and_lists_its_one_wasm_module() {
     let temporary = tempfile::tempdir().unwrap();
     let (server, config, path) = installed_policy(temporary.path());
 
-    let revision = config.package_root.join("scheduling/fixture/1");
+    let revision = config.package_root.join("program/fixture/1");
     for file in [
         "package.toml",
         "workspace/Cargo.toml",
@@ -404,8 +507,8 @@ fn an_installed_policy_holds_its_workspace_and_lists_its_one_wasm_module() {
 
     let listing = server.list().unwrap();
     assert_eq!(listing.len(), 1);
-    let (package, modules) = &listing[0];
-    assert_eq!(package.op, "scheduling");
+    let (package, _, modules) = &listing[0];
+    assert_eq!(package.op, "program");
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0].target, Target::wasm());
     assert_eq!(modules[0].descriptor, path.descriptor);
@@ -423,7 +526,7 @@ fn prepare_takes_a_policy_for_wasm32_whatever_the_kernel_targets() {
     let mut progress = Vec::new();
     let prepared = server
         .prepare(
-            &support::latest("scheduling", "fixture", &[SINGLE_KEY], vec![arch()]),
+            &support::latest("program", "fixture", &[SINGLE_KEY], vec![arch()]),
             &mut |step| progress.push(step),
         )
         .unwrap();
@@ -445,7 +548,7 @@ fn a_policy_module_resolves_for_wasm32_only() {
 
     let resolved = server
         .resolve(
-            "scheduling",
+            "program",
             &revision,
             &Target::wasm(),
             SINGLE_KEY,
@@ -462,12 +565,12 @@ fn a_policy_module_resolves_for_wasm32_only() {
     assert!(resolved.entries.is_empty());
 
     assert!(matches!(
-        server.resolve("scheduling", &revision, &arch(), SINGLE_KEY, &mut |_| {}),
+        server.resolve("program", &revision, &arch(), SINGLE_KEY, &mut |_| {}),
         Err(Error::Build { .. })
     ));
     assert!(matches!(
         server.resolve(
-            "scheduling",
+            "program",
             &revision,
             &Target::wasm(),
             "dtype_bf16",

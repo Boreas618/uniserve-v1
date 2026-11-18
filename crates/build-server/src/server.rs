@@ -35,19 +35,20 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::builder::{Build, BuildState, Builder, Limits, Urgency};
-use crate::inputs::Inputs;
+use crate::inputs::{Inputs, Origin};
 use crate::manifest::{Manifest, ToolchainKind};
 use service::Connection;
 
 use crate::protocol::{
     self, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector, wire,
 };
+use crate::snapshot::WORKSPACE;
 use crate::source::{Cache, Source, Workspace};
 use crate::store::{ModulePath, Root, Staging, Store, directories, file_name};
 use crate::target::Target;
 use crate::toolchain::Toolchains;
 use crate::{Error, Result};
-use proto::module::{ModuleSlot, PackageRevision};
+use proto::module::{ModuleSlot, PROGRAM, PackageRevision};
 
 /// How long the queue's driver waits before it reads the host's memory again
 /// while builds wait for memory and none of its own runs. The host states no
@@ -67,6 +68,9 @@ pub struct Package {
     /// What the revision's modules are built from, as its installation
     /// recorded it; its digest is in every module path of the revision.
     pub inputs: Inputs,
+    /// Where the revision's sources came from: the commit of the tree it was
+    /// installed from and whether that tree was clean.
+    pub origin: Origin,
 }
 
 impl Package {
@@ -144,9 +148,34 @@ pub struct BuildServer {
     queue: Arc<Queue>,
     /// The queue's driver, which runs until the server is dropped.
     driver: Option<std::thread::JoinHandle<()>>,
+    /// The source tree the server was started with, whose workspace a policy
+    /// package's program crates are built in ([`Self::install_program`]).
+    source: Option<PathBuf>,
+    /// What builds and installs keep between them: the program SDK's snapshot
+    /// and the workspaces an installed program crate is composed in.
+    cache: Cache,
+    /// The snapshot of the source tree's workspace a program crate is added to,
+    /// taken at the first program installation ([`Sdk`]).
+    sdk: Mutex<Option<Arc<Sdk>>>,
     /// The upstream server's hold of its package root, which makes it the one
     /// writer of the revisions there; a downstream server writes none.
     _package_root: Option<fs::File>,
+}
+
+/// The program SDK a policy package's program crates are built against: a copy,
+/// in the server's cache, of the snapshot of its source tree's workspace, which
+/// holds the SDK crate (`scheduling`) and the workspace dependencies a program
+/// crate states with `workspace = true`.
+///
+/// The snapshot is taken once per server, as the tree's own packages are
+/// installed once when the server starts, so every program crate a server
+/// installs is built against one SDK, and the copy does not change under a
+/// build when the tree is edited.
+struct Sdk {
+    /// The copy's root, the workspace's root directory.
+    root: PathBuf,
+    /// The copy's files, each by its path below `root`.
+    files: Vec<String>,
 }
 
 impl BuildServer {
@@ -204,6 +233,9 @@ impl BuildServer {
             targets: config.targets.clone(),
             queue,
             driver: Some(driver),
+            source: config.source.clone(),
+            cache: Cache::new(config.cache.clone()),
+            sdk: Mutex::new(None),
             _package_root: package_root,
         })
     }
@@ -305,6 +337,25 @@ impl BuildServer {
     /// Responds to one request, sending its response on `connection`.
     fn respond(&self, connection: &mut Connection, request: wire::request::Request) -> Result<()> {
         match request {
+            wire::request::Request::InstallProgram(install) => {
+                let files = install
+                    .files
+                    .into_iter()
+                    .map(|file| (PathBuf::from(file.path), file.contents))
+                    .collect();
+                let installed = self.install_program(&install.directory, &files)?;
+                Ok(connection.deliver(&wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Installed(
+                        wire::InstallResponse {
+                            package: Some(wire::Package {
+                                op: installed.op,
+                                backend: installed.backend,
+                                revision: installed.revision,
+                            }),
+                        },
+                    )),
+                })?)
+            }
             wire::request::Request::Install(install) => {
                 let installed = self.install(Path::new(&install.package))?;
                 Ok(connection.deliver(&wire::ServerMessage {
@@ -378,6 +429,8 @@ impl BuildServer {
                             metadata: module.metadata.unwrap_or_default(),
                             interface_version: module.interface_version,
                             executable: module.executable.unwrap_or_default(),
+                            commit: module.origin.commit,
+                            clean: module.origin.clean,
                         },
                     )),
                 };
@@ -440,10 +493,12 @@ impl BuildServer {
                     packages: self
                         .list()?
                         .into_iter()
-                        .map(|(package, modules)| wire::PackageEntry {
+                        .map(|(package, origin, modules)| wire::PackageEntry {
                             op: package.op,
                             backend: package.backend,
                             revision: package.revision,
+                            commit: origin.commit,
+                            clean: origin.clean,
                             modules: modules
                                 .into_iter()
                                 .map(|module| wire::ModuleEntry {
@@ -479,20 +534,297 @@ impl BuildServer {
     /// reason, because it cannot state what the revision's modules are built
     /// by.
     pub fn install(&self, directory: &Path) -> Result<protocol::Package> {
-        if let Some(upstream) = &self.upstream {
-            return Err(Error::Refused {
-                reason: format!(
-                    "only the upstream Build Server installs packages, and this is not it: \
-                     the package was not installed from {}",
-                    directory.display()
-                ),
-                upstream: Some(upstream.display().to_string()),
-            });
-        }
+        self.upstream_only(&directory.display().to_string())?;
         let manifest = Manifest::load(directory).map_err(|source| Error::Manifest {
             package: directory.to_path_buf(),
             source: Box::new(source),
         })?;
+        // A cargo package's toolchain is the one its workspace's
+        // `rust-toolchain.toml` selects, which cargo finds from the package's
+        // own directory.
+        let toolchain = self
+            .toolchains
+            .identity(manifest.toolchain.kind, directory)?;
+        let files = crate::snapshot::package_files(directory, &manifest)?;
+        let inputs = Inputs {
+            package: crate::snapshot::files_digest(&files)?,
+            toolchain,
+        };
+        let origin = Origin::of(&crate::snapshot::source_root(directory, &manifest)?);
+        self.install_files(manifest, &files, inputs, origin)
+    }
+
+    /// Installs the program crate `programs/<directory>` of a policy package,
+    /// whose files are `files` (each by its path below that directory), as a
+    /// revision of the [`proto::module::PROGRAM`] package `programs.<directory>`
+    /// ([`program_backend`]), unless the latest revision of it holds the same
+    /// build inputs, which is returned instead. `prepare` and `resolve` then
+    /// build its wasm32 module as any program package's.
+    ///
+    /// The crate is built against the program SDK: it is added as a member to
+    /// the snapshot of the workspace of the source tree this server was
+    /// started with ([`Sdk`]), so it states its dependencies on the SDK
+    /// (`scheduling`) and on the workspace's other dependencies with
+    /// `workspace = true`, and cargo locks it among the workspace's packages
+    /// offline, from the sources vendored for the workspace's lockfile. The
+    /// revision's `package.toml` is the server's: a wasm source of the
+    /// operator and backend above, whose module states its own kind. Its
+    /// origin has no commit: the crate came with a package, from no tree.
+    ///
+    /// # Errors
+    ///
+    /// Refused on a server that is not the upstream or was started with no
+    /// source tree, for a directory name that is not one plain path component,
+    /// a file path that leaves the crate, or a crate with no `Cargo.toml`;
+    /// fails when the workspace cannot be composed or cargo cannot lock the
+    /// crate among it.
+    pub fn install_program(
+        &self,
+        directory: &str,
+        files: &BTreeMap<PathBuf, Vec<u8>>,
+    ) -> Result<protocol::Package> {
+        let named = format!("the program crate programs/{directory}");
+        self.upstream_only(&named)?;
+        let refused = |reason: String| Error::Refused {
+            reason,
+            upstream: None,
+        };
+        if directory.is_empty()
+            || !directory
+                .chars()
+                .all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '_')
+        {
+            return Err(refused(format!(
+                "{named} is not installed: a program crate's directory is named by letters, \
+                 digits, `-` and `_`"
+            )));
+        }
+        for path in files.keys() {
+            if path.as_os_str().is_empty()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(refused(format!(
+                    "{named} is not installed: its file {} leaves the crate's directory",
+                    path.display()
+                )));
+            }
+        }
+        if !files.contains_key(Path::new("Cargo.toml")) {
+            return Err(refused(format!(
+                "{named} is not installed: it holds no Cargo.toml"
+            )));
+        }
+        let sdk = self.sdk(&named)?;
+
+        // The workspace the crate is locked in: the SDK's files linked from
+        // its copy, with a manifest that lists the crate among the members and
+        // a lockfile of its own, which cargo rewrites.
+        let work = self.cache.work();
+        fs::create_dir_all(&work)?;
+        let staging = Staging::new(&work)?;
+        let workspace = staging.path();
+        for name in &sdk.files {
+            let destination = workspace.join(name);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if fs::hard_link(sdk.root.join(name), &destination).is_err() {
+                fs::copy(sdk.root.join(name), &destination)?;
+            }
+        }
+        let member = Path::new(PROGRAMS).join(directory);
+        let crate_root = workspace.join(&member);
+        if crate_root.exists() {
+            return Err(refused(format!(
+                "{named} is not installed: the SDK's workspace holds {} itself",
+                member.display()
+            )));
+        }
+        for (path, contents) in files {
+            let destination = crate_root.join(path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&destination, contents)?;
+        }
+        let backend = program_backend(directory);
+        fs::write(crate_root.join(Manifest::FILE), program_manifest(&backend))?;
+        let mut manifest: toml::Table =
+            toml::from_str(&fs::read_to_string(sdk.root.join("Cargo.toml"))?)
+                .map_err(|error| refused(format!("the SDK's Cargo.toml does not read: {error}")))?;
+        manifest
+            .get_mut("workspace")
+            .and_then(|workspace| workspace.get_mut("members"))
+            .and_then(toml::Value::as_array_mut)
+            .ok_or_else(|| refused("the SDK's Cargo.toml lists no workspace members".into()))?
+            .push(toml::Value::String(member.to_string_lossy().into_owned()));
+        for (name, contents) in [
+            (
+                "Cargo.toml",
+                toml::to_string(&manifest)
+                    .map_err(|error| refused(error.to_string()))?
+                    .into_bytes(),
+            ),
+            ("Cargo.lock", fs::read(sdk.root.join("Cargo.lock"))?),
+        ] {
+            // A linked file is the SDK copy's own: it is replaced, never written.
+            fs::remove_file(workspace.join(name))?;
+            fs::write(workspace.join(name), contents)?;
+        }
+        let vendor = crate::snapshot::vendored(&sdk.root, &self.cache)?;
+        let locked = crate::toolchain::cargo(&crate_root)
+            .args(["metadata", "--format-version", "1", "--offline", "--config"])
+            .arg(&vendor)
+            .output()?;
+        if !locked.status.success() {
+            return Err(refused(format!(
+                "{named} is not installed: cargo does not lock it among the SDK's workspace: {}",
+                String::from_utf8_lossy(&locked.stderr).trim()
+            )));
+        }
+
+        // The revision's snapshot: its manifest, the workspace as it now is,
+        // and the crate's files.
+        let manifest = Manifest::load(&crate_root).map_err(|source| Error::Manifest {
+            package: crate_root.clone(),
+            source: Box::new(source),
+        })?;
+        let mut snapshot: BTreeMap<String, PathBuf> = sdk
+            .files
+            .iter()
+            .map(|name| (format!("{WORKSPACE}/{name}"), workspace.join(name)))
+            .collect();
+        for path in files
+            .keys()
+            .map(PathBuf::as_path)
+            .chain([Path::new(Manifest::FILE)])
+        {
+            let name = Path::new(WORKSPACE).join(&member).join(path);
+            snapshot.insert(name.to_string_lossy().into_owned(), crate_root.join(path));
+        }
+        let mut snapshot: Vec<(String, PathBuf)> = snapshot.into_iter().collect();
+        snapshot.insert(
+            0,
+            (Manifest::FILE.to_owned(), crate_root.join(Manifest::FILE)),
+        );
+        let inputs = Inputs {
+            package: crate::snapshot::files_digest(&snapshot)?,
+            toolchain: self
+                .toolchains
+                .identity(manifest.toolchain.kind, &crate_root)?,
+        };
+
+        let latest = {
+            let packages = self
+                .packages
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            packages
+                .iter()
+                .filter(|((op, name, _), _)| op == PROGRAM && *name == backend)
+                .max_by_key(|((_, _, revision), _)| *revision)
+                .map(|((_, _, revision), package)| (*revision, package.inputs.clone()))
+        };
+        if let Some((revision, installed)) = latest
+            && installed == inputs
+        {
+            return Ok(protocol::Package {
+                op: PROGRAM.to_owned(),
+                backend,
+                revision,
+            });
+        }
+        self.install_files(manifest, &snapshot, inputs, Origin::default())
+    }
+
+    /// The program SDK's snapshot, taken from the source tree at the first
+    /// call and kept for the server's life; `installed` names what needs it
+    /// in the refusal of a server with no source tree.
+    fn sdk(&self, installed: &str) -> Result<Arc<Sdk>> {
+        let mut sdk = self
+            .sdk
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sdk) = &*sdk {
+            return Ok(Arc::clone(sdk));
+        }
+        let source = self.source.as_deref().ok_or_else(|| Error::Refused {
+            reason: format!(
+                "{installed} is not installed: this Build Server was started with no source \
+                 tree (`--source`), whose workspace holds the program SDK it is built against"
+            ),
+            upstream: None,
+        })?;
+
+        // The snapshot's names are below `workspace/`; the copy holds the
+        // workspace's files at its root.
+        let files: Vec<(String, PathBuf)> = crate::snapshot::workspace_files(source)?
+            .into_iter()
+            .map(|(name, path)| {
+                let name = name
+                    .strip_prefix(&format!("{WORKSPACE}/"))
+                    .unwrap_or(&name)
+                    .to_owned();
+                (name, path)
+            })
+            .collect();
+        let root = self.cache.sdk(&crate::snapshot::files_digest(&files)?);
+        if !root.join("Cargo.lock").is_file() {
+            let parent = root.parent().ok_or_else(|| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} has no parent directory", root.display()),
+                ))
+            })?;
+            fs::create_dir_all(parent)?;
+            let staging = Staging::new(parent)?;
+            crate::snapshot::write_files(&files, staging.path())?;
+            match staging.publish(&root) {
+                Ok(()) => {}
+                // Another server of this cache copied the same snapshot first.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty
+                    ) && root.join("Cargo.lock").is_file() => {}
+                Err(error) => return Err(Error::Io(error)),
+            }
+        }
+        let copied = Arc::new(Sdk {
+            root,
+            files: files.into_iter().map(|(name, _)| name).collect(),
+        });
+        *sdk = Some(Arc::clone(&copied));
+        Ok(copied)
+    }
+
+    /// Refuses an installation on a server that is not the upstream, naming
+    /// what was to be installed and where the upstream is.
+    fn upstream_only(&self, installed: &str) -> Result<()> {
+        match &self.upstream {
+            Some(upstream) => Err(Error::Refused {
+                reason: format!(
+                    "only the upstream Build Server installs packages, and this is not it: \
+                     {installed} was not installed"
+                ),
+                upstream: Some(upstream.display().to_string()),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Installs the snapshot `files` of a package whose manifest is `manifest`
+    /// as the next revision of its operator and backend, with its build inputs
+    /// and origin recorded beside it.
+    fn install_files(
+        &self,
+        manifest: Manifest,
+        files: &[(String, PathBuf)],
+        inputs: Inputs,
+        origin: Origin,
+    ) -> Result<protocol::Package> {
         let mut packages = self
             .packages
             .write()
@@ -514,18 +846,7 @@ impl BuildServer {
             &manifest.backend,
             revision,
         );
-        // A cargo package's toolchain is the one its workspace's
-        // `rust-toolchain.toml` selects, which cargo finds from the package's
-        // own directory.
-        let toolchain = self
-            .toolchains
-            .identity(manifest.toolchain.kind, directory)?;
-        let files = crate::snapshot::package_files(directory, &manifest)?;
-        let inputs = Inputs {
-            package: crate::snapshot::files_digest(&files)?,
-            toolchain,
-        };
-        install_package(&files, &root, &inputs)?;
+        install_package(files, &root, &inputs, &origin)?;
         // The source compiles the installed copy, not the tree the install
         // named: a downstream server's package root is a read-only mount of the
         // upstream's, and the publisher's directory need not exist there.
@@ -535,6 +856,7 @@ impl BuildServer {
             root,
             source,
             inputs,
+            origin,
         });
         let (op, backend) = (
             package.manifest.op.clone(),
@@ -556,11 +878,53 @@ impl BuildServer {
     /// # Errors
     ///
     /// Fails as [`Self::installed`] and [`Self::install`] fail.
+    ///
+    /// An unchanged revision installed from a tree that was not clean takes the
+    /// origin of a clean tree that holds the same files: the revision is then
+    /// that commit's.
     pub fn install_if_changed(&self, directory: &Path) -> Result<protocol::Package> {
-        match self.installed(directory)? {
-            Some(installed) => Ok(installed),
-            None => self.install(directory),
+        let Some(installed) = self.installed(directory)? else {
+            return self.install(directory);
+        };
+        let manifest = Manifest::load(directory).map_err(|source| Error::Manifest {
+            package: directory.to_path_buf(),
+            source: Box::new(source),
+        })?;
+        let origin = Origin::of(&crate::snapshot::source_root(directory, &manifest)?);
+        if origin.clean {
+            self.adopt_origin(&installed, origin)?;
         }
+        Ok(installed)
+    }
+
+    /// Records `origin` as the origin of the installed revision `installed`,
+    /// when its own is not clean.
+    fn adopt_origin(&self, installed: &protocol::Package, origin: Origin) -> Result<()> {
+        let mut packages = self
+            .packages
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (
+            installed.op.clone(),
+            installed.backend.clone(),
+            installed.revision,
+        );
+        let Some(package) = packages.get(&key) else {
+            return Ok(());
+        };
+        if package.origin.clean {
+            return Ok(());
+        }
+        origin.write(&package.root)?;
+        let adopted = Arc::new(Package {
+            manifest: package.manifest.clone(),
+            root: package.root.clone(),
+            source: package.manifest.source(&package.root),
+            inputs: package.inputs.clone(),
+            origin,
+        });
+        packages.insert(key, adopted);
+        Ok(())
     }
 
     /// Installs the serving packages of the source tree `source`
@@ -894,6 +1258,7 @@ impl BuildServer {
         })?;
         let entries = crate::source::entries(&package.manifest, &directory)?;
         Ok(Module {
+            origin: package.origin.clone(),
             form: package.manifest.module.form,
             files: module_files,
             metadata: package.manifest.module.metadata_name(&path.descriptor),
@@ -915,8 +1280,8 @@ impl BuildServer {
         })
     }
 
-    /// Lists every installed package revision with its modules.
-    pub fn list(&self) -> Result<Vec<(protocol::Package, Vec<protocol::ModuleEntry>)>> {
+    /// Lists every installed package revision with its origin and its modules.
+    pub fn list(&self) -> Result<Vec<(protocol::Package, Origin, Vec<protocol::ModuleEntry>)>> {
         let packages = self
             .packages
             .read()
@@ -952,13 +1317,19 @@ impl BuildServer {
         }
         Ok(listed
             .into_iter()
-            .map(|((op, backend, revision), modules)| {
+            .map(|(key, modules)| {
+                let origin = packages
+                    .get(&key)
+                    .map(|package| package.origin.clone())
+                    .unwrap_or_default();
+                let (op, backend, revision) = key;
                 (
                     protocol::Package {
                         op,
                         backend,
                         revision,
                     },
+                    origin,
                     modules,
                 )
             })
@@ -1597,6 +1968,27 @@ fn refusal(error: &Error) -> wire::Refusal {
     }
 }
 
+/// The directory of a policy package that holds its program crates, and of
+/// the workspace a program crate is composed into.
+const PROGRAMS: &str = "programs";
+
+/// The backend a policy package's program crate `programs/<directory>` is
+/// installed under: the crate's path with a dot, so it names no program of the
+/// release, whose backends are plain names.
+pub fn program_backend(directory: &str) -> String {
+    format!("{PROGRAMS}.{directory}")
+}
+
+/// The `package.toml` of a policy package's program crate installed as
+/// `backend`: a wasm source of the program interface, whose module states its
+/// kind and interface version itself.
+fn program_manifest(backend: &str) -> String {
+    format!(
+        "# A policy package's program crate, as the Build Server installed it.\n\
+         op = \"{PROGRAM}\"\nbackend = \"{backend}\"\n\n[source]\nkind = \"wasm\"\n"
+    )
+}
+
 /// Loads every installed package under a package root.
 fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Package>>> {
     let mut packages = BTreeMap::new();
@@ -1632,6 +2024,7 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
                 // Every installed revision records its build inputs, which name
                 // the modules it builds.
                 let inputs = Inputs::read(&revision)?;
+                let origin = Origin::read(&revision)?;
                 let source = manifest.source(&revision);
                 packages.insert(
                     (op_name.clone(), backend_name.clone(), number),
@@ -1640,6 +2033,7 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
                         root: revision.clone(),
                         source,
                         inputs,
+                        origin,
                     }),
                 );
             }
@@ -1657,7 +2051,12 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
 /// every byte it builds from, so a source several packages share in the tree
 /// (an operator's ABI header, one convolution source behind three operators)
 /// is one file there and a file of each package's revision.
-fn install_package(files: &[(String, PathBuf)], destination: &Path, inputs: &Inputs) -> Result<()> {
+fn install_package(
+    files: &[(String, PathBuf)],
+    destination: &Path,
+    inputs: &Inputs,
+    origin: &Origin,
+) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         Error::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1667,6 +2066,7 @@ fn install_package(files: &[(String, PathBuf)], destination: &Path, inputs: &Inp
     let staging = Staging::new(parent)?;
     crate::snapshot::write_files(files, staging.path())?;
     inputs.write(staging.path())?;
+    origin.write(staging.path())?;
     fs::File::open(staging.path())?.sync_all()?;
     staging.publish(destination)?;
     Ok(())

@@ -70,17 +70,30 @@ macro_rules! interface_section {
 }
 
 /// The version of its interface the module a build of `manifest`'s package
-/// wrote into `workspace` implements: the one the manifest states, or, for a
-/// cargo source, the one its executable states in its [`INTERFACE_SECTION`]
-/// (the manifest's validation leaves exactly one of the two).
+/// wrote into `workspace` implements: the one the manifest states; for a
+/// wasm source, the one its program module states in its own section
+/// (`program::kind`); for a cargo source, the one its executable states in its
+/// [`INTERFACE_SECTION`] (the manifest's validation leaves exactly one).
 ///
 /// # Errors
 ///
-/// Why no version was read: the executable cannot be read, or states none
-/// there, or states 0.
+/// Why no version was read: the module or executable cannot be read, or
+/// states none there, or states 0.
 pub fn stated_interface(manifest: &Manifest, workspace: &Path) -> std::result::Result<u32, String> {
     if let Some(version) = manifest.interface_version {
         return Ok(version.get());
+    }
+    if manifest.source.kind == SourceKind::Wasm {
+        let bytes = std::fs::read(workspace.join(MODULE_WASM))
+            .map_err(|error| format!("reading the built {MODULE_WASM}: {error}"))?;
+        let (_, version) =
+            program::kind(&bytes).map_err(|error| format!("the built {MODULE_WASM}: {error}"))?;
+        return match version {
+            0 => Err(format!(
+                "the built {MODULE_WASM} states interface version 0; versions start at 1"
+            )),
+            version => Ok(version),
+        };
     }
 
     let binary = manifest
@@ -153,6 +166,12 @@ impl Cache {
     /// The directory builds' workspaces are made in.
     pub fn work(&self) -> PathBuf {
         self.root.join("work")
+    }
+
+    /// The copy of the program SDK's workspace snapshot whose digest is
+    /// `digest`, which a policy package's program crates are composed into.
+    pub fn sdk(&self, digest: &str) -> PathBuf {
+        self.root.join("sdk").join(digest)
     }
 }
 

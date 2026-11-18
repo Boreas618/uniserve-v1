@@ -117,11 +117,14 @@ pub type Packages = BTreeMap<ModuleSlot, PackageRevision>;
 /// epoch, an executable the daemon starts.
 pub const ENGINE: &str = "engine";
 
-/// The interface a scheduling policy package implements, as its packages are filed.
-pub const POLICY: &str = "scheduling";
+/// The interface every program package implements, as its packages are filed: a wasm32 program
+/// module of any kind (control, routing, KV, scheduling), which states its kind in its own
+/// section (`scheduling::program::SECTION`). The release's programs are installed under their
+/// names; a policy package's own program crates under `programs.<dir>`.
+pub const PROGRAM: &str = "program";
 
-/// The key of the one module a package of the engine or the policy interface builds: each fills a
-/// whole interface, not a set of kernel shapes.
+/// The key of the one module a package of the engine or a program builds: each fills a whole
+/// interface, not a set of kernel shapes.
 pub const SINGLE_KEY: &str = "default";
 
 /// A module set: for every interface a deployment uses, the package revision selected for it and

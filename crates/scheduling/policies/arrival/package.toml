@@ -1,15 +1,14 @@
 # The `arrival` scheduling policy's package (design §5.2): the deployment's
 # default policy. Its waiting queue admits in the order its `order` argument
 # names, and each step assembles the running requests by phase class and
-# admission. A deployment selects it by naming its backend
-# (`scheduler_config.policy`).
+# admission. A policy package runs it by naming it as a program's source
+# (`[programs.<name>] source = "uniserve:arrival"`).
 
-op = "scheduling"
+# A program package: its module states its kind (a scheduling program) and the
+# policy interface version it implements in its own `uniserve.program` section,
+# which the Build Server records with the module and the engine checks.
+op = "program"
 backend = "arrival"
-# The policy interface the module implements (`scheduling::INTERFACE_VERSION`),
-# which the Build Server records with the module: the engine refuses a module
-# whose record, or whose own `sched_interface_version`, states another.
-interface_version = 6
 
 # The policy is built with the workspace's pinned Rust toolchain.
 [toolchain]

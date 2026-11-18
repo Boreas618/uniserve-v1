@@ -932,9 +932,8 @@ fn a_cargo_package_states_no_interface_version_and_no_compiler_release() {
 /// A scheduling policy: a crate cargo builds for wasm32, which fills the
 /// whole policy interface with one module (design sections 5.2 and 5.3).
 const POLICY: &str = r#"
-op = "scheduling"
+op = "program"
 backend = "fcfs"
-interface_version = 1
 
 [source]
 kind = "wasm"
@@ -978,6 +977,14 @@ fn a_scheduling_policy_is_a_wasm_package_of_one_module() {
         error.contains("only a native module has C entries"),
         "{error}"
     );
+
+    // The module states its interface version in its own section, so the manifest states none.
+    let versioned = POLICY.replace(
+        "backend = \"fcfs\"\n",
+        "backend = \"fcfs\"\ninterface_version = 6\n",
+    );
+    let error = load(&versioned, &[]).unwrap_err();
+    assert!(error.contains("interface_version"), "{error}");
 }
 
 /// An executable: a package revision the main process runs as its own

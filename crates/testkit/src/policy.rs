@@ -192,7 +192,7 @@ fn member(backend: &str) -> (PathBuf, String, PathBuf) {
         .find_map(|package| {
             let directory = Path::new(package["manifest_path"].as_str()?).parent()?;
             let manifest = build_server::manifest::Manifest::load(directory).ok()?;
-            if manifest.op != proto::module::POLICY || manifest.backend != backend {
+            if manifest.op != proto::module::PROGRAM || manifest.backend != backend {
                 return None;
             }
             Some((directory.to_path_buf(), package["id"].as_str()?.to_owned()))

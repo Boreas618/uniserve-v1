@@ -115,7 +115,7 @@ fn done(apply: impl FnOnce(&mut MainProcess) + Send + 'static) -> Input {
 /// The slot the scheduling policy's package is kept under in the packages a generation is made
 /// of, beside the kernels' slots: the interface it implements, which no operator is named.
 fn policy_slot() -> ModuleSlot {
-    ModuleSlot::all(proto::module::POLICY)
+    ModuleSlot::all(proto::module::PROGRAM)
 }
 
 /// `packages` without the policy's slot: the kernel packages of a generation.

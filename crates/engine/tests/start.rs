@@ -88,7 +88,7 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
     let policy = testkit::serving::launch().modules.policy;
     client
         .resolve(
-            proto::module::POLICY,
+            proto::module::PROGRAM,
             &policy,
             &build_server::Target::wasm(),
             build_server::manifest::SINGLE_KEY,

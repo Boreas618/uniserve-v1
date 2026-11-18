@@ -228,7 +228,7 @@ pub(crate) fn policy(
     );
     let module = client
         .resolve(
-            proto::module::POLICY,
+            proto::module::PROGRAM,
             package,
             &target,
             build_server::manifest::SINGLE_KEY,
@@ -462,6 +462,7 @@ mod tests {
             )]),
             interface_version: 1,
             executable: None,
+            origin: build_server::protocol::Origin::default(),
         };
         let Resolved::Native { library, entry, .. } = Resolved::of(native).unwrap() else {
             panic!("a native module reads as a native library");
@@ -493,6 +494,7 @@ mod tests {
             entries: BTreeMap::new(),
             interface_version: 1,
             executable: None,
+            origin: build_server::protocol::Origin::default(),
         };
         let Resolved::Cubin { image, metadata } = Resolved::of(cubin).unwrap() else {
             panic!("a cubin module reads as a cubin");
@@ -518,6 +520,7 @@ mod tests {
             )]),
             interface_version: 1,
             executable: None,
+            origin: build_server::protocol::Origin::default(),
         };
 
         let Err(refused) = Resolved::of(module) else {

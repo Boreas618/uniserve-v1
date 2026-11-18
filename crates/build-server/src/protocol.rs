@@ -28,6 +28,7 @@ use prost::Message;
 use service::Connection;
 
 use crate::builder::BuildState;
+pub use crate::inputs::Origin;
 use crate::manifest::ModuleForm;
 use crate::store::ModulePath;
 use crate::target::Target;
@@ -129,6 +130,9 @@ pub struct Module {
     /// executable its process runs as, which the package's manifest names
     /// (`[source] binary`); `None` for every other form.
     pub executable: Option<String>,
+    /// Where the module's package revision came from: the commit of the tree
+    /// it was installed from and whether that tree was clean.
+    pub origin: Origin,
 }
 
 /// One module of an installed package, as `list` names it.
@@ -455,6 +459,55 @@ impl Client {
         }
     }
 
+    /// Installs a policy package's program crate `programs/<directory>`, whose
+    /// files are `files` (each by its path below that directory), and returns
+    /// its revision: the latest one when it holds the same build inputs
+    /// (`crate::BuildServer::install_program`).
+    ///
+    /// Only the upstream Build Server installs; another one refuses and names
+    /// the upstream, which the error carries.
+    pub fn install_program(
+        &mut self,
+        directory: &str,
+        files: &std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) -> Result<Package> {
+        let files = files
+            .iter()
+            .map(|(path, contents)| {
+                let path = path.to_str().ok_or_else(|| {
+                    Error::Protocol(format!(
+                        "the program file path {} is not UTF-8",
+                        path.display()
+                    ))
+                })?;
+                Ok(wire::ProgramFile {
+                    path: path.to_owned(),
+                    contents: contents.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.connection.deliver(&wire::Request {
+            request: Some(wire::request::Request::InstallProgram(
+                wire::InstallProgram {
+                    directory: directory.to_owned(),
+                    files,
+                },
+            )),
+        })?;
+        match self.response()? {
+            wire::server_message::Message::Installed(installed) => installed
+                .package
+                .map(|package| Package {
+                    op: package.op,
+                    backend: package.backend,
+                    revision: package.revision,
+                })
+                .ok_or_else(|| Error::Protocol("installed without a package".into())),
+            wire::server_message::Message::Refused(refused) => Err(refused_error(refused)),
+            other => Err(unexpected(Some(other))),
+        }
+    }
+
     /// Selects an epoch's package revisions and has every module of their descriptors
     /// built, reporting each build through `progress` (design section 6.3).
     /// Returns each requested slot with the package revision selected for it.
@@ -547,6 +600,10 @@ impl Client {
                         interface_version: resolved.interface_version,
                         executable: (!resolved.executable.is_empty())
                             .then_some(resolved.executable),
+                        origin: Origin {
+                            commit: resolved.commit,
+                            clean: resolved.clean,
+                        },
                     });
                 }
                 wire::server_message::Message::Refused(refused) => {
@@ -557,8 +614,8 @@ impl Client {
         }
     }
 
-    /// Lists every installed package revision with its modules.
-    pub fn list(&mut self) -> Result<Vec<(Package, Vec<ModuleEntry>)>> {
+    /// Lists every installed package revision with its origin and its modules.
+    pub fn list(&mut self) -> Result<Vec<(Package, Origin, Vec<ModuleEntry>)>> {
         self.connection.deliver(&wire::Request {
             request: Some(wire::request::Request::List(wire::List {})),
         })?;
@@ -588,6 +645,10 @@ impl Client {
                             op: package.op,
                             backend: package.backend,
                             revision: package.revision,
+                        },
+                        Origin {
+                            commit: package.commit,
+                            clean: package.clean,
                         },
                         modules,
                     ));

@@ -260,6 +260,8 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
                             metadata: "metadata.json".into(),
                             interface_version: 1,
                             executable: String::new(),
+                            commit: Some("4c36250e65".into()),
+                            clean: true,
                         },
                     )),
                 },
@@ -278,6 +280,8 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
     assert_eq!(module.files[0].size, "the cubin bytes".len() as u64);
     assert_eq!(module.metadata.as_deref(), Some("metadata.json"));
     assert!(module.entries.is_empty());
+    assert_eq!(module.origin.commit.as_deref(), Some("4c36250e65"));
+    assert!(module.origin.clean);
     let mut bytes = Vec::new();
     let mut file = &module.files[0].file;
     file.seek(SeekFrom::Start(0)).unwrap();
@@ -297,6 +301,8 @@ fn a_listing_names_the_packages_revisions_and_modules() {
                             op: "rms_norm".into(),
                             backend: "triton".into(),
                             revision: 2,
+                            commit: Some("4c36250e65".into()),
+                            clean: false,
                             modules: vec![wire::ModuleEntry {
                                 target: arch().to_string(),
                                 descriptor: "dtype_bf16".into(),
@@ -313,8 +319,10 @@ fn a_listing_names_the_packages_revisions_and_modules() {
 
     let listing = client.list().unwrap();
     assert_eq!(listing.len(), 1);
-    let (package, modules) = &listing[0];
+    let (package, origin, modules) = &listing[0];
     assert_eq!(package.revision, 2);
+    assert_eq!(origin.commit.as_deref(), Some("4c36250e65"));
+    assert!(!origin.clean);
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0].descriptor, "dtype_bf16");
     assert_eq!(modules[0].form, ModuleForm::Cubin);
@@ -418,6 +426,8 @@ fn a_native_module_comes_back_with_its_entries_by_role() {
                             metadata: String::new(),
                             interface_version: 1,
                             executable: String::new(),
+                            commit: None,
+                            clean: false,
                         },
                     )),
                 },
@@ -453,9 +463,11 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
                 &wire::ServerMessage {
                     message: Some(wire::server_message::Message::Listing(wire::ListResponse {
                         packages: vec![wire::PackageEntry {
-                            op: "scheduling".into(),
+                            op: "program".into(),
                             backend: "fcfs".into(),
                             revision: 1,
+                            commit: None,
+                            clean: false,
                             modules: vec![wire::ModuleEntry {
                                 target: Target::wasm().to_string(),
                                 descriptor: "default".into(),
@@ -471,7 +483,7 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
     });
 
     let listing = client.list().unwrap();
-    assert_eq!(listing[0].1[0].form, ModuleForm::Wasm);
+    assert_eq!(listing[0].2[0].form, ModuleForm::Wasm);
 }
 
 #[test]
@@ -486,6 +498,8 @@ fn a_listed_module_of_an_unknown_form_is_refused_rather_than_guessed() {
                             op: "rms_norm".into(),
                             backend: "triton".into(),
                             revision: 1,
+                            commit: None,
+                            clean: false,
                             modules: vec![wire::ModuleEntry {
                                 target: arch().to_string(),
                                 descriptor: "dtype_bf16".into(),

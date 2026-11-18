@@ -23,6 +23,7 @@ message Request {
     Resolve resolve = 3;
     List list = 4;
     Cover cover = 5;
+    InstallProgram install_program = 6;
   }
 }
 
@@ -32,6 +33,24 @@ message Request {
 message Install {
   // The package directory, as the server host sees it.
   string package = 1;
+}
+
+// Install a policy package's program crate `programs/<directory>`, whose files
+// the request carries: the server adds it to the workspace of its source tree,
+// which holds the program SDK, and installs it as the next revision of the
+// `program` package `programs.<directory>`, unless its latest revision holds
+// the same build inputs, which is the response then. Only the upstream Build
+// Server accepts it. Responded to with `InstallResponse`.
+message InstallProgram {
+  // The crate's directory name below the package's `programs/`.
+  string directory = 1;
+  repeated ProgramFile files = 2;
+}
+
+// One file of a program crate, by its path below the crate's directory.
+message ProgramFile {
+  string path = 1;
+  bytes contents = 2;
 }
 
 // The identity of an installed package.
@@ -166,9 +185,9 @@ enum ModuleForm {
   // A native library with a C ABI: loaded with `dlopen` and called through
   // the entry its package declares.
   MODULE_FORM_NATIVE = 2;
-  // A wasm32 module, which the engine's wasmtime compiles when it loads it:
-  // a scheduling policy (design section 5.3). A flat blob, with neither
-  // launch metadata nor a C entry.
+  // A wasm32 module, which its host's wasmtime compiles when it loads it: a
+  // program of any kind, which the module's own section states (design
+  // section 5.3). A flat blob, with neither launch metadata nor a C entry.
   MODULE_FORM_WASM = 3;
   // An executable, stored as it is and run as its own process: it is
   // not loaded into the main process (design section 5.1).
@@ -236,6 +255,11 @@ message ResolveResponse {
   // runs as, which its package's manifest names (`[source] binary`); empty for
   // every other form.
   string executable = 7;
+  // The git commit of the tree the module's package revision was installed
+  // from; absent for a revision of files from no repository.
+  optional string commit = 8;
+  // Whether that tree held exactly the commit's files.
+  bool clean = 9;
 }
 
 message ModuleEntry {
@@ -251,6 +275,9 @@ message PackageEntry {
   string backend = 2;
   uint32 revision = 3;
   repeated ModuleEntry modules = 4;
+  // The revision's origin, as `ResolveResponse` states it.
+  optional string commit = 5;
+  bool clean = 6;
 }
 
 message ListResponse {

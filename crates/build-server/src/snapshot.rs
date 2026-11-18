@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::inputs::{BYTECODE_CACHE, RECORD};
+use crate::inputs::{BYTECODE_CACHE, ORIGIN, RECORD};
 use crate::manifest::Manifest;
 use crate::source::Cache;
 use crate::toolchain::CARGO;
@@ -65,6 +65,32 @@ pub fn package_files(directory: &Path, manifest: &Manifest) -> Result<Files> {
     }
 
     files.push((Manifest::FILE.to_owned(), directory.join(Manifest::FILE)));
+    files.extend(workspace_files(directory)?);
+    Ok(files)
+}
+
+/// The directory an installation of the package in `directory` takes its
+/// files from: the root of a cargo package's workspace, and the package's own
+/// directory otherwise. Its git state is the revision's [`crate::inputs::Origin`].
+///
+/// # Errors
+///
+/// Fails when cargo cannot report a cargo package's workspace.
+pub fn source_root(directory: &Path, manifest: &Manifest) -> Result<PathBuf> {
+    if manifest.source.kind.builds_with_cargo() {
+        return Ok(metadata(directory)?.workspace_root);
+    }
+    Ok(directory.to_path_buf())
+}
+
+/// The snapshot of the workspace the crate in `directory` belongs to, each file
+/// named under [`WORKSPACE`]: the workspace's manifest, lockfile and toolchain
+/// file, and every file cargo packages of every member, in name order.
+///
+/// # Errors
+///
+/// Fails when cargo cannot list the workspace.
+pub fn workspace_files(directory: &Path) -> Result<Files> {
     let workspace = metadata(directory)?;
     let mut listed: BTreeMap<String, PathBuf> = BTreeMap::new();
     for name in WORKSPACE_FILES {
@@ -90,8 +116,7 @@ pub fn package_files(directory: &Path, manifest: &Manifest) -> Result<Files> {
             }
         }
     }
-    files.extend(listed);
-    Ok(files)
+    Ok(listed.into_iter().collect())
 }
 
 /// The SHA-256 of a snapshot, in hex: each file framed by its name and its
@@ -141,7 +166,9 @@ fn tree_files(directory: &Path, prefix: &Path, files: &mut Files) -> Result<()> 
     entries.sort();
 
     for name in entries {
-        if name == BYTECODE_CACHE || (prefix.as_os_str().is_empty() && name == RECORD) {
+        if name == BYTECODE_CACHE
+            || (prefix.as_os_str().is_empty() && (name == RECORD || name == ORIGIN))
+        {
             continue;
         }
         let path = directory.join(&name);
@@ -269,7 +296,11 @@ pub fn member(revision: &Path) -> Result<Member> {
 
 /// The cargo configuration that replaces every source the lockfile of the
 /// workspace snapshot at `workspace` names with its vendored copy, provisioned
-/// once per lockfile in the Build Server's cache ([`Cache::vendor`]).
+/// once per set of external packages the lockfile locks in the Build Server's
+/// cache ([`Cache::vendor`], [`external_digest`]): two lockfiles that differ
+/// only in their workspace members, such as a workspace and the same
+/// workspace with a policy package's program crate added as a member, share
+/// one provisioning.
 ///
 /// The provisioning is `cargo vendor --locked --offline` into a staging
 /// directory beside the destination ([`crate::store::Staging`]), which holds
@@ -284,10 +315,7 @@ pub fn member(revision: &Path) -> Result<Member> {
 ///
 /// Fails when the lockfile cannot be read or cargo cannot vendor its sources.
 pub fn vendored(workspace: &Path, cache: &Cache) -> Result<PathBuf> {
-    let lock = format!(
-        "{:x}",
-        Sha256::digest(fs::read(workspace.join("Cargo.lock"))?)
-    );
+    let lock = external_digest(&fs::read_to_string(workspace.join("Cargo.lock"))?)?;
     let destination = cache.vendor(&lock);
     let config = destination.join(VENDOR_CONFIG);
     if config.is_file() {
@@ -342,6 +370,42 @@ pub fn vendored(workspace: &Path, cache: &Cache) -> Result<PathBuf> {
     }
 }
 
+/// The SHA-256, in hex, of the external packages the lockfile `text` locks:
+/// each package with a `source` (a registry or a git repository), by its name,
+/// version, source and checksum, in the lockfile's order. Workspace members and
+/// path dependencies have no source and are no part of it, since nothing is
+/// vendored for them.
+///
+/// # Errors
+///
+/// Fails when the text is no lockfile.
+pub fn external_digest(text: &str) -> Result<String> {
+    let lock: toml::Table = toml::from_str(text)
+        .map_err(|error| invalid(format!("the lockfile does not read: {error}")))?;
+    let mut hasher = Sha256::new();
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for package in packages {
+        let field = |key: &str| package.get(key).and_then(toml::Value::as_str);
+        let Some(source) = field("source") else {
+            continue;
+        };
+        for part in [
+            field("name").unwrap_or_default(),
+            field("version").unwrap_or_default(),
+            source,
+            field("checksum").unwrap_or_default(),
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update([0]);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn invalid(message: String) -> Error {
     Error::Io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
@@ -364,8 +428,41 @@ mod tests {
         files_digest(&files).unwrap()
     }
 
+    /// Two lockfiles that differ only in their workspace members lock one set of external
+    /// packages, which one vendored copy serves; another version of an external package is
+    /// another set.
+    #[test]
+    fn the_vendored_sources_follow_the_external_packages_alone() {
+        let lock = |members: &str, version: &str| {
+            format!(
+                "version = 4\n\n{members}[[package]]\nname = \"serde\"\nversion = \"{version}\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"ab\"\n"
+            )
+        };
+        let sdk = lock(
+            "[[package]]\nname = \"scheduling\"\nversion = \"2.0.0\"\n\n",
+            "1.0.1",
+        );
+        let program = lock(
+            "[[package]]\nname = \"program-first\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"serde\"]\n\n[[package]]\nname = \"scheduling\"\n\
+             version = \"2.0.0\"\n\n",
+            "1.0.1",
+        );
+        let other = lock("", "1.0.2");
+        assert_eq!(
+            external_digest(&sdk).unwrap(),
+            external_digest(&program).unwrap()
+        );
+        assert_ne!(
+            external_digest(&sdk).unwrap(),
+            external_digest(&other).unwrap()
+        );
+    }
+
     /// A changed byte, a renamed file and an added file each change a package's digest; bytecode
-    /// and the revision's record do not.
+    /// and the revision's records do not.
     #[test]
     fn a_package_digest_follows_the_files_a_build_reads() {
         let directory = tempfile::tempdir().unwrap();
@@ -381,6 +478,7 @@ mod tests {
             &[
                 ("src/__pycache__/kernel.pyc", "bytecode"),
                 (RECORD, "record"),
+                (ORIGIN, "origin"),
             ],
         );
         assert_eq!(digest(root), base);

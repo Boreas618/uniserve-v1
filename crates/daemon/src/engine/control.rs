@@ -1229,7 +1229,7 @@ pub fn with_store_modules(
 
     let mut complete = filled.clone();
     fix_revision(&mut client, proto::module::ENGINE, &mut complete.engine)?;
-    fix_revision(&mut client, proto::module::POLICY, &mut complete.policy)?;
+    fix_revision(&mut client, proto::module::PROGRAM, &mut complete.policy)?;
     for (slot, package) in &mut complete.kernels {
         fix_revision(&mut client, &slot.op, package)?;
     }
@@ -1301,7 +1301,7 @@ fn prepare_at(
     server: &BuildServer,
     filled: &crate::epoch::ModuleSet,
 ) -> anyhow::Result<crate::epoch::ModuleSet> {
-    let policy_slot = proto::module::ModuleSlot::all(proto::module::POLICY);
+    let policy_slot = proto::module::ModuleSlot::all(proto::module::PROGRAM);
     let engine_slot = proto::module::ModuleSlot::all(proto::module::ENGINE);
     let mut requests = Vec::with_capacity(filled.kernels.len() + 2);
     for (slot, package) in &filled.kernels {

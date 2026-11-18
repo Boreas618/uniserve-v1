@@ -523,10 +523,12 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             if json {
                 let packages: Vec<ListedPackage<'_>> = listing
                     .iter()
-                    .map(|(package, modules)| ListedPackage {
+                    .map(|(package, origin, modules)| ListedPackage {
                         op: &package.op,
                         backend: &package.backend,
                         revision: package.revision,
+                        commit: origin.commit.as_deref(),
+                        clean: origin.clean,
                         modules: modules
                             .iter()
                             .map(|module| ListedModule {
@@ -541,9 +543,15 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
                 write_line(&mut std::io::stdout().lock(), &packages)?;
                 return Ok(());
             }
-            for (package, modules) in listing {
+            for (package, origin, modules) in listing {
+                // The commit the revision was installed from, marked when its tree was not clean.
+                let commit = match (&origin.commit, origin.clean) {
+                    (Some(commit), true) => format!(" commit {commit}"),
+                    (Some(commit), false) => format!(" commit {commit} (modified)"),
+                    (None, _) => String::new(),
+                };
                 println!(
-                    "{} {} revision {}",
+                    "{} {} revision {}{commit}",
                     package.op, package.backend, package.revision
                 );
                 for module in modules {
@@ -593,6 +601,8 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
                             .as_deref()
                             .and_then(|name| module.files.iter().find(|file| file.name == name))
                             .map(|file| file.path.as_path()),
+                        commit: module.origin.commit.as_deref(),
+                        clean: module.origin.clean,
                     },
                 )?;
                 return Ok(());
@@ -830,13 +840,15 @@ pub struct InstalledPackage<'a> {
     pub revision: u32,
 }
 
-/// One element of what `list --json` prints: an installed package revision and the modules its
-/// store holds.
+/// One element of what `list --json` prints: an installed package revision, the commit of the
+/// tree it was installed from and whether that tree was clean, and the modules its store holds.
 #[derive(Serialize)]
 pub struct ListedPackage<'a> {
     pub op: &'a str,
     pub backend: &'a str,
     pub revision: u32,
+    pub commit: Option<&'a str>,
+    pub clean: bool,
     pub modules: Vec<ListedModule<'a>>,
 }
 
@@ -851,12 +863,15 @@ pub struct ListedModule<'a> {
 }
 
 /// What `resolve --json` prints: the module's form, the path of each of its files in the store,
-/// and for an executable module the file its process runs as.
+/// for an executable module the file its process runs as, and the commit of the tree its package
+/// revision was installed from with whether that tree was clean.
 #[derive(Serialize)]
 pub struct ResolvedModule<'a> {
     pub form: ModuleForm,
     pub files: Vec<&'a Path>,
     pub executable: Option<&'a Path>,
+    pub commit: Option<&'a str>,
+    pub clean: bool,
 }
 
 /// Writes `value` to `writer` as one JSON line and flushes it.

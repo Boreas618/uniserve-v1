@@ -109,8 +109,9 @@ pub enum SourceKind {
     CuteDsl,
     /// A vendor cubin the package carries, stored as it is.
     Cubin,
-    /// A scheduling policy: a crate of a Cargo workspace, built for wasm32
-    /// from the snapshot an installation takes of the whole workspace.
+    /// A program (control, routing, KV or scheduling): a crate of a Cargo
+    /// workspace, built for wasm32 from the snapshot an installation takes of
+    /// the whole workspace.
     Wasm,
     /// An executable: stored as it is.
     Executable,
@@ -760,7 +761,9 @@ pub struct Manifest {
     /// version of the interface it was compiled to implement in its
     /// [`crate::source::INTERFACE_SECTION`] ([`crate::interface_section!`]),
     /// which the build reads, so the interface's own constant is the one
-    /// statement of it.
+    /// statement of it. Neither does a wasm source (a program): its module
+    /// states its kind and version in its `uniserve.program` section
+    /// (`scheduling::program::SECTION`), which the build reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_version: Option<NonZeroU32>,
     /// The package's place among its operator's backends: of the packages
@@ -918,7 +921,15 @@ impl Manifest {
                         .into(),
                 ));
             }
-            (SourceKind::Cargo, None) | (_, Some(_)) => {}
+            (SourceKind::Wasm, Some(_)) => {
+                return Err(ManifestError::Invalid(
+                    "a wasm source's module states its kind of program and the interface version \
+                     it implements in its own section (`scheduling::program::SECTION`): its \
+                     manifest states no `interface_version`"
+                        .into(),
+                ));
+            }
+            (SourceKind::Cargo | SourceKind::Wasm, None) | (_, Some(_)) => {}
             (_, None) => {
                 return Err(ManifestError::Invalid(
                     "state the version of the interface the package implements in \
@@ -930,8 +941,7 @@ impl Manifest {
         match (&self.kernel, self.module.form) {
             (Some(_), ModuleForm::Wasm) => {
                 return Err(ManifestError::Invalid(
-                    "a scheduling policy fills a whole interface, so it names no kernel package"
-                        .into(),
+                    "a program fills a whole interface, so it names no kernel package".into(),
                 ));
             }
             (Some(kernel), _) if kernel.descriptors.is_empty() => {

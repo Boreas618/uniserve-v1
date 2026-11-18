@@ -10,6 +10,7 @@ mod builder;
 mod command;
 mod cover;
 mod manifest;
+mod program;
 mod protocol;
 mod serve;
 mod server;

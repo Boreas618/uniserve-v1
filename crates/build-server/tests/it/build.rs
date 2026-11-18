@@ -96,9 +96,9 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     );
 
     let listing = client.list().unwrap();
-    assert_eq!(listing[0].1.len(), 1);
-    assert_eq!(listing[0].1[0].descriptor, PAGE_64);
-    assert_eq!(listing[0].1[0].form, ModuleForm::Cubin);
+    assert_eq!(listing[0].2.len(), 1);
+    assert_eq!(listing[0].2[0].descriptor, PAGE_64);
+    assert_eq!(listing[0].2[0].form, ModuleForm::Cubin);
 
     drop(client);
     serving.stop().unwrap();
@@ -276,7 +276,7 @@ fn served(store: &Path, cache: &Path) -> Vec<(u32, Vec<String>)> {
         .list()
         .unwrap()
         .into_iter()
-        .map(|(package, modules)| {
+        .map(|(package, _, modules)| {
             let keys = modules
                 .into_iter()
                 .map(|module| module.descriptor)
@@ -447,12 +447,12 @@ fn the_workspace_policy_is_built_from_its_installed_snapshot() {
     let config = support::config(temporary.path());
     let server = BuildServer::open(&config).unwrap();
     let installed = server
-        .install(&workspace_package("scheduling", "arrival"))
+        .install(&workspace_package("program", "arrival"))
         .unwrap();
     let revision = support::revision(&installed.backend, installed.revision);
     server
         .prepare(
-            &support::latest("scheduling", "arrival", &[SINGLE_KEY], Vec::new()),
+            &support::latest("program", "arrival", &[SINGLE_KEY], Vec::new()),
             &mut |_| {},
         )
         .expect("the server builds the policy from its snapshot");
@@ -462,7 +462,7 @@ fn the_workspace_policy_is_built_from_its_installed_snapshot() {
     let mut progress = Vec::new();
     let module = server
         .resolve(
-            "scheduling",
+            "program",
             &revision,
             &Target::wasm(),
             SINGLE_KEY,
