@@ -1079,6 +1079,18 @@ impl Thread {
         // device's work is its design, so the figure is a record and not a fault.
         let _watched = self.device.map(|_| Watched::enter());
 
+        // The spans of this thread and of its device's kernels name the worker.
+        let label = service::span::Label::Worker {
+            group: self.tables.group().0,
+            rank: u32::try_from(self.rank).unwrap_or(u32::MAX),
+        };
+        service::span::label(label);
+        if let (Some(device), Some(markers)) =
+            (self.device, profiling::markers::Markers::installed())
+        {
+            markers.label(device, label);
+        }
+
         while let Some(Entry {
             job,
             submission,

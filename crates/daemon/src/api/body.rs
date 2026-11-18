@@ -69,6 +69,12 @@ pub trait Session: Send + 'static {
     /// so the engine's next consumer takes it over where this one stopped.
     /// Never cancels the request.
     fn detach(&mut self);
+
+    /// The trace id of the response's request, which the spans of its sending name; `None` for
+    /// a response whose request is traced nowhere.
+    fn trace(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// How a response's head goes out relative to its body.

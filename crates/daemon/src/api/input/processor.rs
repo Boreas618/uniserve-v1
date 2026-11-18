@@ -27,6 +27,7 @@ use proto::handoff;
 use proto::request::{
     CachePolicy, GenerationFeatures, GenerationLimits, GenerationRequest, RequestId,
 };
+use service::span::{self, Stage};
 use thiserror::Error;
 
 use crate::api::input::chat::MultimodalRenderInfo;
@@ -445,7 +446,9 @@ impl Processor {
     ///
     /// `images` are the fetched `image_url` parts of the request, in
     /// `ChatCompletionRequest::image_urls` order; a text request has none. `adapter` is the
-    /// LoRA adapter the request's `model` names, when it names one.
+    /// LoRA adapter the request's `model` names, when it names one. `trace` is the request's
+    /// trace id, which the generation request carries and its template, tokenize and
+    /// preprocess spans name.
     ///
     /// # Errors
     ///
@@ -458,6 +461,7 @@ impl Processor {
         request: &ChatCompletionRequest,
         adapter: Option<&AdapterSelection>,
         images: Vec<crate::api::input::ImageInput>,
+        trace: u64,
     ) -> Result<(GenerationRequest, handoff::Lowering)> {
         let has_input_image = !images.is_empty() || !request.image_urls().is_empty();
         self.validate_generation_features(request_id, request, has_input_image)?;
@@ -466,6 +470,7 @@ impl Processor {
         (|| -> std::result::Result<_, TokenizeError> {
             validate_request(request)?;
             let mut generation = GenerationRequest {
+                trace,
                 // The daemon's submission stamps the engine's identifier for the request.
                 request_id: RequestId::default(),
                 prompt_token_ids: Vec::new(),
@@ -714,16 +719,25 @@ impl Processor {
         images: &[crate::api::input::ImageInput],
         generation: &mut GenerationRequest,
     ) -> std::result::Result<(), TokenizeError> {
-        let rendered_text = self
-            .chat_renderer()
-            .ok_or(TokenizeError::MissingChatTemplate)?
-            .render(request, GenerationPromptMode::StartNewAssistant)?;
-        let mut prompt_token_ids = self.tokenizer.encode(&rendered_text, false)?;
-        generation.multimodal_inputs.images = self.lower_images(
-            &mut prompt_token_ids,
-            images,
-            generation.cache.isolation_key,
-        )?;
+        let trace = generation.trace;
+        let rendered_text = {
+            let _template = span::enter(Stage::Template, trace);
+            self.chat_renderer()
+                .ok_or(TokenizeError::MissingChatTemplate)?
+                .render(request, GenerationPromptMode::StartNewAssistant)?
+        };
+        let mut prompt_token_ids = {
+            let _tokenize = span::enter(Stage::Tokenize, trace);
+            self.tokenizer.encode(&rendered_text, false)?
+        };
+        generation.multimodal_inputs.images = {
+            let _preprocess = (!images.is_empty()).then(|| span::enter(Stage::Preprocess, trace));
+            self.lower_images(
+                &mut prompt_token_ids,
+                images,
+                generation.cache.isolation_key,
+            )?
+        };
 
         // The context holds the prompt's tokens and every image block's rows.
         let image_tokens: u32 = generation

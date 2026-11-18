@@ -379,11 +379,14 @@ pub enum Request {
         at: u32,
         key: Key,
     },
-    /// Move the owner to another group, copying its blocks to that group's memory.
+    /// Move the owner to another group, copying its blocks to that group's memory: a
+    /// prefill-to-decode handoff of the request of trace id `trace` (zero for one nothing
+    /// traces), whose span the server records.
     Transfer {
         owner: OwnerId,
         group: GroupId,
         after: Stamps,
+        trace: u64,
     },
     /// Reclaim each named block that is shared and has no pin.
     Evict { keys: Vec<Key> },
@@ -834,11 +837,13 @@ impl Request {
                 owner,
                 group,
                 after,
+                trace,
             } => {
                 writer.byte(7);
                 writer.long(owner.0);
                 writer.byte(group.0);
                 writer.stamps(after);
+                writer.long(*trace);
             }
             Self::Evict { keys } => {
                 writer.byte(8);
@@ -983,6 +988,7 @@ impl Request {
                 owner: OwnerId(reader.long()?),
                 group: GroupId(reader.byte()?),
                 after: reader.stamps()?,
+                trace: reader.long()?,
             },
             8 => Self::Evict {
                 keys: reader.keys()?,
@@ -1351,6 +1357,7 @@ mod tests {
                 owner: OwnerId(1),
                 group: GroupId(1),
                 after: after.clone(),
+                trace: 1 << 40,
             },
             Request::Evict { keys: vec![] },
             Request::Victims {

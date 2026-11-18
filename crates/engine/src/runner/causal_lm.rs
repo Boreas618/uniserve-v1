@@ -169,6 +169,7 @@ use nn::{KvCache, RecurrentState, TokenBatch, VerifySlots};
 use platform::{Event, Stream};
 use proto::module::commit::COMMIT_FIELDS;
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
+use service::span::{self, Stage};
 use tensor::{DType, Shape, Tensor};
 
 use self::columns::{Column, Layout, Refusal};
@@ -1248,6 +1249,10 @@ impl CausalLmRunner {
                 batch.id.0
             )));
         }
+        // The batch's host-to-device stage: its columns, slots and inputs, up to the replay.
+        let id = batch.id.0;
+        span::begin(Stage::CopyIn, id);
+
         // Everything that can refuse the batch comes first: the choice of a bucket, the cache
         // slots its tokens write and the padding of the columns.
         let base = self.choose(batch)?;
@@ -1306,8 +1311,10 @@ impl CausalLmRunner {
             None => base,
         };
         self.prepare_staged(&bucket)?;
+        span::end(Stage::CopyIn, id);
 
         let launched = Instant::now();
+        span::begin(Stage::Launch, id);
         let outputs = self.graphs.replay(&bucket)?;
         self.launched += 1;
 
@@ -1324,6 +1331,7 @@ impl CausalLmRunner {
         if let Some(hook) = self.page_work.as_mut() {
             hook(PageWork::AfterReplay)?;
         }
+        span::end(Stage::Launch, id);
 
         // The outputs, then the drafter's proposals, are copied to the host behind everything
         // of the step, the state keeps included, before anything of a later step is issued:
@@ -1337,6 +1345,8 @@ impl CausalLmRunner {
             .into_iter()
             .chain(proposals.iter().cloned())
             .collect();
+        // The device-to-host stage lasts until the host holds the outputs ([`Self::land`]).
+        span::begin(Stage::CopyOut, id);
         let pending = readback.issue(&read, stream)?;
 
         Ok(Flight {
@@ -1375,6 +1385,8 @@ impl CausalLmRunner {
             ))?
             .read(pending)?;
         let landed = Instant::now();
+        span::end(Stage::CopyOut, batch.id.0);
+        let _postprocess = span::enter(Stage::Postprocess, batch.id.0);
 
         // The stream has passed every slot write since `Slots::begin` only when no later step
         // began writing again.

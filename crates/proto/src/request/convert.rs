@@ -56,12 +56,14 @@ impl Request {
                 priority: request.priority,
                 kind: Some(wire::request::Kind::Generation(request.as_ref().into())),
                 scheduler: None,
+                trace: request.trace,
             },
             Self::Diffusion(request) => wire::Request {
                 id: request.request_id.0,
                 priority: request.priority,
-                kind: Some(wire::request::Kind::Diffusion(request.into())),
+                kind: Some(wire::request::Kind::Diffusion(request.as_ref().into())),
                 scheduler: None,
+                trace: request.trace,
             },
         }
     }
@@ -79,13 +81,15 @@ impl Request {
                 let mut generation = GenerationRequest::try_from(generation)?;
                 generation.request_id = id;
                 generation.priority = request.priority;
+                generation.trace = request.trace;
                 Ok(Self::Generation(Box::new(generation)))
             }
             wire::request::Kind::Diffusion(diffusion) => {
                 let mut diffusion = DiffusionRequest::try_from(diffusion)?;
                 diffusion.request_id = id;
                 diffusion.priority = request.priority;
-                Ok(Self::Diffusion(diffusion))
+                diffusion.trace = request.trace;
+                Ok(Self::Diffusion(Box::new(diffusion)))
             }
         }
     }
@@ -136,6 +140,7 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
         let cache = present(request.cache, "cache policy")?;
         Ok(Self {
             request_id: RequestId::default(),
+            trace: 0,
             prompt_token_ids: request.prompt_token_ids,
             multimodal_inputs: MultimodalInputs {
                 images: request
@@ -376,6 +381,7 @@ impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
         let sampling = present(request.sampling, "diffusion sampling")?;
         Ok(Self {
             request_id: RequestId::default(),
+            trace: 0,
             prompt_token_ids: request.prompt_token_ids,
             conditioning: request.conditioning,
             conditions: request

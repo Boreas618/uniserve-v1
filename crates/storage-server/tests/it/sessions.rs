@@ -628,6 +628,7 @@ fn a_transfer_copies_an_owner_s_units_between_its_groups_ranks_through_the_trans
     let written = pattern(32, 5);
     planes[0].write_all_at(&written, 16).unwrap();
     let transfer = prefill.submit(Request::Transfer {
+        trace: 0,
         owner: OwnerId(1),
         group: DECODE,
         after: Vec::new(),

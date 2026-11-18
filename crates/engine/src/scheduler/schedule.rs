@@ -22,6 +22,7 @@ use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, Request
 use scheduling::decision::{Shortage, Storage, Victim};
 use scheduling::ids::{EncodingId, PageId};
 use scheduling::{Duration as Span, Event as PolicyEvent};
+use service::span::{self, Stage};
 use storage::Key;
 use storage::runtime::{self, GroupId, OwnerId, Tier};
 
@@ -104,6 +105,10 @@ impl Scheduler {
     /// Queues `input`, a request under the event window `window`, or refuses it (`add_request`).
     fn arrive(&mut self, input: proto::request::Request, window: std::num::NonZeroU32) {
         let id = input.request_id();
+        let trace = input.trace();
+        if trace != 0 {
+            span::end(Stage::Enqueue, trace);
+        }
 
         // Refusals answer at once and keep nothing.
         if let Err(message) = self.validate(&input) {
@@ -228,6 +233,7 @@ impl Scheduler {
 
         // The policy chooses the order and the work; everything below enforces the limits.
         let room = self.room();
+        let called = span::now();
         let output = match self
             .policy
             .dispatch(&room, &mut self.requests, &self.groups)
@@ -238,6 +244,7 @@ impl Scheduler {
                 return Vec::new();
             }
         };
+        let dispatched = span::now();
         let mut budget = (self.budget.tokens, self.budget.calls);
         let mut batches: Vec<Batch> = Vec::new();
 
@@ -316,6 +323,7 @@ impl Scheduler {
         }
         let empty = self.copy_batches(&sealed);
         sealed.extend(empty);
+        self.record_batches(&sealed, (called, dispatched));
 
         // The policy is told the step ended; its next `observe` begins at the next step, which
         // the loop numbers.
@@ -325,6 +333,27 @@ impl Scheduler {
             duration,
         });
         sealed
+    }
+
+    /// Records the spans of the step's batches `formed`: each batch's scheduling program call,
+    /// from `called` to `dispatched`, and its formation from then to now, with a membership
+    /// record of every traced request it holds, which joins the request to the batch.
+    fn record_batches(&self, formed: &[Batch], (called, dispatched): (u64, u64)) {
+        let sealed = span::now();
+        for batch in formed {
+            let id = batch.id.0;
+            span::interval(Stage::Schedule, id, called, dispatched);
+            for request in &batch.requests {
+                let trace = self
+                    .requests
+                    .get(request)
+                    .map_or(0, |request| request.input.trace());
+                if trace != 0 {
+                    span::member(trace, id);
+                }
+            }
+            span::interval(Stage::Batch, id, dispatched, sealed);
+        }
     }
 
     /// One call of `phase` of request `id` joins the batch of its group and phase in `batches`,
@@ -1114,6 +1143,12 @@ impl Scheduler {
             return false;
         }
 
+        // The admission's span lasts until its last answer settles it ([`Scheduler::admitted`]).
+        let trace = request.input.trace();
+        if trace != 0 {
+            span::begin(Stage::Admit, trace);
+        }
+
         // One admission is one submission: the buffer pool takes its requests in this order, so
         // each finds the owner and the positions the ones before it set up. Each owner is the
         // request's attachment to one group, drawn anew at every admission.
@@ -1723,6 +1758,7 @@ mod tests {
     /// A token request numbered `id` of `prompt` that may generate `max` tokens.
     fn tokens(id: u64, prompt: &[u32], max: usize) -> GenerationRequest {
         GenerationRequest {
+            trace: 0,
             request_id: RequestId(id),
             prompt_token_ids: prompt.to_vec(),
             multimodal_inputs: Default::default(),

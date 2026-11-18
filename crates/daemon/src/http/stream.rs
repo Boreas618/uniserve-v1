@@ -452,12 +452,21 @@ async fn drive(
         .await;
         match step {
             Driven::Step(Step::Frames(produced)) => {
+                // Sending a step's frames lasts until the connection took the last of them.
+                let trace = session.trace();
+                let sending = produced.iter().any(|frame| !frame.is_empty());
+                if let Some(trace) = trace.filter(|_| sending) {
+                    service::span::begin(service::span::Stage::Send, trace);
+                }
                 for frame in produced.into_iter().filter(|frame| !frame.is_empty()) {
                     if frames.send(Produced::Frame(frame)).await.is_err() {
                         // The connection is gone; cancel the request.
                         session.abort();
                         return;
                     }
+                }
+                if let Some(trace) = trace.filter(|_| sending) {
+                    service::span::end(service::span::Stage::Send, trace);
                 }
             }
             Driven::Step(Step::Migrate) => session.migrate().await,

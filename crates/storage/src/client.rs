@@ -911,6 +911,14 @@ impl Client {
             other => Err(unexpected("program_records", &other)),
         }
     }
+
+    /// See [`Request::Spans`]: the spans the server keeps in its rings.
+    pub fn spans(&mut self) -> Result<Vec<service::span::Span>> {
+        match self.request(&Request::Spans, &[])?.0 {
+            Response::Spans { spans } => Ok(spans),
+            other => Err(unexpected("spans", &other)),
+        }
+    }
 }
 
 /// The tensors of a response to a `Get`, with one descriptor per storage.
@@ -1089,6 +1097,11 @@ impl ClaimClient {
     /// ([`Client::program_records`]).
     pub fn program_records(&mut self) -> Result<Vec<ProgramRecord>> {
         self.client.program_records()
+    }
+
+    /// The spans the server keeps in its rings ([`Client::spans`]).
+    pub fn spans(&mut self) -> Result<Vec<service::span::Span>> {
+        self.client.spans()
     }
 
     /// Passes the claim to another process ([`ClaimClient::resume`]): its

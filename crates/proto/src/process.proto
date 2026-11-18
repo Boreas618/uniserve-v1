@@ -154,6 +154,7 @@ message Request {
     ConfigureStorage configure_storage = 13;
     ConfigureProgram configure_program = 14;
     ProgramRecordsQuery program_records = 15;
+    SpansQuery spans = 16;
   }
 }
 
@@ -178,6 +179,7 @@ message Reply {
     StorageConfigured storage_configured = 14;
     ProgramConfigured program_configured = 15;
     ProgramRecords program_records = 16;
+    NodeSpans spans = 17;
   }
 }
 
@@ -487,6 +489,20 @@ message ProgramRecordsQuery {
   string deployment = 2;
 }
 
+// The spans a node's daemon and the deployment's Storage Server on the node
+// keep in their rings (`docs/profiling.md`).
+message SpansQuery {
+  string host = 1;
+  string deployment = 2;
+}
+
+message NodeSpans {
+  // The daemon's spans and the Storage Server's, each the MessagePack
+  // encoding of a `service::span::Span` list the process named itself.
+  bytes daemon = 1;
+  bytes storage = 2;
+}
+
 message ProgramRecords {
   // The records (`Vec<storage::protocol::ProgramRecord>`) in the storage
   // protocol's own encoding (`storage::protocol::encode`), relayed unchanged:
@@ -625,6 +641,10 @@ message Command {
 message Prepare {
   repeated KernelPackage kernels = 1;
   PackageRevision policy = 2;
+  // Which instance of each kind of layer carries the generation's kernel
+  // probes (`profiling_config.kernel_instance`); none when absent. A bucket
+  // whose serving graph holds its probes elsewhere is captured again.
+  optional uint32 kernel_instance = 3;
 }
 
 message Switch {

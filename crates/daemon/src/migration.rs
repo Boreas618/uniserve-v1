@@ -134,7 +134,7 @@ enum Resumable {
     /// A token request, with the tokens it generated before.
     Generation(Box<GenerationRequest>),
     /// A video request, naming the trajectory steps an engine stored.
-    Diffusion(DiffusionRequest),
+    Diffusion(Box<DiffusionRequest>),
 }
 
 impl Resumable {
@@ -555,6 +555,7 @@ mod tests {
     /// tokens.
     fn request(max_tokens: usize) -> GenerationRequest {
         GenerationRequest {
+            trace: 0,
             request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),
@@ -573,6 +574,7 @@ mod tests {
     /// A video request of a two-token prompt, whose trajectory is `trajectory`.
     fn video(trajectory: Trajectory) -> DiffusionRequest {
         DiffusionRequest {
+            trace: 0,
             request_id: Default::default(),
             prompt_token_ids: vec![1, 2],
             conditioning: Vec::new(),
@@ -827,7 +829,7 @@ mod tests {
         }
         let migrator = Migrator::new(Arc::clone(&hold), 1);
         let (mut events, _) = migrator
-            .submit(Request::Diffusion(video(trajectory)), None)
+            .submit(Request::Diffusion(Box::new(video(trajectory))), None)
             .await
             .unwrap();
 

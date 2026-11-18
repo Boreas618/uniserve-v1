@@ -474,6 +474,8 @@ pub struct Scheduler {
     lists_answered: u64,
     next_batch: u64,
     step: u64,
+    /// The scheduler's data-parallel rank, its index in the session, which its spans name.
+    index: u32,
 }
 
 impl Scheduler {
@@ -666,8 +668,11 @@ impl Scheduler {
             demoting: Vec::new(),
             lists_asked: 0,
             lists_answered: 0,
-            next_batch: 0,
+            // Batch numbers carry the data-parallel rank from bit 40, so the batches of one
+            // process's schedulers, and the spans that name them, never share a number.
+            next_batch: rank << 40,
             step: 0,
+            index: u32::try_from(rank).unwrap_or(u32::MAX),
         };
 
         // Written at the first step; nothing is scheduled before its `Listing` but what the
@@ -824,6 +829,8 @@ impl Scheduler {
     /// the doorbell's descriptor, which the inbox cannot be waited on with, and forwards each
     /// ring ([`Relay`]). A relay that cannot start is a fault of the scheduler.
     pub(crate) fn run(mut self, inbox: Receiver<Message>) {
+        // The spans this thread records name the scheduler.
+        service::span::label(service::span::Label::Scheduler(self.index));
         let relay = match Relay::start(&self.queue) {
             Ok(relay) => relay,
             Err(error) => {

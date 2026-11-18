@@ -754,6 +754,45 @@ impl EngineControl {
         Ok(records)
     }
 
+    /// The spans every node of the deployment keeps in its rings, each with its node's host:
+    /// its daemon's, then its Storage Server's (`Request::Spans`).
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot be reached or cannot read them.
+    pub(crate) fn node_spans(&self) -> anyhow::Result<Vec<(String, Vec<service::span::Span>)>> {
+        let (mut connection, nodes) = self.connect()?;
+        let mut spans = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            connection.deliver(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: index as u64 + 1,
+                    kind: Some(request::Kind::Spans(process::SpansQuery {
+                        host: node.host.clone(),
+                        deployment: self.deployment.clone(),
+                    })),
+                })),
+            })?;
+            let reply = await_reply(&mut connection, index as u64 + 1)
+                .context("awaiting a node's spans")?;
+            anyhow::ensure!(
+                reply.error.is_empty(),
+                "the spans of {}: {}",
+                node.host,
+                reply.error
+            );
+            let Some(reply::Kind::Spans(read)) = reply.kind else {
+                anyhow::bail!("the daemon of {} answered its spans with none", node.host);
+            };
+            for encoded in [&read.daemon, &read.storage] {
+                let decoded: Vec<service::span::Span> = service::msgpack::decode(encoded)
+                    .with_context(|| format!("reading the spans of {}", node.host))?;
+                spans.push((node.host.clone(), decoded));
+            }
+        }
+        Ok(spans)
+    }
+
     /// Has the daemon of `host` prepare the module set `filled` at its own Build Server
     /// (`Request::PrepareModules`), and returns the set as that Build Server prepared it.
     ///

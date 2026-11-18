@@ -1121,7 +1121,7 @@ impl Harness {
 
     /// Submits a video request, as the daemon does (`Message::AddRequest`).
     pub(crate) fn submit_video(&mut self, request: DiffusionRequest) -> RequestId {
-        self.add(proto::request::Request::Diffusion(request))
+        self.add(proto::request::Request::Diffusion(Box::new(request)))
     }
 
     fn add(&mut self, request: proto::request::Request) -> RequestId {
@@ -1643,6 +1643,7 @@ pub(crate) fn sharing(
 /// `max_tokens` tokens, sampled greedily, with the default cache policy.
 pub(crate) fn token(id: u64, prompt_tokens: u32, max_tokens: usize) -> GenerationRequest {
     GenerationRequest {
+        trace: 0,
         request_id: RequestId(id),
         prompt_token_ids: prompt(id, prompt_tokens),
         multimodal_inputs: Default::default(),
@@ -1689,6 +1690,7 @@ pub(crate) fn chat_image(
 /// raster and timeline a video deployment captured.
 pub(crate) fn video(id: u64, units: u32) -> DiffusionRequest {
     DiffusionRequest {
+        trace: 0,
         request_id: RequestId(id),
         prompt_token_ids: prompt(id, 40),
         conditioning: proto::video::Conditions {

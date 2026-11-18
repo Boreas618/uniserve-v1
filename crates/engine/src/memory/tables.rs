@@ -1257,6 +1257,7 @@ mod tests {
         // A detach and a transfer name an owner: its slot and every entry of it.
         tables.apply(&detach(2)).unwrap();
         let transfer = Request::Transfer {
+            trace: 0,
             owner: OwnerId(3),
             group: GroupId(1),
             after: vec![],
@@ -1893,6 +1894,7 @@ mod tests {
         // An owner that moves into the group brings every entry it holds, each writable
         // when its block is private; a completion for another group is not this table's.
         let transfer = |group| Request::Transfer {
+            trace: 0,
             owner: OwnerId(2),
             group,
             after: vec![],
@@ -2130,6 +2132,7 @@ mod tests {
         // An owner that moves in keeps the runs its process maps of each block, one at most in
         // the rank's own memory.
         let transfer = Request::Transfer {
+            trace: 0,
             owner: OwnerId(2),
             group: GROUP,
             after: vec![],

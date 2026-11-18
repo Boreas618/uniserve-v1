@@ -1447,6 +1447,9 @@ pub enum Request {
     /// outputs fared since the last such request, oldest first; the server
     /// keeps them no longer. Responded with [`Response::ProgramRecords`].
     ProgramRecords,
+    /// From a head: the spans the server keeps in its rings (`service::span`), which a read of
+    /// the deployment's request timelines gathers. Responded with [`Response::Spans`].
+    Spans,
 }
 
 /// A deployment's KV program as its head sets it on a Storage Server
@@ -1657,6 +1660,10 @@ pub enum Response {
     /// What a [`Request::ProgramRecords`] drained.
     ProgramRecords {
         records: Vec<ProgramRecord>,
+    },
+    /// The server's spans, as a [`Request::Spans`] read them.
+    Spans {
+        spans: Vec<service::span::Span>,
     },
     Error {
         kind: ErrorKind,

@@ -55,6 +55,21 @@
 //! between its markers (class `step`). The histograms travel with the next batch result
 //! ([`Markers::take`], [`super::forward_stats`]).
 //!
+//! **Kernel probes.** A capture of a forward that enters the family's step stack also places a
+//! probe before and after kernels ([`Plan`]): the stack's child ranges are its layers, two of
+//! which are of one kind when their classes and the operators and descriptor keys of their
+//! launch tables are the same, and each kind's instance `profiling_config.kernel_instance` names
+//! carries a probe pair around each of its launches, as does every launch outside the layers.
+//! Each probed launch is a site, named by its operator, its descriptor key, its module path and
+//! the layers of its kind; its probes are stamps of the reserved class [`KERNEL_CLASS`], whose
+//! switch word follows `profiling_config.kernel_probes`. Where the probes lie is the
+//! generation's ([`Markers::place`]), so moving them captures every bucket again.
+//!
+//! **Spans.** At a step's end marker the reader also writes the step's span and the span of
+//! every kernel probe pair of the step into the device's ring (`service::span`), each named by
+//! the batch, its times converted to the host's `CLOCK_REALTIME` through the device's latest
+//! calibration, which the reader takes again every [`CALIBRATION`].
+//!
 //! **One process, many ranks.** The instances are the process's: every rank of a block registers
 //! the same ones, and a rank of another block adds its own. Everything a device writes or a reader
 //! keeps (the buffers, the step cells, the steps not yet ended, the histograms) is that device's,
@@ -103,6 +118,17 @@ const STEP_END: u32 = 0xf_ffff;
 /// every other is taken.
 const CELLS: usize = 64;
 
+/// The class of the kernel probes' sites: no module's, so that no pattern of `fence_modules` or
+/// `fence_probes_off` is needed to name it, and its switch word follows the kernel probes' own
+/// switch.
+pub(crate) const KERNEL_CLASS: &str = "(kernel)";
+
+/// The records a device's span ring keeps: 32 MiB, about a minute of a decode's kernel spans.
+const DEVICE_RECORDS: usize = 1 << 21;
+
+/// How often a device's reader calibrates its clock against the host's for the spans it writes.
+const CALIBRATION: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The name patterns of the module classes whose instances carry markers in the graphs a
 /// deployment captures: `profiling_config.fence_modules`, or the family's step stack (the class
 /// of the module the family runs once per step) when it names none. Empty for a deployment that
@@ -150,6 +176,8 @@ enum Read {
 struct Launched {
     stream: usize,
     step: u32,
+    /// The batch's full id, which its spans name.
+    batch: u64,
     stage: Arc<str>,
 }
 
@@ -218,6 +246,10 @@ struct DeviceMarkers {
     /// Where the stamps read go while a session keeps them: the class patterns it keeps (empty
     /// for every class) and its file's writer.
     tap: Mutex<Option<(Vec<String>, Sender<Message>)>>,
+    /// The ring the device's step and kernel spans are written into.
+    ring: &'static service::span::Ring,
+    /// The calibration the spans' times are converted through, and when it was taken.
+    clock: Mutex<Option<(ClockRow, std::time::Instant)>>,
 }
 
 /// Where a device's reader stands.
@@ -247,6 +279,10 @@ struct Instances {
     instance_classes: Vec<u32>,
     /// Whether a class pattern of the deployment names each class seen, by name.
     timed: HashMap<String, bool>,
+    /// Each kernel probe's site, by its instance number.
+    sites: HashMap<u32, service::span::Kernel>,
+    /// Each site's instance number, by its operator, descriptor key and module path.
+    site_numbers: HashMap<(&'static str, String, String), u32>,
 }
 
 /// The range markers of this process's devices and what they measure.
@@ -255,41 +291,193 @@ pub(crate) struct Markers {
     /// The deployment's class patterns (`profiling_config.fence_modules`).
     patterns: Vec<String>,
     instances: Mutex<Instances>,
-    /// The switch as last stated: the master word and the patterns switched off.
-    switched: Mutex<(bool, Vec<String>)>,
+    /// The switch as last stated: the master word, the patterns switched off and the kernel
+    /// probes' word.
+    switched: Mutex<Switch>,
+    /// The family's step stack, whose child ranges are the layers kernel probes are placed in.
+    stack: String,
+    /// Which instance of each kind of layer carries kernel probes, by generation; a generation
+    /// not named takes `placement`.
+    placements: Mutex<BTreeMap<u64, Option<u32>>>,
+    placement: Option<u32>,
     /// The master word, read at every step: a step marker with the switch off stamps nothing, so
     /// it is not launched.
     recording: AtomicBool,
 }
 
+/// The switch as last stated.
+#[derive(Clone, Debug, Default)]
+struct Switch {
+    /// The master word.
+    enabled: bool,
+    /// The patterns of the probed classes switched off.
+    off: Vec<String>,
+    /// The kernel probes' word, on while the master word is too.
+    kernels: bool,
+}
+
 static MARKERS: OnceLock<Arc<Markers>> = OnceLock::new();
 
-/// The profiler of a context on `stream`: the process's markers while the stream captures,
-/// because a graph is what runs them at every step, and none for a forward run once or in a
-/// process without markers.
+/// The profiler of a context on `stream` that captures a forward of generation `generation`
+/// replayed on `replay`,
+/// whose meta run entered `ranges` and launched `table`: the process's markers while the stream
+/// captures, because a graph is what runs them at every step, with the kernel probes the
+/// generation places in the forward ([`Plan`]); none for a forward run once or in a process
+/// without markers.
 ///
 /// A runner gives the result to `ops::Context::set_profiler` before it runs the forward it
 /// captures.
-pub(crate) fn profiler(stream: &Stream) -> Option<Arc<dyn ops::Profiler>> {
+pub(crate) fn profiler(
+    stream: &Stream,
+    replay: &Stream,
+    generation: u64,
+    ranges: &[ops::context::Range],
+    table: &[(&'static str, String, String)],
+) -> Option<Arc<dyn ops::Profiler>> {
     let markers = MARKERS.get()?;
     let capturing = stream
         .capture_status()
         .is_ok_and(|status| status != platform::CaptureStatus::None);
+    if !capturing {
+        return None;
+    }
 
-    capturing.then(|| Arc::clone(markers) as Arc<dyn ops::Profiler>)
+    let plan = markers
+        .placement(generation)
+        .map(|instance| Plan::of(ranges, table, &markers.stack, instance));
+    Some(Arc::new(Capture {
+        markers: Arc::clone(markers),
+        replay: replay.raw(),
+        plan,
+    }))
 }
 
-impl ops::Profiler for Markers {
+/// Where one capture's kernel probes lie: the layers of a forward's step stack, grouped by kind,
+/// and the instance of each kind that carries probes.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Plan {
+    /// Each layer instance's path, with the layers of its kind when it is its kind's probed
+    /// instance and `None` otherwise.
+    layers: HashMap<String, Option<u32>>,
+    /// Whether the forward entered the step stack: a forward that does not places no probe.
+    stacked: bool,
+}
+
+impl Plan {
+    /// The plan of a forward that entered `ranges` and launched `table`: the child ranges of each
+    /// instance of the class `stack` names (a pattern, `*` matching any run) are its layers, each
+    /// of the kind of its class and the operators and keys it launched, and of each kind the
+    /// instance at position `instance` in launch order (the last of a kind with fewer) carries
+    /// the probes.
+    pub(crate) fn of(
+        ranges: &[ops::context::Range],
+        table: &[(&'static str, String, String)],
+        stack: &str,
+        instance: u32,
+    ) -> Self {
+        let mut stacked = false;
+        let mut within: Option<usize> = None;
+        let mut layers: Vec<(&str, &str)> = Vec::new();
+        for range in ranges {
+            if matches(stack, &range.class) {
+                stacked = true;
+                within = Some(range.depth);
+                continue;
+            }
+            match within {
+                Some(depth) if range.depth <= depth => within = None,
+                Some(depth) if range.depth == depth + 1 => {
+                    layers.push((&range.class, &range.path));
+                }
+                _ => {}
+            }
+        }
+
+        // The kinds in the order their first layers were entered, each with its layers.
+        let mut kinds: Vec<(Kind<'_>, Vec<&str>)> = Vec::new();
+        for (class, path) in layers {
+            let launches: Vec<(&str, &str)> = table
+                .iter()
+                .filter(|(operator, _, at)| {
+                    *operator != ops::breaks::BREAK && within_path(at, path)
+                })
+                .map(|(operator, key, _)| (*operator, key.as_str()))
+                .collect();
+            let kind = (class, launches);
+            match kinds.iter_mut().find(|(known, _)| *known == kind) {
+                Some((_, paths)) => paths.push(path),
+                None => kinds.push((kind, vec![path])),
+            }
+        }
+
+        let mut plan = Self {
+            layers: HashMap::new(),
+            stacked,
+        };
+        for (_, paths) in kinds {
+            let count = u32::try_from(paths.len()).unwrap_or(u32::MAX);
+            let chosen = (instance as usize).min(paths.len() - 1);
+            for (position, path) in paths.into_iter().enumerate() {
+                plan.layers
+                    .insert(path.to_owned(), (position == chosen).then_some(count));
+            }
+        }
+        plan
+    }
+
+    /// The layers a launch inside the range at `path` stands for when it carries probes: those of
+    /// its layer's kind in its kind's probed instance, one outside every layer; `None` in another
+    /// instance, and in a forward that never entered the step stack.
+    pub(crate) fn layers(&self, path: &str) -> Option<u32> {
+        if !self.stacked {
+            return None;
+        }
+        let mut at = path;
+        loop {
+            if let Some(&layers) = self.layers.get(at) {
+                return layers;
+            }
+            match at.rfind('.') {
+                Some(dot) => at = &at[..dot],
+                None => return Some(1),
+            }
+        }
+    }
+}
+
+/// A kind of layer: its class, and the operators and descriptor keys its launch table states in
+/// launch order.
+type Kind<'a> = (&'a str, Vec<(&'a str, &'a str)>);
+
+/// Whether the range at `path` lies within the range at `outer`: it is that range, or one whose
+/// path continues it after a dot.
+fn within_path(path: &str, outer: &str) -> bool {
+    path.strip_prefix(outer)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// The profiler of one capture: the process's markers, with the capture's kernel probes.
+struct Capture {
+    markers: Arc<Markers>,
+    /// The handle of the stream the captured graph is replayed on, whose step cell its markers
+    /// read: a graph captured beside the runner's, on a stream of its own, replays on the
+    /// runner's.
+    replay: usize,
+    /// `None` when the capture's generation places no kernel probe.
+    plan: Option<Plan>,
+}
+
+impl ops::Profiler for Capture {
     fn enter(
         &self,
         class: &str,
         path: &str,
         stream: &Stream,
     ) -> std::result::Result<Option<u32>, Box<dyn StdError + Send + Sync>> {
-        let Some(instance) = self.instance(class, path)? else {
+        let Some(instance) = self.markers.instance(class, path)? else {
             return Ok(None);
         };
-        self.launch(stream, 2 * instance)?;
+        self.markers.launch(stream, self.replay, 2 * instance)?;
         Ok(Some(instance))
     }
 
@@ -298,7 +486,33 @@ impl ops::Profiler for Markers {
         instance: u32,
         stream: &Stream,
     ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
-        self.launch(stream, 2 * instance + 1)?;
+        self.markers.launch(stream, self.replay, 2 * instance + 1)?;
+        Ok(())
+    }
+
+    fn launch(
+        &self,
+        operator: &'static str,
+        key: &str,
+        path: &str,
+        stream: &Stream,
+    ) -> std::result::Result<Option<u32>, Box<dyn StdError + Send + Sync>> {
+        let Some(layers) = self.plan.as_ref().and_then(|plan| plan.layers(path)) else {
+            return Ok(None);
+        };
+        let Some(site) = self.markers.site(operator, key, path, layers)? else {
+            return Ok(None);
+        };
+        self.markers.launch(stream, self.replay, 2 * site)?;
+        Ok(Some(site))
+    }
+
+    fn launched(
+        &self,
+        site: u32,
+        stream: &Stream,
+    ) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
+        self.markers.launch(stream, self.replay, 2 * site + 1)?;
         Ok(())
     }
 }
@@ -313,11 +527,17 @@ impl Markers {
     ///
     /// Fails when a device's modules lack a kernel of the package or the device cannot allocate
     /// the buffers, or the process installed markers already.
+    ///
+    /// The kernel probes record while `kernels` and `enabled` both hold; `stack` is the family's
+    /// step stack, whose child ranges are the layers they are placed in, and `placement` which
+    /// instance of each kind of layer carries them in every generation [`Markers::place`] names
+    /// no other placement for.
     pub(crate) fn install(
         kernels: Vec<(DeviceId, Vec<KernelEntry>)>,
         patterns: Vec<String>,
-        enabled: bool,
-        off: &[String],
+        (enabled, off, kernel_probes): (bool, &[String], bool),
+        stack: String,
+        placement: Option<u32>,
     ) -> Result<Arc<Self>> {
         let devices = kernels
             .into_iter()
@@ -327,10 +547,13 @@ impl Markers {
             devices,
             patterns,
             instances: Mutex::default(),
-            switched: Mutex::new((enabled, off.to_vec())),
+            switched: Mutex::new(Switch::default()),
+            stack,
+            placements: Mutex::new(BTreeMap::new()),
+            placement,
             recording: AtomicBool::new(enabled),
         });
-        markers.switch(enabled, off)?;
+        markers.switch(enabled, off, kernel_probes)?;
 
         MARKERS
             .set(Arc::clone(&markers))
@@ -350,20 +573,28 @@ impl Markers {
     /// The number of the instance at `path` of `class`, naming it on first sight, or `None` when
     /// no pattern of the deployment names the class.
     fn instance(&self, class: &str, path: &str) -> Result<Option<u32>> {
-        let mut instances = lock(&self.instances);
-
-        let timed = match instances.timed.get(class) {
-            Some(&timed) => timed,
-            None => {
-                let timed = self.patterns.iter().any(|pattern| matches(pattern, class));
-                instances.timed.insert(class.to_owned(), timed);
-                timed
+        {
+            let mut instances = lock(&self.instances);
+            let timed = match instances.timed.get(class) {
+                Some(&timed) => timed,
+                None => {
+                    let timed = class != KERNEL_CLASS
+                        && self.patterns.iter().any(|pattern| matches(pattern, class));
+                    instances.timed.insert(class.to_owned(), timed);
+                    timed
+                }
+            };
+            if !timed {
+                return Ok(None);
             }
-        };
-        if !timed {
-            return Ok(None);
         }
+        self.register(class, path)
+    }
 
+    /// The number of the instance at `path` of `class`, naming it on first sight; `None` once the
+    /// instances fill the markers' id space.
+    fn register(&self, class: &str, path: &str) -> Result<Option<u32>> {
+        let mut instances = lock(&self.instances);
         let key = (class.to_owned(), path.to_owned());
         if let Some(&number) = instances.numbers.get(&key) {
             return Ok(Some(number));
@@ -390,8 +621,8 @@ impl Markers {
                 }
                 instances.classes.push(class.to_owned());
                 let index = instances.classes.len() - 1;
-                let (enabled, off) = lock(&self.switched).clone();
-                let (words, _) = switch_words(&instances.classes, enabled, &off);
+                let switch = lock(&self.switched).clone();
+                let (words, _) = switch_words(&instances.classes, &switch);
                 self.write_switch(&words)?;
                 index
             }
@@ -403,20 +634,103 @@ impl Markers {
         Ok(Some(number))
     }
 
+    /// The instance number of the kernel probe site of a launch of `operator` under `key` in the
+    /// range at `path`, which stands for `layers` layers, naming it on first sight; `None` once
+    /// the sites fill what a span's point can name, a launch that then carries no probe.
+    fn site(
+        &self,
+        operator: &'static str,
+        key: &str,
+        path: &str,
+        layers: u32,
+    ) -> Result<Option<u32>> {
+        let named = (operator, key.to_owned(), path.to_owned());
+        if let Some(&site) = lock(&self.instances).site_numbers.get(&named) {
+            return Ok(Some(site));
+        }
+        // The site's probes are stamps of an instance of the kernel class, numbered with the
+        // modules' instances.
+        let site_path = format!("{path} {operator} {key}");
+        let instances = lock(&self.instances);
+        let number = instances.instances.len();
+        drop(instances);
+        let points = usize::from(service::span::POINTS - service::span::KERNEL);
+        if number >= points {
+            tracing::warn!(
+                sites = number,
+                "the kernel probes' sites fill what a span names: further launches carry none"
+            );
+            return Ok(None);
+        }
+        let Some(site) = self.register(KERNEL_CLASS, &site_path)? else {
+            return Ok(None);
+        };
+
+        let mut instances = lock(&self.instances);
+        instances.site_numbers.insert(named, site);
+        instances.sites.insert(
+            site,
+            service::span::Kernel {
+                op: operator.to_owned(),
+                descriptor: key.to_owned(),
+                module: path.to_owned(),
+                layers,
+            },
+        );
+        Ok(Some(site))
+    }
+
+    /// The kernel the probes of site `site` time, as a span names it.
+    pub(crate) fn kernel(&self, site: u16) -> Option<service::span::Kernel> {
+        lock(&self.instances).sites.get(&u32::from(site)).cloned()
+    }
+
+    /// Places the kernel probes of generation `generation` in each kind of layer's instance at
+    /// `placement`, none when `None`: what every capture of the generation follows.
+    pub(crate) fn place(&self, generation: u64, placement: Option<u32>) {
+        lock(&self.placements).insert(generation, placement);
+    }
+
+    /// Where generation `generation` places the kernel probes.
+    pub(crate) fn placement(&self, generation: u64) -> Option<u32> {
+        lock(&self.placements)
+            .get(&generation)
+            .copied()
+            .unwrap_or(self.placement)
+    }
+
+    /// Names the place of `device`'s spans: the worker that issues the device.
+    pub(crate) fn label(&self, device: DeviceId, label: service::span::Label) {
+        if let Ok(markers) = self.device(device) {
+            markers.ring.label(label);
+        }
+    }
+
     /// Turns the markers on or off: the master word as `enabled` says, and every class's word
     /// with it but those of the classes matching a pattern of `off` (`*` matches any run), which
-    /// stay off. Written on each device's control stream; markers already queued read whichever
-    /// value reaches them. Returns the classes switched off.
+    /// stay off, and the kernel probes' word, on while `enabled` and `kernels` both hold. Written
+    /// on each device's control stream; markers already queued read whichever value reaches
+    /// them. Returns the classes switched off.
     ///
     /// # Errors
     ///
     /// When a device refuses the write.
-    pub(crate) fn switch(&self, enabled: bool, off: &[String]) -> Result<Vec<String>> {
+    pub(crate) fn switch(
+        &self,
+        enabled: bool,
+        off: &[String],
+        kernels: bool,
+    ) -> Result<Vec<String>> {
         let instances = lock(&self.instances);
-        *lock(&self.switched) = (enabled, off.to_vec());
+        let switch = Switch {
+            enabled,
+            off: off.to_vec(),
+            kernels,
+        };
         self.recording.store(enabled, Ordering::Release);
 
-        let (words, switched_off) = switch_words(&instances.classes, enabled, off);
+        let (words, switched_off) = switch_words(&instances.classes, &switch);
+        *lock(&self.switched) = switch;
         self.write_switch(&words)?;
         Ok(switched_off)
     }
@@ -460,9 +774,11 @@ impl Markers {
             .ok_or_else(|| Error::Invalid(format!("no range markers on {device}")))
     }
 
-    /// Launches marker `marker` (`2 * instance` at the entry, `+ 1` at the exit) on `stream`;
-    /// captured when the stream captures.
-    fn launch(&self, stream: &Stream, marker: u32) -> Result<()> {
+    /// Launches marker `marker` (`2 * instance` at the entry, `+ 1` at the exit) on `stream`,
+    /// captured when the stream captures, for a graph replayed on the stream of handle `replay`:
+    /// the marker reads that stream's step cell, which the replay's step markers write, whichever
+    /// stream captured it.
+    fn launch(&self, stream: &Stream, replay: usize, marker: u32) -> Result<()> {
         let class = *lock(&self.instances)
             .instance_classes
             .get((marker / 2) as usize)
@@ -470,7 +786,7 @@ impl Markers {
                 Error::Invalid(format!("range marker {marker} names no module instance"))
             })?;
         let markers = self.device(stream.device())?;
-        let cell = Self::cell(markers, stream.raw());
+        let cell = Self::cell(markers, replay);
         markers.launch(stream, class, marker, cell, None)?;
 
         // A session's range profiler pushes the instance's range at its entry and pops it at its
@@ -508,16 +824,16 @@ impl Markers {
         let markers = self.device(stream.device())?;
         let cell = Self::cell(markers, stream.raw());
         // A stamp carries the low 32 bits of the batch id.
-        let step = step as u32;
 
-        markers.launch(stream, 0, STEP_BEGIN, cell, Some(step))?;
+        markers.launch(stream, 0, STEP_BEGIN, cell, Some(step as u32))?;
         lock(&markers.launched).push_back(Launched {
             stream: stream.raw(),
-            step,
+            step: step as u32,
+            batch: step,
             stage: Arc::from(stage),
         });
         let ran = run();
-        markers.launch(stream, 0, STEP_END, cell, Some(step))?;
+        markers.launch(stream, 0, STEP_END, cell, Some(step as u32))?;
         Ok(ran)
     }
 
@@ -604,12 +920,12 @@ impl Markers {
             let mut launched = lock(&device.launched);
             for (step, end, open) in ended {
                 // A step no bracket of this process launched names no stage, and is not measured.
-                let Some((stage, lost)) = release(&mut launched, step) else {
+                let Some((stage, batch, lost)) = release(&mut launched, step) else {
                     continue;
                 };
                 lost_ends.extend(lost);
                 if let Some(open) = open {
-                    measured.push((stage, end, open));
+                    measured.push((stage, batch, end, open));
                 }
             }
         }
@@ -622,10 +938,21 @@ impl Markers {
             }
         }
 
+        let clock = self.clock_of(device);
         let mut histograms = lock(&device.histograms);
         let instances = lock(&self.instances);
-        for (stage, end, mut open) in measured {
-            let begin = open.iter().rev().find(|stamp| stamp.marker == STEP_BEGIN);
+        // The kernel probes' class, whose stamps are spans and enter no module's histogram.
+        let kernel_class = instances
+            .classes
+            .iter()
+            .position(|class| class == KERNEL_CLASS)
+            .map(|index| index + 1);
+        for (stage, batch, end, mut open) in measured {
+            let begin = open
+                .iter()
+                .rev()
+                .find(|stamp| stamp.marker == STEP_BEGIN)
+                .map(|stamp| stamp.time);
             let step_of = |module: &str| FenceStep {
                 stage: stage.to_string(),
                 module: module.to_owned(),
@@ -634,14 +961,49 @@ impl Markers {
                 histograms
                     .entry(step_of("step"))
                     .or_default()
-                    .observe(seconds(end.saturating_sub(begin.time)));
+                    .observe(seconds(end.saturating_sub(begin)));
+            }
+            let kernels = kernel_spans(&instances.instance_classes, kernel_class, &mut open);
+            if let Some(clock) = &clock {
+                write_spans(
+                    device.ring,
+                    clock,
+                    batch,
+                    begin.map(|begin| (begin, end)),
+                    &kernels,
+                );
             }
             for (class, ns) in class_time(&instances.instance_classes, &mut open) {
+                if Some(class) == kernel_class {
+                    continue;
+                }
                 histograms
                     .entry(step_of(&instances.classes[class - 1]))
                     .or_default()
                     .observe(seconds(ns));
             }
+        }
+    }
+
+    /// The calibration `device`'s spans are converted through: its latest, taken again once it
+    /// is [`CALIBRATION`] old; `None` while the device has none.
+    fn clock_of(&self, device: &DeviceMarkers) -> Option<ClockRow> {
+        let held = *lock(&device.clock);
+        if let Some((clock, taken)) = held
+            && taken.elapsed() < CALIBRATION
+        {
+            return Some(clock);
+        }
+        // The least uncertain of a few samples: one queued behind other work is wide.
+        let sample = (0..3)
+            .filter_map(|_| device.sample().ok())
+            .min_by_key(|sample| sample.uncertainty);
+        match sample {
+            Some(sample) => {
+                *lock(&device.clock) = Some((sample, std::time::Instant::now()));
+                Some(sample)
+            }
+            None => held.map(|(clock, _)| clock),
         }
     }
 
@@ -752,9 +1114,10 @@ fn end_steps(
 /// entry of its stream, which ended before it in stream order and whose end stamp was lost.
 /// Returns the step's stage and the steps released whose ends were lost; `None` for a step no
 /// entry names.
-fn release(launched: &mut VecDeque<Launched>, step: u32) -> Option<(Arc<str>, Vec<u32>)> {
+fn release(launched: &mut VecDeque<Launched>, step: u32) -> Option<(Arc<str>, u64, Vec<u32>)> {
     let position = launched.iter().position(|entry| entry.step == step)?;
     let stream = launched[position].stream;
+    let batch = launched[position].batch;
 
     let mut lost = Vec::new();
     let mut stage = None;
@@ -772,7 +1135,81 @@ fn release(launched: &mut VecDeque<Launched>, step: u32) -> Option<(Arc<str>, Ve
         }
         true
     });
-    stage.map(|stage| (stage, lost))
+    stage.map(|stage| (stage, batch, lost))
+}
+
+/// The kernel probe pairs among one step's stamps, sorted by time: each site's entry paired with
+/// its next exit, as `(site, start, end)` in `%globaltimer` nanoseconds, in the order they began.
+/// A stamp of another class is passed over.
+fn kernel_spans(
+    instance_classes: &[u32],
+    kernel_class: Option<usize>,
+    stamps: &mut [Stamp],
+) -> Vec<(u32, u64, u64)> {
+    let Some(kernel_class) = kernel_class else {
+        return Vec::new();
+    };
+    stamps.sort_unstable_by_key(|stamp| (stamp.time, stamp.marker));
+
+    let mut entered: HashMap<u32, VecDeque<u64>> = HashMap::new();
+    let mut spans = Vec::new();
+    for stamp in stamps.iter().filter(|stamp| stamp.marker < STEP_BEGIN) {
+        let site = stamp.marker / 2;
+        let class = instance_classes.get(site as usize).copied();
+        if class != Some(kernel_class as u32) {
+            continue;
+        }
+        if stamp.marker % 2 == 0 {
+            entered.entry(site).or_default().push_back(stamp.time);
+        } else if let Some(start) = entered.get_mut(&site).and_then(VecDeque::pop_front) {
+            spans.push((site, start, stamp.time));
+        }
+    }
+    spans.sort_unstable_by_key(|&(_, start, _)| start);
+    spans
+}
+
+/// `%globaltimer` nanoseconds `gpu` on the host's `CLOCK_REALTIME`, through `clock`, a
+/// calibration sample of the device's clock against the host's.
+pub(crate) fn host_time(clock: &ClockRow, gpu: u64) -> u64 {
+    let Some(sampled) = clock.gpu else {
+        return gpu;
+    };
+    let offset = i128::from(clock.realtime) - i128::from(sampled);
+    u64::try_from(i128::from(gpu) + offset).unwrap_or(0)
+}
+
+/// Writes a step's spans into `ring`, named by its batch `batch`: the step's span between its
+/// markers, `step` as `(begin, end)`, and each kernel probe pair `(site, start, end)`, every time
+/// converted through `clock`.
+fn write_spans(
+    ring: &service::span::Ring,
+    clock: &ClockRow,
+    batch: u64,
+    step: Option<(u64, u64)>,
+    kernels: &[(u32, u64, u64)],
+) {
+    use service::span::{KERNEL, Mark, Record, Stage};
+
+    let pair = |point: u16, start: u64, end: u64| {
+        for (time, mark) in [(start, Mark::Begin), (end, Mark::End)] {
+            ring.write(&Record {
+                time: host_time(clock, time),
+                id: batch,
+                point,
+                mark,
+            });
+        }
+    };
+    if let Some((begin, end)) = step {
+        pair(Stage::Step.point(), begin, end);
+    }
+    for &(site, start, end) in kernels {
+        // A site is numbered below what a point names ([`Markers::site`]).
+        if let Ok(site) = u16::try_from(site) {
+            pair(KERNEL + site, start, end);
+        }
+    }
 }
 
 /// Notes `stamps` lost at the current position of a read: the reader counts them, and `taken`
@@ -825,6 +1262,8 @@ impl DeviceMarkers {
             launched: Mutex::new(VecDeque::new()),
             histograms: Mutex::new(BTreeMap::new()),
             tap: Mutex::new(None),
+            ring: service::span::Ring::new(DEVICE_RECORDS, service::span::Label::None),
+            clock: Mutex::new(None),
         })
     }
 
@@ -940,6 +1379,18 @@ impl DeviceMarkers {
     /// function: a kernel that queued behind the device's work gives a wide sample, which a
     /// narrower one replaces.
     fn calibrate(&self) -> Result<ClockRow> {
+        let sample = self.sample()?;
+        let mut reader = lock(&self.reader);
+        let best = match reader.best {
+            Some(best) if best.uncertainty <= sample.uncertainty => best,
+            _ => sample,
+        };
+        reader.best = Some(best);
+        Ok(best)
+    }
+
+    /// One calibration sample, as [`DeviceMarkers::calibrate`] takes it.
+    fn sample(&self) -> Result<ClockRow> {
         let mut arguments = Arguments::new(proto::module::operator::RANGE_MARKER);
         arguments.pointer("out", DevicePtr::from_address(self.clock_out.address()));
         let before = (realtime(), platform::cupti::timestamp().unwrap_or(0));
@@ -973,13 +1424,7 @@ impl DeviceMarkers {
             monotonic: None,
             uncertainty: after.0.saturating_sub(before.0) / 2,
         };
-        let mut reader = lock(&self.reader);
-        let best = match reader.best {
-            Some(best) if best.uncertainty <= sample.uncertainty => best,
-            _ => sample,
-        };
-        reader.best = Some(best);
-        Ok(best)
+        Ok(sample)
     }
 }
 
@@ -1004,14 +1449,20 @@ fn stamp((time, packed): (u64, u64), epoch: u64) -> Option<Stamp> {
     })
 }
 
-/// The switch words of `classes` (by class index from 1): the master word, on as `enabled` says,
-/// then each class's, on with it unless the class matches a pattern of `off`; and the classes
-/// matched.
-fn switch_words(classes: &[String], enabled: bool, off: &[String]) -> (Vec<u32>, Vec<String>) {
+/// The switch words of `classes` (by class index from 1): the master word, on as `switch`'s
+/// `enabled` says, then each class's, on with it unless the class matches a pattern of its
+/// `off`, the kernel class's on with it while its `kernels` holds; and the classes matched.
+fn switch_words(classes: &[String], switch: &Switch) -> (Vec<u32>, Vec<String>) {
+    let enabled = switch.enabled;
     let mut words = vec![u32::from(enabled)];
     let mut switched_off = Vec::new();
     for class in classes {
-        let excluded = off.iter().any(|pattern| matches(pattern, class));
+        // The kernel probes follow their own word, whatever patterns are switched off.
+        if class == KERNEL_CLASS {
+            words.push(u32::from(enabled && switch.kernels));
+            continue;
+        }
+        let excluded = switch.off.iter().any(|pattern| matches(pattern, class));
         if excluded {
             switched_off.push(class.clone());
         }
@@ -1034,17 +1485,191 @@ mod tests {
     #[test]
     fn a_class_named_off_stays_off_while_the_others_stamp() {
         let classes = ["Attention".to_owned(), "Transformer".to_owned()];
+        let switch = |enabled, off: &[&str]| Switch {
+            enabled,
+            off: off.iter().map(|&pattern| pattern.to_owned()).collect(),
+            kernels: true,
+        };
         assert_eq!(
-            switch_words(&classes, true, &["*Attention".to_owned()]),
+            switch_words(&classes, &switch(true, &["*Attention"])),
             (vec![1, 0, 1], vec![classes[0].clone()])
         );
         assert_eq!(
-            switch_words(&classes, true, &[]),
+            switch_words(&classes, &switch(true, &[])),
             (vec![1, 1, 1], Vec::new())
         );
         assert_eq!(
-            switch_words(&classes, false, &["*Attention".to_owned()]),
+            switch_words(&classes, &switch(false, &["*Attention"])),
             (vec![0, 0, 0], vec![classes[0].clone()])
+        );
+    }
+
+    /// The kernel probes' word follows their own switch while the master word is on, and no
+    /// pattern of the classes switched off reaches it.
+    #[test]
+    fn the_kernel_probes_follow_their_own_switch() {
+        let classes = ["Transformer".to_owned(), KERNEL_CLASS.to_owned()];
+        let switch = |enabled, kernels| Switch {
+            enabled,
+            off: vec!["*".to_owned()],
+            kernels,
+        };
+        assert_eq!(switch_words(&classes, &switch(true, true)).0, [1, 0, 1]);
+        assert_eq!(switch_words(&classes, &switch(true, false)).0, [1, 0, 0]);
+        assert_eq!(switch_words(&classes, &switch(false, true)).0, [0, 0, 0]);
+    }
+
+    /// The ranges and launch table of a forward of a step stack `Stack` at `model`: an embedding
+    /// outside the stack, two layers of one kind, a layer of the same class that launches other
+    /// keys, and a norm inside the stack outside every layer.
+    fn forward() -> (
+        Vec<ops::context::Range>,
+        Vec<(&'static str, String, String)>,
+    ) {
+        let range = |class: &str, path: &str, depth| ops::context::Range {
+            class: class.to_owned(),
+            path: path.to_owned(),
+            depth,
+        };
+        let ranges = vec![
+            range("Embedding", "embed", 0),
+            range("Stack", "model", 0),
+            range("Layer", "model.layers.0", 1),
+            range("Mlp", "model.layers.0.mlp", 2),
+            range("Layer", "model.layers.1", 1),
+            range("Mlp", "model.layers.1.mlp", 2),
+            range("Layer", "model.layers.2", 1),
+            range("Mlp", "model.layers.2.mlp", 2),
+        ];
+        let launch = |operator, key: &str, path: &str| (operator, key.to_owned(), path.to_owned());
+        let table = vec![
+            launch("embedding", "e", "embed"),
+            launch("rms_norm", "n", "model.layers.0"),
+            launch("gemm", "dense", "model.layers.0.mlp"),
+            launch("rms_norm", "n", "model.layers.1"),
+            launch(ops::breaks::BREAK, "", "model.layers.1"),
+            launch("gemm", "dense", "model.layers.1.mlp"),
+            launch("rms_norm", "n", "model.layers.2"),
+            launch("grouped_gemm", "moe", "model.layers.2.mlp"),
+            launch("rms_norm", "n", "model"),
+            launch("sample", "s", ""),
+        ];
+        (ranges, table)
+    }
+
+    /// Each kind of layer's chosen instance carries the probes and stands for its kind's layers;
+    /// a layer that launches other keys is a kind of its own; every launch outside the layers is
+    /// probed once; a graph break is no launch of a layer's kind.
+    #[test]
+    fn each_kind_of_layer_carries_probes_in_one_instance() {
+        let (ranges, table) = forward();
+        let plan = Plan::of(&ranges, &table, "Stack", 0);
+
+        assert_eq!(plan.layers("model.layers.0"), Some(2));
+        assert_eq!(plan.layers("model.layers.0.mlp"), Some(2));
+        assert_eq!(plan.layers("model.layers.1.mlp"), None);
+        assert_eq!(plan.layers("model.layers.2.mlp"), Some(1));
+        assert_eq!(plan.layers("model"), Some(1));
+        assert_eq!(plan.layers("embed"), Some(1));
+        assert_eq!(plan.layers(""), Some(1));
+
+        // A position past a kind's layers takes its last.
+        let later = Plan::of(&ranges, &table, "Stack", 5);
+        assert_eq!(later.layers("model.layers.0.mlp"), None);
+        assert_eq!(later.layers("model.layers.1.mlp"), Some(2));
+        assert_eq!(later.layers("model.layers.2.mlp"), Some(1));
+    }
+
+    /// A forward that never enters the step stack places no kernel probe.
+    #[test]
+    fn a_forward_outside_the_step_stack_places_no_kernel_probe() {
+        let (ranges, table) = forward();
+        let plan = Plan::of(&ranges, &table, "Encoder", 0);
+        assert_eq!(plan.layers(""), None);
+        assert_eq!(plan.layers("model.layers.0"), None);
+    }
+
+    /// A kernel probe's entry pairs with its site's next exit; the stamps of other classes and
+    /// the step markers make no kernel span.
+    #[test]
+    fn kernel_stamps_pair_by_site_in_time_order() {
+        // Instance 0 is a module's (class 1), instances 1 and 2 are kernel sites (class 2).
+        let instance_classes = [1, 2, 2];
+        let stamp = |time, marker| Stamp {
+            time,
+            marker,
+            step: 4,
+        };
+        let mut stamps = [
+            stamp(9, STEP_BEGIN),
+            stamp(10, 0),
+            stamp(11, 2),
+            stamp(13, 3),
+            stamp(14, 2),
+            stamp(15, 3),
+            stamp(16, 4),
+            stamp(18, 5),
+            stamp(20, 1),
+        ];
+
+        let spans = kernel_spans(&instance_classes, Some(2), &mut stamps);
+        assert_eq!(spans, [(1, 11, 13), (1, 14, 15), (2, 16, 18)]);
+        assert!(kernel_spans(&instance_classes, None, &mut stamps).is_empty());
+    }
+
+    /// A device time converts to the host clock by the offset of the calibration sample.
+    #[test]
+    fn a_device_time_converts_through_its_calibration() {
+        let clock = ClockRow {
+            source: "globaltimer",
+            device: Some(0),
+            gpu: Some(1_000),
+            realtime: 1_700_000_000_000_000_000,
+            cupti: None,
+            monotonic: None,
+            uncertainty: 3_000,
+        };
+        assert_eq!(host_time(&clock, 1_250), 1_700_000_000_000_000_250);
+        assert_eq!(host_time(&clock, 400), 1_699_999_999_999_999_400);
+    }
+
+    /// A step's spans go into the device's ring by its batch: its span between its markers, and
+    /// each kernel probe pair as a span of its site, on the host clock.
+    #[test]
+    fn a_steps_spans_name_its_batch_on_the_host_clock() {
+        let ring = service::span::Ring::new(64, service::span::Label::None);
+        let clock = ClockRow {
+            source: "globaltimer",
+            device: Some(0),
+            gpu: Some(100),
+            realtime: 10_100,
+            cupti: None,
+            monotonic: None,
+            uncertainty: 1,
+        };
+        write_spans(ring, &clock, 77, Some((100, 200)), &[(3, 120, 130)]);
+
+        let spans = service::span::spans(&[(service::span::Label::None, ring.read())], |site| {
+            (site == 3).then(|| service::span::Kernel {
+                op: "gemm".to_owned(),
+                descriptor: "k".to_owned(),
+                module: "model.layers.0.mlp".to_owned(),
+                layers: 48,
+            })
+        });
+        let named: Vec<(u64, u64, Option<u64>, bool)> = spans
+            .iter()
+            .map(|span| {
+                let kernel = matches!(span.name, service::span::Name::Kernel(_));
+                (span.start, span.end, span.batch, kernel)
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (10_100, 10_200, Some(77), false),
+                (10_120, 10_130, Some(77), true)
+            ]
         );
     }
 
@@ -1128,6 +1753,7 @@ mod tests {
         let entry = |stream, step, stage: &str| Launched {
             stream,
             step,
+            batch: u64::from(step),
             stage: Arc::from(stage),
         };
         let mut launched = VecDeque::from([
@@ -1137,8 +1763,8 @@ mod tests {
             entry(1, 13, "verify"),
         ]);
 
-        let (stage, lost) = release(&mut launched, 12).unwrap();
-        assert_eq!((&*stage, lost), ("decode", vec![10]));
+        let (stage, batch, lost) = release(&mut launched, 12).unwrap();
+        assert_eq!((&*stage, batch, lost), ("decode", 12, vec![10]));
         let left: Vec<(usize, u32)> = launched
             .iter()
             .map(|entry| (entry.stream, entry.step))
@@ -1153,6 +1779,15 @@ mod tests {
     /// built for the device's target at the Build Server of the deployment `device-cases` on this
     /// host (`build_server::socket`), which holds the package.
     fn kernels(device: DeviceId) -> Vec<KernelEntry> {
+        installed(device, &keys())
+    }
+
+    /// The modules of `wanted` (descriptor keys by operator) on `device`, from the Build Server
+    /// of the deployment `device-cases` on this host.
+    fn installed(
+        device: DeviceId,
+        wanted: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Vec<KernelEntry> {
         let socket = build_server::socket(
             &service::RuntimeDirectory::of_user().unwrap(),
             "device-cases",
@@ -1161,9 +1796,157 @@ mod tests {
         let mut client = build_server::Client::connect(&socket).unwrap();
         let targets = [build_server::Target::arch(device.compute_capability().unwrap()).unwrap()];
         let (packages, routes) =
-            crate::modules::load::select(&mut client, &targets, &Default::default(), &keys())
+            crate::modules::load::select(&mut client, &targets, &Default::default(), wanted)
                 .unwrap();
         crate::modules::load::install(&mut client, device, &packages, &routes).unwrap()
+    }
+
+    /// A captured forward carries a probe pair around each launch of its layers' kind's chosen
+    /// instance and of every launch outside its layers, and none around the other instance's:
+    /// every replay's kernel spans name, in launch order, the operator, descriptor key and module
+    /// path of those entries of the forward's launch table, with the layers each stands for,
+    /// within the step's own span on the host clock, though the graph was captured on another
+    /// stream than the one it replays on.
+    #[test]
+    #[ignore = "requires a GPU and the host's Build Server holding the range_marker and rms_norm \
+                packages"]
+    fn a_layers_kernel_probes_time_each_launch_its_table_states() {
+        use tensor::DType;
+
+        const ROWS: usize = 4;
+        const HIDDEN: usize = 64;
+        let device = DeviceId(0);
+        let markers = Markers::install(
+            vec![(device, kernels(device))],
+            Vec::new(),
+            (true, &[], true),
+            "Stack".to_owned(),
+            Some(0),
+        )
+        .unwrap();
+
+        // Two layers of one kind, each two normalizations, and one normalization in the stack
+        // outside them.
+        let forward = |x: &tensor::Tensor, gain: &tensor::Tensor| -> nn::Result<()> {
+            nn::profiler::range("Stack", "model", || {
+                for layer in 0..2 {
+                    nn::profiler::range("Layer", &format!("model.layers.{layer}"), || {
+                        let normed = nn::functional::rms_norm(x, gain, 1e-6, false, DType::F32)?;
+                        nn::functional::rms_norm(&normed, gain, 1e-6, false, DType::F32)?;
+                        nn::Result::Ok(())
+                    })?;
+                }
+                nn::functional::rms_norm(x, gain, 1e-6, false, DType::F32)?;
+                Ok(())
+            })
+        };
+
+        // The profile run: its launch table and the ranges it entered.
+        let meta = ops::Context::meta(None);
+        meta.record_launches();
+        {
+            let _guard = meta.enter();
+            let weight = |address, dims: &[usize]| {
+                ops::retained(address, dims, DType::F32, &ops::meta()).unwrap()
+            };
+            forward(
+                &weight(1 << 40, &[ROWS, HIDDEN]),
+                &weight(2 << 40, &[HIDDEN]),
+            )
+            .unwrap();
+        }
+        let table: Vec<(&'static str, String, String)> = meta
+            .take_launches()
+            .into_iter()
+            .map(|(operator, key, path, _)| (operator, key, path))
+            .collect();
+        let ranges = meta.take_ranges();
+        let mut wanted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (operator, key, _) in &table {
+            wanted
+                .entry((*operator).to_owned())
+                .or_default()
+                .insert(key.clone());
+        }
+        let generation = Arc::new(ops::Generation::new(1, installed(device, &wanted)));
+
+        // The capture, over device operands and a region for the activations, on a stream of
+        // its own beside the one the graph replays on, as a capture thread's.
+        let stream = Stream::new(device).unwrap();
+        let beside = Stream::new(device).unwrap();
+        let region = DeviceAllocation::linear(device, 1 << 20).unwrap();
+        let x = DeviceAllocation::linear(device, 4 * ROWS * HIDDEN).unwrap();
+        let gain = DeviceAllocation::linear(device, 4 * HIDDEN).unwrap();
+        let on_device = |allocation: &DeviceAllocation, dims: &[usize]| {
+            ops::retained(allocation.address(), dims, DType::F32, &ops::cuda(0)).unwrap()
+        };
+        let context = ops::Context::new(
+            0,
+            beside.clone(),
+            generation,
+            platform::DeviceRange::new(DevicePtr::from_address(region.address()), region.len()),
+        );
+        context.record_launches();
+        let capture = platform::Capture::begin(&beside, platform::CaptureMode::Relaxed).unwrap();
+        context.set_profiler(profiler(&beside, &stream, 1, &ranges, &table));
+        {
+            let _guard = context.enter();
+            forward(
+                &on_device(&x, &[ROWS, HIDDEN]),
+                &on_device(&gain, &[HIDDEN]),
+            )
+            .unwrap();
+        }
+        context.set_profiler(None);
+        let executable = capture.end().unwrap().instantiate().unwrap();
+        let captured: Vec<(&'static str, String, String)> = context
+            .take_launches()
+            .into_iter()
+            .map(|(operator, key, path, _)| (operator, key, path))
+            .collect();
+        assert_eq!(captured, table);
+
+        const BATCH: u64 = 0x5_0000_0007;
+        markers
+            .bracket(&stream, BATCH, "decode", || executable.launch(&stream))
+            .unwrap()
+            .unwrap();
+        stream.synchronize().unwrap();
+        markers.read_device(device);
+
+        let spans: Vec<service::span::Span> =
+            service::span::spans(&service::span::records(), |site| markers.kernel(site))
+                .into_iter()
+                .filter(|span| span.batch == Some(BATCH))
+                .collect();
+        let step = spans
+            .iter()
+            .find(|span| span.name == service::span::Name::Stage("step".to_owned()))
+            .unwrap();
+        let mut timed = Vec::new();
+        for span in &spans {
+            if let service::span::Name::Kernel(kernel) = &span.name {
+                assert!(step.start <= span.start && span.start <= span.end && span.end <= step.end);
+                timed.push((
+                    kernel.op.clone(),
+                    kernel.descriptor.clone(),
+                    kernel.module.clone(),
+                    kernel.layers,
+                ));
+            }
+        }
+        // The first layer is its kind's probed instance and stands for both; the launch outside
+        // the layers stands for itself; the second layer carries none.
+        let expected: Vec<(String, String, String, u32)> = table
+            .iter()
+            .filter(|(_, _, path)| path != "model.layers.1")
+            .map(|(operator, key, path)| {
+                let layers = if path == "model" { 1 } else { 2 };
+                ((*operator).to_owned(), key.clone(), path.clone(), layers)
+            })
+            .collect();
+        assert_eq!(expected.len(), 3);
+        assert_eq!(timed, expected);
     }
 
     /// The markers a capture places around a module run at every replay: each step between its
@@ -1176,16 +1959,17 @@ mod tests {
         let markers = Markers::install(
             vec![(device, kernels(device))],
             vec!["Mlp".to_owned()],
-            true,
-            &[],
+            (true, &[], true),
+            "Stack".to_owned(),
+            None,
         )
         .unwrap();
         let stream = Stream::new(device).unwrap();
 
         // A forward run once carries no marker; a capture's does.
-        assert!(profiler(&stream).is_none());
+        assert!(profiler(&stream, &stream, 0, &[], &[]).is_none());
         let capture = platform::Capture::begin(&stream, platform::CaptureMode::Relaxed).unwrap();
-        let captured = profiler(&stream).unwrap();
+        let captured = profiler(&stream, &stream, 0, &[], &[]).unwrap();
 
         let instance = captured
             .enter("Mlp", "layers.0.mlp", &stream)

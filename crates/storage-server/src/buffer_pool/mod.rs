@@ -631,6 +631,10 @@ pub struct BufferPool {
     /// The blocks whose holders the handler running now changed, counted
     /// again when it is done; empty between handlers.
     touched: RefCell<Vec<Weak<Block>>>,
+    /// The trace id of each transfer's request, by the request that asked for it, from its
+    /// arrival to its task's end: the request its handoff span names. Not part of the pool's
+    /// state, which a trace replays without it.
+    traces: HashMap<(QueueId, RequestId), u64>,
 }
 
 /// How long a transfer and a put to the remote store may take under
@@ -673,6 +677,7 @@ impl BufferPool {
             stopped: Vec::new(),
             peers: HashMap::new(),
             touched: RefCell::new(Vec::new()),
+            traces: HashMap::new(),
         }
     }
 
@@ -697,6 +702,8 @@ impl BufferPool {
     }
 
     fn complete(&mut self, queue: QueueId, request: RequestId, completion: Completion) {
+        // A transfer refused or failed before its task started has no span to end.
+        self.traces.remove(&(queue, request));
         self.completions.push((queue, request, completion));
     }
 
@@ -795,7 +802,13 @@ impl BufferPool {
                 owner,
                 group,
                 after,
-            } => self.transfer(queue, id, owner, group, after),
+                trace,
+            } => {
+                if trace != 0 {
+                    self.traces.insert((queue, id), trace);
+                }
+                self.transfer(queue, id, owner, group, after)
+            }
             Request::Prefetch {
                 group,
                 class,

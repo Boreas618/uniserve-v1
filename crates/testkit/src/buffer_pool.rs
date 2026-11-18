@@ -855,6 +855,7 @@ mod tests {
         bench.ask(A, 0, attach(1, A));
         bench.ask(A, 1, allocate(1, 2));
         let transfer = |owner| Request::Transfer {
+            trace: 0,
             owner: OwnerId(owner),
             group: B,
             after: Vec::new(),

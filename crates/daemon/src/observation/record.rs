@@ -652,6 +652,9 @@ pub(crate) struct Request {
     /// The caller's session of the request (`prompt_cache_key`), which its event states.
     session: Option<String>,
     recorded: bool,
+    /// The request's trace id, which its event's `request` field states; zero for one traced
+    /// nowhere.
+    trace: u64,
 }
 
 impl Request {
@@ -675,7 +678,16 @@ impl Request {
             log,
             session: None,
             recorded: false,
+            trace: 0,
         }
+    }
+
+    /// The recorder of a request of trace id `trace`, which its event's `request` field states:
+    /// the id its `span` events name.
+    #[must_use]
+    pub(crate) fn traced(mut self, trace: u64) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// The recorder of a request of the caller's session `session`.
@@ -730,6 +742,9 @@ impl Request {
             .unwrap_or(Duration::ZERO)
             .as_secs_f64();
         fields.insert("arrival".to_owned(), arrived.into());
+        if self.trace != 0 {
+            fields.insert("request".to_owned(), self.trace.to_string().into());
+        }
         fields.insert("outcome".to_owned(), outcome.name().into());
         fields.insert("latency".to_owned(), latency.into());
         if let Some(session) = &self.session {
@@ -1086,7 +1101,8 @@ mod tests {
             },
         };
         let mut finished = Request::new(recorder.clone(), (0, Some(1)), Instant::now(), None)
-            .session(Some("conversation-7".to_owned()));
+            .session(Some("conversation-7".to_owned()))
+            .traced(41);
         finished.record(Outcome::Length, Some(&usage));
         finished.record(Outcome::Error, None);
         drop(finished);
@@ -1111,8 +1127,11 @@ mod tests {
         assert_eq!(fields["ttft"], "0.02");
         assert_eq!(fields["tpot"], "0.01");
         assert_eq!(fields["session"], "conversation-7");
+        // The trace id its spans name; a request traced nowhere states none.
+        assert_eq!(fields["request"], "41");
         assert_eq!(events[0]["revision"], 7);
         assert_eq!(events[1]["fields"]["outcome"], "abort");
+        assert!(events[1]["fields"].get("request").is_none());
 
         let outcomes = rows(
             store,

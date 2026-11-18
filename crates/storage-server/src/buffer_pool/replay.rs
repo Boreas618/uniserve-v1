@@ -435,6 +435,7 @@ fn stated_request(request: &Request, session: &str) -> String {
             owner,
             group,
             after: stamps,
+            ..
         } => {
             format!(
                 "transfer o={} to={session}.g{} after={}",

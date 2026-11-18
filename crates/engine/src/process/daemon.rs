@@ -477,6 +477,7 @@ mod tests {
     /// A `Submit` whose request states `conditions` conditions.
     fn submit(conditions: usize) -> wire::ToEngine {
         let request = wire::Request {
+            trace: 0,
             id: 7,
             priority: 0,
             kind: Some(wire::request::Kind::Diffusion(wire::DiffusionRequest {

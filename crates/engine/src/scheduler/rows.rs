@@ -1015,6 +1015,7 @@ mod tests {
     /// with the first `computed` positions of its context computed.
     fn request(id: u64, prompt: Vec<u32>, slot: u32, computed: u32) -> Request {
         let input = GenerationRequest {
+            trace: 0,
             request_id: RequestId(id),
             prompt_token_ids: prompt.clone(),
             multimodal_inputs: Default::default(),
@@ -1845,6 +1846,7 @@ mod tests {
     /// and vision patches, three media units.
     fn video(id: u64) -> Request {
         let input = DiffusionRequest {
+            trace: 0,
             request_id: RequestId(id),
             prompt_token_ids: vec![5, 6, 7],
             conditioning: proto::video::Conditions {
@@ -1875,7 +1877,7 @@ mod tests {
         };
         row(
             id,
-            proto::request::Request::Diffusion(input),
+            proto::request::Request::Diffusion(Box::new(input)),
             Vec::new(),
             0,
             2,

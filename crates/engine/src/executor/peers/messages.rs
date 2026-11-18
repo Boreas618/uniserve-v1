@@ -324,8 +324,15 @@ pub enum RankOperation {
         reason: String,
     },
     /// Switches the fence probes on or off, the module classes `off` names off whatever
-    /// `enabled` says. Answers [`RankReports::Fences`].
-    SwitchFences { enabled: bool, off: Vec<String> },
+    /// `enabled` says, and the kernel probes as `kernels` says while `enabled` holds. Answers
+    /// [`RankReports::Fences`].
+    SwitchFences {
+        enabled: bool,
+        off: Vec<String>,
+        kernels: bool,
+    },
+    /// Reads the spans the process keeps in its rings. Answers [`RankReports::Spans`].
+    ReadSpans,
 }
 
 /// What the ranks report of a [`RankOperation`], every rank's in rank order, the main process's
@@ -342,6 +349,8 @@ pub(crate) enum RankReports {
     ProfileReleases(Vec<RankRelease>),
     /// Each process's switch of its fence probes.
     Fences(Vec<FencesSwitched>),
+    /// Each process's spans, as it named them.
+    Spans(Vec<Vec<service::span::Span>>),
 }
 
 impl RankReports {
@@ -359,6 +368,7 @@ impl RankReports {
             (Self::ProfileStops(ours), Self::ProfileStops(theirs)) => ours.extend(theirs),
             (Self::ProfileReleases(ours), Self::ProfileReleases(theirs)) => ours.extend(theirs),
             (Self::Fences(ours), Self::Fences(theirs)) => ours.extend(theirs),
+            (Self::Spans(ours), Self::Spans(theirs)) => ours.extend(theirs),
             (ours, theirs) => {
                 return Err(format!(
                     "a process reported {theirs:?} beside {ours:?}: they ran different operations"

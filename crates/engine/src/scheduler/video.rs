@@ -1320,6 +1320,7 @@ mod tests {
             .map(|condition| condition.video_rows() as u32 + condition.audio_rows)
             .sum();
         DiffusionRequest {
+            trace: 0,
             request_id: RequestId(1),
             prompt_token_ids: vec![1; prompt],
             conditioning: proto::video::Conditions {
@@ -1369,7 +1370,7 @@ mod tests {
         }
         Request {
             id: input.request_id,
-            input: proto::request::Request::Diffusion(input),
+            input: proto::request::Request::Diffusion(Box::new(input)),
             arrival: now,
             status: RequestStatus::Running,
             placement: placed,

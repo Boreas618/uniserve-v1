@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use proto::handoff;
 use proto::request::Event;
+use service::span::{self, Stage};
 
 use crate::api::error::Error;
 use crate::api::events::{Events, Stats};
@@ -43,6 +44,8 @@ pub struct OutputProcessor {
     stats: Box<dyn Stats>,
     /// Whether the decoder's terminal event was consumed.
     ended: bool,
+    /// The request's trace id, which the spans of its output name; zero for one traced nowhere.
+    trace: u64,
 }
 
 /// The parts of a lowering every token response is built from, each checked present once.
@@ -132,6 +135,7 @@ impl OutputProcessor {
             clock,
             stats,
             ended: false,
+            trace: 0,
         })
     }
 
@@ -192,6 +196,9 @@ impl OutputProcessor {
             clock: StreamClock::resume(assembly),
             stats,
             ended: false,
+            // A successor's processor traces nothing: the trace id stayed with the daemon that
+            // received the request.
+            trace: 0,
         })
     }
 
@@ -236,6 +243,8 @@ impl OutputProcessor {
             request_id: request_id.clone(),
             source,
         };
+        // Decoding one event's tokens, and parsing them into the response's blocks.
+        let _detokenize = (self.trace != 0).then(|| span::enter(Stage::Detokenize, self.trace));
         let decoded = self.decode.push(event, events).map_err(failed)?;
 
         let mut outputs = Vec::new();
@@ -341,6 +350,18 @@ impl OutputProcessor {
             parser: Some(self.parser.clone()),
             response: Some(self.response.clone()),
         }
+    }
+
+    /// The processor of a request of trace id `trace`, whose output spans name it.
+    #[must_use]
+    pub fn traced(mut self, trace: u64) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    /// The request's trace id; zero for one traced nowhere.
+    pub fn trace(&self) -> u64 {
+        self.trace
     }
 
     /// The incremental detokenizer's state and its stop-string decisions.

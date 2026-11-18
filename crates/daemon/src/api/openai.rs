@@ -27,6 +27,7 @@ use axum::extract::{FromRequest, Request, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
+use service::span::{self, Stage};
 use validator::Validate;
 
 use crate::api::protocol::{ListModelsResponse, ModelObject};
@@ -42,6 +43,12 @@ pub use error::{ApiError, Result};
 /// not be unique: the engine identifies each request by its own identifier.
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
+
+/// The request's trace id, which the HTTP layer gives every request it receives and inserts into
+/// the request extensions beside its [`RequestId`]: the id every span of the request names,
+/// in this daemon and in the engine and Storage Server that serve it (`docs/profiling.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Trace(pub u64);
 
 /// The model listing route, `GET /v1/models`.
 pub(crate) fn models_router(served: Arc<Served>) -> Router {
@@ -97,13 +104,24 @@ where
     type Rejection = ApiError;
 
     async fn from_request(request: Request, state: &S) -> Result<Self> {
-        let Json(data) = Json::<T>::from_request(request, state)
+        // The request reached its route: what follows reads and parses its body.
+        let trace = request.extensions().get::<Trace>().copied();
+        if let Some(Trace(trace)) = trace {
+            span::end(Stage::Receive, trace);
+            span::begin(Stage::Parse, trace);
+        }
+        let parsed = Json::<T>::from_request(request, state)
             .await
-            .map_err(|rejection: JsonRejection| ApiError::from(rejection))?;
-
-        data.validate()
-            .map_err(|errors| ApiError::invalid_request(errors.to_string(), None))?;
-        Ok(Self(data))
+            .map_err(|rejection: JsonRejection| ApiError::from(rejection))
+            .and_then(|Json(data)| {
+                data.validate()
+                    .map_err(|errors| ApiError::invalid_request(errors.to_string(), None))?;
+                Ok(Self(data))
+            });
+        if let Some(Trace(trace)) = trace {
+            span::end(Stage::Parse, trace);
+        }
+        parsed
     }
 }
 

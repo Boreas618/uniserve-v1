@@ -32,9 +32,9 @@ use axum::{Extension, Json, Router};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 
-use crate::api::openai::RequestId;
 use crate::api::openai::video_jobs::{JobStatus, StageClock, VideoFailure, VideoJob, VideoJobs};
 use crate::api::openai::{ApiError, check_model_served};
+use crate::api::openai::{RequestId, Trace};
 use crate::api::output::video::ArtifactCollector;
 use crate::api::protocol::{VideoGenerationRequest, from_form};
 use crate::http::served::Served;
@@ -90,6 +90,7 @@ pub(crate) fn job_router(served: Arc<Served>, jobs: Arc<VideoJobs>, body_limit: 
 async fn videos_sync(
     State(served): State<Arc<Served>>,
     Extension(RequestId(base_id)): Extension<RequestId>,
+    Extension(Trace(trace)): Extension<Trace>,
     VideoBody(body): VideoBody,
 ) -> Response {
     let started_at = Instant::now();
@@ -98,7 +99,8 @@ async fn videos_sync(
     if let Err(error) = check_model_served(&body.model, &served.leader.served_model_name()) {
         return error.into_response();
     }
-    let (processed, mut stream) = match served.leader.generate_video(request_id, body).await {
+    let (processed, mut stream) = match served.leader.generate_video(request_id, body, trace).await
+    {
         Ok(generation) => generation,
         Err(error) => return ApiError::from(error).into_response(),
     };
@@ -215,6 +217,23 @@ impl<S: Send + Sync> FromRequest<S> for VideoBody {
     type Rejection = ApiError;
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        // The request reached its route: what follows reads and parses its body.
+        let trace = request.extensions().get::<Trace>().copied();
+        if let Some(Trace(trace)) = trace {
+            service::span::end(service::span::Stage::Receive, trace);
+            service::span::begin(service::span::Stage::Parse, trace);
+        }
+        let parsed = Self::parse(request, state).await;
+        if let Some(Trace(trace)) = trace {
+            service::span::end(service::span::Stage::Parse, trace);
+        }
+        parsed
+    }
+}
+
+impl VideoBody {
+    /// The request's body, as JSON or as a multipart form.
+    async fn parse<S: Send + Sync>(request: Request, state: &S) -> Result<Self, ApiError> {
         let content_type = request
             .headers()
             .get(header::CONTENT_TYPE)
@@ -255,13 +274,14 @@ impl<S: Send + Sync> FromRequest<S> for VideoBody {
 async fn videos_create(
     State(JobState { served, jobs }): State<JobState>,
     Extension(RequestId(base_id)): Extension<RequestId>,
+    Extension(Trace(trace)): Extension<Trace>,
     VideoBody(body): VideoBody,
 ) -> Response {
     let request_id = format!("vid-{base_id}");
     if let Err(error) = check_model_served(&body.model, &served.leader.served_model_name()) {
         return error.into_response();
     }
-    let (prepared, mut stream) = match served.leader.generate_video(request_id, body).await {
+    let (prepared, mut stream) = match served.leader.generate_video(request_id, body, trace).await {
         Ok(generation) => generation,
         Err(error) => return ApiError::from(error).into_response(),
     };

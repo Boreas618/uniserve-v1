@@ -1400,7 +1400,8 @@ mod media {
 
 /// The workers' always-on profiling (`profiling_config`): the fence
 /// probes at the entry and exit of the model's modules, which export
-/// per-step durations by module class (`docs/profiling.md`).
+/// per-step durations by module class, the kernel probes of each kind of
+/// layer, and how far back the request timelines reach (`docs/profiling.md`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfilingConfig {
@@ -1445,7 +1446,27 @@ pub struct ProfilingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[reload(step)]
     pub session: Option<crate::profile::SessionRequest>,
+    /// Which instance of each kind of layer carries a kernel probe before and after each of its
+    /// kernels, by its position among the layers of its kind in launch order (the last when the
+    /// kind has fewer), beside a pair around every kernel outside the layers; no kernel probe is
+    /// placed when unset (`docs/profiling.md`). Probes are captured into the CUDA graphs, so a
+    /// change is a kernel generation: every bucket is captured again with the probes moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[reload(generation)]
+    pub kernel_instance: Option<u32>,
+    /// Whether the kernel probes the graphs carry record: their device switch, changed in place
+    /// at the engine's next step boundary, as `fence_probes` is.
+    #[reload(step)]
+    pub kernel_probes: bool,
+    /// How far back a read of the `span` events reaches: the spans that ended longer ago are not
+    /// read, whatever the processes' rings still hold. Read by the leader at each query.
+    #[serde(with = "values::duration")]
+    #[reload(step)]
+    pub span_window: Duration,
 }
+
+/// How far back a read of the `span` events reaches by default: five minutes.
+pub const DEFAULT_SPAN_WINDOW: Duration = Duration::from_secs(300);
 
 impl Default for ProfilingConfig {
     fn default() -> Self {
@@ -1456,6 +1477,9 @@ impl Default for ProfilingConfig {
             graph_pc_sampling: false,
             nvtx_ranges: false,
             session: None,
+            kernel_instance: None,
+            kernel_probes: true,
+            span_window: DEFAULT_SPAN_WINDOW,
         }
     }
 }
@@ -1898,6 +1922,9 @@ impl EngineConfig {
             graph_pc_sampling,
             nvtx_ranges: _,
             session: _,
+            kernel_instance: _,
+            kernel_probes: _,
+            span_window: _,
         } = profiling;
         BuildPart {
             executable,

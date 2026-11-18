@@ -1091,6 +1091,10 @@ impl Scheduler {
         request.status = RequestStatus::Running;
         request.queued = false;
         request.last_progress = now;
+        let trace = request.input.trace();
+        if trace != 0 {
+            service::span::end(service::span::Stage::Admit, trace);
+        }
         tracing::debug!(
             target: super::schedule::STEPS,
             step = self.step,
@@ -1141,6 +1145,8 @@ impl Scheduler {
             return;
         };
         let verifies = self.groups[index].serves(Phase::Verify);
+        // The Storage Server's span of the handoff names the request.
+        let trace = request.input.trace();
 
         if let Some(request) = self.requests.get_mut(&id) {
             request.placement[Phase::Decode.index()] = Some(target);
@@ -1155,6 +1161,7 @@ impl Scheduler {
             owner,
             group: target,
             after: Vec::new(),
+            trace,
         });
         self.mark(id);
     }
@@ -2299,6 +2306,7 @@ mod tests {
         prefill_and_decode(&mut bench);
 
         let transfer = runtime::Request::Transfer {
+            trace: 0,
             owner: OWNER_A,
             group: B,
             after: Vec::new(),
@@ -2431,6 +2439,7 @@ mod tests {
     /// Group A's workers return request 1's `Transfer`, stamped.
     fn stamp_transfer(bench: &mut Bench) {
         bench.scheduler.stamped(vec![runtime::Request::Transfer {
+            trace: 0,
             owner: OWNER_A,
             group: B,
             after: vec![(A, 9)],

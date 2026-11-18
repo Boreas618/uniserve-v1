@@ -36,6 +36,7 @@ mod events;
 pub(crate) mod export;
 pub(crate) mod log;
 pub(crate) mod record;
+pub(crate) mod spans;
 mod stats;
 pub mod table;
 mod view;
@@ -186,6 +187,8 @@ struct Inner {
 
     /// The id of the last appended event, which subscriptions wait on.
     appended: watch::Sender<u64>,
+    /// What reads the deployment's spans for a query of `span` events ([`spans`]).
+    spans: Mutex<Option<Arc<dyn spans::Source>>>,
 }
 
 impl fmt::Debug for Store {
@@ -209,6 +212,7 @@ impl Store {
                 stats: Mutex::new(stats::Table::new(limits)),
                 events: Mutex::default(),
                 appended: watch::Sender::new(0),
+                spans: Mutex::new(None),
             }),
         })
     }
@@ -358,6 +362,30 @@ impl Store {
             .forget(revision);
     }
 
+    /// Has a query of `span` events read them through `source` from now on: the serving
+    /// deployment's processes, or none.
+    pub(crate) fn read_spans(&self, source: Option<Arc<dyn spans::Source>>) {
+        *self
+            .inner
+            .spans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = source;
+    }
+
+    /// The spans the source reads, as events; none without a source.
+    async fn spans(&self) -> Vec<Event> {
+        let source = self
+            .inner
+            .spans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match source {
+            Some(source) => source.read().await,
+            None => Vec::new(),
+        }
+    }
+
     /// The `stats` view of control programs.
     pub fn stats(&self) -> Stats {
         Stats::new(self.clone())
@@ -418,12 +446,19 @@ impl Store {
         })
     }
 
-    /// The `events` rows of the kinds `kinds` selects (all when `None`).
-    fn events_batch(&self, kinds: Option<&[String]>) -> Result<RecordBatch, ArrowError> {
+    /// The `events` rows of the kinds `kinds` selects (all when `None`): the table's, and the
+    /// spans the deployment's processes keep when `span` is among them.
+    async fn events_batch(&self, kinds: Option<&[String]>) -> Result<RecordBatch, ArrowError> {
+        let admits =
+            |kind: &str| kinds.is_none_or(|kinds| kinds.iter().any(|admitted| admitted == kind));
+        let spans = if admits(Kind::Span.as_str()) {
+            self.spans().await
+        } else {
+            Vec::new()
+        };
         self.read_events(|table| {
-            table::events(table.after(0).filter(|event| {
-                kinds.is_none_or(|kinds| kinds.iter().any(|kind| kind == event.kind.as_str()))
-            }))
+            let held = table.after(0).filter(|event| admits(event.kind.as_str()));
+            table::events(held.chain(&spans))
         })
     }
 

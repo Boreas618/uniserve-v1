@@ -1387,6 +1387,7 @@ fn a_transfer_moves_an_owner_and_copies_what_the_target_group_lacks() {
     let id = fixture.submit(
         QUEUE,
         Request::Transfer {
+            trace: 0,
             owner: OwnerId(2),
             group: DECODE,
             after: vec![(PREFILL, 2)],
@@ -1445,6 +1446,45 @@ fn a_transfer_moves_an_owner_and_copies_what_the_target_group_lacks() {
     assert_eq!(fixture.listing()[1], (key(8), KV, 64, 0b001, 0b10, 0));
 }
 
+/// A handoff's span is its task's: it begins as the task starts and ends as it ends, naming the
+/// request's trace id and the bytes the task copied into the decode group's memory.
+#[test]
+fn a_transfer_spans_its_handoff_with_the_bytes_it_copies() {
+    // A trace id no other test of the process names: the rings are the process's.
+    const TRACE: u64 = 0x5eed_7a11;
+    let mut fixture = Fixture::new();
+    fixture.cached(1, 7);
+    fixture.attach(2, PREFILL);
+    fixture.pin(2, 0, &[7]);
+    fixture.allocate(2, 1, 1);
+
+    let id = fixture.submit(
+        QUEUE,
+        Request::Transfer {
+            owner: OwnerId(2),
+            group: DECODE,
+            after: vec![(PREFILL, 2)],
+            trace: TRACE,
+        },
+    );
+    fixture.pool.advance(SERVING, PREFILL, 2);
+    fixture.pool.ended((QUEUE, id), true);
+
+    let spans: Vec<service::span::Span> = service::span::spans(&service::span::records(), |_| None)
+        .into_iter()
+        .filter(|span| span.request == Some(TRACE))
+        .collect();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].name,
+        service::span::Name::Stage("handoff".to_owned())
+    );
+    assert_eq!(spans[0].process, service::span::Process::Storage);
+    // Two blocks of one 64-byte unit each; the slot row moves without a fill.
+    assert_eq!(spans[0].bytes, Some(128));
+    assert!(spans[0].start <= spans[0].end);
+}
+
 #[test]
 fn a_failed_transfer_leaves_the_owner_in_its_group() {
     let mut fixture = Fixture::new();
@@ -1453,6 +1493,7 @@ fn a_failed_transfer_leaves_the_owner_in_its_group() {
     let id = fixture.submit(
         QUEUE,
         Request::Transfer {
+            trace: 0,
             owner: OwnerId(1),
             group: DECODE,
             after: Vec::new(),
@@ -1470,6 +1511,7 @@ fn a_failed_transfer_leaves_the_owner_in_its_group() {
     fixture.attach(2, DECODE);
     fixture.attach(3, DECODE);
     let request = Request::Transfer {
+        trace: 0,
         owner: OwnerId(1),
         group: DECODE,
         after: Vec::new(),
@@ -1486,6 +1528,7 @@ fn a_transfer_holds_its_blocks_until_its_task_ends_whatever_its_owner_does() {
     let id = fixture.submit(
         QUEUE,
         Request::Transfer {
+            trace: 0,
             owner: OwnerId(1),
             group: DECODE,
             after: Vec::new(),
@@ -1519,6 +1562,7 @@ fn a_transfer_waits_while_another_fills_the_target_memory_of_a_block_it_holds() 
     fixture.pin(3, 0, &[7]);
 
     let transfer = |owner| Request::Transfer {
+        trace: 0,
         owner: OwnerId(owner),
         group: DECODE,
         after: Vec::new(),
@@ -2413,6 +2457,7 @@ fn a_crossing_waits_for_its_stamps_and_its_task_and_makes_the_block_valid_where_
     assert_eq!(fixture.answer(crossing), None);
     assert_eq!(fixture.pool.started(), Vec::new());
     let transfer = Request::Transfer {
+        trace: 0,
         owner: OwnerId(1),
         group: DECODE,
         after: Vec::new(),
@@ -2498,6 +2543,7 @@ fn a_crossing_that_names_what_does_not_fit_is_refused_and_changes_nothing() {
 
     // An owner whose transfer waits.
     let transfer = Request::Transfer {
+        trace: 0,
         owner: OwnerId(2),
         group: DECODE,
         after: vec![(PREFILL, 1)],

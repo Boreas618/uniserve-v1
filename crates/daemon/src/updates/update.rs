@@ -548,7 +548,7 @@ impl Update {
     }
 
     /// `Prepare` to every serving engine, with the target's kernel and policy
-    /// modules.
+    /// modules and where its kernel probes lie.
     fn prepare_generation(&mut self, processes: &mut Processes) {
         let modules = &self.target.modules;
         let prepare = command(command::Kind::Prepare(process::Prepare {
@@ -558,6 +558,7 @@ impl Update {
                 .map(|(slot, package)| proto::module::kernel_to_wire(slot, package))
                 .collect(),
             policy: Some((&modules.policy).into()),
+            kernel_instance: self.target.engine.profiling.kernel_instance,
         }));
         for node in &self.nodes {
             processes.command(&node.host, node.launch, prepare.clone());

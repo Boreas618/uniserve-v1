@@ -1013,6 +1013,7 @@ mod tests {
     /// A token request of `prompt` that may generate `max` tokens.
     fn tokens(prompt: &[u32], max: usize) -> GenerationRequest {
         GenerationRequest {
+            trace: 0,
             request_id: RequestId(7),
             prompt_token_ids: prompt.to_vec(),
             multimodal_inputs: Default::default(),

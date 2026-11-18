@@ -392,6 +392,7 @@ pub(super) mod tests {
     /// A waiting token request of `prompt`, as the scheduler holds it on arrival.
     pub(in super::super) fn waiting(id: u64, priority: i32, prompt: &[u32]) -> Request {
         let input = GenerationRequest {
+            trace: 0,
             request_id: RequestId(id),
             prompt_token_ids: prompt.to_vec(),
             multimodal_inputs: Default::default(),

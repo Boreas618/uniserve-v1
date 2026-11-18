@@ -37,18 +37,19 @@ use crate::updates::change::Applied;
 use crate::updates::update::{EpochSwitch, Node, Update};
 
 /// The options the workers switch in place, at the engine's next step boundary: the fence
-/// probes' switch and the classes whose probes stay off. Every other profiling option shapes the
-/// CUDA graphs an epoch captures.
-const FENCE_SWITCHES: [&str; 2] = [
+/// probes' switch, the classes whose probes stay off and the kernel probes' switch. The other
+/// profiling options of the engines shape the CUDA graphs they capture.
+const FENCE_SWITCHES: [&str; 3] = [
     "profiling_config.fence_probes",
     "profiling_config.fence_probes_off",
+    "profiling_config.kernel_probes",
 ];
 
 /// The options that take effect at a step which the daemon applies itself, rather than the
 /// schedulers reading them from their next step's snapshot: the deployment's name, admission and
-/// sleep, its prefix cache's flush, its adapters, its profiling session, and what it does to its
-/// storage when it comes down.
-const DAEMON_STEPS: [&str; 7] = [
+/// sleep, its prefix cache's flush, its adapters, its profiling session, how far back a read of
+/// its spans reaches, and what it does to its storage when it comes down.
+const DAEMON_STEPS: [&str; 8] = [
     "served_model_name",
     "paused",
     "asleep",
@@ -56,7 +57,14 @@ const DAEMON_STEPS: [&str; 7] = [
     "retire",
     "adapters",
     "profiling_config.session",
+    "profiling_config.span_window",
 ];
+
+/// Whether `target` places the kernel probes elsewhere than `serving`: a kernel generation,
+/// whose captures move them.
+fn probes_move(serving: &EngineConfig, target: &EngineConfig) -> bool {
+    serving.profiling.kernel_instance != target.profiling.kernel_instance
+}
 
 /// Whether `changes` switch the fence probes.
 fn switches_probes(changes: &[proto::reload::Change]) -> bool {
@@ -144,7 +152,10 @@ impl Leader {
         };
         let form = if named == Change::Epoch || record.engine != next.modules.engine {
             Effect::Epoch
-        } else if record.kernels != next.modules.kernels || record.policy != next.modules.policy {
+        } else if record.kernels != next.modules.kernels
+            || record.policy != next.modules.policy
+            || probes_move(&record.config, &next.engine)
+        {
             Effect::Generation
         } else {
             return self.apply_in_place(target, stated, revision).await;
@@ -755,8 +766,9 @@ impl Replica {
         if switches_probes(changes) {
             let enabled = target_engine.profiling.fence_probes;
             let off = target_engine.profiling.fence_probes_off.clone();
+            let kernels = target_engine.profiling.kernel_probes;
             running
-                .switch_fences(enabled, off.clone())
+                .switch_fences(enabled, off.clone(), kernels)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!("the workers did not switch the probes: {error}")
@@ -764,6 +776,7 @@ impl Replica {
             info!(
                 enabled,
                 ?off,
+                kernels,
                 "the workers switched the fence probes in place"
             );
         }

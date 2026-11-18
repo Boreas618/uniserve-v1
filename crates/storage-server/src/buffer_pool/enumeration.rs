@@ -749,6 +749,7 @@ impl Driver {
                 after: stamps(mask),
             },
             Step::Transfer(o, group, mask) => Request::Transfer {
+                trace: 0,
                 owner: owner(o),
                 group: GroupId(group),
                 after: stamps(mask),

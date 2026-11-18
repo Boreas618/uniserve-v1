@@ -1090,6 +1090,11 @@ impl Server {
                     Vec::new(),
                 ))
             }
+            // The rings are the process's, whichever deployment's head reads them.
+            (Request::Spans, Role::Head { .. }) => {
+                let spans = service::span::spans(&service::span::records(), |_| None);
+                Ok(Handling::Response(Response::Spans { spans }, Vec::new()))
+            }
             (
                 request,
                 Role::Worker {

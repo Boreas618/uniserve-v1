@@ -11,6 +11,7 @@
 
 use std::rc::Rc;
 
+use service::span::Stage;
 use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, RequestId, Stamps};
 
@@ -218,6 +219,24 @@ impl BufferPool {
             deadline,
         });
 
+        // The handoff's span: from its task's start to its end, with the bytes it copies into
+        // the decode group's memory.
+        if let Some(&trace) = self.traces.get(&(queue, request)) {
+            let run_bytes = |run: &Run| {
+                let unit = self
+                    .regions
+                    .get(usize::from(run.region()))
+                    .map_or(0, |region| region.unit_bytes);
+                u64::from(run.count()) * unit
+            };
+            let bytes = copies
+                .iter()
+                .filter(|copy| copy.fill)
+                .map(|copy| copy.write.runs.borrow().iter().map(run_bytes).sum::<u64>())
+                .sum();
+            service::span::bytes(Stage::Handoff, trace, bytes);
+            service::span::begin(Stage::Handoff, trace);
+        }
         self.hold_copies((queue, request), copies);
         self.answers.insert((queue, request), Vec::new());
         self.started.push((queue, request));
@@ -1053,6 +1072,9 @@ impl BufferPool {
         let completion = match copies.first().map(|copy| copy.to) {
             Some(Target::Group { owner, to }) => {
                 let completion = self.transferred(task.0.0, owner, to, &copies, ok);
+                if let Some(trace) = self.traces.remove(&task) {
+                    service::span::end(Stage::Handoff, trace);
+                }
                 answer.map(|_| completion)
             }
             Some(Target::Memory {

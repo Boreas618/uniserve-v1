@@ -448,8 +448,8 @@ impl Epoch {
 /// ([`proto::reload`]) and the module sets both fix: the daemon's own options
 /// first, then an epoch (an option that builds the engine, a replaced Storage
 /// Server, or another engine package or revision), then the kernel and
-/// program modules. A change of options that take effect at the next step
-/// alone is `None`: no update moves it.
+/// program modules and the kernel probes' placement. A change of options that
+/// take effect at the next step alone is `None`: no update moves it.
 pub fn change(previous: &Epoch, next: &Epoch) -> Change {
     let effects = proto::reload::Effects::of(&proto::reload::changes(
         Some(&previous.config),
@@ -463,7 +463,11 @@ pub fn change(previous: &Epoch, next: &Epoch) -> Change {
         // Another engine package, or another revision of it, is another
         // executable: its engines are started beside the serving ones.
         Change::Epoch
-    } else if previous.modules != next.modules {
+    } else if previous.modules != next.modules
+        || previous.engine.profiling.kernel_instance != next.engine.profiling.kernel_instance
+    {
+        // Another kernel package, or the kernel probes placed elsewhere: the graphs are
+        // captured again.
         Change::Generation
     } else {
         Change::None

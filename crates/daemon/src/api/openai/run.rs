@@ -305,6 +305,10 @@ impl<S: ResponseSink> GenerationRun<S> {
         event: proto::request::Event,
     ) -> Result<Step, crate::api::output::OutputError> {
         let outputs = self.output.push(event, self.events.as_mut())?;
+        let trace = self.output.trace();
+        // Assembling the outputs into the response's chunks or its document.
+        let _assemble = (trace != 0 && !outputs.is_empty())
+            .then(|| service::span::enter(service::span::Stage::Assemble, trace));
         let mut frames = Vec::new();
         for output in &outputs {
             match self.sink.push(output) {
@@ -424,6 +428,10 @@ impl<S: ResponseSink> Session for GenerationRun<S> {
     fn detach(&mut self) {
         self.output.abandoned();
         self.events.hand_over();
+    }
+
+    fn trace(&self) -> Option<u64> {
+        Some(self.output.trace()).filter(|&trace| trace != 0)
     }
 }
 

@@ -243,6 +243,7 @@ impl Bench {
     pub(super) fn attach(&mut self, attachments: &[(GroupId, OwnerId, u32)]) {
         let id = proto::request::RequestId(1);
         let input = GenerationRequest {
+            trace: 0,
             request_id: id,
             prompt_token_ids: vec![1, 2, 3],
             multimodal_inputs: Default::default(),

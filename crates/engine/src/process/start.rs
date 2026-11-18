@@ -1087,9 +1087,10 @@ fn weight_binding(
 /// Installs what the deployment's always-on profiling captures into every graph of the devices
 /// `model_runner` serves, after setting the NVTX ranges' switch as `profiling_config.nvtx_ranges`
 /// states: the range markers of the classes `profiling_config.fence_modules` names,
-/// or of the family's step stack when it names none ([`ModelRunner::step_stack`]), with their
-/// kernels resolved through `build`, the Build Server's client and the devices' targets, as every
-/// operator's are; and PC sampling when `graph_pc_sampling` keeps it on, which CUPTI attributes
+/// or of the family's step stack when it names none ([`ModelRunner::step_stack`]), and the
+/// kernel probes of the layers of the step stack `profiling_config.kernel_instance` places, with
+/// their kernels resolved through `build`, the Build Server's client and the devices' targets, as
+/// every operator's are; and PC sampling when `graph_pc_sampling` keeps it on, which CUPTI attributes
 /// to a graph only when enabled before its capture; otherwise the counters' record of each graph
 /// launch as a whole, in which the executables are then instantiated
 /// ([`crate::profiling::counters::record_whole_graphs`]).
@@ -1110,7 +1111,8 @@ fn instrument(
     crate::profiling::ranges::set_enabled(profiling.nvtx_ranges);
     let devices = model_runner.devices();
     let classes = crate::profiling::markers::classes(profiling, model_runner.step_stack());
-    if !classes.is_empty() {
+    // The kernel probes are stamps of the range markers too.
+    if !classes.is_empty() || profiling.kernel_instance.is_some() {
         let (client, targets) =
             build.context("the start holds no Build Server client to resolve the range markers")?;
         let mut client = service::lock(client);
@@ -1132,8 +1134,13 @@ fn instrument(
         crate::profiling::markers::Markers::install(
             kernels,
             classes,
-            profiling.fence_probes,
-            &profiling.fence_probes_off,
+            (
+                profiling.fence_probes,
+                &profiling.fence_probes_off,
+                profiling.kernel_probes,
+            ),
+            model_runner.step_stack().to_owned(),
+            profiling.kernel_instance,
         )
         .context("installing the range markers")?;
     }

@@ -196,7 +196,7 @@ fn preprocess_chat(
     images: Vec<ImageInput>,
 ) -> Result<(GenerationRequest, Lowering), ApiError> {
     processor
-        .process(&request_id, &request, None, images)
+        .process(&request_id, &request, None, images, 0)
         .map_err(ApiError::from)
 }
 

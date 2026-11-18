@@ -415,7 +415,11 @@ impl TableProvider for Events {
         _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let batch = match &self.source {
-            Source::Store(store) => store.events_batch(admitted(filters, "kind").as_deref())?,
+            Source::Store(store) => {
+                store
+                    .events_batch(admitted(filters, "kind").as_deref())
+                    .await?
+            }
             Source::Batch(batch) => batch.clone(),
         };
 

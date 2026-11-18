@@ -172,6 +172,9 @@ pub struct Graphs {
 /// The device side of a runner's graphs.
 struct Cuda {
     stream: Stream,
+    /// The stream these graphs' captures are replayed on: their own, or for graphs beside a
+    /// runner's, the runner's, whose step markers the captured range markers read.
+    replays_on: Stream,
     /// The context that launches: a serving runner's eager and paired forwards compute under
     /// it, and graphs beside them capture under it. A rehearsal's graphs derive each rehearsal's
     /// context from it.
@@ -349,6 +352,7 @@ impl Graphs {
         let buffer = InputBuffer::pinned(device, inputs, values, slots)?;
         let cuda = Cuda {
             launching: Context::new(ordinal, stream.clone(), Arc::clone(&kernels), allocator),
+            replays_on: stream.clone(),
             stream,
             region,
             done: Event::new(EventFlags::default()),
@@ -399,6 +403,7 @@ impl Graphs {
             device: Some(Cuda {
                 launching: cuda.launching.beside(stream.clone())?,
                 stream,
+                replays_on: cuda.replays_on.clone(),
                 region: cuda.region,
                 done: Event::new(EventFlags::default()),
                 rehearsal: RefCell::new(None),
@@ -444,6 +449,7 @@ impl Graphs {
             device: Some(Cuda {
                 launching: cuda.launching.beside(stream.clone())?,
                 stream,
+                replays_on: cuda.replays_on.clone(),
                 region: cuda.region,
                 done: Event::new(EventFlags::default()),
                 rehearsal: RefCell::new(None),
@@ -1010,8 +1016,8 @@ impl Graphs {
     /// warm-up, which `serving` is then `None` for): a profile run of the forward, which also
     /// states its launches for the capture's check.
     ///
-    /// The bucket is captured when it has no graph, its launch table changed, or a launch's
-    /// kernel is another in `next`; it is rehearsed first when it launches a native kernel
+    /// The bucket is captured when it has no graph, its launch table changed, a launch's kernel
+    /// is another in `next`, or `next` places the kernel probes elsewhere; it is rehearsed first when it launches a native kernel
     /// `serving` does not hold under the same key, whose first use a capture cannot record.
     ///
     /// # Errors
@@ -1054,10 +1060,17 @@ impl Graphs {
             ));
         }
 
+        // A bucket whose kernel probes the generation moves is captured again with them.
+        let probes_moved = |serving: &Generation| {
+            crate::profiling::markers::Markers::installed().is_some_and(|markers| {
+                markers.placement(serving.number()) != markers.placement(next.number())
+            })
+        };
         let capture = match (held, serving) {
             (Some(held), Some(serving)) => {
                 !same_launches(held, &profiled)
                     || !changed_launches(&profiled, serving, next).is_empty()
+                    || probes_moved(serving)
             }
             _ => true,
         };
@@ -1167,7 +1180,9 @@ impl Graphs {
 
         let slot = self.fill_slot(|columns| runner.idle_inputs(bucket, columns))?;
         self.lend_values(&self.preparing, slot)?;
-        let (_, prepared, _) = self.meta_forward(&self.preparing, runner, bucket)?;
+        let (profiled, prepared, _) = self.meta_forward(&self.preparing, runner, bucket)?;
+        // The module tree the forward enters, which places the generation's kernel probes.
+        let ranges = self.preparing.take_ranges();
 
         let Some(cuda) = &self.device else {
             let (table, copies, _) = self.meta_forward(&self.preparing, runner, bucket)?;
@@ -1194,11 +1209,17 @@ impl Graphs {
         let captured = {
             let _guard = cuda.launching.enter();
             Recording::capture(&cuda.stream, || {
-                // A captured forward carries the range markers of the modules it enters, which
-                // every replay then runs; the process's markers are a profiler only while the
-                // stream captures.
+                // A captured forward carries the range markers of the modules it enters and the
+                // probes of the kernels its generation places, which every replay then runs; the
+                // process's markers are a profiler only while the stream captures.
                 cuda.launching
-                    .set_profiler(crate::profiling::markers::profiler(&cuda.stream));
+                    .set_profiler(crate::profiling::markers::profiler(
+                        &cuda.stream,
+                        &cuda.replays_on,
+                        kernels.number(),
+                        &ranges,
+                        &profiled,
+                    ));
                 runner.forward(bucket)
             })
         };

@@ -166,6 +166,7 @@ fn a_prefill_then_its_transfer_then_its_decodes_on_another_group() {
                 owner: of,
                 group,
                 after,
+                ..
             } if of == owner => Some((group, after)),
             _ => None,
         });

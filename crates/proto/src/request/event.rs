@@ -245,6 +245,10 @@ pub struct ArtifactEvent {
 pub struct DiffusionRequest {
     /// Engine request identity.
     pub request_id: RequestId,
+    /// The request's trace id, which every span of the request names
+    /// ([`GenerationRequest::trace`](super::GenerationRequest::trace)).
+    #[serde(default)]
+    pub trace: u64,
     /// The conditioner's presentation (condition labels, vision placeholders
     /// and the prompt), tokenized.
     pub prompt_token_ids: Vec<u32>,
@@ -446,11 +450,11 @@ pub enum DiffusionRequestError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
-    /// Token generation: autoregressive text. Boxed, as it is several times the size of a diffusion
-    /// request.
+    /// Token generation: autoregressive text. Boxed, as each kind is hundreds of bytes and the
+    /// request moves through channels and queues.
     Generation(Box<super::GenerationRequest>),
-    /// Video diffusion.
-    Diffusion(DiffusionRequest),
+    /// Video diffusion, boxed as a generation request is.
+    Diffusion(Box<DiffusionRequest>),
 }
 
 impl From<super::GenerationRequest> for Request {
@@ -461,6 +465,14 @@ impl From<super::GenerationRequest> for Request {
 }
 
 impl Request {
+    /// Returns the request's trace id, which its spans name; zero for a request nothing traces.
+    pub fn trace(&self) -> u64 {
+        match self {
+            Self::Generation(request) => request.trace,
+            Self::Diffusion(request) => request.trace,
+        }
+    }
+
     /// Returns the request identifier.
     pub fn request_id(&self) -> RequestId {
         match self {

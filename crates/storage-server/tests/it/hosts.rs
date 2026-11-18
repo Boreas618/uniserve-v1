@@ -335,6 +335,7 @@ fn a_transfer_reaches_a_rank_of_another_host_through_that_host_s_transfer_server
     let written = pattern(32, 5);
     prefill_planes.write_all_at(&written, 16).unwrap();
     let transfer = |group| Request::Transfer {
+        trace: 0,
         owner: OwnerId(1),
         group,
         after: Vec::new(),

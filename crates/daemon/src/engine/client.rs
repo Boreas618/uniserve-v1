@@ -899,15 +899,46 @@ impl EngineClient {
         &self,
         enabled: bool,
         off: Vec<String>,
+        kernels: bool,
     ) -> Result<Vec<wire::FencesSwitched>, String> {
         match self
             .ask(|id| {
-                wire::engine_command::Kind::SwitchFences(wire::SwitchFences { id, enabled, off })
+                wire::engine_command::Kind::SwitchFences(wire::SwitchFences {
+                    id,
+                    enabled,
+                    off,
+                    kernels,
+                })
             })
             .await?
         {
             Some(wire::operated::Reports::FenceSwitches(switches)) => Ok(switches.processes),
             other => Err(unexpected("switch_fences", other)),
+        }
+    }
+
+    /// The spans every process of the engine keeps in its rings (`ReadSpans`), each process's
+    /// as it named them, with the epoch the engine executes, which qualifies their batch ids.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason the engine could not read them, a process's list that does not
+    /// decode, or when the engine ends first.
+    pub async fn read_spans(&self) -> Result<(u64, Vec<service::span::Span>), String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::ReadSpans(wire::ReadSpans { id }))
+            .await?
+        {
+            Some(wire::operated::Reports::Spans(spans)) => {
+                let mut read = Vec::new();
+                for process in &spans.processes {
+                    let decoded: Vec<service::span::Span> = service::msgpack::decode(process)
+                        .map_err(|error| format!("a process's spans do not decode: {error}"))?;
+                    read.extend(decoded);
+                }
+                Ok((spans.epoch, read))
+            }
+            other => Err(unexpected("read_spans", other)),
         }
     }
 
@@ -1521,6 +1552,7 @@ mod tests {
     /// A text request that generates `max_tokens` tokens.
     fn request(max_tokens: usize) -> Request {
         GenerationRequest {
+            trace: 0,
             request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),

@@ -24,7 +24,7 @@ use http_body::{Frame, SizeHint};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::api::openai::{ApiError, RequestId};
+use crate::api::openai::{ApiError, RequestId, Trace};
 use crate::http::stream::HandedBody;
 
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -35,8 +35,8 @@ const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// The client's `X-Request-Id` is used when it is acceptable (see
 /// `is_acceptable_request_id`, with `server_config.max_request_id` as
 /// `max_length`); otherwise a fresh ID is generated. The ID is inserted as
-/// [`RequestId`] before the inner service runs. This is the outermost layer,
-/// so every response carries the header when enabled, including an API-key
+/// [`RequestId`], with the request's [`Trace`], before the inner service runs. This is the
+/// outermost layer, so every response carries the header when enabled, including an API-key
 /// refusal and a shed request.
 pub(crate) async fn resolve_request_id(
     echo: bool,
@@ -51,6 +51,11 @@ pub(crate) async fn resolve_request_id(
         .filter(|id| is_acceptable_request_id(id, max_length))
         .map_or_else(generate_request_id, ToOwned::to_owned);
     request.extensions_mut().insert(RequestId(id.clone()));
+    // The request's trace id, which every span of it names: its receipt begins here, with its
+    // head read, and ends as its route takes it (`ValidatedJson`).
+    let trace = crate::observation::spans::next_trace();
+    service::span::begin(service::span::Stage::Receive, trace);
+    request.extensions_mut().insert(Trace(trace));
 
     let mut response = next.run(request).await;
 

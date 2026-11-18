@@ -281,6 +281,7 @@ fn store(id: u64, from: Run, to: Run) -> Hand {
 /// whether its block is private.
 fn moved_in(id: u64, owner: u64, slot: u32, entries: &[(u32, u32, bool)]) -> Hand {
     let request = Request::Transfer {
+        trace: 0,
         owner: OwnerId(owner),
         group: GROUP,
         after: vec![(ELSEWHERE, 1)],
@@ -326,6 +327,7 @@ fn detach(owner: u64) -> Hand {
 /// The owner leaving for another group.
 fn moved_out(owner: u64) -> Hand {
     Hand::Stamp(Request::Transfer {
+        trace: 0,
         owner: OwnerId(owner),
         group: ELSEWHERE,
         after: Vec::new(),

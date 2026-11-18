@@ -351,6 +351,7 @@ mod tests {
     /// A text request that generates until the fake's end of text.
     fn request() -> Request {
         GenerationRequest {
+            trace: 0,
             request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),

@@ -591,6 +591,7 @@ mod tests {
 
     fn request(id: u64) -> Request {
         let input = GenerationRequest {
+            trace: 0,
             request_id: RequestId(id),
             prompt_token_ids: vec![1, 2, 3],
             multimodal_inputs: Default::default(),

@@ -716,6 +716,12 @@ impl Node {
         let restarting = restarter.restarting();
         let mut decided = restarter.decide();
         status::watch(&leader, &token);
+        // A query of the `span` events reads them from the rings of the deployment's processes.
+        self.recorder
+            .store()
+            .read_spans(Some(Arc::new(crate::leader::DeploymentSpans(
+                Arc::downgrade(&leader),
+            ))));
         let client = router(
             Arc::clone(&leader),
             Arc::clone(&jobs),
@@ -797,6 +803,7 @@ impl Node {
             ),
         }
         self.set(Serving::Idle);
+        self.recorder.store().read_spans(None);
         info!(deployment = name, "the node serves no deployment");
         ended
     }

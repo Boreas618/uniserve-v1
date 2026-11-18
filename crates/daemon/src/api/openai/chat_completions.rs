@@ -43,7 +43,7 @@ use tracing_futures::Instrument as _;
 use crate::api::body::{Opening, Session};
 use crate::api::openai::error::{bail_server_error, server_error};
 use crate::api::openai::run::{ChatBodySink, GenerationRun};
-use crate::api::openai::{ApiError, RequestId, ValidatedJson, check_model_served};
+use crate::api::openai::{ApiError, RequestId, Trace, ValidatedJson, check_model_served};
 use crate::api::output::chat::AssistantBlockKind;
 use crate::api::output::{FinishReason, RequestOutput, RequestUsage, StopReason};
 use crate::api::protocol::{
@@ -74,6 +74,7 @@ pub(crate) fn router(served: Arc<Served>) -> Router {
 async fn chat_completions(
     State(served): State<Arc<Served>>,
     Extension(RequestId(base_id)): Extension<RequestId>,
+    Extension(Trace(trace)): Extension<Trace>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let stream = body.stream;
@@ -95,7 +96,7 @@ async fn chat_completions(
     );
     let (events, output) = match served
         .leader
-        .generate(request_id.clone(), body, adapter)
+        .generate(request_id.clone(), body, adapter, trace)
         .instrument(request_span.clone())
         .await
     {

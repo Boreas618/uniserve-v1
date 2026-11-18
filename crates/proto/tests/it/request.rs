@@ -14,6 +14,8 @@ use proto::request::{
 /// A generation request with every field away from its default.
 fn generation() -> GenerationRequest {
     GenerationRequest {
+        // The trace id the daemon gave it, which travels beside the request's identity.
+        trace: 0x1234_5678_9abc,
         request_id: RequestId(41),
         prompt_token_ids: vec![1, 2, 3, 4],
         multimodal_inputs: MultimodalInputs {
@@ -85,7 +87,8 @@ fn generation() -> GenerationRequest {
 fn requests_come_back_from_their_messages_unchanged() {
     let requests = [
         Request::from(generation()),
-        Request::Diffusion(DiffusionRequest {
+        Request::Diffusion(Box::new(DiffusionRequest {
+            trace: 7,
             request_id: RequestId(42),
             prompt_token_ids: vec![5, 6],
             conditioning: proto::video::Conditions {
@@ -129,7 +132,7 @@ fn requests_come_back_from_their_messages_unchanged() {
             })),
             // The media travel beside the request's frame, not in it.
             media: Vec::new(),
-        }),
+        })),
     ];
     for request in requests {
         let message = request.to_wire();

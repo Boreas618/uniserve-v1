@@ -201,7 +201,8 @@ impl VideoService {
     /// The request-only rules run before any fetch. The processed prompt must fit the prompt
     /// capacity (`--max-model-len`). Each reference's fetched media is then copied into a sealed
     /// memory file, which the request holds for as long as it lives. The daemon's submission
-    /// stamps the engine's identifier on the request.
+    /// stamps the engine's identifier on the request; `trace` is the request's trace id, which
+    /// the request carries and its fetch and preprocess spans name.
     ///
     /// # Errors
     ///
@@ -213,7 +214,10 @@ impl VideoService {
         request_id: &str,
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
+        trace: u64,
     ) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
+        use service::span::{Stage, enter};
+
         let spec = request.spec()?;
         self.processor.check(&spec)?;
 
@@ -224,6 +228,7 @@ impl VideoService {
             .iter()
             .map(|reference| reference.url.as_str())
             .collect();
+        let fetch = (trace != 0 && !urls.is_empty()).then(|| enter(Stage::Fetch, trace));
         let media = self.connector.fetch_all(&urls).await.map_err(|error| {
             InputError::invalid(
                 format!("input_references[{}]", error.index),
@@ -236,13 +241,16 @@ impl VideoService {
                     .probe(index, spec.references[index].kind, &media.bytes)
             }))
             .await?;
+        drop(fetch);
 
         let processor = Arc::clone(&self.processor);
         let tokenizer = Arc::clone(&self.tokenizer);
         let request_id = request_id.to_owned();
         let priority = request.priority.unwrap_or(0);
         tokio::task::spawn_blocking(move || {
+            let preprocess = (trace != 0).then(|| enter(Stage::Preprocess, trace));
             let input = processor.process(&spec, &probes, &*tokenizer)?;
+            drop(preprocess);
             let prompt_len = u32::try_from(input.prompt_token_ids.len()).map_err(|_| {
                 InputError::Internal("a prompt of more tokens than a u32 counts".into())
             })?;
@@ -255,7 +263,7 @@ impl VideoService {
                     },
                 });
             }
-            submission(input, &media, priority)
+            submission(input, &media, priority, trace)
         })
         .await
         .unwrap_or_else(|error| {
@@ -264,12 +272,13 @@ impl VideoService {
     }
 }
 
-/// The engine request of `input` at scheduler `priority`, holding each reference's media in a
-/// sealed memory file.
+/// The engine request of `input` at scheduler `priority` and of trace id `trace`, holding each
+/// reference's media in a sealed memory file.
 fn submission(
     input: processing::VideoInput,
     media: &[FetchedMedia],
     priority: i32,
+    trace: u64,
 ) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
     // Each reference's media reaches the engine's media reader beside the request.
     let mut copies = Vec::with_capacity(media.len());
@@ -310,6 +319,7 @@ fn submission(
         })?;
 
     let request = DiffusionRequest {
+        trace,
         request_id: RequestId::default(),
         prompt_token_ids: input.prompt_token_ids,
         conditions: conditions
@@ -440,7 +450,7 @@ mod tests {
         let mut inputs = Vec::new();
         for (prompt, height) in [("a fox", 90), ("a fox", 90), ("a bear", 90), ("a fox", 91)] {
             let (resolved, _) = service
-                .process("encoding", &input(prompt, height), 1 << 16)
+                .process("encoding", &input(prompt, height), 1 << 16, 0)
                 .await
                 .unwrap();
             inputs.push(resolved.encoder_inputs.unwrap());
@@ -462,7 +472,9 @@ mod tests {
             "input_references": [{"type": "image", "url": "data:,"}],
         }));
         let Err(ServeError::Video(processing::InputError::Invalid { param, .. })) =
-            test_video_service().process("rules", &body, 1 << 16).await
+            test_video_service()
+                .process("rules", &body, 1 << 16, 0)
+                .await
         else {
             panic!("the request is refused");
         };

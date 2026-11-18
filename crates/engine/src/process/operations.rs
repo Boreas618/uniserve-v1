@@ -418,9 +418,22 @@ fn here(binding: &Arc<WeightBinding>, operation: &RankOperation) -> Result<RankR
             collector,
             reason,
         } => RankReports::ProfileReleases(binding.release_profile(*session, *collector, reason)?),
-        RankOperation::SwitchFences { enabled, off } => {
-            RankReports::Fences(vec![switch_fences(*enabled, off)?])
-        }
+        RankOperation::SwitchFences {
+            enabled,
+            off,
+            kernels,
+        } => RankReports::Fences(vec![switch_fences(*enabled, off, *kernels)?]),
+        RankOperation::ReadSpans => RankReports::Spans(vec![read_spans()]),
+    })
+}
+
+/// The spans this process keeps in its rings (`docs/profiling.md`): its control thread's, its
+/// schedulers', its workers' and the timed kernels of its devices, which the range markers name
+/// by their sites.
+fn read_spans() -> Vec<service::span::Span> {
+    let markers = crate::profiling::markers::Markers::installed();
+    service::span::spans(&service::span::records(), |site| {
+        markers.and_then(|markers| markers.kernel(site))
     })
 }
 
@@ -553,12 +566,12 @@ fn prepared(preparations: &Receiver<Preparation>, generation: u64, bound: Durati
 }
 
 /// Writes the fence probes' device switch (`docs/profiling.md`): on when `enabled`, with the
-/// probed module classes `off` names switched off whatever `enabled` says. The range markers read
-/// it in device storage, and writing it waits for nothing. A process without range markers says
-/// so.
-fn switch_fences(enabled: bool, off: &[String]) -> Result<FencesSwitched> {
+/// probed module classes `off` names switched off whatever `enabled` says, and the kernel probes
+/// on while both `enabled` and `kernels` are. The range markers read it in device storage, and
+/// writing it waits for nothing. A process without range markers says so.
+fn switch_fences(enabled: bool, off: &[String], kernels: bool) -> Result<FencesSwitched> {
     let switched = crate::profiling::markers::Markers::installed()
-        .map(|markers| markers.switch(enabled, off))
+        .map(|markers| markers.switch(enabled, off, kernels))
         .transpose()?;
     Ok(FencesSwitched {
         probes: switched.is_some(),

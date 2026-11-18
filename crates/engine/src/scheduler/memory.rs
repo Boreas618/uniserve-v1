@@ -2883,6 +2883,7 @@ mod tests {
         /// keys set and its tables sized to the session's classes.
         fn request(&mut self, id: u64, prompt: Vec<u32>) -> RequestId {
             let input = GenerationRequest {
+                trace: 0,
                 request_id: RequestId(id),
                 prompt_token_ids: prompt,
                 multimodal_inputs: Default::default(),

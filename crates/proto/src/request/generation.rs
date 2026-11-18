@@ -437,6 +437,10 @@ impl Default for CachePolicy {
 pub struct GenerationRequest {
     /// Engine request identity.
     pub request_id: RequestId,
+    /// The request's trace id, which every span of the request names: given by the daemon as it
+    /// received the request, and kept across migrations. Zero for a request nothing traces.
+    #[serde(default)]
+    pub trace: u64,
     /// Final positive model prompt, including template and image-marker tokens.
     pub prompt_token_ids: Vec<u32>,
     /// Media positions refer directly to `prompt_token_ids`.
@@ -687,6 +691,7 @@ mod tests {
     /// encoder-cache reservations are opt-in per test.
     fn complete_request() -> GenerationRequest {
         GenerationRequest {
+            trace: 0,
             request_id: RequestId(7),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: MultimodalInputs {

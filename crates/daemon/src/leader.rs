@@ -1264,6 +1264,7 @@ impl Leader {
         request_id: String,
         request: crate::api::protocol::ChatCompletionRequest,
         adapter: Option<AdapterSelection>,
+        trace: u64,
     ) -> Result<
         (
             Box<dyn crate::api::events::Events>,
@@ -1278,6 +1279,8 @@ impl Leader {
         } else {
             Vec::new()
         };
+        let fetching = !image_urls.is_empty();
+        let fetch = fetching.then(|| service::span::enter(service::span::Stage::Fetch, trace));
         let images = self
             .images
             .fetch_images(image_urls)
@@ -1287,10 +1290,11 @@ impl Leader {
                 index: error.index,
                 source: error.source,
             })?;
+        drop(fetch);
         let processor = Arc::clone(&self.processor);
         let (request, lowering) = preprocess(&request_id, {
             let request_id = request_id.clone();
-            move || processor.process(&request_id, &request, adapter.as_ref(), images)
+            move || processor.process(&request_id, &request, adapter.as_ref(), images, trace)
         })
         .await?;
 
@@ -1301,14 +1305,16 @@ impl Leader {
             .map_err(ServeError::from)?;
         let log = self.log_requests.then_some(request_id);
         let stats = record::Request::new(self.recorder.clone(), placement.at(), started, log)
-            .session(session);
+            .session(session)
+            .traced(trace);
         // Dropping the events on a failure cancels the request in its engine.
         let output = crate::api::output::OutputProcessor::new(
             self.processor.tokenizer(),
             lowering,
             compile_us,
             Box::new(stats),
-        )?;
+        )?
+        .traced(trace);
 
         Ok((Box::new(events), output))
     }
@@ -1380,6 +1386,7 @@ impl Leader {
         &self,
         request_id: String,
         request: VideoGenerationRequest,
+        trace: u64,
     ) -> Result<(ProcessedVideo, RequestOutputStream), ServeError> {
         let started = Instant::now();
         let video =
@@ -1390,10 +1397,17 @@ impl Leader {
                     feature: "video_generation",
                 })?;
         let (request, processed) = video
-            .process(&request_id, &request, self.processor.config().max_model_len)
+            .process(
+                &request_id,
+                &request,
+                self.processor.config().max_model_len,
+                trace,
+            )
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
-        let (events, placement) = self.submit(Request::Diffusion(request), None).await?;
+        let (events, placement) = self
+            .submit(Request::Diffusion(Box::new(request)), None)
+            .await?;
         let output = crate::api::output::media_output(
             request_id.clone(),
             started,
@@ -1403,20 +1417,23 @@ impl Leader {
         );
         Ok((
             processed,
-            self.stats(request_id, started, placement, output),
+            self.stats(request_id, started, placement, output, trace),
         ))
     }
 
-    /// Records `output`'s request metrics under where it is served.
+    /// Records `output`'s request metrics under where it is served, as the request of trace id
+    /// `trace`.
     fn stats(
         &self,
         request_id: String,
         started: Instant,
         placement: Placement,
         output: RequestOutputStream,
+        trace: u64,
     ) -> RequestOutputStream {
         let log = self.log_requests.then_some(request_id);
-        let request = record::Request::new(self.recorder.clone(), placement.at(), started, log);
+        let request =
+            record::Request::new(self.recorder.clone(), placement.at(), started, log).traced(trace);
         Box::pin(Recorded::new(output, request))
     }
 
@@ -1436,13 +1453,105 @@ impl Leader {
         request: Request,
         session: Option<&str>,
     ) -> Result<(RequestEvents, Placement), SubmitError> {
+        use service::span::{Stage, enter};
+
+        // The route the routing program chose, then the hand-over until the engine accepted.
+        let trace = request.trace();
+        let route = (trace != 0).then(|| enter(Stage::Route, trace));
         let (replica, scheduler) = self.route(&request, session).await?;
+        drop(route);
+        let submit = (trace != 0).then(|| enter(Stage::Submit, trace));
         let (events, scheduler) = replica.migrator.submit(request, scheduler).await?;
+        drop(submit);
         let placement = Placement {
             replica: replica.ordinal as u32,
             scheduler,
         };
         Ok((events, placement))
+    }
+}
+
+impl Leader {
+    /// The spans every process of the deployment keeps in its rings that ended within
+    /// `profiling_config.span_window`, as `span` events (`crate::observation::spans`): each
+    /// replica's engine's, read through its request interface, and every node's daemon's and
+    /// Storage Server's, read through the nodes' daemons. A process that cannot be read is
+    /// logged, and the others' spans are read.
+    pub(crate) async fn spans(&self) -> Vec<crate::observation::Event> {
+        use crate::observation::spans::{Place, event, recent};
+
+        let replicas = self.replicas();
+        let Some(first) = replicas.first() else {
+            return Vec::new();
+        };
+        let window = service::lock(&first.config).profiling_config.span_window;
+        let revision = self.recorder.revision();
+        let now = std::time::SystemTime::now();
+
+        let mut events = Vec::new();
+        for replica in &replicas {
+            let Some(client) = replica.hold().client() else {
+                continue;
+            };
+            match client.read_spans().await {
+                Ok((epoch, spans)) => {
+                    let place = Place {
+                        replica: Some(replica.ordinal),
+                        epoch: Some(epoch),
+                        host: None,
+                    };
+                    events.extend(
+                        spans
+                            .iter()
+                            .filter(|span| recent(span, now, window))
+                            .map(|span| event(span, place, revision)),
+                    );
+                }
+                Err(error) => warn!(
+                    replica = replica.ordinal,
+                    "the spans of the replica's engine were not read: {error}"
+                ),
+            }
+        }
+
+        let Some(control) = first.control.get().cloned() else {
+            return events;
+        };
+        match tokio::task::spawn_blocking(move || control.node_spans()).await {
+            Ok(Ok(nodes)) => {
+                for (host, spans) in &nodes {
+                    let place = Place {
+                        host: Some(host),
+                        ..Place::default()
+                    };
+                    events.extend(
+                        spans
+                            .iter()
+                            .filter(|span| recent(span, now, window))
+                            .map(|span| event(span, place, revision)),
+                    );
+                }
+            }
+            Ok(Err(error)) => warn!("the nodes' spans were not read: {error:#}"),
+            Err(error) => warn!("reading the nodes' spans did not complete: {error}"),
+        }
+        events
+    }
+}
+
+/// The spans of a serving deployment, which its leader reads for the observation store's
+/// queries (`crate::observation::spans::Source`); none once the leader is gone.
+pub(crate) struct DeploymentSpans(pub(crate) std::sync::Weak<Leader>);
+
+impl crate::observation::spans::Source for DeploymentSpans {
+    fn read(&self) -> futures::future::BoxFuture<'static, Vec<crate::observation::Event>> {
+        let leader = self.0.upgrade();
+        Box::pin(async move {
+            match leader {
+                Some(leader) => leader.spans().await,
+                None => Vec::new(),
+            }
+        })
     }
 }
 
@@ -3613,6 +3722,7 @@ mod tests {
     /// A text request that generates until the simulator's EOS.
     fn text_request() -> Request {
         GenerationRequest {
+            trace: 0,
             request_id: Default::default(),
             prompt_token_ids: vec![1, 2, 3, 4],
             multimodal_inputs: Default::default(),

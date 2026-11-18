@@ -398,6 +398,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     // One request is accepted by the one scheduler.
     let request =
         proto::request::Request::Generation(Box::new(proto::request::GenerationRequest {
+            trace: 0,
             request_id: proto::request::RequestId(11),
             prompt_token_ids: vec![1, 5, 6],
             multimodal_inputs: Default::default(),
@@ -655,6 +656,7 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
     // One request is accepted by the one scheduler, whose group's batches reach both ranks.
     let request =
         proto::request::Request::Generation(Box::new(proto::request::GenerationRequest {
+            trace: 0,
             request_id: proto::request::RequestId(11),
             prompt_token_ids: vec![1, 5, 6],
             multimodal_inputs: Default::default(),

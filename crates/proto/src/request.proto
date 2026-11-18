@@ -292,6 +292,10 @@ message Request {
   // or naming no scheduler of the engine (a request resubmitted to another
   // epoch), the scheduler with the fewest requests in flight serves it.
   optional uint32 scheduler = 5;
+  // The request's trace id, which the daemon gave it as it received it and
+  // which every span of the request names (`docs/profiling.md`); it stays the
+  // same when the request migrates. Zero for a request the daemon traces not.
+  uint64 trace = 6;
 }
 
 // A command for one request.
@@ -393,6 +397,9 @@ message EngineCommand {
     // units each rank's cache gives up when the device's room does not hold
     // it; nothing is installed. Answered with `Rooms`.
     MeasureRoom measure_room = 31;
+    // Read the spans every process of the engine keeps in its rings;
+    // answered with `Spans`.
+    ReadSpans read_spans = 30;
   }
 }
 
@@ -487,6 +494,22 @@ message SwitchFences {
   uint64 id = 1;
   bool enabled = 2;
   repeated string off = 3;
+  // The kernel probes' own switch (`profiling_config.kernel_probes`): they
+  // record while both it and `enabled` are on.
+  bool kernels = 4;
+}
+
+// Read every process's spans (`docs/profiling.md`); answered with `Spans`.
+message ReadSpans {
+  uint64 id = 1;
+}
+
+// Each process's spans, in process order: the MessagePack encoding of the
+// process's `service::span::Span` list, which it named itself.
+message Spans {
+  repeated bytes processes = 1;
+  // The epoch the engine executes, which qualifies its batch ids.
+  uint64 epoch = 2;
 }
 
 // A profiling session as the daemon starts it (`proto::profile::SessionStart`).
@@ -559,6 +582,7 @@ message Operated {
     FenceSwitches fence_switches = 9;
     WeightReports weight_reports = 10;
     Rooms rooms = 12;
+    Spans spans = 11;
   }
 }
 

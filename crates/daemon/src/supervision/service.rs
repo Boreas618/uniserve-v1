@@ -40,10 +40,10 @@ use prost::Message as _;
 use proto::process::refusal::Reason;
 use proto::process::{
     self, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface, Node,
-    NodesKnown, ProgramConfigured, ProgramRecords, Refusal, Released, Replied, Reply, Request,
-    Spawned, Stopped, StorageConfigured, ToMember, TransfersThrottled, Unnumbered, Unserved,
-    Upstream, UsageReport, Welcome, downstream, event, from_member, hello, reply, request,
-    to_member, upstream,
+    NodeSpans, NodesKnown, ProgramConfigured, ProgramRecords, Refusal, Released, Replied, Reply,
+    Request, Spawned, Stopped, StorageConfigured, ToMember, TransfersThrottled, Unnumbered,
+    Unserved, Upstream, UsageReport, Welcome, downstream, event, from_member, hello, reply,
+    request, to_member, upstream,
 };
 use service::{Connection, Handed, Listener, Waker};
 
@@ -284,6 +284,20 @@ impl Local {
                 }
                 Err(error) => reply.error = format!("{error:#}"),
             },
+            // The node's spans: this daemon's own, which it names itself, and its Storage
+            // Server's.
+            Some(request::Kind::Spans(query)) => {
+                match self.claims.spans(&query.deployment).and_then(|storage| {
+                    let daemon = service::span::spans(&service::span::records(), |_| None);
+                    Ok(NodeSpans {
+                        daemon: service::msgpack::encode(&daemon)?,
+                        storage: service::msgpack::encode(&storage)?,
+                    })
+                }) {
+                    Ok(spans) => reply.kind = Some(reply::Kind::Spans(spans)),
+                    Err(error) => reply.error = format!("{error:#}"),
+                }
+            }
             Some(request::Kind::Nodes(_)) => {
                 reply.error = "the leader replies for the deployment's nodes".to_owned();
             }
@@ -1131,6 +1145,7 @@ impl LeaderService {
             Some(request::Kind::ConfigureStorage(configure)) => Some(configure.host.as_str()),
             Some(request::Kind::ConfigureProgram(configure)) => Some(configure.host.as_str()),
             Some(request::Kind::ProgramRecords(query)) => Some(query.host.as_str()),
+            Some(request::Kind::Spans(query)) => Some(query.host.as_str()),
             Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
         };
         let forwarded = ToMember {

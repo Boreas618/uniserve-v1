@@ -258,6 +258,11 @@ impl MainProcess {
             proto::request::Request::Generation(generation) => generation.request_id = engine,
             proto::request::Request::Diffusion(diffusion) => diffusion.request_id = engine,
         }
+        // The request's hand-over to its scheduler, which ends as the scheduler takes it.
+        let trace = input.trace();
+        if trace != 0 {
+            service::span::begin(service::span::Stage::Enqueue, trace);
+        }
         if inbox.send(Message::AddRequest(input, window)).is_err() {
             let message = format!("scheduler {scheduler} is gone");
             return self.reject(front, id, RejectionKind::Overloaded, message);
@@ -507,6 +512,7 @@ impl MainProcess {
         let bos = self.launch.engine_config.model.bos;
         for (index, scheduler) in engine.schedulers.iter().enumerate() {
             let request = GenerationRequest {
+                trace: 0,
                 // The scheduler gives its warm-up request an id of its own (`Scheduler::warm_up`).
                 request_id: RequestId::default(),
                 prompt_token_ids: vec![bos],

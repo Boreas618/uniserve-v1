@@ -899,6 +899,11 @@ impl MainProcess {
             Ok(generation) => generation,
             Err(report) => return self.report(report),
         };
+        // Where the generation places its kernel probes, which every capture of it follows: a
+        // bucket whose serving graph holds them elsewhere is captured again.
+        if let Some(markers) = crate::profiling::markers::Markers::installed() {
+            markers.place(generation, prepare.kernel_instance);
+        }
         let parts = match generation::named(prepare) {
             Ok((packages, policy)) => self
                 .engine
@@ -1441,9 +1446,11 @@ impl MainProcess {
                 let operation = RankOperation::SwitchFences {
                     enabled: switch.enabled,
                     off: switch.off,
+                    kernels: switch.kernels,
                 };
                 self.on_ranks(front, switch.id, Ok(operation));
             }
+            Kind::ReadSpans(read) => self.read_spans(front, read.id),
             Kind::Tune(tune) => self.tune(front, &tune),
             Kind::MeasureRoom(measure) => self.measure_room(front, measure),
             Kind::ResizeCache(resize) => self.resize_cache(front, &resize),
@@ -1619,6 +1626,38 @@ impl MainProcess {
         self.work(Box::new(move || {
             let reports = operations::on_ranks(&binding, &operation).map(rank_reports);
             done(move |main| main.operated(front, id, reports))
+        }));
+    }
+
+    /// `ReadSpans`: every process's spans, this one's and its peers', with the epoch that
+    /// qualifies their batch ids. Each process encodes its own list, which the daemon decodes.
+    fn read_spans(&mut self, front: usize, id: u64) {
+        let Some(binding) = self
+            .engine
+            .as_ref()
+            .map(|engine| Arc::clone(&engine.binding))
+        else {
+            return self.operated(front, id, Err(starting()));
+        };
+        let epoch = self.launch.epoch;
+        self.work(Box::new(move || {
+            let read =
+                operations::on_ranks(&binding, &RankOperation::ReadSpans).and_then(|reports| {
+                    let RankReports::Spans(processes) = reports else {
+                        anyhow::bail!(
+                            "the processes answered a read of their spans with {reports:?}"
+                        );
+                    };
+                    let processes = processes
+                        .iter()
+                        .map(service::msgpack::encode)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    Ok(Some(wire::operated::Reports::Spans(wire::Spans {
+                        processes,
+                        epoch,
+                    })))
+                });
+            done(move |main| main.operated(front, id, read))
         }));
     }
 
@@ -1836,6 +1875,8 @@ fn rank_reports(reports: RankReports) -> Option<wire::operated::Reports> {
         RankReports::ProfileReleases(ranks) => Reports::ProfileReleases(wire::ProfileReleases {
             ranks: ranks.iter().map(wire::ProfileRelease::from).collect(),
         }),
+        // A read of the spans answers with its own message ([`Main::read_spans`]).
+        RankReports::Spans(_) => return None,
         RankReports::Fences(processes) => Reports::FenceSwitches(wire::FenceSwitches {
             processes: processes
                 .into_iter()
