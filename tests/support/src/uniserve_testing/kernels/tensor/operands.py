@@ -71,6 +71,15 @@ MOVED = {"f8e4m3": torch.uint8}
 #: (``ops::tolerance::unit_roundoff``).
 UNIT = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24, "f64": 2.0**-53}
 
+#: Each floating element type's subnormal unit (``tolerance::underflow``):
+#: the absolute part of a bound that ends in a rounding into the type.
+UNDERFLOW = {
+    "f16": 2.0**-24,
+    "bf16": 2.0**-133,
+    "f32": 2.0**-149,
+    "f64": 2.0**-1074,
+}
+
 #: A bound is ``(atol, rtol, cancels)``, as ``Tolerance`` holds it.
 EXACT = (0.0, 0.0, False)
 
@@ -228,14 +237,15 @@ def gamma(reduction: int, unit: float) -> float:
 def rounding(reduction: int, dtype: str):
     """``Tolerance::rounding(reduction, dtype.accumulate(), dtype)``."""
     unit = UNIT[accumulate(dtype)]
-    return (0.0, 2.0 * gamma(reduction, unit) + UNIT[dtype], False)
+    relative = 2.0 * gamma(reduction, unit) + UNIT[dtype]
+    return (UNDERFLOW[dtype], relative, False)
 
 
 def dot(reduction: int, dtype: str):
     """``Tolerance::dot(reduction, dtype.accumulate(), dtype)``."""
     unit = UNIT[accumulate(dtype)]
     relative = 2.0 * gamma(reduction, unit) * reduction**0.5 + UNIT[dtype]
-    return (0.0, relative, True)
+    return (UNDERFLOW[dtype], relative, True)
 
 
 def with_atol(bound, atol: float):
@@ -341,7 +351,8 @@ class Primitives:
         A rounding bound is relative, which holds where the element type's
         values are: a value past its largest finite one is stored as an
         infinity, and below its smallest normal one the type's grid is
-        uniform, so the comparison there allows one step of that grid.
+        uniform, which the bound's absolute part, the type's subnormal unit
+        (:data:`UNDERFLOW`), allows one step of.
         """
         result = real(got)
         expected = np.asarray(expected).reshape(result.shape)
@@ -366,7 +377,7 @@ class Primitives:
             magnitude = np.abs(np.where(finite, expected, 0.0))
             if cancels:
                 magnitude = np.full_like(magnitude, magnitude.max(initial=0.0))
-            allowed = atol + rtol * magnitude + limits.tiny * limits.eps
+            allowed = atol + rtol * magnitude
             with np.errstate(invalid="ignore"):
                 close = np.abs(result - expected) <= allowed
             # An infinity or a NaN has no neighbourhood: it is matched as it
