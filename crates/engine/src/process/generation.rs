@@ -110,9 +110,20 @@ pub(crate) fn kernels(
     let (selected, routes) = select(&mut client, targets, named, &keys)
         .context("selecting the generation's packages at the Build Server")?;
     let replaced = replaced_operators(&selected, serving);
-    if replaced.is_empty() {
+    // A generation that places the probes elsewhere captures every bucket again, whatever
+    // kernels it replaces.
+    let moved = held.first().is_some_and(|serving| {
+        crate::profiling::markers::Markers::installed()
+            .is_some_and(|markers| markers.moved(serving.number(), generation))
+    });
+    if replaced.is_empty() && !moved {
         return Ok(serving.clone());
     }
+    let recaptured: BTreeSet<String> = if moved {
+        keys.keys().cloned().collect()
+    } else {
+        replaced.clone()
+    };
     let packages: Packages = selected
         .into_iter()
         .filter(|(slot, _)| replaced.contains(&slot.op))
@@ -136,7 +147,7 @@ pub(crate) fn kernels(
         });
     }
     drop(client);
-    room(&replaced).context("making the room the generation's graphs take")?;
+    room(&recaptured).context("making the room the generation's graphs take")?;
 
     // One generation per device: a kernel belongs to the context that loaded it. Beginning a
     // preparation runs no forward, so every worker begins at once.
@@ -184,8 +195,9 @@ fn launched_keys(held: &[Arc<ops::Generation>]) -> BTreeMap<String, BTreeSet<Str
 /// process's ranks then every peer's ([`update_room`]), measured without installing anything:
 /// the Build Server selects the packages of every key the devices launch as the update's
 /// preparation would ([`kernels`]), and the operators whose packages differ from `serving`'s
-/// are those whose graphs it captures again. None when it replaces no operator. What a
-/// validation of a change reports before the change begins (`MeasureRoom`).
+/// are those whose graphs it captures again; with `recapture`, a generation that places the
+/// probes elsewhere, every graph is. None when it replaces no operator and captures nothing
+/// again. What a validation of a change reports before the change begins (`MeasureRoom`).
 ///
 /// # Errors
 ///
@@ -196,9 +208,14 @@ pub(crate) fn room(
     build: &(Arc<Mutex<Client>>, Vec<Target>),
     (named, serving): (&Packages, &Packages),
     binding: &WeightBinding,
+    recapture: bool,
 ) -> Result<Vec<UpdateRoom>> {
     let (client, targets) = build;
     let keys = launched_keys(&serving_kernels(workers)?);
+    if recapture {
+        let every: BTreeSet<String> = keys.keys().cloned().collect();
+        return update_room(workers, binding, &every);
+    }
     let (selected, _) = select(&mut lock(client), targets, named, &keys)
         .context("selecting the generation's packages at the Build Server")?;
     let replaced = replaced_operators(&selected, serving);

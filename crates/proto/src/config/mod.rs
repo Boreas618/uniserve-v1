@@ -879,8 +879,10 @@ pub struct MoeConfig {
     /// experts ([`EngineConfig::expert_union`]).
     #[reload(epoch)]
     pub expert_parallel: bool,
-    /// Microbatches overlapping attention with dedicated expert workers.
-    #[reload(epoch)]
+    /// Microbatches overlapping attention with dedicated expert workers. The microbatches shape
+    /// the graphs an expert union captures, so a change is a kernel generation: the serving
+    /// engines capture the buckets it changes in the background and switch bucket by bucket.
+    #[reload(generation)]
     pub microbatches: NonZeroU32,
     /// The rows per rank of the middle capture class of an expert union's steps: a step in which
     /// another member prefills a few prompts while this one decodes, which neither the decode
@@ -1410,10 +1412,13 @@ pub struct ProfilingConfig {
     #[reload(step)]
     pub fence_probes: bool,
     /// Name patterns (`*` matches any run) of the module classes whose
-    /// instances carry probes in the CUDA graphs an epoch captures; a change
-    /// takes a new epoch. Empty for no probe; the model family's step stack
-    /// (the decoder or denoiser stack, one instance per step) when unset.
-    #[reload(epoch)]
+    /// instances carry probes in the CUDA graphs the engines capture. Empty for no probe; the
+    /// model family's step stack (the decoder or denoiser stack, one instance per step) when
+    /// unset. Probes are captured into the graphs, so a change is a kernel generation: every
+    /// bucket is captured again with the probes moved, by the range markers an engine installs
+    /// when it starts with probes; a change from no probe takes a new epoch, which installs them
+    /// ([`fence_effect`]).
+    #[reload(by = fence_effect)]
     pub fence_modules: Option<Vec<String>>,
     /// Name patterns (`*` matches any run) of the probed module classes whose
     /// probes are off while `fence_probes` is on: the classes whose
@@ -1467,6 +1472,21 @@ pub struct ProfilingConfig {
 
 /// How far back a read of the `span` events reaches by default: five minutes.
 pub const DEFAULT_SPAN_WINDOW: Duration = Duration::from_secs(300);
+
+/// How a change of `profiling_config.fence_modules` from `previous` to `next` takes effect: a
+/// kernel generation, whose captures place the probes on the classes `next` names, in an engine
+/// that started with probes and so installed the range markers; from no probe (an empty list),
+/// and at a start, a new epoch, which installs them.
+pub fn fence_effect(
+    previous: Option<&Option<Vec<String>>>,
+    _next: &Option<Vec<String>>,
+) -> crate::reload::Effect {
+    match previous {
+        Some(Some(patterns)) if patterns.is_empty() => crate::reload::Effect::Epoch,
+        Some(_) => crate::reload::Effect::Generation,
+        None => crate::reload::Effect::Epoch,
+    }
+}
 
 impl Default for ProfilingConfig {
     fn default() -> Self {
@@ -1886,7 +1906,7 @@ impl EngineConfig {
         } = self;
         let MoeConfig {
             expert_parallel,
-            microbatches,
+            microbatches: _,
             beside_rows,
             expert_order: _,
         } = moe;
@@ -1917,7 +1937,7 @@ impl EngineConfig {
         } = speculative;
         let ProfilingConfig {
             fence_probes: _,
-            fence_modules,
+            fence_modules: _,
             fence_probes_off: _,
             graph_pc_sampling,
             nvtx_ranges: _,
@@ -1939,7 +1959,6 @@ impl EngineConfig {
             load,
             kv_cache,
             expert_parallel: *expert_parallel,
-            microbatches: *microbatches,
             beside_rows: *beside_rows,
             cuda_graph,
             engine,
@@ -1951,9 +1970,20 @@ impl EngineConfig {
             host_queue_depth: *host_queue_depth,
             num_draft_tokens: *num_draft_tokens,
             video,
-            fence_modules,
             graph_pc_sampling: *graph_pc_sampling,
         }
+    }
+
+    /// Takes from `target` the values a kernel generation moves the serving engines to (the
+    /// probes' places, `profiling_config.kernel_instance` and `fence_modules`, and
+    /// `moe_config.microbatches`): what a relaunch and a standby start from once the generation
+    /// committed.
+    pub fn take_generation(&mut self, target: &EngineConfig) {
+        self.profiling.kernel_instance = target.profiling.kernel_instance;
+        self.profiling
+            .fence_modules
+            .clone_from(&target.profiling.fence_modules);
+        self.moe.microbatches = target.moe.microbatches;
     }
 
     /// The layout this configuration lays an epoch's device memory out in ([`Layout`]).
@@ -1984,7 +2014,6 @@ pub struct BuildPart<'a> {
     pub load: &'a LoadConfig,
     pub kv_cache: &'a KvCacheConfig,
     pub expert_parallel: bool,
-    pub microbatches: NonZeroU32,
     /// The expert union's middle capture class, which the captured graphs are shaped for.
     pub beside_rows: NonZeroU32,
     pub cuda_graph: &'a CudaGraphConfig,
@@ -1997,7 +2026,6 @@ pub struct BuildPart<'a> {
     pub host_queue_depth: NonZeroUsize,
     pub num_draft_tokens: u32,
     pub video: &'a VideoConfig,
-    pub fence_modules: &'a Option<Vec<String>>,
     pub graph_pc_sampling: bool,
 }
 

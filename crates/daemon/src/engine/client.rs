@@ -858,7 +858,8 @@ impl EngineClient {
     /// What a generation update to the kernel packages `kernels` would take on every rank's
     /// device beside the serving graphs, each rank's device's extra bytes, room and the KV units
     /// its cache would give up; measured without installing anything, empty when it replaces no
-    /// kernel.
+    /// kernel and, unless `recapture` (a generation that places the probes elsewhere), captures
+    /// no bucket again.
     ///
     /// # Errors
     ///
@@ -866,6 +867,7 @@ impl EngineClient {
     pub async fn measure_room(
         &self,
         kernels: &proto::module::Packages,
+        recapture: bool,
     ) -> Result<Vec<wire::DeviceRoom>, String> {
         let kernels: Vec<wire::RoomKernel> = kernels
             .iter()
@@ -879,7 +881,11 @@ impl EngineClient {
             .collect();
         match self
             .ask(move |id| {
-                wire::engine_command::Kind::MeasureRoom(wire::MeasureRoom { id, kernels })
+                wire::engine_command::Kind::MeasureRoom(wire::MeasureRoom {
+                    id,
+                    kernels,
+                    recapture,
+                })
             })
             .await?
         {

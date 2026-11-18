@@ -645,6 +645,15 @@ message Prepare {
   // probes (`profiling_config.kernel_instance`); none when absent. A bucket
   // whose serving graph holds its probes elsewhere is captured again.
   optional uint32 kernel_instance = 3;
+  // The module classes whose instances carry the generation's fence probes
+  // (`profiling_config.fence_modules`); the family's step stack when absent.
+  // A bucket whose serving graph probes other classes is captured again.
+  optional FenceModules fence_modules = 4;
+}
+
+message FenceModules {
+  // Name patterns of module classes, `*` matching any run; empty for none.
+  repeated string patterns = 1;
 }
 
 message Switch {

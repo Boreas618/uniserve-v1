@@ -559,6 +559,13 @@ impl Update {
                 .collect(),
             policy: Some((&modules.policy).into()),
             kernel_instance: self.target.engine.profiling.kernel_instance,
+            fence_modules: self
+                .target
+                .engine
+                .profiling
+                .fence_modules
+                .clone()
+                .map(|patterns| process::FenceModules { patterns }),
         }));
         for node in &self.nodes {
             processes.command(&node.host, node.launch, prepare.clone());

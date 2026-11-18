@@ -463,7 +463,8 @@ pub fn change(previous: &Epoch, next: &Epoch) -> Change {
         // Another engine package, or another revision of it, is another
         // executable: its engines are started beside the serving ones.
         Change::Epoch
-    } else if previous.modules != next.modules
+    } else if effects.has(proto::reload::Effect::Generation)
+        || previous.modules != next.modules
         || previous.engine.profiling.kernel_instance != next.engine.profiling.kernel_instance
     {
         // Another kernel package, or the kernel probes placed elsewhere: the graphs are
@@ -717,9 +718,6 @@ mod tests {
                 "speculative_config.num_draft_tokens",
                 |config: &mut Config| config.speculative_config.num_draft_tokens = 4,
             ),
-            ("moe_config.microbatches", |config: &mut Config| {
-                config.moe_config.microbatches = NonZeroU32::new(2).unwrap()
-            }),
             (
                 "profiling_config.graph_pc_sampling",
                 |config: &mut Config| config.profiling_config.graph_pc_sampling = true,
@@ -735,6 +733,13 @@ mod tests {
                 "speculative_config.refill_token_cost",
                 |config: &mut Config| config.speculative_config.refill_token_cost = Some(0.5),
             ),
+            // The options the graphs are captured with.
+            ("moe_config.microbatches", |config: &mut Config| {
+                config.moe_config.microbatches = NonZeroU32::new(2).unwrap()
+            }),
+            ("profiling_config.fence_modules", |config: &mut Config| {
+                config.profiling_config.fence_modules = Some(vec!["*.Attention".to_owned()])
+            }),
             ("kernels", |config: &mut Config| {
                 config.kernels.insert(
                     "paged_attention".to_owned(),

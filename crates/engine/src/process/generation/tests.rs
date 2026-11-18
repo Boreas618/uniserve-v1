@@ -166,6 +166,7 @@ fn a_preparation_names_its_packages_with_their_arguments() {
     let fcfs = package("fcfs", "chunked_prefill_size = 4096");
     let prepare = Prepare {
         kernel_instance: None,
+        fence_modules: None,
         kernels: vec![
             kernel_to_wire(&every_key, &attention),
             kernel_to_wire(&pinned, &norm),

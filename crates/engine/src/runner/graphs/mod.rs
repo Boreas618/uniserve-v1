@@ -1060,11 +1060,11 @@ impl Graphs {
             ));
         }
 
-        // A bucket whose kernel probes the generation moves is captured again with them.
+        // A bucket whose kernel probes or fence probes the generation moves is captured again
+        // with them.
         let probes_moved = |serving: &Generation| {
-            crate::profiling::markers::Markers::installed().is_some_and(|markers| {
-                markers.placement(serving.number()) != markers.placement(next.number())
-            })
+            crate::profiling::markers::Markers::installed()
+                .is_some_and(|markers| markers.moved(serving.number(), next.number()))
         };
         let capture = match (held, serving) {
             (Some(held), Some(serving)) => {

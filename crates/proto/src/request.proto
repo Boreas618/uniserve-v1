@@ -593,6 +593,9 @@ message Operated {
 message MeasureRoom {
   uint64 id = 1;
   repeated RoomKernel kernels = 2;
+  // The generation places the probes elsewhere, so every bucket is captured
+  // again whatever kernels it replaces.
+  bool recapture = 3;
 }
 
 message RoomKernel {

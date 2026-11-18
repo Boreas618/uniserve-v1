@@ -277,8 +277,6 @@ struct Instances {
     classes: Vec<String>,
     /// Each instance's class index.
     instance_classes: Vec<u32>,
-    /// Whether a class pattern of the deployment names each class seen, by name.
-    timed: HashMap<String, bool>,
     /// Each kernel probe's site, by its instance number.
     sites: HashMap<u32, service::span::Kernel>,
     /// Each site's instance number, by its operator, descriptor key and module path.
@@ -288,8 +286,12 @@ struct Instances {
 /// The range markers of this process's devices and what they measure.
 pub(crate) struct Markers {
     devices: Vec<DeviceMarkers>,
-    /// The deployment's class patterns (`profiling_config.fence_modules`).
+    /// The class patterns of the generations [`Markers::place_classes`] names none for
+    /// (`profiling_config.fence_modules` as the process started).
     patterns: Vec<String>,
+    /// The class patterns of each generation that names its own, which every capture of it
+    /// follows.
+    generation_patterns: Mutex<BTreeMap<u64, Vec<String>>>,
     instances: Mutex<Instances>,
     /// The switch as last stated: the master word, the patterns switched off and the kernel
     /// probes' word.
@@ -349,6 +351,7 @@ pub(crate) fn profiler(
         markers: Arc::clone(markers),
         replay: replay.raw(),
         plan,
+        patterns: markers.classes(generation),
     }))
 }
 
@@ -465,6 +468,8 @@ struct Capture {
     replay: usize,
     /// `None` when the capture's generation places no kernel probe.
     plan: Option<Plan>,
+    /// The class patterns whose instances carry the capture's generation's fence probes.
+    patterns: Vec<String>,
 }
 
 impl ops::Profiler for Capture {
@@ -474,7 +479,7 @@ impl ops::Profiler for Capture {
         path: &str,
         stream: &Stream,
     ) -> std::result::Result<Option<u32>, Box<dyn StdError + Send + Sync>> {
-        let Some(instance) = self.markers.instance(class, path)? else {
+        let Some(instance) = self.markers.instance(&self.patterns, class, path)? else {
             return Ok(None);
         };
         self.markers.launch(stream, self.replay, 2 * instance)?;
@@ -546,6 +551,7 @@ impl Markers {
         let markers = Arc::new(Self {
             devices,
             patterns,
+            generation_patterns: Mutex::new(BTreeMap::new()),
             instances: Mutex::default(),
             switched: Mutex::new(Switch::default()),
             stack,
@@ -571,22 +577,12 @@ impl Markers {
     }
 
     /// The number of the instance at `path` of `class`, naming it on first sight, or `None` when
-    /// no pattern of the deployment names the class.
-    fn instance(&self, class: &str, path: &str) -> Result<Option<u32>> {
-        {
-            let mut instances = lock(&self.instances);
-            let timed = match instances.timed.get(class) {
-                Some(&timed) => timed,
-                None => {
-                    let timed = class != KERNEL_CLASS
-                        && self.patterns.iter().any(|pattern| matches(pattern, class));
-                    instances.timed.insert(class.to_owned(), timed);
-                    timed
-                }
-            };
-            if !timed {
-                return Ok(None);
-            }
+    /// no pattern of `patterns`, the capture's generation's, names the class. An instance keeps
+    /// its number across generations, whichever classes each probes.
+    fn instance(&self, patterns: &[String], class: &str, path: &str) -> Result<Option<u32>> {
+        let timed = class != KERNEL_CLASS && patterns.iter().any(|pattern| matches(pattern, class));
+        if !timed {
+            return Ok(None);
         }
         self.register(class, path)
     }
@@ -697,6 +693,30 @@ impl Markers {
             .get(&generation)
             .copied()
             .unwrap_or(self.placement)
+    }
+
+    /// Probes in generation `generation` the instances of the module classes `fence_modules`
+    /// names, the family's step stack when `None` (`profiling_config.fence_modules`): what every
+    /// capture of the generation follows.
+    pub(crate) fn place_classes(&self, generation: u64, fence_modules: Option<Vec<String>>) {
+        let patterns = fence_modules.unwrap_or_else(|| vec![self.stack.clone()]);
+        lock(&self.generation_patterns).insert(generation, patterns);
+    }
+
+    /// The class patterns whose instances carry generation `generation`'s fence probes.
+    pub(crate) fn classes(&self, generation: u64) -> Vec<String> {
+        lock(&self.generation_patterns)
+            .get(&generation)
+            .cloned()
+            .unwrap_or_else(|| self.patterns.clone())
+    }
+
+    /// Whether generation `next` places the probes otherwise than generation `serving`: its
+    /// kernel probes in other layers, or its fence probes on other classes. Every bucket of such
+    /// a generation is captured again.
+    pub(crate) fn moved(&self, serving: u64, next: u64) -> bool {
+        self.placement(serving) != self.placement(next)
+            || self.classes(serving) != self.classes(next)
     }
 
     /// Names the place of `device`'s spans: the worker that issues the device.

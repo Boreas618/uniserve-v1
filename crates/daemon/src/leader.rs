@@ -2139,9 +2139,15 @@ impl Replica {
                     // The configuration and the module set are what the next
                     // apply compares with, what a relaunch and a standby
                     // start from and what a successor daemon takes over.
+                    let target = config.engine_config();
                     *service::lock(&self.config) = config;
                     if let Some(args) = service::lock(&self.served).as_mut() {
                         args.modules = modules;
+                        // The options the graphs were captured with, which a relaunch starts
+                        // with.
+                        if let Ok(target) = &target {
+                            args.engine_config.take_generation(target);
+                        }
                     }
                     // The parked standby holds the generation the commit
                     // released: it is replaced by one of the committed set.

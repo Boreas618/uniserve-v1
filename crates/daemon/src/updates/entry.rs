@@ -152,7 +152,8 @@ impl Leader {
         };
         let form = if named == Change::Epoch || record.engine != next.modules.engine {
             Effect::Epoch
-        } else if record.kernels != next.modules.kernels
+        } else if named == Change::Generation
+            || record.kernels != next.modules.kernels
             || record.policy != next.modules.policy
             || probes_move(&record.config, &next.engine)
         {
@@ -173,6 +174,12 @@ impl Leader {
             )
             .await
         } else {
+            // The generation switches bucket by bucket and includes no step: the change's step
+            // and order options take effect in place first, with the options the graphs are
+            // captured with kept until the generation commits, which takes the whole target.
+            let mut lighter = target.clone();
+            lighter.take(&current, Effect::Generation);
+            Box::pin(self.apply_in_place(lighter, stated, revision)).await?;
             self.generation_update(number, next, serving, &options)
                 .await
         }
@@ -210,7 +217,19 @@ impl Leader {
         .await
         .map_err(|error| UpdateError::Failed(anyhow::anyhow!("fixing the kernels: {error}")))?
         .map_err(|error| UpdateError::Refused(format!("fixing the kernels: {error:#}")))?;
-        if fixed.kernels == record.kernels {
+        // A generation that places the probes elsewhere captures every bucket again.
+        let probes = |engine: &EngineConfig| {
+            (
+                engine.profiling.kernel_instance,
+                engine.profiling.fence_modules.clone(),
+            )
+        };
+        let current = service::lock(&self.replicas()[0].config).engine_config();
+        let recapture = match (target.engine_config(), current) {
+            (Ok(target), Ok(current)) => probes(&target) != probes(&current),
+            _ => false,
+        };
+        if fixed.kernels == record.kernels && !recapture {
             return Ok(Vec::new());
         }
         let mut rooms = Vec::new();
@@ -218,9 +237,12 @@ impl Leader {
             let Some(client) = replica.hold().client() else {
                 continue;
             };
-            let measured = client.measure_room(&fixed.kernels).await.map_err(|error| {
-                UpdateError::Failed(anyhow::anyhow!("measuring the generation's room: {error}"))
-            })?;
+            let measured = client
+                .measure_room(&fixed.kernels, recapture)
+                .await
+                .map_err(|error| {
+                    UpdateError::Failed(anyhow::anyhow!("measuring the generation's room: {error}"))
+                })?;
             rooms.extend(measured);
         }
         Ok(rooms)
@@ -856,7 +878,8 @@ mod tests {
     use super::*;
 
     /// The fence probes' switch, and a module's probes switched off, change in place; the
-    /// probed modules and PC sampling shape the captured graphs and take a new epoch.
+    /// probed modules shape the captured graphs and take a kernel generation, and PC sampling,
+    /// the process's one CUPTI mode every graph is instantiated under, a new epoch.
     #[test]
     fn only_the_fence_probes_switch_changes_profiling_in_place() {
         let profiled = |profiling: proto::config::ProfilingConfig| Config {
@@ -881,20 +904,26 @@ mod tests {
             ..served.profiling_config.clone()
         });
         assert!(switches_probes(&changed(&thinned)));
-        for epoch in [
-            proto::config::ProfilingConfig {
-                graph_pc_sampling: true,
-                ..served.profiling_config.clone()
-            },
-            proto::config::ProfilingConfig {
-                fence_modules: Some(vec!["*.TransformerLayer".to_owned()]),
-                ..served.profiling_config.clone()
-            },
-        ] {
-            let changes = changed(&profiled(epoch));
-            assert!(!switches_probes(&changes));
-            assert_eq!(Effects::of(&changes).heaviest(), Some(Effect::Epoch));
-        }
+        let sampled = changed(&profiled(proto::config::ProfilingConfig {
+            graph_pc_sampling: true,
+            ..served.profiling_config.clone()
+        }));
+        assert!(!switches_probes(&sampled));
+        assert_eq!(Effects::of(&sampled).heaviest(), Some(Effect::Epoch));
+        // The probed modules are captured into the graphs, again by a kernel generation.
+        let moved = changed(&profiled(proto::config::ProfilingConfig {
+            fence_modules: Some(vec!["*.TransformerLayer".to_owned()]),
+            ..served.profiling_config.clone()
+        }));
+        assert!(!switches_probes(&moved));
+        assert_eq!(Effects::of(&moved).heaviest(), Some(Effect::Generation));
+        // From no probe, a new epoch installs the range markers.
+        let unprobed = profiled(proto::config::ProfilingConfig {
+            fence_modules: Some(Vec::new()),
+            ..served.profiling_config.clone()
+        });
+        let probed = proto::reload::changes(Some(&unprobed), &served);
+        assert_eq!(Effects::of(&probed).heaviest(), Some(Effect::Epoch));
         assert!(!switches_probes(&[]));
     }
 

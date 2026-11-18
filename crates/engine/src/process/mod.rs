@@ -899,10 +899,16 @@ impl MainProcess {
             Ok(generation) => generation,
             Err(report) => return self.report(report),
         };
-        // Where the generation places its kernel probes, which every capture of it follows: a
-        // bucket whose serving graph holds them elsewhere is captured again.
+        // Where the generation places its kernel probes and which module classes carry its
+        // fence probes, which every capture of it follows: a bucket whose serving graph holds
+        // them elsewhere is captured again.
         if let Some(markers) = crate::profiling::markers::Markers::installed() {
             markers.place(generation, prepare.kernel_instance);
+            let classes = prepare
+                .fence_modules
+                .as_ref()
+                .map(|modules| modules.patterns.clone());
+            markers.place_classes(generation, classes);
         }
         let parts = match generation::named(prepare) {
             Ok((packages, policy)) => self
@@ -1556,10 +1562,10 @@ impl MainProcess {
         let workers = engine.workers.clone();
         let binding = Arc::clone(&engine.binding);
         let serving = kernels_of(&self.serving);
-        let id = measure.id;
+        let (id, recapture) = (measure.id, measure.recapture);
         self.work(Box::new(move || {
-            let rooms =
-                generation::room(&workers, &build, (&named, &serving), &binding).map(|rooms| {
+            let rooms = generation::room(&workers, &build, (&named, &serving), &binding, recapture)
+                .map(|rooms| {
                     let devices = rooms
                         .into_iter()
                         .map(|room| wire::DeviceRoom {
