@@ -31,6 +31,10 @@ from typing import Any
 
 from uniserve_testing.servers import Server, environment, launch, socket_path
 
+#: The deployment a check's Build Server serves: a server builds for one
+#: deployment, and a check's is the only one in its runtime directory.
+DEPLOYMENT = "checks"
+
 #: How long a Build Server takes to serve, in seconds: uv brings its
 #: environment to the tree's lock, it describes its toolchains, which imports
 #: the compilers of the environment, and it installs the tree's packages,
@@ -189,12 +193,13 @@ def build_server(
     """A Build Server over a fresh package root and store under `work`,
     with `repository` as its source tree, until the block ends.
 
-    The server binds its default socket in a runtime directory of its own,
-    which this creates in the system's temporary directory: a Unix socket's
-    path holds at most 107 bytes, and `work` may lie deep in a run's
-    artifacts. Its package root and store live as long as the block: a
-    revision counts from 1 in a fresh package root, so a store kept across
-    runs would answer a changed package with the module older source built.
+    The server serves the deployment :data:`DEPLOYMENT`, whose socket it binds
+    in a runtime directory of its own, which this creates in the system's
+    temporary directory: a Unix socket's path holds at most 107 bytes, and
+    `work` may lie deep in a run's artifacts. Its package root and store live
+    as long as the block: a revision counts from 1 in a fresh package root, so
+    a store kept across runs would answer a changed package with the module
+    older source built.
     It serves once it has installed the tree's packages, so a deployment's
     start builds what it launches and later deployments reuse it.
     """  # noqa: D205
@@ -204,6 +209,8 @@ def build_server(
             str(uniserve),
             "build-server",
             "serve",
+            "--deployment",
+            DEPLOYMENT,
             "--source",
             str(repository),
             "--package-root",
