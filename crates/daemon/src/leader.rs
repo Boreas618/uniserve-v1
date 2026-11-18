@@ -3985,7 +3985,8 @@ mod tests {
             "uniserve_request_generation_tokens",
             "uniserve_e2e_request_latency_seconds",
             "uniserve_request_queue_time_seconds",
-            "uniserve_time_to_first_token_seconds",
+            "uniserve_ttft_seconds",
+            "uniserve_tpot_seconds",
         ] {
             assert_eq!(observed(&engine, histogram, 0).await.0, 1, "{histogram}");
         }

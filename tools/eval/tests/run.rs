@@ -134,7 +134,7 @@ async fn query(State(admin): State<Arc<Admin>>, body: Bytes) -> Response {
         return axum::Json(json!([
             {"name": "uniserve_requests_total", "labels": {"outcome": "length", "replica": "0"},
              "total": requests, "count": null, "sum": null},
-            {"name": "uniserve_time_to_first_token_seconds", "labels": {},
+            {"name": "uniserve_ttft_seconds", "labels": {},
              "total": 0.1, "count": count, "sum": sum},
         ]))
         .into_response();
@@ -390,8 +390,8 @@ command = ["true"]
         observed["counter_deltas"],
         json!({
             r#"uniserve_requests_total{outcome="length",replica="0"}"#: 3.0,
-            "uniserve_time_to_first_token_seconds_count": 2.0,
-            "uniserve_time_to_first_token_seconds_sum": 0.5,
+            "uniserve_ttft_seconds_count": 2.0,
+            "uniserve_ttft_seconds_sum": 0.5,
         }),
         "{summary}"
     );

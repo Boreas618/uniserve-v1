@@ -841,12 +841,24 @@ fn usage_metrics(recorder: &Recorder, labels: &Labels, revision: u64, usage: &Re
         && let Some(first_us) = usage.timings.first_visible_output_us
     {
         recorder.observe(
-            "uniserve_time_to_first_token_seconds",
+            "uniserve_ttft_seconds",
             labels,
             revision,
             first_us as f64 * 1e-6,
         );
+        if let Some(tpot) = tpot(usage, first_us) {
+            recorder.observe("uniserve_tpot_seconds", labels, revision, tpot);
+        }
     }
+}
+
+/// A finished request's time per output token after its first, in seconds: the rest of the
+/// request over the tokens it generated after its first; `None` for a request of one token.
+fn tpot(usage: &RequestUsage, first_us: u64) -> Option<f64> {
+    (usage.output_tokens > 1).then(|| {
+        let rest = usage.timings.total_us.saturating_sub(first_us) as f64 * 1e-6;
+        rest / f64::from(usage.output_tokens - 1)
+    })
 }
 
 /// The fields of a finished request's `request` event: its prompt, prefix hit and output
@@ -863,11 +875,7 @@ fn request_fields(fields: &mut Fields, usage: &RequestUsage) {
     };
     let ttft = first_us as f64 * 1e-6;
     fields.insert("ttft".to_owned(), ttft.into());
-    // The time per output token after the first: the rest of the request over the tokens it
-    // generated after its first.
-    if usage.output_tokens > 1 {
-        let rest = (usage.timings.total_us.saturating_sub(first_us)) as f64 * 1e-6;
-        let tpot = rest / f64::from(usage.output_tokens - 1);
+    if let Some(tpot) = tpot(usage, first_us) {
         fields.insert("tpot".to_owned(), tpot.into());
     }
 }
@@ -1092,6 +1100,16 @@ mod tests {
         )
         .await;
         assert_eq!(tokens[0]["n"], 5.0);
+        let latencies = rows(
+            store,
+            "SELECT name, histogram FROM stats \
+             WHERE name IN ('uniserve_ttft_seconds', 'uniserve_tpot_seconds') ORDER BY name",
+        )
+        .await;
+        assert_eq!(latencies.len(), 2);
+        assert_eq!(latencies[0]["name"], "uniserve_tpot_seconds");
+        assert_eq!(latencies[0]["histogram"]["max"], 0.01);
+        assert_eq!(latencies[1]["histogram"]["max"], 0.02);
     }
 
     /// The revision a deployment serves is each replica's `uniserve_replica_revision`, and what
