@@ -18,14 +18,9 @@ scale tensors with ``tile_atom_to_shape_SF`` and the reference agree about
 where a scale byte lives, and the reference against a direct sum.
 
 **The tolerance** is the operator's declared one,
-``Tolerance::rounding(2, f32, output)``: ``2γ₂(u_f32) + u_output``, the bound
-for a reduction whose result is a scale of its inputs. A matrix product is not
-one: its terms cancel, and ``fp4.rs``'s own documentation says such a
-reduction declares ``Tolerance::dot``, ``2γ_n√n + u_out`` over the ``n``-term
-contraction. A failure states how many elements the contraction's own bound
-would also refuse, so a deviation that only the declared bound refuses reads
-as a question for the operator's declaration rather than a verdict on the
-module.
+``Tolerance::rounding(k, f32, output)``: ``2γ_k(u_f32) + u_output`` over the
+``k``-term FP32 contraction, with the output's subnormal unit as the absolute
+part (:func:`uniserve_testing.kernels.gemm.nvfp4.gemm_tolerance`).
 """
 
 import ctypes
@@ -42,8 +37,7 @@ E2M1_VALUES = torch.tensor(
     [*nvfp4.E2M1, *(-value for value in nvfp4.E2M1)], dtype=torch.float64
 )
 
-#: The unit roundoff of the output types the check states.
-UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-9, "f32": 2.0**-24}
+#: The torch element type of each output type the check states.
 TORCH_TYPES = {
     "f16": torch.float16,
     "bf16": torch.bfloat16,
@@ -78,28 +72,25 @@ def encode_e4m3(values):
     return values.to(torch.float8_e4m3fn).view(torch.uint8)
 
 
-def dequantized(codes, scale_bytes, offsets, scale_shape):
-    """The matrix a packed operand and its scale bytes stand for, in FP64.
+def dequantized(codes, scale_buffer, offsets):
+    """The matrix a packed operand and its scale buffer stand for, in FP64.
 
-    ``scale_bytes`` are the ``[rows, scales]`` logical scales, which the
-    layout puts at ``offsets`` of a ``scale_shape`` buffer.
+    ``scale_buffer`` is the flat scale buffer the call passes and ``offsets``
+    the flat offset of every ``[row, scale]`` in it, so each block reads the
+    byte its layout puts there.
     """
     values = e2m1_values(codes)
-    scales = torch.zeros(scale_shape[0] * scale_shape[1], dtype=torch.float64)
-    scales[offsets.reshape(-1)] = decode_e4m3(scale_bytes).reshape(-1).double()
-    matrix = scales.reshape(scale_shape)
-    per_block = matrix[
-        : values.shape[0], : values.shape[1] // nvfp4.BLOCK_ELEMENTS
-    ]
+    per_block = decode_e4m3(scale_buffer[offsets]).double()
     return values * per_block.repeat_interleave(nvfp4.BLOCK_ELEMENTS, dim=1)
 
 
-def gamma(reduction, unit):
-    """``γₙ = n·u / (1 − n·u)``, saturating where the expression stops being
-    a bound.
+def scale_buffer(scale_bytes, offsets, shape):
+    """The flat ``shape`` buffer that holds the logical ``[rows, scales]``
+    bytes ``scale_bytes`` at ``offsets``; the padding is zero.
     """  # noqa: D205
-    terms = reduction * unit
-    return 1.0 if terms >= 1.0 else terms / (1.0 - terms)
+    buffer = torch.zeros(shape[0] * shape[1], dtype=torch.uint8)
+    buffer[offsets.reshape(-1)] = scale_bytes.reshape(-1)
+    return buffer
 
 
 def test_the_call_mirror_is_the_entrys_call_structure():
@@ -156,17 +147,21 @@ def test_the_reference_is_a_direct_sum_over_the_packed_codes():
     input_scale_bytes = torch.full((m, scales), 0x40, dtype=torch.uint8)
     weight_scale_bytes = torch.full((n, scales), 0x38, dtype=torch.uint8)
 
+    input_offsets = nvfp4.linear_offsets(m, scales)
+    weight_offsets = nvfp4.swizzled_offsets(n, scales)
     a = dequantized(
         input_codes,
-        input_scale_bytes,
-        nvfp4.linear_offsets(m, scales),
-        (m, scales),
+        scale_buffer(input_scale_bytes, input_offsets, (m, scales)),
+        input_offsets,
     )
     b = dequantized(
         weight_codes,
-        weight_scale_bytes,
-        nvfp4.swizzled_offsets(n, scales),
-        nvfp4.padded_shape(n, scales),
+        scale_buffer(
+            weight_scale_bytes,
+            weight_offsets,
+            nvfp4.padded_shape(n, scales),
+        ),
+        weight_offsets,
     )
     product = ALPHA * (a @ b.T)
 
@@ -268,29 +263,23 @@ def test_the_product_is_within_the_operators_declared_bound(
     input_offsets = nvfp4.swizzled_offsets(M, scales)
     weight_shape = nvfp4.padded_shape(N, scales)
     weight_offsets = nvfp4.swizzled_offsets(N, scales)
-    input_scale_matrix = torch.zeros(
-        input_shape[0] * input_shape[1], dtype=torch.uint8
+    input_scale_matrix = scale_buffer(
+        input_scale_bytes, input_offsets, input_shape
     )
-    weight_scale_matrix = torch.zeros(
-        weight_shape[0] * weight_shape[1], dtype=torch.uint8
-    )
-    input_scale_matrix[input_offsets.reshape(-1)] = input_scale_bytes.reshape(
-        -1
-    )
-    weight_scale_matrix[weight_offsets.reshape(-1)] = (
-        weight_scale_bytes.reshape(-1)
+    weight_scale_matrix = scale_buffer(
+        weight_scale_bytes, weight_offsets, weight_shape
     )
     packed_input = pack_e2m1(input_codes)
     packed_weight = pack_e2m1(weight_codes)
-    input_scale_matrix = input_scale_matrix.to(torch_device)
-    weight_scale_matrix = weight_scale_matrix.to(torch_device)
+    input_scales = input_scale_matrix.to(torch_device)
+    weight_scales = weight_scale_matrix.to(torch_device)
     out = torch.zeros(M, N, dtype=TORCH_TYPES[OUTPUT], device=torch_device)
 
     call = nvfp4.GemmCall(
         input=packed_input.data_ptr(),
         weight=packed_weight.data_ptr(),
-        input_scales=input_scale_matrix.data_ptr(),
-        weight_scales=weight_scale_matrix.data_ptr(),
+        input_scales=input_scales.data_ptr(),
+        weight_scales=weight_scales.data_ptr(),
         alpha=alpha.data_ptr(),
         bias=None,
         out=out.data_ptr(),
@@ -306,24 +295,16 @@ def test_the_product_is_within_the_operators_declared_bound(
     )
 
     # The reference reads the bytes the call passed, on the host, in FP64.
-    a = dequantized(
-        input_codes.cpu(), input_scale_bytes, input_offsets, input_shape
-    )
-    b = dequantized(
-        weight_codes.cpu(), weight_scale_bytes, weight_offsets, weight_shape
-    )
+    a = dequantized(input_codes.cpu(), input_scale_matrix, input_offsets)
+    b = dequantized(weight_codes.cpu(), weight_scale_matrix, weight_offsets)
     reference = ALPHA * (a @ b.T)
     error = (out.double().cpu() - reference).abs()
-    magnitude = reference.abs()
-    declared = 2.0 * gamma(2, UNIT_ROUNDOFF["f32"]) + UNIT_ROUNDOFF[OUTPUT]
-    contraction = 2.0 * gamma(K, UNIT_ROUNDOFF["f32"]) * K**0.5
-    contraction += UNIT_ROUNDOFF[OUTPUT]
-    violations = int((~(error <= declared * magnitude)).sum())
-    outside_contraction = int((~(error <= contraction * magnitude)).sum())
+    atol, rtol = nvfp4.gemm_tolerance(K, OUTPUT)
+    # `~(error <= bound)`: the comparison must fail on a NaN.
+    violations = int((~(error <= atol + rtol * reference.abs())).sum())
     worst = torch.nan_to_num(error).max().item()
     assert violations == 0, (
         f"{M}x{N} over k={K}, {OUTPUT}, scales {LAYOUT}: {violations} of "
-        f"{M * N} elements outside the operator's declared rtol "
-        f"{declared:.3e}, {outside_contraction} of them also outside the "
-        f"contraction's own rtol {contraction:.3e}; max |error| {worst:.3e}"
+        f"{M * N} elements outside the operator's declared rtol {rtol:.3e}; "
+        f"max |error| {worst:.3e}"
     )

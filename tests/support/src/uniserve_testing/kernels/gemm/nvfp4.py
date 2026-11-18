@@ -14,12 +14,15 @@ for a matrix of ``rows`` rows and ``scales = columns / 16`` scale columns:
 ``test_nvfp4_gemm.py`` proves the swizzle is the atom layout ``cute`` builds,
 and ``test_nvfp4_quantize.py`` that both layouts read one logical matrix
 alike. Both call the ``nvfp4_gemm`` module's entry with :class:`GemmCall`,
-which ``test_nvfp4_gemm.py`` holds to the generated header.
+which ``test_nvfp4_gemm.py`` holds to the generated header, and hold its
+product to :func:`gemm_tolerance`.
 """
 
 import ctypes
 
 import torch
+
+from uniserve_testing.kernels.tensor.operands import UNIT, gamma
 
 
 class GemmCall(ctypes.Structure):
@@ -101,3 +104,20 @@ def unpacked(packed, rows, columns):
     codes[:, 0::2] = (narrow & 0xF).long()
     codes[:, 1::2] = ((narrow >> 4) & 0xF).long()
     return codes
+
+
+#: The spacing of the product's output types' subnormal grids: below the
+#: smallest normal value a rounding errs by up to half of it whatever the
+#: value's size, so it is the absolute part of a bound that ends in a rounding.
+UNDERFLOW = {"bf16": 2.0**-133, "f16": 2.0**-24}
+
+
+def gemm_tolerance(k, output):
+    """``Nvfp4Gemm::tolerance``: ``Tolerance::rounding(k, f32, output)``.
+
+    The packed operands are exact, the contraction accumulates ``k`` terms in
+    FP32 and the epilogue rounds once into ``output``, so a product element is
+    within ``atol + rtol·|exact|`` of the FP64 product of the decoded bytes.
+    Answers ``(atol, rtol)``.
+    """
+    return UNDERFLOW[output], 2.0 * gamma(k, UNIT["f32"]) + UNIT[output]
