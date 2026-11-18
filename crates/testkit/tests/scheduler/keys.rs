@@ -13,7 +13,6 @@
 use engine::batch::Phase;
 use engine::batch::cache::CacheGroupKind;
 use engine::scheduler::Message;
-use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, GenerationRequest, MigrationCause, RequestId};
 use storage::Key;
 use storage::key::{page_key, page_root};
@@ -323,8 +322,8 @@ fn an_admission_pins_the_device_part_of_its_hit_and_loads_the_host_part_after_it
 
     // Every cached block leaves the device; the host keeps its copies.
     let (reply, flushed) = crossbeam_channel::bounded(1);
-    harness.apply(Message::Flush(None, WeightsInFlight::Keep, reply));
-    assert!(flushed.try_recv().unwrap().is_ok());
+    harness.apply(Message::Flush(reply));
+    assert!(flushed.try_recv().is_ok());
     let evicted = |harness: &Harness| {
         let mut answers = harness.answers().into_iter();
         answers.any(|answer| matches!(answer, (Request::Evict { .. }, Completion::Evicted { .. })))

@@ -1,17 +1,17 @@
 //! A second load of a serving model.
 //!
-//! An in-place weight update and an expert redistribution are the same operation seen from a
-//! rank: the model is loaded again against another target, and each weight whose key changed
-//! takes the address of the weight it replaces. The load is the model's own, through
-//! `nn::WeightLoader`, so nothing here knows a model's tensors, and a changed weight reaches the
-//! Storage Server by the path every weight takes.
+//! An expert redistribution is, seen from a rank, the model loaded again against another expert
+//! order of the served checkpoint, each weight whose key changed taking the address of the weight
+//! it replaces. The load is the model's own, through `nn::WeightLoader`, so nothing here knows a
+//! model's tensors, and a changed weight reaches the Storage Server by the path every weight
+//! takes.
 //!
 //! The second load runs twice. First over [`MetaWeights`], which holds no storage: the model's
 //! load states the weights it would reach, in order, without reading a payload byte, and
-//! [`paired`] compares that order with the one that serves, so a checkpoint that loads other
-//! tensors is refused before any storage is touched. Then over [`Reload`], beside the serving
-//! weights: a key the rank holds already costs nothing, so an update publishes exactly what
-//! changed, and [`WeightStore::rebind`] puts it in place at a boundary where nothing runs.
+//! [`paired`] compares that order with the one that serves, so a target that loads other tensors
+//! is refused before any storage is touched. Then over [`Reload`], beside the serving weights: a
+//! key the rank holds already costs nothing, so a redistribution publishes exactly what changed,
+//! and [`WeightStore::rebind`] puts it in place at a boundary where nothing runs.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -110,10 +110,9 @@ impl RetainedWeights for MetaWeights {
 ///
 /// Both are the orders of two loads of one model ([`WeightStore::finish`],
 /// [`MetaWeights::into_order`]). A load's order is the identity of its weights, so the two are
-/// compared in step, and whatever differs beside the files is a load of other tensors. With
-/// `rearranged`, a stack may hold the same parts in another order (another arrangement of the
-/// same checkpoint, as an expert redistribution loads); without, each weight reads the same
-/// tensors in the same order (another checkpoint of the model, as a weight update loads).
+/// compared in step, and whatever differs beside the files is a load of other tensors, except
+/// that a stack may hold the same parts in another order (another arrangement of the same
+/// checkpoint, as an expert redistribution loads).
 ///
 /// A weight whose key did not change, and a table the model writes after its load, has no
 /// pair: the first serves on as it is, and the model writes the second again.
@@ -125,7 +124,6 @@ impl RetainedWeights for MetaWeights {
 pub fn paired(
     serving: &[(WeightKey, bool)],
     target: &[(WeightKey, bool)],
-    rearranged: bool,
 ) -> Result<Vec<(WeightKey, WeightKey)>> {
     if serving.len() != target.len() {
         return Err(Error::Invalid(format!(
@@ -174,16 +172,12 @@ pub fn paired(
             )));
         }
 
-        let same_tensors = if rearranged {
-            let mut left: Vec<&String> = from.tensors.iter().collect();
-            let mut right: Vec<&String> = to.tensors.iter().collect();
-            left.sort_unstable();
-            right.sort_unstable();
-            left == right
-        } else {
-            from.tensors == to.tensors
-        };
-        if !same_tensors {
+        // The same parts, in whatever order the target's stack holds them.
+        let mut left: Vec<&String> = from.tensors.iter().collect();
+        let mut right: Vec<&String> = to.tensors.iter().collect();
+        left.sort_unstable();
+        right.sort_unstable();
+        if left != right {
             return Err(Error::Invalid(format!(
                 "the weight the served model reads from {tensor} is read from {:?}",
                 to.tensors.first()
@@ -411,22 +405,22 @@ mod tests {
     }
 
     #[test]
-    fn another_checkpoint_pairs_every_changed_weight_by_its_position() {
+    fn another_expert_order_pairs_every_changed_weight_by_its_position() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let serving = [
             weight(root, "a", &["norm"], WeightLayout::ROW_MAJOR, 1),
-            weight(root, "a", &["head"], WeightLayout::ROW_MAJOR, 1),
+            weight(root, "a", &["e0.up", "e1.up"], WeightLayout::UP_GATE, 2),
         ];
         let target = [
-            weight(root, "b", &["norm"], WeightLayout::ROW_MAJOR, 1),
-            weight(root, "a", &["head"], WeightLayout::ROW_MAJOR, 1),
+            weight(root, "a", &["norm"], WeightLayout::ROW_MAJOR, 1),
+            weight(root, "a", &["e1.up", "e0.up"], WeightLayout::UP_GATE, 2),
         ];
 
-        let pairs = paired(&serving, &target, false).unwrap();
+        let pairs = paired(&serving, &target).unwrap();
 
-        // The head's file did not change, so its key did not, and nothing replaces it.
-        assert_eq!(pairs, [(serving[0].0.clone(), target[0].0.clone())]);
+        // The norm's key did not change, and nothing replaces it.
+        assert_eq!(pairs, [(serving[1].0.clone(), target[1].0.clone())]);
     }
 
     #[test]
@@ -436,16 +430,16 @@ mod tests {
         let serving = [weight(root, "a", &["norm"], WeightLayout::ROW_MAJOR, 1)];
 
         let other = [weight(root, "b", &["other"], WeightLayout::ROW_MAJOR, 1)];
-        let difference = paired(&serving, &other, false).unwrap_err().to_string();
+        let difference = paired(&serving, &other).unwrap_err().to_string();
         assert!(difference.contains("norm"), "{difference}");
 
-        assert!(paired(&serving, &[], false).is_err());
+        assert!(paired(&serving, &[]).is_err());
 
         let wider = [weight(root, "b", &["norm"], WeightLayout::ROW_MAJOR, 2)];
-        assert!(paired(&serving, &wider, false).is_err());
+        assert!(paired(&serving, &wider).is_err());
 
         let (key, _) = weight(root, "b", &["norm"], WeightLayout::ROW_MAJOR, 1);
-        assert!(paired(&serving, &[(key, true)], false).is_err());
+        assert!(paired(&serving, &[(key, true)]).is_err());
     }
 
     /// A table the model writes after its load keeps its place in the order and has no pair:
@@ -457,7 +451,7 @@ mod tests {
         let (serving, _) = weight(root, "a", &["table"], WeightLayout::ROW_MAJOR, 1);
         let (target, _) = weight(root, "b", &["table"], WeightLayout::ROW_MAJOR, 1);
 
-        let pairs = paired(&[(serving, true)], &[(target, true)], false).unwrap();
+        let pairs = paired(&[(serving, true)], &[(target, true)]).unwrap();
 
         assert!(pairs.is_empty());
     }
@@ -483,10 +477,7 @@ mod tests {
 
         assert_eq!(slots_of(&serving[0].0, &target[0].0), Some(vec![1, 0]));
 
-        assert_eq!(paired(&serving, &target, true).unwrap().len(), 1);
-        // A weight update reads each weight's tensors in the served order: the same names in
-        // another order are other tensors to it.
-        assert!(paired(&serving, &target, false).is_err());
+        assert_eq!(paired(&serving, &target).unwrap().len(), 1);
     }
 
     /// A stack of another checkpoint names the same tensors from other files: its bytes are

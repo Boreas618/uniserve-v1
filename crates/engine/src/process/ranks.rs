@@ -192,7 +192,7 @@ pub(crate) struct LoadedRank {
     /// `None` for a meta start.
     pub(crate) store: Option<Arc<WeightStore>>,
     /// The weights its load reached, in order, each with whether the model writes it after the
-    /// load: what a weight update pairs against. Empty for a meta start.
+    /// load: what an expert redistribution pairs against. Empty for a meta start.
     pub(crate) weights: Vec<(WeightKey, bool)>,
     /// The device's graph and scratch pools, which the runners' graphs address, once the rank is
     /// opened; `None` for a meta start.
@@ -4044,8 +4044,7 @@ fn text_regions(layout: &Open, opened: &Opened, group: Option<&Group>) -> Vec<u8
 /// A group that denoises states the latent seed of the identities of the weights of every rank
 /// of the deployment (`storage::key::latent_seed`), which keys the trajectories it stores
 /// (`storage::key::latent_content`): a trajectory follows from the denoiser's weights and from
-/// the encoders' that compute its conditioning. A weight update's `Flush` renews all three from
-/// the same weights (`crate::process::operations`).
+/// the encoders' that compute its conditioning.
 ///
 /// # Errors
 ///
@@ -4065,7 +4064,7 @@ pub(crate) fn capacities(
     let identity = binding::page_identity(&served);
     let identities: Vec<String> = served
         .iter()
-        .map(|(_, _, names)| binding::identity_of_names(names))
+        .map(|(_, _, names)| binding::identity_of(names))
         .collect();
     let latent = storage::key::latent_seed(identities.iter().map(String::as_str))
         .ok_or_else(|| anyhow::anyhow!("no rank of the deployment states its weights' identity"))?;

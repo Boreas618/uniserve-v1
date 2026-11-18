@@ -145,7 +145,7 @@ use crate::runtime::{Open, Opened};
 /// speaks: the one version either accepts. Each process that talks to the
 /// server checks it at its own `Hello`, independently of the other
 /// interfaces it speaks.
-pub const VERSION: u32 = 28;
+pub const VERSION: u32 = 29;
 
 /// How long a server of another host may take to answer a request it answers from what it holds
 /// (a hello, a peer's hold and release, a task's submission or cancellation, a connector's pages):
@@ -1123,17 +1123,6 @@ pub enum Request {
     /// Give up write access: the caller has drained its streams and
     /// unmapped or downgraded its mappings.
     Release { keys: Vec<Key> },
-    /// Move the copies at the locations `at` lists (every copy when `at`
-    /// is empty) of read-only tensors to new keys, each `(old, new)`: the
-    /// caller rewrites their bytes in place, as an in-place weight update
-    /// does, so the old keys no longer name them. Refused, moving none,
-    /// unless every old key has such a copy, each a read-only tensor that
-    /// the caller's deployment alone holds, and no new key has a copy at
-    /// its location.
-    Rekey {
-        moves: Vec<(Key, Key)>,
-        at: Vec<Location>,
-    },
     /// Every tensor, storage and claim the server holds.
     List,
     /// Pass the server to a successor server that runs the executable whose descriptor travels
@@ -1582,7 +1571,6 @@ pub enum Response {
     Put,
     Promoted,
     Released,
-    Rekeyed,
     Listing(Listing),
     /// The server serves with the settings of a [`Request::Configure`].
     Configured,

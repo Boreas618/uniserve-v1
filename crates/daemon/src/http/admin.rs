@@ -22,8 +22,8 @@
 //!   apply, for package selections and the options the operator lists
 //!   (`admin_config.harness_options`), commit, rollback, and reading the
 //!   status, the events and the update's report. The operator's operations
-//!   (weight update, sleep, wake, LoRA, rebalance, pause, flush, profiling,
-//!   shutdown, daemon restart) are not routes of it.
+//!   (sleep, wake, LoRA, rebalance, pause, flush, profiling, shutdown, daemon
+//!   restart) are not routes of it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -456,7 +456,6 @@ pub(crate) fn router(state: AdminState) -> Router {
         .route("/admin/flush_cache", post(flush_cache))
         .route("/admin/shutdown", post(shutdown))
         .route("/admin/restart", post(restart))
-        .route("/admin/update_weights", post(update_weights))
         .route("/admin/rebalance_experts", post(rebalance_experts))
         .route("/admin/sleep", post(sleep))
         .route("/admin/wake_up", post(wake_up))
@@ -624,54 +623,6 @@ async fn flush_cache(State(state): State<AdminState>) -> Response {
     .await
 }
 
-/// The body of `POST /admin/update_weights`.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UpdateWeightsBody {
-    /// Another checkpoint of the served model (a local directory or a
-    /// Hugging Face repository), or a plugin's weight source by its URL.
-    model_path: crate::leader::WeightSource,
-    /// How the requests in flight continue: `keep` (the default), `recompute`
-    /// or `abort`.
-    #[serde(default)]
-    in_flight: crate::leader::WeightsInFlight,
-}
-
-/// `POST /admin/update_weights`: the engine rewrites its weights in place
-/// from another checkpoint of the served model (SGLang's
-/// `update_weights_from_disk`).
-async fn update_weights(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
-    let body: UpdateWeightsBody = match serde_json::from_slice(&body) {
-        Ok(body) => body,
-        Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
-    };
-    let leader = Arc::clone(&state.leader);
-    run(
-        &state.admin,
-        OperationKind::UpdateWeights,
-        true,
-        async move {
-            leader
-                .update_weights(&body.model_path, body.in_flight)
-                .await
-                .map(|results| {
-                    serde_json::json!({
-                        "model_path": body.model_path,
-                        "in_flight": body.in_flight,
-                        "results": results.iter().map(weight_report).collect::<Vec<_>>(),
-                    })
-                })
-                .map_err(|error| {
-                    (
-                        update_status(&error),
-                        format!("{:#}", anyhow::Error::from(error)),
-                    )
-                })
-        },
-    )
-    .await
-}
-
 /// Redistribute experts within each selected replica's current epoch.
 async fn rebalance_experts(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let request: crate::experts::Rebalance = match serde_json::from_slice(&body) {
@@ -730,17 +681,6 @@ async fn wake_up(State(state): State<AdminState>) -> Response {
             })
     })
     .await
-}
-
-/// One rank's report of a change of its weights, as the admin API answers it.
-fn weight_report(report: &proto::request::wire::WeightReport) -> serde_json::Value {
-    serde_json::json!({
-        "group": report.group,
-        "rank": report.rank,
-        "identity": report.identity,
-        "identities": report.identities,
-        "moved": report.moved,
-    })
 }
 
 /// The request's JSON object body.

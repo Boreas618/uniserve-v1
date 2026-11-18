@@ -16,7 +16,6 @@ use proto::config::{
     BlockConfig, BlockDistribution, HostBlock, SchedulerConfig, Tuning, WorkerGroupConfig,
     WorkerRank,
 };
-use proto::request::wire::WeightsInFlight;
 use proto::request::{GenerationLimits, GenerationRequest};
 use scheduling::limits::Parameters;
 use scheduling::view::Snapshot;
@@ -1149,10 +1148,8 @@ fn a_flush_evicts_every_cached_block_the_scheduler_knows_of() {
     }
 
     let (reply, replied) = crossbeam_channel::bounded(1);
-    bench
-        .scheduler
-        .apply(Message::Flush(None, WeightsInFlight::Keep, reply));
-    assert!(matches!(replied.try_recv(), Ok(Ok(()))));
+    bench.scheduler.apply(Message::Flush(reply));
+    assert!(replied.try_recv().is_ok());
 
     // Each step writes what the queues have room for; the buffer pool evicts what it is named.
     let mut evicted = Vec::new();

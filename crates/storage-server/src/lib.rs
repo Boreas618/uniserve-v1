@@ -1123,7 +1123,6 @@ impl Server {
                     }
                     Request::Promote { keys } => self.promote(&holder, keys),
                     Request::Release { keys } => self.release(&holder, keys),
-                    Request::Rekey { moves, at } => self.rekey(&holder, moves, at),
                     Request::Place {
                         region,
                         memory,
@@ -2039,60 +2038,6 @@ impl Server {
             }
         }
         Ok(Handling::Response(Response::Released, Vec::new()))
-    }
-
-    /// `rekey`: see [`Request::Rekey`].
-    fn rekey(
-        &mut self,
-        holder: &Holder,
-        moves: &[(Key, Key)],
-        at: &[Location],
-    ) -> Result<Handling, (ErrorKind, String)> {
-        if !self.current(holder) {
-            return Err(stale(holder));
-        }
-        // Each copy moves to the new key at its own location.
-        let mut renamed: Vec<(TensorId, TensorId)> = Vec::new();
-        let mut moved = std::collections::HashSet::new();
-        for (old, new) in moves {
-            let copies = self.copies_of(old, at);
-            if copies.is_empty() {
-                return Err(invalid(&format!("{old:?} is not retained")));
-            }
-            for id in copies {
-                let Some(tensor) = self.tensors.get(&id) else {
-                    continue;
-                };
-                if tensor.access != Access::ReadOnly {
-                    return Err(invalid(&format!("{} is not read-only", tensor.name)));
-                }
-                if let Some(other) = tensor
-                    .retainers
-                    .iter()
-                    .map(|retainer| &retainer.scope)
-                    .find(|scope| scope.deployment != holder.scope.deployment)
-                {
-                    return Err((
-                        ErrorKind::Held,
-                        format!("{} is held by {other} as well", tensor.name),
-                    ));
-                }
-                let target = (*new, id.1);
-                if self.tensors.contains_key(&target) || !moved.insert(target) {
-                    return Err(invalid(&format!(
-                        "{} cannot move to {new:?}, which is retained",
-                        tensor.name
-                    )));
-                }
-                renamed.push((id, target));
-            }
-        }
-        for (old, new) in renamed {
-            if let Some(tensor) = self.take_tensor(&old) {
-                self.insert_tensor(new, tensor);
-            }
-        }
-        Ok(Handling::Response(Response::Rekeyed, Vec::new()))
     }
 
     /// Index a tensor under `id`.

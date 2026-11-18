@@ -491,15 +491,6 @@ impl Client {
         }
     }
 
-    /// See [`Request::Rekey`]: move the copies at the locations `at`
-    /// (every copy when empty).
-    pub fn rekey(&mut self, moves: Vec<(Key, Key)>, at: Vec<Location>) -> Result<()> {
-        match self.request(&Request::Rekey { moves, at }, &[])?.0 {
-            Response::Rekeyed => Ok(()),
-            other => Err(unexpected("rekey", &other)),
-        }
-    }
-
     /// See [`Request::Quota`]. Returns the quotas of `gpu` the caller
     /// reserves against; a refusal is [`ErrorKind::Quota`], whose message
     /// names every reservation of the quota it would overrun.

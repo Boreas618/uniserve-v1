@@ -1,8 +1,8 @@
-//! The operator's operations inside an epoch (`docs/admin.md`): a weight update in place, sleep
-//! and wake, the room a profiling session's storage takes from the KV cache, a cache flush, the
-//! commit of an expert redistribution, the operations every rank runs beside the batches (LoRA
-//! adapters, the experts' copies, profiling sessions, the fence probes' switch: [`on_ranks`]), and
-//! the scheduling limits.
+//! The operator's operations inside an epoch (`docs/admin.md`): sleep and wake, the room a
+//! profiling session's storage takes from the KV cache, a cache flush, the commit of an expert
+//! redistribution, the operations every rank runs beside the batches (LoRA adapters, the experts'
+//! copies, profiling sessions, the fence probes' switch: [`on_ranks`]), and the scheduling
+//! limits.
 //!
 //! Each operation is a job: a function of the parts it reads, which returns once the operation
 //! ended and touches nothing of the control thread's. One that changes what a batch reads does so
@@ -24,23 +24,20 @@
 //! against the batches of every rank, a peer's included.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::executor::peers::Operate;
 use crate::executor::peers::messages::{DataOperation, FencesSwitched, RankOperation, RankReports};
-use crate::process::binding::{Replacement, WeightsUpdated};
+use crate::process::binding::WeightsUpdated;
 use anyhow::{Context as _, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
 
-use proto::request::wire::WeightsInFlight;
 use service::lock;
-use storage::Key;
 
 use super::epoch;
 use crate::memory::client::StorageClient;
-use crate::process::binding::{Target, WeightBinding};
+use crate::process::binding::WeightBinding;
 use crate::scheduler::{self, Message};
 use crate::worker::Worker;
 
@@ -113,149 +110,6 @@ pub(crate) fn at_boundary<T>(
 
     resume(schedulers);
     done
-}
-
-/// Puts the weights of `target`, another checkpoint of the served model, in place on every rank
-/// (`docs/admin.md`, `/admin/update_weights`), and returns each rank's report.
-///
-/// The model's load first walks the checkpoint's headers alone, and a checkpoint that loads other
-/// tensors is refused with the weights as they were. Then, as `in_flight` says:
-///
-/// - `Keep`: the new weights load beside the batches, and at one boundary they are put in place
-///   and the cache is flushed under the new weights' page seeds; the requests in flight go on
-///   with the KV cache they reached and commit nothing from there. When the room beside the KV
-///   cache does not hold the load, the graph storage is given back for it and the batches stop
-///   for as long as it runs; when even that leaves too little room, the update is refused,
-///   changing nothing.
-/// - `Recompute`: the engine sleeps ([`sleep`]), so that the KV cache's storage holds the load,
-///   puts the new weights in place, flushes under their seeds and wakes ([`wake`]); every
-///   request in flight is computed again by the daemon's resubmission.
-/// - `Abort`: every request the schedulers hold ends, aborted, then as `Recompute`.
-///
-/// # Errors
-///
-/// A checkpoint of another model, a load that failed (the ranks serve on as they did), a mapping
-/// change that failed part of the way (the weight binding is poisoned, and the epoch must end), or
-/// a scheduler that stopped.
-pub(crate) fn update_weights(
-    schedulers: &[Sender<Message>],
-    head: &Mutex<StorageClient>,
-    binding: &WeightBinding,
-    target: Target,
-    in_flight: WeightsInFlight,
-) -> Result<Vec<WeightsUpdated>> {
-    let checkpoint = target.checkpoint.display().to_string();
-    let replacement = binding
-        .pair(target, false)
-        .with_context(|| format!("pairing the weights of {checkpoint}"))?;
-
-    match in_flight {
-        WeightsInFlight::Keep => {
-            let bytes = replacement.bytes();
-            let rooms = binding.room()?;
-            let graphs = binding.graph_bytes()?;
-
-            if rooms.iter().all(|room| room.holds(bytes, 0)) {
-                let loaded = binding.load(replacement)?;
-                at_boundary(schedulers, || {
-                    binding.stage(loaded)?;
-                    apply(schedulers, binding)
-                })
-            } else if rooms.iter().all(|room| room.holds(bytes, graphs)) {
-                // The graph storage makes the room: nothing may replay a graph until it is back,
-                // and it comes back only once the old weights' storage went.
-                at_boundary(schedulers, || {
-                    binding.suspend_graphs()?;
-                    let applied = binding
-                        .load(replacement)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|loaded| {
-                            binding.stage(loaded)?;
-                            apply(schedulers, binding)
-                        });
-                    let restored = binding.restore_graphs();
-
-                    let reports = applied?;
-                    restored?;
-                    Ok(reports)
-                })
-            } else {
-                binding.discard(replacement);
-                bail!(
-                    "the weights of {checkpoint} take {bytes} bytes beside the KV cache, and the \
-                     devices have {rooms:?} of room with {graphs} bytes of graph storage to give \
-                     back: `keep` cannot load them, and `recompute` or `abort` gives the KV \
-                     cache's storage to the load"
-                );
-            }
-        }
-        WeightsInFlight::Recompute | WeightsInFlight::Abort => {
-            if in_flight == WeightsInFlight::Abort {
-                let aborted = ask(schedulers, |reply| {
-                    Message::Flush(None, WeightsInFlight::Abort, reply)
-                })?;
-                every(aborted, "aborting the requests it holds")?;
-            }
-
-            // The engine wakes whatever happened after the drain: a sleep that stopped part way
-            // is undone by the wake, which grants back what the head withdrew.
-            let applied = sleep(schedulers, head, binding).and_then(|()| {
-                let loaded = binding.load(replacement)?;
-                binding.stage(loaded)?;
-                apply(schedulers, binding)
-            });
-            let woken = wake(schedulers, head, binding);
-
-            let reports = applied?;
-            woken?;
-            Ok(reports)
-        }
-    }
-}
-
-/// Puts the staged weights in place on every rank, and has every scheduler flush its cache and
-/// key the pages, encoder outputs and trajectories it stores from here on by the new weights. The
-/// requests the schedulers hold continue: under a weight update they commit nothing more.
-///
-/// What keys them is what the rank start states in each group's `Capacity` for the weights it
-/// serves (`crate::process::ranks::capacities`), now for the new ones: the page seed of each cache
-/// group, from the ranks' page identities for the new weights (`storage::key::page_seed`); the
-/// latent seed, from every rank's identity of its new weights (`storage::key::latent_seed`); and
-/// per group whose ranks encode, the identity of their new weights
-/// ([`WeightBinding::encoder_identities`]), which each scheduler takes for its groups. So no
-/// block, encoder output or trajectory another set of weights computed is read. A weight binding
-/// of no rank states no identity, and the seeds stay.
-fn apply(schedulers: &[Sender<Message>], binding: &WeightBinding) -> Result<Vec<WeightsUpdated>> {
-    let reports = binding.update_weights()?;
-
-    let encoders = if reports.is_empty() {
-        Vec::new()
-    } else {
-        binding.encoder_identities()?
-    };
-    let seeds = reports
-        .first()
-        .map(|report| {
-            let pages: Vec<Key> = report
-                .identities
-                .iter()
-                .map(storage::key::page_seed)
-                .collect();
-            let latent = storage::key::latent_seed(
-                reports
-                    .iter()
-                    .filter_map(|report| report.identity.as_deref()),
-            )
-            .ok_or_else(|| anyhow::anyhow!("no rank states the identity of its new weights"))?;
-            anyhow::Ok((pages, latent, encoders))
-        })
-        .transpose()?;
-
-    let flushed = ask(schedulers, |reply| {
-        Message::Flush(seeds.clone(), WeightsInFlight::Keep, reply)
-    })?;
-    every(flushed, "flushing the cache under the new weights")?;
-    Ok(reports)
 }
 
 /// Puts the engine to sleep (`docs/admin.md`, `/admin/sleep`): every scheduler drains at once
@@ -431,14 +285,9 @@ pub(crate) fn make_room(
 ///
 /// # Errors
 ///
-/// A scheduler that stopped or refused.
+/// A scheduler that stopped.
 pub(crate) fn flush(schedulers: &[Sender<Message>]) -> Result<()> {
-    at_boundary(schedulers, || {
-        let flushed = ask(schedulers, |reply| {
-            Message::Flush(None, WeightsInFlight::Keep, reply)
-        })?;
-        every(flushed, "flushing the cache")
-    })
+    at_boundary(schedulers, || ask(schedulers, Message::Flush).map(drop))
 }
 
 /// Puts the redistribution of the routed experts the weight binding holds ready in place, at one
@@ -535,35 +384,29 @@ pub(crate) type Preparation = (u64, std::result::Result<(), String>);
 
 /// What a peer runs each operation of the scheduler node's data plane with
 /// (`crate::executor::peers::Upstream::serve`): [`operate`] on `binding` and `workers`, this
-/// process's, keeping a weight load's replacement between the operations that pair, load, stage
-/// and discard it, and reading the ends of this process's own preparations from `preparations`,
-/// which it waits for at most `bound`.
+/// process's, reading the ends of this process's own preparations from `preparations`, which it
+/// waits for at most `bound`.
 pub(crate) fn operator(
     binding: Arc<WeightBinding>,
     workers: Vec<Arc<Worker>>,
     preparations: Receiver<Preparation>,
     bound: Duration,
 ) -> Operate {
-    let mut held: Option<Replacement> = None;
     Box::new(move |operation| {
         let preparations = (&preparations, bound);
-        operate(&binding, &workers, &mut held, preparations, operation)
-            .map_err(|error| format!("{error:#}"))
+        operate(&binding, &workers, preparations, operation).map_err(|error| format!("{error:#}"))
     })
 }
 
 /// Runs `operation`, which the scheduler node relayed, on this peer's `binding` and `workers`, and
 /// returns its value in the peer link's encoding, as the scheduler node's binding reads it.
-/// `held` is the weight load's replacement this process keeps from the pairing to the stage or
-/// discard that ends it.
 ///
 /// # Errors
 ///
-/// What the operation fails with; a load or a stage with nothing paired.
+/// What the operation fails with.
 fn operate(
     binding: &Arc<WeightBinding>,
     workers: &[Arc<Worker>],
-    held: &mut Option<Replacement>,
     preparations: (&Receiver<Preparation>, Duration),
     operation: DataOperation,
 ) -> Result<Vec<u8>> {
@@ -597,52 +440,17 @@ fn operate(
             encoded(&binding.device_rooms(&groups, region)?)
         }
         Operation::WarmSegments { groups, region } => encoded(&binding.warm_here(&groups, region)?),
-        Operation::Room => encoded(&binding.room()?),
         Operation::UpdateRoom { operators } => {
             let operators = operators.into_iter().collect();
             encoded(&super::generation::update_room_here(
                 workers, binding, &operators,
             )?)
         }
-        Operation::GraphBytes => encoded(&binding.graph_bytes_here()),
         Operation::Sleep => encoded(&binding.sleep()?),
         Operation::SuspendGraphs => encoded(&binding.suspend_graphs()?),
         Operation::RestoreGraphs => encoded(&binding.restore_graphs()?),
         Operation::SetKernels => encoded(&binding.set_kernels()?),
         Operation::ReserveServing => encoded(&binding.reserve_serving()?),
-        Operation::Pair {
-            checkpoint,
-            experts,
-            rearranged,
-        } => {
-            let target = Target {
-                checkpoint: PathBuf::from(checkpoint),
-                experts,
-            };
-            let paired = binding.pair(target, rearranged)?;
-            let bytes = paired.bytes();
-            if let Some(previous) = held.replace(paired) {
-                binding.discard(previous);
-            }
-            encoded(&bytes)
-        }
-        Operation::Load => {
-            let paired = held.take().context("no weights are paired to load")?;
-            *held = Some(binding.load(paired)?);
-            encoded(&())
-        }
-        Operation::Stage => {
-            let loaded = held.take().context("no weights are loaded to stage")?;
-            binding.stage(loaded)?;
-            encoded(&())
-        }
-        Operation::Discard => {
-            if let Some(paired) = held.take() {
-                binding.discard(paired);
-            }
-            encoded(&())
-        }
-        Operation::UpdateWeights => encoded(&binding.update_weights()?),
         Operation::CommitExperts { order } => encoded(&binding.commit_experts(&order)?),
         Operation::ServingOrder => encoded(&binding.served_here()),
         Operation::Prepared { generation } => {

@@ -33,8 +33,8 @@ enum Kind {
     /// Device storage this process created and holds.
     Device(DeviceAllocation),
     /// A device allocation the Storage Server retains, mapped into this process through its
-    /// descriptor. Behind a lock because an in-place weight update replaces the physical
-    /// allocation under the mapping's address ([`Storage::rebind`]).
+    /// descriptor. Behind a lock because an expert commit replaces the physical allocation
+    /// under the mapping's address ([`Storage::rebind`]).
     Mapped(Mutex<PeerMapping>),
     /// Host storage the Storage Server keeps: a memfd mapped into this process and registered
     /// for device copies.

@@ -725,19 +725,6 @@ impl Leader {
         Ok(results)
     }
 
-    pub async fn update_weights(
-        &self,
-        source: &WeightSource,
-        in_flight: WeightsInFlight,
-    ) -> Result<Vec<wire::WeightReport>, UpdateError> {
-        let _replacing = self.replicas.replacing.lock().await;
-        let mut results = Vec::new();
-        for replica in self.replicas() {
-            results.extend(replica.update_weights(source, in_flight).await?);
-        }
-        Ok(results)
-    }
-
     /// The settings of the deployment's Storage Servers as the serving configuration states
     /// them (`Config::storage_settings`).
     pub(crate) fn storage_settings(&self) -> storage::Settings {
@@ -1600,84 +1587,6 @@ impl StatusChanges {
             futures::future::select_all(waits).await;
         }
         self.follow();
-    }
-}
-
-/// Where an in-place weight update reads the weights from (`POST /admin/update_weights`'s
-/// `model_path`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub enum WeightSource {
-    /// Another checkpoint of the served model: a local directory or a Hugging Face repository.
-    Checkpoint(String),
-    /// A plugin's weight source that streams the served checkpoint's tensors, named by its URL
-    /// (`scheme://...`).
-    Streamed(String),
-}
-
-impl WeightSource {
-    /// The source as the operator named it.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Checkpoint(source) | Self::Streamed(source) => source,
-        }
-    }
-}
-
-impl TryFrom<String> for WeightSource {
-    type Error = String;
-
-    /// A source that parses as a URL with a scheme of its own is streamed; any other names a
-    /// checkpoint.
-    ///
-    /// # Errors
-    ///
-    /// An empty source.
-    fn try_from(source: String) -> Result<Self, Self::Error> {
-        if source.is_empty() {
-            return Err("model_path names no checkpoint or weight source".to_owned());
-        }
-        // A one-letter scheme is a drive, not a protocol.
-        let streamed = url::Url::parse(&source).is_ok_and(|url| url.scheme().len() > 1);
-        Ok(if streamed {
-            Self::Streamed(source)
-        } else {
-            Self::Checkpoint(source)
-        })
-    }
-}
-
-impl From<WeightSource> for String {
-    fn from(source: WeightSource) -> Self {
-        match source {
-            WeightSource::Checkpoint(source) | WeightSource::Streamed(source) => source,
-        }
-    }
-}
-
-/// How the requests in flight continue through an in-place weight update
-/// (`POST /admin/update_weights`; vLLM's `keep` and `abort`, SGLang's
-/// `in_place`, `retract` and `abort`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WeightsInFlight {
-    /// Each continues on the new weights with the KV cache it reached; the
-    /// pages it writes afterwards reach no shared tier.
-    #[default]
-    Keep,
-    /// Each computes its state again with the new weights.
-    Recompute,
-    /// Each ends, aborted.
-    Abort,
-}
-
-impl From<WeightsInFlight> for wire::WeightsInFlight {
-    fn from(in_flight: WeightsInFlight) -> Self {
-        match in_flight {
-            WeightsInFlight::Keep => Self::Keep,
-            WeightsInFlight::Recompute => Self::Recompute,
-            WeightsInFlight::Abort => Self::Abort,
-        }
     }
 }
 
@@ -3426,103 +3335,6 @@ impl Replica {
             .map_err(|error| UpdateError::Failed(anyhow::anyhow!("{what}: {error}")))
     }
 
-    /// Rewrites the engine's weights in place from `source`: another checkpoint
-    /// of the served model, as SGLang's `update_weights_from_disk` does, or a
-    /// plugin's weight source that streams the served checkpoint's tensors, and
-    /// returns what each worker reported. New requests wait; the requests
-    /// in flight continue as `in_flight` says (`scheduler::WeightsInFlight`):
-    /// on the new weights with the KV cache they reached, recomputed with
-    /// the new weights once the others finish, or aborted. A relaunch or an
-    /// update after loads the new checkpoint.
-    ///
-    /// # Errors
-    ///
-    /// Refuses a checkpoint the daemon would process requests of
-    /// differently (another tokenizer, chat template, generation defaults
-    /// or model facts); fails when no engine serves, or with the reason a
-    /// worker did not update, after which the weights are those of before.
-    pub(crate) async fn update_weights(
-        self: &Arc<Self>,
-        source: &WeightSource,
-        in_flight: WeightsInFlight,
-    ) -> Result<Vec<wire::WeightReport>, UpdateError> {
-        let _replacing = self.replacing.lock().await;
-        let hold = self.hold();
-        let client = hold.client().ok_or(UpdateError::NoEngine)?;
-        let mut config = service::lock(&self.config).clone();
-        let model_path = source.as_str();
-        // A plugin's weight source streams the tensors of the served
-        // checkpoint, whose configuration and tokenizer stay; another
-        // checkpoint of the model is checked to process requests alike.
-        let streamed = matches!(source, WeightSource::Streamed(_));
-        let mut prepared_model = None;
-        if streamed {
-            config.load_config.weights = Some(model_path.to_owned());
-        } else {
-            // The checkpoint is a local directory, as the engine reads it.
-            config.model = None;
-            config.model_dir = Some(model_path.into());
-            config.load_config.weights = None;
-            let prepared =
-                Leader::prepare(&self.families, &config, &Stated::from_paths(Vec::new()))
-                    .await
-                    .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-            let served_checkpoint = service::lock(&self.served)
-                .as_ref()
-                .map(|args| args.engine_config.model.model.clone())
-                .ok_or(UpdateError::NoEngine)?;
-            same_processing(
-                &self.families,
-                &served_checkpoint,
-                &prepared.engine.model.model,
-            )
-            .await
-            .map_err(UpdateError::Refused)?;
-            let served = service::lock(&self.served)
-                .as_ref()
-                .map(|args| args.engine_config.model.clone());
-            if served.is_some_and(|served| !served.processes_as(&prepared.engine.model)) {
-                return Err(UpdateError::Refused(format!(
-                    "the checkpoint at {model_path} has other model facts (generation limits, \
-                     special tokens or context length) than the served model: deploy it instead"
-                )));
-            }
-            prepared_model = Some(prepared.engine.model);
-        }
-
-        let paused = !hold.pause();
-        let started = Instant::now();
-        let results = client.update_weights(model_path, in_flight.into()).await;
-        if paused {
-            hold.resume();
-        }
-        let results = results.map_err(|error| {
-            UpdateError::Failed(anyhow::anyhow!("the weights were not updated: {error}"))
-        })?;
-        if let Some(args) = service::lock(&self.served).as_mut() {
-            if let Some(prepared) = prepared_model {
-                let proto::config::ModelConfig { model, base, .. } = prepared;
-                args.engine_config.model.model = model;
-                args.engine_config.model.base = base;
-            }
-            args.engine_config
-                .load
-                .weights
-                .clone_from(&config.load_config.weights);
-        }
-        *service::lock(&self.config) = config;
-        // A parked standby mapped the weights this update replaced, and a promotion would serve
-        // them: it starts again on the new ones.
-        self.restart_standby();
-        info!(
-            model = model_path,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            ?in_flight,
-            "the engine updated its weights in place"
-        );
-        Ok(results)
-    }
-
     /// Has the serving engine revoke every cached prefix page; the
     /// requests in flight keep theirs.
     ///
@@ -4369,32 +4181,6 @@ mod tests {
         let mut union = deployment(1, 4, true);
         union.moe.exchange = Some("deepep".to_owned());
         assert_eq!(super::replica_configs(&union).unwrap().len(), 1);
-    }
-
-    /// A weight source that parses as a URL of its own scheme streams the served checkpoint's
-    /// tensors; a directory, a repository or a path behind a drive letter names a checkpoint,
-    /// and an empty source is refused.
-    #[test]
-    fn a_weight_source_is_streamed_by_its_url_scheme() {
-        use super::WeightSource;
-
-        for checkpoint in ["Org/model", "relative/dir", "C:\\checkpoints\\model"] {
-            assert_eq!(
-                WeightSource::try_from(checkpoint.to_owned()),
-                Ok(WeightSource::Checkpoint(checkpoint.to_owned()))
-            );
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().to_str().unwrap().to_owned();
-        assert_eq!(
-            WeightSource::try_from(path.clone()),
-            Ok(WeightSource::Checkpoint(path))
-        );
-        assert_eq!(
-            WeightSource::try_from("s3://bucket/weights".to_owned()),
-            Ok(WeightSource::Streamed("s3://bucket/weights".to_owned()))
-        );
-        assert!(WeightSource::try_from(String::new()).is_err());
     }
 
     /// A pipeline checkpoint processes requests as the served one only with the same index and,

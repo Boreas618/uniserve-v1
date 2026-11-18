@@ -298,12 +298,12 @@ fn a_loader_publishes_a_checkpoint_and_a_second_load_maps_what_was_published() {
     assert_eq!(device_bytes(&embed, device), embed_bytes(DEVICE_ROWS, 1.0));
 }
 
-/// An update in place loads another checkpoint of the model beside the weights that serve and
-/// puts each changed weight at the address of the one it replaces: the tensors the first load
-/// returned, which a rank's modules and graphs hold, read the other checkpoint's bytes.
+/// A second load beside the weights that serve publishes each weight whose key changed, and a
+/// rebind puts it at the address of the one it replaces, as an expert commit does: the tensors
+/// the first load returned, which a rank's modules and graphs hold, read the new bytes.
 #[test]
 #[ignore = "requires a GPU"]
-fn an_update_in_place_puts_the_changed_weights_at_the_serving_addresses() {
+fn a_rebind_puts_the_changed_weights_at_the_serving_addresses() {
     let device = DeviceId(0);
     let server = StorageServer::start();
     let (_head, client) = rank(&server);
@@ -320,7 +320,7 @@ fn an_update_in_place_puts_the_changed_weights_at_the_serving_addresses() {
     let stated = MetaWeights::new();
     load(&target_checkpoint, &stated, DEVICE_ROWS);
     let target = stated.into_order();
-    let pairs = paired(&serving, &target, false).unwrap();
+    let pairs = paired(&serving, &target).unwrap();
     assert_eq!(pairs.len(), 2);
 
     let reload = Reload::new(&store, &serving).unwrap();

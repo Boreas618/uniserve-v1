@@ -30,8 +30,6 @@ pub enum OperationKind {
     Commit,
     /// `POST /admin/config/rollback`.
     Rollback,
-    /// `POST /admin/update_weights`.
-    UpdateWeights,
     /// `POST /admin/rebalance_experts`.
     RebalanceExperts,
     /// `POST /admin/pause_generation`.
@@ -63,7 +61,6 @@ impl OperationKind {
             Self::Config => "config",
             Self::Commit => "commit",
             Self::Rollback => "rollback",
-            Self::UpdateWeights => "update_weights",
             Self::RebalanceExperts => "rebalance_experts",
             Self::PauseGeneration => "pause_generation",
             Self::ContinueGeneration => "continue_generation",

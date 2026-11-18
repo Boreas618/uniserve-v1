@@ -1,7 +1,7 @@
 //! The weight binding of a serving epoch: the operations thread's changes to what its ranks hold
-//! on their devices inside the epoch, weights above all. Another checkpoint's weights are staged
-//! beside the serving batches and bound at a batch boundary in place of the ones they replace; the
-//! KV planes' segments, the graph pools, LoRA adapters, profiling sessions and the process's
+//! on their devices inside the epoch. A redistribution of the routed experts is copied beside the
+//! serving batches and bound at a batch boundary in place of the stacks it replaces; the KV
+//! planes' segments, the graph pools, LoRA adapters, profiling sessions and the process's
 //! reservation in its GPUs' quotas change through the same ranks.
 //!
 //! Every change reaches a device as a control operation of the rank's worker
@@ -13,25 +13,25 @@
 //!
 //! The work comes in three kinds, which differ in who may run them when:
 //!
-//! - **At a batch boundary**: binding staged weights in place ([`WeightBinding::update_weights`],
-//!   [`WeightBinding::commit_experts`]), suspending and restoring the graph pools, releasing and
+//! - **At a batch boundary**: binding a redistribution's weights in place
+//!   ([`WeightBinding::commit_experts`]), suspending and restoring the graph pools, releasing and
 //!   creating the KV planes' segments, and the kernels the cache and the state launch, each
 //!   rank's from the generation its graphs serve ([`WeightBinding::set_kernels`]). A control
 //!   operation is ordered against its own worker's jobs only, so the engine first pauses the
 //!   schedulers whose batches read what changes: every rank of a group then changes between the
 //!   same two batches.
-//! - **Beside the serving batches**: staging a load of another checkpoint of the same model, or
-//!   of another arrangement of its experts ([`WeightBinding::pair`], [`WeightBinding::load`]),
-//!   published at the Storage Server while requests go on; LoRA adapters; profiling sessions,
-//!   which each rank's worker starts and ends between two of its batches.
+//! - **Beside the serving batches**: copying another arrangement of the routed experts
+//!   ([`WeightBinding::prepare_experts`], [`WeightBinding::start_experts`]), published at the
+//!   Storage Server while requests go on; LoRA adapters; profiling sessions, which each rank's
+//!   worker starts and ends between two of its batches.
 //! - **The quota**: what the process holds on each device beside its pools and the Storage
 //!   Server's storages, reserved in the GPU's quota ([`WeightBinding::reserve_serving`]) with
 //!   what a profiling session's collectors hold.
 //!
-//! A weight is never written after it is published, by anyone. An update changes which published
+//! A weight is never written after it is published, by anyone. A commit changes which published
 //! allocation an address maps: the graphs captured over that address stay valid, the mapping
-//! stays read-only, and the allocation is the one a relaunch on the new target finds under its
-//! own key.
+//! stays read-only, and the allocation is the one a relaunch on the new expert order finds under
+//! its own key.
 //!
 //! ## The KV planes' memory
 //!
@@ -76,13 +76,12 @@
 //! process's ranks and sends it to each link that holds a rank it names
 //! ([`DataOperation`]), which the peer runs on its own binding, then awaits every part and joins
 //! the values. Segment tables are listed in rank order and must agree where the ranks create
-//! segments; rooms are listed, and the segments that fit and the graph bytes given back are the
-//! smallest over every rank; reports and results are listed in rank order. A boundary
-//! operation is ordered against the group's batches as this process's is: the schedulers are
-//! paused, and no batch travels to a peer until it ended there. A weight load's replacement stays
-//! in each process: a peer pairs, loads, stages and discards its own as this process does.
-//! An expert redistribution's stages run on each process's own ranks as the daemon's operations
-//! reach it ([`WeightBinding::on_peers`]); its commit acts on every rank.
+//! segments; rooms are listed, and the segments that fit are the smallest over every rank;
+//! reports and results are listed in rank order. A boundary operation is ordered against the
+//! group's batches as this process's is: the schedulers are paused, and no batch travels to a
+//! peer until it ended there. An expert redistribution's stages run on each process's own ranks
+//! as the daemon's operations reach it ([`WeightBinding::on_peers`]), each keeping its own
+//! replacement; its commit acts on every rank.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -231,28 +230,13 @@ struct Share {
     bytes: u64,
 }
 
-/// A load of another target on every rank, from its pairing to the boundary that puts it in
-/// place, or to its discard.
+/// A load of another expert order on every rank of this process, from its pairing to the
+/// boundary that puts it in place, or to its discard.
 pub(crate) struct Replacement {
     target: Target,
     ranks: Vec<Share>,
-    /// The most device bytes a rank of the peers needs beside what it serves: each peer keeps
-    /// its own share of the replacement.
-    peers: u64,
     /// Whether the new weights are published yet, so a discard knows what there is to release.
     loaded: bool,
-}
-
-impl Replacement {
-    /// The most device bytes any rank needs beside what it serves.
-    pub(crate) fn bytes(&self) -> u64 {
-        self.ranks
-            .iter()
-            .map(|rank| rank.bytes)
-            .max()
-            .unwrap_or(0)
-            .max(self.peers)
-    }
 }
 
 /// The room one device has beside what it holds.
@@ -361,8 +345,6 @@ pub(crate) struct WeightBinding {
     remotes: Vec<(Vec<GroupId>, Arc<Remote>)>,
     /// What the ranks serve now.
     target: Mutex<Target>,
-    /// A weight update's load, waiting for its boundary.
-    staged: Mutex<Option<Replacement>>,
     experts: Mutex<Option<Experts>>,
     /// Signalled when copies that ran leave [`Experts::Copying`], which an abort waits on: the
     /// copies own their storage until they end.
@@ -399,15 +381,10 @@ fn rejected(what: &str, error: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("{what}: {error}"))
 }
 
-/// The digest a set of weights is known by, from their load's order: what roots the prefix hash
-/// chains of the pages computed with them, so a page of another checkpoint never matches.
-pub(crate) fn identity_of(order: &[(WeightKey, bool)]) -> String {
-    identity_of_names(order.iter().map(|(key, _)| key.to_string()))
-}
-
-/// [`identity_of`] the weights of `names`, each weight's name (its key's text) in their load's
-/// order.
-pub(crate) fn identity_of_names(names: impl IntoIterator<Item = impl AsRef<str>>) -> String {
+/// The digest a set of weights is known by, from `names`, each weight's name (its key's text) in
+/// their load's order: what roots the prefix hash chains of the pages computed with them, so a
+/// page of another checkpoint never matches.
+pub(crate) fn identity_of(names: impl IntoIterator<Item = impl AsRef<str>>) -> String {
     let mut digest = ::storage::key::Digest::new(b"uniserve-weights-identity");
     for name in names {
         digest.text(name.as_ref());
@@ -429,8 +406,7 @@ pub(crate) fn served(group: GroupId, encodes: bool, weights: &[(WeightKey, bool)
 /// The identity of the weights that compute each worker group's encoder outputs
 /// (`Capacity::encoder_identity`), from `ranks`, what every rank of the deployment serves in rank
 /// order: per group, in the order of its first encoding rank, the identity of its encoding ranks'
-/// weights in rank order ([`identity_of`]). The rank start states it, and a weight update renews
-/// it from the same ranks, so one set of weights keys its outputs alike in both.
+/// weights in rank order ([`identity_of`]), as the rank start states it.
 pub(crate) fn encoder_identities(ranks: &[Served]) -> Vec<(GroupId, String)> {
     let mut groups: Vec<(GroupId, Vec<&str>)> = Vec::new();
     for (group, _, names) in ranks.iter().filter(|(_, encodes, _)| *encodes) {
@@ -443,14 +419,14 @@ pub(crate) fn encoder_identities(ranks: &[Served]) -> Vec<(GroupId, String)> {
 
     groups
         .into_iter()
-        .map(|(group, names)| (group, identity_of_names(names)))
+        .map(|(group, names)| (group, identity_of(names)))
         .collect()
 }
 
 /// The identity the pages of every rank of the deployment are keyed by: of the weights of
 /// `ranks`, every rank's in rank order ([`identity_of`]).
 pub(crate) fn page_identity(ranks: &[Served]) -> String {
-    identity_of_names(ranks.iter().flat_map(|(_, _, names)| names))
+    identity_of(ranks.iter().flat_map(|(_, _, names)| names))
 }
 
 /// Refuses `tables`, every rank's segment table of the regions an operation created segments
@@ -626,7 +602,6 @@ impl WeightBinding {
             ranks: ranks.into_iter().map(Mutex::new).collect(),
             remotes,
             target: Mutex::new(target),
-            staged: Mutex::new(None),
             experts: Mutex::new(None),
             experts_copied: Condvar::new(),
             adapters: Mutex::new(BTreeMap::new()),
@@ -1095,21 +1070,6 @@ impl WeightBinding {
         lock(&self.target).clone()
     }
 
-    /// What every rank of the deployment this binding reaches serves, in rank order: this
-    /// process's ranks, then each peer's. What a rank's pages and encoder outputs hold follows
-    /// from all of them: an expert union's rank computes each token's experts on its peers, and a
-    /// tensor rank's activations reach the others', so a page is another page once any rank's
-    /// weights change, and every rank keys it alike.
-    ///
-    /// # Errors
-    ///
-    /// A peer's failure.
-    pub(crate) fn served(&self) -> Result<Vec<Served>> {
-        let mut ranks = self.served_here();
-        ranks.extend(self.served_by_peers()?);
-        Ok(ranks)
-    }
-
     /// What every peer's rank serves, in rank order; none on an epoch of one process.
     ///
     /// # Errors
@@ -1163,31 +1123,6 @@ impl WeightBinding {
             .collect()
     }
 
-    /// The identity of the weights that compute each worker group's encoder outputs, as every
-    /// rank of the deployment serves them now ([`encoder_identities`]): what a weight update keys
-    /// the outputs computed after it by. A group none of whose ranks encodes has none.
-    ///
-    /// # Errors
-    ///
-    /// A peer's failure.
-    pub(crate) fn encoder_identities(&self) -> Result<Vec<(GroupId, String)>> {
-        Ok(encoder_identities(&self.served()?))
-    }
-
-    /// The room every device has for a load, in rank order, the peers' ranks after this
-    /// process's.
-    ///
-    /// # Errors
-    ///
-    /// When the quota or the device cannot be read, or a peer's failure.
-    pub(crate) fn room(&self) -> Result<Vec<Room>> {
-        let answers = self.ask_peers(None, || DataOperation::Room)?;
-        let here: Result<Vec<Room>> = self.ranks.iter().map(|rank| room_of(&lock(rank))).collect();
-        let (mut rooms, peers) = both(here, answered::<Vec<Room>>(answers))?;
-        rooms.extend(peers.into_iter().flatten());
-        Ok(rooms)
-    }
-
     /// What the ranks' devices map now, one entry per device in the order of its first rank, as
     /// the process's metrics report it: the limit of the GPU's quota the mappings are reserved
     /// against, the bytes each pool of the device's allocators maps (`GraphPool::usage`), and
@@ -1226,59 +1161,15 @@ impl WeightBinding {
         devices
     }
 
-    /// The bytes of device storage the graph pools map, on the device that maps the fewest over
-    /// every rank, the peers' included: what a suspension of the pools gives back on every
-    /// device. Zero for a binding of no rank.
-    ///
-    /// # Errors
-    ///
-    /// A peer's failure.
-    pub(crate) fn graph_bytes(&self) -> Result<u64> {
-        let answers = self.ask_peers(None, || DataOperation::GraphBytes)?;
-        let here = self.graph_bytes_here();
-        let peers: Vec<Option<u64>> = answered(answers)?;
-        Ok(peers.into_iter().chain([here]).flatten().min().unwrap_or(0))
-    }
-
-    /// [`Self::graph_bytes`] over this process's ranks; none for a process of no rank.
-    pub(crate) fn graph_bytes_here(&self) -> Option<u64> {
-        self.ranks
-            .iter()
-            .map(|rank| Arc::clone(&lock(rank).graphs))
-            .map(|graphs| lock(&graphs).mapped())
-            .min()
-    }
-
-    /// Pairs the weights of a load of `target` with the ones that serve, on every rank, the
-    /// peers' included, each of which keeps its own share ([`Self::pair_here`]).
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::pair_here`], on any rank.
-    pub(crate) fn pair(&self, target: Target, rearranged: bool) -> Result<Replacement> {
-        let checkpoint = target.checkpoint.to_string_lossy().into_owned();
-        let answers = self.ask_peers(None, || DataOperation::Pair {
-            checkpoint: checkpoint.clone(),
-            experts: target.experts.clone(),
-            rearranged,
-        })?;
-        let here = self.pair_here(target, rearranged);
-        let (mut replacement, peers) = both(here, answered::<u64>(answers))?;
-
-        replacement.peers = peers.into_iter().max().unwrap_or(0);
-        Ok(replacement)
-    }
-
-    /// Pairs the weights of a load of `target` with the ones that serve, on every rank of this
-    /// process, moving no byte: the model's load runs over storage on the meta device, which
-    /// states the weights it reaches without reading a payload. With `rearranged`, a stack may
-    /// hold the same parts in another order (an expert redistribution); without, each weight
-    /// reads the same tensors (a weight update).
+    /// Pairs the weights of a load of `target`, another expert order of the served checkpoint,
+    /// with the ones that serve, on every rank of this process, moving no byte: the model's load
+    /// runs over storage on the meta device, which states the weights it reaches without reading
+    /// a payload, and a stack may hold the same parts in another order.
     ///
     /// # Errors
     ///
     /// When the target cannot be the served model: the sentence names its first difference.
-    pub(crate) fn pair_here(&self, target: Target, rearranged: bool) -> Result<Replacement> {
+    fn pair_here(&self, target: Target) -> Result<Replacement> {
         let mut ranks = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
             let (model, weights, serving) = {
@@ -1294,7 +1185,7 @@ impl WeightBinding {
             model.load(&target, &meta).map_err(Error::Invalid)?;
             let order = meta.into_order();
 
-            let pairs = paired(&serving, &order, rearranged).map_err(|difference| {
+            let pairs = paired(&serving, &order).map_err(|difference| {
                 Error::Invalid(format!(
                     "{} loads other tensors than the served model: {difference}",
                     target.checkpoint.display()
@@ -1317,35 +1208,8 @@ impl WeightBinding {
         Ok(Replacement {
             target,
             ranks,
-            peers: 0,
             loaded: false,
         })
-    }
-
-    /// Publishes what `replacement` changes on every rank, each peer its own share
-    /// ([`Self::load_here`]).
-    ///
-    /// # Errors
-    ///
-    /// When a rank's load fails: everything this load published is released on every rank, and
-    /// the ranks serve on as they did.
-    pub(crate) fn load(&self, replacement: Replacement) -> Result<Replacement> {
-        let answers = self.ask_peers(None, || DataOperation::Load)?;
-        let here = self.load_here(replacement);
-        let there = answered::<()>(answers);
-
-        match (here, there) {
-            (Ok(replacement), Ok(_)) => Ok(replacement),
-            (Ok(replacement), Err(error)) => {
-                self.discard(replacement);
-                Err(error)
-            }
-            // This process's share is released already; the peers' goes too.
-            (Err(error), _) => {
-                self.discard_peers();
-                Err(error)
-            }
-        }
     }
 
     /// Publishes what `replacement` changes on every rank of this process, each rank on a thread
@@ -1355,7 +1219,7 @@ impl WeightBinding {
     ///
     /// When a rank's load fails: everything this load published is released, and the ranks serve
     /// on as they did.
-    pub(crate) fn load_here(&self, mut replacement: Replacement) -> Result<Replacement> {
+    fn load_here(&self, mut replacement: Replacement) -> Result<Replacement> {
         let target = replacement.target.clone();
 
         // One rank's share of the load, copied out so no rank's lock is held while the loads run.
@@ -1423,27 +1287,9 @@ impl WeightBinding {
         Ok(replacement)
     }
 
-    /// Ends a replacement that will not serve, on every rank: what its load published goes back,
-    /// and the ranks serve on.
-    pub(crate) fn discard(&self, replacement: Replacement) {
-        self.discard_here(replacement);
-        self.discard_peers();
-    }
-
-    /// Ends each peer's share of the replacement that will not serve. A failure leaves storage
-    /// published that nothing reads, which only overstates the peer's storage, so it is logged.
-    fn discard_peers(&self) {
-        let discarded = self
-            .ask_peers(None, || DataOperation::Discard)
-            .and_then(answered::<()>);
-        if let Err(error) = discarded {
-            tracing::warn!(%error, "a peer's abandoned weight load was not released");
-        }
-    }
-
     /// Ends a replacement of this process's ranks that will not serve: what its load published
     /// goes back, and the ranks serve on.
-    pub(crate) fn discard_here(&self, replacement: Replacement) {
+    fn discard_here(&self, replacement: Replacement) {
         if !replacement.loaded {
             return;
         }
@@ -1459,53 +1305,9 @@ impl WeightBinding {
         }
     }
 
-    /// Keeps a loaded replacement for the boundary that puts it in place
-    /// ([`Self::update_weights`]), each peer its own share.
-    ///
-    /// # Errors
-    ///
-    /// A peer that holds no loaded share.
-    pub(crate) fn stage(&self, replacement: Replacement) -> Result<()> {
-        let answers = self.ask_peers(None, || DataOperation::Stage)?;
-        self.stage_here(replacement);
-        answered::<()>(answers).map(drop)
-    }
-
-    /// Keeps a loaded replacement of this process's ranks for the boundary that puts it in place.
-    pub(crate) fn stage_here(&self, replacement: Replacement) {
-        if let Some(previous) = lock(&self.staged).replace(replacement) {
-            self.discard_here(previous);
-        }
-    }
-
-    /// Puts the staged replacement in place on every rank, the peers' included, and returns each
-    /// rank's report, in rank order.
-    ///
-    /// The caller has paused every scheduler whose batches read the ranks' weights, so every
-    /// rank of a group changes between the same two batches.
-    ///
-    /// # Errors
-    ///
-    /// When no replacement is staged, and as [`Self::commit_experts`].
-    pub(crate) fn update_weights(&self) -> Result<Vec<WeightsUpdated>> {
-        let answers = self.ask_peers(None, || DataOperation::UpdateWeights)?;
-        let here = lock(&self.staged)
-            .take()
-            .ok_or(Error::State(
-                "no weights are loaded for this update to put in place",
-            ))
-            .and_then(|replacement| self.rebind(replacement));
-        self.reported(here, answers)
-    }
-
     /// The reports of a change of every rank's weights: this process's (`here`) and each peer's
     /// (`answers`), in rank order. A peer that changed part of the way leaves the deployment's
-    /// weights no one checkpoint's, which poisons this binding as a rank of its own would.
-    ///
-    /// Every rank keys its pages by the weights of every rank of the deployment
-    /// ([`Self::served`]), which only this process reaches: each report that states page
-    /// identities states the ones this process's ranks give for all of them, every rank of a
-    /// text deployment laying its cache out as the others do.
+    /// weights no one order's, which poisons this binding as a rank of its own would.
     fn reported(
         &self,
         here: Result<Vec<WeightsUpdated>>,
@@ -1517,24 +1319,6 @@ impl WeightBinding {
         }
         let (mut reports, peers) = both(here, there)?;
         reports.extend(peers.into_iter().flatten());
-        if self.remotes.is_empty() {
-            return Ok(reports);
-        }
-
-        let fingerprint = page_identity(&self.served()?);
-        let identities = self.ranks.iter().find_map(|rank| {
-            let rank = lock(rank);
-            let cache = rank.cache.as_ref()?;
-            Some(lock(cache).page_identities(&fingerprint))
-        });
-        if let Some(identities) = identities {
-            for report in reports
-                .iter_mut()
-                .filter(|report| !report.identities.is_empty())
-            {
-                report.identities.clone_from(&identities);
-            }
-        }
         Ok(reports)
     }
 
@@ -1583,23 +1367,12 @@ impl WeightBinding {
             lock(rank).serving = share.order;
         }
 
-        // The cached pages were computed from the weights this replaces, so later pages are keyed
-        // by the new ones at every cache level: a prompt no longer finds the old.
-        let pages = page_identity(&self.served_here());
         let mut reports = Vec::with_capacity(moved.len());
         for (rank, moved) in self.ranks.iter().zip(moved) {
             let rank = lock(rank);
-            let identities = rank
-                .cache
-                .as_ref()
-                .map(|cache| lock(cache).page_identities(&pages))
-                .unwrap_or_default();
-
             reports.push(WeightsUpdated {
                 group: rank.client.scope().map(|scope| scope.group.clone()),
                 rank: rank.client.scope().map(|scope| scope.rank),
-                identity: Some(identity_of(&rank.serving)),
-                identities,
                 moved,
             });
         }
@@ -2157,7 +1930,7 @@ impl WeightBinding {
 
         let mut target = self.target();
         target.experts.extend(orders.clone());
-        let replacement = self.pair_here(target, true)?;
+        let replacement = self.pair_here(target)?;
 
         let mut reports = Vec::with_capacity(self.ranks.len());
         for (rank, share) in self.ranks.iter().zip(&replacement.ranks) {
@@ -2456,7 +2229,7 @@ impl WeightBinding {
     }
 }
 
-/// What a rank responds of a change of its weights: an update's or an expert commit's report.
+/// What a rank responds of an expert commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WeightsUpdated {
     /// The rank's worker group and rank; `None` from a worker of no
@@ -2465,16 +2238,7 @@ pub(crate) struct WeightsUpdated {
     pub(crate) group: Option<String>,
     #[serde(default)]
     pub(crate) rank: Option<u32>,
-    /// The identity of the rank's new weights, which keys the trajectories
-    /// they compute.
-    #[serde(default)]
-    pub(crate) identity: Option<String>,
-    /// The page identity of each of the rank's cache groups under the new
-    /// weights (`KvCacheMemory::page_identities`); empty for a rank that keeps
-    /// no paged cache.
-    #[serde(default)]
-    pub(crate) identities: Vec<storage::Key>,
-    /// The weights the update rewrote.
+    /// The weights the commit mapped at the addresses of the ones they replace.
     #[serde(default)]
     pub(crate) moved: usize,
 }
@@ -2813,22 +2577,8 @@ mod tests {
 
     #[test]
     fn one_set_of_weights_has_one_identity_whatever_loads_it() {
-        let weight = |tensor: &str| {
-            let key = WeightKey {
-                files: Vec::new(),
-                dtype: nn::DType::BF16,
-                layout: nn::WeightLayout::ROW_MAJOR,
-                tensors: vec![tensor.to_owned()],
-                start: 0,
-                shape: nn::Shape::from(vec![1]),
-                stride: None,
-                provenance: None,
-            };
-            (key, false)
-        };
-
-        let first = identity_of(&[weight("a"), weight("b")]);
-        assert_eq!(first, identity_of(&[weight("a"), weight("b")]));
-        assert_ne!(first, identity_of(&[weight("a"), weight("c")]));
+        let first = identity_of(["a", "b"]);
+        assert_eq!(first, identity_of(["a", "b"]));
+        assert_ne!(first, identity_of(["a", "c"]));
     }
 }

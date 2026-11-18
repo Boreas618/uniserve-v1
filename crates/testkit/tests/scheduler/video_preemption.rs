@@ -27,7 +27,7 @@ use crate::harness::{A, Deployment, Harness, LATENT_SEED, STEPS, pipeline, video
 const TRAJECTORY: u64 = 7;
 
 /// The latent seed of the harness's epoch: the one its denoising group states for its weights
-/// from the start (SD §2.1 `Capacity`, §4.3), with no weight update since.
+/// from the start (SD §2.1 `Capacity`, §4.3).
 const SEED: u64 = LATENT_SEED;
 
 /// The host latent units of a stored trajectory: the harness's captured shape states 30 000 bytes

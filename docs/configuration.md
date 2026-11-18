@@ -211,7 +211,7 @@ The Transfer Server copies by its host's calibration, which `uniserve storage-se
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `weights` | unset | A weight source (`scheme://...`) that streams the checkpoint's tensors in place of its files; the model's configuration and tokenizer stay the checkpoint's. An in-place weight update from a source sets it |
+| `weights` | unset | A weight source (`scheme://...`) that streams the checkpoint's tensors in place of its files; the model's configuration and tokenizer stay the checkpoint's |
 
 ### `kv_cache_config`
 

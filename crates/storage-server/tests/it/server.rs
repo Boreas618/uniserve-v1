@@ -374,92 +374,6 @@ fn putting_a_retained_read_only_key_again_keeps_the_retained_bytes_for_both_scop
 }
 
 #[test]
-fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
-    let server = Running::start();
-    // The head stays connected, so another deployment's claim keeps this
-    // one.
-    let mut model_head = head(&server.socket);
-    let claim = model_head
-        .claim(
-            Claimant::Head,
-            0,
-            vec![scope("text", 0), scope("text", 1)],
-            Vec::new(),
-        )
-        .unwrap();
-    model_head.publish(vec![0]).unwrap();
-    let mut first = worker(&server.socket, scope("text", 0), 1, claim);
-    let storage = memfd(b"abcdefgh");
-    first
-        .put(
-            vec![
-                tensor(key(1), "a", 0, 0, Access::ReadOnly),
-                tensor(key(2), "b", 0, 4, Access::ReadOnly),
-                tensor(key(3), "planes", 0, 0, Access::Exclusive),
-            ],
-            &[(host(8), storage.as_fd())],
-        )
-        .unwrap();
-    // Another rank of the deployment holds `a` too.
-    let mut second = worker(&server.socket, scope("text", 1), 1, claim);
-    second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
-
-    // Refused, moving none: an exclusive tensor, a retained new key, or one
-    // new key twice.
-    assert_eq!(
-        server_error(first.rekey(vec![(key(1), key(11)), (key(3), key(13))], Vec::new())),
-        ErrorKind::Invalid
-    );
-    assert_eq!(
-        server_error(first.rekey(vec![(key(1), key(11)), (key(2), key(1))], Vec::new())),
-        ErrorKind::Invalid
-    );
-    assert_eq!(
-        server_error(first.rekey(vec![(key(1), key(11)), (key(2), key(11))], Vec::new())),
-        ErrorKind::Invalid
-    );
-    assert_eq!(
-        first
-            .get(vec![key(1), key(2)], Mode::Read, Vec::new())
-            .unwrap()
-            .0
-            .missing,
-        vec![]
-    );
-
-    // The deployment's tensors move with their scopes; the old keys name
-    // nothing more and the new ones the same bytes.
-    first
-        .rekey(vec![(key(1), key(11)), (key(2), key(12))], Vec::new())
-        .unwrap();
-    let (got, descriptors) = second
-        .get(vec![key(1), key(11), key(12)], Mode::Read, Vec::new())
-        .unwrap();
-    assert_eq!(got.missing, vec![key(1)]);
-    let descriptor = descriptors.into_iter().next().unwrap();
-    assert_eq!(contents(descriptor), b"abcdefgh");
-    let listing = first.list().unwrap();
-    let a = listing
-        .tensors
-        .iter()
-        .find(|tensor| tensor.name == "a")
-        .unwrap();
-    assert_eq!(a.scopes, vec![scope("text", 0), scope("text", 1)]);
-
-    // A tensor another deployment holds as well is not the caller's to move.
-    let other = scope_of("other");
-    let other_claim = head_of(&server.socket, "other")
-        .claim(Claimant::Head, 0, vec![other.clone()], Vec::new())
-        .unwrap();
-    let mut stranger = worker(&server.socket, other, 1, other_claim);
-    stranger.get(vec![key(12)], Mode::Read, Vec::new()).unwrap();
-    assert_eq!(
-        server_error(first.rekey(vec![(key(12), key(22))], Vec::new())),
-        ErrorKind::Held
-    );
-}
-
-#[test]
 fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
     let server = Running::start();
     let claim = head(&server.socket)
@@ -622,28 +536,6 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     );
     let descriptor = descriptors.into_iter().next().unwrap();
     assert_eq!(contents(descriptor), [3; 4]);
-}
-
-/// A head of `deployment`.
-fn head_of(socket: &Path, deployment: &str) -> Client {
-    Client::connect(
-        socket,
-        Role::Head {
-            deployment: deployment.into(),
-            epoch: 0,
-            generation: 0,
-        },
-    )
-    .unwrap()
-}
-
-/// The first worker of group `text` of `deployment`.
-fn scope_of(deployment: &str) -> Scope {
-    Scope {
-        deployment: deployment.into(),
-        group: "text".into(),
-        rank: 0,
-    }
 }
 
 /// A worker of `scope` in `epoch`.
@@ -1272,22 +1164,9 @@ fn one_key_keeps_a_copy_at_each_location() {
     let descriptor = descriptors.into_iter().next().unwrap();
     assert_eq!(contents(descriptor), b"bbbb");
 
-    // Rekeying moves the selected copy only.
-    first.rekey(vec![(key(1), key(2))], vec![near]).unwrap();
-    let (got, _) = first
-        .get(vec![key(1), key(2)], Mode::Read, Vec::new())
-        .unwrap();
-    let mut held: Vec<(Key, Location)> = got
-        .tensors
-        .iter()
-        .map(|tensor| (tensor.key, got.storages[tensor.storage as usize].location))
-        .collect();
-    held.sort_by_key(|(key, _)| *key);
-    assert_eq!(held, vec![(key(1), far), (key(2), near)]);
-
     // Each copy lives while some scope retains it at its location.
     second.retain(Vec::new(), Vec::new()).unwrap();
-    first.retain(vec![key(2)], vec![near]).unwrap();
+    first.retain(vec![key(1)], vec![near]).unwrap();
     let listed: Vec<(Key, Location)> = head
         .list()
         .unwrap()
@@ -1295,7 +1174,7 @@ fn one_key_keeps_a_copy_at_each_location() {
         .into_iter()
         .map(|tensor| (tensor.key, tensor.location))
         .collect();
-    assert_eq!(listed, vec![(key(2), near)]);
+    assert_eq!(listed, vec![(key(1), near)]);
 }
 
 /// The GPU the quota tests reserve on, which no process touches: the server

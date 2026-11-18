@@ -1,36 +1,22 @@
 //! Pause, flush and resize (SD §8.1): the operations the engine runs at a batch boundary (SD
 //! §2.4, §3.1). `Pause` forms no batch and is answered once nothing is in flight; `Flush` evicts
-//! every cached block the scheduler knows of, with a weight update's seeds from then on, while
-//! the requests it holds keep their state, compute it again or end as the update says; `Resize`
-//! is answered at its `Resized` with the units the region reached, which are its capacity from
-//! then on, and the units it asked for bound the region: a shrink that stops short goes on as
-//! the units held past them come free.
+//! every cached block the scheduler knows of while the requests it holds keep their state;
+//! `Resize` is answered at its `Resized` with the units the region reached, which are its
+//! capacity from then on, and the units it asked for bound the region: a shrink that stops short
+//! goes on as the units held past them come free.
 
 use crossbeam_channel::{Receiver, bounded};
-use engine::scheduler::{Message, Output, Seeds};
-use proto::request::wire::WeightsInFlight;
-use proto::request::{Event, FinishReason, MigrationCause, RejectionKind};
-use storage::Key;
+use engine::scheduler::{Message, Output};
+use proto::request::{Event, RejectionKind};
 use storage::runtime::{Completion, Request};
 
 use crate::harness::{A, Deployment, Harness, sharing, token};
 
-/// Sends `Flush` with the seeds and the treatment of the requests in flight of a weight update
-/// (`None`: a flush alone), and returns the reply, which the scheduler sends at once.
-pub(crate) fn flush(
-    harness: &mut Harness,
-    seeds: Option<Seeds>,
-    in_flight: WeightsInFlight,
-) -> Result<(), engine::Error> {
+/// Sends `Flush` and waits for its reply, which the scheduler sends at once.
+pub(crate) fn flush(harness: &mut Harness) {
     let (reply, replied) = bounded(1);
-    harness.apply(Message::Flush(seeds, in_flight, reply));
-    replied.try_recv().unwrap()
-}
-
-/// The page seeds of a weight update: one per cache group of the harness's token deployment,
-/// whose groups encode nothing.
-fn update_seeds() -> Option<Seeds> {
-    Some((vec![Key([9; 32])], 7, Vec::new()))
+    harness.apply(Message::Flush(reply));
+    replied.try_recv().unwrap();
 }
 
 /// `Pause` is answered once no batch is in flight, and from it on the scheduler forms no batch;
@@ -69,96 +55,6 @@ fn pause_is_answered_once_nothing_is_in_flight_and_forms_nothing_until_resume() 
     assert_eq!(harness.tokens(id).len(), 20);
 }
 
-/// A weight update that keeps the requests in flight lets a running request continue to its end
-/// with the state it reached, committing no block from then on, since its state follows neither
-/// the old weights nor the new ones; a later request of the same prompt reaches none of the
-/// blocks the old weights computed, and commits its own under the update's seeds (SD §2.4
-/// `Flush`, §4.3 "What computes a block").
-#[test]
-fn a_weight_update_keeping_requests_lets_them_run_on_and_commit_nothing_more() {
-    let mut harness = Deployment::tokens().build();
-    let kept = harness.submit(token(1, 9, 16));
-    harness.run_until(30, |harness| harness.tokens(kept).len() >= 2);
-    let owner = harness.owner(kept, A).unwrap();
-    let before = harness.committed(owner);
-    assert!(!before.is_empty(), "its prompt's blocks were committed");
-
-    assert!(flush(&mut harness, update_seeds(), WeightsInFlight::Keep).is_ok());
-    harness.settle(100);
-    assert_eq!(harness.tokens(kept).len(), 16);
-    assert!(harness.finished_with(kept, FinishReason::MaxTokens));
-    assert_eq!(
-        harness.committed(owner),
-        before,
-        "nothing committed after the update"
-    );
-
-    // The same prompt under the new weights computes from its first token.
-    let later = harness.submit(sharing(2, 1, 9, 2));
-    harness.settle(100);
-    assert_eq!(harness.first_written(later, 0), Some(0));
-    let pinned = harness.taken().into_iter().any(|request| match request {
-        Request::Pin { keys, .. } => keys.iter().any(|key| before.contains(key)),
-        _ => false,
-    });
-    assert!(!pinned, "no key of the old weights is read");
-    // Its prompt's two blocks, under keys the old weights' blocks do not have.
-    let renewed = harness.committed(harness.owner(later, A).unwrap());
-    assert_eq!(renewed.len(), 2);
-    assert!(renewed.iter().all(|key| !before.contains(key)));
-}
-
-/// A weight update that recomputes the requests in flight ends every request holding blocks as
-/// `Migratable { Drain }`, which the daemon resubmits to be computed again; a request still
-/// queued waits and runs under the new weights (SD §2.4 `Flush`).
-#[test]
-fn a_weight_update_recomputing_requests_ends_those_holding_blocks_as_migratable() {
-    let mut harness = Deployment::tokens().slots(1).build();
-    let running = harness.submit(token(1, 10, 20));
-    harness.run_until(30, |harness| harness.tokens(running).len() >= 2);
-    let queued = harness.submit(token(2, 10, 4));
-    harness.step();
-    assert!(harness.events(queued).is_empty(), "one slot: it waits");
-
-    assert!(flush(&mut harness, update_seeds(), WeightsInFlight::Recompute).is_ok());
-    harness.settle(100);
-    assert!(
-        matches!(
-            harness.terminal(running),
-            Some(Event::Migratable {
-                cause: MigrationCause::Drain,
-                ..
-            })
-        ),
-        "{:?}",
-        harness.events(running)
-    );
-    assert!(harness.finished_with(queued, FinishReason::MaxTokens));
-    assert_eq!(harness.tokens(queued).len(), 4);
-}
-
-/// A weight update that aborts the requests in flight ends every request, running or queued,
-/// with `Aborted` at once (SD §2.4 `Flush`).
-#[test]
-fn a_weight_update_aborting_requests_ends_every_one_aborted() {
-    let mut harness = Deployment::tokens().slots(1).build();
-    let running = harness.submit(token(1, 10, 20));
-    harness.run_until(30, |harness| harness.tokens(running).len() >= 2);
-    let queued = harness.submit(token(2, 10, 4));
-    harness.step();
-
-    assert!(flush(&mut harness, update_seeds(), WeightsInFlight::Abort).is_ok());
-    for id in [running, queued] {
-        assert!(
-            harness.finished_with(id, FinishReason::Aborted),
-            "{:?}",
-            harness.events(id)
-        );
-    }
-    harness.settle(100);
-    assert!(harness.batches_of(queued).is_empty());
-}
-
 /// A flush asks the buffer pool to evict every cached block the scheduler knows of; the blocks a
 /// running request still pins stay, and `cache` keeps the keys `Evicted` does not list: a later
 /// request reads the blocks that stayed, and computes those evicted (SD §2.4 `Flush`, §3.5
@@ -174,7 +70,7 @@ fn a_flush_evicts_every_known_key_and_cache_keeps_the_keys_evicted_does_not_list
     harness.run_until(30, |harness| harness.tokens(running).len() >= 2);
     let running_keys = harness.committed(harness.owner(running, A).unwrap());
 
-    assert!(flush(&mut harness, None, WeightsInFlight::Keep).is_ok());
+    flush(&mut harness);
     harness.run_until(10, |harness| {
         harness
             .answers()

@@ -933,36 +933,6 @@ impl EngineClient {
         .map(drop)
     }
 
-    /// Has every worker rewrite its weights in place from the checkpoint at
-    /// `model_path`, the requests in flight continuing as `in_flight` says,
-    /// and returns what each reported.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the reason a worker could not update, or when the engine
-    /// ends first.
-    pub async fn update_weights(
-        &self,
-        model_path: &str,
-        in_flight: wire::WeightsInFlight,
-    ) -> Result<Vec<wire::WeightReport>, String> {
-        let in_flight = in_flight as i32;
-        let model_path = model_path.to_owned();
-        match self
-            .ask(|id| {
-                wire::engine_command::Kind::UpdateWeights(wire::UpdateWeights {
-                    id,
-                    model_path,
-                    in_flight,
-                })
-            })
-            .await?
-        {
-            Some(wire::operated::Reports::WeightReports(reports)) => Ok(reports.ranks),
-            other => Err(unexpected("update_weights", other)),
-        }
-    }
-
     /// Commands the engine to revoke every cached prefix page; requests in
     /// flight keep their pages.
     pub fn flush_cache(&self) {

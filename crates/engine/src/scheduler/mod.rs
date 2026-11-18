@@ -75,7 +75,6 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use arc_swap::ArcSwap;
 use proto::config::{SchedulerConfig, Tuning, WorkerGroupConfig};
 use proto::report::SchedulerStats;
-use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, GenerationLimits, MigrationCause, RequestId};
 use scheduling::Parameters;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId, Tier};
@@ -130,7 +129,7 @@ impl std::error::Error for Error {}
 ///
 /// The buffer pool's completions and capacity words are not messages: the thread reads them
 /// from its queue pair at every pass of its loop. Every operation at a batch boundary (a policy
-/// or kernel generation switch, sleep and wake, a weight update, a cache flush) is the engine
+/// or kernel generation switch, sleep and wake, an expert commit, a cache flush) is the engine
 /// sending `Pause`, doing its work once the reply arrives, and sending `Resume`.
 #[derive(Debug)]
 #[expect(
@@ -172,12 +171,9 @@ pub enum Message {
     RollbackPolicy(Sender<Result<(), Error>>),
     /// Drop the policy kept for rollback.
     CommitPolicy,
-    /// Evict every cached block the scheduler knows of, the requests it holds continuing as the
-    /// [`WeightsInFlight`] says (`Keep`, `Recompute`, `Abort`). With a weight update's
-    /// [`Seeds`], what keys the blocks computed from here on, as the new weights' `Capacity`
-    /// would state it. The reply refuses seeds whose encoder identities differ between the
-    /// scheduler's groups, changing nothing.
-    Flush(Option<Seeds>, WeightsInFlight, Sender<Result<(), Error>>),
+    /// Evict every cached block the scheduler knows of; the requests it holds keep theirs. The
+    /// reply is sent once the evictions are submitted.
+    Flush(Sender<()>),
     /// `Resize { region, units }` at the buffer pool, the region by its number; the reply, sent at
     /// its `Resized`, is the units the region reached, which a shrink and a grow may stop short of.
     Resize(u8, u32, Sender<u32>),
@@ -190,12 +186,6 @@ pub enum Message {
     /// End every request the scheduler holds, aborted, and stop.
     Shutdown,
 }
-
-/// What keys the blocks a scheduler computes, as a weight update's `Flush` renews it for the new
-/// weights: the page seed of each cache group in class order (`Capacity::seeds`), the latent seed
-/// of stored trajectories (`Capacity::latent_seed`), and per worker group whose ranks encode, the
-/// identity of the weights that compute its encoder outputs (`Capacity::encoder_identity`).
-pub type Seeds = (Vec<Key>, u64, Vec<(GroupId, String)>);
 
 /// What leaves the scheduler's thread, on its one channel (vLLM's `EngineCoreOutputs`).
 #[derive(Debug)]
@@ -377,16 +367,14 @@ pub struct Scheduler {
     next_owner: u64,
     /// Per cache group, in class order, the seed the key chains of its blocks are rooted at (SD
     /// §4.3); a request's `CachePolicy::state_seeds` override it. Empty until stated, which roots
-    /// every chain at the zero key, the seed of an empty identity. A weight update's `Flush`
-    /// replaces it, so that no key reaches a block the previous weights computed.
+    /// every chain at the zero key, the seed of an empty identity.
     seeds: Vec<Key>,
     /// The identity of the weights that compute the scheduler's encoder outputs, which keys them
     /// (`encoder_output`, SD §4.3): what its encoding groups state (`Capacity::encoder_identity`),
-    /// empty when none does. A weight update's `Flush` replaces it with `seeds`.
+    /// empty when none does.
     encoder_identity: String,
     /// The seed of the keys of stored trajectories (`latent_content`, SD §4.3): what its
-    /// denoising groups state (`Capacity::latent_seed`), 0 when none does. A weight update's
-    /// `Flush` replaces it with `seeds`.
+    /// denoising groups state (`Capacity::latent_seed`), 0 when none does.
     latent_seed: u64,
     /// Per region, the `Store`s to the host into it that stored a block (answered `Stored` after
     /// their copy ran): a block whose own `Store` stored nothing waits for this count, among
@@ -913,8 +901,9 @@ impl Scheduler {
                 let _ = reply.send(self.policy.rollback(snapshot));
             }
             Message::CommitPolicy => self.policy.commit(),
-            Message::Flush(seeds, in_flight, reply) => {
-                let _ = reply.send(self.flush(seeds, in_flight));
+            Message::Flush(reply) => {
+                self.flush();
+                let _ = reply.send(());
             }
             Message::Resize(region, units, reply) => self.resize(region, units, reply),
             Message::Bound(region, units, reply) => self.bound(region, units, reply),
@@ -1167,111 +1156,18 @@ impl Scheduler {
                 .any(|(_, request, _)| pending(request))
     }
 
-    /// `Flush` (SD §2.4): the requests the scheduler holds continue as `in_flight` says, then
-    /// every cached block the scheduler knows of is evicted, and with a weight update's `seeds`
-    /// what keys the blocks computed from here on is replaced: the cache groups' page seeds, the
-    /// latent seed, and the encoder identity, which the identities `seeds` states for this
-    /// scheduler's groups agree on as their `Capacity` would (empty when none of them encodes).
-    ///
-    /// The requests are dealt with first, under the seeds their state was computed with:
-    ///
-    /// - `Keep`: every request continues with what it holds. Under a weight update its state
-    ///   follows neither the old weights nor the new ones, so a token request commits nothing
-    ///   from here on, and keeps the seeds its keys were rooted at unless it states its own.
-    /// - `Recompute`: every request that holds blocks, admitted or being admitted, ends as
-    ///   `Migratable { Drain }`, and the daemon resubmits it to be computed again; a video request
-    ///   whose denoising is fully scheduled runs to its end. A request still queued waits.
-    /// - `Abort`: every request ends, aborted.
+    /// `Flush` (SD §2.4): every cached block the scheduler knows of is evicted; the requests it
+    /// holds continue with what they hold.
     ///
     /// `Evict` names every key of `cache`, as many per record as a record holds; the buffer pool
     /// evicts those that no request pins, and `cache` keeps the keys its `Evicted` does not list.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidRequest`] when `seeds` states different encoder identities for two of the
-    /// scheduler's groups; nothing changes then.
-    fn flush(&mut self, seeds: Option<Seeds>, in_flight: WeightsInFlight) -> Result<(), Error> {
-        let seeds = match seeds {
-            Some((pages, latent, encoders)) => {
-                let ours = self.groups.iter().filter_map(|group| {
-                    encoders
-                        .iter()
-                        .find(|(id, _)| *id == group.id())
-                        .map(|(_, identity)| identity)
-                });
-                let identity = agreed(ours).ok_or_else(|| differ(ENCODER_IDENTITIES))?;
-                Some((pages, latent, identity))
-            }
-            None => None,
-        };
-
-        let ids: Vec<RequestId> = self.requests.keys().copied().collect();
-        match in_flight {
-            WeightsInFlight::Keep => {
-                if seeds.is_some() {
-                    self.keep_lineage();
-                }
-            }
-            WeightsInFlight::Recompute => {
-                for id in ids {
-                    let Some(request) = self.requests.get(&id) else {
-                        continue;
-                    };
-                    let holds = matches!(
-                        request.status,
-                        RequestStatus::Running | RequestStatus::WaitingForRemoteKvs
-                    );
-                    if holds && !request.runs_to_end(&self.groups) {
-                        self.finish(id, update::migratable(MigrationCause::Drain));
-                    }
-                }
-            }
-            WeightsInFlight::Abort => {
-                for id in ids {
-                    self.cancel(id, FinishReason::Aborted);
-                }
-            }
-        }
-
+    fn flush(&mut self) {
         let fits = self.queue.max_record().saturating_sub(EVICT_RECORD) / size_of::<Key>();
         let keys: Vec<Key> = self.cache.values().map(|row| row.key).collect();
         for keys in keys.chunks(fits.max(1)) {
             self.submit(runtime::Request::Evict {
                 keys: keys.to_vec(),
             });
-        }
-
-        if let Some((pages, latent, identity)) = seeds {
-            self.seeds = pages;
-            self.latent_seed = latent;
-            self.encoder_identity = identity;
-        }
-        Ok(())
-    }
-
-    /// Under a weight update that keeps the requests in flight: each token request commits no
-    /// block from here on, and its keys stay rooted at the seeds before the update when it states
-    /// none of its own (`S/cache_storage.rs:288-326`).
-    fn keep_lineage(&mut self) {
-        let groups = self
-            .groups
-            .iter()
-            .map(|group| group.capacity.cache_groups.len())
-            .max()
-            .unwrap_or(0);
-        let seeds: Vec<[u8; 32]> = if self.seeds.is_empty() {
-            vec![[0; 32]; groups]
-        } else {
-            self.seeds.iter().map(|seed| seed.0).collect()
-        };
-
-        for request in self.requests.values_mut() {
-            if let proto::request::Request::Generation(input) = &mut request.input {
-                if input.cache.state_seeds.is_empty() {
-                    input.cache.state_seeds.clone_from(&seeds);
-                }
-                input.cache.write = false;
-            }
         }
     }
 

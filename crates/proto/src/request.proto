@@ -348,7 +348,8 @@ message Takeover {
 // answered with an `Operated` of that id, carrying the reports its kind
 // states.
 message EngineCommand {
-  reserved 5, 6, 13, 14, 16, 17, 21;
+  reserved 5, 6, 9, 13, 14, 16, 17, 21;
+  reserved "update_weights";
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
@@ -362,9 +363,6 @@ message EngineCommand {
     // Give back or restore KV cache storage on every scheduler; answered
     // with no reports.
     ResizeCache resize_cache = 8;
-    // Rewrite the weights in place from another checkpoint of the same
-    // model, once no request runs; answered with `WeightReports`.
-    UpdateWeights update_weights = 9;
     // Install completed expert copies at the common drained step boundary;
     // answered with `WeightReports`.
     CommitExperts commit_experts = 18;
@@ -643,45 +641,21 @@ message FencesSwitched {
   repeated string off = 3;
 }
 
-// Each rank's report of a change of its weights, in rank order.
+// Each rank's report of an expert commit (`CommitExperts`), in rank order.
 message WeightReports {
   repeated WeightReport ranks = 1;
 }
 
-// One rank's report of a change of its weights.
+// One rank's report of an expert commit: the weights it mapped again.
 message WeightReport {
+  reserved 3, 4;
+  reserved "identity", "identities";
   // The rank's worker group and rank; unset for a worker of no storage
   // scope.
   optional string group = 1;
   optional uint32 rank = 2;
-  // The identity of the rank's new weights, which keys the trajectories
-  // they compute; unset when it has none.
-  optional string identity = 3;
-  // The page identity of each of the rank's cache groups under the new
-  // weights; empty for a rank that keeps no paged cache.
-  repeated string identities = 4;
-  // The weights the change rewrote.
+  // The weights the commit mapped at the addresses of the ones they replace.
   uint64 moved = 5;
-}
-
-// An in-place weight update: every worker rewrites its weights from the
-// checkpoint at `model_path`, which loads the same tensors.
-message UpdateWeights {
-  // Matches the `Operated` answer.
-  uint64 id = 1;
-  string model_path = 2;
-  WeightsInFlight in_flight = 3;
-}
-
-// How the requests in flight continue through an in-place weight update.
-enum WeightsInFlight {
-  // Each continues on the new weights with the KV cache it reached; the
-  // pages it writes afterwards reach no shared tier.
-  WEIGHTS_IN_FLIGHT_KEEP = 0;
-  // Each computes its state again with the new weights.
-  WEIGHTS_IN_FLIGHT_RECOMPUTE = 1;
-  // Each ends, aborted, as do the requests the engine queued.
-  WEIGHTS_IN_FLIGHT_ABORT = 2;
 }
 
 // A change to the device storage of every scheduler's KV cache.

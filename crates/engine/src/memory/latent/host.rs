@@ -38,7 +38,7 @@ const PAGE_ENCODING: &str = "a trajectory row's values in the row's order, page 
 /// The units of the rank's part: every trajectory the rank can have saved at once, twice the
 /// trajectory pages of its rows.
 ///
-/// - One preemption (a park, a sleep, a weight update, a shrink of the KV cache) saves every
+/// - One preemption (a park, a sleep, a shrink of the KV cache) saves every
 ///   trajectory the rank's rows hold: at most `pages.pages` pages, a video model's request slots'
 ///   pages or the pages an image model's scheduler assigns its trajectories.
 /// - A saved trajectory is needed until the request's latent preparation restores it. A video

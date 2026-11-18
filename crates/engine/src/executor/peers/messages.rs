@@ -217,9 +217,6 @@ pub(crate) struct FromPeer {
 /// One operation of the data plane (`crate::process::data_plane::DataPlane`) on a peer's
 /// ranks, with the arguments of the method that runs it there. The answer
 /// ([`MainProcessResponse::Operated`]) is the method's value in the link's encoding.
-///
-/// A weight load's replacement stays in the process that loaded it: the peer keeps its own
-/// from [`Self::Pair`] to the [`Self::Stage`] or [`Self::Discard`] that ends it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataOperation {
@@ -250,11 +247,6 @@ pub enum DataOperation {
     /// every such rank holds beside its warm process in its GPU's quota; none when no such rank
     /// splits its memory of it.
     WarmSegments { groups: Vec<GroupId>, region: u8 },
-    /// Answers the room every device has for a load.
-    Room,
-    /// Answers the bytes the graph pools map on the device that maps the fewest; none for a
-    /// process of no device.
-    GraphBytes,
     /// Suspends the graph pools and releases every segment. Answers every rank's segment table.
     Sleep,
     /// Suspends the graph pools.
@@ -265,22 +257,6 @@ pub enum DataOperation {
     SetKernels,
     /// Reserves what the ranks' processes hold beside their pools in their GPUs' quotas.
     ReserveServing,
-    /// Pairs a load of `checkpoint` with the expert order `experts` with the weights that serve,
-    /// and keeps the replacement. Answers the most device bytes a rank needs beside what it
-    /// serves.
-    Pair {
-        checkpoint: String,
-        experts: BTreeMap<String, Vec<u32>>,
-        rearranged: bool,
-    },
-    /// Publishes what the kept replacement changes.
-    Load,
-    /// Keeps the loaded replacement for the boundary that puts it in place.
-    Stage,
-    /// Ends the kept replacement: what its load published goes back.
-    Discard,
-    /// Puts the staged replacement in place. Answers each rank's report.
-    UpdateWeights,
     /// Puts the redistribution of the routed experts made for `order` in place. Answers each
     /// rank's report.
     CommitExperts { order: BTreeMap<String, Vec<u32>> },

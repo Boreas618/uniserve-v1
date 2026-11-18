@@ -21,8 +21,8 @@
 //! A job is a closure that runs elsewhere and returns the [`Input`] the control thread applies
 //! when it ends ([`Input::Done`]). The operations thread runs, one at a time and in order, every
 //! job that pauses the schedulers or changes the ranks' device memory (a switch, a commit, a
-//! rollback, a weight update, sleep and wake, a flush, an expert commit, making room, growing,
-//! the release after a `Shrunk`, the start and the end of a drain), so two pause sequences never
+//! rollback, sleep and wake, a flush, an expert commit, making room, growing, the release after
+//! a `Shrunk`, the start and the end of a drain), so two pause sequences never
 //! interleave; while the engine drains the control thread starts none that pauses the schedulers,
 //! since a `Resume` ends a drain as well as a pause (`Lifecycle::boundary_refusal`). A job beside
 //! the batches (a preparation, an adapter, a profiling change, a drain's wait, an attach) runs on
@@ -75,7 +75,6 @@ pub use start::Engine;
 use crate::memory::client::StorageClient;
 use crate::modules::load;
 use crate::modules::select::changed_operators;
-use crate::process::binding::Target;
 use crate::scheduler::{Message, Output};
 use proto::config::Tuning;
 
@@ -1414,7 +1413,6 @@ impl MainProcess {
                 self.operated(front, tune.id, tuned);
             }
             Kind::ResizeCache(resize) => self.resize_cache(front, &resize),
-            Kind::UpdateWeights(update) => self.update_weights(front, update),
             Kind::CommitExperts(commit) => {
                 let order: BTreeMap<String, Vec<u32>> = commit
                     .order
@@ -1569,36 +1567,6 @@ impl MainProcess {
         self.serial(job);
     }
 
-    /// `UpdateWeights`: the weights are rewritten in place from another checkpoint of the same
-    /// model on the operations thread, answered with each rank's report. With `abort` every
-    /// request the schedulers hold ends first.
-    fn update_weights(&mut self, front: usize, update: wire::UpdateWeights) {
-        let id = update.id;
-        let Ok(in_flight) = wire::WeightsInFlight::try_from(update.in_flight) else {
-            let error = anyhow::anyhow!("unknown in-flight choice {}", update.in_flight);
-            return self.operated(front, id, Err(error));
-        };
-        if let Some(refusal) = self.lifecycle.boundary_refusal() {
-            return self.operated(front, id, Err(anyhow::anyhow!(refusal)));
-        }
-        let (schedulers, head, binding) = match self.segment_parts() {
-            Ok(parts) => parts,
-            Err(error) => return self.operated(front, id, Err(error)),
-        };
-
-        // The same model from another checkpoint: the experts keep the order they serve in.
-        let target = Target {
-            checkpoint: PathBuf::from(&update.model_path),
-            ..binding.target()
-        };
-        self.serial(Box::new(move || {
-            let updated =
-                operations::update_weights(&schedulers, &head, &binding, target, in_flight)
-                    .map(|reports| Some(weight_reports(reports)));
-            done(move |main| main.operated(front, id, updated))
-        }));
-    }
-
     /// What a job that changes the KV planes' segments reads: each scheduler's inbox, the head of
     /// the session, which states each change of them, and the weight binding.
     ///
@@ -1653,7 +1621,7 @@ fn starting() -> anyhow::Error {
     anyhow::anyhow!("the engine is starting and holds nothing to operate on yet")
 }
 
-/// Each rank's report of a change of its weights, as an `Operated` answer states them.
+/// Each rank's report of an expert commit, as an `Operated` answer states them.
 fn weight_reports(reports: Vec<WeightsUpdated>) -> wire::operated::Reports {
     wire::operated::Reports::WeightReports(wire::WeightReports {
         ranks: reports
@@ -1661,8 +1629,6 @@ fn weight_reports(reports: Vec<WeightsUpdated>) -> wire::operated::Reports {
             .map(|report| wire::WeightReport {
                 group: report.group,
                 rank: report.rank,
-                identity: report.identity,
-                identities: report.identities.iter().map(storage::Key::hex).collect(),
                 moved: report.moved as u64,
             })
             .collect(),

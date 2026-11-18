@@ -39,16 +39,16 @@
 //! A table a model writes after its load ([`nn::RetainedWeights::writable`]) is device storage
 //! of this process alone, since published storage is read-only.
 //!
-//! ## An update in place
+//! ## A replacement in place
 //!
 //! A weight tensor is `ops::retained` over the address the weight is mapped at, and the
-//! modules and the captured graphs of a rank hold that address. An in-place weight update
-//! (`/admin/update_weights`) keeps it: the checkpoint is loaded again beside the weights that
-//! serve ([`Reload`](crate::memory::reload::Reload)), each weight whose key changed is
-//! published where the one it replaces lies (in an allocation of the same length, or at the
-//! same offset of a shared allocation of its own), and [`WeightStore::rebind`] then maps each
-//! replacement's allocation at the address of the weight it replaces. No module is rebuilt and
-//! no published byte is written.
+//! modules and the captured graphs of a rank hold that address. An expert redistribution
+//! (`docs/admin.md`, "Expert redistribution") keeps it: the model is loaded again in the new
+//! expert order beside the weights that serve ([`Reload`](crate::memory::reload::Reload)), each
+//! weight whose key changed is published where the one it replaces lies (in an allocation of the
+//! same length, or at the same offset of a shared allocation of its own), and
+//! [`WeightStore::rebind`] then maps each replacement's allocation at the address of the weight
+//! it replaces. No module is rebuilt and no published byte is written.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -143,7 +143,7 @@ pub(crate) fn refusal(key: &WeightKey, error: Error) -> nn::Error {
 /// A rank's read-only mapping of one retained weight.
 ///
 /// The mapping is the weight's own, also when its allocation is shared with other weights, so
-/// an update maps another allocation at this weight's address without moving its neighbours.
+/// a replacement maps another allocation at this weight's address without moving its neighbours.
 /// The mappings of a shared allocation share its physical memory.
 #[derive(Clone)]
 struct Mapping {
@@ -207,8 +207,8 @@ struct State {
 /// same code over a checkpoint of the same model asks for the same weights one after another),
 /// which the store records: [`WeightStore::finish`] or [`WeightStore::abandon`] ends the load
 /// and returns its order. A position in that order identifies a weight across two loads, which
-/// is what pairs each serving weight with its replacement in an update although their keys
-/// differ ([`paired`](crate::memory::reload::paired)).
+/// is what pairs each serving weight with its replacement although their keys differ
+/// ([`paired`](crate::memory::reload::paired)).
 pub struct WeightStore {
     client: Arc<StorageClient>,
     /// The device this store's weights are mapped on.
@@ -423,7 +423,7 @@ impl WeightStore {
     ///
     /// The address is what the rank's captured graphs and its modules' tensors hold, so it
     /// stays; the allocation behind it becomes the replacement's, which the Storage Server
-    /// retains under the key a load of that checkpoint asks for. A relaunch therefore finds it
+    /// retains under the key a load of that expert order asks for. A relaunch therefore finds it
     /// without this rank saying anything, and the mapping stays read-only throughout: no
     /// process writes a published weight.
     ///
@@ -434,7 +434,7 @@ impl WeightStore {
     ///
     /// When the rank maps no weight under a key of a pair, or a replacement does not lie as
     /// the weight it replaces does: nothing moved, and the rank serves on. A driver failure
-    /// while the weights move leaves the rank with weights of two checkpoints, and the caller
+    /// while the weights move leaves the rank with weights of two orders, and the caller
     /// retires the rank.
     pub fn rebind(&self, pairs: &[(WeightKey, WeightKey)]) -> Result<usize> {
         let mut state = lock(&self.state);
@@ -692,7 +692,7 @@ impl WeightStore {
 
         let mapping = if self.packs(length as u64) {
             // The replacement of a packed weight lies at that weight's offset of a shared
-            // allocation of its own, which the update then maps at the serving address.
+            // allocation of its own, which the rebind then maps at the serving address.
             let at = replaced
                 .and_then(|replaced| state.mapped.get(&self.key(replaced)))
                 .filter(|replaced| self.packs(replaced.length))
@@ -800,7 +800,7 @@ impl WeightStore {
         self.stream.synchronize()?;
 
         // The weight's own read-only mapping of the allocation: the writable one is the pack's
-        // until it is published, and an update rebinds this one alone.
+        // until it is published, and a replacement rebinds this one alone.
         let storage = Storage::map_device(
             &pack.descriptor,
             allocation,

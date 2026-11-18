@@ -555,7 +555,6 @@ mod tests {
             ("POST", "/admin/flush_cache"),
             ("POST", "/admin/shutdown"),
             ("POST", "/admin/restart"),
-            ("POST", "/admin/update_weights"),
             ("POST", "/admin/rebalance_experts"),
             ("POST", "/admin/sleep"),
             ("POST", "/admin/wake_up"),
@@ -820,31 +819,6 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    /// A weight update names its checkpoint, and one whose files cannot be
-    /// resolved is refused before the engine is asked.
-    #[tokio::test]
-    async fn a_weight_update_from_an_unknown_checkpoint_is_refused() {
-        let app = daemon_routers(served_engine(crate::test_support::CHAT));
-        let (status, _, _) = send(
-            &app,
-            post_json("/admin/update_weights", &json!({"path": "/nowhere"})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let (status, _, body) = send(
-            &app,
-            post_json(
-                "/admin/update_weights",
-                &json!({"model_path": "/nonexistent/checkpoint"}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["state"], json!("failed"), "{body}");
-        let (_, _, body) = send(&app, get_request("/admin/status")).await;
-        assert_eq!(body["deployment"]["paused"], json!(false));
     }
 
     /// A token model serves chat completions and no video route; a video

@@ -9,8 +9,8 @@
 //! the executors and the buffer pool are fakes (`testkit::engine`). The default fake serves text
 //! alone, so the engine refuses every video submission as an invalid request. The fake engine
 //! holds no rank: an operation on the ranks answers with no rank's result, and one on the KV
-//! cache's segments (sleep, wake, making room, a weight update) is refused, since the engine
-//! holds no session with a Storage Server whose segments it would change.
+//! cache's segments (sleep, wake, making room) is refused, since the engine holds no session
+//! with a Storage Server whose segments it would change.
 //!
 //! A test that states an engine's every answer itself plays the engine over a socket pair
 //! ([`scripted_client`]).

@@ -22,7 +22,6 @@ use std::collections::{HashMap, HashSet};
 use engine::batch::cache::CacheGroupKind;
 use engine::batch::{Batch, Phase};
 use engine::scheduler::Message;
-use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
 use storage::Key;
 use storage::key::{page_key, page_root};
@@ -1114,7 +1113,7 @@ fn host_hits_beyond_what_the_device_has_free_are_admitted_in_turn_and_all_end() 
         harness.run_until(400, |harness| harness.terminal(id).is_some());
     }
     stored(&mut harness, Tier::Host);
-    crate::pause_flush_resize::flush(&mut harness, None, WeightsInFlight::Keep).unwrap();
+    crate::pause_flush_resize::flush(&mut harness);
     harness.run(5);
 
     let ids: Vec<RequestId> = (1..=4)

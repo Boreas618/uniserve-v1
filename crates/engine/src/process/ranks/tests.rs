@@ -251,7 +251,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     // The group's one key chain roots at the seed of the page identity its cache states for the
     // weights the process serves, which a meta start loads none of.
     let identities = service::lock(&ranks[0].text().unwrap().cache)
-        .page_identities(&crate::process::binding::identity_of(&[]));
+        .page_identities(&crate::process::binding::page_identity(&[]));
     let seeds: Vec<storage::Key> = identities.iter().map(storage::key::page_seed).collect();
     assert_eq!(capacity.seeds, seeds);
     assert_eq!(capacity.seeds.len(), 1);
