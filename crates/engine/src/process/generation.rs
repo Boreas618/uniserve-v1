@@ -28,7 +28,6 @@
 //! that reached them (`WeightBinding::uncompared_by_peers`).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +41,7 @@ use scheduling::limits::{Limits, Parameters};
 use scheduling::view::Snapshot;
 use service::lock;
 
+use crate::batch::Generations;
 use crate::worker::Worker;
 
 use super::operations::{ask, at_boundary, every, stopped};
@@ -342,7 +342,7 @@ pub(crate) fn switch(
     schedulers: &[Sender<Message>],
     route: Option<&Route>,
     binding: &WeightBinding,
-    served: &AtomicU64,
+    served: &Generations,
     generation: u64,
     policy: &(Arc<wasmtime::Module>, Parameters),
 ) -> Result<()> {
@@ -384,7 +384,8 @@ pub(crate) fn switch(
             return Err(failure.context(what));
         }
 
-        served.store(generation, Ordering::Release);
+        served.set_kernels(generation);
+        served.set_policy(generation);
         binding
             .set_kernels()
             .with_context(|| format!("the ranks' memories under generation {generation}"))?;
@@ -432,7 +433,7 @@ pub(crate) fn rollback(
     schedulers: &[Sender<Message>],
     route: Option<&Route>,
     binding: &WeightBinding,
-    served: &AtomicU64,
+    served: &Generations,
     generation: u64,
     kept: u64,
 ) -> Result<()> {
@@ -441,7 +442,8 @@ pub(crate) fn rollback(
             on_ranks(route, |route| route.rollback(generation)),
             &format!("rolling generation {generation} back"),
         );
-        served.store(kept, Ordering::Release);
+        served.set_kernels(kept);
+        served.set_policy(kept);
 
         let memories = binding
             .set_kernels()

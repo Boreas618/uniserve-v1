@@ -60,7 +60,8 @@ fn group_batch() -> batch::Batch {
         id: batch::BatchId(7),
         group: storage::runtime::GroupId(2),
         phase: batch::Phase::Decode,
-        generation: 3,
+        kernels: 3,
+        policy: 3,
         shape: batch::Shape::decode(2, batch::Variant::DecodeSampled),
         requests: vec![RequestId(1), RequestId(2)],
         columns: batch::Columns {

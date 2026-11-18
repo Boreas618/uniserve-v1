@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -123,7 +122,7 @@ pub(in crate::process) struct Node {
     pub(in crate::process) binding: Arc<WeightBinding>,
     pub(in crate::process) head: Mutex<StorageClient>,
     /// The generation the scheduler's batches carry.
-    pub(in crate::process) served: Arc<AtomicU64>,
+    pub(in crate::process) served: Arc<crate::batch::Generations>,
     threads: Vec<JoinHandle<()>>,
     /// The Storage Server's socket.
     socket: PathBuf,
@@ -165,7 +164,7 @@ impl Node {
         let (route, workers) = node(1, &Arc::default());
         let (inbox, messages) = crossbeam_channel::unbounded();
         let (output, outputs) = crossbeam_channel::unbounded();
-        let served = Arc::new(AtomicU64::new(1));
+        let served = Arc::new(crate::batch::Generations::new(1, 1));
 
         let groups =
             WorkerExecutor::new(Arc::clone(&route), &[GROUP], inbox.clone(), Arc::default())

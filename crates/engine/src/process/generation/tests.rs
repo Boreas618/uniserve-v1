@@ -2,7 +2,6 @@
 //! (`operations::tests::Node`), whose rank serves generation 1 of no kernel.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::worker::completion::Outcome;
 use ops::Generation;
@@ -86,7 +85,7 @@ fn on_trial() -> Node {
 fn a_switch_moves_the_schedulers_and_every_worker_to_the_generation() {
     let node = on_trial();
 
-    assert_eq!(node.served.load(Ordering::Acquire), 2);
+    assert_eq!(node.served.kernels(), 2);
     assert_eq!(serving(&node), [2]);
     // Generation 1 is kept for the trial: no other update is prepared beside it.
     assert!(!holds_one(&node));
@@ -97,7 +96,7 @@ fn a_commit_leaves_the_generation_on_trial_alone() {
     let node = on_trial();
 
     commit(&node.schedulers, Some(&node.route), 2).unwrap();
-    assert_eq!(node.served.load(Ordering::Acquire), 2);
+    assert_eq!(node.served.kernels(), 2);
     assert_eq!(serving(&node), [2]);
     assert!(holds_one(&node));
     assert!(!keeps_a_policy(&node));
@@ -116,7 +115,7 @@ fn a_rollback_leaves_the_kept_generation_alone() {
         1,
     )
     .unwrap();
-    assert_eq!(node.served.load(Ordering::Acquire), 1);
+    assert_eq!(node.served.kernels(), 1);
     assert_eq!(serving(&node), [1]);
     assert!(holds_one(&node));
     assert!(!keeps_a_policy(&node));
@@ -139,7 +138,7 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
     assert!(failed.is_err());
 
     // Generation 1 serves alone, under the policy it had, and the batches carry it.
-    assert_eq!(node.served.load(Ordering::Acquire), 1);
+    assert_eq!(node.served.kernels(), 1);
     assert_eq!(serving(&node), [1]);
     assert!(holds_one(&node));
     assert!(!keeps_a_policy(&node));

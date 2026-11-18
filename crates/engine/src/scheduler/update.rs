@@ -1760,7 +1760,8 @@ mod tests {
             id: BatchId(7),
             group: A,
             phase,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape {
                 rows: 1,
                 tokens,

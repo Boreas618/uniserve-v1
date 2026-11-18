@@ -28,7 +28,6 @@ use std::collections::BTreeMap;
 use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::batch::ValidationResult;
 use crate::batch::philox::{DrawAddress, request_sampling_key};
@@ -537,7 +536,8 @@ impl Scheduler {
     /// The first rule of the batch [`Batch::check`] finds broken, which is a defect of the rows
     /// the step appended.
     pub(super) fn seal(&self, batch: &mut Batch) -> ValidationResult<()> {
-        batch.generation = self.generation.load(Ordering::Acquire);
+        batch.kernels = self.generations.kernels();
+        batch.policy = self.generations.policy();
         batch.new_slots.sort_unstable_by_key(|new| new.slot);
         if let Some(shape) = self.shape(batch) {
             batch.shape = shape;
@@ -1109,7 +1109,8 @@ mod tests {
             id: BatchId(1),
             group: A,
             phase,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::decode(0, Variant::DecodeGreedy),
             requests: Vec::new(),
             columns: Columns::default(),

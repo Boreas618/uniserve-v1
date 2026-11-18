@@ -548,7 +548,8 @@ fn batch(shape: BatchShape, columns: Columns) -> Batch {
         id: BatchId(7),
         group: GroupId(0),
         phase,
-        generation: 1,
+        kernels: 1,
+        policy: 1,
         shape,
         requests: (0..columns.calls() as u64)
             .map(|call| RequestId(100 + call))
@@ -1824,7 +1825,7 @@ fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared()
     // set's nine. The paired forward is not run, the shadow batch ends, and the update states
     // that it has no comparison of the attention kernel on that batch.
     let mut long = decode(&[1, 2, 3], &[0.0, 0.0, 0.0]);
-    long.generation = 2;
+    long.kernels = 2;
     long.columns.rows.positions = vec![63; 3];
     long.columns.rows.cache_positions = vec![63; 3];
     long.columns.rows.seq_lens = vec![MAX_KV_LEN as i32; 3];
@@ -1844,7 +1845,7 @@ fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared()
 
     // The batch itself is served as every batch is: its page work is issued around the
     // replay, which graphs with no device refuse.
-    long.generation = 1;
+    long.kernels = 1;
     issued.lock().unwrap().clear();
     let served = ended(worker.submit(2, long.clone()));
     let Some(Outcome::Failed(refused)) = served else {
@@ -1857,7 +1858,7 @@ fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared()
     // Rows that fit are paired: their history reaches the scratch pages, and the paired
     // forward runs, which graphs with no device refuse.
     let mut short = decode(&[1, 2], &[0.0, 0.0]);
-    short.generation = 2;
+    short.kernels = 2;
     let shadowed = ended(worker.shadow(3, short));
     let Some(Outcome::Failed(refused)) = shadowed else {
         panic!("graphs with no device run no paired forward: {shadowed:?}");
@@ -2191,6 +2192,18 @@ fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
     let mut first = member(&groups[0], 0, deliver(to_second));
     let mut second = member(&groups[1], 1, deliver(to_first));
     let (group, phase) = (GroupId(0), Phase::Decode);
+    let step = Batch {
+        id: BatchId(0),
+        group,
+        phase,
+        kernels: 1,
+        policy: 1,
+        shape: crate::batch::Shape::decode(1, Variant::DecodeGreedy),
+        requests: Vec::new(),
+        columns: Columns::default(),
+        media: Vec::new(),
+        new_slots: Vec::new(),
+    };
 
     // The first member has a batch of three tokens and the second none: its worker takes
     // the join batch, and both leave the step at the first member's tokens.
@@ -2204,16 +2217,16 @@ fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
             second.join(&join).unwrap()
         });
 
-        assert_eq!(first.enter(3, group, phase, 1).unwrap(), 3);
+        assert_eq!(first.enter(3, &step).unwrap(), 3);
         assert_eq!(idle.join().unwrap(), Some(3));
     });
 
     // Both members have a batch: the step holds the larger, and the join each asked of the
     // other finds its step closed.
     std::thread::scope(|scope| {
-        let other = scope.spawn(|| second.enter(9, group, phase, 1).unwrap());
+        let other = scope.spawn(|| second.enter(9, &step).unwrap());
 
-        assert_eq!(first.enter(5, group, phase, 1).unwrap(), 9);
+        assert_eq!(first.enter(5, &step).unwrap(), 9);
         assert_eq!(other.join().unwrap(), 9);
     });
     let late = first_inbox.recv().unwrap();
@@ -2224,11 +2237,11 @@ fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
     // A member enters with tokens of its own, no more than the transport holds, and joins no
     // step past the union's next.
     assert!(matches!(
-        first.enter(0, group, phase, 1),
+        first.enter(0, &step),
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        first.enter(UNION_ROWS + 1, group, phase, 1),
+        first.enter(UNION_ROWS + 1, &step),
         Err(Error::Invalid(_))
     ));
     let mut ahead = late;
@@ -2647,7 +2660,8 @@ fn a_batch_with_no_rows_writes_the_tables_and_runs_the_copies_without_a_forward(
         id: BatchId(1),
         group,
         phase: Phase::Decode,
-        generation: 0,
+        kernels: 0,
+        policy: 0,
         shape: BatchShape::decode(0, Variant::DecodeGreedy),
         requests: Vec::new(),
         columns: Columns::default(),

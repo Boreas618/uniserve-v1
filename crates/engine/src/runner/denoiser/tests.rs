@@ -246,7 +246,8 @@ fn batch(variant: Variant, step: u32, results: Vec<u32>, reads: u32) -> Batch {
         id: BatchId(1),
         group: GROUP,
         phase,
-        generation: 0,
+        kernels: 0,
+        policy: 0,
         shape: Shape {
             rows: 1,
             tokens: 0,

@@ -26,6 +26,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use proto::video::Layout;
 pub use scheduling::Phase;
@@ -90,6 +91,45 @@ pub use capacity::Capacity;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct BatchId(pub u64);
 
+/// The kernel and policy generations a scheduler stamps on the batches it forms
+/// ([`Batch::kernels`], [`Batch::policy`]): one value per engine, shared by its schedulers and
+/// set by the generation update at a batch boundary of every scheduler.
+#[derive(Debug, Default)]
+pub struct Generations {
+    kernels: AtomicU64,
+    policy: AtomicU64,
+}
+
+impl Generations {
+    /// Stamps of `kernels` and `policy`.
+    pub fn new(kernels: u64, policy: u64) -> Self {
+        Self {
+            kernels: AtomicU64::new(kernels),
+            policy: AtomicU64::new(policy),
+        }
+    }
+
+    /// The kernel generation the next batch is stamped with.
+    pub fn kernels(&self) -> u64 {
+        self.kernels.load(Ordering::Acquire)
+    }
+
+    /// The policy generation the next batch is stamped with.
+    pub fn policy(&self) -> u64 {
+        self.policy.load(Ordering::Acquire)
+    }
+
+    /// Stamps the batches formed from here on with kernel generation `kernels`.
+    pub fn set_kernels(&self, kernels: u64) {
+        self.kernels.store(kernels, Ordering::Release);
+    }
+
+    /// Stamps the batches formed from here on with policy generation `policy`.
+    pub fn set_policy(&self, policy: u64) {
+        self.policy.store(policy, Ordering::Release);
+    }
+}
+
 /// One phase of one step on one worker group, as the scheduler assembled it.
 ///
 /// `shape` is the scheduler's statement of the batch's size, the rows and tokens it wrote, and
@@ -103,8 +143,16 @@ pub struct Batch {
     pub group: GroupId,
     /// What every call of the batch computes.
     pub phase: Phase,
-    /// The kernel and policy generation the batch was assembled for.
-    pub generation: u64,
+    /// The newest kernel generation whose graphs the batch may replay. Each bucket serves from
+    /// the newest generation its graphs were switched to on the group's ranks, at most this one:
+    /// the scheduler stamps the number of a generation whose buckets are being switched from the
+    /// boundary its switch begins at, and the kept one again from the boundary a rollback takes
+    /// effect at, so no batch formed after a rollback replays a graph of the rolled-back
+    /// generation.
+    pub kernels: u64,
+    /// The generation of the scheduling program the batch was formed under. It changes at one
+    /// batch boundary of every scheduler and involves no graph.
+    pub policy: u64,
     /// The rows, tokens, variant and extent the scheduler wrote: what selects the bucket.
     pub shape: Shape,
     /// The requests the batch advances, one call each, in row order: the order of
@@ -1344,7 +1392,8 @@ mod tests {
             id: BatchId(4),
             group: GroupId(1),
             phase: Phase::Verify,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::prefill(4, 8, Variant::VerifyGreedy),
             requests: vec![RequestId(7), RequestId(9)],
             columns: Columns {
@@ -1469,7 +1518,8 @@ mod tests {
             id: BatchId(5),
             group: GroupId(0),
             phase: Phase::Denoise,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape {
                 rows: 1,
                 tokens: 0,

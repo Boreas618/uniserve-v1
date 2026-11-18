@@ -455,7 +455,8 @@ mod tests {
             id: BatchId(1),
             group: GroupId(0),
             phase,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape {
                 rows: calls.len() as u32,
                 tokens: columns.input_ids.len() as u32,

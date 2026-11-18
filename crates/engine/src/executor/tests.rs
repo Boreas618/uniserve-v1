@@ -185,7 +185,8 @@ fn decode(id: u64, rows: u32) -> Batch {
         id: BatchId(id),
         group: GROUP,
         phase: Phase::Decode,
-        generation: 1,
+        kernels: 1,
+        policy: 1,
         shape: Shape::decode(rows, Variant::DecodeGreedy),
         requests: (0..u64::from(rows))
             .map(|row| RequestId(100 * id + row))
@@ -221,7 +222,8 @@ pub(crate) fn host_batch(id: u64, group: GroupId, phase: Phase, variant: Variant
         id: BatchId(id),
         group,
         phase,
-        generation: 1,
+        kernels: 1,
+        policy: 1,
         shape: Shape {
             rows: 1,
             tokens: 0,

@@ -2848,7 +2848,7 @@ mod tests {
             scheduling::Parameters::default(),
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(crate::batch::Generations::default()),
         )
         .unwrap();
         scheduler.policy.limits.chunked_prefill_size = 8;
@@ -3024,7 +3024,8 @@ mod tests {
             id: BatchId(1),
             group: A,
             phase,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::decode(1, Variant::DecodeGreedy),
             requests: Vec::new(),
             columns: Columns {

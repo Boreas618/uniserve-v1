@@ -428,7 +428,7 @@ impl Shadow {
 
         self.in_flight += 1;
         let mut shadow = batch.clone();
-        shadow.generation = generation;
+        shadow.kernels = generation;
         Some((self.passes, shadow))
     }
 

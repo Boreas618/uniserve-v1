@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::Range;
-use std::sync::atomic::AtomicU64;
+use engine::batch::Generations;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -442,7 +442,7 @@ impl Deployment {
             self.parameters(),
             Box::new(fake.clone()),
             output,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(Generations::default()),
         )
         .unwrap_or_else(|refusal| panic!("the scheduler refuses the deployment: {refusal}"));
 

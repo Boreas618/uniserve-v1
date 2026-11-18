@@ -15,7 +15,6 @@
 //! session's regions.
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::batch::{Batch, BatchId, Columns, Extent, Phase, Shape};
@@ -555,7 +554,8 @@ impl Scheduler {
             id: BatchId(self.next_batch),
             group,
             phase,
-            generation: self.generation.load(Ordering::Acquire),
+            kernels: self.generations.kernels(),
+            policy: self.generations.policy(),
             shape: Shape {
                 rows: 0,
                 tokens: 0,

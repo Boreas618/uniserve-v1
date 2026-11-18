@@ -1149,7 +1149,6 @@ fn holds(shape: &Shape, video: &DiffusionRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -1534,7 +1533,7 @@ mod tests {
             scheduling::Parameters::default(),
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::batch::Generations::default()),
         )
         .unwrap();
         (scheduler, stamped)
@@ -1721,7 +1720,8 @@ mod tests {
             id: BatchId(1),
             group: A,
             phase: Phase::TextEncode,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::decode(1, Variant::Encode),
             requests: vec![id],
             columns: Columns::default(),
@@ -2213,7 +2213,7 @@ mod tests {
             scheduling::Parameters::default(),
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::batch::Generations::default()),
         )
         .unwrap();
         (scheduler, stamped, outputs)
@@ -2292,7 +2292,8 @@ mod tests {
             id: BatchId(1),
             group: A,
             phase: Phase::TextEncode,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::decode(1, Variant::Encode),
             requests: Vec::new(),
             columns: Columns::default(),

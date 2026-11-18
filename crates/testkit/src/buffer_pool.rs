@@ -694,7 +694,8 @@ mod tests {
             id: BatchId(1),
             group: A,
             phase: Phase::Prefill,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::prefill(1, tokens as u32, Variant::PrefillOutput),
             requests: vec![proto::request::RequestId(1)],
             columns: Columns {

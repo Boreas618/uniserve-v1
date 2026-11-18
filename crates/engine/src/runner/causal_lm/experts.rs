@@ -48,14 +48,13 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::batch::{Batch, BatchId, Columns, Phase, Shape as BatchShape, Variant};
+use crate::batch::{Batch, BatchId, Columns, Shape as BatchShape, Variant};
 use nn::ExpertExchange;
 use ops::Generation;
 use ops::collective::Meet;
 use ops::moe::ExchangeTransport;
 use ops::moe::exchange::{Descriptor, Mode, Transport, TransportShape};
 use platform::Stream;
-use storage::runtime::GroupId;
 use tensor::Tensor;
 
 use crate::parallel::HostGroup;
@@ -346,9 +345,9 @@ impl Member {
     /// Enters the union's next step with `tokens` tokens of this member's own, and returns the
     /// step's capacity once every member has entered: the most tokens any member sends.
     ///
-    /// The member first asks the others to join, with a batch of `group`, `phase` and
-    /// `generation`, the step's own, numbered by the step. The call blocks the worker thread
-    /// until the step is agreed.
+    /// The member first asks the others to join, with a batch of the group, phase and kernel and
+    /// policy generations of `step`, the step's own batch, numbered by the union's step. The
+    /// call blocks the worker thread until the step is agreed.
     ///
     /// # Errors
     ///
@@ -357,9 +356,7 @@ impl Member {
     pub(crate) fn enter(
         &mut self,
         tokens: u32,
-        group: GroupId,
-        phase: Phase,
-        generation: u64,
+        step: &Batch,
     ) -> Result<u32> {
         if tokens == 0 || tokens > self.shape.max_tokens {
             return Err(Error::Invalid(format!(
@@ -370,9 +367,10 @@ impl Member {
 
         (self.join)(Batch {
             id: BatchId(self.round),
-            group,
-            phase,
-            generation,
+            group: step.group,
+            phase: step.phase,
+            kernels: step.kernels,
+            policy: step.policy,
             shape: BatchShape::decode(1, Variant::ExpertJoin),
             requests: Vec::new(),
             columns: Columns::default(),

@@ -1053,7 +1053,8 @@ mod tests {
             id: BatchId(id),
             group: A,
             phase,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::prefill(calls.len() as u32, tokens, Variant::DecodeSampled),
             requests: calls.iter().map(|call| RequestId(call.0)).collect(),
             columns: Columns {

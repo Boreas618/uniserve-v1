@@ -416,7 +416,6 @@ impl Scheduler {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Instant;
 
     use crate::batch::{Batch, BatchId, Columns, Extent, Phase, Shape, Variant};
@@ -582,7 +581,7 @@ mod tests {
             scheduling::Parameters::default(),
             Box::new(Idle),
             output,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::batch::Generations::default()),
         )
         .unwrap();
         scheduler.available = free.to_vec();
@@ -661,7 +660,8 @@ mod tests {
             id: BatchId(1),
             group: GroupId(0),
             phase,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::decode(0, Variant::DecodeGreedy),
             requests: (0..calls).map(RequestId).collect(),
             columns: Columns::default(),

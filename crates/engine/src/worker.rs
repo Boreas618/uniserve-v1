@@ -210,7 +210,7 @@ pub(crate) enum Job {
     },
     /// Take the number of a batch another rank of the group runs alone, and run nothing.
     Pass(u64),
-    /// Run the paired forwards of one shadow batch: the generation `batch.generation` names,
+    /// Run the paired forwards of one shadow batch: the generation `batch.kernels` names,
     /// which is being prepared, against the serving one, for each operator the batch's bucket
     /// launches whose kernel changed. One paired forward per queue turn.
     Shadow {
@@ -332,7 +332,7 @@ impl std::fmt::Display for Job {
             Self::Shadow { batch, .. } => write!(
                 formatter,
                 "shadowing generation {} on batch {} of phase {:?} ({})",
-                batch.generation, batch.id.0, batch.phase, batch.shape
+                batch.kernels, batch.id.0, batch.phase, batch.shape
             ),
             Self::Map { id, .. } => write!(
                 formatter,
@@ -1602,10 +1602,10 @@ impl Thread {
     /// were compared in earlier turns. Returns whether an operator is left for a later turn.
     fn shadow(&mut self, batch: &Batch, compared: usize) -> Result<bool> {
         let index = self.runner_of(batch.phase)?;
-        if !self.kernels.contains_key(&batch.generation) {
+        if !self.kernels.contains_key(&batch.kernels) {
             return Err(Error::Invariant(format!(
                 "shadow batch {} names generation {}, which this worker is not preparing",
-                batch.id.0, batch.generation
+                batch.id.0, batch.kernels
             )));
         }
         self.write_tables()?;
@@ -1621,7 +1621,7 @@ impl Thread {
 
         self.queue.note(format!(
             "shadowing `{operator}` of generation {} in bucket {bucket} on batch {} (runner {})",
-            batch.generation, batch.id.0, index
+            batch.kernels, batch.id.0, index
         ));
         // A batch the runner could not pair compares nothing: the operator is reported
         // uncompared with the reason, not as compared over no element.
@@ -1631,7 +1631,7 @@ impl Thread {
                 runner = index,
                 operator,
                 %bucket,
-                generation = batch.generation,
+                generation = batch.kernels,
                 elements,
                 "a replaced kernel was compared with the one it replaces"
             ),
@@ -1640,7 +1640,7 @@ impl Thread {
                 runner = index,
                 operator,
                 %bucket,
-                generation = batch.generation,
+                generation = batch.kernels,
                 "a replaced kernel was not compared on this batch, and is reported uncompared"
             ),
         }

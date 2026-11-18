@@ -1289,7 +1289,7 @@ impl CausalLmRunner {
         let bucket = match self.union.as_mut() {
             Some(member) => {
                 let tokens = batch.columns.tokens() as u32;
-                let capacity = member.enter(tokens, batch.group, batch.phase, batch.generation)?;
+                let capacity = member.enter(tokens, batch)?;
 
                 let bucket = at_capacity(&self.graphs, &base, capacity)?;
                 if let Some(stream) = &self.stream {

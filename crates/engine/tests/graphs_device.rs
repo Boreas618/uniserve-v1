@@ -290,7 +290,8 @@ fn batch(ids: &[u32], bound: u32) -> Batch {
         id: BatchId(1),
         group: GroupId(0),
         phase: Phase::Decode,
-        generation: 1,
+        kernels: 1,
+        policy: 1,
         shape: BatchShape::decode(ids.len() as u32, Variant::DecodeGreedy),
         requests: Vec::new(),
         columns: Columns {

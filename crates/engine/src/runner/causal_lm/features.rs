@@ -366,7 +366,8 @@ mod tests {
             id: BatchId(5),
             group: GroupId(0),
             phase: Phase::Prefill,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape::prefill(2, 12, Variant::PrefillWrite),
             requests: Vec::new(),
             columns: Columns {

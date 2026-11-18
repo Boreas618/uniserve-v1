@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -203,7 +203,7 @@ fn built(
         policy.1,
         Box::new(Recording(Arc::clone(&executor))),
         output,
-        Arc::new(AtomicU64::new(0)),
+        Arc::new(crate::batch::Generations::default()),
     )?;
 
     Ok(Bench {

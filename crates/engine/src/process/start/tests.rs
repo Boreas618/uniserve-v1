@@ -15,7 +15,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::batch::Capacity;
@@ -307,7 +306,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     // One scheduler over the one group of the one rank, which no routing policy chooses among,
     // assembling batches for the start's generation.
     let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
-    assert_eq!(engine.served.load(Ordering::Acquire), FIRST_GENERATION);
+    assert_eq!(engine.served.kernels(), FIRST_GENERATION);
     assert_eq!(engine.schedulers.len(), 1);
     assert!(engine.route.is_none());
     assert_eq!(engine.workers.len(), 1);

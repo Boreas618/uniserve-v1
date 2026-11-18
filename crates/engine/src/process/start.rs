@@ -54,12 +54,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::batch::Capacity;
 use crate::batch::Phase;
+use crate::batch::{Capacity, Generations};
 use crate::executor::Route;
 use crate::executor::peers::messages::{FromPeer, MainProcessResponse};
 use crate::executor::peers::{Answer, Liveness, Remote, Upstream};
@@ -111,7 +110,7 @@ pub struct Engine {
     /// `max_running_requests`, within the slots the groups' ranks hold.
     pub(crate) max_running_requests: usize,
     /// The generation batches are assembled for, which the schedulers read and a switch moves.
-    pub(crate) served: Arc<AtomicU64>,
+    pub(crate) served: Arc<Generations>,
     /// What ends the session with the buffer pool once the workers have stopped: the head's
     /// `Close`, or whatever stands for the buffer pool in its place.
     pub(crate) session: Box<dyn FnOnce() -> Result<()> + Send>,
@@ -246,7 +245,7 @@ impl Engine {
             &capacities,
             &ceilings,
         );
-        let served = Arc::new(AtomicU64::new(FIRST_GENERATION));
+        let served = Arc::new(Generations::new(FIRST_GENERATION, FIRST_GENERATION));
 
         // The schedulers' limits as the deployment states them, which each scheduler lowers to
         // what its groups' workers captured; the captured sizes in tokens are the graph tiers.
@@ -925,7 +924,7 @@ fn start_peer(
         // A peer runs no scheduler: the scheduler node serves the deployment's requests within
         // its ranks' slots, and the peer states the launch's bound.
         max_running_requests: launch.engine_config.max_running_requests.get(),
-        served: Arc::new(AtomicU64::new(FIRST_GENERATION)),
+        served: Arc::new(Generations::new(FIRST_GENERATION, FIRST_GENERATION)),
         session,
         workers,
         groups: Some(route),

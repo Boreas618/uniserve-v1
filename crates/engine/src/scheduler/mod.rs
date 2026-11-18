@@ -65,11 +65,11 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::batch::{Batch, BatchId, BatchOutput, Capacity, Phase};
+use crate::batch::{Batch, BatchId, BatchOutput, Capacity, Generations, Phase};
 use crate::executor::Executor;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use proto::config::{SchedulerConfig, WorkerGroupConfig};
@@ -378,8 +378,8 @@ pub struct Scheduler {
     stats: SchedulerStats,
     /// When `stats` started counting: the scheduler's start, then its last `Output::Stats`.
     published: Instant,
-    /// The kernel and policy generation batches are assembled for.
-    generation: Arc<AtomicU64>,
+    /// The kernel and policy generations batches are stamped with.
+    generations: Arc<Generations>,
     paused: bool,
     /// Whether the scheduler stopped, on a fault (`fail`), once a `Shutdown` settled
     /// ([`Scheduler::settle_shutdown`]), or when the inbox lost its last sender: it takes no
@@ -457,7 +457,7 @@ impl Scheduler {
         parameters: Parameters,
         executor: Box<dyn Executor>,
         output: Sender<Output>,
-        generation: Arc<AtomicU64>,
+        generations: Arc<Generations>,
     ) -> Result<Self, Error> {
         let stated = layout.schedulers.get(scheduler).ok_or_else(|| {
             Error::Storage(format!("the session states no scheduler {scheduler}"))
@@ -583,7 +583,7 @@ impl Scheduler {
             outbox: None,
             stats: stats::empty(),
             published: Instant::now(),
-            generation,
+            generations,
             paused: false,
             stopped: false,
             closing: false,

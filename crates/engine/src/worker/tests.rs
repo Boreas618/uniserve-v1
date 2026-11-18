@@ -382,7 +382,8 @@ fn batch(id: u64, phase: Phase, rows: u32) -> Batch {
         id: BatchId(id),
         group: GROUP,
         phase,
-        generation: 1,
+        kernels: 1,
+        policy: 1,
         shape: BatchShape::decode(rows, Variant::DecodeGreedy),
         requests: vec![RequestId(id)],
         columns: Columns::default(),
@@ -979,7 +980,7 @@ fn a_shadow_batch_compares_the_replaced_operators_its_bucket_launches() {
     let mut sequence = 0;
     let mut shadow = |generation: u64| {
         let mut batch = batch(20, Phase::Decode, 3);
-        batch.generation = generation;
+        batch.kernels = generation;
         sequence += 1;
         worker.shadow(sequence, batch).unwrap()
     };

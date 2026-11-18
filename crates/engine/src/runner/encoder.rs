@@ -834,7 +834,8 @@ mod tests {
             id: BatchId(3),
             group: GROUP,
             phase: Phase::TextEncode,
-            generation: 0,
+            kernels: 0,
+            policy: 0,
             shape: Shape {
                 rows: 2,
                 tokens: 8,

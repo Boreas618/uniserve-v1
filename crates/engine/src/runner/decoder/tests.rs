@@ -298,7 +298,8 @@ fn dealt(
         id: BatchId(1),
         group: GROUP,
         phase,
-        generation: 0,
+        kernels: 0,
+        policy: 0,
         shape: Shape {
             rows: 1,
             tokens: 0,
