@@ -101,7 +101,7 @@ One replica spanning every GPU gives the lowest latency; replicas serve more req
 | `GET /v1/videos/{id}/content` | Download a completed job's MP4 |
 | `DELETE /v1/videos/{id}` | Cancel or delete a job |
 | `POST /v1/chat/completions` | Streaming and non-streaming chat generation, with reasoning and tool-call parsing where the model's chat profile names them |
-| `/admin/*` | The admin API, served apart from the routes above on the daemon's operator and harness Unix sockets: the deployment's policy package (`GET` and `PUT /admin/policy`), each change applied as the least it needs and, when it moves modules, as an update on trial that fails no request and commits by itself, and the other operations of a serving deployment ([docs/admin.md](docs/admin.md)) |
+| `/admin/*` | The admin API, served apart from the routes above on the daemon's admin Unix socket: the deployment's policy package (`GET` and `PUT /admin/policy`), each change applied as the least it needs and, when it moves modules, as an update on trial that fails no request and commits by itself, with every operation of a serving deployment an option of the package (pausing, sleeping, flushing the prefix cache, LoRA adapters, the experts' order, profiling sessions, a hot restart); and the deployment's observation store, read with SQL (`GET` and `POST /admin/query`) ([docs/admin.md](docs/admin.md)) |
 
 The server registers the routes of the tasks the served model performs: the video routes and `/v1/capabilities` for a video model, and chat completions for a text model. Any other path answers `404` with `{"detail": "Not Found"}`. With an API key configured, every route but `/health` and `/metrics` requires it. Another build of the engine and workers is a revision of the engine package installed at the Build Server (`uniserve build-server install crates/engine`), which a package stating `worker_config.engine_revision` selects (`PUT /admin/policy`): the new epoch serves on trial for `update_config.trial` and commits by itself, and the `PUT` answers with the revision's record once it converged. On SIGTERM or Ctrl-C the server stops accepting connections and lets requests in flight, streamed responses included, finish within `server_config.shutdown_timeout`; asynchronous video jobs end at once, since a restarted server keeps none.
 
@@ -238,7 +238,7 @@ crates/models/          The model families, one crate with a module per family, 
   src/qwen3/            The Qwen3 family: configurations, the decoder layer, `Qwen3MoeForCausalLM` and the Qwen3.5-MoE language model with its drafter, and the Qwen3-VL encoder and vision tower
   src/qwen4_exp/        Qwen3.8 Flash Next (`Qwen4ExpForConditionalGeneration`), on the vision tower and configuration readers of `qwen3`
   src/minimax_h3/       MiniMax-H3 and FastH3: checkpoint configuration, the diffusion transformer and its denoiser, the video and audio VAEs and the packed sequence; their request processing is `crates/processing/src/minimax_h3/`
-crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, the HTTP server and its connections, metrics, the served model, the engine's client, and the API server: the OpenAI-compatible API, input processing (templates, tokenization, media) and output processing (detokenization, parsers, response bodies)
+crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, the HTTP server and its connections, the observation store, the served model, the engine's client, and the API server: the OpenAI-compatible API, input processing (templates, tokenization, media) and output processing (detokenization, parsers, response bodies)
 crates/service/         Host services: the per-user socket, its owner lock, a detached start and the start of an absent service; the one connection every process interface runs on
 crates/media/           H.264/AAC output encoding and MP4 muxing, conditional media reading and host resamplers
 crates/build-server/  The Build Server: builds packages into modules, keeps them and hands them out; one per deployment and node
@@ -250,7 +250,7 @@ tools/verification/     The buffer pool's design model and its checks
 configs/                Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
 docs/architecture.md    Processes, the rank planes and the request path
 docs/configuration.md   The serving option tree, configuration files and deployment files
-docs/admin.md           The admin API: a node's status, event log, deployment and configuration
+docs/admin.md           The admin API: the policy package and its operations, the observation store, updates and nodes
 docs/profiling.md       Timeline and native profiling
 docs/minimax_h3/        H3 serving and evaluation guides
 docs/qwen3_moe/         Qwen3-MoE serving and its GSM8K quality confirmation
