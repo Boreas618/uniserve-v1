@@ -14,12 +14,11 @@ replace kernel packages and the scheduling policy under it:
   generations' graphs exist.
 
 Each case installs a revision at the module's Build Server and applies the
-deployment's package with a bound no request of the module reaches changed
-(:func:`_reselect`): a change selects the Build Servers' latest revisions,
-which moves a newly installed one into a generation update, while a package
-equal to the current revision is no change (``docs/admin.md``, Updates). An
-update commits by itself once it stood its trial (``update_config.trial``),
-and one whose throughput falls past the deployment's threshold rolls back.
+deployment's current package again, unchanged (:func:`_reapply`): every write
+resolves `latest` anew at the Build Servers, so a newly installed revision
+moves into a generation update (``docs/admin.md``, Updates). An update commits
+by itself once it stood its trial (``update_config.trial``), and one whose
+throughput falls past the deployment's threshold rolls back.
 Phases are asserted on the daemon's events, never on sleeps. The revisions
 are derived from the serving packages by the mutations
 ``tests/python/e2e/packages`` declares
@@ -55,7 +54,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import httpx
 import pytest
@@ -127,10 +126,6 @@ UPDATES = {
 #: trial's throughput falls past its threshold, while each scheduler still
 #: steps requests the trial reads.
 TRICKLE_S = 5
-
-#: The queue bound :func:`_reselect` changes, before the module changed it:
-#: far above what the module's requests ever queue.
-QUEUE_BOUND = 4096
 
 
 @pytest.fixture(scope="module")
@@ -296,18 +291,12 @@ def traffic(server: Server) -> Iterator[Traffic]:
         loop.stop()
 
 
-def _reselect(server: Server) -> dict[str, Any]:
-    """The change that moves the newly installed revisions into a generation
-    update: the deployment's queue bound, a step option no request of the
-    module reaches, one above the current revision's.
-
-    A change selects the Build Servers' latest revision of every package the
-    deployment runs, and a package equal to the current revision is no
-    change, so each update of the module states a bound of its own.
+def _reapply(server: Server) -> httpx.Response:
+    """``PUT /admin/policy`` of the deployment's current package, unchanged:
+    the write resolves `latest` anew, so the revisions the Build Servers
+    installed since the current revision are a generation update.
     """  # noqa: D205
-    current = admin.policy(server).config.get("scheduler_config", {})
-    bound = current.get("max_queued_requests", QUEUE_BOUND) + 1
-    return {"scheduler_config": {"max_queued_requests": bound}}
+    return admin.change(server, {})
 
 
 def _update(server: Server) -> None:
@@ -315,7 +304,7 @@ def _update(server: Server) -> None:
     once it stood its trial and committed.
     """  # noqa: D205
     before = admin.now(server)
-    admin.revision(admin.change(server, _reselect(server)))
+    admin.revision(_reapply(server))
     update = admin.wait_for_log(
         server,
         "update",
@@ -466,7 +455,7 @@ def test_a_rollback_restores_the_previous_generation(
     build_server.install(repository / builds.POLICY_PACKAGE)
 
     after_event = admin.now(server)
-    with admin.changing(server, _reselect(server)) as change:
+    with admin.changing(server, {}) as change:
         # The policy swap is a generation of the serving epoch on trial.
         on_trial = admin.wait_for_log(
             server, "update", after=after_event, phase="trial"
@@ -521,7 +510,7 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
         # with its reason (`409`), and its `update` event with the update as
         # it ended.
         after_event = admin.now(server)
-        response = admin.change(server, _reselect(server))
+        response = _reapply(server)
     finally:
         resident.close()
     assert response.status_code == 409, response.text

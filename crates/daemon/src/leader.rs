@@ -282,29 +282,11 @@ pub(crate) fn epoch_hosts(config: &proto::config::EngineConfig) -> anyhow::Resul
 ///
 /// # Errors
 ///
-/// Fails when the worker groups do not form equal replicas, or when a deployment that shards its
-/// groups' experts over their tensor-parallel ranks selects an exchange: no token moves between
-/// those ranks, and the exchanges serve expert unions.
+/// Fails when the worker groups do not form equal replicas.
 pub(crate) fn replica_configs(
     config: &proto::config::EngineConfig,
 ) -> anyhow::Result<Vec<proto::config::EngineConfig>> {
     let union = config.expert_union();
-    let tensor_groups = config.parallel.worker_groups.iter().any(|group| {
-        group
-            .blocks
-            .get(proto::config::DEFAULT_BLOCK)
-            .is_some_and(|block| block.tensor_parallel_size > 1)
-    });
-    if let Some(exchange) = &config.moe.exchange {
-        anyhow::ensure!(
-            !config.moe.expert_parallel || union || !tensor_groups,
-            "`moe_config.exchange` is {exchange:?} and `moe_config.expert_parallel` shards each \
-             worker group's experts over its tensor-parallel ranks, which exchange no token: the \
-             exchanges serve schedulers of one rank each and dedicated expert workers \
-             (docs/expert_parallelism.md)"
-        );
-    }
-
     let count = config.parallel.data_parallel_size.get();
     if count == 1 || union {
         return Ok(vec![config.clone()]);
@@ -4243,25 +4225,6 @@ mod tests {
                 && replica.parallel.data_parallel_size.get() == 1
                 && replica.moe.expert_parallel
         }));
-    }
-
-    /// The exchanges serve expert unions: a deployment that shards its groups' experts over
-    /// their tensor-parallel ranks and names an exchange is refused, while schedulers of one
-    /// rank each take any exchange.
-    #[test]
-    fn tensor_parallel_groups_sharding_their_experts_take_no_exchange() {
-        for (tensor, data) in [(4, 1), (2, 2)] {
-            let mut config = deployment(tensor, data, true);
-            config.moe.exchange = Some("deepep".to_owned());
-            let error = super::replica_configs(&config)
-                .expect_err("an exchange beside tensor-parallel experts")
-                .to_string();
-            assert!(error.contains("deepep"), "{error}");
-        }
-
-        let mut union = deployment(1, 4, true);
-        union.moe.exchange = Some("deepep".to_owned());
-        assert_eq!(super::replica_configs(&union).unwrap().len(), 1);
     }
 
     /// A pipeline checkpoint processes requests as the served one only with the same index and,

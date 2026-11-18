@@ -792,7 +792,7 @@ fn a_module_set_resolves_from_a_shipped_store() {
                 op: op.to_owned(),
                 targets: Vec::new(),
                 keys: Vec::new(),
-                preferred: Vec::new(),
+                pins: Default::default(),
                 fixed: Vec::new(),
             })
             .unwrap()

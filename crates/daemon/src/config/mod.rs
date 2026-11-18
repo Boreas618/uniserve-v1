@@ -122,10 +122,7 @@ impl Config {
             dtype: Every,
             quantization: Every,
             mm_processor_kwargs: Every,
-            attention_backend: Of(Kind::Chat),
-            prefill_attention_backend: Of(Kind::Chat),
-            decode_attention_backend: Of(Kind::Chat),
-            moe_runner_backend: Of(Kind::Chat),
+            kernels: Every,
             build_config: Every,
             max_running_requests: Every,
             max_num_batched_tokens: Of(Kind::Chat),
@@ -289,28 +286,16 @@ pub struct Config {
     /// one it does not take.
     #[reload(daemon)]
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
-    /// Attention package (the paged-attention operator's backend) for every
-    /// attention call, by its backend name; unset, the Build Server selects
-    /// each attention descriptor key's package among the installed ones that
-    /// cover it, by manifest priority.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The kernel each descriptor key is pinned to (`[kernels]`): for each operator, by its name
+    /// as a table, its descriptor keys in the canonical text the kernel observations label them
+    /// by (`op`, `descriptor`), each pinned to `backend@revision` or `backend@latest`, which the
+    /// apply fixes to the latest installed revision. A key the table does not list is selected
+    /// by the Build Server among the installed packages that cover it, by manifest priority. A
+    /// change is a kernel generation: the serving engines capture the graphs of the buckets
+    /// whose kernels change in the background and switch bucket by bucket.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[reload(generation)]
-    pub attention_backend: Option<String>,
-    /// The attention package that fills prompt processing; unset takes
-    /// `attention_backend` (`prefill_attention_backend`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[reload(generation)]
-    pub prefill_attention_backend: Option<String>,
-    /// The attention package that fills one decoding token; unset takes
-    /// `attention_backend` (`decode_attention_backend`, §5.2).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[reload(generation)]
-    pub decode_attention_backend: Option<String>,
-    /// The grouped expert GEMM package (`moe_runner_backend`, §5.1, §9);
-    /// unset lets the daemon resolve it when it prepares the epoch.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[reload(generation)]
-    pub moe_runner_backend: Option<String>,
+    pub kernels: proto::module::Kernels,
     /// The deployment's Build Server on each node (`build_config`): the settings the node's
     /// daemon starts it with, which prepares the epochs' modules (§5.1, §6.3) in the
     /// deployment's own directories. The daemon reads it alone: a change of it is a hot restart,
@@ -433,10 +418,7 @@ impl Default for Config {
             dtype: ModelDtype::BFloat16,
             quantization: proto::config::Quantization::default(),
             mm_processor_kwargs: serde_json::Map::new(),
-            attention_backend: None,
-            prefill_attention_backend: None,
-            decode_attention_backend: None,
-            moe_runner_backend: None,
+            kernels: std::collections::BTreeMap::new(),
             build_config: build_server::command::Settings::default(),
             max_running_requests: positive(128),
             max_num_batched_tokens: None,
@@ -698,10 +680,6 @@ impl Config {
             max_running_requests: self.max_running_requests,
             max_num_batched_tokens: self.max_num_batched_tokens,
             max_logprobs: self.max_logprobs,
-            attention_backend: self.attention_backend.clone(),
-            prefill_attention_backend: self.prefill_attention_backend.clone(),
-            decode_attention_backend: self.decode_attention_backend.clone(),
-            moe_runner_backend: self.moe_runner_backend.clone(),
             device: self.device_config.clone(),
             scheduler: self.scheduler_config.clone(),
             media: self.media_config.clone(),
@@ -773,7 +751,9 @@ impl Config {
     /// (0, 1], a rank layout-shorthand option is stated with `worker_groups`, the
     /// server host or Unix socket path is blank, or
     /// `video_config.max_seconds` lies outside the durations the video API
-    /// admits, or a program's name is not one plain name or its period is zero.
+    /// admits, a program's name is not one plain name or its period is zero, or the `[kernels]`
+    /// table names an operator this build lacks or pins one backend of an operator at two
+    /// revisions.
     pub fn validate(&self, stated: &Stated) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.states_model(),
@@ -789,6 +769,31 @@ impl Config {
             "`admin_config.join` is the port the other nodes reach the leader at: a deployment of \
              several nodes states a fixed one"
         );
+        // One backend serves an operator at one revision (`BuildServer::cover`), so the keys of
+        // an operator pin each backend at one revision.
+        for (op, pins) in &self.kernels {
+            anyhow::ensure!(
+                proto::module::operator::named(op).is_some(),
+                "`kernels.{op}` names no operator of this build"
+            );
+            let mut revisions: std::collections::BTreeMap<&str, (&str, Option<u32>)> =
+                std::collections::BTreeMap::new();
+            for (key, pin) in pins {
+                anyhow::ensure!(
+                    !key.is_empty(),
+                    "`kernels.{op}` pins an empty descriptor key"
+                );
+                let (first, revision) = *revisions
+                    .entry(pin.backend.as_str())
+                    .or_insert((key.as_str(), pin.revision));
+                anyhow::ensure!(
+                    revision == pin.revision,
+                    "`kernels.{op}` pins {pin} for {key:?} and another revision of {} for \
+                     {first:?}: one backend serves an operator at one revision",
+                    pin.backend
+                );
+            }
+        }
         // A program's name names its saved state's file and the revisions it writes.
         for (name, program) in &self.programs {
             anyhow::ensure!(

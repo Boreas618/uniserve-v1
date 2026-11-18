@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::process as wire;
 
-use super::{ModuleSet, ModuleSlot, PackageRevision, Phase};
+use super::{ModuleSet, ModuleSlot, PackageRevision};
 
 /// Why a wire form is no module vocabulary value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -21,32 +21,12 @@ pub enum WireError {
     /// A kernel slot names no package.
     #[error("the kernel slot of {0} names no package")]
     KernelWithoutPackage(String),
-    /// A phase id no [`Phase`] has.
-    #[error("phase {0} is no phase")]
-    Phase(u32),
     /// A parameter value of no kind.
     #[error("the parameter {0} states no value")]
     EmptyValue(String),
     /// A datetime parameter whose text is no TOML datetime.
     #[error("the parameter {0} is no datetime: {1}")]
     Datetime(String, String),
-}
-
-/// A slot's phase as a wire states it: the phase's id ([`Phase::id`]), absent for a package that
-/// fills every phase of its operator.
-pub fn phase_to_wire(phase: Option<Phase>) -> Option<u32> {
-    phase.map(|phase| phase.id().0)
-}
-
-/// The phase a slot's wire id states ([`phase_to_wire`]).
-///
-/// # Errors
-///
-/// An id no phase has.
-pub fn phase_of(phase: Option<u32>) -> Result<Option<Phase>, WireError> {
-    phase
-        .map(|id| Phase::of_id(scheduling::PhaseId(id)).ok_or(WireError::Phase(id)))
-        .transpose()
 }
 
 impl From<&PackageRevision> for wire::PackageRevision {
@@ -84,7 +64,7 @@ impl TryFrom<wire::PackageRevision> for PackageRevision {
 pub fn kernel_to_wire(slot: &ModuleSlot, package: &PackageRevision) -> wire::KernelPackage {
     wire::KernelPackage {
         op: slot.op.clone(),
-        phase: phase_to_wire(slot.phase),
+        key: slot.key.clone(),
         package: Some(package.into()),
         part: slot.part.clone(),
     }
@@ -94,14 +74,14 @@ pub fn kernel_to_wire(slot: &ModuleSlot, package: &PackageRevision) -> wire::Ker
 ///
 /// # Errors
 ///
-/// A kernel without a package, a phase of no kind, or an unreadable parameter.
+/// A kernel without a package, or an unreadable parameter.
 pub fn kernel_of(kernel: wire::KernelPackage) -> Result<(ModuleSlot, PackageRevision), WireError> {
     let package = kernel
         .package
         .ok_or_else(|| WireError::KernelWithoutPackage(kernel.op.clone()))?;
     let slot = ModuleSlot {
         op: kernel.op,
-        phase: phase_of(kernel.phase)?,
+        key: kernel.key,
         part: kernel.part,
     };
     Ok((slot, package.try_into()?))
@@ -200,7 +180,7 @@ mod tests {
     use super::*;
 
     /// A module set crosses the wire and reads back as itself, every parameter with the type its
-    /// configuration gave it, a phase-split slot and a part slot included.
+    /// configuration gave it, a pinned key's slot and a part slot included.
     #[test]
     fn a_module_set_reads_back_as_itself() {
         let parameters: toml::Table = toml::from_str(
@@ -226,13 +206,13 @@ mod tests {
             kernels: BTreeMap::from([
                 (ModuleSlot::all("gemm"), package("cublas", 2)),
                 (
-                    ModuleSlot::phase("paged_attention", Phase::Decode),
+                    ModuleSlot::key("paged_attention", "phase_decode_head_128"),
                     package("trtllm", 4),
                 ),
                 (
                     ModuleSlot {
                         op: "rms_norm".to_owned(),
-                        phase: None,
+                        key: None,
                         part: Some("triton".to_owned()),
                     },
                     package("triton", 1),
@@ -247,8 +227,8 @@ mod tests {
         assert_eq!(ModuleSet::try_from(decoded).unwrap(), modules);
     }
 
-    /// A set that leaves out a package it always fills, or a slot of no phase kind, is refused
-    /// rather than read with a default.
+    /// A set that leaves out a package it always fills, or a kernel slot that names no package, is
+    /// refused rather than read with a default.
     #[test]
     fn an_incomplete_module_set_is_refused() {
         let empty = wire::ModuleSet::default();
@@ -259,10 +239,13 @@ mod tests {
 
         let kernel = wire::KernelPackage {
             op: "gemm".to_owned(),
-            phase: Some(99),
-            package: Some(wire::PackageRevision::default()),
+            key: None,
+            package: None,
             part: None,
         };
-        assert_eq!(kernel_of(kernel), Err(WireError::Phase(99)));
+        assert_eq!(
+            kernel_of(kernel),
+            Err(WireError::KernelWithoutPackage("gemm".to_owned()))
+        );
     }
 }

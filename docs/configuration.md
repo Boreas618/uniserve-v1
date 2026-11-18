@@ -144,7 +144,15 @@ Some options configure one kind of model, by what the served model family serves
 
 Each option's destination follows what its value is used for: a value that builds the main process is **build config**; one that selects an implementation is a **module selection**; one that only steers a decision is a **package parameter**; what the daemon reads stays in the **host layer**. An option a section does not name separately has the destination stated under that section's heading; the sections whose options split state it per field below.
 
-Three backend-name fields are read with `attention_backend` (`modules_of`, `crates/daemon/src/epoch.rs`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM. A backend name selects the package of that name at the Build Server for every descriptor key it covers; a key it does not cover, and every key of an operator whose backend is unset, takes the installed package that covers it with the highest manifest `priority` (`architecture.md`, the Build Server). A named backend no installed package has is refused when the epoch's modules are prepared.
+The `[kernels]` table is the one module selection of kernels (`modules_of`, `crates/daemon/src/epoch.rs`): each sub-table is an operator, by its name, and each key in it is one descriptor key of the operator, in the canonical text the kernel observations label it by (`op` and `descriptor` of `uniserve_kernel_launches_total`), matched exactly; its value pins the key to `backend@revision`, or `backend@latest`, which the apply fixes to the latest installed revision and records in the revision's `lock.toml`. Every key the table does not list takes the installed package that covers it with the highest manifest `priority`, the backend whose name sorts first among equal priorities (`cover`, `architecture.md`, the Build Server). A pinned backend that is not installed, not at the pinned revision, or does not cover its key is refused when the epoch's modules are prepared, and one backend serves an operator at one revision, so the pins of an operator state one revision of each backend. A key no device launches pins nothing. A change of the table is a kernel generation: the serving engines capture the buckets whose kernels change in the background and switch bucket by bucket.
+
+```toml
+[kernels.paged_attention]
+"phase_decode_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960" = "trtllm@7"
+
+[kernels.expert_exchange]
+"mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_multiprocessors_148_dtype_bf16" = "deepep@latest"
+```
 
 ### Top level
 
@@ -153,7 +161,7 @@ Three backend-name fields are read with `attention_backend` (`modules_of`, `crat
 | Deployment identity, cannot change | `served_model_name`, which names the deployment's storage |
 | Build config | `model`, `model_dir`, `max_model_len`, `lora`, `lora_dir`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `hosts`, `engine_host` |
 | Host layer | `mm_processor_kwargs` |
-| Module selection | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase |
+| Module selection | `kernels`, the `[kernels]` table (above) |
 | Package parameter | `max_num_batched_tokens` (the scheduling policy's bound); read at `crates/daemon/src/epoch.rs:1364-1366` |
 | Retired, refused by name | `quantization_config`: the option is stated as `quantization`, and the retired spelling is refused with the name to state instead |
 
@@ -168,7 +176,7 @@ Three backend-name fields are read with `attention_backend` (`modules_of`, `crat
 | `dtype` | `"bfloat16"` | Element type of parameters and activations: `bfloat16`, `float16` or `float32` |
 | `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and representations selected by module under `modules` (`bf16`, `fp16`, `fp8`, `nvfp4`); empty selects the checkpoint's own quantization. The model family interprets it when the engine opens the checkpoint and refuses a policy it does not serve, naming each module: MiniMax-H3 serves every mode and selection but `video_vae = "bf16"` over a dense checkpoint, converting its FP8 and NVFP4 modules' projections at load and measuring each activation's scale on every call ([FastH3 precision](minimax_h3/minimax_h3.md#precision)); the chat families state no mode and no module, and a checkpoint that declares its own quantization takes no policy |
 | `mm_processor_kwargs` | `{}` | Options of the model's multimodal processor; MiniMax-H3 takes `reference_image_short_edge` and `enlarge_references` ([FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity)) |
-| `attention_backend` | Unset | Attention package: unset, the Build Server selects, for each attention descriptor key the deployment launches, the installed package that covers it by manifest priority; a package's backend name (`trtllm`, `triton`) serves every key it covers, and the others are selected as when it is unset |
+| `kernels` | `{}` | The package each listed descriptor key of each operator is pinned to, `backend@revision` or `backend@latest` (above); a key it does not list is the Build Server's to select by manifest priority |
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold: each worker group holds this many request slots, or as many as its ranks' shares of their GPUs hold beside the weights, the graph pools and the fewest KV units when fewer fit (a slot holds a token request's slot state and, for a model that keeps a recurrent state, one checkpoint of it, or a video request's trajectory and its products on the rank), and a start whose share holds no slot fails, naming the bytes one slot needs |
 | `max_num_batched_tokens` | The widest prefill batch the workers' captured graphs hold; `8192` when they capture none | Token work admitted in one scheduling step, the scheduling policy's step budget when its package states none; token models only |
 | `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the limit `⌊total × fraction⌋` of the GPU's quota, which both epochs of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it for the group's ranks, and a GPU that holds ranks of several groups has the shares of them all (below) |
@@ -362,9 +370,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `moe_config`
 
-**Destination, per field:** `expert_parallel` and `microbatches` are build config; `exchange` is a module selection (expert exchange).
-
-**Read at:** `exchange` in `modules_of` (`crates/daemon/src/epoch.rs`), where it becomes the expert-exchange operator's backend name for a deployment with `expert_parallel`; `moe_runner_backend` beside it.
+**Destination, per field:** `expert_parallel` and `microbatches` are build config. Which exchange package fills each of the `expert_exchange` operator's keys is the `[kernels]` table's pin, else the Build Server's selection by manifest priority.
 
 
 [Expert parallelism](expert_parallelism.md) describes each exchange.
@@ -372,7 +378,6 @@ Each entry is the median over the point's reports of the step time over its run'
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `expert_parallel` | `false` | Shard routed experts across the deployment's expert workers, across schedulers of one rank each (`data_parallel_size` above one), or otherwise over the tensor-parallel ranks of each scheduler's worker group, each rank holding whole experts; a group split over pipeline stages or sequence members is refused with it |
-| `exchange` | unset | The expert-exchange package's backend: `alltoall`, `megamoe` or `deepep` among the packages this tree holds (`crates/ops/kernels/expert_exchange`), refused at the Build Server when it holds no package of the backend; unset, a deployment whose schedulers exchange experts runs `alltoall`. A deployment that shards its groups' experts over their tensor-parallel ranks moves no token and refuses an exchange |
 | `microbatches` | `1` | Microbatches overlapping attention with dedicated expert workers |
 | `beside_rows` | `1024` | The rows per rank of the middle capture class of an expert union's steps, a step in which another member prefills a few prompts while this one decodes, beside the class of its decode buckets and the class of the union's whole capacity; not captured when a decode bucket reaches it or it lies within a quarter of the whole capacity |
 

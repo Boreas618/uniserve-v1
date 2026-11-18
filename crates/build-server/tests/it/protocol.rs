@@ -11,7 +11,7 @@ use build_server::manifest::ModuleForm;
 use build_server::protocol::{Client, Descriptors, PackageRequest, PrepareRequest, Selector, wire};
 use build_server::store::ModulePath;
 use build_server::target::Target;
-use proto::module::{ModuleSlot, PackageRevision, Phase};
+use proto::module::{ModuleSlot, PackageRevision};
 use service::Connection;
 
 use crate::support::arch;
@@ -186,7 +186,7 @@ fn prepare_reports_each_build_and_returns_the_selected_packages() {
                         wire::PrepareResponse {
                             packages: vec![wire::SlotPackage {
                                 op: "rms_norm".into(),
-                                phase: None,
+                                key: None,
                                 package: Some(wire::PackageRevision {
                                     backend: "triton".into(),
                                     revision: 2,
@@ -329,13 +329,13 @@ fn a_listing_names_the_packages_revisions_and_modules() {
 }
 
 #[test]
-fn the_four_phases_of_a_revision_slot_travel_whole() {
+fn the_pinned_keys_of_revision_slots_travel_whole() {
     let mut client = server_on(|connection| {
         let (request, _) = connection.receive::<wire::Request>().unwrap();
         let Some(wire::request::Request::Prepare(prepare)) = request.request else {
             panic!("a prepare");
         };
-        // The server echoes what it selected, phase and all.
+        // The server echoes what it selected, pinned key and all.
         connection
             .post(
                 &wire::ServerMessage {
@@ -346,7 +346,7 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
                                 .iter()
                                 .map(|revision| wire::SlotPackage {
                                     op: revision.op.clone(),
-                                    phase: revision.phase,
+                                    key: revision.key.clone(),
                                     package: Some(wire::PackageRevision {
                                         backend: "triton".into(),
                                         revision: 1,
@@ -363,22 +363,18 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
             .unwrap();
     });
 
-    let phases = [
-        Phase::Prefill,
-        Phase::Decode,
-        Phase::TextEncode,
-        Phase::Denoise,
+    let keys = [
+        "phase_prefill",
+        "phase_decode",
+        "phase_text_encode",
+        "phase_denoise",
     ];
     let request = PrepareRequest {
         targets: Vec::new(),
-        packages: phases
+        packages: keys
             .iter()
-            .map(|phase| PackageRequest {
-                slot: ModuleSlot {
-                    op: "attention".into(),
-                    phase: Some(*phase),
-                    part: None,
-                },
+            .map(|key| PackageRequest {
+                slot: ModuleSlot::key("attention", *key),
                 selector: Selector::Latest {
                     backend: "triton".into(),
                     arguments: toml::Table::new(),
@@ -386,7 +382,7 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
             })
             .collect(),
         descriptors: vec![Descriptors {
-            slot: ModuleSlot::phase("attention", Phase::Prefill),
+            slot: ModuleSlot::key("attention", "phase_prefill"),
             keys: vec!["phase_prefill".into()],
         }],
     };
@@ -394,9 +390,9 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
     assert_eq!(
         prepared
             .iter()
-            .map(|(slot, _)| slot.phase)
+            .map(|(slot, _)| slot.key.as_deref())
             .collect::<Vec<_>>(),
-        phases.map(Some)
+        keys.map(Some)
     );
 }
 
@@ -518,9 +514,8 @@ fn a_listed_module_of_an_unknown_form_is_refused_rather_than_guessed() {
 }
 
 #[test]
-fn the_protocol_speaks_phases_and_arguments_of_its_own_vocabulary() {
-    // The wire's phases map onto the record's, and arguments travel as a
-    // TOML table, so a package revision's types survive the connection.
+fn a_package_revisions_arguments_keep_their_types() {
+    // Arguments travel as a TOML table, so a package revision's types survive the connection.
     let mut arguments = toml::Table::new();
     arguments.insert("chunked_prefill_size".into(), toml::Value::Integer(4096));
     let message = wire::PackageRevision::from(&PackageRevision {
@@ -534,9 +529,4 @@ fn the_protocol_speaks_phases_and_arguments_of_its_own_vocabulary() {
         read.arguments.get("chunked_prefill_size"),
         Some(&toml::Value::Integer(4096))
     );
-    assert_eq!(
-        proto::module::phase_of(proto::module::phase_to_wire(Some(Phase::Decode))).unwrap(),
-        Some(Phase::Decode)
-    );
-    assert_eq!(proto::module::phase_of(None).unwrap(), None);
 }

@@ -172,51 +172,70 @@ pub const DEFAULT_CONVERSION_BUFFER_MIB: NonZeroU64 = match NonZeroU64::new(1024
 };
 
 /// The KV cache (`kv_cache_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct KvCacheConfig {
     /// Capacity in tokens; sized from storage when unset.
+    #[reload(epoch)]
     pub max_tokens: Option<NonZeroU64>,
     /// Tokens per page of the cache group with the widest token rows, a
     /// power of two the attention kernels read; [`DEFAULT_BLOCK_SIZE`] when
     /// unset ([`KvCacheConfig::block_tokens`]).
+    #[reload(epoch)]
     pub block_size: Option<NonZeroU32>,
     /// Element type (`float16`, `bfloat16`, `float32` or `float8_e4m3fn`);
     /// each layer's compute type when unset.
+    #[reload(epoch)]
     pub dtype: Option<PrefixCacheDtype>,
-    /// Reuse and retain cached prompt prefixes across requests.
+    /// Reuse and retain cached prompt prefixes across requests. Switched off, the schedulers
+    /// neither read nor write cached prefixes from their next step on, and the cached pages
+    /// leave by eviction; switched on, a new epoch builds what an epoch that caches prefixes
+    /// lays out beside the device cache (the host tier's region, a converted load's buffers)
+    /// ([`switched_off`]).
+    #[reload(by = switched_off)]
     pub prefix_caching: bool,
     /// Offload full prompt pages to the host KV cache of each host's Storage
     /// Server and load them back on a later prefix match the device cache
     /// no longer holds: every published page of a full-attention group, and
     /// a sliding-window group's window before each aligned boundary.
-    /// Applies with `prefix_caching`.
+    /// Applies with `prefix_caching`. Switched off, the schedulers offload no page from their
+    /// next step on; switched on, a new epoch opens the host region ([`switched_off`]).
+    #[reload(by = switched_off)]
     pub host_tier: bool,
     /// The host KV cache's token count over the device KV cache's, the
     /// same on every rank of an epoch (as SGLang's `--hicache-ratio`); each
     /// host's Storage Server lowers it for the whole epoch to what four
     /// fifths of its available storage hold. [`DEFAULT_HOST_RATIO`] unless
-    /// stated.
+    /// stated. The host region is created at its size when an epoch of the deployment first
+    /// opens it, under a name its size is no part of, and each later epoch's open keeps its
+    /// numbering, so a change of it is an epoch's.
+    #[reload(epoch)]
     pub host_ratio: f64,
     /// The deployment's host KV cache on each host, in GiB, over the ranks
-    /// there, in place of `host_ratio` (as SGLang's `--hicache-size`).
+    /// there, in place of `host_ratio` (as SGLang's `--hicache-size`); sized as `host_ratio`
+    /// is, so a change of it is an epoch's.
+    #[reload(epoch)]
     pub host_gib: Option<NonZeroU64>,
     /// Keep every page of the host KV cache in Mooncake, the KV storage,
     /// through the Mooncake connector of each host's Storage Server, and
     /// prefetch long hits back. Applies with `host_tier`; none when unset.
+    #[reload(epoch)]
     pub mooncake: Option<storage::connector::Settings>,
     /// The pages of the largest block size between the aligned boundaries
     /// a long prompt offloads its sliding windows before
     /// ([`DEFAULT_BOUNDARY_INTERVAL`] unless stated).
+    #[reload(epoch)]
     pub boundary_interval: NonZeroU32,
     /// The decoded tokens between two checkpoints of the state a model
     /// keeps per request slot, a recurrent state ([`DEFAULT_STATE_INTERVAL`]
     /// unless stated).
+    #[reload(epoch)]
     pub state_interval: NonZeroU32,
     /// For a model that keeps a recurrent state, the bytes of its state
     /// region beyond one checkpoint per request slot over the bytes of the
     /// KV planes, which divide what a rank's share leaves between them;
     /// positive. [`DEFAULT_STATE_RATIO`] unless stated.
+    #[reload(epoch)]
     pub state_ratio: f64,
     /// The time a copy of cached blocks the scheduler asks for may take
     /// whatever its size, before it gives the copy up and the request
@@ -225,12 +244,14 @@ pub struct KvCacheConfig {
     /// host and the device, and a stored trajectory's restore
     /// ([`DEFAULT_PREFETCH_TIMEOUT_BASE`] unless stated).
     #[serde(with = "values::duration")]
+    #[reload(epoch)]
     pub prefetch_timeout_base: Duration,
     /// The time such a copy may take beyond `prefetch_timeout_base` for
     /// every 1024 tokens it moves (as SGLang's
     /// `prefetch_timeout_per_ki_token`)
     /// ([`DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN`] unless stated).
     #[serde(with = "values::duration")]
+    #[reload(epoch)]
     pub prefetch_timeout_per_ki_token: Duration,
     /// The Storage Server endpoints (`host:port`) of other hosts serving the
     /// same model under the same served name, whose published host KV cache
@@ -239,6 +260,7 @@ pub struct KvCacheConfig {
     /// Server and loaded like host pages. The endpoints are unauthenticated;
     /// the hosts rely on the isolation of their network. Applies with
     /// `host_tier`; none when empty.
+    #[reload(epoch)]
     pub peers: Vec<String>,
     /// The most host storage, in MiB, one cache group's converted-load
     /// source buffer takes on each rank: the buffer a peer's pages of
@@ -247,7 +269,19 @@ pub struct KvCacheConfig {
     /// pages of the widest row within this bound; a page it finds no slot
     /// for is computed instead. [`DEFAULT_CONVERSION_BUFFER_MIB`] unless
     /// stated.
+    #[reload(epoch)]
     pub conversion_buffer_mib: NonZeroU64,
+}
+
+/// How a switch of a capability the epoch lays out storage for takes effect: switched off at the
+/// schedulers' next step, which stop using it; switched on, or stated by a start, by a new epoch,
+/// which lays the storage out.
+pub fn switched_off(previous: Option<&bool>, next: &bool) -> crate::reload::Effect {
+    match previous {
+        Some(true) if !*next => crate::reload::Effect::Step,
+        Some(previous) if previous == next => crate::reload::Effect::Step,
+        _ => crate::reload::Effect::Epoch,
+    }
 }
 
 impl Default for KvCacheConfig {
@@ -381,9 +415,9 @@ pub struct SchedulerConfig {
     #[reload(epoch)]
     pub prefetch_timeout_per_ki_token: Duration,
     /// How often the scheduler reports its statistics, resolved from
-    /// `worker_config.report_period`.
+    /// `worker_config.report_period`, which each step's snapshot carries ([`Tuning`]).
     #[serde(skip)]
-    #[reload(epoch)]
+    #[reload(step)]
     pub report_period: Duration,
 }
 
@@ -504,14 +538,18 @@ impl SchedulerConfig {
     }
 }
 
-/// The options every scheduler reads at its next step (`specs/configuration.md` §7, step values),
-/// with the configuration revision they belong to.
+/// The options an engine reads at its next step (`specs/configuration.md` §7, step values), with
+/// the configuration revision they belong to: the schedulers' limits, and what every main process
+/// of the epoch reads beside its batches (its watchdog's bound, its report period, its
+/// comparison bound, its NVTX ranges).
 ///
 /// An engine keeps the current values in one snapshot its schedulers share; each step takes the
 /// snapshot once when it begins and uses it for the whole step, and every batch it assembles
-/// names the snapshot's revision, so all ranks of a batch read one configuration. A change of
-/// them replaces the snapshot (the engine command `Tune`) and takes effect at each scheduler's
-/// next step, without a new policy instance or a new process.
+/// names the snapshot's revision and carries the values its ranks read with it (the copy
+/// budget), so all ranks of a batch read one configuration. A change of them replaces the
+/// snapshot (the engine command `Tune`), which the scheduler node relays to every peer, and
+/// takes effect at each scheduler's next step and each process's next turn of its control
+/// loop, without a new policy instance or a new process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tuning {
     /// The configuration revision the values are of.
@@ -525,23 +563,58 @@ pub struct Tuning {
     pub max_num_batched_tokens: Option<NonZeroUsize>,
     /// Waiting requests before a submission is refused as overloaded; unbounded when unstated.
     pub max_queued_requests: Option<NonZeroUsize>,
+    /// Batches each worker group keeps in flight, by the group's id
+    /// (`device_config.queue_depth`, or the group's own `queue_depth`).
+    pub queue_depths: BTreeMap<String, NonZeroUsize>,
+    /// Whether the schedulers read and write cached prefixes (`kv_cache_config.prefix_caching`).
+    pub prefix_caching: bool,
+    /// Whether the schedulers offload pages to the host tier (`kv_cache_config.host_tier`).
+    pub host_tier: bool,
+    /// The bytes the copies started with one batch move together over a group's ranks
+    /// (`worker_config.copy_budget`).
+    pub copy_budget: u64,
+    /// How often each process and scheduler reports (`worker_config.report_period`).
+    pub report_period: Duration,
+    /// How long a job may stay in flight before it is reported stalled
+    /// (`worker_config.watchdog_timeout`).
+    pub watchdog_timeout: Duration,
+    /// How long a generation update's shadow pass and a peer's own preparation are waited for
+    /// (`worker_config.compare_timeout`).
+    pub compare_timeout: Duration,
+    /// Whether the processes emit their NVTX ranges (`profiling_config.nvtx_ranges`).
+    pub nvtx_ranges: bool,
 }
 
 impl Tuning {
     /// The step values `config` states, as of `revision`.
     pub fn of(config: &EngineConfig, revision: u64) -> Self {
+        let queue_depths = config
+            .parallel
+            .worker_groups
+            .iter()
+            .map(|group| (group.id.0.clone(), positive(group.queue_depth.max(1))))
+            .collect();
         Self {
             revision,
             chunked_prefill_size: config.scheduler.chunked_prefill_size,
             max_batch: config.scheduler.max_batch,
             max_num_batched_tokens: config.max_num_batched_tokens,
             max_queued_requests: config.scheduler.max_queued_requests,
+            queue_depths,
+            prefix_caching: config.kv_cache.prefix_caching,
+            host_tier: config.kv_cache.host_tier,
+            copy_budget: config.worker.copy_budget,
+            report_period: config.worker.report_period,
+            watchdog_timeout: config.worker.watchdog_timeout,
+            compare_timeout: config.worker.compare_timeout,
+            nvtx_ranges: config.profiling.nvtx_ranges,
         }
     }
 
     /// The engine command that delivers these values, numbered `id`.
     pub fn command(&self, id: u64) -> crate::request::wire::Tune {
         let count = |value: NonZeroUsize| u64::try_from(value.get()).unwrap_or(u64::MAX);
+        let millis = |value: Duration| u64::try_from(value.as_millis()).unwrap_or(u64::MAX);
         crate::request::wire::Tune {
             id,
             revision: self.revision,
@@ -549,19 +622,44 @@ impl Tuning {
             max_batch: count(self.max_batch),
             max_num_batched_tokens: self.max_num_batched_tokens.map(count),
             max_queued_requests: self.max_queued_requests.map(count),
+            queue_depths: self
+                .queue_depths
+                .iter()
+                .map(|(group, depth)| (group.clone(), count(*depth)))
+                .collect(),
+            prefix_caching: self.prefix_caching,
+            host_tier: self.host_tier,
+            copy_budget: self.copy_budget,
+            report_period_ms: millis(self.report_period),
+            watchdog_timeout_ms: millis(self.watchdog_timeout),
+            compare_timeout_ms: millis(self.compare_timeout),
+            nvtx_ranges: self.nvtx_ranges,
         }
     }
 
-    /// The values a `Tune` command delivers; `None` for one whose batch is zero calls, which
-    /// no deployment states.
+    /// The values a `Tune` command delivers; `None` for one whose batch, or a group's depth, is
+    /// zero calls, which no deployment states.
     pub fn of_command(command: &crate::request::wire::Tune) -> Option<Self> {
         let count = |value: u64| usize::try_from(value).ok().and_then(NonZeroUsize::new);
+        let queue_depths = command
+            .queue_depths
+            .iter()
+            .map(|(group, depth)| Some((group.clone(), count(*depth)?)))
+            .collect::<Option<_>>()?;
         Some(Self {
             revision: command.revision,
             chunked_prefill_size: command.chunked_prefill_size.and_then(count),
             max_batch: count(command.max_batch)?,
             max_num_batched_tokens: command.max_num_batched_tokens.and_then(count),
             max_queued_requests: command.max_queued_requests.and_then(count),
+            queue_depths,
+            prefix_caching: command.prefix_caching,
+            host_tier: command.host_tier,
+            copy_budget: command.copy_budget,
+            report_period: Duration::from_millis(command.report_period_ms),
+            watchdog_timeout: Duration::from_millis(command.watchdog_timeout_ms),
+            compare_timeout: Duration::from_millis(command.compare_timeout_ms),
+            nvtx_ranges: command.nvtx_ranges,
         })
     }
 }
@@ -738,19 +836,25 @@ pub const DEFAULT_QUEUE_DEPTH: usize = 2;
 
 /// Rank layout without a deployment file, and product transport
 /// (`device_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeviceConfig {
     /// Device kind of every rank; `cuda` numbers each host's GPUs from zero.
+    #[reload(epoch)]
     pub device: DeviceKind,
     /// Each rank's CUDA device index on its host, in rank order; empty
     /// numbers each host's ranks from zero. A change of the parallel
     /// configuration that does not state it takes the order that leaves
     /// the most weights on the GPUs already holding them.
+    #[reload(epoch)]
     pub devices: Vec<u32>,
     /// Hosts after this one the ranks spread across, in equal blocks.
+    #[reload(epoch)]
     pub worker_hosts: Vec<String>,
-    /// Batches in flight per rank; a deployment group states its own.
+    /// Batches in flight per rank; a deployment group states its own. It holds no storage: a
+    /// scheduler keeps this many of a group's batches in flight from its next step on, and one
+    /// that holds more lets them end first.
+    #[reload(step)]
     pub queue_depth: NonZeroUsize,
 }
 
@@ -765,10 +869,6 @@ impl Default for DeviceConfig {
     }
 }
 
-/// The expert-exchange package a deployment that shards its experts runs when its configuration
-/// names none: FlashInfer's NVLink all-to-all (`crates/ops/kernels/expert_exchange/alltoall`).
-pub const DEFAULT_EXPERT_EXCHANGE: &str = "alltoall";
-
 /// Mixture-of-experts parallelism (`moe_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
@@ -779,12 +879,6 @@ pub struct MoeConfig {
     /// experts ([`EngineConfig::expert_union`]).
     #[reload(epoch)]
     pub expert_parallel: bool,
-    /// The expert-exchange package's backend, which reaches sharded experts (`alltoall`,
-    /// `megamoe`, `deepep`): a package the Build Server holds. Unset, a deployment whose
-    /// schedulers exchange experts runs [`DEFAULT_EXPERT_EXCHANGE`], and one that exchanges no
-    /// token names none.
-    #[reload(generation)]
-    pub exchange: Option<String>,
     /// Microbatches overlapping attention with dedicated expert workers.
     #[reload(epoch)]
     pub microbatches: NonZeroU32,
@@ -801,7 +895,6 @@ impl Default for MoeConfig {
     fn default() -> Self {
         Self {
             expert_parallel: false,
-            exchange: None,
             microbatches: NonZeroU32::MIN,
             beside_rows: DEFAULT_BESIDE_ROWS,
         }
@@ -849,34 +942,44 @@ impl CudaGraphConfig {
 }
 
 /// The worker processes (`worker_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
     /// The engine package the deployment's main processes run as: the name of an implementation
     /// of the engine interface installed at the Build Server.
+    #[reload(epoch)]
     pub engine: String,
     /// The revision of the engine package to run; the latest installed one, fixed when the
     /// configuration is applied, when unset.
+    #[reload(epoch)]
     pub engine_revision: Option<u32>,
     /// Time a job of a rank's worker may stay in flight before it is reported `Stalled`, which
-    /// fails the epoch: its worker group is replaced, and an update on trial rolls back.
+    /// fails the epoch: its worker group is replaced, and an update on trial rolls back. Every
+    /// main process's watchdog takes a change at its engine's next step values ([`Tuning`]).
     #[serde(with = "values::duration")]
+    #[reload(step)]
     pub watchdog_timeout: Duration,
     /// How long the main processes of an epoch whose ranks span several hosts
     /// wait for one another as they start: the scheduler node for every peer's
     /// registration, a peer for the scheduler node's acceptance, and every
     /// process for the others at the ranks' host-group rendezvous. A process
     /// that is connected and then exits or loses its host fails the start at
-    /// once; the bound covers a process that never arrives.
+    /// once; the bound covers a process that never arrives. Only a start reads it, so a change
+    /// moves no running process: the next start of a process (a relaunch, a standby, another
+    /// epoch) waits as long as it states.
     #[serde(with = "values::duration")]
+    #[reload(step)]
     pub join_timeout: Duration,
     /// Time a generation update's shadow pass waits for the running requests of every scheduler
     /// to run a step its changed kernels are compared on, and for every peer's own preparation of
-    /// the generation to end, before the update is abandoned as uncompared.
+    /// the generation to end, before the update is abandoned as uncompared. A change bounds the
+    /// next preparation ([`Tuning`]).
     #[serde(with = "values::duration")]
+    #[reload(step)]
     pub compare_timeout: Duration,
     /// `tower=gen:<device>` places the generation tower on another device
     /// than the rank's.
+    #[reload(epoch)]
     pub mesh: Option<String>,
     /// Keep a standby beside every worker group: it maps the group's
     /// retained weights and cache, captures its graphs and parks, and
@@ -888,6 +991,7 @@ pub struct WorkerConfig {
     /// promoted together when one of them fails. Each standby rank holds a
     /// CUDA context, graph pools and workspaces of its own, which the storage
     /// `mem_fraction_static` leaves must hold.
+    #[reload(epoch)]
     pub standby: bool,
     /// How a parked standby (a group's, a failure domain's epoch, or a hot
     /// update's engine) keeps the device storage of its graph pools, scratch,
@@ -900,26 +1004,32 @@ pub struct WorkerConfig {
     /// their addresses (DeepEP's windows, colocated MegaMoE's NVSHMEM heap)
     /// are created again at the promotion, which captures the graphs that
     /// use them anew.
+    #[reload(epoch)]
     pub standby_storage: StandbyStorage,
     /// How often each main process states its metrics and each scheduler its statistics to the
     /// daemon, each report covering the period since the last ([`DEFAULT_REPORT_PERIOD`] unless
-    /// stated).
+    /// stated). A change takes effect with the engine's next step values ([`Tuning`]).
     #[serde(with = "values::duration")]
+    #[reload(step)]
     pub report_period: Duration,
     /// The bytes, summed over a worker group's ranks, that the copies started with one batch may
     /// move together beside its forward; a larger copy starts alone ([`DEFAULT_COPY_BUDGET`]
-    /// unless stated).
+    /// unless stated). Each batch carries the budget of the step that assembled it, so every
+    /// rank of a group starts the same copies with it, from the next step on.
     #[serde(with = "values::bytes")]
+    #[reload(step)]
     pub copy_budget: u64,
     /// The threads of a main process's host work: the width of its media pool, each with
     /// `host_queue_depth` tasks of room, and the threads a conversion of a request's condition
     /// media shares its work over. Half the CPUs the process may run on (its affinity mask within
     /// its cgroup's quota) when unset, the other half left to its workers', schedulers' and
     /// communicators' threads.
+    #[reload(epoch)]
     pub host_threads: Option<NonZeroUsize>,
     /// The tasks of host work one thread of a main process's media pool has room for: the
     /// requests a host phase serves at once are the threads times it
     /// ([`DEFAULT_HOST_QUEUE_DEPTH`] unless stated).
+    #[reload(epoch)]
     pub host_queue_depth: NonZeroUsize,
 }
 
@@ -1313,8 +1423,9 @@ pub struct ProfilingConfig {
     /// the scheduler's and control thread's ranges) are emitted from the
     /// epoch's start, for a profiler that records them, such as Nsight
     /// Systems; a session's `timeline` collector turns them on while it
-    /// records either way. A change takes a new epoch.
-    #[reload(epoch)]
+    /// records either way. They are host ranges no graph captures: every main process switches
+    /// them with its engine's next step values ([`Tuning`]).
+    #[reload(step)]
     pub nvtx_ranges: bool,
 }
 
@@ -1636,8 +1747,9 @@ pub struct ParallelConfig {
 ///
 /// The leader daemon resolves it once from the serving options and hands the same value to every
 /// engine process of the epoch. Any change to it is a new epoch, except a change to a value that
-/// selects a package's backend or is a package's parameter, which the generation layer applies in
-/// place; [`EngineConfig::build_part`] tells the two apart.
+/// is a package's parameter or that the serving engine takes in place;
+/// [`EngineConfig::build_part`] tells the two apart. Which package fills each kernel is no part
+/// of it: the epoch's module set states that.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
@@ -1658,13 +1770,6 @@ pub struct EngineConfig {
     /// it samples, so it is a property of the captured graphs and a request asking for more is
     /// refused. Zero reports no candidate.
     pub max_logprobs: u32,
-    /// The attention package's backend, and the ones that fill prompt processing and one decoding
-    /// token when they differ.
-    pub attention_backend: Option<String>,
-    pub prefill_attention_backend: Option<String>,
-    pub decode_attention_backend: Option<String>,
-    /// The grouped expert GEMM package's backend.
-    pub moe_runner_backend: Option<String>,
     pub device: DeviceConfig,
     pub scheduler: SchedulerConfig,
     pub media: MediaConfig,
@@ -1708,11 +1813,13 @@ impl EngineConfig {
     /// Every field of the configuration, and of each of its sections that holds a value of both
     /// layers, is classified by name here, and the destructuring is exhaustive: a field added to
     /// any of these types does not compile until it is placed in the build part or named as a
-    /// generation-layer value. The generation layer's values are the package backends
-    /// (attention, the grouped expert GEMM, the expert exchange); the scheduling policy's
+    /// generation-layer value. The generation layer's values are the scheduling policy's
     /// parameters (the scheduler section, the batched token budget, the speculative cost
-    /// figures); the probes' switches, which change at a step boundary; and the media section,
-    /// which the frontend reads.
+    /// figures); the values the serving engine takes at a step boundary (the probes' switches,
+    /// the NVTX ranges, the queue depth, the workers' bounds, report period and copy budget);
+    /// and the media section, which the frontend reads. A switch the engine takes in place only
+    /// when it is switched off (`kv_cache_config.prefix_caching`, `host_tier`) stays in the
+    /// build part.
     pub fn build_part(&self) -> BuildPart<'_> {
         let Self {
             executable,
@@ -1721,10 +1828,6 @@ impl EngineConfig {
             max_running_requests,
             max_num_batched_tokens: _,
             max_logprobs,
-            attention_backend: _,
-            prefill_attention_backend: _,
-            decode_attention_backend: _,
-            moe_runner_backend: _,
             device,
             scheduler: _,
             media: _,
@@ -1740,10 +1843,29 @@ impl EngineConfig {
         } = self;
         let MoeConfig {
             expert_parallel,
-            exchange: _,
             microbatches,
             beside_rows,
         } = moe;
+        let WorkerConfig {
+            engine,
+            engine_revision,
+            watchdog_timeout: _,
+            join_timeout: _,
+            compare_timeout: _,
+            mesh,
+            standby,
+            standby_storage,
+            report_period: _,
+            copy_budget: _,
+            host_threads,
+            host_queue_depth,
+        } = worker;
+        let DeviceConfig {
+            device,
+            devices,
+            worker_hosts,
+            queue_depth: _,
+        } = device;
         let SpeculativeConfig {
             num_draft_tokens,
             expected_speedup: _,
@@ -1754,7 +1876,7 @@ impl EngineConfig {
             fence_modules,
             fence_probes_off: _,
             graph_pc_sampling,
-            nvtx_ranges,
+            nvtx_ranges: _,
         } = profiling;
         BuildPart {
             executable,
@@ -1762,7 +1884,9 @@ impl EngineConfig {
             parallel,
             max_running_requests: *max_running_requests,
             max_logprobs: *max_logprobs,
-            device,
+            device: *device,
+            devices,
+            worker_hosts,
             mem_fraction_static: *mem_fraction_static,
             load,
             kv_cache,
@@ -1770,12 +1894,17 @@ impl EngineConfig {
             microbatches: *microbatches,
             beside_rows: *beside_rows,
             cuda_graph,
-            worker,
+            engine,
+            engine_revision: *engine_revision,
+            mesh,
+            standby: *standby,
+            standby_storage: *standby_storage,
+            host_threads: *host_threads,
+            host_queue_depth: *host_queue_depth,
             num_draft_tokens: *num_draft_tokens,
             video,
             fence_modules,
             graph_pc_sampling: *graph_pc_sampling,
-            nvtx_ranges: *nvtx_ranges,
         }
     }
 
@@ -1800,7 +1929,9 @@ pub struct BuildPart<'a> {
     pub parallel: &'a ParallelConfig,
     pub max_running_requests: NonZeroUsize,
     pub max_logprobs: u32,
-    pub device: &'a DeviceConfig,
+    pub device: DeviceKind,
+    pub devices: &'a [u32],
+    pub worker_hosts: &'a [String],
     pub mem_fraction_static: f64,
     pub load: &'a LoadConfig,
     pub kv_cache: &'a KvCacheConfig,
@@ -1809,12 +1940,17 @@ pub struct BuildPart<'a> {
     /// The expert union's middle capture class, which the captured graphs are shaped for.
     pub beside_rows: NonZeroU32,
     pub cuda_graph: &'a CudaGraphConfig,
-    pub worker: &'a WorkerConfig,
+    pub engine: &'a str,
+    pub engine_revision: Option<u32>,
+    pub mesh: &'a Option<String>,
+    pub standby: bool,
+    pub standby_storage: StandbyStorage,
+    pub host_threads: Option<NonZeroUsize>,
+    pub host_queue_depth: NonZeroUsize,
     pub num_draft_tokens: u32,
     pub video: &'a VideoConfig,
     pub fence_modules: &'a Option<Vec<String>>,
     pub graph_pc_sampling: bool,
-    pub nvtx_ranges: bool,
 }
 
 impl BuildPart<'_> {
@@ -1934,8 +2070,6 @@ pub struct EngineArgs {
     /// graph pools while it parks: the daemon resolves `worker_config.standby_storage` for the
     /// failure domain, so it states `resident` or `suspended` and never `auto`.
     pub standby_storage: StandbyStorage,
-    /// The rank layout's queue depth for this rank's worker groups.
-    pub queue_depth: u32,
     /// The number of the deployment's ranks, every worker group's on every host: this process's
     /// ranks and those of its peers, the members of the host group they meet in.
     pub world_size: u32,
@@ -2001,7 +2135,6 @@ impl EngineArgs {
             scheduler_node: false,
             world: None,
             standby_storage: StandbyStorage::Resident,
-            queue_depth: 0,
             world_size: 0,
         }
     }

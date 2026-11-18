@@ -382,7 +382,7 @@ impl BuildServer {
                         .into_iter()
                         .map(|(slot, package)| wire::SlotPackage {
                             op: slot.op,
-                            phase: protocol::phase_to_wire(slot.phase),
+                            key: slot.key,
                             package: Some((&package).into()),
                             part: slot.part.unwrap_or_default(),
                         })
@@ -441,19 +441,22 @@ impl BuildServer {
                 Ok(connection.flush()?)
             }
             wire::request::Request::Cover(cover) => {
-                let mut preferred = Vec::with_capacity(cover.preferred.len());
-                for entry in cover.preferred {
-                    preferred.push(protocol::Preference {
-                        phase: protocol::phase_from_wire(entry.phase)?,
-                        backend: entry.backend,
-                        revision: (entry.revision != 0).then_some(entry.revision),
-                    });
-                }
+                let pins = cover
+                    .pins
+                    .into_iter()
+                    .map(|pin| {
+                        let pinned = proto::module::Pin {
+                            backend: pin.backend,
+                            revision: (pin.revision != 0).then_some(pin.revision),
+                        };
+                        (pin.key, pinned)
+                    })
+                    .collect();
                 let coverage = self.cover(&protocol::CoverRequest {
                     op: cover.op,
                     targets: cover.targets.into_iter().map(Target::new).collect(),
                     keys: cover.keys,
-                    preferred,
+                    pins,
                     fixed: cover
                         .fixed
                         .into_iter()
@@ -1044,7 +1047,7 @@ impl BuildServer {
         for (slot, revision) in &chosen {
             let package = self.package(&slot.op, revision)?;
             // A slot's package revision builds the keys named for that slot alone: two
-            // slots of one operator, one per phase or per part, hold disjoint
+            // slots of one operator, one per pinned key or per part, hold disjoint
             // keys, and a package is never asked for another slot's.
             let mut keys = Vec::new();
             for descriptors in request
@@ -1341,43 +1344,55 @@ impl BuildServer {
     ///
     /// The candidates are the packages a module set fixed for the operator,
     /// when the request states them, and otherwise each backend's latest
-    /// installed revision - or the revision a named backend states; of those,
-    /// the ones that build for every requested target. The response lists them
-    /// in selection order, which is what the daemon fixes a module set from. A key goes to the first candidate whose manifest
-    /// covers it, in the selection order: a backend the request names for the
-    /// key's phase (its descriptor's `phase` field, as the candidate's manifest
-    /// reads the key) first, then the manifest's
-    /// `priority`, highest first, then the backend whose name sorts first. A
-    /// named backend that does not cover a key leaves it to the next candidate,
-    /// so a deployment that names its attention backend still serves the keys
-    /// only another package declares. A key no candidate covers is returned in
-    /// `uncovered`. Nothing is built, and the response does not depend on what
-    /// the store has built: every host selects alike.
+    /// installed revision, or the revision a pin states; of those, the ones
+    /// that build for every requested target. The response lists them in
+    /// selection order, which is what the daemon fixes a module set from: the
+    /// manifest's `priority`, highest first, then the backend whose name sorts
+    /// first. A key the request pins (the deployment's `[kernels]` table, by the
+    /// key's exact text) goes to its pinned backend; every other key goes to the
+    /// first candidate in selection order whose manifest covers it. A key no
+    /// candidate covers is returned in `uncovered`. Nothing is built, and the
+    /// response does not depend on what the store has built: every host
+    /// selects alike.
     ///
     /// # Errors
     ///
-    /// Fails when the request names or fixes a revision of a backend that is
-    /// not installed.
+    /// Fails when the request pins or fixes a revision of a backend that is
+    /// not installed, or pins a key to a backend that is no candidate for the
+    /// targets or does not cover the key.
     pub fn cover(&self, request: &protocol::CoverRequest) -> Result<protocol::Coverage> {
         let packages = self
             .packages
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        // The revision a pin states of each backend. One backend serves an operator at one
+        // revision, so its pins state one, and its unpinned keys are selected at it too.
+        let mut pinned: BTreeMap<&str, Option<u32>> = BTreeMap::new();
+        for (key, pin) in &request.pins {
+            let held = *pinned.entry(pin.backend.as_str()).or_insert(pin.revision);
+            if held != pin.revision {
+                return Err(Error::Refused {
+                    reason: format!(
+                        "{} key {key} pins {pin}, and another key pins {} at another revision: \
+                         one backend serves an operator at one revision",
+                        request.op, pin.backend
+                    ),
+                    upstream: None,
+                });
+            }
+        }
+
         // Each backend's revision: the one a module set fixed, when the
-        // request states them, and otherwise the one a named backend states,
-        // else the latest installed.
+        // request states them, and otherwise the one a pin states, else the
+        // latest installed.
         let mut revisions: BTreeMap<&str, (u32, &Arc<Package>)> = BTreeMap::new();
         for ((op, backend, revision), package) in packages.iter() {
             if *op != request.op {
                 continue;
             }
             let stated = if request.fixed.is_empty() {
-                request
-                    .preferred
-                    .iter()
-                    .find(|preference| preference.backend == *backend)
-                    .and_then(|preference| preference.revision)
+                pinned.get(backend.as_str()).copied().flatten()
             } else {
                 // A package the set does not hold is no candidate at all.
                 match request.fixed.iter().find(|(fixed, _)| fixed == backend) {
@@ -1395,23 +1410,25 @@ impl BuildServer {
                 *held = (*revision, package);
             }
         }
-        let stated = request
-            .preferred
+        let stated = pinned
             .iter()
             .filter(|_| request.fixed.is_empty())
-            .filter_map(|preference| Some((&preference.backend, preference.revision?)))
-            .chain(
-                request
-                    .fixed
-                    .iter()
-                    .map(|(backend, revision)| (backend, *revision)),
-            );
+            .filter_map(|(backend, revision)| Some(((*backend).to_owned(), (*revision)?)))
+            .chain(request.fixed.iter().cloned());
         for (backend, revision) in stated {
             if !revisions.contains_key(backend.as_str()) {
                 return Err(Error::UnknownRevision {
                     op: request.op.clone(),
-                    backend: backend.clone(),
+                    backend,
                     revision,
+                });
+            }
+        }
+        for backend in pinned.keys() {
+            if !revisions.contains_key(backend) {
+                return Err(Error::NotInstalled {
+                    op: request.op.clone(),
+                    backend: (*backend).to_owned(),
                 });
             }
         }
@@ -1442,29 +1459,33 @@ impl BuildServer {
             if !seen.insert(key.as_str()) {
                 continue;
             }
-            // A key's phase is a field of its descriptor, which only the manifest that
-            // declares the operator's dimensions reads: each candidate reads it itself.
-            let phase = |index: usize| {
-                candidates[index]
-                    .2
-                    .manifest
-                    .fields(key)?
-                    .into_iter()
-                    .find(|(dimension, _)| dimension == "phase")
-                    .and_then(|(_, value)| proto::module::Phase::named(&value))
-            };
-            let preferred = |index: &usize| {
-                request.preferred.iter().any(|preference| {
-                    preference.backend == candidates[*index].0
-                        && (preference.phase.is_none() || preference.phase == phase(*index))
-                })
-            };
             let covering = |index: &usize| candidates[*index].2.manifest.covers(key);
-            let selected = (0..candidates.len())
-                .filter(preferred)
-                .find(covering)
-                .or_else(|| (0..candidates.len()).find(covering));
-            match selected {
+            if let Some(pin) = request.pins.get(key) {
+                // A pinned key is the pin's alone: a backend that cannot build it for these
+                // targets refuses the selection rather than handing the key to another.
+                let index = candidates
+                    .iter()
+                    .position(|(backend, _, _)| *backend == pin.backend)
+                    .ok_or_else(|| Error::Refused {
+                        reason: format!(
+                            "{} key {key} is pinned to {}, which builds for none of the targets \
+                             {:?}",
+                            request.op, pin.backend, request.targets
+                        ),
+                        upstream: None,
+                    })?;
+                if !covering(&index) {
+                    return Err(Error::UnsupportedDescriptor {
+                        op: request.op.clone(),
+                        backend: pin.backend.clone(),
+                        revision: candidates[index].1,
+                        descriptor: key.clone(),
+                    });
+                }
+                chosen[index].push(key.clone());
+                continue;
+            }
+            match (0..candidates.len()).find(covering) {
                 Some(index) => chosen[index].push(key.clone()),
                 None => uncovered.push(key.clone()),
             }
@@ -2076,7 +2097,7 @@ fn install_package(
 fn prepare_request(message: wire::Prepare) -> Result<PrepareRequest> {
     let mut packages = Vec::with_capacity(message.packages.len());
     for revision in message.packages {
-        let slot = protocol::slot_of(revision.op, revision.phase, revision.part)?;
+        let slot = protocol::slot_of(revision.op, revision.key, revision.part);
         let selector = match revision.selector {
             Some(wire::package_request::Selector::Backend(backend)) => Selector::Latest {
                 backend: backend.backend,
@@ -2096,7 +2117,7 @@ fn prepare_request(message: wire::Prepare) -> Result<PrepareRequest> {
     let mut descriptors = Vec::with_capacity(message.descriptors.len());
     for entry in message.descriptors {
         descriptors.push(Descriptors {
-            slot: protocol::slot_of(entry.op, entry.phase, entry.part)?,
+            slot: protocol::slot_of(entry.op, entry.key, entry.part),
             keys: entry.keys,
         });
     }

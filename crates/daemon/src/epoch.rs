@@ -19,20 +19,15 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use proto::admin::{EpochState, EpochStatus, KernelPackage, ManagedProcess};
-pub use proto::module::{ModuleSet, ModuleSlot, PackageRevision, Phase};
-// The operators the configuration selects a backend for are named by the
-// module vocabulary (`proto::module::operator`), whose names each
-// operator's `Op::NAME` is: the daemon, the Build Server and the engine
-// cannot disagree about a slot's name.
-use proto::module::operator;
+pub use proto::module::{ModuleSet, ModuleSlot, PackageRevision};
 use serde::Serialize;
 
 use crate::config::Config;
 
 /// The key an epoch's modules are stored under: the operator, and the
-/// phase when the configuration fills it per phase. Modules and
-/// slots are `proto::module`'s types, which the daemon, the engine
-/// and the Build Server all name modules with.
+/// descriptor key the configuration's `[kernels]` table pins its package
+/// for. Modules and slots are `proto::module`'s types, which the daemon, the
+/// engine and the Build Server all name modules with.
 pub type KernelKey = ModuleSlot;
 
 /// What the leader's daemon records of one epoch.
@@ -294,55 +289,30 @@ pub fn kernel_packages(kernels: &BTreeMap<KernelKey, PackageRevision>) -> Vec<Ke
 }
 
 /// The module set `config` names: the engine package, the scheduling policy's
-/// and the kernel package of each operator, or phase of one, it selects a
-/// backend for.
+/// and the kernel package its `[kernels]` table pins for each descriptor key it lists.
 ///
-/// The backends and parameters come from the configuration; the revisions
-/// are fixed when the configuration is applied, at the Build Server.
-/// A package's `revision` is zero until then, unless the
-/// configuration states one. An operator whose backend the configuration
-/// does not state is absent: the deployment names
-/// nothing for it, and the Build Server selects its package for each of its
-/// descriptor keys among the packages that cover them, by manifest priority.
+/// The revisions are fixed when the configuration is applied, at the Build Server: a package's
+/// `revision` is zero until then, unless the configuration states one, and a pin of `latest`
+/// becomes the latest installed revision. A key the table does not list is absent: the
+/// deployment names nothing for it, and the Build Server selects its package among the packages
+/// that cover it, by manifest priority. An operator's names are those of the module vocabulary
+/// (`proto::module::operator`), which [`Config::validate`] holds the table to, so the daemon, the
+/// Build Server and the engine cannot disagree about a slot's name.
 pub fn modules_of(config: &Config) -> ModuleSet {
-    let mut kernels = BTreeMap::new();
-    let attention = attention_packages(config);
-    kernels.extend(attention);
-    // The exchange slot is filled only when the deployment spreads its
-    // experts over ranks. At one rank the model's MoE block takes its local
-    // arm and launches no exchange at all (`nn::Moe::forward` routes
-    // through `forward_expert_parallel` only when an expert lives on
-    // another rank), so a slot filled here would pin a package no call
-    // reaches — and, worse, the Build Server would refuse the epoch for a
-    // package nothing runs.
-    if config.moe_config.expert_parallel {
-        kernels.insert(
-            KernelKey::all(operator::EXPERT_EXCHANGE),
-            PackageRevision {
-                backend: config
-                    .moe_config
-                    .exchange
-                    .clone()
-                    .unwrap_or_else(|| proto::config::DEFAULT_EXPERT_EXCHANGE.to_owned()),
-                revision: 0,
-                arguments: toml::Table::new(),
-            },
-        );
-    }
-    if let Some(backend) = &config.moe_runner_backend {
-        // The grouped expert GEMM is two operators, gather and route,
-        // and one package backend fills both.
-        for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
-            kernels.insert(
-                KernelKey::all(operator),
-                PackageRevision {
-                    backend: backend.clone(),
-                    revision: 0,
+    let kernels = config
+        .kernels
+        .iter()
+        .flat_map(|(op, pins)| {
+            pins.iter().map(move |(key, pin)| {
+                let package = PackageRevision {
+                    backend: pin.backend.clone(),
+                    revision: pin.revision.unwrap_or(0),
                     arguments: toml::Table::new(),
-                },
-            );
-        }
-    }
+                };
+                (KernelKey::key(op.as_str(), key.as_str()), package)
+            })
+        })
+        .collect();
     ModuleSet {
         engine: PackageRevision {
             backend: config.worker_config.engine.clone(),
@@ -385,43 +355,6 @@ pub fn with_programs(
     }
     named.programs = programs;
     named
-}
-
-/// The attention operator's modules: one entry for every phase when the
-/// per-phase backends agree, or one entry per phase when they differ.
-/// A phase whose backend is unset names no package: the Build Server selects its
-/// keys' packages.
-fn attention_packages(config: &Config) -> Vec<(KernelKey, PackageRevision)> {
-    let prefill = config
-        .prefill_attention_backend
-        .clone()
-        .or_else(|| config.attention_backend.clone());
-    let decode = config
-        .decode_attention_backend
-        .clone()
-        .or_else(|| config.attention_backend.clone());
-    // No attention package declares parameters: its arguments are none.
-    let package = |backend: String| PackageRevision {
-        backend,
-        revision: 0,
-        arguments: toml::Table::new(),
-    };
-    if prefill == decode {
-        return prefill
-            .map(|backend| (KernelKey::all(operator::PAGED_ATTENTION), package(backend)))
-            .into_iter()
-            .collect();
-    }
-    [(Phase::Prefill, prefill), (Phase::Decode, decode)]
-        .into_iter()
-        .filter_map(|(phase, backend)| Some((phase, backend?)))
-        .map(|(phase, backend)| {
-            (
-                KernelKey::phase(operator::PAGED_ATTENTION, phase),
-                package(backend),
-            )
-        })
-        .collect()
 }
 
 /// The scheduling policy's arguments the configuration states beside its program's `args`: the
@@ -543,6 +476,11 @@ mod tests {
 
     use super::*;
     use crate::config::SchedulerConfig;
+
+    /// The pin `text` states (`backend@revision`).
+    fn pin(text: &str) -> proto::module::Pin {
+        text.parse().expect("a pin reads")
+    }
 
     /// A package of backend `backend` at revision 1 with no parameters.
     fn package(backend: &str) -> PackageRevision {
@@ -792,17 +730,15 @@ mod tests {
                 "speculative_config.refill_token_cost",
                 |config: &mut Config| config.speculative_config.refill_token_cost = Some(0.5),
             ),
-            ("attention_backend", |config: &mut Config| {
-                config.attention_backend = Some("attention-a".to_owned())
-            }),
-            ("prefill_attention_backend", |config: &mut Config| {
-                config.prefill_attention_backend = Some("attention-b".to_owned())
-            }),
-            ("decode_attention_backend", |config: &mut Config| {
-                config.decode_attention_backend = Some("attention-c".to_owned())
-            }),
-            ("moe_runner_backend", |config: &mut Config| {
-                config.moe_runner_backend = Some("grouped".to_owned())
+            ("kernels", |config: &mut Config| {
+                config.kernels.insert(
+                    "paged_attention".to_owned(),
+                    [(
+                        "phase_decode_head_128".to_owned(),
+                        pin("attention-a@latest"),
+                    )]
+                    .into(),
+                );
             }),
         ];
 
@@ -878,35 +814,6 @@ mod tests {
             );
         }
 
-        // The exchange is a package only where experts are spread over ranks:
-        // a single-rank deployment's MoE block takes its local arm and launches
-        // no exchange at all (`nn::Moe::forward` routes through
-        // `forward_expert_parallel` only when an expert lives on another rank),
-        // so the setting moves nothing there — and filling the slot anyway
-        // would pin a package no call reaches.
-        let exchange_only =
-            set(|config: &mut Config| config.moe_config.exchange = Some("deepep".to_owned()));
-        assert_eq!(
-            change(
-                &base,
-                &Epoch::of(exchange_only.clone()).expect("the configuration resolves")
-            ),
-            Change::None,
-            "at one rank the exchange setting moves nothing"
-        );
-        let mut spread = Config::default();
-        spread.moe_config.expert_parallel = true;
-        let mut spread_exchanged = spread.clone();
-        spread_exchanged.moe_config.exchange = Some("deepep".to_owned());
-        assert_eq!(
-            change(
-                &Epoch::of(spread).expect("the configuration resolves"),
-                &Epoch::of(spread_exchanged).expect("the configuration resolves")
-            ),
-            Change::Generation,
-            "in an expert-parallel deployment the exchange moves the modules"
-        );
-
         // Only an epoch update's values build the engine: the daemon's own
         // options and a generation update's leave the build config equal.
         for (what, change) in host_frontend
@@ -939,7 +846,14 @@ mod tests {
         // A package's revision is a generation change: the same backend
         // and parameters at a newly installed revision move the modules.
         let named_base = Epoch::of(set(|config: &mut Config| {
-            config.attention_backend = Some("attention-c".to_owned());
+            config.kernels.insert(
+                "paged_attention".to_owned(),
+                [(
+                    "phase_decode_head_128".to_owned(),
+                    pin("attention-c@latest"),
+                )]
+                .into(),
+            );
         }))
         .expect("the configuration resolves");
         let mut installed = named_base.clone();
@@ -953,47 +867,50 @@ mod tests {
         );
     }
 
-    /// The modules a configuration fills are keyed by the operators the
-    /// design names, with the attention operator split by phase only when
-    /// its per-phase fields state different backends, and the
-    /// scheduling policy package carries the values that only inform its decisions.
+    /// The modules a configuration fills are the pins of its `[kernels]` table, one slot per
+    /// pinned descriptor key at the revision the pin states (zero for `latest`, which the apply
+    /// fixes), and none for a key the table leaves to the Build Server; the scheduling policy
+    /// package carries the values that only inform its decisions.
     #[test]
-    fn the_filled_modules_name_the_operators_and_phases() {
-        let config = Config::default();
-        let modules = crate::epoch::modules_of(&config);
+    fn the_filled_modules_are_the_pinned_keys() {
+        let modules = crate::epoch::modules_of(&Config::default());
+        assert!(
+            modules.kernels.is_empty(),
+            "a deployment that pins nothing leaves every key to the Build Server"
+        );
 
-        // One attention package for every phase, and no expert exchange for a
-        // deployment whose experts all live on one rank: the model's MoE block
-        // takes its local arm and launches no exchange, so the slot is absent
-        // rather than filled with a package nothing calls. No
-        // grouped expert GEMM either, until the configuration names one.
-        // The default attention backend is `auto`: the deployment names no
-        // attention package, and the Build Server selects its packages.
-        for operator in [
-            operator::PAGED_ATTENTION,
-            operator::EXPERT_EXCHANGE,
-            operator::GATHER_GEMM,
-            operator::ROUTE_GEMM,
-        ] {
-            assert!(
-                !modules.kernels.contains_key(&KernelKey::all(operator)),
-                "an operator the configuration does not fill is absent"
-            );
-        }
-
-        // A deployment that spreads its experts over ranks does route through
-        // the exchange, and the slot states the backend its configuration
-        // names.
-        let mut parallel = Config::default();
-        parallel.moe_config.expert_parallel = true;
-        let modules = crate::epoch::modules_of(&parallel);
+        let prefill = "phase_prefill_head_128";
+        let decode = "phase_decode_head_128";
+        let mut pinned = Config::default();
+        pinned.kernels.insert(
+            "paged_attention".to_owned(),
+            [
+                (prefill.to_owned(), pin("trtllm@7")),
+                (decode.to_owned(), pin("triton@latest")),
+            ]
+            .into(),
+        );
+        pinned.kernels.insert(
+            "gather_gemm".to_owned(),
+            [("m_64".to_owned(), pin("grouped@2"))].into(),
+        );
+        let modules = crate::epoch::modules_of(&pinned);
+        let held: Vec<(KernelKey, &str, u32)> = modules
+            .kernels
+            .iter()
+            .map(|(slot, package)| (slot.clone(), package.backend.as_str(), package.revision))
+            .collect();
         assert_eq!(
-            modules.kernels[&KernelKey::all(operator::EXPERT_EXCHANGE)].backend,
-            "alltoall"
+            held,
+            vec![
+                (KernelKey::key("gather_gemm", "m_64"), "grouped", 2),
+                (KernelKey::key("paged_attention", decode), "triton", 0),
+                (KernelKey::key("paged_attention", prefill), "trtllm", 7),
+            ]
         );
 
         // The scheduling policy package's backend is the policy's name, and its
-        // parameters are the configuration's values it reads, as TOML strings.
+        // parameters are the configuration's values it reads, as TOML values.
         assert_eq!(modules.policy.backend, "arrival");
         let scheduler = SchedulerConfig {
             max_queued_requests: NonZeroUsize::new(16),
@@ -1011,103 +928,52 @@ mod tests {
             modules.policy.arguments["expected_speedup"],
             toml::Value::Float(2.5)
         );
+    }
 
-        // Per-phase attention: two entries, each naming its phase, once the
-        // fields state different backends.
-        let split = Config {
-            prefill_attention_backend: Some("attention-b".to_owned()),
-            decode_attention_backend: Some("attention-c".to_owned()),
-            ..Default::default()
-        };
-        let modules = crate::epoch::modules_of(&split);
-        let prefill =
-            &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, Phase::Prefill)];
-        let decode = &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode)];
-        assert_eq!(
-            (prefill.backend.as_str(), decode.backend.as_str()),
-            ("attention-b", "attention-c")
-        );
-        assert!(
-            !modules
-                .kernels
-                .contains_key(&KernelKey::all(operator::PAGED_ATTENTION)),
-            "a per-phase fill covers no whole operator"
-        );
-
-        // One backend for both phases fills the operator once, whether the
-        // operator states it or both phases state the same one; an unstated
-        // phase falls back to `attention_backend`, which the split above
-        // keeps as a phase of its own.
-        let one = Config {
-            attention_backend: Some("attention-b".to_owned()),
-            ..Default::default()
-        };
-        let modules = crate::epoch::modules_of(&one);
-        assert_eq!(
-            modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
-            "attention-b"
-        );
-        assert!(
-            !modules
-                .kernels
-                .contains_key(&KernelKey::phase(operator::PAGED_ATTENTION, Phase::Prefill)),
-            "one backend covers every phase of the operator"
-        );
-        let agreed = Config {
-            prefill_attention_backend: Some("attention-b".to_owned()),
-            decode_attention_backend: Some("attention-b".to_owned()),
-            ..Default::default()
-        };
-        let modules = crate::epoch::modules_of(&agreed);
-        assert_eq!(
-            modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
-            "attention-b",
-            "phases that agree collapse to the operator's slot"
-        );
-
-        // A stated grouped expert GEMM package fills both of its operators.
-        let moe = Config {
-            moe_runner_backend: Some("grouped".to_owned()),
-            ..Default::default()
-        };
-        let modules = crate::epoch::modules_of(&moe);
-        for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
-            assert_eq!(
-                modules.kernels[&KernelKey::all(operator)].backend,
-                "grouped"
+    /// A table that names an operator this build lacks, an empty key, or one backend of an
+    /// operator at two revisions is refused before anything is selected.
+    #[test]
+    fn a_table_the_build_server_could_not_select_by_is_refused() {
+        let stated = crate::config::Stated::from_paths(Vec::new());
+        let refused = |op: &str, pins: &[(&str, &str)]| {
+            let mut config = Config {
+                model: Some("org/model".to_owned()),
+                ..Config::default()
+            };
+            config.kernels.insert(
+                op.to_owned(),
+                pins.iter()
+                    .map(|(key, text)| ((*key).to_owned(), pin(text)))
+                    .collect(),
             );
+            config
+                .validate(&stated)
+                .err()
+                .map(|error| error.to_string())
+        };
+        assert_eq!(
+            refused("paged_attention", &[("a", "trtllm@7"), ("b", "triton@2")]),
+            None
+        );
+        for (op, pins, named) in [
+            ("no_such_operator", vec![("a", "trtllm@7")], "no operator"),
+            ("paged_attention", vec![("", "trtllm@7")], "empty"),
+            (
+                "paged_attention",
+                vec![("a", "trtllm@7"), ("b", "trtllm@latest")],
+                "one revision",
+            ),
+        ] {
+            let error = refused(op, &pins).expect("the table is refused");
+            assert!(error.contains(named), "{error}");
         }
     }
 
-    /// A backend option left unset names no slot, whichever phase it is
-    /// for: the Build Server selects that operator's packages, and a phase
-    /// the deployment does name keeps its package.
-    #[test]
-    fn an_unset_backend_names_no_package() {
-        let mut config = Config {
-            decode_attention_backend: Some("base".to_owned()),
-            ..Default::default()
-        };
-        let modules = crate::epoch::modules_of(&config);
-        assert_eq!(
-            modules.kernels.keys().cloned().collect::<Vec<_>>(),
-            vec![KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode)]
-        );
-
-        config.attention_backend = Some("attention-c".to_owned());
-        config.decode_attention_backend = None;
-        let modules = crate::epoch::modules_of(&config);
-        assert_eq!(
-            modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
-            "attention-c"
-        );
-    }
-
-    /// Modules are recorded per operator and, where the configuration fills
-    /// one per phase, per phase; the epoch that serves is the one of the
+    /// Modules are recorded per operator and, where the configuration pins
+    /// a descriptor key, per key; the epoch that serves is the one of the
     /// highest number that is serving or on trial.
     #[test]
-    fn epochs_are_reported_by_operator_phase_and_status() {
+    fn epochs_are_reported_by_operator_key_and_status() {
         let epochs = Epochs::default();
         let mut first = record();
         first.status = EpochState::Trial;
@@ -1115,7 +981,7 @@ mod tests {
         let mut second = record();
         second.status = EpochState::Preparing;
         second.kernels.insert(
-            KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode),
+            KernelKey::key("paged_attention", "phase_decode_head_128"),
             package("attention-c"),
         );
         epochs.record(2, second);
@@ -1136,7 +1002,7 @@ mod tests {
             vec![(1, EpochState::Trial), (2, EpochState::Preparing)]
         );
         let decode = &statuses[1].kernels[0];
-        assert_eq!(decode.slot.phase, Some(Phase::Decode));
+        assert_eq!(decode.slot.key.as_deref(), Some("phase_decode_head_128"));
         assert_eq!(decode.package.backend, "attention-c");
     }
 

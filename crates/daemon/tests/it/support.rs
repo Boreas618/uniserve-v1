@@ -449,7 +449,7 @@ fn answer(
                 .into_iter()
                 .map(|requested| wire::SlotPackage {
                     op: requested.op,
-                    phase: requested.phase,
+                    key: requested.key,
                     part: requested.part,
                     package: match requested.selector {
                         Some(wire::package_request::Selector::Package(mut revision)) => {

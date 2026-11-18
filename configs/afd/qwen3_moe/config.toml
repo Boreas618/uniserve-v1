@@ -1,13 +1,13 @@
 # Qwen3 MoE with dedicated experts on two hosts: a TP2 attention replica on
 # the leader's host and two expert ranks on the second host, exchanging
-# tokens through DeepEP.
+# tokens through DeepEP: an exchange with attention ranks is a key only the
+# DeepEP package covers, so the Build Server selects it.
 
 model = "Qwen/Qwen3-30B-A3B"
 hosts = ["rank-1", "rank-2"]
 
 [moe_config]
 expert_parallel = true
-exchange = "deepep"
 
 [[worker_groups]]
 id = "attention"

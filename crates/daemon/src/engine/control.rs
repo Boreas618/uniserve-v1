@@ -1318,9 +1318,10 @@ pub(crate) fn prepare_node(
 ///
 /// This is the one selection of an apply. The daemon asks `cover` for each interface the
 /// deployment uses: the engine, the scheduling policy and every kernel operator of this build.
-/// A package the deployment names takes the revision it states, else its latest installed one.
-/// Every candidate of an operator is recorded as well, one slot per package with the package as
-/// its part: for each descriptor key the engine later asks `cover` to select among exactly
+/// A package the deployment names, the engine, the policy or a pin of its `[kernels]` table,
+/// takes the revision it states, else its latest installed one. Every candidate of an operator is
+/// recorded as well, one slot per package with the package as its part, a pinned backend at its
+/// pinned revision: for each descriptor key the engine later asks `cover` to select among exactly
 /// these revisions, so a package or a revision installed after this call is run by nobody until
 /// a configuration is applied again, and a later revision of one of them is a package change a
 /// configuration comparison sees. Every other host is then asked for exactly these revisions
@@ -1329,7 +1330,7 @@ pub(crate) fn prepare_node(
 /// # Errors
 ///
 /// Fails when the Build Server cannot be reached, or holds no package, or not the revision, the
-/// deployment names for an interface.
+/// deployment names for an interface, or refuses the pins of an operator.
 pub fn with_store_modules(
     server: &BuildServer,
     filled: &crate::epoch::ModuleSet,
@@ -1349,11 +1350,25 @@ pub fn with_store_modules(
         fix_revision(&mut client, &slot.op, package)?;
     }
     for operator in proto::module::operator::ALL {
-        for candidate in candidates(&mut client, operator, &[])? {
+        // The operator's pins, at their fixed revisions: a pinned backend is the operator's
+        // candidate at the revision its pins state.
+        let pins = complete
+            .kernels
+            .iter()
+            .filter(|(slot, _)| slot.op == *operator)
+            .filter_map(|(slot, package)| {
+                let pin = proto::module::Pin {
+                    backend: package.backend.clone(),
+                    revision: Some(package.revision),
+                };
+                Some((slot.key.clone()?, pin))
+            })
+            .collect();
+        for candidate in candidates(&mut client, operator, pins, Vec::new())? {
             complete.kernels.insert(
                 proto::module::ModuleSlot {
                     op: candidate.op,
-                    phase: None,
+                    key: None,
                     part: Some(candidate.backend.clone()),
                 },
                 proto::module::PackageRevision {
@@ -1367,13 +1382,14 @@ pub fn with_store_modules(
     Ok(complete)
 }
 
-/// The candidates the Build Server selects among for `op`, given what the deployment prefers:
-/// every installed package of the interface, each at its latest revision or the one `preferred`
-/// states.
+/// The candidates the Build Server selects among for `op`: every installed package of the
+/// interface that `fixed` leaves a candidate, each at its latest revision, the revision `pins`
+/// state of a pinned backend, or the revision `fixed` states.
 fn candidates(
     client: &mut build_server::Client,
     op: &str,
-    preferred: &[build_server::Preference],
+    pins: std::collections::BTreeMap<String, proto::module::Pin>,
+    fixed: Vec<(String, u32)>,
 ) -> anyhow::Result<Vec<build_server::protocol::Package>> {
     let coverage = client
         .cover(&build_server::CoverRequest {
@@ -1382,8 +1398,8 @@ fn candidates(
             // engine selects among them for its own devices.
             targets: Vec::new(),
             keys: Vec::new(),
-            preferred: preferred.to_vec(),
-            fixed: Vec::new(),
+            pins,
+            fixed,
         })
         .with_context(|| format!("asking the Build Server for the packages of {op}"))?;
     Ok(coverage.candidates)
@@ -1396,12 +1412,8 @@ pub(crate) fn fix_revision(
     op: &str,
     package: &mut proto::module::PackageRevision,
 ) -> anyhow::Result<()> {
-    let stated = build_server::Preference {
-        phase: None,
-        backend: package.backend.clone(),
-        revision: (package.revision != 0).then_some(package.revision),
-    };
-    let selected = candidates(client, op, &[stated])?
+    let stated = (package.revision != 0).then(|| (package.backend.clone(), package.revision));
+    let selected = candidates(client, op, Default::default(), stated.into_iter().collect())?
         .into_iter()
         .find(|candidate| candidate.backend == package.backend)
         .with_context(|| format!("no {op} package {} is installed", package.backend))?;

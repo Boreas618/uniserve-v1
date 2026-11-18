@@ -49,7 +49,7 @@
 //! - [`protocol`]: the Protobuf protocol and its client, which the daemon and
 //!   the main process use.
 //!
-//! The package revisions it serves, the slots they fill and their phases are
+//! The package revisions it serves, the slots they fill and the keys they are pinned for are
 //! `proto::module`'s (section 5.1), which the daemon and the main process
 //! name them with too.
 
@@ -73,7 +73,7 @@ pub use builder::{BuildState, Limits, Urgency};
 pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, ToolchainKind};
 pub use protocol::{
     Client, CoverRequest, Coverage, Descriptors, Module, ModuleEntry, ModuleFile, PackageRequest,
-    Preference, PrepareRequest, Progress, Selector,
+    PrepareRequest, Progress, Selector,
 };
 pub use server::{BuildServer, ServerConfig};
 pub use store::{ModulePath, Root, Store};

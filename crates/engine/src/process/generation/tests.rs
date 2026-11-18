@@ -147,11 +147,11 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
 }
 
 /// A preparation's packages read back as the daemon named them: each kernel under its operator
-/// and phase (none for every phase), its arguments as the TOML values whose text the Protobuf
+/// and pinned key (none for every key), its arguments as the TOML values whose text the Protobuf
 /// carries, and the policy beside them; a kernel without a package is refused by its operator.
 #[test]
 fn a_preparation_names_its_packages_with_their_arguments() {
-    use proto::module::{ModuleSlot, PackageRevision, Phase, kernel_to_wire};
+    use proto::module::{ModuleSlot, PackageRevision, kernel_to_wire};
     use proto::process::Prepare;
 
     let package = |backend: &str, arguments: &str| PackageRevision {
@@ -159,22 +159,22 @@ fn a_preparation_names_its_packages_with_their_arguments() {
         revision: 2,
         arguments: toml::from_str(arguments).unwrap(),
     };
-    let every_phase = ModuleSlot::all("decode_attention");
-    let prefill = ModuleSlot::phase("rms_norm", Phase::Prefill);
+    let every_key = ModuleSlot::all("decode_attention");
+    let pinned = ModuleSlot::key("rms_norm", "dtype_bf16_width_4096");
     let attention = package("trtllm", "block = 16");
     let norm = package("triton", "");
     let fcfs = package("fcfs", "chunked_prefill_size = 4096");
     let prepare = Prepare {
         kernels: vec![
-            kernel_to_wire(&every_phase, &attention),
-            kernel_to_wire(&prefill, &norm),
+            kernel_to_wire(&every_key, &attention),
+            kernel_to_wire(&pinned, &norm),
         ],
         policy: Some((&fcfs).into()),
     };
 
     let (packages, policy) = named(prepare.clone()).unwrap();
-    assert_eq!(packages[&every_phase], attention);
-    assert_eq!(packages[&prefill], norm);
+    assert_eq!(packages[&every_key], attention);
+    assert_eq!(packages[&pinned], norm);
     assert_eq!(policy, fcfs);
 
     let mut unnamed = prepare;

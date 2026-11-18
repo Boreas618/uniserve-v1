@@ -25,16 +25,15 @@ use platform::DeviceId;
 use proto::module::{PackageRevision, Packages};
 use scheduling::limits::Parameters;
 
-use crate::modules::select::{
-    Routes, fixed_revisions, interface_agrees, named_backends, selected_slots,
-};
+use crate::modules::select::{Routes, fixed_revisions, interface_agrees, pins, selected_slots};
 
 /// The Build Server's selection of a generation's packages for `keys`, every descriptor key the
 /// generation launches by operator, on `targets`, the devices' architectures: the packages by
 /// slot, and the keys each slot's package builds.
 ///
-/// Every operator is asked once, with every key it launches and the backends the deployment
-/// names for it in `named`; the server returns the package of each key (`BuildServer::cover`).
+/// Every operator is asked once, with every key it launches and the keys the deployment pins for
+/// it in `named`; the server returns the package of each key (`BuildServer::cover`). A pin of a
+/// key the devices do not launch selects nothing.
 ///
 /// # Errors
 ///
@@ -61,7 +60,7 @@ pub fn select(
             op: op.clone(),
             targets: targets.to_vec(),
             keys: keys.iter().cloned().collect(),
-            preferred: named_backends(op, named),
+            pins: pins(op, named),
             fixed: fixed_revisions(op, named),
         };
         let coverage = client
@@ -75,7 +74,7 @@ pub fn select(
                 revision = package.revision,
                 part = slot.part.as_deref().unwrap_or(""),
                 keys = selected.get(slot).map_or(0, Vec::len),
-                named = !request.preferred.is_empty(),
+                pinned = request.pins.len(),
                 "the Build Server selected a package for this operator's keys"
             );
         }

@@ -3,7 +3,7 @@
 //!
 //! The daemon selects packages with the Build Server's `prepare` and records them in the epoch
 //! record, the main process `resolve`s the ones it is told to load, and the kernel library keys its
-//! generations by the same operator names and phases. The vocabulary is stated here, below all of
+//! generations by the same operator names and descriptor keys. The vocabulary is stated here, below all of
 //! them, so a daemon or a scheduler names packages without linking the numerical library, and the
 //! record key, the wire message and a package's descriptor cannot drift apart. Its parameters
 //! are a TOML table, so a package's arguments keep the types their configuration fields have, and
@@ -19,23 +19,19 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub use wire::{WireError, kernel_of, kernel_to_wire, phase_of, phase_to_wire};
+pub use wire::{WireError, kernel_of, kernel_to_wire};
 
-/// Which phase of a request an operator call belongs to, and which phase of an operator a package
-/// fills: the scheduling interface's one phase vocabulary ([`scheduling::view::Phase`]), which the
-/// scheduler, the policies and the package selection name work by alike.
-///
-/// A kernel package may be split by phase: prefill and decode attention are different packages
-/// (`prefill_attention_backend` and `decode_attention_backend`, design section 5.2). The phase is
-/// part of an operator's descriptor (its `phase` dimension names it by [`Phase::name`]) and of a
-/// package's selection key, so one generation still indexes its kernels by (operator name,
-/// descriptor key) (design section 4.2); a wire states it by its id ([`Phase::id`]).
+/// Which phase of a request an operator call belongs to: the scheduling interface's one phase
+/// vocabulary ([`scheduling::view::Phase`]), which the scheduler, the policies and an operator's
+/// descriptor name work by alike. A descriptor that depends on the phase states it as its `phase`
+/// dimension, by [`Phase::name`], so the phase is part of the descriptor key a deployment pins a
+/// package for ([`Pin`]).
 pub use scheduling::view::Phase;
 
 /// One package: the backend that implements an operator, the backend's revision, and the arguments
 /// given to it.
 ///
-/// `backend` is the name the configuration field selects, such as `"trtllm"` for attention or
+/// `backend` is the name of an installed implementation, such as `"trtllm"` for attention or
 /// `"arrival"` for the scheduling policy (design section 5.1). `arguments` are the package's
 /// parameters, which come from the configuration fields that are not part of the build config.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,67 +44,111 @@ pub struct PackageRevision {
     pub arguments: toml::Table,
 }
 
-/// The slot a package fills in an epoch: an operator, and the phase when the operator is filled per
-/// phase (design section 5.1).
+/// The slot a package fills in an epoch: an operator, and either the one descriptor key the
+/// deployment pins the package for or the part of the operator's keys the Build Server's
+/// selection gives it (design section 5.1).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ModuleSlot {
     pub op: String,
-    /// `None` when one package fills every phase of the operator; written by its name.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "phase_name")]
-    pub phase: Option<Phase>,
-    /// The backend, when the operator's packages divide its descriptors between them with no phase
-    /// to tell them apart: each holds a slot of its own.
+    /// The descriptor key, in its canonical text, the deployment's `[kernels]` table pins this
+    /// package for; `None` for a package the selection fills keys with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The backend, when the operator's packages divide its descriptors between them: each holds a
+    /// slot of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
 }
 
 impl ModuleSlot {
-    /// The slot of an operator filled in all of its phases.
+    /// The slot of an operator one package fills whole.
     pub fn all(op: impl Into<String>) -> Self {
         Self {
             op: op.into(),
-            phase: None,
+            key: None,
             part: None,
         }
     }
 
-    /// The slot of an operator filled in one phase.
-    pub fn phase(op: impl Into<String>, phase: Phase) -> Self {
+    /// The slot of the package a deployment pins for one descriptor key of an operator.
+    pub fn key(op: impl Into<String>, key: impl Into<String>) -> Self {
         Self {
             op: op.into(),
-            phase: Some(phase),
+            key: Some(key.into()),
             part: None,
         }
     }
 }
 
-/// A slot's phase as its name ([`Phase::name`]), the form a record and a selection key state it in.
-mod phase_name {
-    use serde::{Deserialize, Deserializer, Serializer};
+/// The package a deployment's `[kernels]` table pins for one descriptor key: a backend and its
+/// revision, written `backend@revision`, or `backend@latest` for the latest installed revision,
+/// which an apply fixes to the revision it resolves (design section 5.1).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pin {
+    /// The installed implementation, such as `trtllm`.
+    pub backend: String,
+    /// The installed revision; `None` for `latest`.
+    pub revision: Option<u32>,
+}
 
-    use super::Phase;
-
-    pub(super) fn serialize<S: Serializer>(
-        phase: &Option<Phase>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match phase {
-            Some(phase) => serializer.serialize_some(phase.name()),
-            None => serializer.serialize_none(),
+impl std::fmt::Display for Pin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.revision {
+            Some(revision) => write!(formatter, "{}@{revision}", self.backend),
+            None => write!(formatter, "{}@latest", self.backend),
         }
     }
+}
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<Phase>, D::Error> {
-        Option::<String>::deserialize(deserializer)?
-            .map(|name| {
-                Phase::named(&name)
-                    .ok_or_else(|| serde::de::Error::custom(format!("{name:?} names no phase")))
-            })
-            .transpose()
+impl std::str::FromStr for Pin {
+    type Err = String;
+
+    /// Reads `backend@revision` or `backend@latest`, refusing an empty backend and a revision
+    /// that is neither `latest` nor a positive integer: revisions count installations from one.
+    fn from_str(text: &str) -> Result<Self, String> {
+        let (backend, revision) = text.rsplit_once('@').ok_or_else(|| {
+            format!("{text:?} names no revision: write `backend@revision` or `backend@latest`")
+        })?;
+        if backend.is_empty() {
+            return Err(format!("{text:?} names no backend before its `@`"));
+        }
+        let revision = match revision {
+            "latest" => None,
+            number => Some(
+                number
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|revision| *revision > 0)
+                    .ok_or_else(|| {
+                        format!("{text:?}: the revision is `latest` or a positive integer")
+                    })?,
+            ),
+        };
+        Ok(Self {
+            backend: backend.to_owned(),
+            revision,
+        })
     }
 }
+
+impl Serialize for Pin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Pin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A deployment's `[kernels]` table: for each operator, by its name, the package each descriptor
+/// key it lists is pinned to, the key in the canonical text the operator's descriptor prints and
+/// the kernel observations label it by (`op` and `descriptor`), matched exactly. A key the table
+/// does not list is the Build Server's to select, by its packages' manifest priorities.
+pub type Kernels = BTreeMap<String, BTreeMap<String, Pin>>;
 
 /// The packages an epoch fills its operators with, by slot.
 pub type Packages = BTreeMap<ModuleSlot, PackageRevision>;
@@ -142,10 +182,10 @@ pub struct ModuleSet {
     pub engine: PackageRevision,
     /// The scheduling policy's package.
     pub policy: PackageRevision,
-    /// The kernel packages. A slot of an operator, or of one phase of it, holds the implementation
-    /// the deployment names for it, which is preferred for every key it covers. A slot whose part
-    /// names an implementation holds an installed package the deployment names nothing for: the
-    /// Build Server selects among those for each key by their manifests' priorities.
+    /// The kernel packages. A slot of one descriptor key holds the package the deployment's
+    /// `[kernels]` table pins for that key. A slot whose part names an implementation holds an
+    /// installed package the Build Server selects among for every other key, by the manifests'
+    /// priorities.
     ///
     /// Written as a list of pairs, because a launch file is JSON and a slot is no JSON key.
     #[serde_as(as = "Vec<(_, _)>")]
@@ -486,19 +526,40 @@ pub mod sampler {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModuleSlot, Phase};
+    use super::{ModuleSlot, Pin};
 
-    /// A slot's phase is recorded by its name and read back from it.
+    /// A slot pinned for a key records the key, and a slot of the whole operator records none.
     #[test]
-    fn a_slots_phase_is_recorded_by_its_name() {
-        let slot = ModuleSlot::phase("paged_attention", Phase::Prefill);
+    fn a_slot_records_the_key_it_is_pinned_for() {
+        let slot = ModuleSlot::key("paged_attention", "phase_decode_head_128");
         let recorded = serde_json::to_value(&slot).unwrap();
-        assert_eq!(recorded["phase"], "prefill");
+        assert_eq!(recorded["key"], "phase_decode_head_128");
         assert_eq!(
             serde_json::from_value::<ModuleSlot>(recorded).unwrap(),
             slot
         );
         let every = serde_json::to_value(ModuleSlot::all("rms_norm")).unwrap();
-        assert!(every.get("phase").is_none());
+        assert!(every.get("key").is_none());
+    }
+
+    /// A pin reads and prints `backend@revision` and `backend@latest`, and refuses a text that
+    /// names no backend or no revision of one.
+    #[test]
+    fn a_pin_is_a_backend_at_a_revision_or_the_latest() {
+        let pinned: Pin = "trtllm@7".parse().unwrap();
+        assert_eq!(
+            pinned,
+            Pin {
+                backend: "trtllm".to_owned(),
+                revision: Some(7),
+            }
+        );
+        assert_eq!(pinned.to_string(), "trtllm@7");
+        let latest: Pin = "triton@latest".parse().unwrap();
+        assert_eq!(latest.revision, None);
+        assert_eq!(latest.to_string(), "triton@latest");
+        for refused in ["trtllm", "@7", "trtllm@0", "trtllm@seven", "trtllm@"] {
+            assert!(refused.parse::<Pin>().is_err(), "{refused}");
+        }
     }
 }

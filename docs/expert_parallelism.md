@@ -12,7 +12,6 @@ data_parallel_size = 2
 
 [moe_config]
 expert_parallel = true
-exchange = "alltoall"
 ```
 
 ```bash
@@ -21,11 +20,11 @@ CUDA_VISIBLE_DEVICES=0,1 uniserve serve qwen3-moe
 
 Every scheduler keeps its own KV cache and attention, and its worker holds `1 / N` of each layer's routed experts. The schedulers run every expert layer together: before each forward, their workers agree over a host connection on which scheduler's batch runs and on the step's per-scheduler token capacity, and every other worker joins the step without tokens of its own, so its experts serve the tokens routed to them. A worker that is idle keeps joining. Schedulers sharing their experts each run one one-rank worker group.
 
-`moe_config.exchange` selects the token transport:
+The token transport is the package that fills the `expert_exchange` operator's descriptor key: the installed package that covers the key with the highest manifest priority, `alltoall` among the tree's packages of equal priority, unless the deployment's `[kernels]` table pins the key to another (`docs/configuration.md`, the `[kernels]` table):
 
 | Exchange | Transport | Requirements |
 | --- | --- | --- |
-| `alltoall` (default) | FlashInfer's NVLink all-to-all around each rank's grouped experts | NVLink peers (MNNVL fabric or peer storage) |
+| `alltoall` | FlashInfer's NVLink all-to-all around each rank's grouped experts | NVLink peers (MNNVL fabric or peer storage); no attention ranks |
 | `megamoe` | The fused MegaMoE kernel: one launch exchanges, runs the experts and combines | NVFP4 expert weights, Blackwell GPUs |
 | `deepep` | DeepEP elastic dispatch and combine | Dedicated expert workers |
 
@@ -65,7 +64,6 @@ model = "Qwen/Qwen3-30B-A3B"
 
 [moe_config]
 expert_parallel = true
-exchange = "deepep"
 microbatches = 2
 
 [[worker_groups]]

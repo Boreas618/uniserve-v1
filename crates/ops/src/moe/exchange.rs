@@ -4,8 +4,9 @@
 //! `[local_offset, local_offset + local_experts)` window is resident. The exchange carries each
 //! route's payload — the hidden state, the expert id and the route weight — to the rank that holds
 //! the expert (dispatch), and returns each token's partial expert sums to the rank that owns the
-//! token (combine). `moe_config.exchange` names the backend (`alltoall`, `deepep`, `megamoe`), each a
-//! native library because the transport's workspace and its handshake are the package's host code.
+//! token (combine). Each backend (`alltoall`, `deepep`, `megamoe`) is a native library, because
+//! the transport's workspace and its handshake are the package's host code; the Build Server
+//! selects the one of each key, unless a deployment's `[kernels]` table pins it.
 //! A backend whose one launch runs the whole expert layer states so in [`Info::fused`] and takes
 //! [`Mode::Fused`] instead of the two directions.
 //!

@@ -3,35 +3,35 @@
 //! start serve together, and the operators a selection replaces or changes against what serves.
 //!
 //! The engine chooses nothing here. The Build Server owns coverage and selection
-//! (`BuildServer::cover`): for every key it returns the one package that builds it, the backend
-//! the deployment names first and the manifests' priorities after. This module only turns that
-//! response into the slots a generation records.
+//! (`BuildServer::cover`): for every key it returns the one package that builds it, the package
+//! the deployment's `[kernels]` table pins for the key first and the manifests' priorities after.
+//! This module only turns that response into the slots a generation records.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use build_server::Preference;
-use proto::module::{ModuleSlot, PackageRevision, Packages, Phase};
+use proto::module::{ModuleSlot, PackageRevision, Packages, Pin};
 
 /// The descriptor keys of each slot a selection filled, by slot: the keys its package was selected
 /// for, and the only keys that package is asked to build.
 pub type Routes = BTreeMap<ModuleSlot, Vec<String>>;
 
-/// The backends a deployment names for `op`, as the Build Server's selection takes them: each
-/// slot's backend, its phase, and its revision. A slot with a part is a candidate of the module
-/// set, not a preference, so it is none of these.
+/// The deployment's pins of `op`'s descriptor keys, as the Build Server's selection takes them:
+/// each pinned slot's key with its package's backend and revision.
 ///
 /// Every revision of a launch's module set is fixed: the daemon fixes each package the
-/// deployment names, at the revision it states or its latest installed one, before it launches
+/// deployment pins, at the revision it states or its latest installed one, before it launches
 /// an epoch or prepares an update (`daemon::engine::control::with_store_modules`), so the engine
 /// passes each one on as it is and the Build Server refuses a revision it does not hold.
-pub(crate) fn named_backends(op: &str, named: &Packages) -> Vec<Preference> {
+pub(crate) fn pins(op: &str, named: &Packages) -> BTreeMap<String, Pin> {
     named
         .iter()
-        .filter(|(slot, _)| slot.op == op && slot.part.is_none())
-        .map(|(slot, package)| Preference {
-            phase: slot.phase,
-            backend: package.backend.clone(),
-            revision: Some(package.revision),
+        .filter(|(slot, _)| slot.op == op)
+        .filter_map(|(slot, package)| {
+            let pin = Pin {
+                backend: package.backend.clone(),
+                revision: Some(package.revision),
+            };
+            Some((slot.key.clone()?, pin))
         })
         .collect()
 }
@@ -80,7 +80,7 @@ pub(crate) fn selected_slots(
         let backend = &covering.backend;
         let slot = ModuleSlot {
             op: op.to_owned(),
-            phase: None,
+            key: None,
             part: divided.then(|| backend.clone()),
         };
         let arguments = named
@@ -129,7 +129,7 @@ pub(crate) fn served<'a>(selections: impl IntoIterator<Item = &'a Packages>) -> 
         for (backend, package) in packages {
             let slot = ModuleSlot {
                 op: op.to_owned(),
-                phase: None,
+                key: None,
                 part: divided.then(|| backend.to_owned()),
             };
             served.insert(slot, package.clone());
@@ -161,19 +161,19 @@ pub(crate) fn interface_agrees(
     ))
 }
 
-/// One operator's packages as a comparison reads them: each slot's phase and part with its
+/// One operator's packages as a comparison reads them: each slot's pinned key and part with its
 /// package, in a stated order. Arguments are left out - the two sides state a package's defaults in
 /// different words - so a package is its backend and revision.
 fn held<'a>(
     packages: &'a Packages,
     op: &str,
-) -> Vec<(Option<Phase>, Option<&'a str>, &'a str, u32)> {
+) -> Vec<(Option<&'a str>, Option<&'a str>, &'a str, u32)> {
     let mut held: Vec<_> = packages
         .iter()
         .filter(|(slot, _)| slot.op == op)
         .map(|(slot, package)| {
             (
-                slot.phase,
+                slot.key.as_deref(),
                 slot.part.as_deref(),
                 package.backend.as_str(),
                 package.revision,
@@ -279,7 +279,7 @@ mod tests {
     fn an_operator_filled_by_two_packages_is_one_changed_operator() {
         let part = |backend: &str| ModuleSlot {
             op: "paged_attention".to_owned(),
-            phase: None,
+            key: None,
             part: Some(backend.to_owned()),
         };
         let mut serving = Packages::new();
@@ -330,7 +330,7 @@ mod tests {
             .expect("every key is covered");
         let part = |backend: &str| ModuleSlot {
             op: "dense_attention".to_owned(),
-            phase: None,
+            key: None,
             part: Some(backend.to_owned()),
         };
         let held: Vec<(ModuleSlot, String)> = slots
@@ -378,7 +378,7 @@ mod tests {
         let f32 = "dtype_f32_head_dim_64";
         let candidate = |backend: &str| ModuleSlot {
             op: "dense_attention".to_owned(),
-            phase: None,
+            key: None,
             part: Some(backend.to_owned()),
         };
         let mut candidates = Packages::new();
@@ -435,67 +435,42 @@ mod tests {
         assert!(refusal.contains(&(launched + 1).to_string()), "{refusal}");
     }
 
-    /// The revisions a module set fixed for an operator are its named packages' and its
-    /// candidates', each once; a candidate is no preference.
+    /// The revisions a module set fixed for an operator are its pinned packages' and its
+    /// candidates', each once; a candidate is no pin.
     #[test]
-    fn a_module_sets_candidates_are_fixed_and_not_preferred() {
+    fn a_module_sets_candidates_are_fixed_and_not_pinned() {
         let candidate = |backend: &str| ModuleSlot {
             op: "paged_attention".to_owned(),
-            phase: None,
+            key: None,
             part: Some(backend.to_owned()),
         };
+        let decode = "phase_decode_head_128";
         let mut set = Packages::new();
-        set.insert(ModuleSlot::all("paged_attention"), package("trtllm", 4));
+        set.insert(
+            ModuleSlot::key("paged_attention", decode),
+            package("trtllm", 4),
+        );
         set.insert(candidate("trtllm"), package("trtllm", 4));
         set.insert(candidate("triton"), package("triton", 2));
+        set.insert(ModuleSlot::key("gemm", "m_64"), package("cublas", 1));
 
         assert_eq!(
             fixed_revisions("paged_attention", &set),
             vec![("triton".to_owned(), 2), ("trtllm".to_owned(), 4)]
         );
         assert_eq!(
-            named_backends("paged_attention", &set),
-            vec![Preference {
-                phase: None,
-                backend: "trtllm".to_owned(),
-                revision: Some(4),
-            }]
-        );
-        assert!(
-            fixed_revisions("gemm", &set).is_empty(),
-            "an operator the set names no package of leaves the selection to the store"
-        );
-    }
-
-    /// The named backends of an operator carry their phase and the revision the module set
-    /// fixed.
-    #[test]
-    fn named_backends_carry_their_phase_and_fixed_revision() {
-        let mut named = Packages::new();
-        named.insert(
-            ModuleSlot::phase("paged_attention", Phase::Prefill),
-            package("trtllm", 4),
-        );
-        named.insert(
-            ModuleSlot::phase("paged_attention", Phase::Decode),
-            package("triton", 2),
-        );
-        named.insert(ModuleSlot::all("gemm"), package("cublas", 1));
-
-        assert_eq!(
-            named_backends("paged_attention", &named),
-            vec![
-                Preference {
-                    phase: Some(Phase::Prefill),
+            pins("paged_attention", &set),
+            BTreeMap::from([(
+                decode.to_owned(),
+                Pin {
                     backend: "trtllm".to_owned(),
                     revision: Some(4),
-                },
-                Preference {
-                    phase: Some(Phase::Decode),
-                    backend: "triton".to_owned(),
-                    revision: Some(2),
-                },
-            ]
+                }
+            )])
+        );
+        assert!(
+            fixed_revisions("rms_norm", &set).is_empty(),
+            "an operator the set names no package of leaves the selection to the store"
         );
     }
 }

@@ -149,7 +149,8 @@ mod tests {
         let (config, _) = parse(&package(
             "[video_config]\ntext_capacities = [1024, 10240]\nsizes = [\"1344x768\"]\n\
              [quantization]\nmode = \"balanced\"\nmodules = { video_vae = \"bf16\" }\n\
-             [moe_config]\nexpert_parallel = true\nexchange = \"deepep\"\n\
+             [moe_config]\nexpert_parallel = true\n\
+             [kernels.expert_exchange]\n\"mode_dispatch_ranks_2\" = \"deepep@3\"\n\
              [server_config]\nrequest_timeout = \"2m\"\n\
              [admin_config]\nhost = \"0.0.0.0\"\n",
         ))
@@ -168,7 +169,13 @@ mod tests {
             [("video_vae".to_owned(), WeightFormat::Bf16)].into()
         );
         assert!(config.moe_config.expert_parallel);
-        assert_eq!(config.moe_config.exchange.as_deref(), Some("deepep"));
+        assert_eq!(
+            config.kernels["expert_exchange"]["mode_dispatch_ranks_2"],
+            proto::module::Pin {
+                backend: "deepep".to_owned(),
+                revision: Some(3),
+            }
+        );
         assert_eq!(
             config.server_config.request_timeout,
             Some(Duration::from_secs(120))
@@ -420,7 +427,7 @@ mod tests {
     fn grouped_options_reach_the_engine() {
         let (_, engine) = lowered(&package(
             "[quantization]\nmode = \"performance\"\n\
-             [moe_config]\nexpert_parallel = true\nexchange = \"deepep\"\n\
+             [moe_config]\nexpert_parallel = true\n\
              [kv_cache_config]\nprefix_caching = false\n\
              [scheduler_config]\nchunked_prefill_size = 512\n",
         ))
@@ -433,7 +440,6 @@ mod tests {
             }
         );
         assert!(engine.moe.expert_parallel);
-        assert_eq!(engine.moe.exchange.as_deref(), Some("deepep"));
         assert!(!engine.kv_cache.prefix_caching);
         assert_eq!(
             engine.scheduler.chunked_prefill_size,

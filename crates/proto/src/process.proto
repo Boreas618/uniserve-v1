@@ -228,8 +228,8 @@ message ModuleSet {
   PackageRevision engine = 1;
   // The scheduling policy's package.
   PackageRevision policy = 2;
-  // The kernel packages, one per slot: an operator, the phase when the operator is filled per
-  // phase, and the backend when the operator's packages divide its descriptors between them.
+  // The kernel packages, one per slot: an operator, the descriptor key a pin names, and the
+  // backend when the operator's packages divide its descriptors between them.
   repeated KernelPackage kernels = 3;
 }
 
@@ -550,21 +550,21 @@ message Table {
   map<string, Value> entries = 1;
 }
 
-// One operator's kernel package, or one phase's of it: the epoch record's
-// key is the operator and the phase, `phase` absent for every phase.
+// One operator's kernel package in its slot: the descriptor key the
+// deployment's `[kernels]` table pins it for, or the part of the operator's
+// keys the Build Server's selection gives it.
 message KernelPackage {
+  reserved 2;
+  reserved "phase";
   // The operator's name, as the `ops` crate names it.
   string op = 1;
-  // The phase of the operator's calls the package fills, by its id
-  // (`scheduling::view::Phase::id`); absent when the package fills every
-  // phase. An operator is filled once for all its phases unless the
-  // configuration fills it per phase, which attention allows
-  // (`prefill_attention_backend`, `decode_attention_backend`).
-  optional uint32 phase = 2;
+  // The descriptor key, in its canonical text, the `[kernels]` table pins
+  // the package for; absent for a package the selection fills keys with.
+  optional string key = 5;
   PackageRevision package = 3;
   // The package itself, for a candidate the epoch's module set fixed for an
-  // operator without naming it for a phase: the engine selects among
-  // the operator's candidates for each descriptor key.
+  // operator: the engine selects among the operator's candidates for each
+  // descriptor key no pin names.
   optional string part = 4;
 }
 

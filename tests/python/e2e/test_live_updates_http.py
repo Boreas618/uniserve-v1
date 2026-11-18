@@ -1433,7 +1433,8 @@ def _repeated_attention(
     and a stream started after this still runs when the switch comes.
 
     Returns:
-        The options that select it.
+        The options that select it: the ``[kernels]`` table pinning each of
+        those decode keys to its revision.
     """
     repeated = build_server.install(
         updates.derived(repository, "paged_attention", "repeated", directory)
@@ -1461,7 +1462,9 @@ def _repeated_attention(
             key=key,
             target=target,
         )
-    return {"decode_attention_backend": repeated.backend}
+    pinned = f"{repeated.backend}@{repeated.revision}"
+    keys = sorted({key for _, key in decode})
+    return {"kernels": {"paged_attention": dict.fromkeys(keys, pinned)}}
 
 
 def _slower_target(

@@ -18,6 +18,7 @@
 //! package revision changes, and [`Client::cover`] to learn which installed package
 //! builds each descriptor key of an operator the deployment does not name.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -33,7 +34,7 @@ use crate::manifest::ModuleForm;
 use crate::store::ModulePath;
 use crate::target::Target;
 use crate::{Error, Result};
-use proto::module::{ModuleSlot, PackageRevision, Phase, phase_of};
+use proto::module::{ModuleSlot, PackageRevision, Pin};
 
 /// The messages of the protocol, as the build script compiled them.
 pub mod wire {
@@ -154,26 +155,17 @@ pub struct CoverRequest {
     pub targets: Vec<Target>,
     /// Descriptor keys, in the canonical form the operator's `Display` gives.
     pub keys: Vec<String>,
-    /// The backends the deployment names for the operator, preferred for the
-    /// keys of their phase; empty leaves every key to the manifests'
-    /// priorities.
-    pub preferred: Vec<Preference>,
+    /// The deployment's pins of the operator's descriptor keys (its `[kernels]`
+    /// table), by key in its canonical text: each key a pin names goes to the
+    /// pinned backend, which must cover it. Empty leaves every key to the
+    /// manifests' priorities.
+    pub pins: BTreeMap<String, Pin>,
     /// The revisions a module set fixed for the operator's packages, each a
     /// backend and its revision. When any is stated, the candidates are
     /// exactly these: a package or a revision installed since is none. Empty
     /// takes each backend's latest installed revision, which is what the
     /// daemon asks when it fixes a module set.
     pub fixed: Vec<(String, u32)>,
-}
-
-/// A backend a deployment names for an operator: preferred over every other
-/// package for the keys of `phase` (every key when `None`) that it covers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Preference {
-    pub phase: Option<Phase>,
-    pub backend: String,
-    /// The revision to use; `None` is the backend's latest installed one.
-    pub revision: Option<u32>,
 }
 
 /// The response to `cover`: each requested key once, either under the package
@@ -221,28 +213,14 @@ fn arguments(text: &str) -> Result<toml::Table> {
         .map_err(|error| Error::Protocol(format!("a package's arguments are not TOML: {error}")))
 }
 
-/// A slot's phase as the wire states it: the phase's id, absent for a slot of every phase.
-pub(crate) fn phase_to_wire(phase: Option<Phase>) -> Option<u32> {
-    proto::module::phase_to_wire(phase)
-}
-
-/// The phase a wire id states ([`phase_to_wire`]).
-///
-/// # Errors
-///
-/// `Protocol` for an id no phase has.
-pub(crate) fn phase_from_wire(phase: Option<u32>) -> Result<Option<Phase>> {
-    phase_of(phase).map_err(|error| Error::Protocol(error.to_string()))
-}
-
-/// The slot an operator, a wire phase and a wire part name: an empty part is
-/// a slot that holds the operator's every descriptor.
-pub(crate) fn slot_of(op: String, phase: Option<u32>, part: String) -> Result<ModuleSlot> {
-    Ok(ModuleSlot {
+/// The slot an operator, a wire key and a wire part name: an empty part is a
+/// slot of a pinned key or of the operator's every descriptor.
+pub(crate) fn slot_of(op: String, key: Option<String>, part: String) -> ModuleSlot {
+    ModuleSlot {
         op,
-        phase: phase_from_wire(phase)?,
+        key,
         part: (!part.is_empty()).then_some(part),
-    })
+    }
 }
 
 impl From<ModuleForm> for wire::ModuleForm {
@@ -330,7 +308,7 @@ fn prepare_message(request: &PrepareRequest) -> Result<wire::Prepare> {
         };
         packages.push(wire::PackageRequest {
             op: entry.slot.op.clone(),
-            phase: phase_to_wire(entry.slot.phase),
+            key: entry.slot.key.clone(),
             selector: Some(selector),
             part: entry.slot.part.clone().unwrap_or_default(),
         });
@@ -341,7 +319,7 @@ fn prepare_message(request: &PrepareRequest) -> Result<wire::Prepare> {
         .map(|descriptors| wire::Descriptors {
             op: descriptors.slot.op.clone(),
             keys: descriptors.keys.clone(),
-            phase: phase_to_wire(descriptors.slot.phase),
+            key: descriptors.slot.key.clone(),
             part: descriptors.slot.part.clone().unwrap_or_default(),
         })
         .collect();
@@ -529,7 +507,7 @@ impl Client {
                 wire::server_message::Message::Prepared(prepared) => {
                     let mut chosen = Vec::with_capacity(prepared.packages.len());
                     for revision in prepared.packages {
-                        let slot = slot_of(revision.op, revision.phase, revision.part)?;
+                        let slot = slot_of(revision.op, revision.key, revision.part);
                         let revision = revision.package.ok_or_else(|| {
                             Error::Protocol("a chosen package carries no package".into())
                         })?;
@@ -668,13 +646,13 @@ impl Client {
                 op: request.op.clone(),
                 targets: request.targets.iter().map(Target::to_string).collect(),
                 keys: request.keys.clone(),
-                preferred: request
-                    .preferred
+                pins: request
+                    .pins
                     .iter()
-                    .map(|preference| wire::Preference {
-                        phase: phase_to_wire(preference.phase),
-                        backend: preference.backend.clone(),
-                        revision: preference.revision.unwrap_or(0),
+                    .map(|(key, pin)| wire::KeyPin {
+                        key: key.clone(),
+                        backend: pin.backend.clone(),
+                        revision: pin.revision.unwrap_or(0),
                     })
                     .collect(),
                 fixed: request

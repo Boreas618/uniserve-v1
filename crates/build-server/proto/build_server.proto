@@ -62,10 +62,10 @@ message Package {
   uint32 revision = 3;
 }
 
-// A phase of an operator a package revision fills is stated by the phase's
-// id (`scheduling::view::Phase::id`, the one phase vocabulary of the
-// scheduler and the package selection); an absent phase fills every phase of
-// the operator with one package revision (design section 5.2).
+// A slot is an operator and either the one descriptor key a deployment's
+// `[kernels]` table pins its package for (`key`) or the part of the
+// operator's keys the selection gives the package (`part`); neither, the
+// package fills every key of the operator (design section 5.2).
 
 // A package revision named by its backend and arguments: the server selects the
 // backend's latest installed revision (design section 5.1).
@@ -84,8 +84,12 @@ message PackageRevision {
 
 // One operator of an epoch and the package revision that fills it.
 message PackageRequest {
+  reserved 2;
+  reserved "phase";
   string op = 1;
-  optional uint32 phase = 2;
+  // The descriptor key a pin names the slot for; absent for a slot of a part
+  // or of the whole operator.
+  optional string key = 6;
   oneof selector {
     Backend backend = 3;
     PackageRevision package = 4;
@@ -96,13 +100,15 @@ message PackageRequest {
 }
 
 // The descriptors one slot's package revision must cover (design section 4.2): the
-// slot is the operator, its phase and its part, exactly as the package revision
-// request that fills it names them.
+// slot is the operator, its pinned key and its part, exactly as the package
+// revision request that fills it names them.
 message Descriptors {
+  reserved 3;
+  reserved "phase";
   string op = 1;
   // Descriptor keys, in the canonical form the operator's `Display` gives.
   repeated string keys = 2;
-  optional uint32 phase = 3;
+  optional string key = 5;
   string part = 4;
 }
 
@@ -120,8 +126,10 @@ message Prepare {
 
 // A slot and the package revision the server selected for it.
 message SlotPackage {
+  reserved 2;
+  reserved "phase";
   string op = 1;
-  optional uint32 phase = 2;
+  optional string key = 5;
   PackageRevision package = 3;
   string part = 4;
 }
@@ -141,20 +149,23 @@ message List {}
 // Ask which installed package is selected for each of an operator's
 // descriptor keys (design section 6.3). The candidates are the packages a
 // module set fixed, when the request states them, and otherwise each backend's
-// latest installed revision, or the revision a named backend states; of
-// those, the ones that build for every target. A key goes to the first candidate whose manifest
-// covers it, in this order: the backend the deployment names for the key's
-// phase, then the manifest's `priority`, highest first, then the backend whose
-// name sorts first. The server responds with `Coverage`; nothing is built.
+// latest installed revision, or the revision a pin states; of those, the ones
+// that build for every target. A key a pin names goes to the pinned backend,
+// which must cover it; every other key goes to the first candidate whose
+// manifest covers it, by the manifest's `priority`, highest first, then the
+// backend whose name sorts first. The server responds with `Coverage`;
+// nothing is built.
 message Cover {
+  reserved 4;
+  reserved "preferred";
   string op = 1;
   // The targets the keys' modules are built for, such as `sm_100a`.
   repeated string targets = 2;
   // Descriptor keys, in the canonical form the operator's `Display` gives.
   repeated string keys = 3;
-  // The backends the deployment prefers for the operator; none leaves the
-  // selection to the manifests' priorities.
-  repeated Preference preferred = 4;
+  // The deployment's pins of the operator's keys (its `[kernels]` table);
+  // none leaves every key to the manifests' priorities.
+  repeated KeyPin pins = 6;
   // The revisions a module set fixed for the operator's packages. When any is
   // stated, the candidates are exactly these packages at these revisions: a
   // package or a revision installed since is none.
@@ -167,10 +178,10 @@ message FixedRevision {
   uint32 revision = 2;
 }
 
-// A backend a deployment names for an operator, in every phase (no phase) or
-// in one: it is selected for the keys of that phase whenever it covers them.
-message Preference {
-  optional uint32 phase = 1;
+// The package a deployment pins for one descriptor key of an operator.
+message KeyPin {
+  // The descriptor key, in its canonical text, matched exactly.
+  string key = 1;
   string backend = 2;
   // The revision to use; zero names the backend's latest installed revision.
   uint32 revision = 3;

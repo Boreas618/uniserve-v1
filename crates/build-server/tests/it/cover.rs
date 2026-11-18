@@ -5,10 +5,10 @@
 
 use std::path::Path;
 
-use build_server::protocol::{CoverRequest, Package, Preference};
+use build_server::protocol::{CoverRequest, Package};
 use build_server::server::BuildServer;
 use build_server::target::Target;
-use proto::module::Phase;
+use proto::module::Pin;
 
 use crate::support::{self, arch, other_arch};
 
@@ -50,18 +50,20 @@ fn request(keys: &[&str]) -> CoverRequest {
         op: OP.to_owned(),
         targets: vec![arch()],
         keys: keys.iter().map(|key| (*key).to_owned()).collect(),
-        preferred: Vec::new(),
+        pins: Default::default(),
         fixed: Vec::new(),
     }
 }
 
-/// `backend` named for `phase`, at its latest revision.
-fn named(phase: Option<Phase>, backend: &str) -> Preference {
-    Preference {
-        phase,
-        backend: backend.to_owned(),
-        revision: None,
-    }
+/// `key` pinned to `backend` at `revision`, its latest when `None`.
+fn pin(key: &str, backend: &str, revision: Option<u32>) -> (String, Pin) {
+    (
+        key.to_owned(),
+        Pin {
+            backend: backend.to_owned(),
+            revision,
+        },
+    )
 }
 
 /// Revision `revision` of `backend`'s package of [`OP`].
@@ -150,10 +152,10 @@ fn a_key_several_packages_cover_goes_to_the_highest_priority() {
     assert!(coverage.uncovered.is_empty());
 }
 
-/// A named backend takes every key it covers before any priority, and a key
-/// it does not cover goes on to the packages that do.
+/// A pinned key goes to its pinned backend whatever the priorities, matched by its exact text,
+/// and every key no pin names is selected by priority, the pinned backend's other keys included.
 #[test]
-fn a_named_backend_takes_the_keys_it_covers() {
+fn a_pinned_key_goes_to_its_backend() {
     let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
     let server = BuildServer::open(&support::config(temporary.path())).unwrap();
@@ -166,44 +168,71 @@ fn a_named_backend_takes_the_keys_it_covers() {
     install(&server, sources, &manifest("beta", 0, &["bf16"], &arch()));
 
     let mut asked = request(&[BF16, F32]);
-    asked.preferred = vec![named(None, "beta")];
+    asked.pins = [pin(BF16, "beta", None)].into();
     let coverage = server.cover(&asked).unwrap();
     assert_eq!(
         coverage.covered,
         vec![covered("alpha", 1, &[F32]), covered("beta", 1, &[BF16])]
     );
+
+    // A pin of another key's text leaves both keys to the priorities.
+    asked.pins = [pin("dtype_bf16_head_dim_64", "beta", None)].into();
+    let coverage = server.cover(&asked).unwrap();
+    assert_eq!(coverage.covered, vec![covered("alpha", 1, &[BF16, F32])]);
 }
 
-/// A backend named for one phase is preferred for that phase's keys alone.
+/// A pin is the key's alone: a pinned backend that does not cover the key, a pinned revision
+/// that is not installed, a backend that is not installed, and one backend pinned at two
+/// revisions each refuse the selection rather than hand the key to another package.
 #[test]
-fn a_backend_named_for_a_phase_takes_that_phase() {
+fn a_pin_that_cannot_build_its_key_is_refused() {
     let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
     let server = BuildServer::open(&support::config(temporary.path())).unwrap();
-    let phased = |backend: &str| {
-        support::vendor_manifest(
-            OP,
-            backend,
-            0,
-            r#"{ phase = ["prefill", "decode"], dtype = ["bf16"], head_dim = ["128"] }"#,
-            &arch(),
-        )
-    };
-    install(&server, temporary.path(), &phased("alpha"));
-    install(&server, temporary.path(), &phased("beta"));
-
-    let prefill = "phase_prefill_dtype_bf16_head_dim_128";
-    let decode = "phase_decode_dtype_bf16_head_dim_128";
-    let mut asked = request(&[prefill, decode]);
-    asked.preferred = vec![named(Some(Phase::Decode), "beta")];
-    let coverage = server.cover(&asked).unwrap();
-    assert_eq!(
-        coverage.covered,
-        vec![
-            covered("alpha", 1, &[prefill]),
-            covered("beta", 1, &[decode])
-        ]
+    let sources = temporary.path();
+    install(
+        &server,
+        sources,
+        &manifest("alpha", 0, &["bf16", "f32"], &arch()),
     );
+    install(&server, sources, &manifest("beta", 0, &["bf16"], &arch()));
+
+    let mut asked = request(&[BF16, F32]);
+    for (pins, refusal) in [
+        (vec![pin(F32, "beta", None)], "covers no descriptor"),
+        (vec![pin(BF16, "beta", Some(4))], "revision 4"),
+        (vec![pin(BF16, "gamma", None)], "gamma"),
+        (
+            vec![pin(BF16, "alpha", Some(1)), pin(F32, "alpha", None)],
+            "one revision",
+        ),
+    ] {
+        asked.pins = pins.into_iter().collect();
+        let refused = server.cover(&asked).unwrap_err().to_string();
+        assert!(refused.contains(refusal), "{refused}");
+    }
+}
+
+/// A pinned revision is the backend's candidate for the operator: an earlier revision pinned
+/// serves the pinned key and the backend's other keys alike.
+#[test]
+fn a_pinned_revision_is_the_backends_candidate() {
+    let _exclusive = support::exclusive();
+    let temporary = tempfile::tempdir().unwrap();
+    let server = BuildServer::open(&support::config(temporary.path())).unwrap();
+    let sources = temporary.path();
+    install(
+        &server,
+        sources,
+        &manifest("fa4", 0, &["bf16", "f16"], &arch()),
+    );
+    install(&server, sources, &manifest("fa4", 0, &["bf16"], &arch()));
+
+    let mut asked = request(&[BF16, F16]);
+    asked.pins = [pin(BF16, "fa4", Some(1))].into();
+    let coverage = server.cover(&asked).unwrap();
+    assert_eq!(coverage.candidates, vec![package("fa4", 1)]);
+    assert_eq!(coverage.covered, vec![covered("fa4", 1, &[BF16, F16])]);
 }
 
 /// Only a backend's latest revision is a candidate, as `prepare` selects it:

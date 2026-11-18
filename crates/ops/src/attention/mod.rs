@@ -70,13 +70,12 @@
 //! The program is a native library: trtllm-gen's host code selects and loads its cubins, builds its
 //! TMA descriptors, carves its workspace and computes its own grid and cluster, so [`Op::launch`]
 //! computes no grid and hands the library [`Call`]. FlashAttention-4's CuTe DSL package implements
-//! the same operation and the same call structure, and is chosen by `attention_backend` /
-//! `decode_attention_backend` / `prefill_attention_backend`. This crate's Triton package serves
-//! the caches the vendor programs do not read, an E4M3 page and a dense page of another type than
-//! the queries, with the arguments its programs declare instead of [`Call`], and a grid this
-//! launch computes in the query tiles the loaded module was compiled for (its `BLOCK_Q`); a key
-//! no package a deployment names covers goes to a package that covers it (`cover` at the Build
-//! Server).
+//! the same operation and the same call structure, and a deployment's `[kernels]` table pins
+//! either for a descriptor key. This crate's Triton package serves the caches the vendor programs
+//! do not read, an E4M3 page and a dense page of another type than the queries, with the
+//! arguments its programs declare instead of [`Call`], and a grid this launch computes in the
+//! query tiles the loaded module was compiled for (its `BLOCK_Q`); a key no pin names goes to the
+//! package of highest priority that covers it (`cover` at the Build Server).
 //!
 //! The workspace is the program's `workspace_size` argument (512 MiB for trtllm-gen), a transient
 //! region the worker allocates from its scratch pool and zeroes before its first use: trtllm-gen
