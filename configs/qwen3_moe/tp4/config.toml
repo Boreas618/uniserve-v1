@@ -1,0 +1,32 @@
+# Qwen3 MoE on the four GPUs of one host: one TP4 replica whose ranks hold whole experts, run
+# by the release's control programs. `chunk` keeps the p99 time per output token within 50 ms
+# and the time to first token within 1 s through the prefill chunk, `expert-order` balances the
+# four ranks' expert tokens every ten minutes, and `backend` probes every module when the decode
+# step slows and moves the attention kernels to the backend that measures faster.
+
+model = "Qwen/Qwen3-30B-A3B"
+
+[moe_config]
+expert_parallel = true
+
+[[worker_groups]]
+id = "model"
+ranks = ["cuda:0-3"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+tensor_parallel_size = 4
+
+[programs.chunk]
+source = "uniserve:chunk"
+period = "10s"
+args = { tpot = "50ms", ttft = "1s", low = 512, high = 8192 }
+
+[programs.expert-order]
+source = "uniserve:expert-order"
+period = "10m"
+args = { ranks = 4 }
+
+[programs.backend]
+source = "uniserve:backend"
+period = "10s"

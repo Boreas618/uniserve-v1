@@ -1,0 +1,23 @@
+# The `ttft` routing program's package: each request to the prefill replica predicted to give its
+# first token soonest. A policy package runs it by naming it as a program's source
+# (`[programs.<name>] source = "uniserve:ttft"`) with its `args`.
+
+# A program package: its module states its kind (a routing program) and the program interface
+# version it implements in its own `uniserve.program` section, which the Build Server records
+# with the module and the leader daemon checks.
+op = "program"
+backend = "ttft"
+
+# The program is built with the workspace's pinned Rust toolchain.
+[toolchain]
+kind = "cargo"
+
+[module]
+form = "wasm"
+
+# The package is this crate: the Build Server snapshots its whole workspace when it is installed
+# and builds the crate for wasm32 from that snapshot; the leader daemon compiles the module when
+# it loads it. The crate's files are the ones cargo packages, so none is listed here.
+[source]
+kind = "wasm"
+files = []

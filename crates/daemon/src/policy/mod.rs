@@ -302,6 +302,24 @@ mod tests {
         assert_eq!(Package::read(copy.path()).unwrap(), read);
     }
 
+    /// Every package the repository publishes (`configs/<model>/<deployment>`) reads as a
+    /// package: its options and its programs' entries are the configuration's.
+    #[test]
+    fn published_packages_read() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let mut read = 0;
+        for model in std::fs::read_dir(&root).unwrap() {
+            for deployment in std::fs::read_dir(model.unwrap().path()).unwrap() {
+                let directory = deployment.unwrap().path();
+                if let Err(error) = Package::read(&directory) {
+                    panic!("{}: {error:#}", directory.display());
+                }
+                read += 1;
+            }
+        }
+        assert!(read > 0, "configs/ publishes packages");
+    }
+
     /// An archive `tar` made of the package's directory, with its leading `./`, reads as the
     /// package; one without `config.toml`, with a path that leaves the package or with a file
     /// outside its two parts is refused.

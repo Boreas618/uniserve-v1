@@ -19,6 +19,7 @@ members = [
     "crates/ops/derive",
     "crates/processing",
     "crates/program",
+    "crates/program/testing",
     "crates/program/tests/programs/chunk",
     "crates/program/tests/programs/fastest",
     "crates/program/tests/programs/kv",
@@ -27,6 +28,11 @@ members = [
     "crates/proto/derive",
     "crates/scheduling",
     "crates/scheduling/policies/arrival",
+    "crates/scheduling/policies/backend",
+    "crates/scheduling/policies/chunk",
+    "crates/scheduling/policies/expert-order",
+    "crates/scheduling/policies/layout",
+    "crates/scheduling/policies/ttft",
     "crates/service",
     "crates/storage",
     "crates/storage-server",
@@ -98,6 +104,7 @@ ops-derive = { path = "crates/ops/derive" }
 models = { path = "crates/models" }
 processing = { path = "crates/processing" }
 program = { path = "crates/program" }
+program-testing = { path = "crates/program/testing" }
 build-server = { path = "crates/build-server" }
 proto = { path = "crates/proto" }
 proto-derive = { path = "crates/proto/derive" }

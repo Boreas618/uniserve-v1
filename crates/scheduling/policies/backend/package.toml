@@ -1,0 +1,24 @@
+# The `backend` control program's package: when the decode step slows, every module probed for
+# a while, and the attention kernels moved to the backend that measured faster. A policy package
+# runs it by naming it as a program's source (`[programs.<name>] source = "uniserve:backend"`)
+# with a `period` and its `args`.
+
+# A program package: its module states its kind (a control program) and the program interface
+# version it implements in its own `uniserve.program` section, which the Build Server records
+# with the module and the leader daemon checks.
+op = "program"
+backend = "backend"
+
+# The program is built with the workspace's pinned Rust toolchain.
+[toolchain]
+kind = "cargo"
+
+[module]
+form = "wasm"
+
+# The package is this crate: the Build Server snapshots its whole workspace when it is installed
+# and builds the crate for wasm32 from that snapshot; the leader daemon compiles the module when
+# it loads it. The crate's files are the ones cargo packages, so none is listed here.
+[source]
+kind = "wasm"
+files = []

@@ -4639,6 +4639,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "policy-backend"
+version = "2.0.0"
+dependencies = [
+ "program",
+ "program-testing",
+ "scheduling",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "policy-chunk"
+version = "2.0.0"
+dependencies = [
+ "program",
+ "program-testing",
+ "scheduling",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "policy-expert-order"
+version = "2.0.0"
+dependencies = [
+ "program",
+ "program-testing",
+ "scheduling",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "policy-layout"
+version = "2.0.0"
+dependencies = [
+ "program",
+ "program-testing",
+ "scheduling",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "policy-ttft"
+version = "2.0.0"
+dependencies = [
+ "program",
+ "program-testing",
+ "scheduling",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4828,6 +4883,15 @@ version = "2.0.0"
 dependencies = [
  "scheduling",
  "serde",
+]
+
+[[package]]
+name = "program-testing"
+version = "2.0.0"
+dependencies = [
+ "program",
+ "scheduling",
+ "serde_json",
 ]
 
 [[package]]

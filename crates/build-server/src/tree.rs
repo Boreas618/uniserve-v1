@@ -6,8 +6,9 @@
 //!   [`ENVIRONMENT_PROJECT`], which uv creates when the server starts
 //!   ([`crate::toolchain::Environment`]);
 //! - the serving packages of the tree's release ([`packages`]): every kernel
-//!   package of the operator tree (`crates/ops/kernels/<op>/<backend>`), the
-//!   scheduling policy and the engine. The upstream server installs them when
+//!   package of the operator tree (`crates/ops/kernels/<op>/<backend>`), every
+//!   program of the release (`crates/scheduling/policies/<name>`) and the
+//!   engine. The upstream server installs them when
 //!   it starts ([`crate::server::BuildServer::install_tree`]), so a deployment
 //!   selects from the tree it was started with.
 
@@ -23,18 +24,19 @@ pub const ENVIRONMENT_PROJECT: &str = "crates/build-server/python";
 /// backend.
 const KERNEL_TREE: &str = "crates/ops/kernels";
 
-/// The scheduling policy package.
-const POLICY_PACKAGE: &str = "crates/scheduling/policies/arrival";
+/// The release's programs: one package directory per program, which a policy
+/// package names as `uniserve:<name>`.
+const PROGRAM_TREE: &str = "crates/scheduling/policies";
 
 /// The engine package.
 const ENGINE_PACKAGE: &str = "crates/engine";
 
 /// The serving packages of the tree at `source`, in a stable order: the kernel
-/// packages by operator and backend, then the scheduling policy and the engine.
+/// packages by operator and backend, then the programs by name and the engine.
 ///
 /// # Errors
 ///
-/// Fails when the operator tree cannot be read.
+/// Fails when the operator tree or the program tree cannot be read.
 pub fn packages(source: &Path) -> Result<Vec<PathBuf>> {
     let mut kernels = Vec::new();
     for op in std::fs::read_dir(source.join(KERNEL_TREE))? {
@@ -51,7 +53,17 @@ pub fn packages(source: &Path) -> Result<Vec<PathBuf>> {
     }
     kernels.sort();
 
-    kernels.push(source.join(POLICY_PACKAGE));
-    kernels.push(source.join(ENGINE_PACKAGE));
-    Ok(kernels)
+    let mut programs = Vec::new();
+    for program in std::fs::read_dir(source.join(PROGRAM_TREE))? {
+        let program = program?.path();
+        if program.join(Manifest::FILE).is_file() {
+            programs.push(program);
+        }
+    }
+    programs.sort();
+
+    let mut packages = kernels;
+    packages.extend(programs);
+    packages.push(source.join(ENGINE_PACKAGE));
+    Ok(packages)
 }

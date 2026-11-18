@@ -1,0 +1,27 @@
+[package]
+name = "policy-ttft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "The routing program that sends each request to the prefill replica predicted to give its first token soonest, and to the decode replica with the fewest running requests that can reserve its pages."
+
+[lib]
+# A program package is compiled to `wasm32-unknown-unknown` and run by the leader daemon's
+# program host; the library form is what `cargo check` and the program's own tests read.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The program SDK: `Program`, `State`, the views and the exports.
+scheduling.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# The program's module built for wasm32 and run in the program host over stated observations.
+program.workspace = true
+program-testing.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "program-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Test support of the program crates: their wasm32 modules built by the cargo that runs the test, and a deployment that answers a program's host functions from stated observations."
+
+# A development dependency of the program crates only, never of a serving build.
+[dependencies]
+# The program host the modules run in, as the leader daemon runs them.
+program.workspace = true
+# The program SDK: the inputs, outputs and host-function messages.
+scheduling.workspace = true
+# Cargo's JSON messages, which name the modules a build wrote.
+serde_json.workspace = true
+
+[lints]
+workspace = true

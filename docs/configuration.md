@@ -99,6 +99,106 @@ Each program runs in an instance of its own of the program host (wasmtime, no WA
 
 A program that panics, runs past its fuel or breaks the call convention is ended: its host calls it no more, what it wrote stays, and the default rules decide in its place until a change gives it another entry or module. Its log (the `log` crate's records), its failures and its refused outputs are `log` events of the observation store with the program's name as their `writer`, and the outcome of each of its writes is its revision's `revision` event. A program's own fields are its state: its host saves it in the deployment's `program-state/`, as `<name>.state` with the arguments it ran with, after every periodic step (a routing program every `period`, and every program when it ends), and a new instance of the program with the same arguments restores it when it decodes as the program's type, after a restart of the leader and after a change of its module; a program of other arguments is created from them. A change keeps the instance of every program whose source, arguments and module are unchanged, and replaces the others between two of their calls.
 
+#### The release's programs
+
+UniServe releases these programs as program packages (`crates/scheduling/policies/<name>`), which a Build Server started with a `source` tree installs, or `uniserve build-server install --deployment NAME crates/scheduling/policies/<name>` installs; a package names one as `uniserve:<name>`. Every control program among them outputs a change only when `state.validate` accepts it and reports that serving goes on, holds back for its `pause` after a change of its own was rolled back, and keeps in its state (`program-state/<name>.state`) everything it needs across restarts. Durations are written as text (`"10s"`, `"15m"`, `"1h"`).
+
+```toml
+[programs.chunk]
+source = "uniserve:chunk"
+period = "10s"
+args = { tpot = "50ms", ttft = "1s", low = 512, high = 8192 }
+
+[programs.expert-order]
+source = "uniserve:expert-order"
+period = "10m"
+args = { ranks = 4 }
+```
+
+| Program | Kind | Reads | Writes |
+| --- | --- | --- | --- |
+| `arrival` | scheduling | its scheduler's queue | the batch (the default scheduling program) |
+| `chunk` | control | `uniserve_ttft_seconds` and `uniserve_tpot_seconds` p99 by `replica` | `scheduler_config.chunked_prefill_size` |
+| `expert-order` | control | `uniserve_expert_tokens_total` by `layer` and `expert` | `moe_config.expert_order` |
+| `layout` | control | `uniserve_scheduler_running_requests` mean, `uniserve_generation_tokens_total` rate | the options of the named layouts (`worker_groups`, ...) |
+| `backend` | control | `uniserve_step_device_seconds` p50 of phase `decode` by `module`, `uniserve_kernel_launches_total` of its operator by `descriptor` | `profiling_config.fence_modules`, `fence_probes`, `fence_probes_off`; `[kernels.<op>]` |
+| `ttft` | routing | each request and the replicas' roles, queued prefill tokens, remaining batch time, running requests, reservable pages and prefix hits | the request's prefill and decode replicas |
+
+**`chunk`** trades time to first token against time per output token through the prefill chunk. Every period it reads each replica's p99 TTFT and TPOT over the last `window`: while any replica's TPOT is over `tpot` it halves the chunk, down to `low`; while no replica's TPOT is and any replica's TTFT is over `ttft` it doubles it, up to `high`; otherwise it changes nothing. An unset chunk is the step's whole token budget, read as `max_num_batched_tokens` when that is stated and as `high` otherwise. The chunk takes effect at each scheduler's next step.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `tpot` | Required | The p99 time per output token target |
+| `ttft` | Required | The p99 time to first token target |
+| `low` | Required | The smallest chunk, in tokens |
+| `high` | Required | The largest chunk, in tokens |
+| `window` | `"10s"` | The span the p99s are read over |
+| `pause` | `"1h"` | How long a rolled-back change holds the program back |
+
+**`expert-order`** balances each routed layer's expert ranks. A layer's slots divide among its `ranks` expert ranks in equal contiguous blocks, and `moe_config.expert_order` names the logical expert in each slot (a layer it does not name holds the checkpoint's order). Every period the program reads the tokens each layer's experts took over the last `window`; a layer whose busiest rank took more than `imbalance` times the ranks' mean gets the order that gives the experts, heaviest first, to the rank with the fewest tokens that has a slot left, each expert that stays on its rank keeping its slot, and the order is written when it lowers the layer's busiest rank. The order takes effect at one computation boundary (`order`), the epoch, graphs and requests staying.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `ranks` | Required | The expert ranks each layer's slots divide among |
+| `window` | `"10m"` | The span the tokens are counted over |
+| `imbalance` | `1.1` | The multiple of the ranks' mean a layer's busiest rank may take before the layer is reordered |
+| `pause` | `"1h"` | How long a rolled-back change holds the program back |
+
+**`layout`** chooses the parallel layout by concurrency among the layouts its arguments name. The layout that serves is the first whose every option the configuration states at its value. Every period the program reads the mean running requests over the last `window` and the output token rate over the last `rate`; once a layout served a whole `window`, the rate is averaged into its record for the range of running requests (`bounds`) the mean falls in, and these records are its state. When another layout's record in the current range averages at least `samples` values and exceeds the serving layout's by more than `margin`, the program writes that layout's options; a layout change takes effect as an epoch. A configuration that is none of the named layouts is left as it is.
+
+```toml
+[programs.layout]
+source = "uniserve:layout"
+period = "1m"
+
+[programs.layout.args]
+bounds = [32]
+
+[programs.layout.args.layouts.tp8]
+worker_groups = [{ id = "model", ranks = ["cuda:0-7"], blocks = { model = { tensor_parallel_size = 8 } } }]
+
+[programs.layout.args.layouts.tp4x2]
+worker_groups = [
+    { id = "a", ranks = ["cuda:0-3"], blocks = { model = { tensor_parallel_size = 4 } } },
+    { id = "b", ranks = ["cuda:4-7"], blocks = { model = { tensor_parallel_size = 4 } } },
+]
+```
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `layouts` | Required | The layouts, by name: each the options that make it, by their paths, at their values |
+| `bounds` | Required | The ascending bounds of the ranges of running requests (`[32]`: below 32, and 32 or more) |
+| `window` | `"15m"` | The span the running requests are averaged over, and that a layout serves before its throughput counts |
+| `rate` | `"1m"` | The span the throughput is measured over |
+| `margin` | `0.05` | How much higher, as a fraction of the serving layout's, another layout's record must be |
+| `samples` | `3` | The values a record averages before it is compared |
+| `weight` | `0.2` | The weight of each new throughput in a record's moving average |
+| `pause` | `"1h"` | How long a rolled-back change holds the program back |
+
+**`backend`** deepens observation when the decode step slows and moves the attention kernels to the faster backend. Every period it compares the decode step's median device time over the last `window` with its median over the last `baseline`; when it is more than `slowdown` slower, and no probe opened within `interval`, it opens a probe: `profiling_config.fence_modules` becomes `modules`, `fence_probes` true and `fence_probes_off` empty. From the step that reads the probe in the configuration it runs for `probe`, and then the program writes the three options back to the values they had before it and reads what it measured: each module class's median device time per decode step (a class slower than its record of earlier probes by more than `slowdown` is logged as slowed), the descriptor keys its operator `op` launched, and the device time of the `attention` classes, which is averaged into the record of the backend these keys ran on (the one `[kernels.<op>]` pins, or the first of `backends`, which the Build Server selects by priority, for a key it does not pin). When the keys ran on one backend and the next of `backends` has a record on them faster than this probe by more than `margin`, or no record while an attention class is among the slowed ones, the program pins the keys in `[kernels.<op>]` to that backend, at the revision the table already pins it at for the operator or at `latest`, in the same change as the probe's end; the move takes effect as a kernel generation. Closing a probe is never held back.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `slowdown` | `0.1` | How much slower the decode step, and a module class against its record, counts as slowed |
+| `window` | `"10s"` | The span of the step time compared with the baseline |
+| `baseline` | `"1h"` | The span of the baseline |
+| `probe` | `"30s"` | How long a probe measures |
+| `modules` | `["*"]` | The module class patterns a probe places probes on |
+| `attention` | `["*.Attention"]` | The patterns of the attention module classes |
+| `op` | `"paged_attention"` | The attention operator |
+| `backends` | `["trtllm", "triton"]` | The backends the keys move between, the one the Build Server selects for an unpinned key first |
+| `margin` | `0.05` | How much faster, as a fraction of the probe's time, the other backend's record must be |
+| `interval` | `"10m"` | The least time between two probes |
+| `weight` | `0.3` | The weight of each probe's time in a record's moving average |
+| `pause` | `"1h"` | How long a rolled-back change holds the program back |
+
+**`ttft`** routes each request to the prefill replica predicted to give its first token soonest: the replica's running batch completes (`remaining`), then its queued prefill tokens and the prompt's tokens it does not hold (its longest prefix hit on any tier) are computed at `rate` tokens per second; ties go to fewer running requests, then to the first replica. A replica that also decodes decodes what it computed; otherwise the decode replica is the one with the fewest running requests among those that can reserve the prompt's pages (`page` tokens each), which a push of its KV needs, or among every decode replica when none can. A deployment without a replica of a role gets a route the leader refuses and replaces by its own rule, and the program logs why.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `rate` | Required | A replica's prefill throughput, in tokens per second |
+| `page` | Required | The tokens of a KV page |
+
 ### Effects
 
 Every option declares how a change of it takes effect, and a change takes the least its options need: the effects of the options it changes, merged per component.

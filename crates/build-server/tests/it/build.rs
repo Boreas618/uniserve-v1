@@ -400,79 +400,76 @@ fn a_build_reports_the_keys_no_package_built_and_builds_the_rest() {
     assert_eq!(served(&store, &cache), [(1, vec![PAGE_64.to_owned()])]);
 }
 
-/// The directory of the workspace member whose manifest is the package `op`
-/// `backend`, as `cargo metadata` lists the members of this crate's
-/// workspace.
-fn workspace_package(op: &str, backend: &str) -> PathBuf {
-    let output = std::process::Command::new("cargo")
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--offline",
-        ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    metadata["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|member| Path::new(member["manifest_path"].as_str()?).parent())
-        .filter(|directory| directory.join(Manifest::FILE).is_file())
-        .find(|directory| {
-            let manifest = Manifest::load(directory).unwrap();
-            manifest.op == op && manifest.backend == backend
-        })
-        .unwrap_or_else(|| panic!("no workspace member is the package {op} {backend}"))
-        .to_path_buf()
-}
-
-/// A scheduling policy is built by the server from the snapshot its
-/// installation took of its whole workspace, with the lockfile's sources
-/// vendored and nothing fetched; a second server over the same roots resolves
-/// the committed module without building it.
+/// Every program of the release (`crates/scheduling/policies/<name>`, the
+/// packages the server installs from a source tree) is built by the server
+/// from the snapshot its installation took of its whole workspace, with the
+/// lockfile's sources vendored and nothing fetched, into a module that states
+/// its kind; a second server over the same roots resolves the committed
+/// modules without building them.
 #[test]
-#[ignore = "builds the workspace's arrival policy for wasm32 with cargo: run with --ignored"]
-fn the_workspace_policy_is_built_from_its_installed_snapshot() {
+#[ignore = "builds the workspace's programs for wasm32 with cargo: run with --ignored"]
+fn the_release_programs_are_built_from_their_installed_snapshots() {
     let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
     let config = support::config(temporary.path());
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let programs: Vec<PathBuf> = build_server::tree::packages(&source)
+        .unwrap()
+        .into_iter()
+        .filter(|directory| Manifest::load(directory).unwrap().op == "program")
+        .collect();
+    let names: Vec<String> = programs
+        .iter()
+        .map(|directory| Manifest::load(directory).unwrap().backend)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "arrival",
+            "backend",
+            "chunk",
+            "expert-order",
+            "layout",
+            "ttft"
+        ]
+    );
+
     let server = BuildServer::open(&config).unwrap();
-    let installed = server
-        .install(&workspace_package("program", "arrival"))
-        .unwrap();
-    let revision = support::revision(&installed.backend, installed.revision);
-    server
-        .prepare(
-            &support::latest("program", "arrival", &[SINGLE_KEY], Vec::new()),
-            &mut |_| {},
-        )
-        .expect("the server builds the policy from its snapshot");
+    let mut revisions = Vec::new();
+    for directory in &programs {
+        let installed = server.install(directory).unwrap();
+        server
+            .prepare(
+                &support::latest("program", &installed.backend, &[SINGLE_KEY], Vec::new()),
+                &mut |_| {},
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the server builds {} from its snapshot: {error}",
+                    installed.backend
+                )
+            });
+        revisions.push(support::revision(&installed.backend, installed.revision));
+    }
     drop(server);
 
     let server = BuildServer::open(&config).unwrap();
-    let mut progress = Vec::new();
-    let module = server
-        .resolve(
-            "program",
-            &revision,
-            &Target::wasm(),
-            SINGLE_KEY,
-            &mut |step| progress.push(step),
-        )
-        .unwrap();
-    assert!(progress.is_empty(), "the committed module was built again");
-    assert_eq!(module.form, ModuleForm::Wasm);
-    assert!(
-        support::file_of(&module, MODULE_WASM).starts_with(b"\0asm"),
-        "the module is a wasm32 binary"
-    );
+    for revision in &revisions {
+        let mut progress = Vec::new();
+        let module = server
+            .resolve(
+                "program",
+                revision,
+                &Target::wasm(),
+                SINGLE_KEY,
+                &mut |step| progress.push(step),
+            )
+            .unwrap();
+        assert!(progress.is_empty(), "the committed module was built again");
+        assert_eq!(module.form, ModuleForm::Wasm);
+        assert!(
+            support::file_of(&module, MODULE_WASM).starts_with(b"\0asm"),
+            "the module is a wasm32 binary"
+        );
+    }
 }
