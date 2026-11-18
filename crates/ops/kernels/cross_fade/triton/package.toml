@@ -16,9 +16,13 @@ interface_version = 1
 [source]
 kind = "triton"
 
+# The blend rounds each product into the element type before the sum, as the reference does, so a
+# product and the sum must not fuse into one multiply-add: a fused module rounds once where the
+# exact tolerance counts three roundings.
 [launch]
 kernel = "_cross_fade_kernel"
 warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
+options = { enable_fp_fusion = false }
 
 # `axis` and `block` are words the kernel does not read: it reads the compiled values.
 [launch.types]

@@ -68,7 +68,8 @@ TILES = [
 
 def launch(kernels, previous, current, out, extent, axis, block, pdl=False):
     """One launch over every voxel of `out`, each view addressed by its three
-    outer strides; compiled for a dependent launch when `pdl` is.
+    outer strides; compiled for a dependent launch when `pdl` is, and with the
+    package's warps and options.
     """  # noqa: D205
     channels, frames, rows, columns = out.shape
     elements = channels * frames * rows * columns
@@ -91,6 +92,8 @@ def launch(kernels, previous, current, out, extent, axis, block, pdl=False):
         PDL=pdl,
         num_warps=8 if block >= 1024 else 4,
         launch_pdl=pdl,
+        # The launch table's: each product rounds before the sum.
+        enable_fp_fusion=False,
     )
 
 

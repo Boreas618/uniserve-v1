@@ -43,7 +43,28 @@ import triton.language as tl
 from uniserve_kernels import dependent_launch
 
 
-@triton.jit
+# Every integer argument is a launch word, read at run time as the launch table compiles it:
+# a JIT launch must not fold a word equal to 1 into a constant, which leaves no tensor to cast.
+@triton.jit(
+    do_not_specialize=[
+        "extent",
+        "axis",
+        "channels",
+        "frames",
+        "rows",
+        "columns",
+        "previous_stride0",
+        "previous_stride1",
+        "previous_stride2",
+        "current_stride0",
+        "current_stride1",
+        "current_stride2",
+        "out_stride0",
+        "out_stride1",
+        "out_stride2",
+        "block",
+    ]
+)
 def _cross_fade_kernel(
     previous_ptr,
     current_ptr,
@@ -145,7 +166,10 @@ def _cross_fade_kernel(
     # The reference's ramp, in the element type at every step: `arange(extent, dtype) / extent`,
     # then `1 - that`, then the two products and their sum. The two integers reach the element type
     # through FP32: every position and overlap a tile holds is far below 2**24, so the intermediate
-    # is exact and the rounding into the element type is the reference's own.
+    # is exact and the rounding into the element type is the reference's own. Each product rounds
+    # before the sum only because the module compiles without floating-point fusion (the launch
+    # table's `enable_fp_fusion = false`): a fused multiply-add would skip the first product's
+    # rounding.
     position_in_dtype = position.to(tl.float32).to(dtype).to(tl.float32)
     extent_in_dtype = extent.to(tl.float32).to(dtype).to(tl.float32)
     ratio = (position_in_dtype / extent_in_dtype).to(dtype)
