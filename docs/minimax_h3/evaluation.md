@@ -33,13 +33,28 @@ server() {
     "$name" "$(words "$@")" "$environment"
 }
 
-# uniserve NAME MODEL SERVED CONFIG [OPTION...]: a UniServe server of the checkpoint MODEL under
-# the name SERVED, on the deployment file configs/minimax_h3/CONFIG.toml.
-uniserve() {
-  local name=$1 model=$2 served=$3 config=$4
+# package NAME MODEL SERVED LAYOUT [OPTION...]: write the policy package of the server NAME, the
+# directory artifacts/minimax_h3/packages/NAME, whose name names the deployment, and print its path:
+# a config.toml of the checkpoint directory MODEL served under the name SERVED on this host's port
+# 18083, each OPTION as one TOML line of it (`max_running_requests = 2`,
+# `video_config.max_seconds = 15`), and the [[worker_groups]] tables of the package
+# configs/minimax_h3/LAYOUT.
+package() {
+  local package=$PWD/artifacts/minimax_h3/packages/$1 model=$2 served=$3 layout=$4
   shift 4
-  server "$name" -- "$UNISERVE" serve --model-dir "$model" --served-model-name "$served" \
-    --host 127.0.0.1 --port 18083 --config "$PWD/configs/minimax_h3/$config.toml" "$@"
+  mkdir -p "$package"
+  {
+    printf 'model_dir = "%s"\nserved_model_name = "%s"\n' "$model" "$served"
+    printf 'admin_config = { host = "127.0.0.1", port = 18083 }\n'
+    printf '%s\n' "$@"
+    sed -n '/^\[\[worker_groups\]\]/,$p' "$PWD/configs/minimax_h3/$layout/config.toml"
+  } > "$package/config.toml"
+  printf '%s' "$package"
+}
+
+# uniserve NAME MODEL SERVED LAYOUT [OPTION...]: a UniServe server of that package.
+uniserve() {
+  server "$1" -- "$UNISERVE" serve "$(package "$@")"
 }
 
 # video NAME SERVER SERVED WORKLOAD MEASURED [FIELD...]: a point that sends the rows of
@@ -84,7 +99,7 @@ suite() {
 }
 ```
 
-`plan` prints the points a selection resolves to, with every server command and environment as it will run; `run` measures them into `<output root>/<point>`, and `--reuse-deployment` keeps one server for consecutive points of the same server. A two-host server starts the leader on `rank-0` with `--host-identity rank-0 --nnodes 2 --dist-init-addr $DIST` (`DIST` is `rank-0`'s address and a free port); start the daemon of `rank-1` against the same address for each server the run starts, as in [Two hosts](minimax_h3.md#two-hosts).
+`plan` prints the points a selection resolves to, with every server command and environment as it will run; `run` measures them into `<output root>/<point>`, and `--reuse-deployment` keeps one server for consecutive points of the same server. A two-host server's package lists both hosts (`TWO_HOST`, the leader first) and places ranks on the second as its layout does; for each server the run starts, start `uniserve serve` with a copy of the same package on the second host, its `build_config` its own host's, as in [Two hosts](minimax_h3.md#two-hosts).
 
 ## FastH3 post
 
@@ -96,13 +111,13 @@ The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) 
 | `gb200-8` | `ulysses8-two-host`, 2 running | `fasth3-ulysses4x2-two-host`, 4 running | 1, 2, 4, 8, 16 | 0.70 |
 | `rtx-pro-6000-8` | `ulysses8`, 2 running, `text_capacities=[1024, 10240]` | `fasth3-ulysses4x2`, 4 running, the same capacities | 1, 2, 4, 8, 16 | 0.92 |
 
-Every FastH3 deployment states `--max-model-len 16384 --set video_config.max_seconds=15 --set 'dtype="bfloat16"'`; the BF16 checkpoint adds `--set 'quantization.mode="quality"'`, and the NVFP4 export loads the representation its own configuration states. The `gb200-8` throughput deployment is one Ulysses4 replica on each host; its latency deployment places one Ulysses8 replica across both hosts, whose products the hosts' Storage Servers copy between them.
+Every FastH3 deployment states `max_model_len = 16384`, `video_config.max_seconds = 15` and `dtype = "bfloat16"`; the BF16 checkpoint adds `quantization.mode = "quality"`, and the NVFP4 export loads the representation its own configuration states. The `gb200-8` throughput deployment is one Ulysses4 replica on each host; its latency deployment places one Ulysses8 replica across both hosts, whose products the hosts' Storage Servers copy between them.
 
 ```bash
 BF16=/workspace/models/FastVideo-FastH3-8-Step-V2
 NVFP4=/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4
-TWO_HOST=(--host-identity rank-0 --nnodes 2 --dist-init-addr "$DIST")
-FASTH3=(--max-model-len 16384 --set video_config.max_seconds=15 --set 'dtype="bfloat16"')
+TWO_HOST=('hosts = ["rank-1", "rank-2"]')
+FASTH3=('max_model_len = 16384' 'video_config.max_seconds = 15' 'dtype = "bfloat16"')
 
 # fasth3 CONFIGURATION PRECISION LATENCY THROUGHPUT CONCURRENCIES: the servers and points of one
 # configuration and precision (bf16, nvfp4), its LATENCY and THROUGHPUT servers named, and the suite
@@ -121,20 +136,20 @@ fasth3() {
 }
 
 for precision in bf16 nvfp4; do
-  model=$BF16 quality=(--set 'quantization.mode="quality"')
+  model=$BF16 quality=('quantization.mode = "quality"')
   [ $precision = nvfp4 ] && model=$NVFP4 quality=()
   {
-    uniserve gb200-4-$precision $model FastH3 ulysses4 --max-running-requests 2 "${FASTH3[@]}" --mem-fraction-static 0.70 "${quality[@]}"
+    uniserve gb200-4-$precision $model FastH3 ulysses4 'max_running_requests = 2' "${FASTH3[@]}" 'mem_fraction_static = 0.70' "${quality[@]}"
     fasth3 gb200-4 $precision gb200-4-$precision gb200-4-$precision "1 2 4 8"
   } > artifacts/minimax_h3/fasth3-gb200-4-$precision.toml
   {
-    uniserve gb200-8-$precision-latency $model FastH3 ulysses8-two-host --max-running-requests 2 "${FASTH3[@]}" --mem-fraction-static 0.70 "${TWO_HOST[@]}" "${quality[@]}"
-    uniserve gb200-8-$precision-throughput $model FastH3 fasth3-ulysses4x2-two-host --max-running-requests 4 "${FASTH3[@]}" --mem-fraction-static 0.70 "${TWO_HOST[@]}" "${quality[@]}"
+    uniserve gb200-8-$precision-latency $model FastH3 ulysses8-two-host 'max_running_requests = 2' "${FASTH3[@]}" 'mem_fraction_static = 0.70' "${TWO_HOST[@]}" "${quality[@]}"
+    uniserve gb200-8-$precision-throughput $model FastH3 fasth3-ulysses4x2-two-host 'max_running_requests = 4' "${FASTH3[@]}" 'mem_fraction_static = 0.70' "${TWO_HOST[@]}" "${quality[@]}"
     fasth3 gb200-8 $precision gb200-8-$precision-latency gb200-8-$precision-throughput "1 2 4 8 16"
   } > artifacts/minimax_h3/fasth3-gb200-8-$precision.toml
   {
-    uniserve rtx-pro-6000-8-$precision-latency $model FastH3 ulysses8 --max-running-requests 2 "${FASTH3[@]}" --mem-fraction-static 0.92 --set 'video_config.text_capacities=[1024, 10240]' "${quality[@]}"
-    uniserve rtx-pro-6000-8-$precision-throughput $model FastH3 fasth3-ulysses4x2 --max-running-requests 4 "${FASTH3[@]}" --mem-fraction-static 0.92 --set 'video_config.text_capacities=[1024, 10240]' "${quality[@]}"
+    uniserve rtx-pro-6000-8-$precision-latency $model FastH3 ulysses8 'max_running_requests = 2' "${FASTH3[@]}" 'mem_fraction_static = 0.92' 'video_config.text_capacities = [1024, 10240]' "${quality[@]}"
+    uniserve rtx-pro-6000-8-$precision-throughput $model FastH3 fasth3-ulysses4x2 'max_running_requests = 4' "${FASTH3[@]}" 'mem_fraction_static = 0.92' 'video_config.text_capacities = [1024, 10240]' "${quality[@]}"
     fasth3 rtx-pro-6000-8 $precision rtx-pro-6000-8-$precision-latency rtx-pro-6000-8-$precision-throughput "1 2 4 8 16"
   } > artifacts/minimax_h3/fasth3-rtx-pro-6000-8-$precision.toml
 done
@@ -147,7 +162,7 @@ The W1 and W2 workloads of [MiniMax-H3 workloads](#minimax-h3-workloads) run on 
 
 ## H200
 
-These use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the fixed-length prompt of `evaluation/fixed-length.json` at the stated token count, every request at seed 1000, full graphs, `--mem-fraction-static 0.92` and `NCCL_CUMEM_HOST_ENABLE=1`. Latency is the mean ± SD of three requests at concurrency one after one warmup; the DP8 points use eight warmups and 16 requests at concurrency eight.
+These use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the fixed-length prompt of `evaluation/fixed-length.json` at the stated token count, every request at seed 1000, full graphs, `mem_fraction_static = 0.92` and `NCCL_CUMEM_HOST_ENABLE=1`. Latency is the mean ± SD of three requests at concurrency one after one warmup; the DP8 points use eight warmups and 16 requests at concurrency eight.
 
 | Deployment | Precision | Workload | Result |
 | --- | --- | --- | --- |
@@ -164,7 +179,7 @@ These use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4
 | DP8 + text TP8 | `quality` | 5 s, 1000 tokens, concurrency 8 | 0.1519 videos/s, 52.231 ± 0.358 s, 90,329 MiB peak per GPU |
 | DP8 + text TP8 | FP8 MLPs | 5 s, 1000 tokens, concurrency 8 | 0.1676 videos/s, 47.314 ± 0.386 s, 81,531 MiB peak per GPU |
 
-Each row is one point: a request of the stated length (`num_frames` 124, 243 or 362 for 5, 10 or 15 s) and prompt (`prompt_tokens` 1000 or 10000), three measured after one warmup at concurrency one, and 16 after eight at concurrency eight for the DP8 rows. The deployments state `--max-model-len 10240 --set 'video_config.text_capacities=[1024]' --set video_config.max_seconds=15 --max-running-requests 2` (the Ulysses8 and Gather8 rows) or `--max-model-len 1024 --set video_config.max_seconds=5` with 2 running for `ulysses4` and 8 for the DP8 deployment `fasth3-dp8-text-tp8`; the `quality` rows state `--set 'quantization.mode="quality"'` and the FP8 rows `--set 'quantization={ modules = { mlp = "fp8" } }'`. Every H200 server runs with `CUDA_VISIBLE_DEVICES` naming its GPUs, `OMP_NUM_THREADS=1`, `MAX_JOBS=8` and `NCCL_CUMEM_HOST_ENABLE=1`:
+Each row is one point: a request of the stated length (`num_frames` 124, 243 or 362 for 5, 10 or 15 s) and prompt (`prompt_tokens` 1000 or 10000), three measured after one warmup at concurrency one, and 16 after eight at concurrency eight for the DP8 rows. The deployments state `max_model_len = 10240`, `video_config.text_capacities = [1024]`, `video_config.max_seconds = 15` and `max_running_requests = 2` (the Ulysses8 and Gather8 rows) or `max_model_len = 1024` and `video_config.max_seconds = 5` with 2 running for `ulysses4` and 8 for the DP8 deployment `fasth3-dp8-text-tp8`; the `quality` rows state `quantization.mode = "quality"` and the FP8 rows `quantization = { modules = { mlp = "fp8" } }`. Every H200 server runs with `CUDA_VISIBLE_DEVICES` naming its GPUs, `OMP_NUM_THREADS=1`, `MAX_JOBS=8` and `NCCL_CUMEM_HOST_ENABLE=1`:
 
 ```bash
 H200=(CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=1 MAX_JOBS=8 NCCL_CUMEM_HOST_ENABLE=1)
@@ -188,10 +203,9 @@ EOF
 }
 
 {
-  server h200-ulysses8 "${H200[@]}" -- "$UNISERVE" serve --model-dir $BF16 --served-model-name FastH3 \
-    --config $PWD/configs/minimax_h3/ulysses8.toml --host 127.0.0.1 --port 18083 --max-model-len 10240 \
-    --set 'video_config.text_capacities=[1024]' --set video_config.max_seconds=15 --max-running-requests 2 \
-    --mem-fraction-static 0.92 --set 'quantization.mode="quality"'
+  server h200-ulysses8 "${H200[@]}" -- "$UNISERVE" serve "$(package h200-ulysses8 $BF16 FastH3 ulysses8 \
+    'max_model_len = 10240' 'video_config.text_capacities = [1024]' 'video_config.max_seconds = 15' \
+    'max_running_requests = 2' 'mem_fraction_static = 0.92' 'quantization.mode = "quality"')"
   points=
   for frames in 124:5s 243:10s 362:15s; do
     for tokens in 1000:1k 10000:10k; do
@@ -208,15 +222,15 @@ The other rows compose the same way: `ulysses4` on `CUDA_VISIBLE_DEVICES=0,1,2,3
 
 ## RTX PRO 6000
 
-Three deployments run the throughput points of the [FastH3 post](#fasth3-post) on one host with eight RTX PRO 6000 Blackwell Server Edition GPUs: six unmeasured warmups, the priming requests of the concurrency, then the 32 throughput requests, at concurrency 8, and 16 on the TP8 text encoders. Each serves eight one-GPU denoiser replicas, which keep every denoiser collective off PCIe: the NVFP4 checkpoint beside one TP8 text encoder (`fasth3-dp8-text-tp8.toml`) or two TP4 text encoders, one per four-GPU half (`fasth3-dp8-text-tp4x2.toml`), and the BF16 checkpoint with each replica's layer projections in host storage (`fasth3-dp8-text-tp8-host-weights.toml`). A one-GPU replica holds a whole 15-second sequence, so the DP8 servers bound prompts at 10240 tokens (the workload's longest is 10000) and prepare only the 16:9 canvas. Collectives use NCCL's default transport: on a host whose GPUs share no PCIe switch, `NCCL_P2P_LEVEL=SYS` makes NCCL use PCIe peer-to-peer between them where its default connects them through host storage, which lowers its all-to-all and all-reduce bandwidth.
+Three deployments run the throughput points of the [FastH3 post](#fasth3-post) on one host with eight RTX PRO 6000 Blackwell Server Edition GPUs: six unmeasured warmups, the priming requests of the concurrency, then the 32 throughput requests, at concurrency 8, and 16 on the TP8 text encoders. Each serves eight one-GPU denoiser replicas, which keep every denoiser collective off PCIe: the NVFP4 checkpoint beside one TP8 text encoder (`fasth3-dp8-text-tp8`) or two TP4 text encoders, one per four-GPU half (`fasth3-dp8-text-tp4x2`), and the BF16 checkpoint with each replica's layer projections in host storage (`fasth3-dp8-text-tp8-host-weights`). A one-GPU replica holds a whole 15-second sequence, so the DP8 servers bound prompts at 10240 tokens (the workload's longest is 10000) and prepare only the 16:9 canvas. Collectives use NCCL's default transport: on a host whose GPUs share no PCIe switch, `NCCL_P2P_LEVEL=SYS` makes NCCL use PCIe peer-to-peer between them where its default connects them through host storage, which lowers its all-to-all and all-reduce bandwidth.
 
-They state `--max-running-requests 8 --max-model-len 10240 --set video_config.max_seconds=15 --set 'dtype="bfloat16"' --mem-fraction-static 0.92 --set 'video_config.text_capacities=[1024]' --set 'video_config.sizes=["1344x768"]'`, the BF16 checkpoint adding `--set 'quantization.mode="quality"'`, and each measures its throughput points at concurrency 8 and, beside a TP8 text encoder, 16:
+They state `max_running_requests = 8`, `max_model_len = 10240`, `video_config.max_seconds = 15`, `dtype = "bfloat16"`, `mem_fraction_static = 0.92`, `video_config.text_capacities = [1024]` and `video_config.sizes = ["1344x768"]`, the BF16 checkpoint adding `quantization.mode = "quality"`, and each measures its throughput points at concurrency 8 and, beside a TP8 text encoder, 16:
 
 ```bash
 {
-  uniserve rtx-pro-6000-8-dp8-nvfp4 $NVFP4 FastH3 fasth3-dp8-text-tp8 --max-running-requests 8 --max-model-len 10240 \
-    --set video_config.max_seconds=15 --set 'dtype="bfloat16"' --mem-fraction-static 0.92 \
-    --set 'video_config.text_capacities=[1024]' --set 'video_config.sizes=["1344x768"]'
+  uniserve rtx-pro-6000-8-dp8-nvfp4 $NVFP4 FastH3 fasth3-dp8-text-tp8 'max_running_requests = 8' 'max_model_len = 10240' \
+    'video_config.max_seconds = 15' 'dtype = "bfloat16"' 'mem_fraction_static = 0.92' \
+    'video_config.text_capacities = [1024]' 'video_config.sizes = ["1344x768"]'
   for c in 8 16; do
     video rtx-pro-6000-8-dp8-nvfp4-throughput-c$c rtx-pro-6000-8-dp8-nvfp4 FastH3 fasth3-throughput 32 \
       load.max_concurrency=$c load.request_timeout_s=21600 "load.priming_manifest=\"$E/workloads/fasth3-priming-c$c.jsonl\""
@@ -228,7 +242,7 @@ $EVAL run --config artifacts/minimax_h3/fasth3-rtx-pro-6000-8-dp8-nvfp4.toml rtx
 
 The two-TP4 deployment (`fasth3-dp8-text-tp4x2`) measures concurrency 8 only; the BF16 deployment (`fasth3-dp8-text-tp8-host-weights`) measures 8 and 16.
 
-Twelve cells of the OmniRef reference matrix, the `image`, `image-voice`, `video` and `mixed` compositions at 5, 10 and 15 seconds, run on one Ulysses8 reference replica (`ulysses8-reference.toml`) with the capacities, sizing and seeds of the [OmniRef matrix on H200](#omniref-on-h200) and graphs off; SM120 evaluates each 128-row sparse-attention tile as two tiles of its 64-row kernel. A smoke slice runs five of those cells: the four compositions at 5 s and `image` at 15 s.
+Twelve cells of the OmniRef reference matrix, the `image`, `image-voice`, `video` and `mixed` compositions at 5, 10 and 15 seconds, run on one Ulysses8 reference replica (`ulysses8-reference`) with the capacities, sizing and seeds of the [OmniRef matrix on H200](#omniref-on-h200) and graphs off; SM120 evaluates each 128-row sparse-attention tile as two tiles of its 64-row kernel. A smoke slice runs five of those cells: the four compositions at 5 s and `image` at 15 s.
 
 No measurement of these configurations is recorded.
 
@@ -246,14 +260,14 @@ These workloads run on UniServe, SGLang, vLLM-Omni and FastVideo:
 
 Every output is 24 fps with a stereo 32-kHz soundtrack. A point states the output's `size`, `fps`, `audio_sample_rate` and `audio_channels` in its `video` table, and each manifest row states its `num_frames`, which must be a count the model generates; UniServe receives exactly that shape in its `/v1/videos` body and derives the task from the row's `input_references`. A baseline point also states the requested target its native MiniMax-H3 form names: SGLang and vLLM-Omni an `aspect_ratio` (`16:9`, or `auto` where the canvas follows the keyframe or the default) and a `duration_seconds` (5, 8 or 15) that resolve to the stated shape, FastVideo the `duration_seconds`.
 
-Each point sends one unmeasured warmup at seed 42, then its measured requests one at a time: 8 for W1, W3, W4 and W5 and 4 for W2. A referenced workload's point states the inputs directory as `video.reference_root`, and its UniServe server reads media from it (`--set media_config.directory="$INPUTS"`). Reference media decode through the FFmpeg 8.1 libraries the `uniserve` executable links. The UniServe deployments of MiniMax-H3 (`/workspace/models/MiniMax-H3`) and of FastH3 OmniRef (`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`, with the base revision it pins in the Hugging Face cache) are:
+Each point sends one unmeasured warmup at seed 42, then its measured requests one at a time: 8 for W1, W3, W4 and W5 and 4 for W2. A referenced workload's point states the inputs directory as `video.reference_root`, and its UniServe server reads media from it (`media_config.directory`). Reference media decode through the FFmpeg 8.1 libraries the `uniserve` executable links. The UniServe deployments of MiniMax-H3 (`/workspace/models/MiniMax-H3`) and of FastH3 OmniRef (`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`, with the base revision it pins in the Hugging Face cache) are:
 
-| Server | Checkpoint | Deployment file | Options beyond `--max-running-requests 2 --mem-fraction-static 0.70 --set 'dtype="bfloat16"' --set 'quantization.mode="quality"'` | Workloads |
+| Server | Checkpoint | Layout | Options beyond `max_running_requests = 2`, `mem_fraction_static = 0.70`, `dtype = "bfloat16"` and `quantization.mode = "quality"` | Workloads |
 | --- | --- | --- | --- | --- |
-| `gb200-4` | MiniMax-H3 | `ulysses4` | `--max-model-len 1024 --set 'video_config.text_capacities=[1024]' --set video_config.max_seconds=15` | W1, W2 |
-| `gb200-4-keyframe` | MiniMax-H3 | `ulysses4` | `--max-model-len 2048 --set 'video_config.text_capacities=[2048]' --set video_config.max_seconds=8`, the media directory | W3 |
-| `gb200-4-reference` | MiniMax-H3 | `ulysses4-reference` | `--max-model-len 8192 --set 'video_config.text_capacities=[8192]' --set video_config.max_seconds=5 --set video_config.max_condition_rows=40960 --set mm_processor_kwargs.enlarge_references=true`, the media directory | W4, W5 |
-| `gb200-4-omniref` | FastH3 OmniRef | `ulysses4-reference` | as `gb200-4-reference`, with `--set video_config.max_condition_rows=49152` | W4, W5 |
+| `gb200-4` | MiniMax-H3 | `ulysses4` | `max_model_len = 1024`, `video_config.text_capacities = [1024]`, `video_config.max_seconds = 15` | W1, W2 |
+| `gb200-4-keyframe` | MiniMax-H3 | `ulysses4` | `max_model_len = 2048`, `video_config.text_capacities = [2048]`, `video_config.max_seconds = 8`, the media directory | W3 |
+| `gb200-4-reference` | MiniMax-H3 | `ulysses4-reference` | `max_model_len = 8192`, `video_config.text_capacities = [8192]`, `video_config.max_seconds = 5`, `video_config.max_condition_rows = 40960`, `mm_processor_kwargs.enlarge_references = true`, the media directory | W4, W5 |
+| `gb200-4-omniref` | FastH3 OmniRef | `ulysses4-reference` | as `gb200-4-reference`, with `video_config.max_condition_rows = 49152` | W4, W5 |
 | `gb200-8` | MiniMax-H3 | `ulysses8-two-host` | as `gb200-4`, on two hosts | W1, W2 |
 | `gb200-8-keyframe` | MiniMax-H3 | `ulysses8-two-host` | as `gb200-4-keyframe`, on two hosts | W3 |
 
@@ -262,10 +276,10 @@ The reference servers enlarge references to their encoding size (`enlarge_refere
 ```bash
 H3=/workspace/models/MiniMax-H3
 {
-  uniserve gb200-4-keyframe $H3 MiniMax-H3 ulysses4 --max-running-requests 2 --max-model-len 2048 \
-    --set 'video_config.text_capacities=[2048]' --set video_config.max_seconds=8 \
-    --set "media_config.directory=\"$INPUTS\"" --mem-fraction-static 0.70 --set 'dtype="bfloat16"' \
-    --set 'quantization.mode="quality"'
+  uniserve gb200-4-keyframe $H3 MiniMax-H3 ulysses4 'max_running_requests = 2' 'max_model_len = 2048' \
+    'video_config.text_capacities = [2048]' 'video_config.max_seconds = 8' \
+    "media_config.directory = \"$INPUTS\"" 'mem_fraction_static = 0.70' 'dtype = "bfloat16"' \
+    'quantization.mode = "quality"'
   video gb200-4-w3 gb200-4-keyframe MiniMax-H3 w3 8 "video.reference_root=\"$INPUTS\""
 } > artifacts/minimax_h3/w3-gb200-4.toml
 $EVAL plan --config artifacts/minimax_h3/w3-gb200-4.toml gb200-4-w3
@@ -280,7 +294,7 @@ A baseline point names its engine's request form in `video.backend` and states t
 | vLLM-Omni | `$VLLM_OMNI/bin/vllm serve --model-dir $H3/FL2VA` (W1–W3) or `$H3/Ref2VA` with `--text-encoder-tp-size 4` (W4, W5) `--omni --served-model-name MiniMax-H3 --host 127.0.0.1 --port 18083 --trust-remote-code --task-type fl2va` or `ref2va` `--num-gpus 4 --usp 4 --ring 1 --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling --cache-backend none`, with `PATH=$VLLM_OMNI/bin:$PATH`, `LD_LIBRARY_PATH=$VLLM_OMNI/opt/x11-lib`, `VLLM_WORKER_MULTIPROC_METHOD=spawn` and `VLLM_OMNI_VIDEO_SYNC_TIMEOUT=3600` | `video.backend="vllm-omni"`, `video.num_inference_steps=50`, `video.flow_shift=12.0`, `video.audio_flow_shift=3.0` |
 | FastVideo | `$FASTVIDEO/bin/fastvideo serve --config $E/fastvideo-omniref.yaml --generator.model_path $FASTVIDEO_OMNIREF --server.output_dir $SCRATCH/fastvideo-minimax-h3/outputs`, with `PATH=$FASTVIDEO/bin:$PATH` and `HF_HUB_OFFLINE=1` (W4, W5) | `video.backend="fastvideo"`, `video.num_inference_steps=9`, `video.parallel_decoding=true` |
 
-Each baseline point also states `video.duration_seconds`: 5 for W1, W4 and W5, 15 for W2 and 8 for W3; SGLang and vLLM-Omni also `video.aspect_ratio`, `"16:9"` for W1 and W2 and `"auto"` for W3, W4 and W5. The two-host SGLang server serves W1–W3 with `--num-gpus 8 --sp-degree 8 --ulysses-degree 4 --ring-degree 2 --nnodes 2 --node-rank 0 --dist-init-addr $HEAD:20000 --encoder-parallel replicate`, where `HEAD` is `rank-0`'s address; start SGLang's node rank 1 on `rank-1`. `SCRATCH` is the directory the SGLang and FastVideo servers write their inputs and outputs under, one both hosts mount for a two-host server.
+Each baseline point also states `video.duration_seconds`: 5 for W1, W4 and W5, 15 for W2 and 8 for W3; SGLang and vLLM-Omni also `video.aspect_ratio`, `"16:9"` for W1 and W2 and `"auto"` for W3, W4 and W5. The two-host SGLang server serves W1–W3 with `--num-gpus 8 --sp-degree 8 --ulysses-degree 4 --ring-degree 2 --nnodes 2 --node-rank 0 --dist-init-addr $HEAD:20000 --encoder-parallel replicate`, where `HEAD` is the first host's address; start SGLang's node rank 1 on the second host. `SCRATCH` is the directory the SGLang and FastVideo servers write their inputs and outputs under, one both hosts mount for a two-host server.
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host rank layout.
 
@@ -304,16 +318,16 @@ A request's packed sequence is its prompt, which carries every visual reference'
 
 The matrix runs under both reference sizings (`enlarge_references` of `mm_processor_kwargs`). The default sizing: a reference keeps its own size unless it exceeds its encoding size. Every image of the matrix has a short edge below 2048 pixels, so each is as many prompt tokens and condition rows as its own 32-pixel patches, 3,600 for the 2560×1440 subject and 576 to 2,025 for a square, and every reference video is larger than its canvas and scales down to it; the largest cell, `ref-full-15s`, packs 189,830 rows. The enlarged sizing enlarges each image to its 2048-pixel short edge, 7,296 prompt tokens and condition rows at 16:9 and 4,096 when square, as the released pipeline and SGLang do; its largest cell packs 236,294 rows.
 
-A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2, each allowed two hours. One deployment, a Ulysses8 replica across two four-GB200 hosts (`ulysses8-reference-two-host.toml`), serves every cell of a sizing, with a text capacity for each cell's prompt and the condition rows of `full`: `--set video_config.max_seconds=15 --max-model-len 24576 --set 'video_config.text_capacities=[4096, 7168, 8192, 9216, 10240, 12288, 15360]' --set video_config.max_condition_rows=56192` by default, and `--max-model-len 48128 --set 'video_config.text_capacities=[4096, 7168, 8192, 10240, 14336, 15360, 22528, 37888]' --set video_config.max_condition_rows=79104 --set mm_processor_kwargs.enlarge_references=true` for the enlarged sizing.
+A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2, each allowed two hours. One deployment, a Ulysses8 replica across two four-GB200 hosts (`ulysses8-reference-two-host`), serves every cell of a sizing, with a text capacity for each cell's prompt and the condition rows of `full`: `video_config.max_seconds = 15`, `max_model_len = 24576`, `video_config.text_capacities = [4096, 7168, 8192, 9216, 10240, 12288, 15360]` and `video_config.max_condition_rows = 56192` by default, and `max_model_len = 48128`, `video_config.text_capacities = [4096, 7168, 8192, 10240, 14336, 15360, 22528, 37888]`, `video_config.max_condition_rows = 79104` and `mm_processor_kwargs.enlarge_references = true` for the enlarged sizing.
 
 ```bash
 OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Step-V1
 {
-  uniserve gb200-8-omniref-refs $OMNIREF MiniMax-H3 ulysses8-reference-two-host --max-running-requests 2 \
-    --max-model-len 24576 --set 'video_config.text_capacities=[4096, 7168, 8192, 9216, 10240, 12288, 15360]' \
-    --set video_config.max_seconds=15 --set video_config.max_condition_rows=56192 \
-    --set "media_config.directory=\"$INPUTS\"" --mem-fraction-static 0.70 --set 'dtype="bfloat16"' "${TWO_HOST[@]}" \
-    --set 'quantization.mode="quality"'
+  uniserve gb200-8-omniref-refs $OMNIREF MiniMax-H3 ulysses8-reference-two-host 'max_running_requests = 2' \
+    'max_model_len = 24576' 'video_config.text_capacities = [4096, 7168, 8192, 9216, 10240, 12288, 15360]' \
+    'video_config.max_seconds = 15' 'video_config.max_condition_rows = 56192' \
+    "media_config.directory = \"$INPUTS\"" 'mem_fraction_static = 0.70' 'dtype = "bfloat16"' "${TWO_HOST[@]}" \
+    'quantization.mode = "quality"'
   points=
   for seconds in 5 10 15; do
     for composition in image image-voice images3 images9 clip video clips3 mixed full; do
@@ -327,11 +341,11 @@ OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Step-V1
 $EVAL run --config artifacts/minimax_h3/omniref-gb200-8.toml gb200-8-omniref-refs --reuse-deployment --output-root artifacts/minimax_h3/omniref
 ```
 
-SGLang's two-host reference server (`--model-variant ref2va` with the two-host options of [MiniMax-H3 workloads](#minimax-h3-workloads)) measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup, with `video.aspect_ratio="16:9"` and the cell's `video.duration_seconds`; start SGLang's node rank 1 on `rank-1`. SGLang enlarges every reference image, so its results compare with the enlarged suite.
+SGLang's two-host reference server (`--model-variant ref2va` with the two-host options of [MiniMax-H3 workloads](#minimax-h3-workloads)) measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup, with `video.aspect_ratio="16:9"` and the cell's `video.duration_seconds`; start SGLang's node rank 1 on the second host. SGLang enlarges every reference image, so its results compare with the enlarged suite.
 
 ## OmniRef on H200
 
-FastH3 OmniRef runs on H200 with the SM90 kernel of its 128-row sparse-attention tiles. The reference matrix runs on one eight-H200 host as one Ulysses8 replica (`ulysses8-reference.toml`) under both sizings, with the capacities, warmups and seeds of the [GB200 matrix](#omniref-reference-compositions), `--mem-fraction-static 0.92` and `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`, without the two-host options. No measurement of these points is recorded.
+FastH3 OmniRef runs on H200 with the SM90 kernel of its 128-row sparse-attention tiles. The reference matrix runs on one eight-H200 host as one Ulysses8 replica (`ulysses8-reference`) under both sizings, with the capacities, warmups and seeds of the [GB200 matrix](#omniref-reference-compositions), `mem_fraction_static = 0.92` and `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`, without the two-host options. No measurement of these points is recorded.
 
 ## Fixed check set
 
@@ -354,11 +368,11 @@ The reversed order runs the reference cell last, each cell writing its MP4 under
 
 The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (size, frame count, frame rate and stereo 32-kHz soundtrack against the stated shape, and the shape the server reports generating, which the `video` task validates) and the performance metrics each point protects, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
 
-The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` for the two transformer partitions and `configs/minimax_h3/ulysses4-reference.toml` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. Each point states `video.media_dir`, its cell's fixed MP4 directory, and `provenance`, the checkpoint (`FastVideo/FastVideo-FastH3-8-Step-V2`, `FastVideo/FastVideo-FastH3-Omni-8-Step-V1` or `MiniMaxAI/MiniMax-H3`) and the task:
+The four servers place four GPUs each, with the layout of `configs/minimax_h3/ulysses4` for the two transformer partitions and that of `configs/minimax_h3/ulysses4-reference` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. Each point states `video.media_dir`, its cell's fixed MP4 directory, and `provenance`, the checkpoint (`FastVideo/FastVideo-FastH3-8-Step-V2`, `FastVideo/FastVideo-FastH3-Omni-8-Step-V1` or `MiniMaxAI/MiniMax-H3`) and the task:
 
 ```bash
-TRANSFORMER=(--max-running-requests 2 --max-model-len 2048 --set 'video_config.text_capacities=[1024, 2048]' --set video_config.max_seconds=8 --set "media_config.directory=\"$INPUTS\"" --mem-fraction-static 0.70)
-REFERENCE=(--max-running-requests 2 --max-model-len 8192 --set 'video_config.text_capacities=[8192]' --set video_config.max_seconds=5 --set "media_config.directory=\"$INPUTS\"" --mem-fraction-static 0.70 --set mm_processor_kwargs.enlarge_references=true)
+TRANSFORMER=('max_running_requests = 2' 'max_model_len = 2048' 'video_config.text_capacities = [1024, 2048]' 'video_config.max_seconds = 8' "media_config.directory = \"$INPUTS\"" 'mem_fraction_static = 0.70')
+REFERENCE=('max_running_requests = 2' 'max_model_len = 8192' 'video_config.text_capacities = [8192]' 'video_config.max_seconds = 5' "media_config.directory = \"$INPUTS\"" 'mem_fraction_static = 0.70' 'mm_processor_kwargs.enlarge_references = true')
 
 # check ORDER SERVER CHECKPOINT TASK: the cell of CHECKPOINT's TASK on SERVER, writing its MP4 under
 # artifacts/minimax_h3/ORDER.
@@ -372,9 +386,9 @@ check() {
 
 {
   uniserve fasth3-dmd $BF16 FastH3 ulysses4 "${TRANSFORMER[@]}"
-  uniserve fasth3-omniref $OMNIREF MiniMax-H3 ulysses4-reference "${REFERENCE[@]}" --set video_config.max_condition_rows=49152
+  uniserve fasth3-omniref $OMNIREF MiniMax-H3 ulysses4-reference "${REFERENCE[@]}" 'video_config.max_condition_rows = 49152'
   uniserve base-transformer $H3 MiniMax-H3 ulysses4 "${TRANSFORMER[@]}"
-  uniserve base-reference $H3 MiniMax-H3 ulysses4-reference "${REFERENCE[@]}" --set video_config.max_condition_rows=40960
+  uniserve base-reference $H3 MiniMax-H3 ulysses4-reference "${REFERENCE[@]}" 'video_config.max_condition_rows = 40960'
   for order in check check-reversed; do
     [ $order = check ] && check $order base-reference MiniMaxAI/MiniMax-H3 ref2va
     check $order fasth3-dmd FastVideo/FastVideo-FastH3-8-Step-V2 t2va

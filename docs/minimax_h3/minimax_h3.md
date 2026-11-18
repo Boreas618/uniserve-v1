@@ -19,7 +19,7 @@ apt-get install -y build-essential python3.12-dev pkg-config cmake git curl ca-c
 rustup toolchain install
 ```
 
-`rustup toolchain install` installs the Rust release `rust-toolchain.toml` pins. `uv run uniserve serve ... --source .` from the repository root builds the `uniserve` executable the first time and serves. The host's Build Server, which the daemon starts, creates its own environment from the source tree with uv, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4), and installs the tree's packages. It compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the CUDA toolkit NVIDIA's packages register with pkg-config.
+`rustup toolchain install` installs the Rust release `rust-toolchain.toml` pins. `uv run uniserve serve PACKAGE` from the repository root builds the `uniserve` executable the first time and serves the package, whose `build_config = { source = "." }` names the repository as the source tree of the host's Build Server. The host's Build Server, which the daemon starts, creates its own environment from the source tree with uv, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4), and installs the tree's packages. It compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the CUDA toolkit NVIDIA's packages register with pkg-config.
 
 ## Checkpoints
 
@@ -42,7 +42,7 @@ An OmniRef export holds only its DiT partition and schedulers, and its contract 
 
 The [FastH3 Preview v1 adapters](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA) (`dense-datafree`, `vsa-datafree`) are FastVideo's four-step DMD students of the base release's `transformer`, stored as edits of the base checkpoint in FastVideo's `fastvideo-lora-v2` container: rank-64 `lora_A`/`lora_B` factors of the attention, feed-forward and modulation projections, full-rank `.diff`/`.diff_b` deltas of the patch, condition and time embeddings, the norms, the biases and the final layer, and, in the VSA variant, the layers' sparse-attention compression gates as `.set_weight` tensors the base does not hold.
 
-A deployment ships an adapter as one directory that holds the container as `adapter_model.safetensors` and, beside it, the contract of the student the adapter is, `fastvideo_inference.json`, which states the partition the adapter edits (its task), its schedule and its attention backend. The adapter release publishes no contract of its own, so the deployment copies the contract its student's export publishes: `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`'s for `vsa-datafree` (four DMD rungs, `[999, 749, 500, 250]`, with `VIDEO_SPARSE_ATTN_H3` at 64-row tiles and 0.9 sparsity), and the same contract with `"attention_backend": "DENSE"` for `dense-datafree`. Serve the adapter over the base release with `--lora`, naming a repository folder that holds both files, or with `--lora-dir`, naming that directory:
+A deployment ships an adapter as one directory that holds the container as `adapter_model.safetensors` and, beside it, the contract of the student the adapter is, `fastvideo_inference.json`, which states the partition the adapter edits (its task), its schedule and its attention backend. The adapter release publishes no contract of its own, so the deployment copies the contract its student's export publishes: `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`'s for `vsa-datafree` (four DMD rungs, `[999, 749, 500, 250]`, with `VIDEO_SPARSE_ATTN_H3` at 64-row tiles and 0.9 sparsity), and the same contract with `"attention_backend": "DENSE"` for `dense-datafree`. Serve the adapter over the base release with `lora`, naming a repository folder that holds both files, or with `lora_dir`, naming that directory:
 
 ```bash
 # The adapter's container, and beside it the contract of its student.
@@ -50,12 +50,20 @@ hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
   vsa-datafree/adapter_model.safetensors --local-dir fasth3-adapter
 hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
   fastvideo_inference.json --local-dir fasth3-adapter/vsa-datafree
-uniserve serve MiniMaxAI/MiniMax-H3 --source . --lora-dir fasth3-adapter/vsa-datafree \
-  --config configs/minimax_h3/ulysses4.toml --served-model-name FastH3 \
-  --host 0.0.0.0 --port 8000 --max-running-requests 2
+# The package: the ulysses4 layout serving the base release with the adapter.
+mkdir fasth3-vsa && cat > fasth3-vsa/config.toml <<'TOML'
+model = "MiniMaxAI/MiniMax-H3"
+lora_dir = "fasth3-adapter/vsa-datafree"
+served_model_name = "FastH3"
+max_running_requests = 2
+admin_config = { host = "0.0.0.0", port = 8000 }
+build_config = { source = "." }
+TOML
+sed -n '/^\[\[worker_groups\]\]/,$p' configs/minimax_h3/ulysses4/config.toml >> fasth3-vsa/config.toml
+uniserve serve fasth3-vsa
 ```
 
-The adapter is fused into the partition its contract names once, as each rank loads its weights: every element of an edited parameter is `(lora_B @ lora_A + diff) + base`, evaluated in FP32 and rounded once to the base tensor's element type, the container's own reconstruction with no `alpha` (a scale of one), and a parameter the adapter does not edit is read unchanged. The deployment then serves that student for every request, as its full export would: the contract's tasks from the partition it names, on the contract's schedule at the base schedulers' shifts, with the contract's attention. A request cannot select or drop the adapter; another adapter is another deployment, and changing `lora` or `lora_dir` with `PUT /admin/config` starts a new epoch. An adapter is refused at startup when its directory holds no `adapter_model.safetensors` or no contract, when its metadata states another container or other tensor counts or another rank than it carries, when it edits a tensor the partition does not hold, with other extents, or assigns one it does, or when the checkpoint is a FastH3 export rather than the base release.
+The adapter is fused into the partition its contract names once, as each rank loads its weights: every element of an edited parameter is `(lora_B @ lora_A + diff) + base`, evaluated in FP32 and rounded once to the base tensor's element type, the container's own reconstruction with no `alpha` (a scale of one), and a parameter the adapter does not edit is read unchanged. The deployment then serves that student for every request, as its full export would: the contract's tasks from the partition it names, on the contract's schedule at the base schedulers' shifts, with the contract's attention. A request cannot select or drop the adapter; another adapter is another deployment, and changing `lora` or `lora_dir` with `PUT /admin/policy` starts a new epoch. An adapter is refused at startup when its directory holds no `adapter_model.safetensors` or no contract, when its metadata states another container or other tensor counts or another rank than it carries, when it edits a tensor the partition does not hold, with other extents, or assigns one it does, or when the checkpoint is a FastH3 export rather than the base release.
 
 A server names its checkpoint by Hugging Face repository, `<owner>/<name>[@<revision>][/<folder>]` (a revision pins a branch, tag or commit; the default branch otherwise), and reads it from the standard Hugging Face cache, downloading the files its pipeline index declares that the cache lacks; an OmniRef export's server resolves the base revision its contract pins the same way. A host without network access fills the cache beforehand and sets `HF_HUB_OFFLINE`:
 
@@ -69,51 +77,59 @@ hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> \
   --include 'vae/*' --include 'audio_vae/*'
 ```
 
-`--model-dir` serves a local checkpoint directory instead, read in place.
+`model_dir` in place of `model` serves a local checkpoint directory, read in place.
 
 ## Start the server
 
-FastH3 text-to-video and keyframe requests:
+A server serves a policy package (`docs/configuration.md`, Policy package): a directory whose `config.toml` states the checkpoint, the server's options and the layout. The packages of `configs/minimax_h3` state a checkpoint and a layout each; a deployment copies one into a directory of its own, which names the deployment, and states its options above the layout's `[[worker_groups]]` tables. FastH3 text-to-video and keyframe requests:
 
 ```bash
-uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --source . \
-  --config configs/minimax_h3/ulysses4.toml \
-  --served-model-name FastH3 \
-  --host 0.0.0.0 --port 8000 \
-  --max-running-requests 2 \
-  --max-model-len 2048
+mkdir fasth3 && cat > fasth3/config.toml <<'TOML'
+model = "FastVideo/FastVideo-FastH3-8-Step-V2"
+served_model_name = "FastH3"
+max_running_requests = 2
+max_model_len = 2048
+admin_config = { host = "0.0.0.0", port = 8000 }
+build_config = { source = "." }
+TOML
+sed -n '/^\[\[worker_groups\]\]/,$p' configs/minimax_h3/ulysses4/config.toml >> fasth3/config.toml
+uniserve serve fasth3
 ```
 
-Base text-to-video and keyframe requests:
+Base text-to-video and keyframe requests, with the `ulysses4` layout:
 
-```bash
-uniserve serve MiniMaxAI/MiniMax-H3 --source . \
-  --config configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
-  --host 0.0.0.0 --port 8000 --set video_config.max_seconds=8 --max-model-len 2048 \
-  --set 'video_config.text_capacities=[2048]'
+```toml
+model = "MiniMaxAI/MiniMax-H3"
+served_model_name = "MiniMax-H3"
+max_model_len = 2048
+admin_config = { host = "0.0.0.0", port = 8000 }
+build_config = { source = "." }
+video_config = { max_seconds = 8, text_capacities = [2048] }
 ```
 
-Reference requests, with the base reference denoiser or an OmniRef export:
+Reference requests, with the base reference denoiser or an OmniRef export, and the `ulysses4-reference` layout:
 
-```bash
-uniserve serve MiniMaxAI/MiniMax-H3 --source . \
-  --config configs/minimax_h3/ulysses4-reference.toml \
-  --served-model-name MiniMax-H3 --host 0.0.0.0 --port 8000 \
-  --set video_config.max_seconds=5 --max-model-len 8192 \
-  --set 'video_config.text_capacities=[8192]' \
-  --set video_config.max_condition_rows=40960 \
-  --set 'media_config.directory="/srv/media"'
-
-uniserve serve FastVideo/FastVideo-FastH3-Omni-8-Step-V1 --source . \
-  --config configs/minimax_h3/ulysses4-reference.toml \
-  --served-model-name MiniMax-H3-OmniRef --host 0.0.0.0 --port 8000 \
-  --set video_config.max_seconds=5 --max-model-len 8192 \
-  --set 'video_config.text_capacities=[8192]' \
-  --set video_config.max_condition_rows=49152 \
-  --set 'media_config.directory="/srv/media"'
+```toml
+model = "MiniMaxAI/MiniMax-H3"
+served_model_name = "MiniMax-H3"
+max_model_len = 8192
+admin_config = { host = "0.0.0.0", port = 8000 }
+build_config = { source = "." }
+video_config = { max_seconds = 5, text_capacities = [8192], max_condition_rows = 40960 }
+media_config = { directory = "/srv/media" }
 ```
 
-The options can also be kept in a TOML file passed with `--config` ([Configuration](../configuration.md#configuration-file)). A deployment file places each block on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and the H.264 encoders, the muxer and the media reader, which decodes condition media. The media blocks run on the host inside the main process, which serves CUDA devices only, so a deployment places them on CUDA ranks; a rank on `cpu` is refused when the node is launched. The media reader runs on a GPU rank: its decoded pixels lie in that GPU's storage, which the condition encoders of the same host read there and those of another host read once the hosts' Storage Servers copied them to it ([Two hosts](#two-hosts)). Check a running server with:
+```toml
+model = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
+served_model_name = "MiniMax-H3-OmniRef"
+max_model_len = 8192
+admin_config = { host = "0.0.0.0", port = 8000 }
+build_config = { source = "." }
+video_config = { max_seconds = 5, text_capacities = [8192], max_condition_rows = 49152 }
+media_config = { directory = "/srv/media" }
+```
+
+A package's `[[worker_groups]]` place each block on devices ([Configuration](../configuration.md#deployment-layout)). These four-GPU packages run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and the H.264 encoders, the muxer and the media reader, which decodes condition media. The media blocks run on the host inside the main process, which serves CUDA devices only, so a deployment places them on CUDA ranks; a rank on `cpu` is refused when the node is launched. The media reader runs on a GPU rank: its decoded pixels lie in that GPU's storage, which the condition encoders of the same host read there and those of another host read once the hosts' Storage Servers copied them to it ([Two hosts](#two-hosts)). Check a running server with:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/health
@@ -124,24 +140,24 @@ curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.too
 
 ### Deployments
 
-The deployment files are in `configs/minimax_h3/`, in the TOML format [Configuration](../configuration.md#deployment-files) describes: each `[[worker_groups]]` group lists its ranks, such as `cuda:0-3` or `rank-1/cuda:0-3`, and the blocks placed on them, and `replicas` copies a group over equal blocks of its ranks. Each file places the condition encoders and the media reader that keyframe and reference requests use; the `fasth3-` files split each GPU's storage between workers by FastH3's sizes.
+The packages are the directories of `configs/minimax_h3/`, each a `config.toml` that states the checkpoint it serves (FastH3, or the OmniRef export for the `reference` layouts) and its layout in the TOML format [Configuration](../configuration.md#deployment-layout) describes: each `[[worker_groups]]` group lists its ranks, such as `cuda:0-3` or `rank-2/cuda:0-3`, and the blocks placed on them, and `replicas` copies a group over equal blocks of its ranks. Each package places the condition encoders and the media reader that keyframe and reference requests use; the `fasth3-` packages split each GPU's storage between workers by FastH3's sizes.
 
-| File | GPUs | Denoiser | Text encoder |
+| Package | GPUs | Denoiser | Text encoder |
 | --- | --- | --- | --- |
-| `ulysses4.toml` | Four on one host | Ulysses4 | TP4 |
-| `ulysses8.toml` | Eight on one host | Ulysses8 | TP8 |
-| `ulysses8-two-host.toml` | Four on each of two hosts | Ulysses8 | TP8 |
-| `fasth3-ulysses4x2.toml` | Eight on one host | Two Ulysses4 replicas | TP4 per replica |
-| `fasth3-ulysses4x2-two-host.toml` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
-| `fasth3-dp8-text-tp8.toml` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
-| `fasth3-dp8-text-tp4x2.toml` | Eight on one host | Eight one-GPU replicas | Two TP4, one per four-GPU half |
-| `fasth3-dp8-text-tp8-host-weights.toml` | Eight on one host | Eight one-GPU replicas, layer projections in host storage | One shared TP8 |
-| `gather8.toml` | Eight on one host | Eight-way all-gather | TP8 |
-| `ulysses4-reference.toml` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
-| `ulysses8-reference.toml` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
-| `ulysses8-reference-two-host.toml` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
+| `ulysses4` | Four on one host | Ulysses4 | TP4 |
+| `ulysses8` | Eight on one host | Ulysses8 | TP8 |
+| `ulysses8-two-host` | Four on each of two hosts | Ulysses8 | TP8 |
+| `fasth3-ulysses4x2` | Eight on one host | Two Ulysses4 replicas | TP4 per replica |
+| `fasth3-ulysses4x2-two-host` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
+| `fasth3-dp8-text-tp8` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
+| `fasth3-dp8-text-tp4x2` | Eight on one host | Eight one-GPU replicas | Two TP4, one per four-GPU half |
+| `fasth3-dp8-text-tp8-host-weights` | Eight on one host | Eight one-GPU replicas, layer projections in host storage | One shared TP8 |
+| `gather8` | Eight on one host | Eight-way all-gather | TP8 |
+| `ulysses4-reference` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
+| `ulysses8-reference` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
+| `ulysses8-reference-two-host` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on the first host |
 
-A block placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights.toml` places every replica's denoiser this way, and each replica holds its own host copy. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `--max-running-requests 8 --max-model-len 10240 --set 'video_config.text_capacities=[1024]' --set 'video_config.sizes=["1344x768"]' --mem-fraction-static 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
+A block placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights` places every replica's denoiser this way, and each replica holds its own host copy. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `max_running_requests = 8`, `max_model_len = 10240`, `video_config = { text_capacities = [1024], sizes = ["1344x768"] }` and `mem_fraction_static = 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
 
 A Ulysses denoiser's `sequence_parallel` table also selects how each layer's Q/K/V/gate projection reaches every rank's heads. With `projection = "gather"`, the default, every rank all-gathers the other ranks' input rows and projects its own heads, holding the projection weights partitioned by head. With `projection = "exchange"`, every rank projects its own rows for all heads, holding the whole weights, and sends each rank that rank's heads. For FastH3 the exchange transfers two thirds of the gather's bytes with eight ranks and more than the gather with four, and every rank holds the whole Q/K/V/gate weights of the 50 layers, 14.4 GiB in BF16, instead of its share of them. `projection_rows = <rows>` makes the exchange project and send each rank's rows in steps of that many rows, each step's transfer overlapping the next step's projection; without it the exchange sends the whole shard at once. A step holds whole attention tiles: a multiple of the checkpoint's 64- or 128-row tile, so a multiple of 128 suits every FastH3 checkpoint. Every mode produces the same values and serves every precision preset. None applies to the `allgather` kind, which exchanges no heads, and the Ulysses members of a `hybrid` split gather. A denoiser that exchanges in steps:
 
@@ -150,31 +166,32 @@ A Ulysses denoiser's `sequence_parallel` table also selects how each layer's Q/K
 sequence_parallel = { kind = "ulysses", ulysses_degree = 8, projection = "exchange", projection_rows = 4096 }
 ```
 
-One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference file spreads a request's condition encoding over both hosts: its media reader runs in a one-GPU `reader` worker on `rank-0`, and while the text encoder encodes the prompt on `rank-0`'s four GPUs, the latent encoder, whose ranks list `rank-1`'s GPUs first, deals the request's condition units to the ranks the prompt leaves free, those on `rank-1` reading the decoded references once they were copied to that host ([Two hosts](#two-hosts)). The validated FastH3 settings:
+One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference package spreads a request's condition encoding over both hosts: its media reader runs in a one-GPU `reader` worker on the first host, and while the text encoder encodes the prompt on the first host's four GPUs, the latent encoder, whose ranks list the second host's GPUs first, deals the request's condition units to the ranks the prompt leaves free, those on the second host reading the decoded references once they were copied to that host ([Two hosts](#two-hosts)). The validated FastH3 settings:
 
 | Hardware | Goal | Deployment | Options |
 | --- | --- | --- | --- |
-| 4 x GB200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2` |
-| 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-host.toml` | `--max-running-requests 4` |
-| 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set 'video_config.text_capacities=[1024]'` |
-| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --mem-fraction-static 0.92 --max-model-len 10240 --set 'video_config.text_capacities=[1024]'` |
-| 4 x H200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 1024` |
-| 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set 'video_config.text_capacities=[1024]'` |
-| 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8.toml` | `--max-running-requests 8 --set video_config.max_seconds=5 --max-model-len 1024` |
+| 4 x GB200 | Latency and throughput | `ulysses4` | `max_running_requests = 2` |
+| 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-host` | `max_running_requests = 4` |
+| 8 x RTX PRO 6000 | Latency | `ulysses8` | `max_running_requests = 2`, `mem_fraction_static = 0.92`, `max_model_len = 10240`, `video_config.text_capacities = [1024]` |
+| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2` | `max_running_requests = 4`, `mem_fraction_static = 0.92`, `max_model_len = 10240`, `video_config.text_capacities = [1024]` |
+| 4 x H200 | Latency and throughput | `ulysses4` | `max_running_requests = 2`, `mem_fraction_static = 0.92`, `max_model_len = 1024` |
+| 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8` | `max_running_requests = 2`, `mem_fraction_static = 0.92`, `max_model_len = 10240`, `video_config.text_capacities = [1024]` |
+| 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8` | `max_running_requests = 8`, `video_config.max_seconds = 5`, `max_model_len = 1024` |
 
-The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`. On H200, OmniRef serves reference requests as one Ulysses8 replica on one eight-GPU host (`ulysses8-reference.toml`) with `--mem-fraction-static 0.92`, with the capacities of [OmniRef on H200](evaluation.md#omniref-on-h200).
+The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`. On H200, OmniRef serves reference requests as one Ulysses8 replica on one eight-GPU host (`ulysses8-reference`) with `mem_fraction_static = 0.92`, with the capacities of [OmniRef on H200](evaluation.md#omniref-on-h200).
 
 A deployment of several ranks needs NCCL 2.30.4 or later on the loader's default search path (NVIDIA's `libnccl2` package): the serving process opens `libnccl.so.2` by its soname and refuses an older release with an error naming it, since NCCL 2.27.7 crashes on the first replay of a graph that holds a collective.
 
 ### Two hosts
 
-The two-host files name their hosts `rank-0` and `rank-1` (a rank entry without a host runs on the leader's own). Start the leader on `rank-0` with `--host-identity rank-0 --nnodes 2 --dist-init-addr <rank-0 address>:<port>`, a port free on `rank-0`; it logs `awaiting the deployment's other nodes` and binds that port on every interface. Then start the daemon of `rank-1` with the same environment and build; it takes no model and joins the leader, and the leader starts its workers on `rank-1` once its own start completes. A worker compiled from other sources than the leader is refused at registration, naming both builds:
+The two-host packages list their hosts in `hosts`, the leader first, as `rank-1` and `rank-2`, and place the second host's ranks as `rank-2/cuda:0-3` (a rank entry without a host runs on the leader's). A deployment on other hosts states their host names (`uname -n`) in `hosts` and in its ranks. Each host resolves the leader's name. Start `uniserve serve` with the same package on both hosts, each package stating its own host's Build Server (`build_config`): the leader binds the join port (`admin_config.join`, 29700 unless stated) on every interface and logs `awaiting the deployment's other nodes`; the second host's daemon finds itself in `hosts` and joins the leader at the first host's name and that port, and the leader starts its workers on the second host once its own start completes. A worker compiled from other sources than the leader is refused at registration, naming both builds:
 
 ```bash
-uniserve serve --source . --nnodes 2 --node-rank 1 --dist-init-addr <rank-0 address>:<port> --host-identity rank-1
+# on rank-1, then on rank-2, each from a copy of the package with its own options added
+uniserve serve fasth3-two-host
 ```
 
-Each host's main process holds the products of a request its ranks write: the condition media, the conditioning, the latents, the decoded and encoded video units with their splice tails, and the track. A product its ranks on one host write and ranks on the other read is copied between the two hosts' memories by the Transfer Server of the reading host's Storage Server, over NVLink where the two hosts share a fabric and over the network otherwise, after the call that writes it and before the call that reads it; the server places each request's stages on replicas that need no copy whenever one serves the stage. `fasth3-ulysses4x2-two-host.toml` places each replica's text encoder, denoiser, decoders, codecs, muxer and media reader on one host, so its requests copy nothing between hosts. `ulysses8-two-host.toml` and `ulysses8-reference-two-host.toml` place one `model` worker across both hosts beside a `muxer` and a `reader` worker on `rank-0`: the condition media the reader decodes and the conditioning the text encoder's first rank writes on `rank-0` are copied to `rank-1` before its latent preparation, and in `ulysses8-two-host.toml` the vision pixels before its text encoding. Every rank decodes its own units of each decode round into its host's memory and keeps its latents there, a round's splice tail passes from one decoder rank to the next over the decoder ranks' communicator inside the call, each host encodes the units its own ranks decoded, and the encoded units of `rank-1` are copied to `rank-0` for the muxer. A copy that fails ends its request as migratable, and the daemon submits it again.
+Each host's main process holds the products of a request its ranks write: the condition media, the conditioning, the latents, the decoded and encoded video units with their splice tails, and the track. A product its ranks on one host write and ranks on the other read is copied between the two hosts' memories by the Transfer Server of the reading host's Storage Server, over NVLink where the two hosts share a fabric and over the network otherwise, after the call that writes it and before the call that reads it; the server places each request's stages on replicas that need no copy whenever one serves the stage. `fasth3-ulysses4x2-two-host` places each replica's text encoder, denoiser, decoders, codecs, muxer and media reader on one host, so its requests copy nothing between hosts. `ulysses8-two-host` and `ulysses8-reference-two-host` place one `model` worker across both hosts beside a `muxer` and a `reader` worker on the first host: the condition media the reader decodes and the conditioning the text encoder's first rank writes on the first host are copied to the second before its latent preparation, and in `ulysses8-two-host` the vision pixels before its text encoding. Every rank decodes its own units of each decode round into its host's memory and keeps its latents there, a round's splice tail passes from one decoder rank to the next over the decoder ranks' communicator inside the call, each host encodes the units its own ranks decoded, and the encoded units of the second host are copied to the first for the muxer. A copy that fails ends its request as migratable, and the daemon submits it again.
 
 ## Startup and capacity
 
@@ -182,17 +199,17 @@ Each host's main process holds the products of a request its ranks write: the co
 | --- | --- |
 | `video_config.max_seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. A value outside that range is refused at startup. |
 | `video_config.sizes` | The output sizes startup prepares, each `WxH` in pixels, `["1344x768", "768x1344"]` by default; the sizes are listed under [Generate a video](#generate-a-video). The workers refuse at startup a size the checkpoint does not generate, naming the sizes it does, and a request for any other size is refused. |
-| `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; required, since a pipeline keeps no key/value cache from which a length would follow. The text encoder itself accepts up to 262144 positions; the stated length bounds the prompt capacities startup prepares layouts and storage for (`video_config.text_capacities`). The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
-| `video_config.text_capacities` | Prompt capacities that startup prepares, strictly increasing and none above `--max-model-len`; `--max-model-len` itself is always the largest, and each prompt runs in the smallest capacity that holds it. By default 1024, then steps of 2048, below `--max-model-len`. |
-| `--max-running-requests` | Concurrently resident requests, up to the workers' request slots. |
+| `max_model_len` | Longest prompt presentation in tokens, vision tokens included; required, since a pipeline keeps no key/value cache from which a length would follow. The text encoder itself accepts up to 262144 positions; the stated length bounds the prompt capacities startup prepares layouts and storage for (`video_config.text_capacities`). The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
+| `video_config.text_capacities` | Prompt capacities that startup prepares, strictly increasing and none above `max_model_len`; `max_model_len` itself is always the largest, and each prompt runs in the smallest capacity that holds it. By default 1024, then steps of 2048, below `--max-model-len`. |
+| `max_running_requests` | Concurrently resident requests, up to the workers' request slots. |
 | `video_config.max_condition_rows` | Denoiser rows one request's conditions may occupy. Without it the deployment provisions the largest condition set its denoiser admits at `video_config.max_seconds`, so no request is refused for its conditions: two keyframes for keyframe generation, and for references nine images at 4:1 and three videos of the generated length with their soundtracks, beside two keyframes where the denoiser packs them. A machine that cannot hold that set fails at startup, and a deployment that serves less states the rows, as below. A request whose conditions exceed a stated capacity is refused with `invalid_request`: the server counts the conditions as the denoiser packs them and names that total and `video_config.max_condition_rows`, and admission names a condition product that exceeds its own bound and the rows it needs. |
 | `media_config.directory` | Directory under which `file://` condition URIs resolve, stated by its canonical path (absolute, through no symbolic link); `file://` is refused without it. |
-| `media_config.allow_remote` | Whether `http(s)://` condition URIs are fetched; on by default, and `--set media_config.allow_remote=false` refuses them. |
+| `media_config.allow_remote` | Whether `http(s)://` condition URIs are fetched; on by default, and `media_config.allow_remote = false` refuses them. |
 | `mm_processor_kwargs` | Options of the video processor, as a JSON object; an option it does not take is refused at startup. Two size `ref2va` references. `reference_image_short_edge` is the short edge, in pixels, an image reference is encoded at, at most: a multiple of 32 up to the edge the served checkpoint declares, which is the default (2048 for MiniMax-H3 and OmniRef). A reference is only ever reduced: an image with a longer short edge scales down to it and a video with more pixels than the canvas of its aspect scales down to that canvas, while smaller references keep their own size on the 32-pixel grid. `"enlarge_references": true` also enlarges smaller ones to those sizes, as the released pipeline does. |
 | `media_config.max_request_bytes` | Largest request body and fetched media in total, such as `512MiB`; 256 MiB by default. `media_config` takes every option of the request media schema (configuration.md, `media_config`), such as `max_bytes` per medium and the fetch and probe timeouts. |
-| `--mem-fraction-static` | Device storage each worker may hold for weights and KV cache; 0.70 by default. |
+| `mem_fraction_static` | Device storage each worker may hold for weights and KV cache; 0.70 by default. |
 
-Startup prepares, and with graphs captures, every layout a request reaches: each frame count up to `video_config.max_seconds` at each canvas, and for a task with conditions each rung of the condition ladder. A layout's condition rows are real rows of every denoising step, so a request runs in the smallest rung that holds its conditions and its steps cost its own rows, not the deployment's capacity. The server derives the ladder from the condition capacity, and it takes no option: 1,024 rows, doubling, with a rung halfway between two doublings from 4,096 rows up, and the capacity last. A rung is one more captured graph per frame count and canvas, about a second of startup each at five seconds, and the rungs share one arena. Fewer canvases, capacities and seconds start faster and hold less storage. The first startup also compiles kernels. Serving every FastH3 size needs fewer text capacities, such as `--set 'video_config.text_capacities=[1024, 10240]'`. 1536x672 needs more request storage than the other sizes. A deployment that does not fit fails before it reports ready and logs what each block holds.
+Startup prepares, and with graphs captures, every layout a request reaches: each frame count up to `video_config.max_seconds` at each canvas, and for a task with conditions each rung of the condition ladder. A layout's condition rows are real rows of every denoising step, so a request runs in the smallest rung that holds its conditions and its steps cost its own rows, not the deployment's capacity. The server derives the ladder from the condition capacity, and it takes no option: 1,024 rows, doubling, with a rung halfway between two doublings from 4,096 rows up, and the capacity last. A rung is one more captured graph per frame count and canvas, about a second of startup each at five seconds, and the rungs share one arena. Fewer canvases, capacities and seconds start faster and hold less storage. The first startup also compiles kernels. Serving every FastH3 size needs fewer text capacities, such as `video_config.text_capacities = [1024, 10240]`. 1536x672 needs more request storage than the other sizes. A deployment that does not fit fails before it reports ready and logs what each block holds.
 
 A base denoiser counts one condition row per token: a five-second reference video with its soundtrack occupies about 38,000 rows, a 16:9 reference image at a 2048-pixel short edge about 7,300 and one at its own 2560×1440 size 3,600. OmniRef packs each condition into whole 128-row tiles: an image or audio track takes `ceil(rows / 128)` tiles, and a video's token grid of latent frames × height/32 × width/32 takes `ceil(frames / 4) × ceil(height / 32 / 4) × ceil(width / 32 / 8)`. The official video-plus-audio request therefore occupies 38,124 rows on the base reference denoiser and 47,104 on OmniRef. The deployment's text capacity, condition capacity and seconds, and the storage they need, bound a request's packed sequence (prompt, conditions and generated rows).
 
@@ -262,7 +279,7 @@ Every request generates one video.
 
 ## Precision
 
-A dense BF16 checkpoint states its precision with `quantization`. A mode gives four modules a representation each, and `modules` overrides parts of a mode by the names `attention`, `mlp`, `text_encoder` and `video_vae`, as in `--set 'quantization={ mode = "quality", modules = { video_vae = "fp16" } }'`:
+A dense BF16 checkpoint states its precision with `quantization`. A mode gives four modules a representation each, and `modules` overrides parts of a mode by the names `attention`, `mlp`, `text_encoder` and `video_vae`, as in `quantization = { mode = "quality", modules = { video_vae = "fp16" } }`:
 
 | Mode | Denoiser attention | Denoiser MLP | Text encoder | Video VAE |
 | --- | --- | --- | --- | --- |
@@ -310,8 +327,8 @@ Each encoded element differs from its value by at most what its format's roundin
 | `the video VAE decoder computes in fp16` | Select `video_vae = "fp16"` or `"nvfp4"`. |
 | `is not whole tiles of 256` naming a converted projection | Select `bf16` or `fp8` for that module, or serve a layout whose shares are whole tiles. |
 | `NVML reports no device storage for process` | Run the container in the host's process ID namespace (`--pid=host`). |
-| Startup refuses a static storage grant, or GPU out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, or shard the denoiser further. |
+| Startup refuses a static storage grant, or GPU out of memory | Raise `mem_fraction_static`, serve fewer canvases, capacities or seconds, or shard the denoiser further. |
 | `invalid_request` naming a condition product's rows and its bound, or the packed condition rows and `video_config.max_condition_rows` | Serve with a larger `video_config.max_condition_rows`, or without it to provision the largest condition set, or send fewer or smaller references. |
-| `invalid_request` naming the prompt length | Raise `--max-model-len`. |
+| `invalid_request` naming the prompt length | Raise `max_model_len`. |
 | A refused `file://` condition | Set `media_config.directory` to a directory that holds the path. |
 | An OmniRef start that cannot find a base file | Let the server download the pinned revision, or download it into the Hugging Face cache as above. |

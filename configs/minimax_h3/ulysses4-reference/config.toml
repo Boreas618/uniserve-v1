@@ -1,16 +1,19 @@
-# OmniRef on eight GPUs of one host: a Ulysses8 transformer_ref denoiser and a
-# TP8 text encoder.
+# OmniRef on four GPUs of one host: a Ulysses4 transformer_ref denoiser and a
+# TP4 text encoder.
+
+model = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
+served_model_name = "MiniMax-H3-OmniRef"
 
 [[worker_groups]]
 id = "model"
-ranks = ["cuda:0-7"]
+ranks = ["cuda:0-3"]
 queue_depth = 6
 
 [worker_groups.blocks.transformer_ref]
-sequence_parallel = { kind = "ulysses", ulysses_degree = 8, projection = "exchange" }
+sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
 
 [worker_groups.blocks.text_encoder]
-tensor_parallel_size = 8
+tensor_parallel_size = 4
 
 [worker_groups.blocks.video_decoder]
 distribution = "temporal_units"

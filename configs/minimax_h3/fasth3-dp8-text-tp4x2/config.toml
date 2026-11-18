@@ -1,21 +1,23 @@
+model = "FastVideo/FastVideo-FastH3-8-Step-V2"
+served_model_name = "FastH3"
+
 [[worker_groups]]
 id = "text"
 replicas = 2
 ranks = ["cuda:0-7"]
-queue_depth = 6
-mem_fraction_static = 0.26
+queue_depth = 12
+mem_fraction_static = 0.25
 
 [worker_groups.blocks.text_encoder]
 tensor_parallel_size = 4
 [[worker_groups]]
 id = "flow"
-replicas = 2
+replicas = 8
 ranks = ["cuda:0-7"]
 queue_depth = 6
-mem_fraction_static = 0.73
+mem_fraction_static = 0.72
 
 [worker_groups.blocks.transformer]
-sequence_parallel = { kind = "ulysses", ulysses_degree = 4, projection = "exchange" }
 
 [worker_groups.blocks.video_decoder]
 distribution = "temporal_units"

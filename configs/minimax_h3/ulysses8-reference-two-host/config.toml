@@ -1,13 +1,18 @@
+model = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
+served_model_name = "MiniMax-H3-OmniRef"
+hosts = ["rank-1", "rank-2"]
+
 [[worker_groups]]
 id = "model"
-ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
+ranks = ["rank-1/cuda:0-3", "rank-2/cuda:0-3"]
 queue_depth = 6
 
-[worker_groups.blocks.transformer]
+[worker_groups.blocks.transformer_ref]
 sequence_parallel = { kind = "ulysses", ulysses_degree = 8, projection = "exchange" }
 
 [worker_groups.blocks.text_encoder]
-tensor_parallel_size = 8
+ranks = [0, 1, 2, 3]
+tensor_parallel_size = 4
 
 [worker_groups.blocks.video_decoder]
 distribution = "temporal_units"
@@ -16,6 +21,7 @@ distribution = "temporal_units"
 distribution = "temporal_units"
 
 [worker_groups.blocks.latent_encoder]
+ranks = [4, 5, 6, 7, 0, 1, 2, 3]
 distribution = "temporal_units"
 
 # The media blocks are placed on this group's CUDA ranks: the codecs encode and assemble on
@@ -33,14 +39,15 @@ distribution = "temporal_units"
 # node refuses.
 [[worker_groups]]
 id = "muxer"
-ranks = ["rank-0/cuda:0"]
+ranks = ["rank-1/cuda:0"]
 queue_depth = 6
 
 [worker_groups.blocks.muxer]
 
 [[worker_groups]]
 id = "reader"
-ranks = ["rank-0/cuda:0"]
+ranks = ["rank-1/cuda:0"]
 queue_depth = 6
+mem_fraction_static = 0.04
 
 [worker_groups.blocks.media_reader]

@@ -1,0 +1,24 @@
+# Qwen3 MoE with dedicated experts on two hosts: a TP2 attention replica on
+# the leader's host and two expert ranks on the second host, exchanging
+# tokens through DeepEP.
+
+model = "Qwen/Qwen3-30B-A3B"
+hosts = ["rank-1", "rank-2"]
+
+[moe_config]
+expert_parallel = true
+exchange = "deepep"
+
+[[worker_groups]]
+id = "attention"
+ranks = ["rank-1/cuda:0-1"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+tensor_parallel_size = 2
+
+[[worker_groups]]
+id = "experts"
+role = "experts"
+ranks = ["rank-2/cuda:0-1"]
+queue_depth = 2

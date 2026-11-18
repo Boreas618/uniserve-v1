@@ -1,15 +1,19 @@
-# FastH3 on four GPUs of one host: a Ulysses4 denoiser and a TP4 text encoder.
+# FastH3 on eight GPUs of one host: an eight-way all-gather sequence-parallel
+# denoiser and a TP8 text encoder.
+
+model = "FastVideo/FastVideo-FastH3-8-Step-V2"
+served_model_name = "FastH3"
 
 [[worker_groups]]
 id = "model"
-ranks = ["cuda:0-3"]
+ranks = ["cuda:0-7"]
 queue_depth = 6
 
 [worker_groups.blocks.transformer]
-sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
+sequence_parallel = { kind = "allgather", allgather_degree = 8 }
 
 [worker_groups.blocks.text_encoder]
-tensor_parallel_size = 4
+tensor_parallel_size = 8
 
 [worker_groups.blocks.video_decoder]
 distribution = "temporal_units"

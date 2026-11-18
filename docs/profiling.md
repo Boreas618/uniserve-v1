@@ -40,7 +40,7 @@ A probe first reads a device switch, a word per module class and a master word i
 
 Each probe thus costs about a microsecond of every step even when switched off, and about another microsecond when it records, so the default probes each model's decoder or denoiser stack only; probing every layer costs 1–2% and every module 15–35%.
 
-`profiling_config.fence_probes = false` switches every probe off in place: `PUT /admin/config` with that assignment has the process write its devices' switches, and the graphs keep their probes, each of which then returns at once. Changing `fence_modules` changes which modules carry probes in the captured graphs, which is a new epoch (`docs/admin.md`).
+`profiling_config.fence_probes = false` switches every probe off in place: a package that states it, applied with `PUT /admin/policy`, has the process write its devices' switches, and the graphs keep their probes, each of which then returns at once. Changing `fence_modules` changes which modules carry probes in the captured graphs, which is a new epoch (`docs/admin.md`).
 
 ## Profiling sessions
 
@@ -132,7 +132,7 @@ target/release/uniserve-profile perfetto profiles/profile-1-*.sqlite -o trace.js
 
 Set `profiling_config.nvtx_ranges = true` in the deployment to start its ranges on; a session's `timeline` collector also switches them on while it runs. Each worker, the thread of one device, marks every job it runs with a synchronous range of the `uniserve.worker` domain named for the job's kind: `uniserve.worker.execute`, `resume`, `pass`, `shadow`, `map`, `stamp`, `capture`, `prepare`, `switch`, `commit`, `rollback`, `profile` and `control`; `execute`, `resume` and `shadow` carry the batch ID as a numeric payload. Native ranges use the NVIDIA NVTX SDK directly and issue no CUDA operations. Nsight Systems holds CUPTI's subscription in the processes it traces, so their sessions run no CUPTI collector.
 
-Capture a representative workload with Nsight Systems. `CAPTURE` is an output prefix; run the fixed workload against the server the command starts.
+Capture a representative workload with Nsight Systems. `CAPTURE` is an output prefix and `PACKAGE` a policy package whose `config.toml` states `profiling_config.nvtx_ranges = true`; run the fixed workload against the server the command starts.
 
 ```bash
 nsys profile \
@@ -140,7 +140,7 @@ nsys profile \
   --cuda-graph-trace=graph --sample=process-tree \
   --cudabacktrace=sync:0,storage:0 \
   --export=sqlite --output="$CAPTURE" \
-  uniserve serve "$MODEL" --set profiling_config.nvtx_ranges=true
+  uniserve serve "$PACKAGE"
 
 target/release/uniserve-profile trace "$CAPTURE.sqlite"
 target/release/uniserve-profile trace "$CAPTURE.sqlite" --json

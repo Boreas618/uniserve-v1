@@ -1,3 +1,6 @@
+model = "FastVideo/FastVideo-FastH3-8-Step-V2"
+served_model_name = "FastH3"
+
 [[worker_groups]]
 id = "text"
 ranks = ["cuda:0-7"]
@@ -14,6 +17,7 @@ queue_depth = 6
 mem_fraction_static = 0.81
 
 [worker_groups.blocks.transformer]
+weights = "host"
 
 [worker_groups.blocks.video_decoder]
 distribution = "temporal_units"

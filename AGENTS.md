@@ -33,7 +33,7 @@ The authorized objective governs all work. Measure progress by delivered behavio
 
 ### Serving, Evaluation, and Artifacts
 
-- Start serving through `uniserve serve <model> --served-model-name <name>` and inspect `uniserve serve --help` for current options. Resolve evaluation configuration with `target/release/uniserve-eval plan --config <profile> <point>` (`cargo build --release -p eval`) before an artifact-producing run, then execute the fixed profile with the matching `run` command.
+- Start serving through `uniserve serve <package>`, a policy package directory whose `config.toml` states the model and every option and whose name names the deployment, and change a serving deployment only by applying the next package with `PUT /admin/policy` (`docs/configuration.md`, `docs/admin.md`). Resolve evaluation configuration with `target/release/uniserve-eval plan --config <profile> <point>` (`cargo build --release -p eval`) before an artifact-producing run, then execute the fixed profile with the matching `run` command.
 - Keep generated checkpoints, profiles, logs, media, and benchmark outputs under `artifacts/` in stable domain-specific paths. The directory is Git-ignored; commit only source, tests, release documentation, and small fixtures that are required to reproduce behavior. Never add credentials, local model assets, downloaded dependencies, or machine-specific caches.
 - Apply the benchmark and evaluation rules below to every formal measurement. Run measurement points serially, preserve failed or superseded evidence outside the canonical result path, and make the canonical artifact unambiguous rather than overwriting history silently.
 
