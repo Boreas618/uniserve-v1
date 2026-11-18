@@ -9,9 +9,9 @@ use crate::batch::{
 };
 use crate::executor::Route;
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::runner::graphs::Graphs;
+use crate::runner::{Forward, Runner};
 use crate::worker::Sequences;
 use crate::worker::completion::Outcome;
 use crossbeam_channel::{Receiver, Sender};
@@ -45,11 +45,7 @@ struct Answering {
     shadowed: Arc<Mutex<Vec<u64>>>,
 }
 
-impl Runner for Answering {
-    fn phases(&self) -> &[Phase] {
-        &self.phases
-    }
-
+impl Forward for Answering {
     fn buckets(&self) -> Vec<Bucket> {
         Vec::new()
     }
@@ -62,6 +58,20 @@ impl Runner for Answering {
 
     fn idle_inputs(&self, _: &Bucket, _: &mut [u8]) -> crate::worker::Result<()> {
         Ok(())
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for Answering {
+    fn phases(&self) -> &[Phase] {
+        &self.phases
+    }
+
+    fn capturer(&self, graphs: Graphs) -> crate::worker::Result<Box<dyn Forward>> {
+        Ok(Box::new(crate::runner::HostForward::new(graphs)))
     }
 
     fn prepare_inputs(&mut self, batch: &Batch, _: &BlockTables) -> crate::worker::Result<Bucket> {
@@ -88,10 +98,6 @@ impl Runner for Answering {
             calls: batch.requests.iter().map(|_| sampled(batch.id.0)).collect(),
             ..BatchOutput::default()
         })
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 
     fn copy(&mut self, _: &[BlockCopy]) -> crate::worker::Result<()> {

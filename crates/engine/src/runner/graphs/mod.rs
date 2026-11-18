@@ -1,7 +1,7 @@
-//! `Graphs`: the single implementation of the profile run, capture, replay and the switch of
-//! generations, for every runner.
+//! `Graphs`: the single implementation of the profile run, the rehearsal, capture, replay and the
+//! switch of generations, for every runner.
 //!
-//! A runner computes one forward per bucket ([`Runner::forward`]). `Graphs` runs it three ways,
+//! A runner computes one forward per bucket ([`Forward::forward`]). `Graphs` runs it four ways,
 //! and nothing else in the crate does:
 //!
 //! - **Profile run.** At load the forward runs under a meta context: it launches nothing and
@@ -10,33 +10,54 @@
 //!   most one paired call of it carves from a shadow region. The keys are what the engine
 //!   resolves kernels for, and the peaks and the shadow bytes are what a device's memory is
 //!   divided by.
-//! - **Capture.** At warm-up the forward runs eagerly once over idle inputs and is then
-//!   captured, with its launch table, its input copies and its output tensors.
+//! - **Rehearsal.** A kernel whose first use is host work a capture cannot record (a native
+//!   entry that builds its runner or allocates its workspace on first use) is first used by a
+//!   rehearsal ([`Graphs::rehearse`]): the forward runs eagerly over idle inputs, under a
+//!   rehearsal context ([`ops::Context::rehearsal`]), on a stream of its own and in device memory
+//!   of its own, so it writes no tensor a serving forward reads and meets no other rank.
+//! - **Capture.** The forward is captured on a stream beside the serving one
+//!   ([`Graphs::capture`]), with its launch table, its input copies and its output tensors, and
+//!   instantiated. A capture launches nothing: it only records, so it runs while the runner
+//!   serves.
 //! - **Replay.** [`Graphs::prepare_inputs`] takes a slot of the input buffer, lets the runner
 //!   write the bytes of its input tensors and, when the graph has input copies, runs the forward
-//!   under a meta context over the same region, so the host values the model computes land in
-//!   the slot at the offsets the capture recorded. [`Graphs::replay`] then issues the slot's
-//!   copies as one batched copy and launches the graph. Nothing is called back from the stream.
+//!   under a meta context over the same region with the kernels of the graph it prepares for,
+//!   so the host values the model computes land in the slot at the offsets that graph's capture
+//!   recorded. [`Graphs::replay`] then issues the slot's copies as one batched copy and launches
+//!   the graph. Nothing is called back from the stream.
+//!
+//! ## Three kinds of graphs
+//!
+//! A runner's own graphs serve: they hold the captured graphs and replay them on the runner's
+//! stream. Its worker's capture thread holds two more over the runner's second forward instance
+//! (`Runner::capturer`): graphs **beside** the runner's ([`Graphs::beside`]), whose context
+//! launches on a capture stream with an allocator over the runner's region, so a capture records
+//! the addresses a capture of the runner would; and a **rehearsal**'s ([`Graphs::rehearsal`]),
+//! whose input tensors and allocator region are a device allocation of its own, held while a
+//! generation is rehearsed ([`Graphs::release_rehearsal`]).
 //!
 //! ## Memory
 //!
 //! A runner's region is one range of device memory: the block of its input tensors at fixed
 //! addresses, then the region of the context's allocator, which is emptied at the start of
 //! every forward. A forward of one bucket therefore receives the same addresses when it is
-//! captured and whenever it runs again, and a graph's output tensors are the ones its capture
-//! allocated. They are read after the replay and before the next forward on the runner.
+//! captured, beside or not, and whenever it runs again, and a graph's output tensors are the
+//! ones its capture allocated. They are read after the replay and before the next forward on the
+//! runner. Two generations' graphs of a bucket address the same region: only one of them
+//! replays at a time, on the runner's stream.
 //!
 //! ## Generations
 //!
-//! A new generation of kernels is prepared beside the serving graphs: a bucket whose launch
-//! table is unchanged is rebound (a second executable of the serving graph with the new kernels'
-//! parameters on the changed launches), any other is recaptured, and a bucket none of whose
-//! kernels changed keeps its graph. A rebind reads the new parameters from a capture under the
-//! new kernels, and every capture, as at warm-up, follows one eager run of the forward with the
-//! kernels it captures. The buckets are examined one at a time, each with a profile run of its
-//! forward, and the worker serves batches between two of them. The switch takes effect between
-//! two batches; the replaced generation's graphs stay until the trial is committed, and serve
-//! again after a rollback.
+//! A new generation of kernels is prepared beside the serving graphs, one bucket at a time, by
+//! the capture thread: a bucket none of whose launches changed keeps its graph, and any other is
+//! captured again under the new kernels ([`Graphs::examine`], [`Graphs::capture`]); no graph is
+//! ever modified. Each bucket's outcome is installed here on the worker thread
+//! ([`Graphs::install`]). A bucket switches to the new generation once every rank of the groups
+//! that hold it installed it ([`Graphs::switch_buckets`]), and the generation serves whole once
+//! every bucket switched ([`Graphs::switch`]). A replay takes the newest graph of its bucket at or
+//! below what the bucket switched to and what its batch's kernel stamp allows
+//! ([`Graphs::stamp`]). The replaced graphs stay until the trial is committed, and serve again
+//! after a rollback.
 //!
 //! Before the switch, each operator whose kernel changed runs a paired forward
 //! ([`Graphs::shadow`]): the new kernel beside the one it replaces on the same inputs, compared
@@ -46,16 +67,17 @@
 //!
 //! [`Graphs::meta`] holds no stream. It runs profile runs, and the whole generation state
 //! machine with every device step left out: a capture records the launch table and the input
-//! copies of a meta forward and no executable, and a replay is refused. A runner built over it
-//! makes its input tensors on the meta device.
+//! copies of a meta forward and no executable, a rehearsal runs nothing, and a replay is refused.
+//! A runner built over it makes its input tensors on the meta device.
 
 mod capture;
 mod input_buffer;
 mod shadow;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ops::Generation;
 use ops::allocator::ALIGNMENT;
@@ -63,13 +85,13 @@ use ops::breaks::{BREAK, HostWork};
 use ops::collective::Meet;
 use ops::moe::ExchangeTransport;
 use ops::{Context, ContextGuard, Group};
-use platform::{DeviceRange, Event, EventFlags, Stream};
+use platform::{DeviceAllocation, DeviceRange, Event, EventFlags, Stream};
 use tensor::{DType, Device, Shape, Tensor};
 
-use self::capture::{Executable, Recorder, kernels_of, take_break};
+use self::capture::{Executable, Recording, kernels_of, take_break};
 use self::input_buffer::InputBuffer;
 use self::shadow::Shadow;
-use crate::runner::Runner;
+use crate::runner::Forward;
 use crate::runner::buckets::Bucket;
 use crate::worker::{Error, Result};
 
@@ -84,22 +106,42 @@ type Recorded = Vec<(&'static str, String, String, u64)>;
 /// forward makes them.
 type Copies = Vec<(u64, u64, u64)>;
 
-/// What a new generation needs of one bucket's graph.
+/// The axes of a forward's partition as [`Graphs::set_axes`] takes them: per axis its group and
+/// this rank's place in it.
+type Axes = Vec<(Option<Arc<Group>>, u64, u64)>;
+
+/// What a generation needs of one bucket, as the capture thread found it ([`Graphs::examine`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Preparation {
-    /// No kernel the bucket launches changed: the bucket serves from the graph it has.
-    Keep,
-    /// The launch table is unchanged and some kernels changed: a second executable of the
-    /// serving graph takes the new kernels' parameters.
-    Rebind,
-    /// The launch table changed: the bucket is captured again.
-    Recapture,
+pub struct Plan {
+    /// Whether the bucket is captured under the generation's kernels: its launch table changed,
+    /// or a kernel it launches did. A bucket that is not keeps the graph it serves from.
+    pub capture: bool,
+    /// Whether a capture of the bucket is preceded by a rehearsal ([`Graphs::rehearse`]): it
+    /// launches a native kernel the serving generation does not hold, whose first use a capture
+    /// cannot record.
+    pub rehearse: bool,
+}
+
+/// What one capture cost, as the capture thread measured it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Costs {
+    /// The host time of the capture: the forward run on the capturing stream.
+    pub capture: Duration,
+    /// The host time of the instantiation of the captured segments.
+    pub instantiate: Duration,
+    /// The device bytes the instantiation took, as the device's free memory fell across it;
+    /// zero for graphs that hold no device.
+    pub bytes: u64,
+    /// The segments of the graph: one more than its graph breaks.
+    pub segments: usize,
+    /// The kernel nodes one replay of the graph launches.
+    pub kernel_nodes: u64,
 }
 
 /// The captured graphs of one runner, the context its forwards compute under, and the
 /// generations of kernels they launch.
 pub struct Graphs {
-    /// What issues on the device; `None` for graphs that hold none.
+    /// What issues on the device; `None` for graphs that hold no device.
     device: Option<Cuda>,
     /// The meta context of profile runs: it counts and holds no memory.
     profile: Context,
@@ -111,27 +153,41 @@ pub struct Graphs {
     inputs: u64,
     /// Slots of the input buffer.
     slots: usize,
+    /// Whether these are a rehearsal's graphs ([`Graphs::rehearsal`]).
+    rehearses: bool,
+    /// The device address of the runner's input tensors: the start of the runner's region, and
+    /// for a rehearsal's graphs the start of the rehearsal's memory while it rehearses.
+    inputs_at: Cell<u64>,
     state: RefCell<State>,
 }
 
 /// The device side of a runner's graphs.
 struct Cuda {
     stream: Stream,
-    /// The context that launches: captures and eager forwards compute under it.
+    /// The context that launches: a serving runner's eager and paired forwards compute under
+    /// it, and graphs beside them capture under it. A rehearsal's graphs derive each rehearsal's
+    /// context from it.
     launching: Context,
-    /// The device address of the runner's input tensors.
-    inputs: u64,
+    /// The runner's region: its input tensors, then its allocator's.
+    region: DeviceRange,
     /// Recorded on the stream behind each replay and eager forward: what a reader of the
     /// outputs waits on.
     done: Event,
+    /// The device memory of a rehearsal's graphs, while a generation is rehearsed: a region as
+    /// large as the runner's.
+    rehearsal: RefCell<Option<DeviceAllocation>>,
 }
 
 /// What changes while a runner serves.
 struct State {
-    /// The generation that serves.
+    /// The generation that serves whole: eager forwards launch its kernels, and every bucket not
+    /// switched ahead of it replays its graphs.
     serving: Arc<Generation>,
     /// The generation update in flight.
     update: Update,
+    /// The kernel generation the step being prepared was stamped with ([`Graphs::stamp`]): the
+    /// newest generation its replay may take a graph of.
+    stamp: Option<u64>,
     /// The launch table of each profiled bucket.
     profiles: HashMap<Bucket, Table>,
     /// The most one paired call of each profiled bucket's forward carves from a shadow region
@@ -140,9 +196,13 @@ struct State {
     /// The values area of a slot that holds the copies of each profiled bucket's forward at any
     /// offsets ([`input_bound`]).
     inputs: HashMap<Bucket, u64>,
-    /// The graph of each captured bucket, by the generation it was captured or rebound for.
+    /// The graph of each captured bucket, by the generation it was captured for.
     graphs: HashMap<(Bucket, u64), Graph>,
-    /// The input buffer; made at the first use for graphs that hold no device.
+    /// The replays of each bucket since the graphs were made: what orders a generation's
+    /// captures, the most used bucket first ([`Graphs::prepare`]).
+    uses: HashMap<Bucket, u64>,
+    /// The input buffer: page-locked for graphs that serve or rehearse, and made at the first
+    /// use over ordinary host memory for graphs that hold no device or capture beside.
     buffer: Option<InputBuffer>,
     /// The step prepared for a bucket, until the replay, the eager forward or the paired
     /// forward that issues it.
@@ -166,8 +226,9 @@ struct State {
 
 /// The step prepared for a bucket ([`Graphs::prepare_inputs`], [`Graphs::unpaired`]).
 enum Prepared {
-    /// The bucket's inputs, in this slot of the input buffer.
-    Inputs(Bucket, usize),
+    /// The bucket's inputs, in this slot of the input buffer, for the graph of the generation
+    /// of this number; `None` for an eager forward.
+    Inputs(Bucket, usize, Option<u64>),
     /// A paired forward of the bucket that its runner prepared no inputs for, with the reason:
     /// it runs nothing, and the operator it was to compare is reported uncompared.
     Unpaired(Bucket, String),
@@ -177,7 +238,7 @@ impl Prepared {
     /// The bucket the step is of.
     const fn bucket(&self) -> &Bucket {
         match self {
-            Self::Inputs(bucket, _) | Self::Unpaired(bucket, _) => bucket,
+            Self::Inputs(bucket, _, _) | Self::Unpaired(bucket, _) => bucket,
         }
     }
 }
@@ -186,26 +247,40 @@ impl Prepared {
 enum Update {
     /// One generation serves and no other is held.
     Steady,
-    /// `next` is prepared beside the serving generation; `pending` are the captured buckets it
-    /// has yet to examine and, where it needs, prepare, largest first ([`Graphs::prepare_bucket`]).
-    Prepared {
+    /// `next` is prepared beside the serving generation. `pending` are the captured buckets
+    /// whose outcome the capture thread has not installed; `switched` the installed ones that
+    /// serve from `next` ahead of the others ([`Graphs::switch_buckets`]).
+    Preparing {
         next: Arc<Generation>,
-        pending: Vec<Bucket>,
+        pending: BTreeSet<Bucket>,
+        switched: BTreeSet<Bucket>,
     },
-    /// The prepared generation serves on trial and `kept` is the one it replaced.
+    /// The prepared generation serves whole, on trial, and `kept` is the one it replaced.
     Trial { kept: Arc<Generation> },
 }
 
-/// One bucket's captured forward.
-struct Graph {
+/// One bucket's captured forward, as a capture made it.
+pub struct Graph {
     /// The launches of the forward, with a [`BREAK`] entry at each graph break.
     table: Table,
     /// The input copies a replay issues before the launch.
     copies: Copies,
     /// The forward's outputs, at the addresses the capture allocated.
     outputs: Vec<Tensor>,
+    /// The kernels the graph was captured with: what the forward of `prepare_inputs` runs
+    /// under before its replay.
+    kernels: Arc<Generation>,
     /// What a replay launches; `None` for graphs that hold no device.
     executable: Option<Executable>,
+    /// What the capture cost.
+    costs: Costs,
+}
+
+impl Graph {
+    /// What the capture of this graph cost.
+    pub fn costs(&self) -> Costs {
+        self.costs
+    }
 }
 
 impl Graphs {
@@ -218,6 +293,8 @@ impl Graphs {
             preparing: Context::meta(None),
             inputs,
             slots: 2,
+            rehearses: false,
+            inputs_at: Cell::new(0),
             state: RefCell::new(State::new(kernels, None)),
         }
     }
@@ -230,7 +307,8 @@ impl Graphs {
     /// [`Graphs::input_peak`], the bytes of host values one replay copies, and `slots` the
     /// replays whose copies may be in flight at once.
     ///
-    /// The caller keeps `region` mapped at its address for as long as these graphs exist.
+    /// The caller keeps `region` mapped at its address for as long as these graphs, and the
+    /// graphs beside them, exist.
     ///
     /// # Errors
     ///
@@ -247,29 +325,15 @@ impl Graphs {
         let device = stream.device();
         let ordinal = usize::try_from(device.0)
             .map_err(|_| Error::Invalid(format!("{device} names no GPU ordinal")))?;
-
-        // The input tensors take the start of the region, aligned as the allocator's blocks
-        // are; the allocator takes what follows them.
-        let start = region.ptr().address();
-        let base = start.next_multiple_of(ALIGNMENT);
-        let taken = (base - start) + inputs.next_multiple_of(ALIGNMENT);
-        let rest = (region.bytes() as u64).checked_sub(taken).ok_or_else(|| {
-            Error::Invalid(format!(
-                "a region of {} bytes cannot hold {inputs} bytes of input tensors",
-                region.bytes()
-            ))
-        })?;
-        let allocator = DeviceRange::new(
-            platform::DevicePtr::from_address(start + taken),
-            rest as usize,
-        );
+        let (base, allocator) = split_region(region, inputs)?;
 
         let buffer = InputBuffer::pinned(device, inputs, values, slots)?;
         let cuda = Cuda {
             launching: Context::new(ordinal, stream.clone(), Arc::clone(&kernels), allocator),
             stream,
-            inputs: base,
+            region,
             done: Event::new(EventFlags::default()),
+            rehearsal: RefCell::new(None),
         };
 
         Ok(Self {
@@ -278,8 +342,114 @@ impl Graphs {
             preparing: Context::meta(Some(allocator)),
             inputs,
             slots,
+            rehearses: false,
+            inputs_at: Cell::new(base),
             state: RefCell::new(State::new(kernels, Some(buffer))),
         })
+    }
+
+    /// Graphs beside these, for the capture instance of the runner's forward
+    /// (`Runner::capturer`): their context launches the same kernels through groups beside
+    /// these graphs' ([`ops::Context::beside`]) on a capture stream of their own, and allocates
+    /// over the same region, so a forward captured under them records the addresses one
+    /// captured under these graphs would, and the graph replays here. Graphs that hold no
+    /// device give graphs that hold none.
+    ///
+    /// Make them once the runner's groups and expert exchange are set
+    /// ([`Graphs::set_axes`], [`Graphs::set_exchange`]): the context beside takes them as they
+    /// stand.
+    ///
+    /// # Errors
+    ///
+    /// When the capture stream or a group's side stream cannot be created.
+    pub fn beside(&self) -> Result<Self> {
+        let state = self.state.borrow();
+        let kernels = Arc::clone(&state.serving);
+
+        let Some(cuda) = &self.device else {
+            let graphs = Self::meta(kernels, self.inputs);
+            graphs.profile.set_axes(self.splits()?)?;
+            graphs.preparing.set_axes(self.splits()?)?;
+            return Ok(graphs);
+        };
+
+        let stream = Stream::new(cuda.stream.device())?;
+        let (base, allocator) = split_region(cuda.region, self.inputs)?;
+        let graphs = Self {
+            device: Some(Cuda {
+                launching: cuda.launching.beside(stream.clone())?,
+                stream,
+                region: cuda.region,
+                done: Event::new(EventFlags::default()),
+                rehearsal: RefCell::new(None),
+            }),
+            profile: Context::meta(None),
+            preparing: Context::meta(Some(allocator)),
+            inputs: self.inputs,
+            slots: 1,
+            rehearses: false,
+            inputs_at: Cell::new(base),
+            state: RefCell::new(State::new(kernels, None)),
+        };
+        graphs.profile.set_axes(self.splits()?)?;
+        graphs.preparing.set_axes(self.splits()?)?;
+        Ok(graphs)
+    }
+
+    /// Graphs of a rehearsal, for the rehearsal instance of the runner's forward
+    /// (`Runner::capturer`): their input tensors and allocator region are a device allocation as
+    /// large as the runner's region, made at the first rehearsal and held until
+    /// [`Graphs::release_rehearsal`], and each rehearsal runs on a stream of their own under a
+    /// rehearsal context ([`ops::Context::rehearsal`]). Graphs that hold no device give graphs
+    /// that hold none, whose rehearsals run nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the stream, a group's side stream or the page-locked input buffer cannot be
+    /// created.
+    pub fn rehearsal(&self) -> Result<Self> {
+        let Some(cuda) = &self.device else {
+            return self.beside();
+        };
+
+        let state = self.state.borrow();
+        let kernels = Arc::clone(&state.serving);
+        let values = self.input_peak();
+        let stream = Stream::new(cuda.stream.device())?;
+        let buffer = InputBuffer::pinned(cuda.stream.device(), self.inputs, values, 1)?;
+
+        let graphs = Self {
+            device: Some(Cuda {
+                launching: cuda.launching.beside(stream.clone())?,
+                stream,
+                region: cuda.region,
+                done: Event::new(EventFlags::default()),
+                rehearsal: RefCell::new(None),
+            }),
+            profile: Context::meta(None),
+            preparing: Context::meta(None),
+            inputs: self.inputs,
+            slots: 1,
+            rehearses: true,
+            // No input tensor of a rehearsal's forward lies anywhere until it rehearses.
+            inputs_at: Cell::new(0),
+            state: RefCell::new(State::new(kernels, Some(buffer))),
+        };
+        graphs.profile.set_axes(self.splits()?)?;
+        graphs.preparing.set_axes(self.splits()?)?;
+        Ok(graphs)
+    }
+
+    /// Whether these are a rehearsal's graphs ([`Graphs::rehearsal`]): their input tensors lie
+    /// in memory of their own, so what a forward over them writes at a fixed address a served
+    /// step reads must be the forward instance's own.
+    pub fn rehearses(&self) -> bool {
+        self.rehearses
+    }
+
+    /// The stream these graphs issue on; `None` for graphs that hold no device.
+    pub(crate) fn stream(&self) -> Option<&Stream> {
+        self.device.as_ref().map(|cuda| &cuda.stream)
     }
 
     /// The device a runner makes its tensors on: the GPU these graphs issue on, or the meta
@@ -316,11 +486,16 @@ impl Graphs {
             )));
         }
 
-        let address = self.device.as_ref().map_or(0, |cuda| cuda.inputs + offset);
+        let address = self
+            .device
+            .as_ref()
+            .map_or(0, |_| self.inputs_at.get() + offset);
 
-        // SAFETY: on a GPU the address lies in the input block at the start of the region,
-        // which the caller of `Graphs::new` keeps mapped for as long as these graphs exist and
-        // which only the copies these graphs issue write; on the meta device nothing is read.
+        // SAFETY: on a GPU the address lies in the input block at the start of the runner's
+        // region, which the caller of `Graphs::new` keeps mapped for as long as these graphs and
+        // the graphs beside them exist and which only the copies the runner's graphs issue
+        // write; or in a rehearsal's memory, which these graphs hold while it rehearses. On the
+        // meta device nothing is read.
         Ok(unsafe { ops::external(address, shape, dtype, &self.device()) }?)
     }
 
@@ -335,7 +510,7 @@ impl Graphs {
     }
 
     /// Waits for the device to pass everything these graphs issued: the last replay, eager
-    /// forward, paired forward or capture. Graphs that hold no device have nothing in flight.
+    /// forward or paired forward. Graphs that hold no device have nothing in flight.
     ///
     /// # Errors
     ///
@@ -353,13 +528,22 @@ impl Graphs {
         self.state.borrow_mut().step = Some((step, stage));
     }
 
+    /// States the kernel generation the batch whose step is prepared next was stamped with
+    /// (`Batch::kernels`): its replay takes the newest graph of its bucket at or below it and at
+    /// or below what the bucket switched to. The ranks of a group switch a bucket between the
+    /// same two jobs and every rank's batch carries the same stamp, so every rank replays a
+    /// batch with graphs of one generation.
+    pub fn stamp(&self, kernels: u64) {
+        self.state.borrow_mut().stamp = Some(kernels);
+    }
+
     /// The operators the generation being prepared launches with another kernel than the
     /// serving one under the same key in `bucket`'s graph, in launch order, each once: what a
     /// paired forward of the bucket compares ([`Graphs::shadow`]). A key only one of the two
     /// generations holds has no pair. Empty when no generation is being prepared.
     pub(crate) fn replaced(&self, bucket: &Bucket) -> Vec<&'static str> {
         let state = self.state.borrow();
-        let Update::Prepared { next, .. } = &state.update else {
+        let Update::Preparing { next, .. } = &state.update else {
             return Vec::new();
         };
         let Some((_, graph)) = state.served(bucket) else {
@@ -396,8 +580,8 @@ impl Graphs {
     /// # Errors
     ///
     /// As `ops::Context::set_axes`.
-    pub(crate) fn set_axes(&self, axes: Vec<(Option<Arc<Group>>, u64, u64)>) -> Result<()> {
-        let splits: Vec<(Option<Arc<Group>>, u64, u64)> = axes
+    pub(crate) fn set_axes(&self, axes: Axes) -> Result<()> {
+        let splits: Axes = axes
             .iter()
             .map(|(_, rank, ranks)| (None, *rank, *ranks))
             .collect();
@@ -417,16 +601,27 @@ impl Graphs {
         }
     }
 
+    /// The splits of the axes the profile context holds, with no group: what the meta contexts
+    /// of graphs beside these take.
+    fn splits(&self) -> Result<Axes> {
+        Ok(self
+            .profile
+            .splits()
+            .into_iter()
+            .map(|(rank, ranks)| (None, rank, ranks))
+            .collect())
+    }
+
     // ---- The profile run ----
 
     /// Runs the forward of every bucket `runner` states, the captured ones and the eager ones
-    /// ([`Runner::eager_buckets`]), under the meta context and keeps each bucket's launch table
-    /// and the most one paired call of it carves from a shadow region.
+    /// ([`Forward::eager_buckets`]), under the meta context and keeps each bucket's launch
+    /// table and the most one paired call of it carves from a shadow region.
     ///
     /// # Errors
     ///
     /// What a forward refuses.
-    pub fn profile_run(&self, runner: &dyn Runner) -> Result<()> {
+    pub fn profile_run(&self, runner: &dyn Forward) -> Result<()> {
         for bucket in runner.buckets().into_iter().chain(runner.eager_buckets()) {
             self.profile(runner, &bucket)?;
         }
@@ -435,14 +630,14 @@ impl Graphs {
 
     /// Profiles `bucket`: its forward under the meta profile context, whose launch table and
     /// largest paired call ([`shadowed`]) these graphs keep.
-    fn profile(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<()> {
+    fn profile(&self, runner: &dyn Forward, bucket: &Bucket) -> Result<Table> {
         let (table, copies, shadow) = self.meta_forward(&self.profile, runner, bucket)?;
 
         let mut state = self.state.borrow_mut();
-        state.profiles.insert(*bucket, table);
+        state.profiles.insert(*bucket, table.clone());
         state.shadows.insert(*bucket, shadow);
         state.inputs.insert(*bucket, input_bound(&copies));
-        Ok(())
+        Ok(table)
     }
 
     /// The kernels the profiled buckets launch, as `(operator, key)`: what the engine resolves
@@ -520,31 +715,9 @@ impl Graphs {
         state.served(bucket).map(|(_, graph)| graph.copies.clone())
     }
 
-    // ---- Capture and replay ----
+    // ---- Replay ----
 
-    /// Captures `bucket` for the serving generation: the forward runs eagerly once over the
-    /// runner's idle inputs, which leaves every operator ready, and is then captured with its
-    /// launch table, its input copies and its outputs.
-    ///
-    /// Warm-up captures a runner's buckets largest first ([`Runner::buckets`]).
-    ///
-    /// # Errors
-    ///
-    /// When the forward fails, when the capture's launches are not the profile run's, or when
-    /// the forward of `prepare_inputs` would not write its host values where the capture's
-    /// input copies read them.
-    pub fn capture(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<()> {
-        let serving = Arc::clone(&self.state.borrow().serving);
-        let graph = self.captured(runner, bucket, &serving)?;
-
-        self.state
-            .borrow_mut()
-            .graphs
-            .insert((*bucket, serving.number()), graph);
-        Ok(())
-    }
-
-    /// The smallest captured bucket of the serving generation that `holds` a batch.
+    /// The smallest captured bucket the serving generation serves from that `holds` a batch.
     ///
     /// `None` is the caller's error once warm-up has captured the runner's buckets: a batch no
     /// bucket holds is not served from another graph.
@@ -575,35 +748,50 @@ impl Graphs {
     }
 
     /// Prepares the inputs of one step of `bucket`: takes the next slot of the input buffer,
-    /// lets `fill` write the bytes of the runner's input tensors into it, and, when the
-    /// bucket's graph has input copies, runs the bucket's forward under the meta context so the
-    /// host values it computes land in the slot where those copies read them.
+    /// lets `fill` write the bytes of the runner's input tensors into it, and, when the graph
+    /// the step replays has input copies, runs the bucket's forward under the meta context, with
+    /// the kernels that graph was captured with, so the host values it computes land in the
+    /// slot where that graph's copies read them.
     ///
-    /// The step is issued by [`Graphs::replay`] for a captured bucket, or by [`Graphs::eager`].
+    /// The graph is the bucket's newest at or below what the bucket switched to and the kernel
+    /// stamp of the batch the step belongs to ([`Graphs::stamp`]). The step is
+    /// issued by [`Graphs::replay`] for a captured bucket, or by [`Graphs::eager`].
     ///
     /// # Errors
     ///
     /// What `fill` or the forward refuses.
     pub fn prepare_inputs(
         &self,
-        runner: &dyn Runner,
+        runner: &dyn Forward,
         bucket: &Bucket,
         fill: impl FnOnce(&mut [u8]) -> Result<()>,
     ) -> Result<()> {
         let slot = self.fill_slot(fill)?;
 
         // An eager forward writes its host values itself, when it runs.
-        let copies = self
-            .state
-            .borrow()
-            .served(bucket)
-            .is_some_and(|(_, graph)| !graph.copies.is_empty());
-        if copies {
+        let chosen = {
+            let state = self.state.borrow();
+            state
+                .chosen(bucket, state.stamp)
+                .map(|(generation, graph)| {
+                    (
+                        generation,
+                        !graph.copies.is_empty(),
+                        Arc::clone(&graph.kernels),
+                    )
+                })
+        };
+        if let Some((_, true, kernels)) = &chosen {
+            self.preparing.set_kernels(Arc::clone(kernels));
             self.lend_values(&self.preparing, slot)?;
             self.meta_forward(&self.preparing, runner, bucket)?;
         }
 
-        self.state.borrow_mut().prepared = Some(Prepared::Inputs(*bucket, slot));
+        self.state.borrow_mut().prepared = Some(Prepared::Inputs(
+            *bucket,
+            slot,
+            chosen.map(|(generation, _, _)| generation),
+        ));
         Ok(())
     }
 
@@ -628,22 +816,26 @@ impl Graphs {
     /// device, or the driver refuses the copies or the launch.
     pub fn replay(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
         let cuda = self.cuda()?;
-        let slot = self.take_prepared(bucket)?;
+        let (slot, generation) = self.take_prepared(bucket)?;
+        let generation = generation.ok_or_else(|| {
+            Error::Invariant(format!("bucket {bucket} has no captured graph to replay"))
+        })?;
 
         let mut state = self.state.borrow_mut();
-        let serving = state.serving.number();
         let State {
             graphs,
             buffer,
             step,
             launches,
             replays,
+            uses,
             ..
         } = &mut *state;
-        let missing =
-            || Error::Invariant(format!("bucket {bucket} has no captured graph to replay"));
-        let (generation, _) = served(graphs, serving, bucket).ok_or_else(missing)?;
-        let graph = graphs.get_mut(&(*bucket, generation)).ok_or_else(missing)?;
+        let graph = graphs.get_mut(&(*bucket, generation)).ok_or_else(|| {
+            Error::Invariant(format!(
+                "bucket {bucket} has no graph of generation {generation} to replay"
+            ))
+        })?;
         let (Some(executable), Some(buffer)) = (graph.executable.as_mut(), buffer.as_mut()) else {
             return Err(Error::State("the graph holds no executable to replay"));
         };
@@ -652,7 +844,13 @@ impl Graphs {
         // this launch, and no other bucket's with it.
         executable.refresh()?;
 
-        buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &graph.copies)?;
+        buffer.issue(
+            slot,
+            &cuda.stream,
+            self.inputs_at.get(),
+            self.inputs,
+            &graph.copies,
+        )?;
         buffer.release(slot, &cuda.stream)?;
 
         let step = step.take();
@@ -660,6 +858,7 @@ impl Graphs {
         cuda.done.record(&cuda.stream)?;
         *launches += executable.kernel_nodes();
         *replays += 1;
+        *uses.entry(*bucket).or_default() += 1;
 
         Ok(graph.outputs.clone())
     }
@@ -673,11 +872,13 @@ impl Graphs {
     ///
     /// When no inputs are prepared for `bucket`, these graphs hold no device, or the forward or
     /// the driver fails.
-    pub fn eager(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<Vec<Tensor>> {
+    pub fn eager(&self, runner: &dyn Forward, bucket: &Bucket) -> Result<Vec<Tensor>> {
         let cuda = self.cuda()?;
-        let slot = self.take_prepared(bucket)?;
+        let (slot, _) = self.take_prepared(bucket)?;
 
-        self.with_buffer(|buffer| buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &[]))?;
+        self.with_buffer(|buffer| {
+            buffer.issue(slot, &cuda.stream, self.inputs_at.get(), self.inputs, &[])
+        })?;
         self.lend_values(&cuda.launching, slot)?;
 
         let step = self.state.borrow_mut().step.take();
@@ -708,43 +909,336 @@ impl Graphs {
 
     /// The kernels the serving forwards of these graphs launched since they were made: every
     /// kernel node of each replayed graph and every launch of each eager forward. Paired
-    /// forwards and captures are not serving forwards; graphs that hold no device launch none.
+    /// forwards, rehearsals and captures are not serving forwards; graphs that hold no device
+    /// launch none.
     pub(crate) fn launches(&self) -> u64 {
         self.state.borrow().launches
     }
 
     /// The serving forwards of these graphs since they were made, by how they ran: the graphs
     /// [`Graphs::replay`] launched, then the forwards [`Graphs::eager`] ran to the end. Paired
-    /// forwards and captures are not serving forwards; graphs that hold no device run none.
+    /// forwards, rehearsals and captures are not serving forwards; graphs that hold no device
+    /// run none.
     pub(crate) fn forwards(&self) -> (u64, u64) {
         let state = self.state.borrow();
         (state.replays, state.eager)
     }
 
+    // ---- Capture: the capture thread's graphs ----
+
+    /// Examines `bucket` for generation `next` beside `serving`, the generation whose graph of
+    /// the bucket has the launch table `held` (`None` for a bucket with no graph yet, at
+    /// warm-up, which `serving` is then `None` for): a profile run of the forward, which also
+    /// states its launches for the capture's check.
+    ///
+    /// The bucket is captured when it has no graph, its launch table changed, or a launch's
+    /// kernel is another in `next`; it is rehearsed first when it launches a native kernel
+    /// `serving` does not hold under the same key, whose first use a capture cannot record.
+    ///
+    /// # Errors
+    ///
+    /// A profile run that fails, a launch `next` holds no kernel for, or a forward whose peak
+    /// the runner's region cannot hold.
+    pub fn examine(
+        &self,
+        runner: &dyn Forward,
+        bucket: &Bucket,
+        held: Option<&[(&'static str, String, String)]>,
+        serving: Option<&Generation>,
+        next: &Generation,
+    ) -> Result<Plan> {
+        let profiled = self.profile(runner, bucket)?;
+
+        // A generation must hold a kernel for every launch of the bucket: one it cannot launch
+        // is an incomplete generation, not one to switch to.
+        for (operator, key, _) in &profiled {
+            if *operator != BREAK && !next.contains(operator, key) {
+                return Err(Error::Interface(format!(
+                    "generation {} holds no kernel of `{operator}` for `{key}`, which bucket \
+                     {bucket} launches",
+                    next.number()
+                )));
+            }
+        }
+
+        // The new generation's forward allocates in the runner's region as the serving one does.
+        if let Some(cuda) = &self.device
+            && self.peak() > cuda.region.bytes() as u64
+        {
+            return Err(Error::Resource(
+                "a forward of the generation needs more than the runner's region holds",
+            ));
+        }
+
+        let capture = match (held, serving) {
+            (Some(held), Some(serving)) => {
+                !same_launches(held, &profiled)
+                    || !changed_launches(&profiled, serving, next).is_empty()
+            }
+            _ => true,
+        };
+        let rehearse = capture
+            && profiled.iter().any(|(operator, key, _)| {
+                let Ok(kernel) = next.kernel(operator, key) else {
+                    return false;
+                };
+                let held = serving.and_then(|serving| serving.kernel(operator, key).ok());
+                !kernel.is_cubin() && held.is_none_or(|held| !Arc::ptr_eq(held, kernel))
+            });
+        Ok(Plan { capture, rehearse })
+    }
+
+    /// Rehearses `bucket` under `kernels`: its forward runs eagerly once over idle inputs
+    /// ([`Forward::idle_inputs`]), on these graphs' stream and in their own device memory, under
+    /// a rehearsal context that issues no collective and no expert exchange. A kernel whose
+    /// first use is host work a capture cannot record does that work here. Returns once the
+    /// stream ran the forward. Graphs that hold no device run nothing.
+    ///
+    /// The memory is a region as large as the runner's, allocated at the first rehearsal and
+    /// kept for the next ones until [`Graphs::release_rehearsal`]. It is zeroed before each
+    /// rehearsal, so a value a collective would have written reads as zero, which every index a
+    /// kernel reads keeps within its bounds.
+    ///
+    /// # Errors
+    ///
+    /// When the memory cannot be allocated, the forward fails, or the driver refuses a copy or
+    /// the wait.
+    pub fn rehearse(
+        &self,
+        runner: &dyn Forward,
+        bucket: &Bucket,
+        kernels: &Arc<Generation>,
+    ) -> Result<()> {
+        let Some(cuda) = &self.device else {
+            return Ok(());
+        };
+
+        let bytes = cuda.region.bytes();
+        let memory = {
+            let mut held = cuda.rehearsal.borrow_mut();
+            if held.is_none() {
+                *held = Some(DeviceAllocation::linear(cuda.stream.device(), bytes)?);
+            }
+            held.as_ref().map(DeviceAllocation::address).unwrap_or(0)
+        };
+        let region = DeviceRange::new(platform::DevicePtr::from_address(memory), bytes);
+        let (base, allocator) = split_region(region, self.inputs)?;
+        self.inputs_at.set(base);
+
+        // SAFETY: the range is the allocation these graphs hold, which nothing else addresses.
+        unsafe { platform::memset_d8(memory, 0, bytes, &cuda.stream) }?;
+
+        let slot = self.fill_slot(|columns| runner.idle_inputs(bucket, columns))?;
+        self.with_buffer(|buffer| buffer.issue(slot, &cuda.stream, base, self.inputs, &[]))?;
+
+        let rehearsal = cuda.launching.rehearsal(cuda.stream.clone(), allocator)?;
+        rehearsal.set_kernels(Arc::clone(kernels));
+        self.lend_values(&rehearsal, slot)?;
+
+        let outputs = {
+            let _guard = rehearsal.enter();
+            runner.forward(bucket)
+        };
+        drop(outputs.map(drop));
+
+        // The forward's copies read the slot, and its kernels the memory: both are free once the
+        // stream ran it.
+        self.with_buffer(|buffer| buffer.release(slot, &cuda.stream))?;
+        cuda.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Releases the memory of the rehearsals, once the generation they served is captured.
+    pub fn release_rehearsal(&self) {
+        if let Some(cuda) = &self.device {
+            cuda.rehearsal.borrow_mut().take();
+        }
+    }
+
+    /// Captures `bucket`'s forward under `kernels` on these graphs' stream and instantiates it,
+    /// checking the capture against the profile run ([`Graphs::examine`]) and against the
+    /// forward of `prepare_inputs`. Nothing runs: the graph is replayed by the runner's graphs
+    /// once installed ([`Graphs::install`]).
+    ///
+    /// Graphs that hold no device record the launch table and the input copies of a meta
+    /// forward and no executable.
+    ///
+    /// # Errors
+    ///
+    /// When the forward fails, when the capture's launches are not the profile run's, when the
+    /// forward of `prepare_inputs` would not write its host values where the capture's input
+    /// copies read them, or when the driver refuses the capture or the instantiation.
+    pub fn capture(
+        &self,
+        runner: &dyn Forward,
+        bucket: &Bucket,
+        kernels: &Arc<Generation>,
+    ) -> Result<Graph> {
+        // A bucket captured without a profile run is profiled here: its keys and peaks are
+        // then known, and the capture is checked against them like any other.
+        if !self.state.borrow().profiles.contains_key(bucket) {
+            self.profile(runner, bucket)?;
+        }
+
+        let slot = self.fill_slot(|columns| runner.idle_inputs(bucket, columns))?;
+        self.lend_values(&self.preparing, slot)?;
+        let (_, prepared, _) = self.meta_forward(&self.preparing, runner, bucket)?;
+
+        let Some(cuda) = &self.device else {
+            let (table, copies, _) = self.meta_forward(&self.preparing, runner, bucket)?;
+            self.check_profile(bucket, &table)?;
+
+            return Ok(Graph {
+                table,
+                copies,
+                outputs: Vec::new(),
+                kernels: Arc::clone(kernels),
+                executable: None,
+                costs: Costs::default(),
+            });
+        };
+
+        cuda.launching.set_kernels(Arc::clone(kernels));
+        self.lend_values(&cuda.launching, slot)?;
+        cuda.launching.reset();
+        cuda.launching.record_launches();
+        let breaks: Arc<dyn Fn(HostWork) -> ops::Result<()> + Send + Sync> = Arc::new(take_break);
+        cuda.launching.set_breaks(Some(breaks));
+
+        let began = Instant::now();
+        let captured = {
+            let _guard = cuda.launching.enter();
+            Recording::capture(&cuda.stream, || {
+                // A captured forward carries the range markers of the modules it enters, which
+                // every replay then runs; the process's markers are a profiler only while the
+                // stream captures.
+                cuda.launching
+                    .set_profiler(crate::profiling::markers::profiler(&cuda.stream));
+                runner.forward(bucket)
+            })
+        };
+        let capture = began.elapsed();
+        cuda.launching.set_profiler(None);
+        cuda.launching.set_breaks(None);
+
+        let (table, _) = shadowed(cuda.launching.take_launches());
+        let copies = cuda.launching.take_input_copies();
+        let (recording, outputs) = captured?;
+
+        self.check_profile(bucket, &table)?;
+        // The forward of `prepare_inputs` must write where the graph's input copies read: both
+        // lists follow from the forward's shapes alone, so they are one list or the forward
+        // cannot be replayed.
+        if prepared != copies {
+            return Err(Error::Invariant(format!(
+                "the forward of bucket {bucket} makes {} host-to-device copies when it is \
+                 captured and {} under the meta context, or makes them at other offsets or \
+                 addresses: its host values do not follow from the bucket alone",
+                copies.len(),
+                prepared.len()
+            )));
+        }
+
+        // The instantiation is the device memory a graph takes beside its region: what two
+        // generations' graphs of a bucket hold together until the commit.
+        let device = cuda.stream.device();
+        let free = device.memory_info()?.free;
+        let began = Instant::now();
+        let executable = recording.instantiate(kernels_of(kernels, &table)?)?;
+        let instantiate = began.elapsed();
+        let bytes = free.saturating_sub(device.memory_info()?.free);
+
+        let costs = Costs {
+            capture,
+            instantiate,
+            bytes,
+            segments: executable.segments(),
+            kernel_nodes: executable.kernel_nodes(),
+        };
+        Ok(Graph {
+            table,
+            copies,
+            outputs,
+            kernels: Arc::clone(kernels),
+            executable: Some(executable),
+            costs,
+        })
+    }
+
     // ---- Generations ----
 
-    /// The number of the generation that serves.
+    /// The number of the generation that serves whole.
     pub fn generation(&self) -> u64 {
         self.state.borrow().serving.number()
     }
 
-    /// The generation that serves: the kernels a replay launches, which the device's context
-    /// loaded. The engine builds the next generation of the device from it, and the memories of
-    /// the device's rank launch their own work from it.
-    pub(crate) fn kernels(&self) -> Arc<Generation> {
+    /// The generation that serves whole: the kernels an eager forward launches, which the
+    /// device's context loaded. The engine builds the next generation of the device from it,
+    /// and the memories of the device's rank launch their own work from it.
+    pub fn kernels(&self) -> Arc<Generation> {
         Arc::clone(&self.state.borrow().serving)
     }
 
-    /// Begins preparing `next` beside the serving generation and returns the captured buckets it
-    /// examines, largest first. Each is examined, and prepared where it needs, by
-    /// [`Graphs::prepare_bucket`], one bucket per call, so that the worker serves batches
-    /// between two buckets: what a bucket needs takes a profile run of its forward, and a
-    /// runner's buckets are counted in thousands. Beginning runs no forward.
+    /// Installs a captured graph of `bucket` for the generation of `number`, the serving one at
+    /// warm-up or the one being prepared, or for the one being prepared the finding that the
+    /// bucket keeps its graph (`graph` is `None`). The bucket is then ready to switch.
+    ///
+    /// # Errors
+    ///
+    /// When `number` is neither, or the bucket was installed already.
+    pub fn install(&self, bucket: &Bucket, number: u64, graph: Option<Graph>) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        let serving = state.serving.number();
+
+        match &mut state.update {
+            Update::Preparing { next, pending, .. } if next.number() == number => {
+                if !pending.remove(bucket) {
+                    return Err(Error::Invariant(format!(
+                        "bucket {bucket} of generation {number} was installed already, or is \
+                         none the generation examines"
+                    )));
+                }
+            }
+            Update::Steady if serving == number => {
+                if graph.is_none() {
+                    return Err(Error::Invariant(format!(
+                        "bucket {bucket} is warmed up with no graph"
+                    )));
+                }
+            }
+            _ => {
+                return Err(Error::Invariant(format!(
+                    "generation {number} is neither being prepared nor warmed up: generation \
+                     {serving} serves"
+                )));
+            }
+        }
+
+        if let Some(graph) = graph {
+            // A replay's host values take what the graph's copies take: the input buffer is
+            // sized by what these graphs know of every bucket's.
+            let bound = input_bound(&graph.copies);
+            let held = state.inputs.entry(*bucket).or_default();
+            *held = (*held).max(bound);
+            state
+                .profiles
+                .entry(*bucket)
+                .or_insert_with(|| graph.table.clone());
+
+            state.graphs.insert((*bucket, number), graph);
+        }
+        Ok(())
+    }
+
+    /// Begins preparing `next` beside the serving generation and returns the captured buckets
+    /// it examines, the most replayed first and otherwise in `runner`'s capture order. The
+    /// capture thread examines and, where it needs, captures each, and the worker installs the
+    /// outcomes ([`Graphs::install`]). Beginning runs no forward.
     ///
     /// # Errors
     ///
     /// When an update is already in flight, or `next` is the serving generation's number.
-    pub fn prepare(&self, runner: &dyn Runner, next: Arc<Generation>) -> Result<Vec<Bucket>> {
+    pub fn prepare(&self, runner: &dyn Forward, next: Arc<Generation>) -> Result<Vec<Bucket>> {
         let mut state = self.state.borrow_mut();
         if !matches!(state.update, Update::Steady) {
             return Err(Error::State(
@@ -758,103 +1252,108 @@ impl Graphs {
             )));
         }
 
-        let pending: Vec<Bucket> = runner
+        let mut order: Vec<Bucket> = runner
             .buckets()
             .into_iter()
             .filter(|bucket| state.served(bucket).is_some())
             .collect();
+        // A stable sort keeps the capture order among buckets of as many replays.
+        order.sort_by_key(|bucket| std::cmp::Reverse(state.uses.get(bucket).copied().unwrap_or(0)));
 
         state.uncompared.clear();
-        state.update = Update::Prepared {
+        state.update = Update::Preparing {
             next,
-            pending: pending.clone(),
+            pending: order.iter().copied().collect(),
+            switched: BTreeSet::new(),
         };
-        Ok(pending)
+        Ok(order)
     }
 
-    /// The next bucket the generation being prepared has yet to examine, the largest left;
-    /// `None` when it examined every bucket, or no generation is being prepared.
-    pub(crate) fn pending(&self) -> Option<Bucket> {
+    /// The buckets of the generation being prepared whose outcome is not installed yet, in
+    /// ascending order; empty when every one is, or no generation is being prepared.
+    pub(crate) fn pending(&self) -> Vec<Bucket> {
         match &self.state.borrow().update {
-            Update::Prepared { pending, .. } => pending.first().copied(),
-            _ => None,
+            Update::Preparing { pending, .. } => pending.iter().copied().collect(),
+            _ => Vec::new(),
         }
     }
 
-    /// Examines `bucket` for the generation being prepared and prepares its graph where it needs
-    /// one; returns what was done.
-    ///
-    /// What a bucket needs follows from launch tables: the serving graph's against a profile
-    /// run of the same forward now. A table that differs is a recapture; an equal table with a
-    /// launch whose kernel is another in the new generation is a rebind, which is done as a
-    /// recapture when the capture under the new kernels turns out to differ in structure from
-    /// the serving graph; an equal table none of whose kernels changed keeps its graph
-    /// ([`Preparation::Keep`]).
-    ///
-    /// The serving graph is untouched and keeps serving.
+    /// Switches `buckets` to the prepared generation `number` ahead of the others: from the
+    /// next step on, a batch stamped with it ([`Graphs::stamp`]) replays their graphs of that
+    /// generation, or the graph each kept. A bucket these graphs hold no graph of is none of
+    /// theirs and is passed over.
     ///
     /// # Errors
     ///
-    /// When no generation is being prepared or `bucket` is not left to examine, a profile run
-    /// fails, the new generation holds no kernel for a launch of the bucket the serving
-    /// generation has one for, or as [`Graphs::capture`]. The bucket is then still left to
-    /// examine, and the caller gives the generation back ([`Graphs::rollback`]).
-    pub fn prepare_bucket(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<Preparation> {
-        let (next, serving, held) = {
-            let state = self.state.borrow();
-            let Update::Prepared { next, pending } = &state.update else {
-                return Err(Error::State("no generation is being prepared"));
-            };
-            let left = || {
-                Error::Invariant(format!(
-                    "generation {} has no bucket {bucket} left to examine",
-                    next.number()
-                ))
-            };
-            if !pending.contains(bucket) {
-                return Err(left());
-            }
-
-            // A bucket is left to examine only while its serving graph exists.
-            let held = state
-                .served(bucket)
-                .map(|(_, graph)| graph.table.clone())
-                .ok_or_else(left)?;
-            (Arc::clone(next), Arc::clone(&state.serving), held)
-        };
-
-        let (profiled, _, _) = self.meta_forward(&self.profile, runner, bucket)?;
-        let needed = preparation(&held, &profiled, &serving, &next)?;
-
-        // The capture under the new kernels, a rebind's as a recapture's, follows an eager run
-        // of the forward with them: a kernel of a library the process loaded for this generation
-        // has its first use there, where it does the host work of its first use that a capture
-        // cannot record (a native entry may build its runner on first use, and refuses a capture
-        // before it).
-        let prepared = match needed {
-            Preparation::Keep => None,
-            Preparation::Rebind => {
-                let fresh = self.captured(runner, bucket, &next)?;
-                Some(self.rebound(bucket, fresh, &serving, &next)?)
-            }
-            Preparation::Recapture => Some((
-                self.captured(runner, bucket, &next)?,
-                Preparation::Recapture,
-            )),
-        };
-
+    /// When `number` is not the generation being prepared, or a bucket's outcome is not
+    /// installed yet.
+    pub fn switch_buckets(&self, number: u64, buckets: &[Bucket]) -> Result<()> {
         let mut state = self.state.borrow_mut();
-        let done = match prepared {
-            Some((graph, done)) => {
-                state.graphs.insert((*bucket, next.number()), graph);
-                done
-            }
-            None => Preparation::Keep,
+        let held: BTreeSet<Bucket> = state.graphs.keys().map(|(bucket, _)| *bucket).collect();
+
+        let Update::Preparing {
+            next,
+            pending,
+            switched,
+        } = &mut state.update
+        else {
+            return Err(Error::Invariant(format!(
+                "generation {number} is not being prepared"
+            )));
         };
-        if let Update::Prepared { pending, .. } = &mut state.update {
-            pending.retain(|held| held != bucket);
+        if next.number() != number {
+            return Err(Error::Invariant(format!(
+                "generation {number} is not being prepared: generation {} is",
+                next.number()
+            )));
         }
-        Ok(done)
+
+        for bucket in buckets.iter().filter(|bucket| held.contains(bucket)) {
+            if pending.contains(bucket) {
+                return Err(Error::Invariant(format!(
+                    "bucket {bucket} switches to generation {number} before its capture was \
+                     installed"
+                )));
+            }
+            switched.insert(*bucket);
+        }
+        Ok(())
+    }
+
+    /// Switches to the prepared generation `number` whole: from the next step on every bucket
+    /// replays its graph of it, or the graph it kept, eager forwards launch its kernels, and it
+    /// serves on trial, the generation it replaces kept.
+    ///
+    /// # Errors
+    ///
+    /// When `number` is not the prepared generation, or a bucket's outcome is not installed.
+    pub fn switch(&self, number: u64) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+
+        let next = match &state.update {
+            Update::Preparing { next, pending, .. } if next.number() == number => {
+                if let Some(bucket) = pending.first() {
+                    return Err(Error::Invariant(format!(
+                        "generation {number} is not prepared: bucket {bucket} is still to be \
+                         examined"
+                    )));
+                }
+                Arc::clone(next)
+            }
+            _ => {
+                return Err(Error::Invariant(format!(
+                    "generation {number} was not prepared: generation {} serves",
+                    state.serving.number()
+                )));
+            }
+        };
+
+        if let Some(cuda) = &self.device {
+            cuda.launching.set_kernels(Arc::clone(&next));
+        }
+        let kept = std::mem::replace(&mut state.serving, next);
+        state.update = Update::Trial { kept };
+        Ok(())
     }
 
     /// Gives these graphs the region the shadow outputs of paired calls are written in:
@@ -891,15 +1390,15 @@ impl Graphs {
     /// tolerance.
     pub fn shadow(
         &self,
-        runner: &dyn Runner,
+        runner: &dyn Forward,
         bucket: &Bucket,
         operator: &'static str,
     ) -> Result<Option<u64>> {
-        if !matches!(self.state.borrow().update, Update::Prepared { .. }) {
+        if !matches!(self.state.borrow().update, Update::Preparing { .. }) {
             return Err(Error::State("no generation is being prepared"));
         }
         let slot = match self.take_step(bucket)? {
-            Prepared::Inputs(_, slot) => slot,
+            Prepared::Inputs(_, slot, _) => slot,
             Prepared::Unpaired(_, reason) => {
                 self.state
                     .borrow_mut()
@@ -912,7 +1411,7 @@ impl Graphs {
         let cuda = self.cuda()?;
         let (serving, next, pairing) = {
             let state = self.state.borrow();
-            let Update::Prepared { next, .. } = &state.update else {
+            let Update::Preparing { next, .. } = &state.update else {
                 return Err(Error::State("no generation is being prepared"));
             };
             let shadow = state
@@ -925,7 +1424,9 @@ impl Graphs {
             (serving, Arc::clone(next), pairing)
         };
 
-        self.with_buffer(|buffer| buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &[]))?;
+        self.with_buffer(|buffer| {
+            buffer.issue(slot, &cuda.stream, self.inputs_at.get(), self.inputs, &[])
+        })?;
         self.lend_values(&cuda.launching, slot)?;
 
         cuda.launching.set_kernels(next);
@@ -953,43 +1454,9 @@ impl Graphs {
         self.state.borrow().uncompared.clone()
     }
 
-    /// Switches to the prepared generation `number`: from the next batch on its graphs and
-    /// kernels serve, on trial, and the generation it replaces is kept.
-    ///
-    /// # Errors
-    ///
-    /// When `number` is not the prepared generation, or a bucket is still to be examined for it.
-    pub fn switch(&self, number: u64) -> Result<()> {
-        let mut state = self.state.borrow_mut();
-
-        let next = match &state.update {
-            Update::Prepared { next, pending } if next.number() == number => {
-                if let Some(bucket) = pending.first() {
-                    return Err(Error::Invariant(format!(
-                        "generation {number} is not prepared: bucket {bucket} is still to be \
-                         examined"
-                    )));
-                }
-                Arc::clone(next)
-            }
-            _ => {
-                return Err(Error::Invariant(format!(
-                    "generation {number} was not prepared: generation {} serves",
-                    state.serving.number()
-                )));
-            }
-        };
-
-        if let Some(cuda) = &self.device {
-            cuda.launching.set_kernels(Arc::clone(&next));
-        }
-        let kept = std::mem::replace(&mut state.serving, next);
-        state.update = Update::Trial { kept };
-        Ok(())
-    }
-
     /// Commits the trial of generation `number`: the kept generation is released, with every
-    /// graph a newer one replaced and the kernels only they held.
+    /// graph a newer one replaced and the kernels only they held, once the device has passed
+    /// the last batch that replayed one.
     ///
     /// # Errors
     ///
@@ -1027,9 +1494,11 @@ impl Graphs {
         Ok(())
     }
 
-    /// Rolls generation `number` back. On trial, the kept generation serves again from the next
-    /// batch on and the rolled-back generation's graphs are released; prepared and not yet
-    /// switched to, its graphs are released and the serving generation is untouched.
+    /// Rolls generation `number` back. Being prepared, its buckets switched ahead serve their
+    /// kept graphs again from the next batch on and its graphs are released; on trial, the kept
+    /// generation serves again from the next batch on and the rolled-back generation's graphs
+    /// are released. A graph is released once the device has passed the last batch that
+    /// replayed it.
     ///
     /// # Errors
     ///
@@ -1040,7 +1509,7 @@ impl Graphs {
             let state = self.state.borrow();
             let named = match &state.update {
                 Update::Trial { .. } => state.serving.number() == number,
-                Update::Prepared { next, .. } => next.number() == number,
+                Update::Preparing { next, .. } => next.number() == number,
                 Update::Steady => false,
             };
             if !named {
@@ -1066,6 +1535,35 @@ impl Graphs {
         Ok(())
     }
 
+    /// The device bytes a generation that replaces `operators` takes beside the serving graphs
+    /// until its commit: the instantiations of the serving graphs that launch one of them, each
+    /// captured again for it, and, when any does, a rehearsal's memory, a region as large as
+    /// the runner's. Each graph's figure is what its capture measured ([`Costs::bytes`]).
+    pub(crate) fn update_bytes(&self, operators: &BTreeSet<String>) -> u64 {
+        let state = self.state.borrow();
+        let serving = state.serving.number();
+
+        let mut graphs = 0;
+        let mut any = false;
+        for ((bucket, generation), graph) in &state.graphs {
+            let served = served(&state.graphs, serving, bucket).map(|(newest, _)| newest);
+            let launches = graph
+                .table
+                .iter()
+                .any(|(operator, _, _)| operators.contains(*operator));
+            if served == Some(*generation) && launches {
+                graphs += graph.costs.bytes;
+                any = true;
+            }
+        }
+
+        let rehearsal = match &self.device {
+            Some(cuda) if any => cuda.region.bytes() as u64,
+            _ => 0,
+        };
+        graphs + rehearsal
+    }
+
     // ---- What the public operations share ----
 
     /// The device side, or the refusal of graphs that hold none.
@@ -1089,7 +1587,7 @@ impl Graphs {
     fn meta_forward(
         &self,
         context: &Context,
-        runner: &dyn Runner,
+        runner: &dyn Forward,
         bucket: &Bucket,
     ) -> Result<(Table, Copies, u64)> {
         context.reset();
@@ -1106,20 +1604,19 @@ impl Graphs {
         Ok((table, copies, shadow))
     }
 
-    /// Runs `operation` on the input buffer, making the host ring of graphs that hold no device
-    /// when it is first needed or has become too small for the profiled forwards.
+    /// Runs `operation` on the input buffer, making a ring over ordinary host memory when the
+    /// graphs hold none, or theirs has become too small for the profiled forwards: graphs that
+    /// hold no device, and graphs beside a runner's, whose captures issue no copy.
     fn with_buffer<T>(&self, operation: impl FnOnce(&mut InputBuffer) -> Result<T>) -> Result<T> {
         let values = self.input_peak();
         let mut state = self.state.borrow_mut();
 
-        if self.device.is_none() {
-            let stale = state
-                .buffer
-                .as_ref()
-                .is_none_or(|buffer| buffer.values_bytes() < values);
-            if stale {
-                state.buffer = Some(InputBuffer::host(self.inputs, values, self.slots)?);
-            }
+        let host = state
+            .buffer
+            .as_ref()
+            .is_none_or(|buffer| buffer.is_host() && buffer.values_bytes() < values);
+        if host {
+            state.buffer = Some(InputBuffer::host(self.inputs, values, self.slots)?);
         }
 
         let buffer = state
@@ -1153,10 +1650,11 @@ impl Graphs {
         Ok(())
     }
 
-    /// The slot holding the inputs prepared for `bucket`, which the caller now issues.
-    fn take_prepared(&self, bucket: &Bucket) -> Result<usize> {
+    /// The slot holding the inputs prepared for `bucket`, which the caller now issues, and the
+    /// generation of the graph they were prepared for.
+    fn take_prepared(&self, bucket: &Bucket) -> Result<(usize, Option<u64>)> {
         match self.take_step(bucket)? {
-            Prepared::Inputs(_, slot) => Ok(slot),
+            Prepared::Inputs(_, slot, generation) => Ok((slot, generation)),
             Prepared::Unpaired(..) => Err(Error::Invariant(format!(
                 "bucket {bucket}'s step is a paired forward its runner prepared no inputs for"
             ))),
@@ -1173,154 +1671,6 @@ impl Graphs {
             ))),
             None => Err(Error::State("no inputs are prepared for the step")),
         }
-    }
-
-    /// Captures `bucket`'s forward with `generation`'s kernels, after one eager run of it with
-    /// them, and checks the capture against the profile run and against the forward of
-    /// `prepare_inputs`.
-    ///
-    /// Graphs that hold no device record the launch table and the input copies of a meta
-    /// forward and no executable.
-    fn captured(
-        &self,
-        runner: &dyn Runner,
-        bucket: &Bucket,
-        generation: &Arc<Generation>,
-    ) -> Result<Graph> {
-        // A bucket captured without a profile run is profiled here: its keys and peaks are
-        // then known, and the capture is checked against them like any other.
-        if !self.state.borrow().profiles.contains_key(bucket) {
-            self.profile(runner, bucket)?;
-        }
-
-        let slot = self.fill_slot(|columns| runner.idle_inputs(bucket, columns))?;
-
-        let Some(cuda) = &self.device else {
-            self.lend_values(&self.preparing, slot)?;
-            let (table, copies, _) = self.meta_forward(&self.preparing, runner, bucket)?;
-            self.check_profile(bucket, &table)?;
-
-            return Ok(Graph {
-                table,
-                copies,
-                outputs: Vec::new(),
-                executable: None,
-            });
-        };
-
-        let serving = Arc::clone(&self.state.borrow().serving);
-        cuda.launching.set_kernels(Arc::clone(generation));
-        self.lend_values(&cuda.launching, slot)?;
-
-        let captured = self.capture_on(cuda, runner, bucket, slot);
-
-        // Eager forwards between captures launch the serving generation's kernels.
-        cuda.launching.set_route(None);
-        cuda.launching.set_breaks(None);
-        cuda.launching.set_kernels(serving);
-        let mut graph = captured?;
-
-        self.check_profile(bucket, &graph.table)?;
-        let launches = graph
-            .table
-            .iter()
-            .filter(|(name, _, _)| *name != BREAK)
-            .count();
-        let Some(executable) = graph.executable.as_mut() else {
-            return Err(Error::Invariant(
-                "a capture on a device holds no executable".into(),
-            ));
-        };
-        if executable.launches() != launches {
-            return Err(Error::Invariant(format!(
-                "the capture of bucket {bucket} recorded the nodes of {} launches and its launch \
-                 table holds {launches}",
-                executable.launches()
-            )));
-        }
-
-        // The forward of `prepare_inputs` must write where the graph's input copies read: both
-        // lists follow from the forward's shapes alone, so they are one list or the forward
-        // cannot be replayed.
-        self.lend_values(&self.preparing, slot)?;
-        let (_, prepared, _) = self.meta_forward(&self.preparing, runner, bucket)?;
-        if prepared != graph.copies {
-            return Err(Error::Invariant(format!(
-                "the forward of bucket {bucket} makes {} host-to-device copies when it is \
-                 captured and {} under the meta context, or makes them at other offsets or \
-                 addresses: its host values do not follow from the bucket alone",
-                graph.copies.len(),
-                prepared.len()
-            )));
-        }
-
-        executable.hold(kernels_of(generation, &graph.table)?);
-        tracing::debug!(
-            %bucket,
-            generation = generation.number(),
-            launches,
-            kernel_nodes = executable.kernel_nodes(),
-            input_copies = graph.copies.len(),
-            "captured a bucket"
-        );
-        Ok(graph)
-    }
-
-    /// The device steps of one capture: the eager run, then the capture itself. The graph's
-    /// executable holds no kernel yet.
-    fn capture_on(
-        &self,
-        cuda: &Cuda,
-        runner: &dyn Runner,
-        bucket: &Bucket,
-        slot: usize,
-    ) -> Result<Graph> {
-        // The idle inputs reach the input tensors before either forward reads them.
-        self.with_buffer(|buffer| buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &[]))?;
-
-        cuda.launching.reset();
-        let outputs = {
-            let _guard = cuda.launching.enter();
-            runner.forward(bucket)
-        };
-        outputs?;
-
-        // The eager run's copies read the slot's values, which the capture writes again.
-        cuda.stream.synchronize()?;
-
-        cuda.launching.reset();
-        cuda.launching.record_launches();
-        let breaks: Arc<dyn Fn(HostWork) -> ops::Result<()> + Send + Sync> = Arc::new(take_break);
-        cuda.launching.set_route(Some(Arc::new(Recorder)));
-        cuda.launching.set_breaks(Some(breaks));
-
-        let captured = {
-            let _guard = cuda.launching.enter();
-            Executable::capture(&cuda.stream, || {
-                // A captured forward carries the range markers of the modules it enters, which
-                // every replay then runs; the process's markers are a profiler only while the
-                // stream captures.
-                cuda.launching
-                    .set_profiler(crate::profiling::markers::profiler(&cuda.stream));
-                runner.forward(bucket)
-            })
-        };
-        cuda.launching.set_profiler(None);
-
-        let (table, _) = shadowed(cuda.launching.take_launches());
-        let copies = cuda.launching.take_input_copies();
-
-        // The slot is free once the stream has passed the copy of the idle inputs.
-        self.with_buffer(|buffer| buffer.release(slot, &cuda.stream))?;
-        cuda.done.record(&cuda.stream)?;
-        let (executable, outputs) = captured?;
-
-        Ok(Graph {
-            table,
-            copies,
-            outputs,
-            executable: Some(executable),
-        })
     }
 
     /// Refuses a capture whose launches are not the profile run's of the same bucket.
@@ -1340,49 +1690,6 @@ impl Graphs {
             profiled.len()
         )))
     }
-
-    /// The graph of `bucket` for `next` as a rebind of the serving graph with `fresh`'s kernels
-    /// on the launches whose kernel changed, or `fresh` itself as a recapture when the two
-    /// captures differ in structure.
-    fn rebound(
-        &self,
-        bucket: &Bucket,
-        fresh: Graph,
-        serving: &Generation,
-        next: &Generation,
-    ) -> Result<(Graph, Preparation)> {
-        let state = self.state.borrow();
-        let (_, held) = state.served(bucket).ok_or_else(|| {
-            Error::Invariant(format!("bucket {bucket} has no serving graph to rebind"))
-        })?;
-
-        // A rebind keeps the serving graph's copies and outputs, so the new capture must have
-        // made the same ones.
-        if held.copies != fresh.copies {
-            return Ok((fresh, Preparation::Recapture));
-        }
-
-        let executable = match (&held.executable, &fresh.executable) {
-            (Some(held), Some(captured)) => {
-                let changed = changed_launches(&fresh.table, serving, next);
-                let kernels = kernels_of(next, &fresh.table)?;
-
-                match held.rebound(captured, &changed, kernels)? {
-                    Some(executable) => Some(executable),
-                    None => return Ok((fresh, Preparation::Recapture)),
-                }
-            }
-            _ => None,
-        };
-
-        let graph = Graph {
-            table: fresh.table,
-            copies: fresh.copies,
-            outputs: held.outputs.clone(),
-            executable,
-        };
-        Ok((graph, Preparation::Rebind))
-    }
 }
 
 impl State {
@@ -1390,10 +1697,12 @@ impl State {
         Self {
             serving,
             update: Update::Steady,
+            stamp: None,
             profiles: HashMap::new(),
             shadows: HashMap::new(),
             inputs: HashMap::new(),
             graphs: HashMap::new(),
+            uses: HashMap::new(),
             buffer,
             prepared: None,
             step: None,
@@ -1406,10 +1715,51 @@ impl State {
     }
 
     /// The graph the serving generation serves `bucket` from, with the generation it was
-    /// captured or rebound for.
+    /// captured for.
     fn served(&self, bucket: &Bucket) -> Option<(u64, &Graph)> {
         served(&self.graphs, self.serving.number(), bucket)
     }
+
+    /// The graph a step of `bucket` stamped with kernel generation `stamp` replays, with its
+    /// generation: the newest at or below the generation the bucket serves from (the one being
+    /// prepared when the bucket switched to it ahead of the others, otherwise the one that
+    /// serves) and at or below the stamp.
+    fn chosen(&self, bucket: &Bucket, stamp: Option<u64>) -> Option<(u64, &Graph)> {
+        let mut top = self.serving.number();
+        if let Update::Preparing { next, switched, .. } = &self.update
+            && switched.contains(bucket)
+        {
+            top = next.number();
+        }
+        if let Some(stamp) = stamp {
+            top = top.min(stamp);
+        }
+        served(&self.graphs, top, bucket)
+    }
+}
+
+/// Splits `region`, a runner's region, into the address of its input tensors, at its first
+/// aligned address, and the region of the allocator, which follows them.
+///
+/// # Errors
+///
+/// When the region cannot hold `inputs` bytes of input tensors.
+fn split_region(region: DeviceRange, inputs: u64) -> Result<(u64, DeviceRange)> {
+    let start = region.ptr().address();
+    let base = start.next_multiple_of(ALIGNMENT);
+    let taken = (base - start) + inputs.next_multiple_of(ALIGNMENT);
+    let rest = (region.bytes() as u64).checked_sub(taken).ok_or_else(|| {
+        Error::Invalid(format!(
+            "a region of {} bytes cannot hold {inputs} bytes of input tensors",
+            region.bytes()
+        ))
+    })?;
+
+    let allocator = DeviceRange::new(
+        platform::DevicePtr::from_address(start + taken),
+        rest as usize,
+    );
+    Ok((base, allocator))
 }
 
 /// Runs `run`, a step's launches on `stream`, between the step's range markers when the worker
@@ -1425,7 +1775,7 @@ fn bracket<T>(
     }
 }
 
-/// The graph generation `serving` serves `bucket` from: the one of the newest generation at or
+/// The graph `bucket` serves from at generation `top`: the one of the newest generation at or
 /// below it that holds a graph of the bucket.
 ///
 /// A bucket none of whose kernels changed has no graph of the newer generation and keeps
@@ -1433,12 +1783,12 @@ fn bracket<T>(
 /// nothing.
 fn served<'a>(
     graphs: &'a HashMap<(Bucket, u64), Graph>,
-    serving: u64,
+    top: u64,
     bucket: &Bucket,
 ) -> Option<(u64, &'a Graph)> {
     graphs
         .iter()
-        .filter(|((held, generation), _)| held == bucket && *generation <= serving)
+        .filter(|((held, generation), _)| held == bucket && *generation <= top)
         .max_by_key(|((_, generation), _)| *generation)
         .map(|((_, generation), graph)| (*generation, graph))
 }
@@ -1473,7 +1823,7 @@ fn shadowed(recorded: Recorded) -> (Table, u64) {
 /// Whether two launch tables hold the same launches: the same operators with the same keys in
 /// the same order, breaks included. Module paths are not compared: they name where a launch
 /// was issued, not what it launches.
-fn same_launches(left: &Table, right: &Table) -> bool {
+fn same_launches(left: &[(&'static str, String, String)], right: &Table) -> bool {
     left.len() == right.len()
         && left
             .iter()
@@ -1509,35 +1859,5 @@ fn changed_launches(table: &Table, serving: &Generation, next: &Generation) -> V
         .collect()
 }
 
-/// What `next` needs of a bucket whose serving graph has the launch table `held` and whose
-/// profile run now states `profiled`.
-fn preparation(
-    held: &Table,
-    profiled: &Table,
-    serving: &Generation,
-    next: &Generation,
-) -> Result<Preparation> {
-    // The new generation must hold a kernel wherever the serving one does: a bucket it cannot
-    // launch is an incomplete generation, not one to switch to.
-    for (operator, key, _) in profiled {
-        if *operator != BREAK && serving.contains(operator, key) && !next.contains(operator, key) {
-            return Err(Error::Interface(format!(
-                "generation {} holds no kernel of `{operator}` for `{key}`, which generation {} \
-                 launches",
-                next.number(),
-                serving.number()
-            )));
-        }
-    }
-
-    if !same_launches(held, profiled) {
-        return Ok(Preparation::Recapture);
-    }
-    if changed_launches(profiled, serving, next).is_empty() {
-        return Ok(Preparation::Keep);
-    }
-    Ok(Preparation::Rebind)
-}
-
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

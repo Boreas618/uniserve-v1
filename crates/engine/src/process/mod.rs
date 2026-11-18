@@ -47,7 +47,7 @@ mod reports;
 mod requests;
 mod start;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -295,6 +295,9 @@ pub(crate) struct MainProcess {
     serving: Packages,
     kept: Option<Packages>,
     prepared: Option<(Packages, Arc<wasmtime::Module>, Parameters)>,
+    /// Whether the KV cache gave segments back for the graphs of the generation update in
+    /// flight, which it grows back into once the update ends.
+    update_yielded: Arc<std::sync::atomic::AtomicBool>,
     /// The started epoch; `None` while starting.
     engine: Option<Engine>,
     /// The admitted requests' streams, by the engine's identity of each request.
@@ -381,6 +384,7 @@ impl MainProcess {
             serving,
             kept: None,
             prepared: None,
+            update_yielded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine: None,
             streams: HashMap::new(),
             named: HashMap::new(),
@@ -881,21 +885,45 @@ impl MainProcess {
         // A preparation whose shadow pass no running request reaches within the epoch's
         // comparison bound is abandoned, naming the operators it could not compare.
         let bound = self.launch.engine_config.worker.compare_timeout;
+        // The KV cache gives back the tail segments the room of a device lacks for the
+        // generation's graphs, until the update ends ([`Main::grow_after_update`]).
+        let parts = self.segment_parts().ok();
+        let yielded = Arc::clone(&self.update_yielded);
+        let room_workers = workers.clone();
+        let room = move |operators: &BTreeSet<String>| -> Result<()> {
+            let Some((schedulers, head, binding)) = &parts else {
+                return Ok(());
+            };
+            let rooms = generation::update_room(&room_workers, binding, operators)?;
+            let lacking: BTreeMap<[u8; 16], u64> = rooms
+                .iter()
+                .filter(|room| room.kv_units > 0)
+                .map(|room| (room.gpu, room.extra))
+                .collect();
+            if lacking.is_empty() {
+                return Ok(());
+            }
+
+            tracing::info!(?rooms, "the KV cache gives room to a generation's graphs");
+            yielded.store(true, std::sync::atomic::Ordering::Release);
+            operations::make_room(schedulers, head, binding, 0, &lacking)
+        };
         self.work(Box::new(move || {
-            let prepared = generation::kernels(&workers, &build, &named, &serving, generation)
-                .and_then(|kernels| {
-                    let (module, parameters) =
-                        generation::policy(&build.0, &policy, (&ceilings, &budget))?;
-                    // Only an operator whose package changed has an old kernel to compare with.
-                    // Every peer prepares the generation from its own daemon's command.
-                    let changed = changed_operators(&kernels, &serving);
-                    let uncompared = generation::compare(
-                        &shadows, &workers, &binding, generation, &changed, bound,
-                    )?;
-                    let mut packages = kernels;
-                    packages.insert(policy_slot(), policy);
-                    Ok(((packages, module, parameters), uncompared))
-                });
+            let prepared =
+                generation::kernels(&workers, &build, (&named, &serving), generation, &room)
+                    .and_then(|kernels| {
+                        let (module, parameters) =
+                            generation::policy(&build.0, &policy, (&ceilings, &budget))?;
+                        // Only an operator whose package changed has an old kernel to compare with.
+                        // Every peer prepares the generation from its own daemon's command.
+                        let changed = changed_operators(&kernels, &serving);
+                        let uncompared = generation::compare(
+                            &shadows, &workers, &binding, generation, &changed, bound,
+                        )?;
+                        let mut packages = kernels;
+                        packages.insert(policy_slot(), policy);
+                        Ok(((packages, module, parameters), uncompared))
+                    });
             done(move |main| main.prepared(generation, prepared))
         }));
     }
@@ -962,8 +990,10 @@ impl MainProcess {
         }));
     }
 
-    /// `Switch`: the prepared generation executes from one batch boundary of every scheduler,
-    /// the previous one kept; the route instance switches with it.
+    /// `Switch`: the prepared generation's policy executes from one batch boundary of every
+    /// scheduler and its kernels bucket by bucket as every rank captured them, the previous
+    /// generation kept; `Switched` is reported once the last bucket switched, which begins the
+    /// trial. The route instance switches with it.
     fn switch(&mut self, generation: u64) {
         if let Err(report) = lifecycle::switch(self.lifecycle, &mut self.update, generation) {
             return self.report(report);
@@ -986,10 +1016,12 @@ impl MainProcess {
         let route = engine.groups.clone();
         let binding = Arc::clone(&engine.binding);
         let served = Arc::clone(&engine.served);
+        let workers = engine.workers.clone();
         self.serial(Box::new(move || {
             let switched = generation::switch(
                 &schedulers,
                 route.as_deref(),
+                &workers,
                 &binding,
                 &served,
                 generation,
@@ -1060,8 +1092,9 @@ impl MainProcess {
         }
         let schedulers = engine.inboxes();
         let route = engine.groups.clone();
+        let workers = engine.workers.clone();
         self.serial(Box::new(move || {
-            let committed = generation::commit(&schedulers, route.as_deref(), generation);
+            let committed = generation::commit(&schedulers, route.as_deref(), &workers, generation);
             done(move |main| main.committed(generation, committed))
         }));
     }
@@ -1082,6 +1115,7 @@ impl MainProcess {
         {
             route.commit();
         }
+        self.grow_after_update();
         self.report(lifecycle::committed());
     }
 
@@ -1119,6 +1153,32 @@ impl MainProcess {
         }));
     }
 
+    /// Grows the KV cache back into the segments it gave a generation update's graphs, once the
+    /// update committed or rolled back and one generation's graphs remain.
+    fn grow_after_update(&mut self) {
+        if !self
+            .update_yielded
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let (schedulers, head, binding) = match self.segment_parts() {
+            Ok(parts) => parts,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "the cache does not grow back");
+                return;
+            }
+        };
+        self.serial(Box::new(move || {
+            let grown = epoch::grow(&schedulers, &head, &binding);
+            done(move |_| {
+                if let Err(error) = grown {
+                    tracing::warn!(error = %format!("{error:#}"), "growing the cache back failed");
+                }
+            })
+        }));
+    }
+
     /// A switch back to `kept` ended.
     fn rolled_back(&mut self, kept: u64, reason: String, rolled: Result<()>) {
         if let Err(error) = rolled {
@@ -1142,6 +1202,7 @@ impl MainProcess {
                 tracing::warn!(%error, "the route instance kept no policy to roll back to");
             }
         }
+        self.grow_after_update();
         self.report(lifecycle::rolled_back(reason));
     }
 

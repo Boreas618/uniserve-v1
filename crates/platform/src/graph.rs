@@ -1,30 +1,23 @@
-//! CUDA graphs: stream capture, the template graph, executable graphs,
-//! kernel-node rebinding and launch.
+//! CUDA graphs: stream capture, the template graph, executable graphs, and
+//! their launch and update.
 //!
 //! Capture is the driver's stream capture: operations issued on the capturing
 //! stream are recorded as nodes instead of executing, and the template graph
 //! is returned when the capture ends. An executable graph is instantiated
-//! from the template; the template stays alive as long as the executable or
-//! any node handle does, because `cuGraphExecKernelNodeSetParams` addresses a
-//! node of the graph the executable was instantiated from.
+//! from the template ([`Graph::instantiate`]), or an executable of the same
+//! topology takes a new template's nodes and parameters in place
+//! ([`GraphExec::update`]). The template stays alive as long as the executable
+//! or any node handle does.
 //!
-//! Two kernel updates exist (design 4.5):
-//!
-//! - rebind, [`GraphExec::set_kernel_node_params`], changes a kernel node's
-//!   function, grid, block, dynamic shared memory and arguments in place;
-//! - recapture, a new [`Capture`] of the same work, is what a program whose
-//!   launch *attributes* (cluster, programmatic dependent launch, cooperative
-//!   launch) change needs, because those are fixed in a graph node when it is
-//!   captured and no driver call updates them afterwards.
+//! A graph is never changed node by node: the work of other kernels is a new
+//! capture of the same forward under them, which records whatever launches,
+//! launch attributes and library kernels they issue.
 
-use std::collections::HashSet;
-use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::driver::{self, Handle};
-use crate::launch::Function;
 use crate::sys::cuda as sys;
-use crate::{Device, DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
+use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
 
 /// What a template graph, its executable and its nodes share: the `CUgraph`,
 /// the context it belongs to, and the device.
@@ -117,11 +110,6 @@ impl Graph {
     /// one.** Do not map an operation onto a range of indices here: a graph
     /// captured from two launches may list them in either order, and the order
     /// can differ between the capture that made it and a later read.
-    ///
-    /// An owner that needs the nodes *one operation* added, in the order they
-    /// can execute, calls [`Capture::record`] after issuing that operation:
-    /// the capture knows which nodes are new, and returns them in order. That
-    /// is the record a rebind is issued against.
     pub fn nodes(&self) -> Result<Vec<GraphNode>> {
         let handles = self.node_handles()?;
         Ok(handles
@@ -155,98 +143,6 @@ impl Graph {
         nodes.truncate(count);
         Ok(nodes)
     }
-
-    /// Reads back the parameters of kernel node `node`: the kernel it
-    /// captured, its grid, block, dynamic shared memory and the values of its
-    /// arguments.
-    ///
-    /// This is the read half of a rebind walk (design 4.5): a capture with the
-    /// new kernels on a scratch stream gives a throwaway template, each of its
-    /// changed launches is read with this, and the values are set on the live
-    /// executable. `node` must be a kernel node of this graph, and the graph
-    /// may be destroyed once the returned values have been read.
-    pub fn kernel_node_params(&self, node: &GraphNode) -> Result<OwnedKernelNodeParams> {
-        if !Arc::ptr_eq(&self.core, &node.core) {
-            return Err(Error::invalid("the node belongs to another graph"));
-        }
-        let kind = node.kind()?;
-        if kind != GraphNodeKind::Kernel {
-            return Err(Error::invalid(format!(
-                "the node is {kind:?}, not a kernel node"
-            )));
-        }
-
-        let driver = driver::driver()?;
-        let _context = self.core.context.enter()?;
-        let mut raw = sys::CUDA_KERNEL_NODE_PARAMS::default();
-        driver.check(
-            // SAFETY: the node is a live kernel node of this graph; the driver
-            // fills `raw` with the node's own parameter storage.
-            unsafe { (driver.graph_kernel_node_get_params)(node.raw, &mut raw) },
-            "cuGraphKernelNodeGetParams",
-        )?;
-
-        // Each parameter's size comes from the kernel's signature: the node's
-        // array carries no count, so the walk ends where the driver does.
-        let mut sizes = Vec::new();
-        while let Some(parameter) = crate::launch::param_at(raw.func.cast(), sizes.len())? {
-            sizes.push((parameter.offset(), parameter.size()));
-        }
-
-        let mut parameters = Vec::with_capacity(sizes.len());
-        for (index, (offset, size)) in sizes.into_iter().enumerate() {
-            // SAFETY: the node's array has one entry per parameter of the
-            // signature, and its packed form lays the values out at the
-            // offsets just read; each value is `size` bytes there.
-            let source: *const c_void = unsafe {
-                if !raw.kernelParams.is_null() {
-                    *raw.kernelParams.add(index)
-                } else {
-                    (raw.extra as *const u8).add(offset).cast()
-                }
-            };
-            let mut value = vec![0u8; size];
-            if size > 0 {
-                // SAFETY: `source` addresses `size` readable bytes, as the
-                // signature says, and `value` holds exactly that many.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(source.cast::<u8>(), value.as_mut_ptr(), size)
-                };
-            }
-            parameters.push(value);
-        }
-
-        Ok(OwnedKernelNodeParams {
-            function: Function::new(raw.func.cast(), Device::new(self.core.device)?),
-            grid: [raw.gridDimX, raw.gridDimY, raw.gridDimZ],
-            block: [raw.blockDimX, raw.blockDimY, raw.blockDimZ],
-            shared_memory: raw.sharedMemBytes,
-            parameters,
-        })
-    }
-}
-
-/// The template graph's root nodes: those with no dependency.
-fn root_handles(core: &Core) -> Result<Vec<Handle>> {
-    let driver = driver::driver()?;
-    let _context = core.context.enter()?;
-    let mut count = 0usize;
-    driver.check(
-        // SAFETY: a null array asks only for the count.
-        unsafe { (driver.graph_get_root_nodes)(core.raw, std::ptr::null_mut(), &mut count) },
-        "cuGraphGetRootNodes",
-    )?;
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    let mut nodes = vec![std::ptr::null_mut(); count];
-    driver.check(
-        // SAFETY: the array holds `count` handles, which the driver fills.
-        unsafe { (driver.graph_get_root_nodes)(core.raw, nodes.as_mut_ptr(), &mut count) },
-        "cuGraphGetRootNodes",
-    )?;
-    nodes.truncate(count);
-    Ok(nodes)
 }
 
 /// One node of a template graph (`CUgraphNode`).
@@ -265,12 +161,9 @@ unsafe impl Send for GraphNode {}
 unsafe impl Sync for GraphNode {}
 
 impl GraphNode {
-    /// What work the node does (`cuGraphNodeGetType`).
-    ///
-    /// A rebind touches only [`GraphNodeKind::Kernel`] nodes; the capture of
-    /// an operation may add others (a copy of a constant, or the empty node
-    /// that joins dependencies), and setting kernel parameters on one of them
-    /// is the driver's error.
+    /// What work the node does (`cuGraphNodeGetType`): the capture of an
+    /// operation may add other nodes than kernels, such as a copy of a constant
+    /// or the empty node that joins dependencies.
     pub fn kind(&self) -> Result<GraphNodeKind> {
         let driver = driver::driver()?;
         let _context = self.core.context.enter()?;
@@ -295,7 +188,7 @@ impl GraphNode {
 /// The kind of work a graph node does (`CUgraphNodeType`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphNodeKind {
-    /// A kernel launch, the only kind a rebind changes.
+    /// A kernel launch.
     Kernel,
     /// A memory copy.
     Memcpy,
@@ -309,76 +202,6 @@ pub enum GraphNodeKind {
     Empty,
     /// A kind this binding does not name, as the driver's number.
     Other(u32),
-}
-
-/// The parameters a rebind may change in one kernel node.
-///
-/// The launch attributes — the cluster, programmatic dependent launch and
-/// cooperative launch — are not part of a node's parameters: they are fixed
-/// when the node is captured. A program that changes any of them is
-/// recaptured rather than rebound, which the runner decides by comparing the
-/// two programs' metadata.
-pub struct KernelNodeParams<'a> {
-    /// The kernel to run.
-    pub function: &'a Function,
-    /// Blocks per grid dimension.
-    pub grid: [u32; 3],
-    /// Threads per block dimension.
-    pub block: [u32; 3],
-    /// Dynamic shared memory per block, in bytes.
-    pub shared_memory: u32,
-    /// The address of each kernel parameter's value, in declaration order.
-    pub parameters: &'a [*mut c_void],
-}
-
-/// A kernel node's parameters read back from a template graph, owned by the
-/// caller.
-///
-/// [`Graph::kernel_node_params`] fills one from a node of a throwaway capture;
-/// a rebind walk then sets the changed ones on the live executable with
-/// [`GraphExec::set_kernel_node_params_owned`], which replaces the function of
-/// the kernel that answers for the node.
-///
-/// The values are copied out of the node — the driver keeps each parameter's
-/// size in the kernel's signature — so nothing dangles when the template is
-/// destroyed.
-#[derive(Clone)]
-pub struct OwnedKernelNodeParams {
-    /// The kernel the node captured. Valid while the library it was loaded
-    /// from is loaded, the same obligation a captured graph has.
-    pub function: Function,
-    /// Blocks per grid dimension.
-    pub grid: [u32; 3],
-    /// Threads per block dimension.
-    pub block: [u32; 3],
-    /// Dynamic shared memory per block, in bytes.
-    pub shared_memory: u32,
-    /// Each parameter's value, copied, in declaration order.
-    pub parameters: Vec<Vec<u8>>,
-}
-
-impl std::fmt::Debug for OwnedKernelNodeParams {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OwnedKernelNodeParams")
-            .field("function", &(self.function.raw() as usize))
-            .field("grid", &self.grid)
-            .field("block", &self.block)
-            .field("shared_memory", &self.shared_memory)
-            .field("parameters", &self.parameters)
-            .finish()
-    }
-}
-
-impl OwnedKernelNodeParams {
-    /// Pointers to the copied values, as [`KernelNodeParams`] takes them. The
-    /// pointers are valid while this value is alive and not mutated.
-    pub fn pointers(&self) -> Vec<*mut c_void> {
-        self.parameters
-            .iter()
-            .map(|value| value.as_ptr().cast_mut().cast())
-            .collect()
-    }
 }
 
 /// A captured graph instantiated for replay (`CUgraphExec`).
@@ -416,84 +239,36 @@ impl GraphExec {
         )
     }
 
-    /// Replaces the work of `node` in this executable with `params`: the
-    /// function, the grid and block dimensions, the dynamic shared-memory
-    /// size, and the argument values. It affects only future launches; one
-    /// already enqueued or running is unaffected, and the template node is not
-    /// modified.
+    /// Writes `graph` into this executable in place (`cuGraphExecUpdate`): from the next launch
+    /// on it runs `graph`'s nodes and parameters, without an instantiation. A launch already
+    /// enqueued runs what it was enqueued with. The update holds only for a graph of this
+    /// executable's topology, node kinds and kernel contexts; the driver refuses any other and
+    /// the executable is left as it was.
     ///
-    /// `node` must be a kernel node of the graph this executable was
-    /// instantiated from, and `params.function` must belong to the same
-    /// context; the node's launch attributes stay as they were captured.
-    pub fn set_kernel_node_params(
-        &self,
-        node: GraphNode,
-        params: &KernelNodeParams<'_>,
-    ) -> Result<()> {
-        if !Arc::ptr_eq(&self.core, &node.core) {
-            return Err(Error::invalid(
-                "the node does not belong to the graph this executable was instantiated from",
-            ));
-        }
-        if params.function.device().id() != self.core.device {
-            return Err(Error::invalid(
-                "the node's function belongs to another device",
-            ));
-        }
-
+    /// # Errors
+    ///
+    /// The driver's refusal, with the update's result code when it states one.
+    pub fn update(&self, graph: &Graph) -> Result<()> {
         let driver = driver::driver()?;
         let _context = self.core.context.enter()?;
-        let mut kind = 0;
-        driver.check(
-            // SAFETY: the node belongs to a graph that is live.
-            unsafe { (driver.graph_node_get_type)(node.raw, &mut kind) },
-            "cuGraphNodeGetType",
-        )?;
-        if kind != sys::CU_GRAPH_NODE_TYPE_KERNEL {
-            return Err(Error::invalid(format!(
-                "the node is of type {kind}, not a kernel node"
+        let mut info = driver::ExecUpdateInfo {
+            result: 0,
+            error_node: std::ptr::null_mut(),
+            error_from_node: std::ptr::null_mut(),
+        };
+        let checked = driver.check(
+            // SAFETY: both handles are live while their values are; the driver writes the
+            // result into the local `info`.
+            unsafe { (driver.graph_exec_update)(self.raw, graph.core.raw, &mut info) },
+            "cuGraphExecUpdate_v2",
+        );
+        if checked.is_err() && info.result != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "cuGraphExecUpdate refused the graph with update result {}",
+                info.result
             )));
         }
-
-        let raw = sys::CUDA_KERNEL_NODE_PARAMS {
-            func: params.function.raw().cast(),
-            gridDimX: params.grid[0],
-            gridDimY: params.grid[1],
-            gridDimZ: params.grid[2],
-            blockDimX: params.block[0],
-            blockDimY: params.block[1],
-            blockDimZ: params.block[2],
-            sharedMemBytes: params.shared_memory,
-            kernelParams: params.parameters.as_ptr().cast_mut(),
-            ..Default::default()
-        };
-        driver.check(
-            // SAFETY: the executable and node are live and belong together;
-            // the parameter array outlives the call, and the driver copies
-            // the values it points at.
-            unsafe { (driver.graph_exec_kernel_node_set_params)(self.raw, node.raw, &raw) },
-            "cuGraphExecKernelNodeSetParams",
-        )
-    }
-    /// Sets parameters read back from a template's node on this executable:
-    /// the values of [`Graph::kernel_node_params`], with the function a rebind
-    /// chooses.
-    pub fn set_kernel_node_params_owned(
-        &self,
-        node: GraphNode,
-        params: &OwnedKernelNodeParams,
-    ) -> Result<()> {
-        let pointers = params.pointers();
-        self.set_kernel_node_params(
-            node,
-            &KernelNodeParams {
-                function: &params.function,
-                grid: params.grid,
-                block: params.block,
-                shared_memory: params.shared_memory,
-                parameters: &pointers,
-            },
-        )
+        checked
     }
 }
 
@@ -532,20 +307,9 @@ pub fn open_captures() -> usize {
 /// current on this thread until it ends, so it is not `Send`: a capture is
 /// begun, recorded and ended on one thread, as the worker that runs it is
 /// one thread per device.
-///
-/// [`Capture::record`] is called after each operation the owner issues: it
-/// returns the nodes the operation added, in the order they can execute, which
-/// is what the owner records to rebind a graph later.
 pub struct Capture {
     stream: Stream,
     core: Arc<Core>,
-    /// The dependency set of the next node: the nodes added by the previous
-    /// operation end here, and the next operation's nodes are reachable from
-    /// them.
-    frontier: Vec<Handle>,
-    /// Every node recorded so far, so an operation's nodes are exactly the new
-    /// ones.
-    seen: HashSet<usize>,
     ended: bool,
     // Keeps the context current on this thread for the capture's lifetime,
     // and makes the capture thread-bound.
@@ -593,8 +357,7 @@ impl Capture {
             "cuStreamBeginCapture",
         )?;
 
-        let (status, graph, frontier) = capture_info(stream)?;
-        let frontier: Vec<Handle> = frontier.into_iter().map(|(node, _)| node).collect();
+        let (status, graph) = capture_info(stream)?;
         if status != sys::CU_STREAM_CAPTURE_STATUS_ACTIVE {
             return Err(Error::invalid(format!(
                 "the stream's capture is in status {status} right after it began"
@@ -608,116 +371,9 @@ impl Capture {
                 context,
                 device: stream.device(),
             }),
-            frontier,
-            seen: HashSet::new(),
             ended: false,
             _context: guard,
         })
-    }
-
-    /// The nodes the work issued since the previous call added, in an order
-    /// that respects their dependencies; before the first operation, none.
-    ///
-    /// Call it after each operation the owner issues on the capturing stream:
-    /// the nodes are that operation's, and the owner records which operation
-    /// they belong to for a later rebind.
-    pub fn record(&mut self) -> Result<Vec<GraphNode>> {
-        Ok(self
-            .record_walk()?
-            .into_iter()
-            .map(|walked| walked.node)
-            .collect())
-    }
-
-    /// [`Self::record`], with the kind of every dependency that reaches each node.
-    ///
-    /// This is the walk a structure comparison reads: two captures of the same work
-    /// are compared per operation and per position, so the kinds belong to the
-    /// positions rather than to the handles. A rebind sets node parameters and keeps
-    /// the template's edges, so a launch whose edge became programmatic is a
-    /// structure change and its bucket is recaptured.
-    pub fn record_walk(&mut self) -> Result<Vec<WalkedNode>> {
-        let (status, _, frontier) = capture_info(&self.stream)?;
-        if status != sys::CU_STREAM_CAPTURE_STATUS_ACTIVE {
-            return Err(Error::invalid(format!(
-                "the capture is in status {status}; no node can be recorded"
-            )));
-        }
-
-        let mut found: Vec<Handle> = Vec::new();
-        let mut fresh: HashSet<usize> = HashSet::new();
-        let mut kinds: std::collections::HashMap<usize, Vec<EdgeKind>> =
-            std::collections::HashMap::new();
-        // The frontier's own edge data is read and dropped: the driver refuses a
-        // frontier query that asks for its nodes without it, and what it describes is
-        // the edge the *next* operation will add - which the walk reads from that
-        // edge itself once it exists. Attributing it here would state a kind for an
-        // edge this operation did not create.
-        for (_, data) in &frontier {
-            EdgeKind::of(data)?;
-        }
-        // The frontier names the nodes the *next* operation will depend on, so after an operation
-        // has been issued they are the nodes that operation added - the very nodes this walk is
-        // asked for. Collecting only the frontier's dependents finds nothing for a launch, because
-        // the node the launch just added has no dependents yet: the first walk of a capture found
-        // its node only because that node was also a root, and every launch after it was invisible.
-        for (node, _) in &frontier {
-            if self.seen.insert(*node as usize) {
-                found.push(*node);
-                fresh.insert(*node as usize);
-            }
-        }
-        // The walk starts at the *previous* frontier as well as this one. An operation may add more
-        // than one node - a native module that launches two kernels, a reduction beside its main
-        // pass - and only the last of them is the frontier: the earlier ones are reached by walking
-        // downstream from where the operation began, and `seen` keeps a node from being collected
-        // twice.
-        let mut queue: std::collections::VecDeque<Handle> = self
-            .frontier
-            .iter()
-            .copied()
-            .chain(frontier.iter().map(|(node, _)| *node))
-            .collect();
-        // The next node depends on the frontier. When the dependency set is
-        // empty (the first operation, or an operation that clears it), the
-        // new nodes are the graph's root nodes instead.
-        for root in root_handles(&self.core)? {
-            if self.seen.insert(root as usize) {
-                found.push(root);
-                fresh.insert(root as usize);
-                queue.push_back(root);
-            }
-        }
-        while let Some(node) = queue.pop_front() {
-            // Both edge kinds are dependencies: a programmatic edge lets the
-            // downstream node start early, not become unrelated to it.
-            for (dependent, data) in dependent_edges(node)? {
-                if fresh.contains(&(dependent as usize)) {
-                    // Every edge between the nodes this operation added is stated,
-                    // in the order the walk reaches their upstream ends, so the list
-                    // is the same for two captures of the same work.
-                    let entry = kinds.entry(dependent as usize).or_default();
-                    entry.push(EdgeKind::of(&data)?);
-                }
-                if self.seen.insert(dependent as usize) {
-                    found.push(dependent);
-                    fresh.insert(dependent as usize);
-                    queue.push_back(dependent);
-                }
-            }
-        }
-        self.frontier = frontier.into_iter().map(|(node, _)| node).collect();
-
-        Ok(found
-            .into_iter()
-            .map(|raw| WalkedNode {
-                node: GraphNode {
-                    core: Arc::clone(&self.core),
-                    raw,
-                },
-                incoming: kinds.remove(&(raw as usize)).unwrap_or_default(),
-            })
-            .collect())
     }
 
     /// Ends the capture and returns the template graph. `stream` is usable
@@ -733,7 +389,7 @@ impl Capture {
         self.ended = true;
         OPEN_CAPTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // The driver promises the same graph at the end of the capture; a
-        // different handle would leave the node handles of `record` dangling.
+        // different handle would leave the template's node handles dangling.
         debug_assert_eq!(raw, self.core.raw);
         Ok(Graph {
             core: Arc::clone(&self.core),
@@ -759,19 +415,14 @@ impl Drop for Capture {
     }
 }
 
-/// The nodes the next operation will depend on, each with what its edge says.
-type Frontier = Vec<(Handle, sys::CUgraphEdgeData)>;
-
-/// The stream's capture status, the graph being captured, and the dependency
-/// set of the next node, with what each of those edges says
+/// The stream's capture status and the graph being captured
 /// (`cuStreamGetCaptureInfo_v3`).
 ///
-/// **The edge-data array is read for the same reason the walk reads it:** the
+/// The dependency and edge-data arrays are asked for, though unread: the
 /// driver refuses a query that asks for a capture's dependencies without their
 /// edge data when one of them carries non-default data
-/// (`CUDA_ERROR_LOSSY_QUERY`), and the frontier edge of a programmatic
-/// dependent launch is exactly such an edge.
-fn capture_info(stream: &Stream) -> Result<(sys::CUstreamCaptureStatus, Handle, Frontier)> {
+/// (`CUDA_ERROR_LOSSY_QUERY`), as a programmatic dependent launch's does.
+fn capture_info(stream: &Stream) -> Result<(sys::CUstreamCaptureStatus, Handle)> {
     let driver = driver::driver()?;
     let mut status = 0;
     let mut id = 0u64;
@@ -796,141 +447,5 @@ fn capture_info(stream: &Stream) -> Result<(sys::CUstreamCaptureStatus, Handle, 
         },
         "cuStreamGetCaptureInfo_v3",
     )?;
-    let frontier = if dependencies.is_null() || count == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: the driver returns `count` node handles, and `count` edge
-        // data entries when it was asked for them, valid until the next call
-        // that operates on the stream.
-        let nodes = unsafe { std::slice::from_raw_parts(dependencies, count) };
-        let data = if edge_data.is_null() {
-            Vec::new()
-        } else {
-            // SAFETY: as above; the array is `count` entries and was returned
-            // with the node array.
-            unsafe { std::slice::from_raw_parts(edge_data, count) }.to_vec()
-        };
-        nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| (*node, data.get(index).copied().unwrap_or_default()))
-            .collect()
-    };
-    Ok((status, graph, frontier))
-}
-
-/// The nodes that depend directly on `node`, with what each edge says
-/// (`cuGraphNodeGetDependentNodes`).
-///
-/// # Why both arrays are always passed
-///
-/// The driver refuses a query that asks for dependent nodes without their edge
-/// data as soon as one edge carries non-default data: `CUDA_ERROR_LOSSY_QUERY`
-/// (`cuda.h`, `cuGraphNodeGetDependentNodes`: "if an edge has non-zero
-/// (non-default) edge data and `edgeData` is NULL, this API will return
-/// CUDA_ERROR_LOSSY_QUERY"). A programmatic dependent launch is exactly such an
-/// edge, so a captured kernel that triggers its successor early made this walk
-/// fail on a null array - and `edgeData` cannot be passed alone either, because
-/// the driver requires `dependentNodes` with it.
-///
-/// The array sizes are therefore guessed and grown rather than counted first:
-/// there is no way to ask for the count of a graph whose edges carry data. The
-/// driver fills what fits and answers how many it wrote, so one call with room
-/// for eight is most nodes and the loop is bounded by the real out-degree.
-fn dependent_edges(node: Handle) -> Result<Vec<(Handle, sys::CUgraphEdgeData)>> {
-    let driver = driver::driver()?;
-    let mut capacity = 8usize;
-    loop {
-        let mut nodes = vec![std::ptr::null_mut(); capacity];
-        let mut data = vec![sys::CUgraphEdgeData::default(); capacity];
-        let mut count = capacity;
-        driver.check(
-            // SAFETY: both arrays hold `capacity` entries and the driver writes
-            // at most that many, answering the number it wrote.
-            unsafe {
-                (driver.graph_node_get_dependent_nodes)(
-                    node,
-                    nodes.as_mut_ptr(),
-                    data.as_mut_ptr(),
-                    &mut count,
-                )
-            },
-            "cuGraphNodeGetDependentNodes",
-        )?;
-        if count <= capacity {
-            nodes.truncate(count);
-            data.truncate(count);
-            return Ok(nodes.into_iter().zip(data).collect());
-        }
-        // The driver filled the array whole: more dependents than it held.
-        capacity = count;
-    }
-}
-
-/// What one edge of a captured graph means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EdgeKind {
-    /// The downstream node starts when the upstream node has finished
-    /// executing, with the upstream node's writes visible to it.
-    Completion,
-    /// **A programmatic dependent launch.** The downstream node may start
-    /// before the upstream node finishes: it is launched at the upstream node's
-    /// programmatic trigger point and synchronizes itself with
-    /// `cudaGridDependencySynchronize`.
-    ///
-    /// It is still a dependency - the walk follows it, and the node it reaches
-    /// belongs to the operation that issued it - but it orders **less** than a
-    /// completion edge: the upstream node has not finished when the downstream
-    /// one begins, so nothing may treat the two as interchangeable. Anything
-    /// that reorders, rebinds or compares captured graphs reads the kind, and a
-    /// comparison of two graph structures that ignores it compares two different
-    /// orders as one.
-    Programmatic,
-}
-
-impl EdgeKind {
-    /// The kind `data` states, or an error for a value this walk does not know.
-    ///
-    /// A kind it does not know is refused rather than read as a completion
-    /// edge: the driver may add kinds, and a walk that guessed would put a
-    /// weaker order where a stronger one was meant.
-    ///
-    /// The driver states a programmatic edge in either of two ways - the
-    /// dependency kind itself, or the default kind with the upstream node's
-    /// programmatic port - so both are read, and a comparison of two captures
-    /// does not depend on which encoding the driver used in each.
-    fn of(data: &sys::CUgraphEdgeData) -> Result<Self> {
-        let programmatic_port =
-            u32::from(data.from_port) == sys::CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC;
-        match u32::from(data.type_) {
-            sys::CU_GRAPH_DEPENDENCY_TYPE_DEFAULT if !programmatic_port => Ok(Self::Completion),
-            sys::CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC | sys::CU_GRAPH_DEPENDENCY_TYPE_DEFAULT => {
-                Ok(Self::Programmatic)
-            }
-            other => Err(Error::invalid(format!(
-                "a graph edge states dependency kind {other}, which this walk does not know"
-            ))),
-        }
-    }
-}
-
-/// One node an operation added, with the kinds of the dependencies that reach it.
-///
-/// The edges are stated **per node, in the walk's order**, rather than as pairs of
-/// driver handles. Two captures of the same work are compared position by position
-/// (design 4.5's rebind condition), and a handle belongs to one graph while a
-/// position belongs to the order both walks agree on.
-///
-/// `incoming` holds a kind for every edge that reaches this node from another node
-/// of the same walk, in the order their upstream ends are walked - so two captures of
-/// the same work state the same vectors. An edge into a node added by an earlier
-/// operation is not listed: it is that operation's, and it was stated then.
-#[derive(Clone, Debug)]
-pub struct WalkedNode {
-    /// The node the operation added.
-    pub node: GraphNode,
-    /// The kinds of the edges from the nodes already walked into this one, in the
-    /// driver's order. A node an operation added after another operation's nodes has
-    /// one entry per dependency that crosses the boundary.
-    pub incoming: Vec<EdgeKind>,
+    Ok((status, graph))
 }

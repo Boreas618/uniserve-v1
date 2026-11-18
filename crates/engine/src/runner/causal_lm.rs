@@ -8,7 +8,7 @@
 //! ## The forward
 //!
 //! One function computes every bucket, on the meta device for the profile run, under a capture,
-//! and again before each replay ([`Runner::forward`]). It is tensor operations and model calls
+//! and again before each replay ([`Forward::forward`]). It is tensor operations and model calls
 //! over the input tensors alone:
 //!
 //! ```text
@@ -172,7 +172,7 @@ use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
 use tensor::{DType, Shape, Tensor};
 
 use self::columns::{Column, Layout, Refusal};
-use self::experts::Member;
+use self::experts::{Member, Regions};
 use self::features::Features;
 use self::readback::{Pending, Readback};
 use self::slots::Slots;
@@ -182,10 +182,10 @@ use crate::memory::cache::{CacheLayout, scratch};
 use crate::memory::state::layer_fields;
 use crate::memory::tables::{BlockCopy, BlockTables, Change};
 use crate::runner::DeviceCopy;
-use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
 use crate::runner::sampler::{self, Sampler, SamplerConfig};
+use crate::runner::{Forward, Runner};
 use crate::worker::completion::Waker;
 use crate::worker::{Error, Result};
 
@@ -297,6 +297,9 @@ pub struct CausalLmRunner {
     /// This rank's member of the expert union, for a model whose experts are split across
     /// ranks.
     union: Option<Member>,
+    /// What the member of the union lends the runner's forwards: the transport's regions, with
+    /// which every forward instance of the runner shapes its exchange.
+    regions: Option<Regions>,
     /// What a runner that speculates holds beside its sampler: the draft cache it is lent,
     /// the selection of its verifications and what its forwards keep.
     speculation: Option<Speculation>,
@@ -605,6 +608,7 @@ impl CausalLmRunner {
             scratch: Vec::new(),
             paired: Cell::new(false),
             union: None,
+            regions: None,
             stream,
             features: None,
             staged: Vec::new(),
@@ -825,8 +829,10 @@ impl CausalLmRunner {
         }
 
         self.buckets = experts::classes(&self.config.buckets, member.capacity(), member.beside());
-        self.graphs
-            .set_exchange(member.transport(), Some(member.meet()));
+        // A union's members meet in each step's agreement; a capture runs no exchange, and a
+        // rehearsal issues none, so no forward meets the members on its own.
+        self.graphs.set_exchange(member.transport(), None);
+        self.regions = Some(member.regions());
         self.union = Some(member);
         Ok(())
     }
@@ -1484,20 +1490,7 @@ impl CausalLmRunner {
     }
 }
 
-impl Runner for CausalLmRunner {
-    fn phases(&self) -> &[Phase] {
-        &self.config.phases
-    }
-
-    /// A warm-up's forwards are run in step by every member of the runner's expert union: each
-    /// exchange launch of such a forward first meets the other members on the host. A runner
-    /// outside a union ignores it.
-    fn set_warming(&self, warming: bool) {
-        if let Some(member) = &self.union {
-            member.set_warming(warming);
-        }
-    }
-
+impl Forward for CausalLmRunner {
     fn buckets(&self) -> Vec<Bucket> {
         self.buckets.capture_order().copied().collect()
     }
@@ -1520,12 +1513,12 @@ impl Runner for CausalLmRunner {
         // A member of an expert union is lent the exchange of the bucket's capacity class. Its
         // join, and every bucket of a member that holds experts alone, is the expert layers
         // of a step with no tokens of the member's own, and returns no output.
-        let exchange = match &self.union {
-            Some(member) => Some(member.exchange(bucket.capacity)?),
+        let exchange = match &self.regions {
+            Some(regions) => Some(regions.exchange(bucket.capacity)?),
             None => None,
         };
         let joins = bucket.variant == Variant::ExpertJoin
-            || self.union.as_ref().is_some_and(Member::experts_only);
+            || self.regions.as_ref().is_some_and(Regions::experts_only);
         if joins {
             let exchange = exchange.ok_or_else(|| {
                 Error::Invariant(format!(
@@ -1807,6 +1800,57 @@ impl Runner for CausalLmRunner {
         }
     }
 
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for CausalLmRunner {
+    fn phases(&self) -> &[Phase] {
+        &self.config.phases
+    }
+
+    /// The runner's forward over `graphs`: the model, the slot state, the cache and the state
+    /// buffers, the scratch page set, the feature buffer and the union's regions are the
+    /// runner's own, which idle inputs address only at their padding rows and pages. A
+    /// speculating runner's kept outputs, which its drafter's forward and its completion read at
+    /// fixed addresses, are the runner's own beside its graphs and the instance's own for a
+    /// rehearsal.
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        let speculation = match &self.speculation {
+            Some(speculation) if graphs.rehearses() => Some(Speculation {
+                kept: speculation.kept.alike(graphs.stream())?,
+                ..speculation.clone()
+            }),
+            other => other.clone(),
+        };
+
+        Ok(Box::new(Self {
+            model: Arc::clone(&self.model),
+            config: self.config.clone(),
+            graphs,
+            layout: self.layout.clone(),
+            slots: self.slots.shared(),
+            sampler: self.sampler.clone(),
+            cache: self.cache.clone(),
+            state: self.state.clone(),
+            page_work: None,
+            scratch: self.scratch.clone(),
+            paired: Cell::new(false),
+            buckets: self.buckets.clone(),
+            union: None,
+            regions: self.regions.clone(),
+            speculation,
+            stream: None,
+            features: self.features.clone(),
+            staged: Vec::new(),
+            readback: None,
+            launched: 0,
+            flights: VecDeque::new(),
+            lander: None,
+        }))
+    }
+
     /// Prepares the inputs of a step of `batch` over `tables`.
     ///
     /// # Errors
@@ -2062,10 +2106,6 @@ impl Runner for CausalLmRunner {
 
         ended?;
         settled
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 }
 

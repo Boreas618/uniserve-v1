@@ -48,7 +48,7 @@
 //! candidate is the bucket's extent, and candidates its padding collapses onto one layout share
 //! the bucket of the first, which is the request its graph is captured from. A step's bucket is
 //! captured; a preparation's bucket of the same extent is profiled and run eagerly
-//! ([`Runner::eager_buckets`]), and its profile opens the candidate and each condition set a
+//! ([`Forward::eager_buckets`]), and its profile opens the candidate and each condition set a
 //! request of it may open with, after the model's initialization, so the runner's region holds
 //! the largest opening and every generation resolves their kernels.
 //!
@@ -91,9 +91,9 @@ use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::latent::restore::Stored;
 use crate::memory::lend;
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
+use crate::runner::{Forward, Runner};
 use crate::worker::{Error, Result};
 
 /// The element type the media host lays a request's condition pixels and samples out in: the
@@ -824,11 +824,7 @@ impl DenoiserRunner {
     }
 }
 
-impl Runner for DenoiserRunner {
-    fn phases(&self) -> &[Phase] {
-        &self.config.phases
-    }
-
+impl Forward for DenoiserRunner {
     fn buckets(&self) -> Vec<Bucket> {
         self.buckets.capture_order().copied().collect()
     }
@@ -918,6 +914,40 @@ impl Runner for DenoiserRunner {
         self.served(bucket).map(|_| ())
     }
 
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for DenoiserRunner {
+    fn phases(&self) -> &[Phase] {
+        &self.config.phases
+    }
+
+    /// The denoiser over `graphs`, over the runner's state buffer when they lie beside the
+    /// runner's graphs, and over one of its own for a rehearsal: a step writes its latents there.
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        let state = crate::runner::instance_memory(&graphs, self.state.as_ref(), self.bytes)?;
+
+        Ok(Box::new(Self {
+            model: Arc::clone(&self.model),
+            config: self.config.clone(),
+            graphs,
+            memory: Arc::clone(&self.memory),
+            stream: None,
+            done: None,
+            served: self.served.clone(),
+            buckets: self.buckets.clone(),
+            text_width: self.text_width,
+            state,
+            bytes: self.bytes,
+            tensors: self.tensors,
+            encoding: self.encoding,
+            current_step: RefCell::new(None),
+            current_opening: RefCell::new(None),
+        }))
+    }
+
     fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
         let (bucket, row) = self.call(batch)?;
         if bucket.variant == Variant::Denoise {
@@ -996,10 +1026,6 @@ impl Runner for DenoiserRunner {
     /// The copies were issued on the runner's stream, which this waits for.
     fn wait_copies(&mut self) -> Result<()> {
         settle(self.stream.as_ref())
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 
     /// The model's tables are computed from its weights, so they are filled again.

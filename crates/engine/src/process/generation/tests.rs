@@ -72,6 +72,7 @@ fn on_trial() -> Node {
     switch(
         &node.schedulers,
         Some(&node.route),
+        &node.workers,
         &node.binding,
         &node.served,
         2,
@@ -95,7 +96,7 @@ fn a_switch_moves_the_schedulers_and_every_worker_to_the_generation() {
 fn a_commit_leaves_the_generation_on_trial_alone() {
     let node = on_trial();
 
-    commit(&node.schedulers, Some(&node.route), 2).unwrap();
+    commit(&node.schedulers, Some(&node.route), &node.workers, 2).unwrap();
     assert_eq!(node.served.kernels(), 2);
     assert_eq!(serving(&node), [2]);
     assert!(holds_one(&node));
@@ -130,6 +131,7 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
     let failed = switch(
         &node.schedulers,
         Some(&node.route),
+        &node.workers,
         &node.binding,
         &node.served,
         2,

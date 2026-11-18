@@ -32,7 +32,7 @@
 //! The processor sizes an image to any grid of whole merge blocks, and [`Vision`] enumerates
 //! none of them, so the runner states its buckets by their extent: the grid of `rows` rows and
 //! one grid per doubling of the merged rows below it, each the most nearly square grid of its
-//! rows. Warm-up captures each of them ([`Runner::buckets`]); an image of one of those grids
+//! rows. Warm-up captures each of them ([`Forward::buckets`]); an image of one of those grids
 //! replays its graph, and every other grid runs eagerly over the same input block and region,
 //! under the bucket of its patch rows. A forward's launches and memory follow its patch rows, so
 //! the profile run of the captured grids sizes the runner's region for every grid an admitted
@@ -55,9 +55,9 @@ use tensor::{DType, Tensor};
 use super::{DeviceCopy, address, conditions, element_bytes, issue, performed, refused, settle};
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::runner::graphs::Graphs;
+use crate::runner::{Forward, Runner};
 use crate::worker::{Error, Result};
 
 /// The phase a vision runner serves.
@@ -154,7 +154,7 @@ impl VisionRunner {
     }
 
     /// The buckets a runner of `model` that encodes images of at most `rows` rows captures,
-    /// largest first ([`Runner::buckets`]): the shapes its group states for its image encodings.
+    /// largest first ([`Forward::buckets`]): the shapes its group states for its image encodings.
     ///
     /// # Errors
     ///
@@ -446,11 +446,7 @@ impl VisionRunner {
     }
 }
 
-impl Runner for VisionRunner {
-    fn phases(&self) -> &[Phase] {
-        PHASES
-    }
-
+impl Forward for VisionRunner {
     /// The buckets of the grids the runner captures (module documentation), largest first.
     fn buckets(&self) -> Vec<Bucket> {
         self.grids.iter().map(|(bucket, _)| *bucket).collect()
@@ -501,6 +497,32 @@ impl Runner for VisionRunner {
         Ok(())
     }
 
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for VisionRunner {
+    fn phases(&self) -> &[Phase] {
+        PHASES
+    }
+
+    /// The tower over `graphs`: it writes nothing beside their region but its outputs, which a
+    /// capture leaves there.
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(Self {
+            model: Arc::clone(&self.model),
+            graphs,
+            stream: None,
+            memory: Arc::clone(&self.memory),
+            class: self.class,
+            rows: self.rows,
+            grids: self.grids.clone(),
+            grid: Cell::new(self.largest()),
+            threads: self.threads,
+        }))
+    }
+
     /// Prepares the encode of a batch of one image, whose block `tables` hold.
     ///
     /// # Errors
@@ -535,10 +557,6 @@ impl Runner for VisionRunner {
         let output = served?;
         ended?;
         Ok(output)
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 
     /// The rank's media memory, where the encoder outputs lie: its product buffer and its parts
@@ -643,7 +661,7 @@ pub(crate) mod tests {
     use super::VisionRunner;
     use crate::memory::buffers::BufferMemory;
     use crate::memory::tables::BlockTables;
-    use crate::runner::Runner;
+    use crate::runner::Forward;
     use crate::runner::buckets::Bucket;
     use crate::runner::graphs::Graphs;
 
@@ -900,7 +918,7 @@ pub(crate) mod tests {
         // The runner's buckets are profiled and captured.
         runner.graphs().profile_run(&runner).unwrap();
         for bucket in runner.buckets() {
-            runner.graphs().capture(&runner, &bucket).unwrap();
+            crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
         }
         let mut captured = runner.buckets();
         captured.sort();

@@ -7,13 +7,17 @@
 //! an update, the one prepared beside it or kept through the trial, with the graphs of each. The
 //! schedulers hold the policy's instance, and the one a switch replaced until the commit.
 //!
-//! - **Prepare**: [`named`] reads the packages the daemon's `Prepare` names; [`kernels`] selects and installs the kernels of every key the devices launch and
-//!   has every worker rebind or recapture its graphs; [`policy`] resolves the policy package and
+//! - **Prepare**: [`named`] reads the packages the daemon's `Prepare` names; [`kernels`] selects
+//!   and installs the kernels of every key the devices launch and has every worker hand the
+//!   buckets whose kernels changed to its capture thread, which captures them while the worker
+//!   serves; [`policy`] resolves the policy package and
 //!   instantiates it once against the ceilings, so that a policy that faults fails the
 //!   preparation and not the switch; [`compare`] compares each changed kernel with the serving one
 //!   on the batches the schedulers serve ([`shadow`]) and collects what no rank could compare.
 //!   Serving is untouched, and [`discard`] gives back what a preparation built.
-//! - **Switch**: [`switch`], at one boundary of every scheduler.
+//! - **Switch**: [`switch`]: the policy and the batches' stamps at one boundary of every
+//!   scheduler, then each bucket of the kernels as soon as every rank installed it, then the
+//!   kernels whole; the trial begins once the last bucket switched.
 //! - **Trial**: [`commit`] releases the kept generation after its last batch; [`rollback`] serves
 //!   the kept generation again from one boundary.
 //!
@@ -48,7 +52,7 @@ use super::operations::{ask, at_boundary, every, stopped};
 use crate::executor::{Route, Shadow};
 use crate::modules::load::{self, install, select};
 use crate::modules::select::{Routes, replaced_operators};
-use crate::process::binding::WeightBinding;
+use crate::process::binding::{UpdateRoom, WeightBinding};
 use crate::scheduler::Message;
 use crate::scheduler::policy::Policy;
 
@@ -79,21 +83,27 @@ pub(crate) fn named(prepare: proto::process::Prepare) -> Result<(Packages, Packa
 /// the daemon names (`named`), and the server selects the package of each key. The operators
 /// whose selected packages differ from `serving`'s (the packages the serving generation was built
 /// from) are installed on every device, in its own context; every other operator keeps its
-/// kernels, and with them the graphs that launch them. Each worker then prepares the device's
-/// generation beside the serving one: it rebinds the graphs whose launch table is unchanged and
-/// recaptures the others, between the batches it serves. A worker of no device installs
-/// nothing.
+/// kernels, and with them the graphs that launch them. Each worker then begins the device's
+/// generation beside the serving one and hands its buckets to its capture thread, which
+/// captures again those whose kernels changed while the worker serves ([`Worker::prepare`]);
+/// this returns once every worker began. A worker of no device installs nothing. When no
+/// operator's package changed, the generation changes no kernel: no worker prepares anything,
+/// and the generation's switch takes no graph.
+///
+/// Before any worker begins, `room` is given the operators whose kernels change, so the device
+/// memory the update takes beside the serving graphs is made ([`update_room`]).
 ///
 /// # Errors
 ///
-/// The Build Server's refusal, an install that failed, or a device that did not prepare the
-/// generation: what was prepared is given back on every device, and serving is untouched.
+/// The Build Server's refusal, an install that failed, the room that could not be made, or a
+/// device that did not prepare the generation: what was prepared is given back on every device,
+/// and serving is untouched.
 pub(crate) fn kernels(
     workers: &[Arc<Worker>],
     build: &(Arc<Mutex<Client>>, Vec<Target>),
-    named: &Packages,
-    serving: &Packages,
+    (named, serving): (&Packages, &Packages),
     generation: u64,
+    room: &dyn Fn(&BTreeSet<String>) -> Result<()>,
 ) -> Result<Packages> {
     let (client, targets) = build;
     let held = serving_kernels(workers)?;
@@ -113,6 +123,9 @@ pub(crate) fn kernels(
     let (selected, routes) = select(&mut client, targets, named, &keys)
         .context("selecting the generation's packages at the Build Server")?;
     let replaced = replaced_operators(&selected, serving);
+    if replaced.is_empty() {
+        return Ok(serving.clone());
+    }
     let packages: Packages = selected
         .into_iter()
         .filter(|(slot, _)| replaced.contains(&slot.op))
@@ -136,17 +149,18 @@ pub(crate) fn kernels(
         });
     }
     drop(client);
+    room(&replaced).context("making the room the generation's graphs take")?;
 
-    // One generation per device: a kernel belongs to the context that loaded it. Preparing runs
-    // eager forwards, so the groups prepare in turn.
-    let next: Vec<Arc<ops::Generation>> = held
+    // One generation per device: a kernel belongs to the context that loaded it. Beginning a
+    // preparation runs no forward, so every worker begins at once.
+    let submitted = held
         .iter()
         .zip(installed)
-        .map(|(kernels, entries)| Arc::new(kernels.replace(generation, entries)))
+        .zip(workers)
+        .map(|((kernels, entries), worker)| {
+            worker.prepare(Arc::new(kernels.replace(generation, entries)))
+        })
         .collect();
-    let submitted = crate::worker::in_turn(workers, |index, worker| {
-        worker.prepare(Arc::clone(&next[index]))
-    });
     if let Err(failure) = ended(submitted, &format!("preparing generation {generation}")) {
         if let Err(error) = discard(&[], workers, generation) {
             tracing::warn!(%error, generation, "a preparation that failed was not given back");
@@ -325,72 +339,189 @@ pub(crate) fn shadow(
     Ok(())
 }
 
-/// Switches every scheduler and every worker to generation `generation` at one batch boundary
-/// (`Switch`): every worker serves the prepared generation from its next batch, keeping the
-/// one it replaces; every rank's cache and state launch their own work from it; every scheduler
-/// instantiates `policy`, the generation's module and arguments, on its state, keeping the one it
-/// replaces; and the batches formed from here on carry `generation` (`served`, which the
-/// schedulers read). The control thread's route instance switches after.
+/// What a generation update that replaces the kernels of `operators` asks of every rank's
+/// device until its commit, this process's ranks then every peer's, in rank order: the device
+/// bytes its graphs and rehearsals take beside the serving graphs, the room the device has, and
+/// the KV units the rank's cache gives up while the update holds both generations' graphs when
+/// the room does not hold them (`binding::UpdateRoom`). What a validation of the update states
+/// before it begins; the KV policy demotes those units' pages to host memory and the ranks give
+/// their segments back (`WeightBinding::release_segments`) before the update's captures, and
+/// create them again once it committed or rolled back (`WeightBinding::create_segments`).
 ///
 /// # Errors
 ///
-/// A device that did not switch, or a scheduler that refused the policy: the switch is rolled
-/// back, so every scheduler serves its previous policy and every worker the generation that
-/// served (the prepared one is given back), and `served` is unchanged; or a rank whose cache
-/// and state did not take the kernels, with the switch made.
+/// A worker that closed, or a rank's quota or device that cannot be read, here or on a peer.
+pub(crate) fn update_room(
+    workers: &[Arc<Worker>],
+    binding: &WeightBinding,
+    operators: &BTreeSet<String>,
+) -> Result<Vec<UpdateRoom>> {
+    let extra = update_bytes(workers, operators)?;
+    Ok(binding.update_rooms(operators, |device| {
+        extra.get(&device.0).copied().unwrap_or(0)
+    })?)
+}
+
+/// [`update_room`] of this process's ranks alone: what a peer answers.
+///
+/// # Errors
+///
+/// As [`update_room`].
+pub(crate) fn update_room_here(
+    workers: &[Arc<Worker>],
+    binding: &WeightBinding,
+    operators: &BTreeSet<String>,
+) -> Result<Vec<UpdateRoom>> {
+    let extra = update_bytes(workers, operators)?;
+    Ok(binding.update_rooms_here(|device| extra.get(&device.0).copied().unwrap_or(0))?)
+}
+
+/// The bytes a generation update that replaces `operators` takes on each device beside what
+/// serves, by CUDA ordinal, over the workers on it.
+fn update_bytes(
+    workers: &[Arc<Worker>],
+    operators: &BTreeSet<String>,
+) -> Result<BTreeMap<i32, u64>> {
+    let mut extra: BTreeMap<i32, u64> = BTreeMap::new();
+    for worker in workers {
+        let Some(device) = worker.device() else {
+            continue;
+        };
+        let bytes = worker.update_bytes(operators.clone())?;
+        *extra.entry(device.0).or_default() += bytes;
+    }
+    Ok(extra)
+}
+
+/// The buckets one switch job moves to the generation, at most: a switch waits for the
+/// readiness of this many buckets on every rank, then hands them to every rank as one job.
+const SWITCHED_TOGETHER: usize = 16;
+
+/// Switches every scheduler and every worker to generation `generation` (`Switch`).
+///
+/// At one batch boundary every scheduler instantiates `policy`, the generation's module and
+/// arguments, on its state, keeping the one it replaces, and the batches formed from there on
+/// carry `generation` as their policy and kernel stamps (`served`). When the generation changes
+/// kernels on this process's workers, each bucket then switches to its new graph as soon as every
+/// rank of every group installed it (`Worker::ready`, through `route`, the peers' ranks
+/// included), in the order the first worker's capture thread takes them, a few buckets per job
+/// that every rank takes between the same two batches (`Route::switch_buckets`); a bucket that
+/// keeps its graph switches with them. Once every bucket switched, the workers switch to the
+/// generation whole at one boundary: their eager forwards launch its kernels, every rank's cache
+/// and state launch their own work from it, and its trial begins. The control thread's route
+/// instance switches after.
+///
+/// # Errors
+///
+/// A device that did not switch or whose capture failed, or a scheduler that refused the
+/// policy: the switch is rolled back, so every scheduler serves its previous policy and every
+/// worker the generation that served (the prepared one is given back), and the stamps are the
+/// previous generation's; or a rank whose cache and state did not take the kernels, with the
+/// switch made.
 pub(crate) fn switch(
     schedulers: &[Sender<Message>],
     route: Option<&Route>,
+    workers: &[Arc<Worker>],
     binding: &WeightBinding,
     served: &Generations,
     generation: u64,
     policy: &(Arc<wasmtime::Module>, Parameters),
 ) -> Result<()> {
-    at_boundary(schedulers, || {
-        let what = format!("switching to generation {generation}");
-        let switched = ended(on_ranks(route, |route| route.switch(generation)), &what);
+    let kept = served.policy();
+    let set = at_boundary(schedulers, || {
+        let (module, parameters) = policy;
+        let replies = ask(schedulers, |reply| {
+            Message::SetPolicy(Arc::clone(module), parameters.clone(), reply)
+        })?;
+        let took: Vec<Sender<Message>> = schedulers
+            .iter()
+            .zip(&replies)
+            .filter(|(_, reply)| reply.is_ok())
+            .map(|(inbox, _)| inbox.clone())
+            .collect();
 
-        // The policy follows the devices; a scheduler that refuses it serves its own.
-        let mut took = Vec::new();
-        let set = switched.and_then(|()| {
-            let (module, parameters) = policy;
-            let replies = ask(schedulers, |reply| {
-                Message::SetPolicy(Arc::clone(module), parameters.clone(), reply)
-            })?;
-            took = schedulers
-                .iter()
-                .zip(&replies)
-                .filter(|(_, reply)| reply.is_ok())
-                .map(|(inbox, _)| inbox.clone())
-                .collect();
-            every(replies, "the generation's policy")
-        });
-
-        if let Err(failure) = set {
+        // A scheduler that refuses the policy serves its own, and so do the others.
+        if let Err(failure) = every(replies, "the generation's policy") {
             let back = ask(&took, Message::RollbackPolicy)
                 .and_then(|replies| every(replies, "the previous policy"));
             if let Err(error) = back {
                 tracing::error!(%error, generation, "a scheduler did not serve its policy again");
             }
-            // A rollback returns a device that switched to the generation it kept, and gives
-            // the prepared generation back on one that did not.
-            let rolled = ended(
+            return Err(failure);
+        }
+
+        served.set_policy(generation);
+        served.set_kernels(generation);
+        Ok(())
+    });
+    if let Err(failure) = set {
+        // The prepared generation is given back on every rank, which none switched to.
+        let rolled = ended(
+            on_ranks(route, |route| route.rollback(generation)),
+            &format!("rolling generation {generation} back"),
+        );
+        if let Err(error) = rolled {
+            tracing::error!(%error, generation, "a device did not give the generation back");
+        }
+        return Err(failure.context(format!("switching to generation {generation}")));
+    }
+
+    // The kernels follow bucket by bucket, then whole; a failure there returns every scheduler
+    // and every rank to what served before the switch.
+    let kernels = switch_kernels(route, workers, binding, generation);
+    if let Err(failure) = kernels {
+        let back = at_boundary(schedulers, || {
+            let devices = ended(
                 on_ranks(route, |route| route.rollback(generation)),
                 &format!("rolling generation {generation} back"),
             );
-            if let Err(error) = rolled {
-                tracing::error!(%error, generation, "a device did not return to its generation");
-            }
-            return Err(failure.context(what));
+            served.set_policy(kept);
+            served.set_kernels(kept);
+            let policies = ask(schedulers, Message::RollbackPolicy)
+                .and_then(|replies| every(replies, "the previous policy"));
+            devices.and(policies)
+        });
+        if let Err(error) = back {
+            tracing::error!(%error, generation, "a switch that failed was not rolled back");
         }
+        return Err(failure.context(format!("switching to generation {generation}")));
+    }
+    Ok(())
+}
 
-        served.set_kernels(generation);
-        served.set_policy(generation);
-        binding
-            .set_kernels()
-            .with_context(|| format!("the ranks' memories under generation {generation}"))?;
-        Ok(())
-    })
+/// The kernels' half of [`switch`]: each bucket as every rank installed it, then the generation
+/// whole. Nothing when no worker of this process prepared the generation, which then changes no
+/// kernel.
+fn switch_kernels(
+    route: Option<&Route>,
+    workers: &[Arc<Worker>],
+    binding: &WeightBinding,
+    generation: u64,
+) -> Result<()> {
+    let Some(route) = route else {
+        return Ok(());
+    };
+    let Some(order) = workers.iter().find_map(|worker| worker.order(generation)) else {
+        return Ok(());
+    };
+
+    let what = format!("switching the buckets of generation {generation}");
+    for chunk in order.chunks(SWITCHED_TOGETHER) {
+        let keys = chunk.to_vec();
+        ended(vec![route.ready(generation, Some(keys.clone()))], &what)?;
+        ended(vec![route.switch_buckets(generation, keys)], &what)?;
+    }
+
+    // The buckets of ranks this process's first worker does not hold (another group's, a
+    // peer's) are installed too before the generation serves whole.
+    ended(vec![route.ready(generation, None)], &what)?;
+    ended(
+        vec![route.switch(generation)],
+        &format!("switching to generation {generation}"),
+    )?;
+    binding
+        .set_kernels()
+        .with_context(|| format!("the ranks' memories under generation {generation}"))
 }
 
 /// Ends the trial of generation `generation` in its favour (`Commit`): every worker releases the
@@ -403,12 +534,19 @@ pub(crate) fn switch(
 pub(crate) fn commit(
     schedulers: &[Sender<Message>],
     route: Option<&Route>,
+    workers: &[Arc<Worker>],
     generation: u64,
 ) -> Result<()> {
-    ended(
-        on_ranks(route, |route| route.commit(generation)),
-        &format!("committing generation {generation}"),
-    )?;
+    // A generation that changed no kernel holds nothing on the ranks to commit.
+    if workers
+        .iter()
+        .any(|worker| worker.order(generation).is_some())
+    {
+        ended(
+            on_ranks(route, |route| route.commit(generation)),
+            &format!("committing generation {generation}"),
+        )?;
+    }
 
     for (index, inbox) in schedulers.iter().enumerate() {
         inbox

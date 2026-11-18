@@ -669,7 +669,7 @@ fn load_rank(
         &meta_cache,
         meta_state.as_ref().map(|state| state.as_ref()),
     )?;
-    let graphs = crate::runner::Runner::graphs(&profiled);
+    let graphs = crate::runner::Forward::graphs(&profiled);
     let peaks = Peaks {
         graph: graphs.peak(),
         shadow: graphs.shadow_peak(CausalLmRunner::cache_writes(&meta_config, &layout)),
@@ -684,7 +684,7 @@ fn load_rank(
             let model = Arc::clone(&meta);
             let threads = model_runner.host_threads()?;
             let runner = vision_runner(model, graphs, None, memory, (class, images), threads)?;
-            let graphs = crate::runner::Runner::graphs(&runner);
+            let graphs = crate::runner::Forward::graphs(&runner);
             keys.extend(graphs.keys());
             Some(Peaks {
                 graph: graphs.peak(),
@@ -3011,7 +3011,7 @@ fn open_rank(
     if let Some(memory) = &media {
         runner.set_features(Arc::clone(memory), class)?;
     }
-    crate::runner::Runner::graphs(&runner).set_shadow(pool.shadow(rank.peaks.shadow)?)?;
+    crate::runner::Forward::graphs(&runner).set_shadow(pool.shadow(rank.peaks.shadow)?)?;
     profile(&runner)?;
     streams.push(("device", stream));
 
@@ -3870,16 +3870,6 @@ pub(crate) fn spawn(
         sequences.push(Sequences::new(*id, local + links, registers));
     }
 
-    // The node's expert union holds every text rank of this process: its members take one turn
-    // of eager forwards, the turn of its first group (`worker::in_turn`).
-    let union_turn = ranks
-        .first()
-        .and_then(|rank| match &rank.loaded {
-            Loaded::Text(text) => text.union.as_ref(),
-            Loaded::Video(_) => None,
-        })
-        .and_then(|_| placed.iter().map(|(id, _)| *id).min());
-
     let mut workers = Vec::with_capacity(ranks.len());
     for (rank, (id, place)) in ranks.iter_mut().zip(&placed) {
         let device = rank.pool.as_ref().map(|_| rank.model_runner.devices()[0]);
@@ -3933,10 +3923,6 @@ pub(crate) fn spawn(
             // The epoch's one budget, so that every worker of a group starts the same copies.
             rank.model_runner.engine_config().worker.copy_budget,
         )?;
-        let worker = match union_turn {
-            Some(first) => worker.in_union(first),
-            None => worker,
-        };
         workers.push(Arc::new(worker));
     }
 

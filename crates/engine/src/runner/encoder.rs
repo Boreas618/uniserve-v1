@@ -19,7 +19,7 @@
 //! first, lent in place. The eager encode takes its memory from the runner's region, over the
 //! inputs of the bucket that holds the prompt.
 //!
-//! The runner states its eager buckets ([`Runner::eager_buckets`]): the extent of each one-row
+//! The runner states its eager buckets ([`Forward::eager_buckets`]): the extent of each one-row
 //! bucket that a prompt of [`EncoderConfig::warm`] fits, under [`Variant::ConditionEncode`]. A
 //! profile run of one encodes every such prompt that fits it, its ids padded to the bucket's
 //! tokens, over patch rows of its grids, so the runner's region and its input buffer hold the
@@ -42,9 +42,9 @@ use tensor::{DType, Tensor};
 use super::{DeviceCopy, address, element_bytes, issue, performed, settle};
 use crate::memory::buffers::BufferMemory;
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
+use crate::runner::{Forward, Runner};
 use crate::worker::{Error, Result};
 use ops::allocator::ALIGNMENT;
 
@@ -507,11 +507,7 @@ impl EncoderRunner {
     }
 }
 
-impl Runner for EncoderRunner {
-    fn phases(&self) -> &[Phase] {
-        PHASES
-    }
-
+impl Forward for EncoderRunner {
     fn buckets(&self) -> Vec<Bucket> {
         self.config.buckets.capture_order().copied().collect()
     }
@@ -617,6 +613,30 @@ impl Runner for EncoderRunner {
         Ok(())
     }
 
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for EncoderRunner {
+    fn phases(&self) -> &[Phase] {
+        PHASES
+    }
+
+    /// The encoder over `graphs`: its forward writes nothing beside their region.
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(Self {
+            model: Arc::clone(&self.model),
+            config: self.config.clone(),
+            graphs,
+            stream: None,
+            memory: Arc::clone(&self.memory),
+            offsets: self.offsets,
+            prompt: RefCell::new(Vec::new()),
+            images: RefCell::new(Vec::new()),
+        }))
+    }
+
     fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
         let (bucket, ..) = self.place(batch, tables)?;
         self.fill(batch, &bucket)?;
@@ -638,10 +658,6 @@ impl Runner for EncoderRunner {
         let output = served?;
         ended?;
         Ok(output)
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 
     /// Issues the copies of products that start with the runner's next batch through the rank's
@@ -679,9 +695,9 @@ mod tests {
     use super::{EncoderConfig, EncoderRunner};
     use crate::memory::buffers::BufferMemory;
     use crate::memory::tables::BlockTables;
-    use crate::runner::Runner;
     use crate::runner::buckets::{Bucket, Buckets};
     use crate::runner::graphs::Graphs;
+    use crate::runner::{Forward, Runner};
 
     /// The slot region and the product buffer, and the classes of the conditioning and the
     /// vision pixels.
@@ -748,7 +764,7 @@ mod tests {
 
         runner.graphs().profile_run(&runner).unwrap();
         for bucket in runner.buckets() {
-            runner.graphs().capture(&runner, &bucket).unwrap();
+            crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
         }
         runner
     }

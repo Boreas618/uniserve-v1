@@ -13,9 +13,18 @@
 //! their keys, and its host-to-device copies write the input buffer and issue nothing. The
 //! profile run and the forward of `prepare_inputs` run under meta contexts.
 //!
-//! One worker thread issues a device's work, so nothing here is contended. The state is behind
-//! a lock all the same, because a runner is built on one thread and moved to the thread of its
-//! device with its context.
+//! A launching context has two companions for work done beside it on another thread. A context
+//! **beside** it ([`Context::beside`]) launches the same kernels through the same groups on a
+//! stream of its own, with an allocator of its own over the same region: a forward captured under
+//! it receives the addresses one captured under the launching context would, and records what
+//! that one would, while the launching context goes on serving. A **rehearsal**
+//! ([`Context::rehearsal`]) launches the same kernels on a stream of its own over a region of its
+//! own and issues no collective and no expert exchange: a forward run under it makes the first
+//! use of each kernel, which a capture cannot record, without meeting the other ranks.
+//!
+//! One worker thread issues a device's serving work, so nothing here is contended. The state is
+//! behind a lock all the same, because a runner is built on one thread and moved to the thread of
+//! its device with its context.
 
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -46,6 +55,9 @@ pub struct Context {
     /// What changes between and during forwards. Shared with the handle a thread holds while the
     /// context is installed on it ([`Context::enter`]).
     state: Arc<Mutex<State>>,
+    /// Whether this is a rehearsal ([`Context::rehearsal`]): it launches, and its collectives and
+    /// expert exchanges issue nothing.
+    rehearsal: bool,
 }
 
 /// The part of a context that changes: what execution sets between forwards, and what a forward
@@ -126,7 +138,98 @@ impl Context {
             device: Some((ordinal, stream)),
             allocator: Arc::new(allocator(region)),
             state: Arc::new(Mutex::new(State::new(Some(kernels)))),
+            rehearsal: false,
         }
+    }
+
+    /// A launching context beside this one, for a capture on another thread: the same GPU,
+    /// kernels, axes and expert exchange, each group's collectives issued through a group beside
+    /// it ([`Group::beside`]), on `stream`, and an allocator of its own over this context's
+    /// region, which hands out the addresses this one's does for the same forward. It holds no
+    /// route, break taker, profiler, meeting or input buffer: whoever captures under it sets
+    /// those it needs.
+    ///
+    /// Nothing is shared with this context but the kernels, the communicators and the region's
+    /// addresses, so the two may run forwards on two threads at once. A forward captured under
+    /// it launches nothing, and its graph addresses the region this context's forwards use: it
+    /// is replayed on this context's stream, in turn with them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a meta context or a rehearsal; [`Error::Platform`] when a group's
+    /// side stream cannot be created.
+    pub fn beside(&self, stream: Stream) -> Result<Self> {
+        let ordinal = match &self.device {
+            Some((ordinal, _)) if !self.rehearsal => *ordinal,
+            _ => {
+                return Err(Error::Unsupported {
+                    operation: "a context beside another",
+                    reason: "only a launching context that is no rehearsal has one".to_owned(),
+                });
+            }
+        };
+
+        let state = {
+            let held = self.state();
+            let mut state = State::new(held.kernels.clone());
+            let mut beside = Vec::with_capacity(held.axes.len());
+            for (group, split) in &held.axes {
+                let group = match group {
+                    Some(group) => Some(Arc::new(group.beside()?)),
+                    None => None,
+                };
+                beside.push((group, *split));
+            }
+
+            // The first axis is the one a forward's collectives go along outside any other.
+            (state.group, state.split) = beside.first().cloned().unwrap_or((None, None));
+            state.axes = beside;
+            state.exchange = held.exchange;
+            state
+        };
+
+        Ok(Self {
+            device: Some((ordinal, stream)),
+            allocator: Arc::new(self.allocator.alike()),
+            state: Arc::new(Mutex::new(state)),
+            rehearsal: false,
+        })
+    }
+
+    /// A rehearsal of this launching context: the same GPU, kernels and splits, launching on
+    /// `stream` and allocating in `region`, with no group and no expert exchange. Its
+    /// collectives check their buffers against the split and issue nothing, as a meta context's
+    /// do, and so does its expert exchange: a forward run under it computes this rank's share of
+    /// each launch alone, so the first use of a kernel happens there, on a stream no serving
+    /// forward uses, without any rank's device waiting for another.
+    ///
+    /// The caller keeps `region` mapped for as long as a tensor of the rehearsal is in use.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a meta context.
+    pub fn rehearsal(&self, stream: Stream, region: DeviceRange) -> Result<Self> {
+        let Some((ordinal, _)) = &self.device else {
+            return Err(Error::Unsupported {
+                operation: "a rehearsal",
+                reason: "a meta context launches nothing to rehearse".to_owned(),
+            });
+        };
+
+        let state = {
+            let held = self.state();
+            let mut state = State::new(held.kernels.clone());
+            state.axes = held.axes.iter().map(|(_, split)| (None, *split)).collect();
+            state.split = state.axes.first().and_then(|(_, split)| *split);
+            state
+        };
+
+        Ok(Self {
+            device: Some((*ordinal, stream)),
+            allocator: Arc::new(allocator(region)),
+            state: Arc::new(Mutex::new(state)),
+            rehearsal: true,
+        })
     }
 
     /// A meta context: it launches nothing.
@@ -138,6 +241,7 @@ impl Context {
             device: None,
             allocator: Arc::new(region.map_or_else(Allocator::counting, allocator)),
             state: Arc::new(Mutex::new(State::new(None))),
+            rehearsal: false,
         }
     }
 
@@ -150,6 +254,7 @@ impl Context {
             device: self.device.clone(),
             allocator: Arc::clone(&self.allocator),
             state: Arc::clone(&self.state),
+            rehearsal: self.rehearsal,
         });
         let previous = INSTALLED.with(|slot| slot.replace(Some(installed)));
 
@@ -300,7 +405,7 @@ impl Context {
                     )));
                 }
             }
-            None if !self.is_meta() => {
+            None if !self.is_meta() && !self.rehearsal => {
                 return Err(refused(
                     "a context that launches issues its collectives through a communicator, \
                      and none was given"
@@ -310,6 +415,17 @@ impl Context {
             None => {}
         }
         Ok((group, Some((rank, ranks))))
+    }
+
+    /// This rank's place on each axis of the forward's partition ([`Context::set_axes`]), in
+    /// the order the forward addresses them by, as `(rank, ranks)`; `(0, 0)` on an axis the
+    /// forward is not partitioned along.
+    pub fn splits(&self) -> Vec<(u64, u64)> {
+        self.state()
+            .axes
+            .iter()
+            .map(|(_, split)| split.unwrap_or((0, 0)))
+            .collect()
     }
 
     /// The expert exchange of this context's forwards: `transport` is the package's transport for
@@ -354,6 +470,20 @@ impl Context {
     /// The stream launches, copies and collectives are issued on; `None` under a meta context.
     pub(crate) fn stream(&self) -> Option<&Stream> {
         self.device.as_ref().map(|(_, stream)| stream)
+    }
+
+    /// Whether this is a rehearsal ([`Context::rehearsal`]).
+    pub(crate) const fn is_rehearsal(&self) -> bool {
+        self.rehearsal
+    }
+
+    /// The stream a collective is issued on: the launching stream, and `None` under a meta
+    /// context or a rehearsal, whose collectives issue nothing.
+    pub(crate) fn collective_stream(&self) -> Option<&Stream> {
+        if self.rehearsal {
+            return None;
+        }
+        self.stream()
     }
 
     /// The GPU a launching context's tensors are on; `None` under a meta context.

@@ -11,12 +11,11 @@ use std::thread;
 use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
     Capture, CaptureMode, CaptureStatus, Cluster, CopyBatch, Device, DeviceAllocation,
-    DeviceAttribute, DeviceId, DevicePtr, DeviceRange, EdgeKind, Error, Event, EventFlags,
-    FunctionAttribute, GraphNodeKind, HandleType, Interleave, KernelNodeParams, L2Promotion,
-    LaunchConfig, Library, Nvml, OobFill, PeerMapping, PinnedBuffer, Pitched, PitchedBatch,
-    PrimaryContext, Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Swizzle,
-    TensorMap, TensorMapSpec, WaitValue, memcpy_async, memset_2d_d8, memset_d8, memset_d32,
-    reclaim,
+    DeviceAttribute, DeviceId, DevicePtr, DeviceRange, Error, Event, EventFlags, FunctionAttribute,
+    HandleType, Interleave, L2Promotion, LaunchConfig, Library, Nvml, OobFill, PeerMapping,
+    PinnedBuffer, Pitched, PitchedBatch, PrimaryContext, Protection, SegmentedMapping,
+    ShareableHandle, SourceOrder, Stream, Swizzle, TensorMap, TensorMapSpec, WaitValue,
+    memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
@@ -1272,258 +1271,6 @@ fn launch_ex_carries_the_grid_shared_memory_and_launch_attributes() {
     }
 }
 
-/// A dependency a kernel triggers early is walked, and the walk states which
-/// kind of edge it found.
-///
-/// **The shape this catches:** a captured graph whose second kernel launches
-/// programmatically carries non-default edge data, and the driver refuses a
-/// query for dependent nodes that does not ask for that data -
-/// `CUDA_ERROR_LOSSY_QUERY`. The same rule governs the capture's own frontier
-/// query, so both are exercised here: `record` after the programmatic launch is
-/// the frontier query, and `edges` is the walk.
-///
-/// Both kinds are read, because a walk that answered one kind for both would
-/// pass half of this test: a plain pair is a completion edge, a programmatic
-/// launch is not.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn a_programmatic_dependency_is_walked_and_its_kind_is_read() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let library = kernels(&device);
-    let write = library.kernel("write").unwrap();
-    let stream = Stream::new(DEVICE).unwrap();
-    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
-    let mut out = storage.address();
-
-    // Capture one pair with `pdl` as stated and answer the graph's edge kinds.
-    let mut capture_pair = |pdl: bool| {
-        let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
-        let mut first = 7u32;
-        let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut first).cast()];
-        write
-            .launch_ex(
-                &stream,
-                &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
-                &mut parameters,
-            )
-            .unwrap();
-        assert_eq!(capture.record().unwrap().len(), 1, "the first launch");
-
-        let mut second = 9u32;
-        let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut second).cast()];
-        let launch = LaunchConfig {
-            pdl,
-            ..LaunchConfig::new([1, 1, 1], [8, 1, 1])
-        };
-        write.launch_ex(&stream, &launch, &mut parameters).unwrap();
-        // The frontier query the walk runs first: a null edge-data array here
-        // was the second half of the same defect.
-        let walked = capture.record_walk().unwrap();
-        assert_eq!(walked.len(), 1, "the second launch adds one node");
-        assert_eq!(
-            walked[0].incoming.len(),
-            1,
-            "one dependency reaches it from the first launch"
-        );
-        let graph = capture.end().unwrap();
-        assert_eq!(graph.node_count().unwrap(), 2);
-        walked[0].incoming[0]
-    };
-
-    assert_eq!(
-        capture_pair(false),
-        EdgeKind::Completion,
-        "a plain launch orders the second kernel after the first one completes"
-    );
-    assert_eq!(
-        capture_pair(true),
-        EdgeKind::Programmatic,
-        "a programmatic launch lets the second kernel start before the first finishes, \
-         and the graph states that"
-    );
-}
-
-/// Capture records the node each launch adds: nothing before the first launch,
-/// one node per launch after it, and the graph replays them in order.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn capture_records_the_node_of_each_launch() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let library = kernels(&device);
-    let write = library.kernel("write").unwrap();
-    let stream = Stream::new(DEVICE).unwrap();
-    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
-    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
-    let mut out = storage.address();
-
-    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
-    assert!(capture.record().unwrap().is_empty(), "no operation yet");
-
-    let mut first = 7u32;
-    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut first).cast()];
-    write
-        .launch_ex(
-            &stream,
-            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
-            &mut parameters,
-        )
-        .unwrap();
-    assert_eq!(capture.record().unwrap().len(), 1, "the first launch");
-
-    let mut second = 9u32;
-    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut second).cast()];
-    write
-        .launch_ex(
-            &stream,
-            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
-            &mut parameters,
-        )
-        .unwrap();
-    assert_eq!(capture.record().unwrap().len(), 1, "the second launch");
-
-    let graph = capture.end().unwrap();
-    assert_eq!(graph.node_count().unwrap(), 2);
-    assert_eq!(graph.nodes().unwrap().len(), 2);
-
-    let executable = graph.instantiate().unwrap();
-    executable.launch(&stream).unwrap();
-    // SAFETY: the copy reads the allocation into the pinned buffer.
-    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
-    stream.synchronize().unwrap();
-    assert_eq!(
-        words(&host),
-        vec![9; 8],
-        "both captured launches ran in order"
-    );
-}
-
-/// Rebinding replaces a captured kernel node's function, grid, block, dynamic
-/// shared memory and arguments; the executable then runs the new work, while
-/// the template node is unchanged.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn rebinding_changes_a_kernel_node_function_and_arguments() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let library = kernels(&device);
-    let write = library.kernel("write").unwrap();
-    let report = library.kernel("report").unwrap();
-    let stream = Stream::new(DEVICE).unwrap();
-    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
-    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
-    let mut out = storage.address();
-
-    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
-    let mut value = 7u32;
-    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
-    write
-        .launch_ex(
-            &stream,
-            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
-            &mut parameters,
-        )
-        .unwrap();
-    let _ = capture.record().unwrap();
-    let graph = capture.end().unwrap();
-    let node = graph.nodes().unwrap().remove(0);
-    let executable = graph.instantiate().unwrap();
-
-    // The report kernel takes one argument and one block of two threads, none
-    // of which the captured node had.
-    let parameters: [*mut c_void; 1] = [(&raw mut out).cast()];
-    let params = KernelNodeParams {
-        function: &report,
-        grid: [1, 1, 1],
-        block: [2, 1, 1],
-        shared_memory: 0,
-        parameters: &parameters,
-    };
-    executable
-        .set_kernel_node_params(node.clone(), &params)
-        .unwrap();
-
-    executable.launch(&stream).unwrap();
-    // SAFETY: the copy reads the allocation into the pinned buffer.
-    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
-    stream.synchronize().unwrap();
-    assert_eq!(
-        words(&host)[..7],
-        [0, 0, 0, 0, 0, 0, 0],
-        "the rebound function ran with its new grid"
-    );
-
-    // The template still holds the captured node, so a second executable of it
-    // runs the original work.
-    let original = graph.instantiate().unwrap();
-    original.launch(&stream).unwrap();
-    // SAFETY: as above.
-    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
-    stream.synchronize().unwrap();
-    assert_eq!(words(&host), vec![7; 8], "the template node is unchanged");
-}
-
-/// The read half of a rebind walk: a template's node gives back the kernel it
-/// captured, its grid, block and the values of its arguments, and setting those
-/// on another executable's node runs the same work.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn kernel_node_params_read_back_what_a_capture_recorded() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let library = kernels(&device);
-    let write = library.kernel("write").unwrap();
-    let stream = Stream::new(DEVICE).unwrap();
-    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
-    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
-    let mut out = storage.address();
-    let mut value = 9u32;
-    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
-
-    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
-    // The write kernel stores at `threadIdx.x`, so one block of eight threads
-    // fills the eight words of the allocation.
-    write
-        .launch_ex(
-            &stream,
-            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
-            &mut parameters,
-        )
-        .unwrap();
-    let _ = capture.record().unwrap();
-    let graph = capture.end().unwrap();
-    let node = graph.nodes().unwrap().remove(0);
-
-    assert_eq!(node.kind().unwrap(), GraphNodeKind::Kernel);
-    let read = graph.kernel_node_params(&node).unwrap();
-    assert_eq!(read.grid, [1, 1, 1], "the grid the launch carried");
-    assert_eq!(read.block, [8, 1, 1], "the block the launch carried");
-    assert_eq!(read.shared_memory, 0);
-    assert_eq!(read.parameters.len(), 2, "the kernel takes two parameters");
-    assert_eq!(
-        u64::from_ne_bytes(read.parameters[0][..8].try_into().unwrap()),
-        out,
-        "the address the launch carried"
-    );
-    assert_eq!(
-        u32::from_ne_bytes(read.parameters[1][..4].try_into().unwrap()),
-        value,
-        "the value the launch carried"
-    );
-
-    // Setting what was read on an executable's node runs the captured work.
-    let executable = graph.instantiate().unwrap();
-    executable
-        .set_kernel_node_params_owned(node.clone(), &read)
-        .unwrap();
-    executable.launch(&stream).unwrap();
-    // SAFETY: the copy reads the allocation into the pinned buffer.
-    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
-    stream.synchronize().unwrap();
-    assert_eq!(words(&host), vec![9; 8], "the read-back launch ran");
-}
-
 /// Recapture rebuilds a graph from a new capture, so a program whose node
 /// count changed gets a new executable; the previous one keeps replaying what
 /// it captured.
@@ -1539,7 +1286,7 @@ fn recapture_builds_an_executable_of_the_new_capture() {
     let host = PinnedBuffer::new(DEVICE, 32).unwrap();
     let mut out = storage.address();
 
-    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+    let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     let mut one = 1u32;
     let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut one).cast()];
     write
@@ -1549,12 +1296,11 @@ fn recapture_builds_an_executable_of_the_new_capture() {
             &mut parameters,
         )
         .unwrap();
-    capture.record().unwrap();
     let before = capture.end().unwrap();
     let before_exec = before.instantiate().unwrap();
     assert_eq!(before.node_count().unwrap(), 1);
 
-    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+    let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     let mut two = 2u32;
     let mut three = 3u32;
     for value in [&mut two, &mut three] {
@@ -1566,7 +1312,6 @@ fn recapture_builds_an_executable_of_the_new_capture() {
                 &mut parameters,
             )
             .unwrap();
-        capture.record().unwrap();
     }
     let after = capture.end().unwrap();
     assert_eq!(after.node_count().unwrap(), 2);
@@ -1581,6 +1326,49 @@ fn recapture_builds_an_executable_of_the_new_capture() {
         words(&host),
         vec![3; 8],
         "the recaptured executable ran, and the earlier one still replays"
+    );
+}
+
+/// An executable takes a new capture of its own topology in place: its next
+/// launch runs the new capture's arguments, with no instantiation.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn an_executable_takes_a_capture_of_its_topology_in_place() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = kernels(&device);
+    let write = library.kernel("write").unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
+    let mut out = storage.address();
+
+    let mut captured = |value: u32| {
+        let mut value = value;
+        let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+        let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
+        write
+            .launch_ex(
+                &stream,
+                &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+                &mut parameters,
+            )
+            .unwrap();
+        capture.end().unwrap()
+    };
+    let first = captured(5);
+    let second = captured(9);
+    let exec = first.instantiate().unwrap();
+
+    exec.update(&second).unwrap();
+    exec.launch(&stream).unwrap();
+    // SAFETY: the copy reads the allocation into the pinned buffer.
+    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        words(&host),
+        vec![9; 8],
+        "the updated executable ran the new capture"
     );
 }
 

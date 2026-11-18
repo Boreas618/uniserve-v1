@@ -530,13 +530,15 @@ message Command {
   reserved "serve";
   oneof kind {
     // Make the next generation ready beside the serving one: resolve and load
-    // the modules, instantiate the policy, rebind the graphs whose launch
-    // table is unchanged and recapture the others, and shadow each changed
+    // the modules, instantiate the policy, begin capturing the buckets whose
+    // kernels changed on each worker's capture thread, and shadow each changed
     // kernel on a paired forward. Serving is untouched. Acknowledged with
     // `Prepared`, or `PrepareFailed` when nothing changed.
     Prepare prepare = 1;
-    // Execute generation `generation` from the next batch boundary, keeping
-    // the previous one. Acknowledged with `Switched`.
+    // Execute generation `generation`: its policy from the next batch
+    // boundary, its kernels bucket by bucket as every rank captured each, then
+    // whole, keeping the previous one. Acknowledged with `Switched` once the
+    // last bucket switched, which begins the trial.
     Switch switch = 2;
     // End the trial in favour of the generation that executes: the kept one
     // is released once no batch uses it (its graphs, and the kernels whose

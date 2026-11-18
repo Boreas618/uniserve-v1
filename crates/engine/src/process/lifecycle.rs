@@ -85,8 +85,8 @@ pub(crate) enum Lifecycle {
 pub(crate) enum Update {
     /// One generation executes and no update is in flight.
     Steady,
-    /// The generation is being resolved, installed, rebound or recaptured, and shadowed, beside
-    /// the one that executes.
+    /// The generation is being resolved and installed, its changed buckets handed to the capture
+    /// threads, and shadowed, beside the one that executes.
     Preparing(u64),
     /// The generation is ready for its switch; the previous one still executes.
     Prepared(u64),

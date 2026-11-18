@@ -126,6 +126,7 @@ impl Table {
 }
 
 /// The tables every runner holds, each over its part of the slot memory.
+#[derive(Clone)]
 struct Held {
     counts: Tensor,
     bias: Tensor,
@@ -211,6 +212,22 @@ fn offsets(shapes: &[(Shape, DType)]) -> ([u64; Table::COUNT], u64) {
 }
 
 impl Slots {
+    /// The same tables, for a forward instance of the runner (`Runner::capturer`): its forward
+    /// reads and writes them on the device as the runner's does, and it writes nothing into them
+    /// from the host, so it holds none of the means to.
+    pub(crate) fn shared(&self) -> Self {
+        Self {
+            slots: self.slots,
+            vocabulary: self.vocabulary,
+            rows: self.rows,
+            width: self.width,
+            tables: self.tables.clone(),
+            context: self.context.clone(),
+            accepted: self.accepted.clone(),
+            device: None,
+        }
+    }
+
     /// The bytes of device memory the state of `slots` request slots takes, over a
     /// `vocabulary`-wide logit row, for buckets of at most `rows` rows and `width` next input
     /// tokens a slot, with the context table of a model that reads the token history

@@ -26,6 +26,16 @@ pub(crate) type HostFn = unsafe extern "C" fn(Handle);
 
 pub(crate) const LIBCUDA: &str = "libcuda.so.1";
 
+/// `CUgraphExecUpdateResultInfo`: what `cuGraphExecUpdate` reports beside its status, the update's
+/// result and the nodes it failed at.
+#[repr(C)]
+pub(crate) struct ExecUpdateInfo {
+    /// The `CUgraphExecUpdateResult`; zero (`CU_GRAPH_EXEC_UPDATE_SUCCESS`) on success.
+    pub(crate) result: u32,
+    pub(crate) error_node: Handle,
+    pub(crate) error_from_node: Handle,
+}
+
 /// What a refused driver is told to install: the NVIDIA driver of the CUDA release the bindings
 /// are generated from, or a later one.
 const DRIVER_PACKAGE: &str = "the NVIDIA driver of CUDA 13.0 or later";
@@ -123,6 +133,7 @@ driver_table! {
     graph_launch = "cuGraphLaunch": fn(Handle, Handle);
     graph_instantiate = "cuGraphInstantiateWithFlags": fn(*mut Handle, Handle, u64);
     graph_exec_destroy = "cuGraphExecDestroy": fn(Handle);
+    graph_exec_update = "cuGraphExecUpdate_v2": fn(Handle, Handle, *mut ExecUpdateInfo);
 
     event_create = "cuEventCreate": fn(*mut Handle, u32);
     event_record_with_flags = "cuEventRecordWithFlags": fn(Handle, Handle, u32);
@@ -195,19 +206,9 @@ driver_table! {
     );
     graph_destroy = "cuGraphDestroy": fn(Handle);
     graph_get_nodes = "cuGraphGetNodes": fn(Handle, *mut Handle, *mut usize);
-    graph_get_root_nodes = "cuGraphGetRootNodes": fn(Handle, *mut Handle, *mut usize);
-    graph_node_get_dependent_nodes = "cuGraphNodeGetDependentNodes_v2": fn(
-        Handle, *mut Handle, *mut sys::CUgraphEdgeData, *mut usize,
-    );
     graph_node_get_type = "cuGraphNodeGetType": fn(Handle, *mut sys::CUgraphNodeType);
-    graph_kernel_node_get_params = "cuGraphKernelNodeGetParams_v2": fn(
-        Handle, *mut sys::CUDA_KERNEL_NODE_PARAMS,
-    );
     func_get_param_info = "cuFuncGetParamInfo": fn(
         Handle, usize, *mut usize, *mut usize,
-    );
-    graph_exec_kernel_node_set_params = "cuGraphExecKernelNodeSetParams_v2": fn(
-        Handle, Handle, *const sys::CUDA_KERNEL_NODE_PARAMS,
     );
 
     tensor_map_encode_tiled = "cuTensorMapEncodeTiled": fn(

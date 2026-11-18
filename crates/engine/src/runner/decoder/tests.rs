@@ -22,7 +22,7 @@ use tensor::{DType, Tensor};
 use super::{DecoderConfig, DecoderRunner, RoundConfig, Unit};
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::tables::BlockTables;
-use crate::runner::Runner;
+use crate::runner::Forward;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
 
@@ -742,12 +742,12 @@ fn every_bucket_is_profiled_and_captured_with_its_conversions() {
     video.graphs().profile_run(&video).unwrap();
     assert_eq!(launches(&video, &clip, RGB_BYTES), 0);
     assert_eq!(launches(&video, &splice, RGB_BYTES), 3);
-    video.graphs().capture(&video, &clip).unwrap();
+    crate::runner::graphs::tests::warm(&video, &clip).unwrap();
 
     // A track's graph interleaves its waveform once.
     let bucket = Bucket::audio(1, track()).serving(FRAMES, 8, 8);
     let audio = runner(vec![bucket], false);
     audio.graphs().profile_run(&audio).unwrap();
     assert_eq!(launches(&audio, &bucket, PCM_INTERLEAVE), 1);
-    audio.graphs().capture(&audio, &bucket).unwrap();
+    crate::runner::graphs::tests::warm(&audio, &bucket).unwrap();
 }

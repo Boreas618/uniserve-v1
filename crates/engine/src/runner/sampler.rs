@@ -139,6 +139,7 @@ pub(crate) struct SamplerConfig {
 /// tensors over memory its runner owns: external device tensors when serving, meta tensors for
 /// a profile run, CPU tensors on the host. Both are `[slots, vocabulary]`, so a row's slot
 /// names its request's row of each.
+#[derive(Clone)]
 pub(crate) struct Sampler {
     config: SamplerConfig,
     /// `[slots, vocabulary]` I32: how often each slot's request has seen each token.

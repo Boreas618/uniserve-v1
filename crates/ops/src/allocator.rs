@@ -73,6 +73,12 @@ impl Allocator {
         Self::new(0, u64::MAX)
     }
 
+    /// An empty allocator over this one's region: it hands out the addresses this one does for
+    /// the same sequence of allocations, and shares no block with it.
+    pub fn alike(&self) -> Self {
+        Self::new(self.base, self.capacity)
+    }
+
     /// A block of at least `bytes` bytes: its address, and the reset it belongs to.
     ///
     /// The caller hands both back to [`Allocator::free`] with the same `bytes`.

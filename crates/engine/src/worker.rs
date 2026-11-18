@@ -29,9 +29,11 @@
 //!   number;
 //! - a completion of the buffer pool to **map** into the rank's device block tables, and
 //!   requests to **stamp** ([`BlockTables`]);
-//! - the **capture** of the runners' buckets (warm-up), largest first;
-//! - a generation to **prepare**, to **switch** to, to **commit** and to **roll back**, each
-//!   on every runner of the device;
+//! - the **capture** of the runners' buckets (warm-up), which hands them to the capture thread;
+//! - a generation to **prepare**, which hands its buckets to the capture thread; a bucket the
+//!   capture thread **captured**, which is installed in its runner's graphs; buckets to
+//!   **switch** to a prepared generation ahead of the others, or the generation to switch to
+//!   whole; a generation to **commit** and to **roll back**, each on every runner of the device;
 //! - a change of the device's **profiling session**;
 //! - a **wait** for stream events, which deferred storage release hangs on;
 //! - a **control operation**: a closure the worker calls with its runners. This is how a
@@ -40,9 +42,22 @@
 //!   storage owner decides on another thread is issued this way too, so nothing but the worker
 //!   issues on the device's streams.
 //!
-//! A capture, a preparation and a shadow batch take one queue turn per bucket or operator and
-//! go back to the tail in between, so batches submitted meanwhile are executed between two of
-//! their turns instead of behind all of them.
+//! A shadow batch takes one queue turn per operator and goes back to the tail in between, so
+//! batches submitted meanwhile are executed between two of its turns instead of behind all of
+//! them.
+//!
+//! ## The capture thread
+//!
+//! Every worker starts a capture thread beside its own ([`capture`]), over a second instance of
+//! each runner's forward (`Runner::capturer`). Warm-up and a generation's preparation hand it
+//! their buckets, the most replayed first: it examines, rehearses and captures each on streams
+//! of its own while the worker serves, and hands each graph back as a job, which the worker
+//! installs between two batches. What is installed is ready ([`Worker::ready`]): a bucket
+//! switches to a prepared generation once every rank of the groups that hold it is ready for
+//! it, by a job each rank takes between the same two batches ([`Worker::switch_buckets`]), and
+//! a batch replays the newest graph of its bucket at or below what its bucket switched to and
+//! its kernel stamp (`Batch::kernels`), so every rank replays it with graphs of one
+//! generation.
 //!
 //! ## The device block tables and the sequences
 //!
@@ -136,9 +151,11 @@
 //! | [`queue`] | [`Queue`]: the jobs in submission order, the job in flight, the close |
 //! | [`sequences`] | [`Sequences`]: the ended sequences of a group's ranks and its `completed` word |
 //! | [`watchdog`] | [`Watchdog`](watchdog::Watchdog): when the control thread looks at the jobs in flight, and which it reports |
+//! | [`capture`] | The capture thread, and the readiness of what it captured |
 //! | [`completion`] | How an operation ended, the completion its waiters share, and the submission of a job to a worker or to every rank of a group |
 //! | [`error`] | The one error of device work |
 
+pub(crate) mod capture;
 pub mod completion;
 pub(crate) mod error;
 pub(crate) mod queue;
@@ -176,7 +193,9 @@ use crate::profiling;
 use crate::profiling::session::{Change, ProfileAnswer, Session};
 use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
-use crate::runner::graphs::Preparation;
+use crate::runner::graphs::Graph;
+
+use self::capture::{Capturer, Key, Readiness, Work};
 
 /// The copies one batch started: the request of each, in the order they were queued, with
 /// whether it was issued; and the runners, by index, that were handed copies, whose copies the
@@ -231,15 +250,24 @@ pub(crate) enum Job {
     /// Apply requests to the rank's device block tables ([`BlockTables::apply`]) and return them
     /// stamped with the number of the last job the rank launched.
     Stamp(Vec<Request>),
-    /// Capture every bucket the runners state and have no graph of, largest first: the warm-up.
-    /// One bucket per queue turn.
+    /// Hand every bucket the runners state and have no graph of to the capture thread, under
+    /// the serving generation: the warm-up.
     Capture,
-    /// Prepare a generation beside the serving one on every runner: each bucket is examined, and
-    /// its graph rebound or recaptured where the generation changes it, one bucket per queue
-    /// turn.
+    /// Begin preparing a generation beside the serving one on every runner and hand its buckets
+    /// to the capture thread, the most replayed first.
     Prepare(Arc<Generation>),
-    /// Switch every runner to the prepared generation of this number, which then serves on
-    /// trial.
+    /// Install what the capture thread made of one bucket for the generation of this number:
+    /// its graph, `None` for a bucket that keeps the graph it serves from, or the failure that
+    /// ended the generation's captures.
+    Captured {
+        generation: u64,
+        key: Key,
+        outcome: Result<Option<Graph>>,
+    },
+    /// Switch these buckets to the prepared generation of this number ahead of the others.
+    SwitchBuckets(u64, Vec<Key>),
+    /// Switch every runner to the prepared generation of this number whole, which then serves
+    /// on trial.
     Switch(u64),
     /// Commit the trial of the generation of this number: the generation it replaced is
     /// released.
@@ -277,7 +305,7 @@ impl Job {
     fn runs_forwards(&self) -> bool {
         match self {
             Self::Execute { batch, .. } => forwards(batch),
-            Self::Shadow { .. } | Self::Capture | Self::Prepare(_) => true,
+            Self::Shadow { .. } => true,
             _ => false,
         }
     }
@@ -302,6 +330,8 @@ impl Job {
             Self::Stamp(_) => c"uniserve.worker.stamp",
             Self::Capture => c"uniserve.worker.capture",
             Self::Prepare(_) => c"uniserve.worker.prepare",
+            Self::Captured { .. } => c"uniserve.worker.captured",
+            Self::SwitchBuckets(..) => c"uniserve.worker.switch_buckets",
             Self::Switch(_) => c"uniserve.worker.switch",
             Self::Commit(_) => c"uniserve.worker.commit",
             Self::Rollback(_) => c"uniserve.worker.rollback",
@@ -346,6 +376,18 @@ impl std::fmt::Display for Job {
             ),
             Self::Capture => formatter.write_str("warming up: capturing the runners' buckets"),
             Self::Prepare(next) => write!(formatter, "preparing generation {}", next.number()),
+            Self::Captured {
+                generation, key, ..
+            } => write!(
+                formatter,
+                "installing bucket {} of runner {} for generation {generation}",
+                key.1, key.0
+            ),
+            Self::SwitchBuckets(number, keys) => write!(
+                formatter,
+                "switching {} buckets to generation {number}",
+                keys.len()
+            ),
             Self::Switch(number) => write!(formatter, "switching to generation {number}"),
             Self::Commit(number) => write!(formatter, "committing generation {number}"),
             Self::Rollback(number) => write!(formatter, "rolling back generation {number}"),
@@ -430,10 +472,11 @@ pub struct Worker {
     /// The worker group the device is a rank of, and the rank's place among those that report to
     /// the group's [`Sequences`].
     group: GroupId,
-    /// The turn this worker's eager-forward jobs take ([`in_turn`]): its group's, or the first
-    /// group of the node's expert union when the rank is a member of one ([`Worker::in_union`]).
-    turn: GroupId,
     rank: usize,
+    /// The number of the generation the worker started serving: what warm-up captures.
+    first: u64,
+    /// What the capture thread made ready, which the worker thread states as it installs it.
+    readiness: Arc<Readiness>,
     queue: Arc<Queue>,
     counters: Arc<Counters>,
     /// What the generation update in flight has no comparison for; see [`Worker::uncompared`].
@@ -491,6 +534,20 @@ impl Worker {
             .flat_map(|runner| runner.phases().iter().copied())
             .collect();
         let queue = Queue::new(phases);
+
+        // Each runner's forward is instanced twice for the capture thread: over graphs beside
+        // the runner's, which capture, and over a rehearsal's, which run kernels' first uses.
+        let mut instances = Vec::with_capacity(runners.len());
+        for runner in &runners {
+            let graphs = runner.graphs();
+            instances.push((
+                runner.capturer(graphs.beside()?)?,
+                runner.capturer(graphs.rehearsal()?)?,
+            ));
+        }
+        let capturer = Capturer::spawn(device, instances, Arc::clone(&queue))?;
+        let readiness = Arc::new(Readiness::default());
+        let first = kernels.number();
         let counters = Arc::new(Counters::default());
         let uncompared = Arc::new(Mutex::new(Vec::new()));
         let fault = Arc::new(Fault::default());
@@ -500,6 +557,9 @@ impl Worker {
             runners,
             queue: Arc::clone(&queue),
             kernels: BTreeMap::from([(kernels.number(), kernels)]),
+            capturer,
+            readiness: Arc::clone(&readiness),
+            cancelled: BTreeMap::new(),
             counters: Arc::clone(&counters),
             uncompared: Arc::clone(&uncompared),
             unmeasured: Vec::new(),
@@ -527,8 +587,9 @@ impl Worker {
         Ok(Self {
             device,
             group,
-            turn: group,
             rank,
+            first,
+            readiness,
             queue,
             counters,
             uncompared,
@@ -545,15 +606,6 @@ impl Worker {
     /// The worker group the device is a rank of.
     pub(crate) fn group(&self) -> GroupId {
         self.group
-    }
-
-    /// This worker as a member of the node's expert union whose first group is `first`: its
-    /// eager-forward jobs take the union's turn ([`in_turn`]). Every member's warm-up and
-    /// generation preparation runs the union's exchange, whose launches hold a member's device
-    /// until every member reached them, so the members of the union run those jobs at once.
-    pub(crate) fn in_union(mut self, first: GroupId) -> Self {
-        self.turn = first;
-        self
     }
 
     /// The rank's place among those that report to the group's [`Sequences`].
@@ -673,18 +725,21 @@ impl Worker {
         self.queue.submit(Job::Stamp(requests))
     }
 
-    /// Submits the capture of every bucket the runners state ([`Job::Capture`]).
+    /// Warms the runners up: hands every bucket they state to the capture thread under the
+    /// serving generation ([`Job::Capture`]). The submission completes once every bucket's
+    /// graph is installed, and fails with the first capture that failed.
     ///
     /// # Errors
     ///
     /// Once the queue is closed.
     pub(crate) fn warm_up(&self) -> Result<Submission> {
-        self.queue.submit(Job::Capture)
+        let handed = self.queue.submit(Job::Capture)?;
+        Ok(self.readiness.wait(self.first, None).joined(vec![handed]))
     }
 
-    /// Submits the preparation of generation `next` ([`Job::Prepare`]): its first turn begins it
-    /// on every runner, and each later turn examines one bucket and prepares its graph where it
-    /// needs one, so the batches submitted meanwhile are executed between two buckets. A
+    /// Submits the preparation of generation `next` ([`Job::Prepare`]): it begins on every
+    /// runner between two batches and hands the buckets to the capture thread, which captures
+    /// them while the worker serves; [`Worker::ready`] states when they are installed. A
     /// preparation that fails leaves nothing of the generation on this worker's runners; the
     /// engine still rolls it back on every worker ([`Worker::rollback`]), which those that
     /// prepared it give back.
@@ -696,8 +751,49 @@ impl Worker {
         self.queue.submit(Job::Prepare(next))
     }
 
-    /// Submits the switch to the prepared generation `number`, which takes effect between the
+    /// A submission that completes once the outcome of every bucket of `keys` (every bucket the
+    /// generation examines, when `keys` is `None`) is installed for generation `number`, and
+    /// fails once a capture of the generation failed or the generation was rolled back. A key
+    /// of a bucket this worker holds no graph of is ready.
+    pub(crate) fn ready(&self, number: u64, keys: Option<Vec<Key>>) -> Submission {
+        self.readiness.wait(number, keys)
+    }
+
+    /// The device bytes a generation update that replaces `operators` takes on this worker's
+    /// device beside what serves, summed over its runners (`Graphs::update_bytes`). A work
+    /// thread's call, never the control thread's.
+    ///
+    /// # Errors
+    ///
+    /// The close of the queue.
+    pub(crate) fn update_bytes(&self, operators: BTreeSet<String>) -> Result<u64> {
+        self.call("reading what a generation update takes", move |runners| {
+            Ok(runners
+                .iter()
+                .map(|runner| runner.graphs().update_bytes(&operators))
+                .sum())
+        })
+    }
+
+    /// The buckets generation `number` examines on this worker, in the order the capture thread
+    /// takes them; `None` before its preparation began here.
+    pub(crate) fn order(&self, number: u64) -> Option<Vec<Key>> {
+        self.readiness.order(number)
+    }
+
+    /// Submits the switch of `keys`, buckets whose outcome is installed for the prepared
+    /// generation `number`, to that generation ahead of the others: it takes effect between the
     /// batches submitted before and after it.
+    ///
+    /// # Errors
+    ///
+    /// Once the queue is closed.
+    pub(crate) fn switch_buckets(&self, number: u64, keys: Vec<Key>) -> Result<Submission> {
+        self.queue.submit(Job::SwitchBuckets(number, keys))
+    }
+
+    /// Submits the switch to the prepared generation `number` whole, which takes effect between
+    /// the batches submitted before and after it.
     ///
     /// # Errors
     ///
@@ -857,64 +953,6 @@ impl Worker {
     }
 }
 
-/// Submits a job that runs eager forwards (a warm-up, a generation's preparation) to each of
-/// `workers`, through `submit` of each worker's index and worker: the workers of one turn at
-/// once and the turns one after another in the order of their ids, each once every earlier
-/// turn's workers ended their jobs. A worker's turn is its group's, and the members of the
-/// node's expert union, whose exchange meets them all, take the turn of the union's first group
-/// together ([`Worker::in_union`]). Returns each worker's submission, in the workers' order.
-/// Once an earlier turn's job failed, no later turn is submitted, and the entries of their
-/// workers are refusals.
-///
-/// An eager forward uses kernels for the first time, and a kernel's first use takes a lock of
-/// the whole process and waits for the work in flight to drain (`ops::collective`). The ranks of
-/// a host are threads of one process: a rank of one group making a first use would wait on
-/// another group's collective spinning on a device until its peers arrive, while those peers
-/// queue on the same lock. Within a group that meets, the ranks meet before each collective of
-/// an eager forward (`ops::Group::with_meet`); the groups take turns. Every host takes the
-/// groups in the same order, so a group whose ranks span hosts waits on no group after it, and
-/// on no host's copy of itself.
-pub(crate) fn in_turn(
-    workers: &[Arc<Worker>],
-    mut submit: impl FnMut(usize, &Worker) -> Result<Submission>,
-) -> Vec<Result<Submission>> {
-    let mut turns: Vec<GroupId> = workers.iter().map(|worker| worker.turn).collect();
-    turns.sort_unstable();
-    turns.dedup();
-
-    let mut submitted: Vec<Option<Result<Submission>>> = workers.iter().map(|_| None).collect();
-    let mut failed = false;
-    for turn in turns {
-        // Every worker of the earlier turns: a collective of a group ends on one device only
-        // once the group's ranks on the others reached it.
-        for entry in submitted.iter().flatten() {
-            let ended = match entry {
-                Ok(submission) => matches!(submission.wait(), Outcome::Success(_)),
-                Err(_) => false,
-            };
-            failed |= !ended;
-        }
-
-        for (index, worker) in workers.iter().enumerate() {
-            if worker.turn != turn {
-                continue;
-            }
-            submitted[index] = Some(if failed {
-                Err(Error::State(
-                    "an earlier turn's job failed, so this turn's was not submitted",
-                ))
-            } else {
-                submit(index, worker)
-            });
-        }
-    }
-
-    submitted
-        .into_iter()
-        .map(|entry| entry.unwrap_or(Err(Error::State("the worker belongs to no group"))))
-        .collect()
-}
-
 impl Drop for Worker {
     fn drop(&mut self) {
         if self.join_thread().is_err() {
@@ -958,6 +996,13 @@ struct Thread {
     /// ([`Graphs::generation`](crate::runner::graphs::Graphs::generation)); a shadow batch reads
     /// the two it compares here.
     kernels: BTreeMap<u64, Arc<Generation>>,
+    /// The capture thread, which the worker hands warm-up's and each generation's buckets.
+    capturer: Capturer,
+    /// What the capture thread made ready, as the worker installs it.
+    readiness: Arc<Readiness>,
+    /// The flag of each generation handed to the capture thread, which a rollback sets so the
+    /// thread examines no further bucket of it.
+    cancelled: BTreeMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     counters: Arc<Counters>,
     uncompared: Arc<Mutex<Vec<String>>>,
     /// The kernels the generation being prepared adds, which nothing serving is compared with.
@@ -1216,16 +1261,26 @@ impl Thread {
                 BatchOutput::default(),
                 self.stamp(requests)?,
             ))),
-            Job::Capture => Ok(if self.capture()? {
-                ControlFlow::Continue(Job::Capture)
-            } else {
-                done
-            }),
-            Job::Prepare(next) => Ok(if self.prepare(&next)? {
-                ControlFlow::Continue(Job::Prepare(next))
-            } else {
-                done
-            }),
+            Job::Capture => {
+                self.capture()?;
+                Ok(done)
+            }
+            Job::Prepare(next) => {
+                self.prepare(&next)?;
+                Ok(done)
+            }
+            Job::Captured {
+                generation,
+                key,
+                outcome,
+            } => {
+                self.captured(generation, key, outcome)?;
+                Ok(done)
+            }
+            Job::SwitchBuckets(number, keys) => {
+                self.switch_buckets(number, &keys)?;
+                Ok(done)
+            }
             Job::Switch(number) => {
                 self.switch(number)?;
                 Ok(done)
@@ -1316,6 +1371,9 @@ impl Thread {
         if forwards(&batch) {
             self.runners[index].graphs().mark_step(step, stage);
         }
+        // Every forward of the batch replays graphs of at most the generation its scheduler
+        // stamped it with.
+        self.runners[index].graphs().stamp(batch.kernels);
 
         // A numbered batch whose work runs on beyond its runner's call (host work on a thread
         // pool, or a step the device computes while the worker issues the next) leaves the worker
@@ -1649,151 +1707,171 @@ impl Thread {
         Ok(compared + 1 < operators.len())
     }
 
-    /// Captures the first bucket a runner states and has no graph of. Returns whether another is
-    /// left for a later turn.
-    fn capture(&mut self) -> Result<bool> {
-        // The runners in their order, and each runner's buckets in its own: largest first.
-        let mut uncaptured = Vec::new();
+    /// Warms up: hands every bucket a runner states and has no graph of to the capture thread,
+    /// under the serving generation, the runners in their order and each runner's buckets in
+    /// its own, largest first. Each is installed as the capture thread hands it back
+    /// ([`Thread::captured`]).
+    fn capture(&mut self) -> Result<()> {
+        let kernels = self.serving()?;
+        let number = kernels.number();
+
+        let mut buckets = Vec::new();
         for (index, runner) in self.runners.iter().enumerate() {
             let captured = runner.graphs().buckets();
-            uncaptured.extend(
+            buckets.extend(
                 runner
                     .buckets()
                     .into_iter()
                     .filter(|bucket| !captured.contains(bucket))
-                    .map(|bucket| (index, bucket)),
+                    .map(|bucket| ((index, bucket), None)),
             );
         }
-        let Some(&(index, bucket)) = uncaptured.first() else {
-            self.set_warming(false);
-            return Ok(false);
-        };
-        let more = uncaptured.len() > 1;
 
-        // Every runner's forwards are a warm-up's while a bucket is left, so the members of an
-        // expert union capture in step; a batch served between two turns runs with it set.
-        self.set_warming(true);
-
-        // A capture is long device work with no batch to show for it: the line that it started,
-        // with none that it finished, is the shape a stuck warm-up has.
         self.queue.note(format!(
-            "warming up: capturing bucket {bucket} of runner {index}"
+            "warming up: {} buckets handed to the capture thread",
+            buckets.len()
         ));
-        tracing::info!(device = ?self.device, runner = index, %bucket, "a bucket's capture starts");
-
-        let started = Instant::now();
-        let runner = &self.runners[index];
-        let captured = runner.graphs().capture(&**runner, &bucket);
-
-        // The warm-up ends with its last capture, or with the capture that failed it.
-        if captured.is_err() || !more {
-            self.set_warming(false);
-        }
-        captured?;
-
-        tracing::info!(
-            device = ?self.device,
-            runner = index,
-            %bucket,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "the bucket's capture finished"
-        );
-        Ok(more)
+        self.hand(kernels, None, buckets)
+            .inspect_err(|error| self.readiness.fail(number, error.to_string()))
     }
 
-    /// States `warming` on every runner ([`Runner::set_warming`]).
-    fn set_warming(&self, warming: bool) {
-        for runner in &self.runners {
-            runner.set_warming(warming);
-        }
-    }
-
-    /// One turn of the preparation of `next`: the first begins it on every runner, and each
-    /// later one examines one bucket, and prepares its graph where it needs one. Returns whether
-    /// a bucket is left for a later turn.
-    fn prepare(&mut self, next: &Arc<Generation>) -> Result<bool> {
+    /// Begins the preparation of `next` on every runner and hands its buckets to the capture
+    /// thread: each runner's captured buckets, the most replayed first, with the launch table of
+    /// the graph each serves from.
+    fn prepare(&mut self, next: &Arc<Generation>) -> Result<()> {
         let number = next.number();
-        let began = self.kernels.contains_key(&number)
-            && self
-                .runners
-                .iter()
-                .all(|runner| runner.graphs().generation() != number);
-
-        if began {
-            if let Some((index, bucket)) = self.pending() {
-                self.queue.note(format!(
-                    "preparing generation {number}: bucket {bucket} of runner {index}"
-                ));
-
-                let runner = &self.runners[index];
-                let done = match runner.graphs().prepare_bucket(&**runner, &bucket) {
-                    Ok(done) => done,
-                    Err(error) => {
-                        // A generation a bucket refuses, or whose graph fails, is given back on
-                        // every runner of the device, so nothing of it is left being prepared.
-                        if let Err(unwound) = self.rollback(number) {
-                            tracing::warn!(
-                                %unwound,
-                                generation = number,
-                                "a failed preparation was not given back"
-                            );
-                        }
-                        return Err(error);
-                    }
-                };
-
-                // A bucket that keeps its graph is most buckets of most generations, a turn of
-                // a few milliseconds that changes nothing: only a graph made is a line.
-                if done != Preparation::Keep {
-                    tracing::info!(
-                        device = ?self.device,
-                        runner = index,
-                        %bucket,
-                        generation = number,
-                        ?done,
-                        "a bucket's graph was prepared for a generation"
-                    );
-                }
-            }
-            return Ok(self.pending().is_some());
-        }
+        let serving = self.serving()?;
 
         // The device prepares a generation on all of its runners or on none: a runner that
         // refuses it ends the preparation of the runners before it.
+        let mut buckets = Vec::new();
         for (index, runner) in self.runners.iter().enumerate() {
-            let Err(error) = runner.graphs().prepare(&**runner, Arc::clone(next)) else {
-                continue;
+            let order = match runner.graphs().prepare(&**runner, Arc::clone(next)) {
+                Ok(order) => order,
+                Err(error) => {
+                    for earlier in &self.runners[..index] {
+                        if let Err(error) = earlier.graphs().rollback(number) {
+                            tracing::warn!(
+                                %error,
+                                generation = number,
+                                "a refused preparation was not ended"
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
             };
 
-            for earlier in &self.runners[..index] {
-                if let Err(error) = earlier.graphs().rollback(number) {
-                    tracing::warn!(%error, generation = number, "a refused preparation was not ended");
-                }
-            }
-            return Err(error);
+            let graphs = runner.graphs();
+            buckets.extend(
+                order
+                    .into_iter()
+                    .map(|bucket| ((index, bucket), graphs.launch_table(&bucket))),
+            );
         }
 
         // The update's evidence starts empty, but for the kernels it adds: nothing serving
         // computes them, so no paired forward will compare them.
-        let serving = self
-            .runners
-            .first()
-            .and_then(|runner| self.kernels.get(&runner.graphs().generation()));
-        self.unmeasured = serving.map_or_else(Vec::new, |serving| added_kernels(serving, next));
+        self.unmeasured = added_kernels(&serving, next);
         self.kernels.insert(number, Arc::clone(next));
         self.publish_uncompared();
 
-        Ok(self.pending().is_some())
+        tracing::info!(
+            device = ?self.device,
+            generation = number,
+            buckets = buckets.len(),
+            "a generation's buckets were handed to the capture thread"
+        );
+        self.hand(Arc::clone(next), Some(serving), buckets)
     }
 
-    /// Switches every runner to the prepared generation `number`.
+    /// Hands `buckets` of generation `kernels` to the capture thread, beside `serving`, and
+    /// states the order the generation's readiness counts them in.
+    fn hand(
+        &mut self,
+        kernels: Arc<Generation>,
+        serving: Option<Arc<Generation>>,
+        buckets: Vec<(Key, Option<capture::Table>)>,
+    ) -> Result<()> {
+        let number = kernels.number();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancelled.insert(number, Arc::clone(&cancelled));
+        self.readiness
+            .begin(number, buckets.iter().map(|(key, _)| *key).collect());
+
+        self.capturer.submit(Work {
+            kernels,
+            serving,
+            buckets,
+            cancelled,
+        })
+    }
+
+    /// Installs what the capture thread made of `key` for generation `number`, and states the
+    /// bucket ready. A failed capture fails the generation's readiness; an outcome of a
+    /// generation rolled back meanwhile is dropped.
+    fn captured(&mut self, number: u64, key: Key, outcome: Result<Option<Graph>>) -> Result<()> {
+        let (index, bucket) = key;
+        let rolled_back = self
+            .cancelled
+            .get(&number)
+            .is_none_or(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire));
+        if rolled_back {
+            return Ok(());
+        }
+
+        let installed = outcome.and_then(|graph| {
+            let runner = self.runners.get(index).ok_or_else(|| {
+                Error::Invariant(format!("the capture thread names runner {index}"))
+            })?;
+            runner.graphs().install(&bucket, number, graph)
+        });
+        match installed {
+            Ok(()) => {
+                self.readiness.ready(number, key);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    device = ?self.device,
+                    runner = index,
+                    %bucket,
+                    generation = number,
+                    %error,
+                    "a bucket's capture failed; the generation is not ready"
+                );
+                self.readiness.fail(number, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// Switches the buckets of `keys` to the prepared generation `number` ahead of the others,
+    /// each on its runner.
+    fn switch_buckets(&mut self, number: u64, keys: &[Key]) -> Result<()> {
+        for (index, runner) in self.runners.iter().enumerate() {
+            let buckets: Vec<Bucket> = keys
+                .iter()
+                .filter(|(of, _)| *of == index)
+                .map(|(_, bucket)| *bucket)
+                .collect();
+            if !buckets.is_empty() {
+                runner.graphs().switch_buckets(number, &buckets)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Switches every runner to the prepared generation `number` whole.
     fn switch(&mut self, number: u64) -> Result<()> {
         // Checked for every runner before any switches, so the runners serve one generation.
-        if let Some((index, bucket)) = self.pending() {
-            return Err(Error::Invariant(format!(
-                "generation {number} is not prepared: bucket {bucket} of runner {index} is still \
-                 to be examined"
-            )));
+        for (index, runner) in self.runners.iter().enumerate() {
+            if let Some(bucket) = runner.graphs().pending().first() {
+                return Err(Error::Invariant(format!(
+                    "generation {number} is not prepared: bucket {bucket} of runner {index} is \
+                     still to be captured"
+                )));
+            }
         }
 
         for runner in &self.runners {
@@ -1809,17 +1887,25 @@ impl Thread {
 
         if committed.is_ok() {
             self.kernels.retain(|held, _| *held >= number);
+            self.cancelled.retain(|held, _| *held > number);
+            self.readiness.forget(number);
         }
         committed
     }
 
-    /// Rolls generation `number` back on every runner.
+    /// Rolls generation `number` back on every runner: the capture thread examines no further
+    /// bucket of it, and its readiness fails.
     fn rollback(&mut self, number: u64) -> Result<()> {
         // A preparation that a runner refused left nothing of the generation here, and the
         // engine rolls a failed update back on every device alike.
         if !self.kernels.contains_key(&number) {
             return Ok(());
         }
+        if let Some(cancelled) = self.cancelled.remove(&number) {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.readiness
+            .fail(number, format!("generation {number} was rolled back"));
 
         let rolled_back = self.on_every_runner(|runner| runner.graphs().rollback(number));
 
@@ -1833,6 +1919,7 @@ impl Thread {
             self.kernels.remove(&number);
             self.unmeasured.clear();
             self.publish_uncompared();
+            self.readiness.forget(number);
         }
         rolled_back
     }
@@ -1851,13 +1938,21 @@ impl Thread {
         first
     }
 
-    /// The next bucket the generation being prepared has yet to examine, with its runner: the
-    /// runners in their order and each runner's buckets largest first.
-    fn pending(&self) -> Option<(usize, Bucket)> {
-        self.runners
-            .iter()
-            .enumerate()
-            .find_map(|(index, runner)| runner.graphs().pending().map(|bucket| (index, bucket)))
+    /// The generation the runners serve whole; a worker of no runner serves the one it started
+    /// with.
+    fn serving(&self) -> Result<Arc<Generation>> {
+        let number = match self.runners.first() {
+            Some(runner) => runner.graphs().generation(),
+            None => self
+                .kernels
+                .keys()
+                .next()
+                .copied()
+                .ok_or(Error::State("the worker holds no generation"))?,
+        };
+        self.kernels.get(&number).cloned().ok_or(Error::State(
+            "the worker holds no generation of what its runners serve",
+        ))
     }
 
     /// States what the update in flight has no comparison for, for [`Worker::uncompared`].

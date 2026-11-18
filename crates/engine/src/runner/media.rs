@@ -88,12 +88,12 @@ use tensor::Tensor;
 
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::conditions;
 use crate::runner::decoder::RoundConfig;
 use crate::runner::graphs::Graphs;
 use crate::runner::thread_pool::{HostAction, HostTask, ThreadPool};
+use crate::runner::{Forward, Runner};
 use crate::runner::{performed, settle};
 use crate::worker::completion::{Outcome, Waker};
 use crate::worker::{Error, Result};
@@ -746,11 +746,7 @@ impl MediaHost {
     }
 }
 
-impl Runner for MediaHost {
-    fn phases(&self) -> &[Phase] {
-        &self.config.phases
-    }
-
+impl Forward for MediaHost {
     /// A host call captures no graph: its buckets state which phases the runner serves and are
     /// no warm-up's.
     fn buckets(&self) -> Vec<Bucket> {
@@ -768,6 +764,20 @@ impl Runner for MediaHost {
         Err(Error::Unsupported(format!(
             "bucket {bucket} is a host call's, which has no input tensors"
         )))
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for MediaHost {
+    fn phases(&self) -> &[Phase] {
+        &self.config.phases
+    }
+
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(crate::runner::HostForward::new(graphs)))
     }
 
     fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
@@ -811,10 +821,6 @@ impl Runner for MediaHost {
         let output = answered?;
         settled?;
         Ok(output)
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 
     /// Issues the copies that start with the batch through the rank's media memory, on the
@@ -2034,11 +2040,7 @@ mod tests {
         graphs: Graphs,
     }
 
-    impl Runner for Device {
-        fn phases(&self) -> &[Phase] {
-            &[Phase::Decode]
-        }
-
+    impl Forward for Device {
         fn buckets(&self) -> Vec<Bucket> {
             Vec::new()
         }
@@ -2051,6 +2053,20 @@ mod tests {
             Ok(())
         }
 
+        fn graphs(&self) -> &Graphs {
+            &self.graphs
+        }
+    }
+
+    impl Runner for Device {
+        fn phases(&self) -> &[Phase] {
+            &[Phase::Decode]
+        }
+
+        fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+            Ok(Box::new(crate::runner::HostForward::new(graphs)))
+        }
+
         fn prepare_inputs(&mut self, batch: &Batch, _: &BlockTables) -> Result<Bucket> {
             Err(Error::Unsupported(format!("no inputs of {}", batch.id.0)))
         }
@@ -2060,10 +2076,6 @@ mod tests {
                 calls: batch.requests.iter().map(|_| performed()).collect(),
                 ..BatchOutput::default()
             })
-        }
-
-        fn graphs(&self) -> &Graphs {
-            &self.graphs
         }
     }
 

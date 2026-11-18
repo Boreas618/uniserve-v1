@@ -21,7 +21,8 @@ use ops::allocator::ALIGNMENT;
 enum Memory {
     /// Page-locked memory of a device's context, which copies on a stream read.
     Pinned(PinnedBuffer),
-    /// Ordinary host memory, for graphs that hold no device: nothing is ever copied from it.
+    /// Ordinary host memory, for graphs that hold no device or capture beside a runner's:
+    /// nothing is ever copied from it.
     Host(Vec<u8>),
 }
 
@@ -91,6 +92,11 @@ impl InputBuffer {
     /// The bytes of the values area of a slot.
     pub(crate) fn values_bytes(&self) -> u64 {
         self.values
+    }
+
+    /// Whether the ring is over ordinary host memory, from which nothing is copied.
+    pub(crate) fn is_host(&self) -> bool {
+        matches!(self.memory, Memory::Host(_))
     }
 
     /// Takes the next slot of the ring for one replay and returns it.

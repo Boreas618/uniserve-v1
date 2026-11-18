@@ -41,6 +41,7 @@ use crate::worker::{Error, Result};
 use ops::allocator::ALIGNMENT;
 
 /// The runner's feature buffer (module documentation).
+#[derive(Clone)]
 pub(super) struct Features {
     /// The rank's media memory, where the encoder outputs lie.
     memory: Arc<BufferMemory>,

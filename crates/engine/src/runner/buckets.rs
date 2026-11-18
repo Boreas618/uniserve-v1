@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::batch::{Extent, Shape, Variant};
+use serde::{Deserialize, Serialize};
 
 use crate::worker::error::{Error, Result};
 
@@ -31,7 +32,7 @@ use crate::worker::error::{Error, Result};
 /// Buckets are ordered by size, variant first, then rows, then tokens, so that the smallest
 /// bucket holding a shape is the first one an ascending scan finds and the largest bucket is the
 /// last. The ordering is what the capture order and the preemption order both read.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct Bucket {
     pub variant: Variant,
     pub rows: u32,

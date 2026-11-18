@@ -3,7 +3,7 @@
 //! through the worker's queue, and worker groups of such workers driven through
 //! [`Route`] with the buffer pool's requests and completions.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,9 @@ use super::{Sequences, Worker};
 use crate::executor::Route;
 use crate::executor::peers::{Liveness, Remote, Upstream, accept, register};
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::runner::graphs::Graphs;
+use crate::runner::{Forward, Runner};
 use crate::worker::completion::{Outcome, Submission, Waker};
 use crate::worker::{Error, Result};
 use service::lock;
@@ -81,8 +81,6 @@ struct LoggingRunner {
     /// The batches whose execution the test holds, with the channels it holds them by: the
     /// runner sends the batch's id once it executes it and waits for the other to close.
     held: Option<(Vec<u64>, Sender<u64>, Receiver<()>)>,
-    /// What the worker last stated with `Runner::set_warming`.
-    warming: AtomicBool,
     /// The regions whose memory the runner maps: every region of the tests' ranks, unless a
     /// test states fewer.
     regions: Vec<u8>,
@@ -115,7 +113,6 @@ impl LoggingRunner {
             gain: weight(0x2_0000, &[HIDDEN]),
             log: Arc::clone(log),
             held: None,
-            warming: AtomicBool::new(false),
             regions: vec![DEVICE, HOST, PRODUCTS[0], PRODUCTS[1]],
             copying: false,
             in_flight: None,
@@ -128,11 +125,7 @@ impl LoggingRunner {
     }
 }
 
-impl Runner for LoggingRunner {
-    fn phases(&self) -> &[Phase] {
-        &self.phases
-    }
-
+impl Forward for LoggingRunner {
     fn buckets(&self) -> Vec<Bucket> {
         self.buckets.clone()
     }
@@ -150,14 +143,38 @@ impl Runner for LoggingRunner {
     }
 
     fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
-        // A capture fills the idle inputs of its bucket once, and is a warm-up's.
-        if self.warming.load(Ordering::Acquire) {
-            self.state(format!("capture {bucket}"));
-        } else {
-            self.state(format!("capture {bucket} outside a warm-up"));
-        }
+        // A capture fills the idle inputs of its bucket once, on the capture thread.
+        self.state(format!("capture {bucket}"));
         columns.fill(0);
         Ok(())
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for LoggingRunner {
+    fn phases(&self) -> &[Phase] {
+        &self.phases
+    }
+
+    /// The same runner over `graphs`, logging as this one does.
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(Self {
+            name: self.name,
+            phases: self.phases.clone(),
+            buckets: self.buckets.clone(),
+            graphs,
+            table: self.table.clone(),
+            gain: self.gain.clone(),
+            log: Arc::clone(&self.log),
+            held: None,
+            regions: self.regions.clone(),
+            copying: false,
+            in_flight: None,
+            launched: Vec::new(),
+        }))
     }
 
     fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
@@ -219,11 +236,6 @@ impl Runner for LoggingRunner {
             return Err(Error::Invalid("the runner refuses this batch".into()));
         }
 
-        let warming = if self.warming.load(Ordering::Acquire) {
-            " during a warm-up"
-        } else {
-            ""
-        };
         let read: String = batch
             .columns
             .slots
@@ -234,7 +246,7 @@ impl Runner for LoggingRunner {
             })
             .collect();
         self.state(format!(
-            "execute {} at generation {}{read}{warming}",
+            "execute {} at generation {}{read}",
             batch.id.0,
             self.graphs.generation()
         ));
@@ -247,14 +259,6 @@ impl Runner for LoggingRunner {
                 .collect(),
             ..BatchOutput::default()
         })
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
-    }
-
-    fn set_warming(&self, warming: bool) {
-        self.warming.store(warming, Ordering::Release);
     }
 
     fn weights_changed(&mut self) -> Result<()> {
@@ -652,28 +656,35 @@ fn a_batch_goes_to_the_runner_of_its_phase_and_one_no_runner_serves_is_refused()
     assert!(worker.join(batch(5, Phase::Decode, 1)).is_err());
 }
 
+/// The log's entries of captures, which the capture thread makes beside the worker's batches.
+fn captures(log: &Log) -> Vec<String> {
+    entries(log)
+        .into_iter()
+        .filter(|entry| entry.contains("capture"))
+        .collect()
+}
+
+/// The log's entries of batches, which the worker thread executes.
+fn executions(log: &Log) -> Vec<String> {
+    entries(log)
+        .into_iter()
+        .filter(|entry| entry.contains("execute"))
+        .collect()
+}
+
 #[test]
-fn warm_up_captures_every_bucket_largest_first_and_batches_run_between_captures() {
+fn warm_up_captures_every_bucket_largest_first_on_the_capture_thread() {
     let log = Log::default();
     let (worker, _) = worker(&["a", "b"], &log);
 
-    // The warm-up and a batch are queued behind the job in flight, in that order.
-    let (release, held) = hold(&worker);
+    // The warm-up hands the buckets to the capture thread; a batch submitted meanwhile is the
+    // worker's alone.
     let warm_up = worker.warm_up().unwrap();
-    let served = worker.submit(1, batch(1, Phase::Decode, 2)).unwrap();
-    drop(release);
-
-    output_of(&held);
-    output_of(&served);
     output_of(&warm_up);
-
-    // One bucket per turn: the batch is executed after the first capture, not after the last,
-    // and every runner's forwards are a warm-up's until the last capture.
     assert_eq!(
-        entries(&log),
+        captures(&log),
         [
             "a: capture decode_greedy/8 rows/8 tokens",
-            "a: execute 1 at generation 1 during a warm-up",
             "a: capture decode_greedy/4 rows/4 tokens",
             "a: capture decode_greedy/2 rows/2 tokens",
             "b: capture decode_greedy/8 rows/8 tokens",
@@ -694,14 +705,10 @@ fn warm_up_captures_every_bucket_largest_first_and_batches_run_between_captures(
     assert_eq!(captured, [3, 3]);
 
     output_of(&worker.warm_up().unwrap());
-    assert_eq!(entries(&log).len(), 7);
+    assert_eq!(captures(&log).len(), 6);
 
-    // The warm-up ended: a batch after it is no warm-up's.
-    output_of(&worker.submit(2, batch(2, Phase::Decode, 2)).unwrap());
-    assert_eq!(
-        entries(&log).last().map(String::as_str),
-        Some("a: execute 2 at generation 1")
-    );
+    output_of(&worker.submit(1, batch(1, Phase::Decode, 2)).unwrap());
+    assert_eq!(executions(&log), ["a: execute 1 at generation 1"]);
 }
 
 #[test]
@@ -709,10 +716,13 @@ fn a_generation_is_prepared_switched_to_and_committed_on_every_runner_between_ba
     let log = Log::default();
     let (worker, kernels) = worker(&["a", "b"], &log);
     output_of(&worker.warm_up().unwrap());
+    lock(&log).clear();
 
-    // The preparation leaves the serving generation serving.
+    // The preparation captures every bucket beside the serving graphs, which serve meanwhile.
     let next = replacing(&kernels, 2, "rms_norm");
     output_of(&worker.prepare(next).unwrap());
+    output_of(&worker.ready(2, None));
+    assert_eq!(captures(&log).len(), 6);
     assert_eq!(generations(&worker), [1, 1]);
     assert!(worker.uncompared().is_empty());
     lock(&log).clear();
@@ -744,14 +754,63 @@ fn a_generation_is_prepared_switched_to_and_committed_on_every_runner_between_ba
     assert_eq!(generations(&worker), [2, 2]);
 }
 
+/// A generation's buckets become ready in the order the capture thread takes them, each once
+/// the worker installed its capture, and a bucket switches ahead of the others only once it is
+/// ready.
+#[test]
+fn buckets_become_ready_in_order_and_switch_ahead_of_the_others() {
+    let log = Log::default();
+    let (worker, kernels) = worker(&["a"], &log);
+    output_of(&worker.warm_up().unwrap());
+
+    // The switch of a bucket submitted with the preparation, before any capture could be
+    // installed, is refused.
+    let (release, held) = hold(&worker);
+    let prepare = worker.prepare(replacing(&kernels, 2, "rms_norm")).unwrap();
+    let early = worker
+        .switch_buckets(2, vec![(0, Bucket::decode(2, Variant::DecodeGreedy))])
+        .unwrap();
+    drop(release);
+    output_of(&held);
+    output_of(&prepare);
+    let refused = failure_of(&early);
+    assert!(
+        refused.contains("before its capture was installed"),
+        "{refused}"
+    );
+
+    // Graphs with no device replay nothing, so every bucket was replayed as often: the order is
+    // the runner's capture order, largest first.
+    let order = worker.order(2).unwrap();
+    assert_eq!(
+        order,
+        [
+            (0, Bucket::decode(8, Variant::DecodeGreedy)),
+            (0, Bucket::decode(4, Variant::DecodeGreedy)),
+            (0, Bucket::decode(2, Variant::DecodeGreedy)),
+        ]
+    );
+
+    // Once ready, a bucket switches ahead of the others; a key of a bucket the worker holds no
+    // graph of is ready at once.
+    output_of(&worker.ready(2, Some(order[..1].to_vec())));
+    output_of(&worker.ready(2, Some(vec![(5, Bucket::decode(2, Variant::DecodeGreedy))])));
+    output_of(&worker.switch_buckets(2, order[..1].to_vec()).unwrap());
+    assert_eq!(generations(&worker), [1]);
+
+    output_of(&worker.ready(2, None));
+    output_of(&worker.switch(2).unwrap());
+    assert_eq!(generations(&worker), [2]);
+}
+
 #[test]
 fn a_generation_is_rolled_back_prepared_or_on_trial() {
     let log = Log::default();
     let (worker, kernels) = worker(&["a", "b"], &log);
     output_of(&worker.warm_up().unwrap());
 
-    // Prepared and never switched to: its graphs go, and the next update starts from the
-    // serving generation.
+    // Prepared and never switched to: its graphs go, a wait for it fails, and the next update
+    // starts from the serving generation.
     output_of(&worker.prepare(replacing(&kernels, 2, "rms_norm")).unwrap());
     output_of(&worker.rollback(2).unwrap());
     assert_eq!(generations(&worker), [1, 1]);
@@ -761,6 +820,7 @@ fn a_generation_is_rolled_back_prepared_or_on_trial() {
 
     // On trial: the generation it replaced serves again.
     output_of(&worker.prepare(replacing(&kernels, 3, "rms_norm")).unwrap());
+    output_of(&worker.ready(3, None));
     output_of(&worker.switch(3).unwrap());
     assert_eq!(generations(&worker), [3, 3]);
     output_of(&worker.rollback(3).unwrap());
@@ -772,12 +832,13 @@ fn a_generation_is_rolled_back_prepared_or_on_trial() {
 }
 
 #[test]
-fn a_switch_before_the_preparation_ended_switches_no_runner() {
+fn a_switch_before_every_capture_was_installed_switches_no_runner() {
     let log = Log::default();
     let (worker, kernels) = worker(&["a", "b"], &log);
     output_of(&worker.warm_up().unwrap());
 
-    // The preparation's first turn runs, and the switch is taken before its buckets' turns.
+    // The preparation begins, and the switch is taken before the capture thread handed back
+    // any bucket.
     let (release, held) = hold(&worker);
     let prepare = worker.prepare(replacing(&kernels, 2, "rms_norm")).unwrap();
     let switch = worker.switch(2).unwrap();
@@ -789,56 +850,31 @@ fn a_switch_before_the_preparation_ended_switches_no_runner() {
     output_of(&prepare);
     assert_eq!(generations(&worker), [1, 1]);
 
-    // A generation that lacks a kernel the runners launch is refused, and is not being
-    // prepared afterwards.
+    // A generation that lacks a kernel the runners launch fails its capture: it is never
+    // ready, and is not being prepared once rolled back.
     output_of(&worker.rollback(2).unwrap());
-    let refused = failure_of(&worker.prepare(Arc::new(Generation::new(4, []))).unwrap());
-    assert!(refused.contains("preparing generation 4"), "{refused}");
+    output_of(&worker.prepare(Arc::new(Generation::new(4, []))).unwrap());
+    let refused = failure_of(&worker.ready(4, None));
+    assert!(refused.contains("holds no kernel"), "{refused}");
+    output_of(&worker.rollback(4).unwrap());
     output_of(&worker.prepare(replacing(&kernels, 5, "rms_norm")).unwrap());
+    output_of(&worker.ready(5, None));
 }
 
-/// A preparation examines its buckets between batches, whatever the generation changes: one
-/// that keeps every graph (a policy's, which replaces no kernel) is still a profile run of each
-/// bucket, and a batch submitted after it began is executed before it ends, at the generation
-/// that serves.
+/// A generation that keeps every graph (a policy's, which replaces no kernel) captures nothing:
+/// the capture thread examines each bucket beside the batches the worker serves.
 #[test]
-fn a_preparation_that_keeps_every_graph_runs_between_batches() {
+fn a_preparation_that_keeps_every_graph_captures_nothing() {
     let log = Log::default();
     let (worker, kernels) = worker(&["a", "b"], &log);
     output_of(&worker.warm_up().unwrap());
     lock(&log).clear();
 
-    // The worker takes the preparation, then the batch, then an operation the test holds.
-    let (release, held) = hold(&worker);
-    let prepare = worker.prepare(Arc::new(kernels.replace(2, []))).unwrap();
-    let served = worker.submit(1, batch(1, Phase::Decode, 2)).unwrap();
-    let (entered, behind) = crossbeam_channel::bounded(1);
-    let (release_behind, released_behind) = crossbeam_channel::bounded::<()>(1);
-    let behind_batch = worker
-        .control(
-            "holding the worker behind the batch",
-            Box::new(move |_| {
-                entered.send(()).unwrap();
-                let _ = released_behind.recv();
-                Ok(())
-            }),
-        )
-        .unwrap();
-    drop(release);
-    output_of(&held);
-    behind
-        .recv_timeout(LONG)
-        .expect("the worker takes the operation");
+    output_of(&worker.prepare(Arc::new(kernels.replace(2, []))).unwrap());
+    output_of(&worker.submit(1, batch(1, Phase::Decode, 2)).unwrap());
+    output_of(&worker.ready(2, None));
+    assert!(captures(&log).is_empty());
 
-    // The batch was served while the preparation is under way.
-    assert!(matches!(served.outcome(), Some(Outcome::Success(_))));
-    assert!(prepare.outcome().is_none());
-    assert_eq!(entries(&log), ["a: execute 1 at generation 1"]);
-
-    // The preparation ends with every graph kept: it captured nothing, and it is switched to.
-    drop(release_behind);
-    output_of(&behind_batch);
-    output_of(&prepare);
     output_of(&worker.switch(2).unwrap());
     assert_eq!(generations(&worker), [2, 2]);
     assert_eq!(entries(&log), ["a: execute 1 at generation 1"]);

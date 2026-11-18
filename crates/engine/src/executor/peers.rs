@@ -693,11 +693,13 @@ impl Upstream {
     /// ranks, running each data plane's operation with `operate`; a close of the connection
     /// marks `liveness` lost, and the scheduler node's orderly close marks it closed.
     ///
-    /// Three threads: the link, which owns the connection and hands every job to the ranks in
+    /// Four threads: the link, which owns the connection and hands every job to the ranks in
     /// the order it arrived; the responder, which waits for each job in that order (each worker
     /// takes its jobs in that order) and gives its response to the link, with the group's ended
-    /// sequence as this process knows it then; and the operations thread, which runs the data
-    /// plane's operations one at a time in the order they arrived.
+    /// sequence as this process knows it then; the readiness responder, which waits in the same
+    /// way for each question whether a generation's buckets are ready
+    /// ([`MainProcessRequest::Ready`]), which no job's response waits behind; and the operations
+    /// thread, which runs the data plane's operations one at a time in the order they arrived.
     ///
     /// # Errors
     ///
@@ -710,50 +712,23 @@ impl Upstream {
     ) -> Result<Self> {
         let (responses, responded) = crossbeam_channel::unbounded::<FromPeer>();
         let (waiting, awaited) = crossbeam_channel::unbounded::<Awaited>();
+        let (readying, readiness) = crossbeam_channel::unbounded::<Awaited>();
         let (operations, operating) = crossbeam_channel::unbounded::<(u64, DataOperation)>();
         let closing = Arc::new(AtomicBool::new(false));
         let wake = channel.wake();
 
-        let responder = {
-            let wake = wake.clone();
-            let responses = responses.clone();
-            let route = Arc::clone(&route);
-
-            std::thread::Builder::new()
-                .name("peer-responder".into())
-                .spawn(move || {
-                    for (id, group, submission) in awaited {
-                        // Each rank stated its ended sequence before its part completed, so the
-                        // group's is read once the job completed.
-                        let outcome = submission.wait();
-                        let ended = group.map_or(Ok(0), |group| route.completed(group));
-                        let response = match (outcome, ended) {
-                            (Outcome::Success((output, requests)), Ok(ended)) => {
-                                MainProcessResponse::result(output, &requests, ended)
-                            }
-                            (Outcome::Success(_), Err(error)) => {
-                                MainProcessResponse::failed(error.to_string(), &[], 0)
-                            }
-                            (Outcome::Failed(error), ended) => {
-                                // A failed batch returns the `Finish` of each copy it started.
-                                let finished = error
-                                    .downcast_ref::<Error>()
-                                    .map_or(&[][..], Error::finished);
-                                let ended = ended.unwrap_or(0);
-                                MainProcessResponse::failed(error.to_string(), finished, ended)
-                            }
-                            (Outcome::Cancelled, _) => {
-                                MainProcessResponse::failed("the job was cancelled".into(), &[], 0)
-                            }
-                        };
-                        if responses.send(FromPeer { id, response }).is_err() {
-                            return;
-                        }
-                        wake.wake();
-                    }
-                })
-                .map_err(|error| Error::transport_source("starting the peer responder", error))?
-        };
+        let responder = respond(
+            "peer-responder",
+            awaited,
+            (responses.clone(), wake.clone()),
+            Arc::clone(&route),
+        )?;
+        let readiness = respond(
+            "peer-readiness",
+            readiness,
+            (responses.clone(), wake.clone()),
+            Arc::clone(&route),
+        )?;
 
         let operator = {
             let wake = wake.clone();
@@ -786,7 +761,7 @@ impl Upstream {
                     upstream_link(
                         channel,
                         route.as_ref(),
-                        (&waiting, &operations),
+                        (&waiting, &readying, &operations),
                         &responded,
                         &liveness,
                         &closing,
@@ -798,7 +773,7 @@ impl Upstream {
         Ok(Self {
             closing,
             wake,
-            threads: Mutex::new(vec![link, responder, operator]),
+            threads: Mutex::new(vec![link, responder, readiness, operator]),
         })
     }
 
@@ -821,13 +796,67 @@ impl Drop for Upstream {
     }
 }
 
+/// Starts the thread `name` that waits for each of `awaited`'s submissions in the order they
+/// arrive and queues its response for the link: `responses` takes it, and the link's wake has it
+/// sent. A response states the group's ended sequence as this process knows it once the job
+/// completed.
+///
+/// # Errors
+///
+/// When the thread cannot start.
+fn respond(
+    name: &'static str,
+    awaited: Receiver<Awaited>,
+    (responses, wake): (Sender<FromPeer>, service::Wake),
+    route: Arc<Route>,
+) -> Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            for (id, group, submission) in awaited {
+                // Each rank stated its ended sequence before its part completed, so the
+                // group's is read once the job completed.
+                let outcome = submission.wait();
+                let ended = group.map_or(Ok(0), |group| route.completed(group));
+                let response = match (outcome, ended) {
+                    (Outcome::Success((output, requests)), Ok(ended)) => {
+                        MainProcessResponse::result(output, &requests, ended)
+                    }
+                    (Outcome::Success(_), Err(error)) => {
+                        MainProcessResponse::failed(error.to_string(), &[], 0)
+                    }
+                    (Outcome::Failed(error), ended) => {
+                        // A failed batch returns the `Finish` of each copy it started.
+                        let finished = error
+                            .downcast_ref::<Error>()
+                            .map_or(&[][..], Error::finished);
+                        let ended = ended.unwrap_or(0);
+                        MainProcessResponse::failed(error.to_string(), finished, ended)
+                    }
+                    (Outcome::Cancelled, _) => {
+                        MainProcessResponse::failed("the job was cancelled".into(), &[], 0)
+                    }
+                };
+                if responses.send(FromPeer { id, response }).is_err() {
+                    return;
+                }
+                wake.wake();
+            }
+        })
+        .map_err(|error| Error::transport_source(name, error))
+}
+
 /// A peer's side of its connection: hands each job the scheduler node sends to this process's
 /// ranks and each data plane's operation to the operations thread, in the order they arrived,
 /// and sends each response the responder and the operations thread queued.
 fn upstream_link(
     mut channel: Connection,
     route: &Route,
-    (waiting, operations): (&Sender<Awaited>, &Sender<(u64, DataOperation)>),
+    (waiting, readying, operations): (
+        &Sender<Awaited>,
+        &Sender<Awaited>,
+        &Sender<(u64, DataOperation)>,
+    ),
     responded: &Receiver<FromPeer>,
     liveness: &Liveness,
     closing: &AtomicBool,
@@ -887,6 +916,26 @@ fn upstream_link(
                         .and_then(|requests| route.stamp(group, requests)),
                 ),
                 MainProcessRequest::Switch { generation } => (None, route.switch(generation)),
+                MainProcessRequest::SwitchBuckets {
+                    generation,
+                    buckets,
+                } => (None, route.switch_buckets(generation, buckets)),
+                MainProcessRequest::Ready {
+                    generation,
+                    buckets,
+                } => {
+                    // Its answer waits on the capture threads, never in the jobs' order.
+                    match route.ready(generation, buckets) {
+                        Ok(submission) => {
+                            if readying.send((id, None, submission)).is_err() {
+                                failed = Some("the peer's readiness responder ended".into());
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(error) => (None, Err(error)),
+                    }
+                }
                 MainProcessRequest::Commit { generation } => (None, route.commit(generation)),
                 MainProcessRequest::Rollback { generation } => (None, route.rollback(generation)),
                 MainProcessRequest::Data { operation } => {

@@ -40,7 +40,7 @@
 //! (`Splicer::splice`), which is a request's value, and a captured graph's launches follow from
 //! its bucket alone: a graph would place the clip under every distinct splice of the deployment's
 //! timelines to keep one. The splice runs eagerly instead, as the forward of a splice bucket
-//! ([`Runner::eager_buckets`]): a clip's bucket stating the timeline it serves, whose forward
+//! ([`Forward::eager_buckets`]): a clip's bucket stating the timeline it serves, whose forward
 //! places the splice `serve` stages, a few launches beside a clip's decode. Its profile places
 //! every distinct splice of the timeline, so the runner's region holds the largest and every
 //! generation resolves their kernels. The raster lies in the runner's buffers, outside the
@@ -108,9 +108,9 @@ use crate::memory::allocation::Storage;
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::lend;
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
+use crate::runner::{Forward, Runner};
 use crate::runner::{address, element_bytes, performed, settle};
 use crate::worker::{Error, Result};
 
@@ -263,7 +263,7 @@ impl DecoderRunner {
     /// # Errors
     ///
     /// [`Error::Invalid`] for no bucket, a bucket that is neither a clip nor a track, a clip's
-    /// that states a request (a splice's, [`Runner::eager_buckets`]), a video
+    /// that states a request (a splice's, [`Forward::eager_buckets`]), a video
     /// decoder serving no timeline or with a round that deals no unit to its memory's rank, a
     /// splicer of another element type, a track of other channels than a track encode takes, a
     /// stream without a device or the reverse; a communicator a runner on a device whose rounds
@@ -349,7 +349,7 @@ impl DecoderRunner {
                         "a video decoder of {frames}x{height}x{width} clips serves no timeline"
                     )));
                 }
-                // A clip's bucket that states a request is a splice's (`Runner::eager_buckets`).
+                // A clip's bucket that states a request is a splice's (`Forward::eager_buckets`).
                 Extent::Clip { .. } if bucket.serves.is_some() => {
                     return Err(Error::Invalid(format!(
                         "bucket {bucket} states the request a splice serves, and no clip's decode"
@@ -1023,11 +1023,7 @@ impl DecoderRunner {
     }
 }
 
-impl Runner for DecoderRunner {
-    fn phases(&self) -> &[Phase] {
-        &self.config.phases
-    }
-
+impl Forward for DecoderRunner {
     fn buckets(&self) -> Vec<Bucket> {
         self.config.buckets.capture_order().copied().collect()
     }
@@ -1070,6 +1066,40 @@ impl Runner for DecoderRunner {
     /// A decode reads no input tensor: its latents are the runner's buffers.
     fn idle_inputs(&self, bucket: &Bucket, _columns: &mut [u8]) -> Result<()> {
         self.layout(bucket).map(|_| ())
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for DecoderRunner {
+    fn phases(&self) -> &[Phase] {
+        &self.config.phases
+    }
+
+    /// The decoder over `graphs`, over the runner's latent, tail and raster buffers when they
+    /// lie beside the runner's graphs, and over buffers of its own for a rehearsal: a decode
+    /// writes its tails and rasters there.
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        let buffers = crate::runner::instance_memory(&graphs, self.buffers.as_ref(), self.bytes)?;
+
+        Ok(Box::new(Self {
+            model: Arc::clone(&self.model),
+            splicer: self.splicer.clone(),
+            config: self.config.clone(),
+            graphs,
+            memory: Arc::clone(&self.memory),
+            stream: None,
+            communicator: None,
+            done: None,
+            layouts: self.layouts.clone(),
+            staged: Cell::new(None),
+            buffers,
+            tail: self.tail,
+            raster: self.raster,
+            bytes: self.bytes,
+        }))
     }
 
     fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
@@ -1122,10 +1152,6 @@ impl Runner for DecoderRunner {
     /// The copies were issued on the runner's stream, which this waits for.
     fn wait_copies(&mut self) -> Result<()> {
         settle(self.stream.as_ref())
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 }
 

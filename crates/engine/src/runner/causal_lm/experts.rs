@@ -46,12 +46,10 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::batch::{Batch, BatchId, Columns, Shape as BatchShape, Variant};
 use nn::ExpertExchange;
 use ops::Generation;
-use ops::collective::Meet;
 use ops::moe::ExchangeTransport;
 use ops::moe::exchange::{Descriptor, Mode, Transport, TransportShape};
 use platform::Stream;
@@ -103,6 +101,58 @@ pub(crate) fn classes(buckets: &Buckets, capacity: u32, beside: u32) -> Buckets 
     }))
 }
 
+/// What a member of an expert union lends its runner's forwards ([`Member::regions`]): the
+/// transport's regions and the shape of an exchange over them. The runner's forward, and every
+/// instance of it the worker's capture thread computes (`Runner::capturer`), shapes its exchange
+/// from these alone; the member itself, which agrees each step with the others, stays with the
+/// runner.
+#[derive(Clone)]
+pub(crate) struct Regions {
+    /// What the member states of the transport: the union's ranks, its own, and the rows.
+    shape: TransportShape,
+    /// The regions an exchange reads, as [`Member`] holds them.
+    regions: [Tensor; 7],
+    /// Whether one launch runs the whole expert layer.
+    fused: bool,
+}
+
+impl Regions {
+    /// The exchange of a forward shaped for `step_rows` rows a member.
+    ///
+    /// # Errors
+    ///
+    /// What `nn::ExpertExchange::check` refuses: a step of no row, or of more than the
+    /// transport holds.
+    pub(crate) fn exchange(&self, step_rows: u32) -> Result<ExpertExchange> {
+        let [states, ids, weights, combined, live, packed, packed_scales] = self.regions.clone();
+        let exchange = ExpertExchange {
+            ranks: self.shape.ranks,
+            attention: self.shape.attention_ranks,
+            rank_rows: self.shape.max_tokens,
+            step_rows,
+            multiprocessors: self.shape.multiprocessors,
+            states,
+            ids,
+            weights,
+            combined,
+            live,
+            packed,
+            packed_scales,
+            fused: self.fused,
+            source_only: self.shape.rank < self.shape.attention_ranks,
+        };
+
+        exchange.check()?;
+        Ok(exchange)
+    }
+
+    /// Whether the member holds experts alone: its forwards run the expert layers of other
+    /// members' tokens and have no tokens of their own.
+    pub(crate) const fn experts_only(&self) -> bool {
+        self.shape.attention_ranks > 0 && self.shape.rank >= self.shape.attention_ranks
+    }
+}
+
 /// One rank's member of an expert union (module documentation).
 pub(crate) struct Member {
     /// The union's host group: the agreement's gathers, and the package's own.
@@ -117,8 +167,6 @@ pub(crate) struct Member {
     round: u64,
     /// The members' token counts of the step being agreed, four bytes a member.
     records: Vec<u8>,
-    /// Whether the member's forwards are a warm-up's, which every member runs in step.
-    warming: Arc<AtomicBool>,
     /// The regions an exchange reads, in the order `TransportShape::regions` states them:
     /// states, ids, weights, combined, live, packed and packed scales.
     regions: [Tensor; 7],
@@ -198,7 +246,6 @@ impl Member {
             mode,
             join,
             round: 0,
-            warming: Arc::new(AtomicBool::new(false)),
             regions: regions.try_into().map_err(|_| {
                 Error::Invariant("a transport lays out another number of regions".into())
             })?,
@@ -286,78 +333,28 @@ impl Member {
         self.transport.as_ref().map(Transport::handle)
     }
 
-    /// What a launching forward calls before each exchange launch: during a warm-up it returns
-    /// once every member has called it, so no member waits on its device for a launch another
-    /// has not reached; while serving it returns at once, the agreement having met the
-    /// members.
-    pub(crate) fn meet(&self) -> Meet {
-        let group = Arc::clone(&self.group);
-        let warming = Arc::clone(&self.warming);
-
-        Arc::new(move || {
-            if warming.load(Ordering::Acquire) {
-                group
-                    .all_gather_fixed(&[], &mut [])
-                    .map_err(|error| ops::Error::Unsupported {
-                        operation: "an expert exchange",
-                        reason: format!("the members of the union did not meet: {error}"),
-                    })?;
-            }
-            Ok(())
-        })
-    }
-
-    /// States whether the member's forwards are a warm-up's, which every member of the union
-    /// runs in step.
-    pub(crate) fn set_warming(&self, warming: bool) {
-        self.warming.store(warming, Ordering::Release);
-    }
-
-    /// The exchange of a forward shaped for `step_rows` rows a member.
-    ///
-    /// # Errors
-    ///
-    /// What `nn::ExpertExchange::check` refuses: a step of no row, or of more than the
-    /// transport holds.
-    pub(crate) fn exchange(&self, step_rows: u32) -> Result<ExpertExchange> {
-        let [states, ids, weights, combined, live, packed, packed_scales] = self.regions.clone();
-        let exchange = ExpertExchange {
-            ranks: self.shape.ranks,
-            attention: self.shape.attention_ranks,
-            rank_rows: self.shape.max_tokens,
-            step_rows,
-            multiprocessors: self.shape.multiprocessors,
-            states,
-            ids,
-            weights,
-            combined,
-            live,
-            packed,
-            packed_scales,
+    /// What the member lends its runner's forwards: the transport's regions and the shape of an
+    /// exchange over them, as they stand once the transport exists.
+    pub(crate) fn regions(&self) -> Regions {
+        Regions {
+            shape: self.shape,
+            regions: self.regions.clone(),
             fused: self.fused,
-            source_only: self.shape.rank < self.shape.attention_ranks,
-        };
-
-        exchange.check()?;
-        Ok(exchange)
+        }
     }
 
     /// Enters the union's next step with `tokens` tokens of this member's own, and returns the
     /// step's capacity once every member has entered: the most tokens any member sends.
     ///
-    /// The member first asks the others to join, with a batch of the group, phase and kernel and
-    /// policy generations of `step`, the step's own batch, numbered by the union's step. The
-    /// call blocks the worker thread until the step is agreed.
+    /// The member first asks the others to join, with a batch of the group, phase, kernel and
+    /// policy generations and configuration revision of `step`, the step's own batch, numbered by
+    /// the union's step. The call blocks the worker thread until the step is agreed.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for no token or more than the transport holds; what the hook or the
     /// host group fails with; [`Error::Invariant`] for a step no member sends a token in.
-    pub(crate) fn enter(
-        &mut self,
-        tokens: u32,
-        step: &Batch,
-    ) -> Result<u32> {
+    pub(crate) fn enter(&mut self, tokens: u32, step: &Batch) -> Result<u32> {
         if tokens == 0 || tokens > self.shape.max_tokens {
             return Err(Error::Invalid(format!(
                 "a step of {tokens} tokens in a union whose members send at most {}",

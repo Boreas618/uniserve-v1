@@ -159,7 +159,7 @@ impl ModelRunner {
         // group's ranks. The meta contexts take the split alone: a profile run issues no
         // collective.
         let (rank, ranks) = super::split(self.mapping.position as usize, self.world_size);
-        crate::runner::Runner::graphs(&runner).set_group(group, rank, ranks)?;
+        crate::runner::Forward::graphs(&runner).set_group(group, rank, ranks)?;
 
         if let Some(mut member) = member {
             if let Some(stream) = &stream {
@@ -275,7 +275,7 @@ pub(crate) fn vision_runner(
 ) -> Result<VisionRunner> {
     let runner = VisionRunner::new(model, graphs, stream, memory, (class, rows), threads)
         .context("building the rank's vision runner")?;
-    crate::runner::Runner::graphs(&runner)
+    crate::runner::Forward::graphs(&runner)
         .profile_run(&runner)
         .context("profiling the rank's vision runner")?;
     Ok(runner)
@@ -288,7 +288,7 @@ pub(crate) fn vision_runner(
 ///
 /// What a forward refuses.
 pub(crate) fn profile(runner: &CausalLmRunner) -> Result<()> {
-    let graphs = crate::runner::Runner::graphs(runner);
+    let graphs = crate::runner::Forward::graphs(runner);
     graphs
         .profile_run(runner)
         .context("profiling the rank's causal runner")
@@ -305,7 +305,7 @@ pub(crate) fn keys(
     cache: &Mutex<KvCacheMemory>,
     state: Option<&Mutex<StateMemory>>,
 ) -> Result<Keys> {
-    let mut keys = crate::runner::Runner::graphs(runner).keys();
+    let mut keys = crate::runner::Forward::graphs(runner).keys();
     keys.extend(service::lock(cache).keys()?);
     if let Some(state) = state {
         keys.extend(service::lock(state).keys()?);

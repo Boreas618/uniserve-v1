@@ -20,7 +20,9 @@
 //! Under a context that launches, a collective is issued through the context's [`Group`] on the
 //! context's stream, and while that stream is being captured it becomes nodes of the graph.
 //! Under a meta context it checks its buffers against the split and issues nothing, so a profile
-//! run and a `prepare_inputs` forward follow the same shapes with no communicator.
+//! run and a `prepare_inputs` forward follow the same shapes with no communicator. Under a
+//! rehearsal ([`Context::rehearsal`]) it does the same: a rehearsal launches its kernels on a
+//! stream of its own and meets no other rank, so no device waits on another for it.
 //!
 //! A collective may also be **started** beside the stream and **finished** later
 //! ([`start_all_to_all`], [`start_gather_rows`], [`finish`]): it runs on the group's side stream
@@ -62,11 +64,13 @@ const ENDS: usize = 16;
 /// A rank's NCCL communicator, with the side stream its started collectives run on.
 ///
 /// Execution creates one group per communicator and sets it on the contexts of the runners that
-/// share it ([`Context::set_group`]). The communicator may be called from one thread at a time,
+/// share it ([`Context::set_group`]); a context beside one of them for a capture on another
+/// thread takes a group beside it ([`Group::beside`]), over the same communicator with a side
+/// stream of its own. The communicator may be called from one thread at a time,
 /// which the one worker thread of a device already keeps; the lock states it in the type, so
 /// that contexts sharing a group move to their device's thread with their runners.
 pub struct Group {
-    communicator: Mutex<Communicator>,
+    communicator: Arc<Mutex<Communicator>>,
     /// The stream a started collective runs on, beside the forward's own, so a module's compute
     /// overlaps the transfer. Inside a capture the events below make it a branch of the graph.
     side: Stream,
@@ -95,7 +99,7 @@ impl Group {
         let side = Stream::with_priority(communicator.device(), SIDE_PRIORITY)?;
 
         Ok(Self {
-            communicator: Mutex::new(communicator),
+            communicator: Arc::new(Mutex::new(communicator)),
             side,
             fork: Event::new(EventFlags::default()),
             ends: (0..ENDS)
@@ -117,6 +121,32 @@ impl Group {
             meet: Some(meet),
             ..self
         }
+    }
+
+    /// A group over the same communicator with a side stream and events of its own, and no
+    /// meeting: what a context beside one of this group's issues through
+    /// ([`Context::beside`]). Its started collectives join no stream of this group's, so a
+    /// capture on another thread records none of the work this group's forwards issue meanwhile,
+    /// and a captured launch holds no device, so it needs no meeting. The communicator's lock
+    /// keeps the two groups' calls apart.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Platform`] when the side stream cannot be created on the communicator's device.
+    pub fn beside(&self) -> Result<Self> {
+        let device = self.communicator().device();
+        let side = Stream::with_priority(device, SIDE_PRIORITY)?;
+
+        Ok(Self {
+            communicator: Arc::clone(&self.communicator),
+            side,
+            fork: Event::new(EventFlags::default()),
+            ends: (0..ENDS)
+                .map(|_| Event::new(EventFlags::default()))
+                .collect(),
+            next: AtomicUsize::new(0),
+            meet: None,
+        })
     }
 
     /// This rank's index in the communicator and the communicator's member count.
@@ -260,7 +290,7 @@ pub fn all_reduce(x: &Tensor) -> Result<()> {
     let x = buffer(x, "all_reduce")?;
     let (count, dtype) = elements(&x, &x, "all_reduce")?;
 
-    let Some(stream) = context.stream() else {
+    let Some(stream) = context.collective_stream() else {
         return Ok(());
     };
     let group = group(&context, "all_reduce")?;
@@ -289,7 +319,7 @@ pub fn all_gather(send: &Tensor, recv: &Tensor) -> Result<()> {
     let (send, recv) = (buffer(send, "all_gather")?, buffer(recv, "all_gather")?);
     let (count, gathered, dtype) = gather(&send, &recv, ranks)?;
 
-    let Some(stream) = context.stream() else {
+    let Some(stream) = context.collective_stream() else {
         return Ok(());
     };
     let group = group(&context, "all_gather")?;
@@ -316,7 +346,7 @@ pub fn all_to_all(send: &Tensor, recv: &Tensor) -> Result<()> {
     let (send, recv) = (buffer(send, "all_to_all")?, buffer(recv, "all_to_all")?);
     let exchange = exchange(&send, &recv, ranks)?;
 
-    let Some(stream) = context.stream() else {
+    let Some(stream) = context.collective_stream() else {
         return Ok(());
     };
     let group = group(&context, "all_to_all")?;
@@ -338,7 +368,7 @@ pub fn start_all_to_all(send: &Tensor, recv: &Tensor) -> Result<usize> {
     let (send, recv) = (buffer(send, "all_to_all")?, buffer(recv, "all_to_all")?);
     let exchange = exchange(&send, &recv, ranks)?;
 
-    let Some(stream) = context.stream() else {
+    let Some(stream) = context.collective_stream() else {
         return Ok(0);
     };
     let group = group(&context, "all_to_all")?;
@@ -385,7 +415,7 @@ pub fn start_gather_rows(
         ));
     }
 
-    let Some(stream) = context.stream() else {
+    let Some(stream) = context.collective_stream() else {
         return Ok(0);
     };
     let group = group(&context, "gather_rows")?;
@@ -432,7 +462,7 @@ pub fn broadcast(x: &Tensor, root: u64) -> Result<Tensor> {
     let operand = buffer(&result, "broadcast")?;
     let (count, dtype) = elements(&operand, &operand, "broadcast")?;
 
-    let Some(stream) = context.stream() else {
+    let Some(stream) = context.collective_stream() else {
         return Ok(result);
     };
     let group = group(&context, "broadcast")?;
@@ -462,7 +492,7 @@ pub fn broadcast(x: &Tensor, root: u64) -> Result<Tensor> {
 pub fn finish(started: usize) -> Result<()> {
     let (context, _) = member("finish")?;
 
-    let Some(stream) = context.stream() else {
+    let Some(stream) = context.collective_stream() else {
         return Ok(());
     };
     let group = group(&context, "finish")?;
@@ -490,7 +520,9 @@ pub fn finish(started: usize) -> Result<()> {
 /// [`Error::Platform`] when the stream cannot be queried or waited for.
 pub fn settle() -> Result<()> {
     match context::installed() {
-        Some(context) => context.stream().map_or(Ok(()), wait_unless_captured),
+        Some(context) => context
+            .collective_stream()
+            .map_or(Ok(()), wait_unless_captured),
         None => Ok(()),
     }
 }
@@ -513,6 +545,11 @@ pub fn settle() -> Result<()> {
 /// cannot be waited for.
 pub fn expert_exchange(descriptor: &ExchangeDescriptor, args: ExchangeArgs) -> Result<()> {
     let context = context::current("an expert exchange")?;
+
+    // A rehearsal meets no other rank: its exchange issues nothing.
+    if context.is_rehearsal() {
+        return Ok(());
+    }
     let (transport, meet) = {
         let state = context.state();
         (state.exchange, state.meet.clone())

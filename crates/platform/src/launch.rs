@@ -50,10 +50,6 @@ impl Function {
         self.raw
     }
 
-    pub(crate) fn device(&self) -> &Device {
-        &self.device
-    }
-
     /// Launches the kernel on `stream` with `config` and `parameters`, which
     /// points at each kernel parameter's value in declaration order, and
     /// returns without waiting for the kernel. A launch on a capturing stream

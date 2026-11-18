@@ -28,7 +28,7 @@ use engine::runner::buckets::Buckets;
 use engine::runner::causal_lm::speculation::DraftPool;
 use engine::runner::causal_lm::{CausalLmConfig, PageWork};
 use engine::runner::graphs::Graphs;
-use engine::runner::{CausalLmRunner, Runner};
+use engine::runner::{CausalLmRunner, Forward, Runner};
 use nn::capability::Drafter;
 use nn::family::{CacheShape, ExpertShape, StateShape, TextModel, TokenHistory};
 use nn::functional::{WeightOrder, embedding, rms_norm};
@@ -333,9 +333,26 @@ impl Bench {
             runner.set_draft_cache(draft(unread), None, None)?;
         }
         runner.graphs().profile_run(&runner)?;
+        // The warm-up, as the worker's capture thread runs it: each bucket is rehearsed over a
+        // rehearsal instance of the runner's forward and captured over one beside its graphs.
+        let serving = runner.graphs().kernels();
+        let capture = runner.capturer(runner.graphs().beside()?)?;
+        let rehearsal = runner.capturer(runner.graphs().rehearsal()?)?;
         for bucket in runner.buckets() {
-            runner.graphs().capture(&runner, &bucket)?;
+            let plan = capture
+                .graphs()
+                .examine(&*capture, &bucket, None, None, &serving)?;
+            if plan.rehearse {
+                rehearsal
+                    .graphs()
+                    .rehearse(&*rehearsal, &bucket, &serving)?;
+            }
+            let graph = capture.graphs().capture(&*capture, &bucket, &serving)?;
+            runner
+                .graphs()
+                .install(&bucket, serving.number(), Some(graph))?;
         }
+        rehearsal.graphs().release_rehearsal();
 
         Ok(Self {
             runner,

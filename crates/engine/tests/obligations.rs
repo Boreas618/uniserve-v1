@@ -76,9 +76,9 @@ use engine::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape, Variant}
 use engine::executor::Route;
 use engine::executor::peers::{Liveness, Remote, Upstream, accept, register};
 use engine::memory::tables::{BlockCopy, BlockTables, Change};
-use engine::runner::Runner;
 use engine::runner::buckets::Bucket;
 use engine::runner::graphs::Graphs;
+use engine::runner::{Forward, HostForward, Runner};
 use engine::worker::completion::{Outcome, Submission};
 use engine::worker::{Error, Result};
 use engine::worker::{Sequences, Worker};
@@ -1071,11 +1071,7 @@ fn release_flights(released: Receiver<()>, flights: Arc<Mutex<Flights>>) {
     });
 }
 
-impl Runner for Reader {
-    fn phases(&self) -> &[Phase] {
-        &self.phases
-    }
-
+impl Forward for Reader {
     fn buckets(&self) -> Vec<Bucket> {
         Vec::new()
     }
@@ -1086,6 +1082,20 @@ impl Runner for Reader {
 
     fn idle_inputs(&self, _bucket: &Bucket, _columns: &mut [u8]) -> Result<()> {
         Ok(())
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for Reader {
+    fn phases(&self) -> &[Phase] {
+        &self.phases
+    }
+
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(HostForward::new(graphs)))
     }
 
     fn prepare_inputs(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
@@ -1131,10 +1141,6 @@ impl Runner for Reader {
         }
         self.left(number);
         Ok(BatchOutput::default())
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 
     fn write_tables(&mut self, changes: &[Change]) -> Result<()> {

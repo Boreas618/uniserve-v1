@@ -33,9 +33,9 @@ pub(crate) fn set_enabled(value: bool) -> bool {
 }
 
 /// Marks a synchronous phase on its executing thread: a turn of a worker's job, which prepares a
-/// batch's inputs and launches it, captures a bucket, rebinds a generation or runs a control
-/// operation; a scheduler's application of a batch's output or step; the control thread's write
-/// of one request's event. The range closes when the returned guard drops.
+/// batch's inputs and launches it, installs or switches a captured bucket, begins a generation or
+/// runs a control operation; a scheduler's application of a batch's output or step; the control
+/// thread's write of one request's event. The range closes when the returned guard drops.
 ///
 /// `batch` is the payload: the batch the phase belongs to, so a timeline can line the ranges up
 /// with the scheduler's steps, or for an event the request it is of; a phase with neither passes

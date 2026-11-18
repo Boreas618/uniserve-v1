@@ -1,9 +1,10 @@
 //! `Graphs` without a device: profile runs, captures that record a meta forward, the inputs a
-//! replay prepares, bucket choice and the generation state machine, over a small causal
-//! language model of `nn` modules on meta weights.
+//! replay prepares, bucket choice and the generation state machine with its switch bucket by
+//! bucket, over a small causal language model of `nn` modules on meta weights.
 
 use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape as BatchShape, Variant};
 use nn::functional::{WeightOrder, embedding, rms_norm};
@@ -16,10 +17,10 @@ use tensor::{DType, Device, Tensor};
 
 use storage::runtime::GroupId;
 
-use super::{Graphs, Preparation};
+use super::{Graphs, Plan, Prepared};
 use crate::memory::tables::BlockTables;
-use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
+use crate::runner::{Forward, Runner};
 use crate::worker::{Error, Result};
 use testkit::serving::unlaunched_kernel;
 
@@ -48,7 +49,7 @@ struct Tiny {
     gain: Tensor,
     head: Linear,
     /// Whether the decoder normalizes twice: another launch table for the same bucket.
-    deep: Cell<bool>,
+    deep: AtomicBool,
 }
 
 impl Tiny {
@@ -62,7 +63,7 @@ impl Tiny {
                 WeightOrder::NxK,
             )
             .unwrap(),
-            deep: Cell::new(false),
+            deep: AtomicBool::new(false),
         }
     }
 }
@@ -90,7 +91,7 @@ impl CausalLm for Tiny {
 
             let shifted = hidden.broadcast_add(&bound)?;
             let normed = rms_norm(&shifted, &self.gain, 1e-6, false, hidden.dtype())?;
-            if self.deep.get() {
+            if self.deep.load(Ordering::Relaxed) {
                 return rms_norm(&normed, &self.gain, 1e-6, false, hidden.dtype());
             }
             Ok(normed)
@@ -104,7 +105,7 @@ impl CausalLm for Tiny {
 
 /// A runner of [`Tiny`]: decode buckets of four and of two rows over five input columns.
 struct TinyRunner {
-    model: Tiny,
+    model: Arc<Tiny>,
     graphs: Graphs,
     /// The key bound of the step being prepared: the plain value the model's host value holds.
     bound: Cell<u32>,
@@ -113,7 +114,7 @@ struct TinyRunner {
 impl TinyRunner {
     fn new(kernels: Arc<Generation>) -> Self {
         Self {
-            model: Tiny::new(),
+            model: Arc::new(Tiny::new()),
             graphs: Graphs::meta(kernels, INPUTS),
             bound: Cell::new(16),
         }
@@ -125,11 +126,7 @@ impl TinyRunner {
     }
 }
 
-impl Runner for TinyRunner {
-    fn phases(&self) -> &[Phase] {
-        &[Phase::Decode]
-    }
-
+impl Forward for TinyRunner {
     fn buckets(&self) -> Vec<Bucket> {
         vec![
             Bucket::decode(ROWS as u32, Variant::DecodeGreedy),
@@ -168,6 +165,24 @@ impl Runner for TinyRunner {
         Ok(())
     }
 
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for TinyRunner {
+    fn phases(&self) -> &[Phase] {
+        &[Phase::Decode]
+    }
+
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(Self {
+            model: Arc::clone(&self.model),
+            graphs,
+            bound: Cell::new(16),
+        }))
+    }
+
     fn prepare_inputs(&mut self, batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
         let bucket = self
             .graphs
@@ -187,10 +202,6 @@ impl Runner for TinyRunner {
 
     fn execute(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<BatchOutput> {
         Err(Error::State("a runner with no device executes nothing"))
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 }
 
@@ -248,6 +259,53 @@ fn replacing(serving: &Generation, number: u64, operator: &'static str) -> Arc<G
     )
 }
 
+/// Warms `bucket` of `runner` up as its worker's capture thread does: a capture instance of its
+/// forward captures it under the serving generation, and the graph is installed.
+pub(crate) fn warm(runner: &dyn Runner, bucket: &Bucket) -> Result<()> {
+    let kernels = runner.graphs().kernels();
+    let instance = runner.capturer(runner.graphs().beside()?)?;
+    let graph = instance.graphs().capture(&*instance, bucket, &kernels)?;
+
+    runner
+        .graphs()
+        .install(bucket, kernels.number(), Some(graph))
+}
+
+/// What the worker's capture thread does for `runner`'s buckets of generation `kernels` beside
+/// `serving` (`None` at warm-up): each is examined over a capture instance of the runner's
+/// forward, captured when it needs it, and installed in the runner's graphs. Returns each
+/// bucket's plan.
+fn captured_beside(
+    runner: &TinyRunner,
+    buckets: &[Bucket],
+    serving: Option<&Generation>,
+    kernels: &Arc<Generation>,
+) -> Vec<Plan> {
+    let instance = runner.capturer(runner.graphs.beside().unwrap()).unwrap();
+
+    let mut plans = Vec::new();
+    for bucket in buckets {
+        let held = serving.and_then(|_| runner.graphs.launch_table(bucket));
+        let plan = instance
+            .graphs()
+            .examine(&*instance, bucket, held.as_deref(), serving, kernels)
+            .unwrap();
+        let graph = plan.capture.then(|| {
+            instance
+                .graphs()
+                .capture(&*instance, bucket, kernels)
+                .unwrap()
+        });
+
+        runner
+            .graphs
+            .install(bucket, kernels.number(), graph)
+            .unwrap();
+        plans.push(plan);
+    }
+    plans
+}
+
 /// A runner serving generation 1 with both buckets captured, and that generation.
 fn captured() -> (TinyRunner, Arc<Generation>) {
     // The keys come from a profile run, which needs no kernel: the first runner states them and
@@ -258,16 +316,41 @@ fn captured() -> (TinyRunner, Arc<Generation>) {
 
     let runner = TinyRunner::new(Arc::clone(&serving));
     runner.graphs.profile_run(&runner).unwrap();
-    for bucket in runner.buckets() {
-        runner.graphs.capture(&runner, &bucket).unwrap();
-    }
+    captured_beside(&runner, &runner.buckets(), None, &serving);
     (runner, serving)
+}
+
+/// Prepares `next` on `runner` and captures each of its buckets beside the serving graphs, the
+/// way a worker and its capture thread do; returns the buckets in the order they were examined
+/// and each one's plan.
+fn prepared(
+    runner: &TinyRunner,
+    serving: &Generation,
+    next: &Arc<Generation>,
+) -> (Vec<Bucket>, Vec<Plan>) {
+    let buckets = runner.graphs.prepare(runner, Arc::clone(next)).unwrap();
+    let plans = captured_beside(runner, &buckets, Some(serving), next);
+    (buckets, plans)
+}
+
+/// The generation of the graph a step of `bucket` stamped with kernel generation `stamp`
+/// replays, as `prepare_inputs` chooses it.
+fn replayed(runner: &mut TinyRunner, rows: usize, stamp: u64) -> (Bucket, Option<u64>) {
+    runner.graphs.stamp(stamp);
+    let ids: Vec<i32> = (1..=rows as i32).collect();
+    let bucket = runner.prepare_inputs(&batch(&ids, 16), &tables()).unwrap();
+
+    let state = runner.graphs.state.borrow();
+    let Some(Prepared::Inputs(_, _, generation)) = &state.prepared else {
+        panic!("inputs are prepared");
+    };
+    (bucket, *generation)
 }
 
 /// The host values the prepared replay's input copies read: the values area of its slot.
 fn prepared_values(graphs: &Graphs, bytes: usize) -> Vec<u8> {
     let mut state = graphs.state.borrow_mut();
-    let Some(super::Prepared::Inputs(_, slot)) = state.prepared else {
+    let Some(Prepared::Inputs(_, slot, _)) = state.prepared else {
         panic!("inputs are prepared");
     };
     let (base, length) = state.buffer.as_mut().unwrap().values_ptr(slot);
@@ -341,11 +424,7 @@ impl Writes {
     }
 }
 
-impl Runner for Writes {
-    fn phases(&self) -> &[Phase] {
-        &[Phase::Decode]
-    }
-
+impl Forward for Writes {
     fn buckets(&self) -> Vec<Bucket> {
         vec![
             Bucket::decode(4, Variant::DecodeGreedy),
@@ -393,16 +472,30 @@ impl Runner for Writes {
         Ok(())
     }
 
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for Writes {
+    fn phases(&self) -> &[Phase] {
+        &[Phase::Decode]
+    }
+
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(Self {
+            graphs,
+            weight: self.weight.clone(),
+            norms: self.norms,
+        }))
+    }
+
     fn prepare_inputs(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
         Err(Error::State("the runner only profiles"))
     }
 
     fn execute(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<BatchOutput> {
         Err(Error::State("the runner only profiles"))
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 }
 
@@ -456,11 +549,17 @@ fn a_capture_whose_launches_differ_from_the_profile_run_is_refused() {
     runner.graphs.profile_run(&runner).unwrap();
 
     // The forward the capture runs is not the one the profile run stated keys for.
-    runner.model.deep.set(true);
-    let refused = runner
-        .graphs
-        .capture(&runner, &Bucket::decode(2, Variant::DecodeGreedy))
-        .unwrap_err();
+    let instance = runner.capturer(runner.graphs.beside().unwrap()).unwrap();
+    let bucket = Bucket::decode(2, Variant::DecodeGreedy);
+    let kernels = generation_of(&runner, 1);
+    instance
+        .graphs()
+        .examine(&*instance, &bucket, None, None, &kernels)
+        .unwrap();
+    runner.model.deep.store(true, Ordering::Relaxed);
+    let Err(refused) = instance.graphs().capture(&*instance, &bucket, &kernels) else {
+        panic!("a capture whose launches differ from the profile run's is refused");
+    };
 
     assert!(matches!(refused, Error::Invariant(_)), "{refused}");
 }
@@ -552,30 +651,25 @@ fn an_unpaired_batch_is_reported_uncompared_and_not_compared() {
 }
 
 #[test]
-fn a_changed_kernel_under_an_unchanged_launch_table_is_a_rebind() {
+fn a_changed_kernel_is_captured_again_beside_the_serving_graph_and_rehearsed_first() {
     let (runner, serving) = captured();
     let next = replacing(&serving, 2, "rms_norm");
-    let buckets = runner.buckets();
 
-    // Every captured bucket is examined, largest first; both launch the normalization.
-    assert_eq!(runner.graphs.prepare(&runner, next).unwrap(), buckets);
+    // Both buckets launch the normalization, whose kernel is another: each is captured again,
+    // and rehearsed first, since the new kernel is a native entry nothing has used.
+    let (buckets, plans) = prepared(&runner, &serving, &next);
+    assert_eq!(buckets.len(), 2);
+    assert!(plans.iter().all(|plan| plan.capture && plan.rehearse));
 
-    // The switch waits for every bucket.
-    assert!(runner.graphs.switch(2).is_err());
-    for bucket in &buckets {
-        assert_eq!(runner.graphs.pending(), Some(*bucket));
-        let done = runner.graphs.prepare_bucket(&runner, bucket).unwrap();
-        assert_eq!(done, Preparation::Rebind);
-    }
-    assert_eq!(runner.graphs.pending(), None);
-
-    // The serving generation serves until the switch.
+    // The serving generation serves whole until the switch, and the replaced graphs stay
+    // beside the new ones until the commit.
     assert_eq!(runner.graphs.generation(), 1);
     runner.graphs.switch(2).unwrap();
     assert_eq!(runner.graphs.generation(), 2);
+    assert_eq!(runner.graphs.state.borrow().graphs.len(), 4);
 
     runner.graphs.commit(2).unwrap();
-    assert_eq!(runner.graphs.generation(), 2);
+    assert_eq!(runner.graphs.state.borrow().graphs.len(), 2);
     assert_eq!(runner.graphs.buckets().len(), 2);
 }
 
@@ -593,10 +687,8 @@ fn a_generation_that_changes_no_launched_kernel_keeps_every_graph() {
         )],
     ));
 
-    for bucket in runner.graphs.prepare(&runner, next).unwrap() {
-        let done = runner.graphs.prepare_bucket(&runner, &bucket).unwrap();
-        assert_eq!(done, Preparation::Keep);
-    }
+    let (_, plans) = prepared(&runner, &serving, &next);
+    assert!(plans.iter().all(|plan| !plan.capture && !plan.rehearse));
     runner.graphs.switch(2).unwrap();
     assert_eq!(runner.graphs.generation(), 2);
 
@@ -606,26 +698,20 @@ fn a_generation_that_changes_no_launched_kernel_keeps_every_graph() {
         runner.graphs.select(|bucket| bucket.holds(&shape)),
         Some(Bucket::decode(2, Variant::DecodeGreedy))
     );
+    assert_eq!(runner.graphs.state.borrow().graphs.len(), 2);
     runner.graphs.commit(2).unwrap();
 }
 
 #[test]
-fn a_changed_launch_table_is_a_recapture() {
+fn a_changed_launch_table_is_captured_again() {
     let (runner, serving) = captured();
-    let next = replacing(&serving, 2, "rms_norm");
+    let next = Arc::new(serving.replace(2, []));
+    let bucket = Bucket::decode(4, Variant::DecodeGreedy);
 
-    // The forward itself launches differently for the new generation.
-    runner.model.deep.set(true);
-    let buckets = runner.graphs.prepare(&runner, next).unwrap();
-    assert_eq!(buckets, runner.buckets());
-    let bucket = buckets[0];
-
-    // A recapture is checked against the profile run of its own forward.
-    runner.graphs.profile_run(&runner).unwrap();
-    for bucket in &buckets {
-        let done = runner.graphs.prepare_bucket(&runner, bucket).unwrap();
-        assert_eq!(done, Preparation::Recapture);
-    }
+    // The forward itself launches differently for the new generation, under the same kernels.
+    runner.model.deep.store(true, Ordering::Relaxed);
+    let (_, plans) = prepared(&runner, &serving, &next);
+    assert!(plans.iter().all(|plan| plan.capture && !plan.rehearse));
 
     // The serving graph is untouched until the switch, and the new one serves after it.
     let before = runner.graphs.launch_table(&bucket).unwrap();
@@ -634,18 +720,72 @@ fn a_changed_launch_table_is_a_recapture() {
     assert_eq!(after.len(), before.len() + 1);
 }
 
+/// A bucket switches to the prepared generation ahead of the others once its capture is
+/// installed, and a step replays the newest graph at or below both what its bucket switched to
+/// and its batch's kernel stamp: every rank, stamping and switching alike, replays a batch with
+/// graphs of one generation.
+#[test]
+fn a_bucket_switches_ahead_of_the_others_within_its_batches_stamp() {
+    let (mut runner, serving) = captured();
+    let next = replacing(&serving, 2, "rms_norm");
+    let (large, small) = (
+        Bucket::decode(4, Variant::DecodeGreedy),
+        Bucket::decode(2, Variant::DecodeGreedy),
+    );
+
+    // Nothing switches before its capture is installed.
+    let buckets = runner.graphs.prepare(&runner, Arc::clone(&next)).unwrap();
+    assert!(runner.graphs.switch_buckets(2, &[large]).is_err());
+    captured_beside(&runner, &buckets, Some(&serving), &next);
+
+    // The large bucket switches; the small one serves its kept graph.
+    runner.graphs.switch_buckets(2, &[large]).unwrap();
+    assert_eq!(replayed(&mut runner, 3, 2), (large, Some(2)));
+    assert_eq!(replayed(&mut runner, 2, 2), (small, Some(1)));
+
+    // A batch stamped with the kept generation replays the kept graph of a switched bucket.
+    assert_eq!(replayed(&mut runner, 3, 1), (large, Some(1)));
+
+    // Whole, every bucket replays the new generation's graph.
+    runner.graphs.switch(2).unwrap();
+    assert_eq!(replayed(&mut runner, 2, 2), (small, Some(2)));
+}
+
+/// A rollback while buckets serve from the prepared generation returns every bucket to its kept
+/// graph from the next step on, whatever the step's stamp, and releases the rolled-back graphs.
+#[test]
+fn after_a_rollback_no_step_replays_the_rolled_back_generation() {
+    let (mut runner, serving) = captured();
+    let next = replacing(&serving, 2, "rms_norm");
+    let (buckets, _) = prepared(&runner, &serving, &next);
+    runner.graphs.switch_buckets(2, &buckets).unwrap();
+
+    runner.graphs.rollback(2).unwrap();
+    for rows in [2, 3] {
+        for stamp in [1, 2] {
+            assert_eq!(replayed(&mut runner, rows, stamp).1, Some(1));
+        }
+    }
+    assert!(
+        runner
+            .graphs
+            .state
+            .borrow()
+            .graphs
+            .keys()
+            .all(|(_, generation)| *generation == 1)
+    );
+}
+
 #[test]
 fn a_rollback_on_trial_serves_the_kept_generation_again() {
     let (runner, serving) = captured();
     let bucket = Bucket::decode(4, Variant::DecodeGreedy);
     let kept = runner.graphs.launch_table(&bucket).unwrap();
 
-    runner.model.deep.set(true);
-    runner.graphs.profile_run(&runner).unwrap();
+    runner.model.deep.store(true, Ordering::Relaxed);
     let next = replacing(&serving, 2, "rms_norm");
-    for bucket in runner.graphs.prepare(&runner, next).unwrap() {
-        runner.graphs.prepare_bucket(&runner, &bucket).unwrap();
-    }
+    prepared(&runner, &serving, &next);
     runner.graphs.switch(2).unwrap();
     assert_ne!(runner.graphs.launch_table(&bucket).unwrap(), kept);
 
@@ -667,14 +807,16 @@ fn a_prepared_generation_is_rolled_back_without_touching_the_serving_one() {
     let (runner, serving) = captured();
     let next = replacing(&serving, 2, "rms_norm");
     let buckets = runner.graphs.prepare(&runner, Arc::clone(&next)).unwrap();
-    runner.graphs.prepare_bucket(&runner, &buckets[0]).unwrap();
+    captured_beside(&runner, &buckets[..1], Some(&serving), &next);
 
-    // One update at a time.
-    assert!(runner.graphs.prepare(&runner, next).is_err());
+    // One update at a time, and no switch while a bucket's capture is not installed.
+    assert!(runner.graphs.prepare(&runner, Arc::clone(&next)).is_err());
+    assert_eq!(runner.graphs.pending(), buckets[1..]);
+    assert!(runner.graphs.switch(2).is_err());
 
     runner.graphs.rollback(2).unwrap();
     assert_eq!(runner.graphs.generation(), 1);
-    assert_eq!(runner.graphs.pending(), None);
+    assert!(runner.graphs.pending().is_empty());
     assert!(runner.graphs.switch(2).is_err());
 
     // The next update starts from the serving generation.
@@ -684,19 +826,49 @@ fn a_prepared_generation_is_rolled_back_without_touching_the_serving_one() {
 
 #[test]
 fn a_generation_missing_a_launched_kernel_is_refused() {
-    let (runner, _) = captured();
+    let (runner, serving) = captured();
+    let next = Arc::new(Generation::new(2, []));
+    let buckets = runner.graphs.prepare(&runner, Arc::clone(&next)).unwrap();
 
     // The bucket it is examined at is refused, and the generation cannot be switched to.
-    let buckets = runner
-        .graphs
-        .prepare(&runner, Arc::new(Generation::new(2, [])))
-        .unwrap();
-    let refused = runner
-        .graphs
-        .prepare_bucket(&runner, &buckets[0])
+    let instance = runner.capturer(runner.graphs.beside().unwrap()).unwrap();
+    let held = runner.graphs.launch_table(&buckets[0]);
+    let refused = instance
+        .graphs()
+        .examine(
+            &*instance,
+            &buckets[0],
+            held.as_deref(),
+            Some(&serving),
+            &next,
+        )
         .unwrap_err();
     assert!(matches!(refused, Error::Interface(_)), "{refused}");
     assert!(runner.graphs.switch(2).is_err());
+}
+
+/// The buckets a generation examines come most replayed first: what its switch reaches first.
+#[test]
+fn a_generation_examines_the_most_replayed_bucket_first() {
+    let (runner, serving) = captured();
+    runner
+        .graphs
+        .state
+        .borrow_mut()
+        .uses
+        .insert(Bucket::decode(2, Variant::DecodeGreedy), 7);
+
+    let order = runner
+        .graphs
+        .prepare(&runner, replacing(&serving, 2, "rms_norm"))
+        .unwrap();
+    assert_eq!(
+        order,
+        [
+            Bucket::decode(2, Variant::DecodeGreedy),
+            Bucket::decode(4, Variant::DecodeGreedy)
+        ]
+    );
 }
 
 #[test]

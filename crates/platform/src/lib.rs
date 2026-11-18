@@ -74,10 +74,7 @@ pub use device::{
 };
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
-pub use graph::{
-    Capture, CaptureMode, EdgeKind, Graph, GraphExec, GraphNode, GraphNodeKind, KernelNodeParams,
-    OwnedKernelNodeParams, WalkedNode, open_captures,
-};
+pub use graph::{Capture, CaptureMode, Graph, GraphExec, GraphNode, GraphNodeKind, open_captures};
 pub use launch::{
     Cluster, ClusterScheduling, Function, FunctionAttribute, LaunchConfig, ParamInfo,
 };

@@ -1,6 +1,7 @@
 //! `Graphs` on a device: a capture launches what its profile run stated and a replay computes
 //! what the eager forward computes; a replay's columns and host values reach the device through
-//! the input buffer; a generation is rebound, shadowed, switched to and rolled back.
+//! the input buffer; a generation is rehearsed and captured on a thread beside the one that
+//! replays, shadowed, switched to bucket by bucket and whole, and rolled back.
 //!
 //! Every case needs GPU 0; the cases that launch kernels also need this host's Build Server
 //! (`uniserve build-server serve`). Run them on a GPU host:
@@ -19,10 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use engine::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape as BatchShape, Variant};
 use engine::memory::tables::BlockTables;
-use engine::runner::Runner;
 use engine::runner::buckets::Bucket;
-use engine::runner::graphs::Graphs;
-use engine::runner::graphs::Preparation;
+use engine::runner::graphs::{Graph, Graphs, Plan};
+use engine::runner::{Forward, Runner};
 use engine::worker::{Error, Result};
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
@@ -198,7 +198,7 @@ fn host_logits(ids: &[u32], bound: u32) -> Outcome<Vec<Vec<f32>>> {
 
 /// A runner of [`Tiny`]: decode buckets of four and of two rows.
 struct TinyRunner {
-    model: Tiny,
+    model: Arc<Tiny>,
     graphs: Graphs,
     /// The key bound of the step being prepared.
     bound: Cell<u32>,
@@ -219,11 +219,7 @@ impl TinyRunner {
     }
 }
 
-impl Runner for TinyRunner {
-    fn phases(&self) -> &[Phase] {
-        &[Phase::Decode]
-    }
-
+impl Forward for TinyRunner {
     fn buckets(&self) -> Vec<Bucket> {
         vec![
             Bucket::decode(ROWS as u32, Variant::DecodeGreedy),
@@ -257,6 +253,24 @@ impl Runner for TinyRunner {
         Ok(())
     }
 
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for TinyRunner {
+    fn phases(&self) -> &[Phase] {
+        &[Phase::Decode]
+    }
+
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(Self {
+            model: Arc::clone(&self.model),
+            graphs,
+            bound: Cell::new(16),
+        }))
+    }
+
     fn prepare_inputs(&mut self, batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
         let bucket = self
             .graphs
@@ -277,10 +291,6 @@ impl Runner for TinyRunner {
 
     fn execute(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<BatchOutput> {
         Err(Error::State("the cases drive the graphs themselves"))
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 }
 
@@ -314,6 +324,7 @@ fn tables() -> BlockTables {
 /// and the region its graphs address.
 struct Bench {
     runner: TinyRunner,
+    serving: Arc<Generation>,
     kernels: Kernels,
     stream: Stream,
     _region: DeviceAllocation,
@@ -323,7 +334,7 @@ impl Bench {
     fn open() -> Outcome<Self> {
         // The profile run states the keys and the peaks before anything touches the device.
         let profiled = TinyRunner {
-            model: Tiny::meta(),
+            model: Arc::new(Tiny::meta()),
             graphs: Graphs::meta(Arc::new(Generation::new(0, [])), INPUTS),
             bound: Cell::new(16),
         };
@@ -340,7 +351,7 @@ impl Bench {
         );
 
         let runner = TinyRunner {
-            model: Tiny::on_device(&stream)?,
+            model: Arc::new(Tiny::on_device(&stream)?),
             graphs: Graphs::new(
                 stream.clone(),
                 Arc::clone(&serving),
@@ -353,11 +364,13 @@ impl Bench {
         };
         runner.graphs.profile_run(&runner)?;
         for bucket in runner.buckets() {
-            runner.graphs.capture(&runner, &bucket)?;
+            let graph = beside(&runner, &bucket, None, &serving)?;
+            runner.graphs.install(&bucket, 1, graph)?;
         }
 
         Ok(Self {
             runner,
+            serving,
             kernels,
             stream,
             _region: region,
@@ -370,6 +383,52 @@ impl Bench {
         let outputs = self.runner.graphs.replay(&bucket)?;
         self.runner.read(&outputs, ids.len())
     }
+}
+
+/// What a worker's capture thread makes of `bucket` of `runner` for generation `kernels` beside
+/// `serving` (`None` at warm-up): a capture instance of the runner's forward examines it, a
+/// rehearsal instance rehearses it when its plan says, and the capture instance captures it.
+/// `None` for a bucket that keeps its graph.
+fn beside(
+    runner: &dyn Runner,
+    bucket: &Bucket,
+    serving: Option<&Generation>,
+    kernels: &Arc<Generation>,
+) -> Result<Option<Graph>> {
+    let (capture, rehearsal) = instances(runner)?;
+    let held = serving.and_then(|_| runner.graphs().launch_table(bucket));
+    let plan = capture
+        .graphs()
+        .examine(&*capture, bucket, held.as_deref(), serving, kernels)?;
+    capture_planned(&*capture, &*rehearsal, bucket, plan, kernels)
+}
+
+/// The capture and rehearsal instances of `runner`'s forward, as its worker makes them.
+fn instances(runner: &dyn Runner) -> Result<(Box<dyn Forward>, Box<dyn Forward>)> {
+    let graphs = runner.graphs();
+    Ok((
+        runner.capturer(graphs.beside()?)?,
+        runner.capturer(graphs.rehearsal()?)?,
+    ))
+}
+
+/// The graph `plan` asks of `bucket`, rehearsed first when it asks that too.
+fn capture_planned(
+    capture: &dyn Forward,
+    rehearsal: &dyn Forward,
+    bucket: &Bucket,
+    plan: Plan,
+    kernels: &Arc<Generation>,
+) -> Result<Option<Graph>> {
+    if !plan.capture {
+        return Ok(None);
+    }
+    if plan.rehearse {
+        rehearsal.graphs().rehearse(rehearsal, bucket, kernels)?;
+    }
+    let graph = capture.graphs().capture(capture, bucket, kernels)?;
+    rehearsal.graphs().release_rehearsal();
+    Ok(Some(graph))
 }
 
 /// Whether two logit matrices agree within the rounding of an FP32 normalization and product.
@@ -389,11 +448,7 @@ struct Copies {
     value: Cell<f32>,
 }
 
-impl Runner for Copies {
-    fn phases(&self) -> &[Phase] {
-        &[Phase::Decode]
-    }
-
+impl Forward for Copies {
     fn buckets(&self) -> Vec<Bucket> {
         vec![Bucket::decode(ROWS as u32, Variant::DecodeGreedy)]
     }
@@ -412,6 +467,23 @@ impl Runner for Copies {
         Ok(())
     }
 
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+impl Runner for Copies {
+    fn phases(&self) -> &[Phase] {
+        &[Phase::Decode]
+    }
+
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>> {
+        Ok(Box::new(Self {
+            graphs,
+            value: Cell::new(0.0),
+        }))
+    }
+
     fn prepare_inputs(&mut self, batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
         let bucket = Bucket::decode(ROWS as u32, Variant::DecodeGreedy);
 
@@ -427,10 +499,6 @@ impl Runner for Copies {
 
     fn execute(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<BatchOutput> {
         Err(Error::State("the cases drive the graphs themselves"))
-    }
-
-    fn graphs(&self) -> &Graphs {
-        &self.graphs
     }
 }
 
@@ -457,7 +525,8 @@ fn a_replay_copies_its_columns_and_its_host_values_to_the_device() -> Outcome {
         value: Cell::new(0.0),
     };
     let bucket = runner.buckets()[0];
-    runner.graphs.capture(&runner, &bucket)?;
+    let graph = beside(&runner, &bucket, None, &Arc::new(Generation::new(1, [])))?;
+    runner.graphs.install(&bucket, 1, graph)?;
 
     // The graph launches no kernel and has one input copy: the host value.
     assert!(runner.graphs.launch_table(&bucket).unwrap().is_empty());
@@ -504,41 +573,100 @@ fn a_replay_computes_what_the_eager_forward_and_the_host_formula_compute() -> Ou
     Ok(())
 }
 
+/// A generation of the same modules loaded again holds other kernels under every key: every
+/// bucket is captured again on a thread beside the one that replays, rehearsed first (the
+/// product is a native entry), and the steps replayed meanwhile compute what they computed.
 #[test]
 #[ignore = "requires a GPU and a Build Server"]
-fn a_generation_is_rebound_switched_to_and_rolled_back() -> Outcome {
+fn a_generation_is_captured_beside_the_steps_switched_bucket_by_bucket_and_rolled_back() -> Outcome
+{
     let mut bench = Bench::open()?;
     let ids = [4_u32, 8, 15, 16];
     let served = bench.step(&ids, 24)?;
 
-    // The same modules loaded again are other kernels of an unchanged launch table: a rebind
-    // of every bucket.
     let keys = bench.runner.graphs.keys();
     let next = bench.kernels.generation(2, &keys)?;
-    let buckets = bench.runner.graphs.prepare(&bench.runner, next)?;
-    assert_eq!(buckets, bench.runner.buckets());
-    for bucket in &buckets {
-        let done = bench.runner.graphs.prepare_bucket(&bench.runner, bucket)?;
-        assert_eq!(done, Preparation::Rebind);
+    let buckets = bench
+        .runner
+        .graphs
+        .prepare(&bench.runner, Arc::clone(&next))?;
+    assert_eq!(buckets.len(), 2);
+
+    // The capture thread's work, on a thread of its own, while this one replays steps.
+    let (capture, rehearsal) = instances(&bench.runner)?;
+    let held: Vec<_> = buckets
+        .iter()
+        .map(|bucket| bench.runner.graphs.launch_table(bucket))
+        .collect();
+    let serving = Arc::clone(&bench.serving);
+    let (buckets_ref, held, next_ref) = (&buckets, &held, &next);
+    let captured = std::thread::scope(|scope| -> Outcome<Vec<(Plan, Option<Graph>)>> {
+        // The instances move to the capture thread, as a worker's do.
+        let thread = scope.spawn(move || -> Result<Vec<(Plan, Option<Graph>)>> {
+            let context = platform::PrimaryContext::retain(DEVICE)?;
+            let _current = context.enter()?;
+
+            let mut graphs = Vec::new();
+            for (bucket, held) in buckets_ref.iter().zip(held) {
+                let plan = capture.graphs().examine(
+                    &*capture,
+                    bucket,
+                    held.as_deref(),
+                    Some(&serving),
+                    next_ref,
+                )?;
+                let graph = capture_planned(&*capture, &*rehearsal, bucket, plan, next_ref)?;
+                graphs.push((plan, graph));
+            }
+            Ok(graphs)
+        });
+
+        while !thread.is_finished() {
+            assert_eq!(bench.step(&ids, 24)?, served);
+        }
+        Ok(thread.join().expect("the capture thread")?)
+    })?;
+
+    for (bucket, (plan, graph)) in buckets.iter().zip(captured) {
+        assert_eq!(
+            plan,
+            Plan {
+                capture: true,
+                rehearse: true
+            }
+        );
+        bench.runner.graphs.install(bucket, 2, graph)?;
     }
 
-    // The serving generation's graphs serve until the switch, and the rebound ones after it.
+    // One bucket switches ahead of the other: a step stamped with the new generation replays
+    // its new graph, and computes what the kept one computed.
+    let large = Bucket::decode(ROWS as u32, Variant::DecodeGreedy);
+    bench.runner.graphs.switch_buckets(2, &[large])?;
+    bench.runner.graphs.stamp(2);
     assert_eq!(bench.step(&ids, 24)?, served);
+    assert_eq!(bench.step(&ids[..2], 24)?, served[..2]);
+
+    // Whole, then rolled back: the kept graphs serve again.
     bench.runner.graphs.switch(2)?;
     assert_eq!(bench.runner.graphs.generation(), 2);
     assert_eq!(bench.step(&ids, 24)?, served);
-
-    // A rollback serves from the kept graphs again.
     bench.runner.graphs.rollback(2)?;
+    bench.runner.graphs.stamp(1);
     assert_eq!(bench.runner.graphs.generation(), 1);
     assert_eq!(bench.step(&ids, 24)?, served);
 
-    // The next update is committed: the replaced graphs go and the rebound ones serve.
+    // The next update is committed: the replaced graphs go and the new ones serve.
     let again = bench.kernels.generation(3, &keys)?;
-    for bucket in bench.runner.graphs.prepare(&bench.runner, again)? {
-        bench.runner.graphs.prepare_bucket(&bench.runner, &bucket)?;
+    for bucket in bench
+        .runner
+        .graphs
+        .prepare(&bench.runner, Arc::clone(&again))?
+    {
+        let graph = beside(&bench.runner, &bucket, Some(&bench.serving), &again)?;
+        bench.runner.graphs.install(&bucket, 3, graph)?;
     }
     bench.runner.graphs.switch(3)?;
+    bench.runner.graphs.stamp(3);
     bench.runner.graphs.commit(3)?;
     assert_eq!(bench.step(&ids, 24)?, served);
     Ok(())

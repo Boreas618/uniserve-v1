@@ -598,6 +598,12 @@ fn operate(
         }
         Operation::WarmSegments { groups, region } => encoded(&binding.warm_here(&groups, region)?),
         Operation::Room => encoded(&binding.room()?),
+        Operation::UpdateRoom { operators } => {
+            let operators = operators.into_iter().collect();
+            encoded(&super::generation::update_room_here(
+                workers, binding, &operators,
+            )?)
+        }
         Operation::GraphBytes => encoded(&binding.graph_bytes_here()),
         Operation::Sleep => encoded(&binding.sleep()?),
         Operation::SuspendGraphs => encoded(&binding.suspend_graphs()?),

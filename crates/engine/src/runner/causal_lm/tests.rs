@@ -40,9 +40,9 @@ use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheConfig, KvCacheMemo
 use crate::memory::state::{StateConfig, StateMemory};
 use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::parallel::HostGroup;
-use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
+use crate::runner::{Forward, Runner};
 use crate::worker::Error;
 use crate::worker::completion::Outcome;
 use crate::worker::{Sequences, Worker};
@@ -511,7 +511,7 @@ fn captured() -> CausalLmRunner {
 
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
     runner
 }
@@ -1472,7 +1472,7 @@ fn a_model_that_keeps_a_recurrent_state_is_lent_it_by_every_forward() {
     // The model's forward refuses a batch without its state rows.
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
 }
 
@@ -2153,7 +2153,7 @@ fn union_runner(member: Member) -> CausalLmRunner {
 
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
     runner
 }
@@ -2238,10 +2238,7 @@ fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
 
     // A member enters with tokens of its own, no more than the transport holds, and joins no
     // step past the union's next.
-    assert!(matches!(
-        first.enter(0, &step),
-        Err(Error::Invalid(_))
-    ));
+    assert!(matches!(first.enter(0, &step), Err(Error::Invalid(_))));
     assert!(matches!(
         first.enter(UNION_ROWS + 1, &step),
         Err(Error::Invalid(_))
@@ -2408,7 +2405,7 @@ fn over(cache: &KvCacheMemory, state: Option<&StateMemory>) -> CausalLmRunner {
     let runner = CausalLmRunner::over(model, config, graphs, None, cache, state).unwrap();
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
     runner
 }
@@ -3067,7 +3064,7 @@ fn the_verification_and_drafter_buckets_are_profiled_and_captured() {
 
     // Every bucket is captured with its profile run's launches.
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
     let mut ascending = runner.buckets();
     ascending.reverse();
@@ -3096,7 +3093,7 @@ fn a_verification_of_a_model_that_keeps_a_recurrent_state_settles_it_on_its_trai
     assert_eq!(gathers(&stateful), gathers(&plain) + 2);
 
     for bucket in stateful.buckets() {
-        stateful.graphs().capture(&stateful, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&stateful, &bucket).unwrap();
     }
 
     // A model that keeps a state verifies only with a trail of its largest verification.
@@ -3556,7 +3553,7 @@ fn a_speculating_runner_serves_a_verification_from_its_verification_bucket() {
     let mut runner = speculating(false);
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
 
     // A batch in a decode's shape whose calls verify takes the verification bucket of its
@@ -3729,7 +3726,7 @@ fn a_drafter_that_keeps_a_state_is_lent_it_by_each_of_its_forwards() {
         .unwrap();
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
 
     // Each proposal is the argmax of the model's head over the drafter's own read of its rows,
@@ -3877,7 +3874,7 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
     let mut runner = over(config.clone(), &state(12), plain()).unwrap();
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
     assert_eq!(runner.graphs().buckets().len(), 16);
 
@@ -4042,7 +4039,7 @@ fn a_model_that_reads_token_ids_is_lent_them_by_every_forward() {
 
         runner.graphs().profile_run(&runner).unwrap();
         for bucket in runner.buckets() {
-            runner.graphs().capture(&runner, &bucket).unwrap();
+            crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
         }
     }
 
@@ -4305,7 +4302,7 @@ fn a_runner_over_stepwise_state_lends_verify_slots_to_every_forward_and_keeps_no
     let runner = over(Arc::clone(&model), config.clone(), &state(owned)).unwrap();
     runner.graphs().profile_run(&runner).unwrap();
     for bucket in runner.buckets() {
-        runner.graphs().capture(&runner, &bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
     }
 
     // A live buffer of one slot a request holds none of a verification's further slots.

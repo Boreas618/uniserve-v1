@@ -8,9 +8,10 @@
 //!
 //! There is one implementation per capability. Everything the implementations share (the
 //! profile run, capture, replay, the input buffer, generations and shadow) is [`Graphs`]'s, which
-//! reaches a runner through this trait alone: [`Runner::buckets`] states what warm-up captures
-//! and [`Runner::forward`] is the one function that is run on the meta device, captured, and run
-//! again before each replay.
+//! reaches a runner through [`Forward`] alone: [`Forward::buckets`] states what warm-up captures
+//! and [`Forward::forward`] is the one function that is run on the meta device, rehearsed,
+//! captured, and run again before each replay. A runner's worker captures on a thread of its own,
+//! over a second instance of the runner's forward ([`Runner::capturer`]).
 //!
 //! ## What the worker hands a runner
 //!
@@ -120,11 +121,13 @@ use crate::worker::completion::Waker;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RunnerId(pub u32);
 
-/// One stage a rank holds, as the worker and [`Graphs`] drive it.
-pub trait Runner: Send {
-    /// The phases this runner serves, as the scheduler names them in a batch.
-    fn phases(&self) -> &[Phase];
-
+/// What a runner computes, apart from how it serves: its buckets and the one forward that is run
+/// on the meta device, captured, rehearsed and run again before each replay, over its graphs.
+///
+/// A runner is one ([`Runner`]), and so is the second instance of its forward a runner makes for
+/// its worker's capture thread ([`Runner::capturer`]): the capture thread profiles, rehearses and
+/// captures through this trait alone, and calls nothing else of a runner.
+pub trait Forward: Send {
     /// The buckets warm-up captures, largest first.
     ///
     /// The ranks of a group state the same buckets in the same order: a collective captured in
@@ -140,7 +143,8 @@ pub trait Runner: Send {
     }
 
     /// The forward of one bucket over the runner's input tensors: the one function that is run
-    /// on the meta device, captured, and run again by `prepare_inputs` before each replay.
+    /// on the meta device, rehearsed, captured, and run again by `prepare_inputs` before each
+    /// replay.
     ///
     /// It computes under the context installed on the thread, reads the runner's input tensors
     /// at their fixed addresses and returns the forward's outputs in an order the runner fixes
@@ -154,14 +158,43 @@ pub trait Runner: Send {
 
     /// Writes into `columns`, the bytes of the runner's input tensors in the layout of their
     /// device block, the inputs of an idle step of `bucket`: rows that address no slot, page,
-    /// token or request, so a forward over them reads and writes no request's state. Warm-up
-    /// runs each bucket's forward over these before it captures it, and a generation is
-    /// prepared over them beside the serving graphs.
+    /// token or request, so a forward over them reads and writes no request's state. A rehearsal
+    /// runs a bucket's forward over these, in memory of its own, before the bucket is captured
+    /// under kernels whose first use a capture cannot record ([`Graphs::rehearse`]).
     ///
     /// # Errors
     ///
     /// A bucket this runner does not state.
     fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()>;
+
+    /// The graphs the forward computes under: the runner's, which the worker replays, switches
+    /// and releases at a batch boundary, or the graphs of a capture instance.
+    fn graphs(&self) -> &Graphs;
+}
+
+/// One stage a rank holds, as the worker and [`Graphs`] drive it.
+pub trait Runner: Forward {
+    /// The phases this runner serves, as the scheduler names them in a batch.
+    fn phases(&self) -> &[Phase];
+
+    /// A second instance of the runner's forward over `graphs`, for the worker's capture
+    /// thread: it shares the model's weights and every tensor the runner's forward reads at a
+    /// fixed address beside its input tensors (slot state, cache planes, kept outputs), and takes
+    /// its input tensors and allocator region from `graphs`. The worker makes two when it starts:
+    /// one over graphs beside the runner's ([`Graphs::beside`]), whose captures address what the
+    /// runner's graphs address and replay on the runner's stream, and one over a rehearsal's
+    /// graphs ([`Graphs::rehearsal`]), whose forwards run over idle inputs in memory of their own.
+    ///
+    /// Over idle inputs ([`Forward::idle_inputs`]) the instance's forward writes, outside its
+    /// graphs' region, only what idle inputs address: padding rows and pages no request holds.
+    /// What the runner's forward writes at a fixed address that a later forward of a served step
+    /// reads (a speculating runner's kept outputs) is the instance's own unless `graphs` lie
+    /// beside the runner's.
+    ///
+    /// # Errors
+    ///
+    /// What allocating the instance's own tensors fails with.
+    fn capturer(&self, graphs: Graphs) -> Result<Box<dyn Forward>>;
 
     /// Chooses the smallest bucket that holds `batch`, fills the input tensors from the batch's
     /// columns, with every address of a request's memory taken from `tables`, and writes the
@@ -218,10 +251,6 @@ pub trait Runner: Send {
         Ok(false)
     }
 
-    /// The runner's graphs: what the worker captures, switches and releases at a batch
-    /// boundary, and what a profile run of the runner is recorded in.
-    fn graphs(&self) -> &Graphs;
-
     /// The runner's weights changed at their addresses: recompute what the runner or its model
     /// derived from them. It runs on the worker thread with nothing in flight.
     ///
@@ -230,15 +259,6 @@ pub trait Runner: Send {
     /// What recomputing a derived constant fails with.
     fn weights_changed(&mut self) -> Result<()> {
         Ok(())
-    }
-
-    /// States whether the forwards that follow are a warm-up's. The worker's capture job sets
-    /// it on every runner at each of its turns, so batches served between two captures run with
-    /// it set too, and clears it once no bucket is left or a capture failed. A runner whose
-    /// forwards meet other ranks on the host during a warm-up, such as a member of an expert
-    /// union, reads it; the default ignores it.
-    fn set_warming(&self, warming: bool) {
-        let _ = warming;
     }
 
     /// The rank's device block tables changed at `changes` since the last call, in slot, class
@@ -298,6 +318,72 @@ pub trait Runner: Send {
     fn wait_copies(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// The forward instance of a runner whose work is the host's (`Runner::capturer`): it states no
+/// bucket, so its capture thread is handed none.
+pub struct HostForward {
+    graphs: Graphs,
+}
+
+impl HostForward {
+    /// The instance over `graphs`.
+    pub const fn new(graphs: Graphs) -> Self {
+        Self { graphs }
+    }
+}
+
+impl Forward for HostForward {
+    fn buckets(&self) -> Vec<Bucket> {
+        Vec::new()
+    }
+
+    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        Err(crate::worker::Error::Unsupported(format!(
+            "bucket {bucket} is a host call's, which has no forward"
+        )))
+    }
+
+    fn idle_inputs(&self, bucket: &Bucket, _columns: &mut [u8]) -> Result<()> {
+        Err(crate::worker::Error::Unsupported(format!(
+            "bucket {bucket} is a host call's, which has no input tensors"
+        )))
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+}
+
+/// The device memory of `bytes` bytes a forward instance over `graphs` (`Runner::capturer`)
+/// writes at fixed addresses beside its graphs' region, where its runner's forward writes
+/// `shared`: `shared` itself for an instance beside the runner's graphs, whose captures replay in
+/// the runner's place, and zeroed memory of its own for a rehearsal's, so a rehearsal writes
+/// nothing a serving forward reads. `None` for a runner that holds none.
+///
+/// # Errors
+///
+/// When the rehearsal's memory cannot be allocated or zeroed.
+pub(crate) fn instance_memory(
+    graphs: &Graphs,
+    shared: Option<&std::sync::Arc<crate::memory::allocation::Storage>>,
+    bytes: u64,
+) -> Result<Option<std::sync::Arc<crate::memory::allocation::Storage>>> {
+    let (Some(shared), Some(stream)) = (shared, graphs.stream()) else {
+        return Ok(shared.cloned());
+    };
+    if !graphs.rehearses() {
+        return Ok(Some(std::sync::Arc::clone(shared)));
+    }
+
+    let length = usize::try_from(bytes).map_err(|_| {
+        crate::worker::Error::Invalid("a rehearsal's buffers exceed memory".to_owned())
+    })?;
+    let storage = crate::memory::allocation::Storage::linear(stream.device(), length)?;
+    // SAFETY: the range is the whole allocation, which the instance keeps for as long as it
+    // computes over it.
+    unsafe { platform::memset_d8(storage.address(), 0, length, stream) }?;
+    Ok(Some(storage))
 }
 
 /// A copy of device bytes: from an address, to an address, and how many bytes.

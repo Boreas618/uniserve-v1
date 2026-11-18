@@ -18,9 +18,9 @@ use tensor::{DType, Tensor};
 use super::{DenoiserConfig, DenoiserRunner};
 use crate::memory::buffers::{BufferMemory, ByteCopy, UNIT_BYTES};
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::runner::Runner;
 use crate::runner::address;
 use crate::runner::graphs::Graphs;
+use crate::runner::{Forward, Runner};
 
 const GROUP: GroupId = GroupId(0);
 
@@ -521,7 +521,7 @@ fn each_layout_is_profiled_its_steps_captured_and_a_batch_with_no_row_returns_no
         assert!(runner.graphs().launch_table(bucket).is_some());
     }
     for bucket in &steps {
-        runner.graphs().capture(&runner, bucket).unwrap();
+        crate::runner::graphs::tests::warm(&runner, bucket).unwrap();
     }
     assert_eq!(runner.graphs().buckets().len(), 2);
 

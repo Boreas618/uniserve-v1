@@ -269,6 +269,26 @@ pub(crate) struct Room {
     pub elsewhere: u64,
 }
 
+/// What a generation update that replaces kernels asks of one rank's device until its commit
+/// (`crate::process::generation::update_room`): the bytes its graphs and rehearsal take beside
+/// the serving graphs, the room the device has, and the KV units the rank's cache gives up while
+/// the update holds both generations' graphs when the room does not hold them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UpdateRoom {
+    /// The identity of the rank's GPU.
+    pub gpu: [u8; 16],
+    /// The device bytes the update takes beside what serves: the instantiations of the graphs
+    /// it captures again, and a rehearsal's memory when it rehearses (`Graphs::update_bytes`).
+    pub extra: u64,
+    /// What the device holds of them now: the lesser of the quota's room and the device's free
+    /// bytes.
+    pub room: u64,
+    /// The KV units whose device memory covers what the room lacks, rounded up: what the rank's
+    /// cache demotes and gives back by its segments before the update captures, and creates
+    /// again once it committed. Zero when the room holds the update.
+    pub kv_units: u64,
+}
+
 impl Room {
     /// The room of a device whose deployment's quota is `quota` and which has `free` bytes free,
     /// for a rank of `epoch`: what the quota leaves, what the device has free, and what other
@@ -723,6 +743,65 @@ impl WeightBinding {
             })
             .map(|(_, remote)| Ok((remote.rank(), remote.operate(operation())?)))
             .collect()
+    }
+
+    /// What a generation update that replaces `operators` asks of every rank's device, this
+    /// process's (`extra`, each rank's bytes beside what serves, by its device) then each
+    /// peer's, in rank order ([`UpdateRoom`]).
+    ///
+    /// # Errors
+    ///
+    /// When a rank's quota or device cannot be read, here or on a peer's host.
+    pub(crate) fn update_rooms(
+        &self,
+        operators: &BTreeSet<String>,
+        extra: impl Fn(DeviceId) -> u64,
+    ) -> Result<Vec<UpdateRoom>> {
+        let answers = self.ask_peers(None, || DataOperation::UpdateRoom {
+            operators: operators.iter().cloned().collect(),
+        })?;
+        let here = self.update_rooms_here(extra);
+        let (mut rooms, peers) = both(here, answered::<Vec<UpdateRoom>>(answers))?;
+        rooms.extend(peers.into_iter().flatten());
+        Ok(rooms)
+    }
+
+    /// [`Self::update_rooms`] of this process's ranks.
+    ///
+    /// # Errors
+    ///
+    /// When a rank's quota or device cannot be read.
+    pub(crate) fn update_rooms_here(
+        &self,
+        extra: impl Fn(DeviceId) -> u64,
+    ) -> Result<Vec<UpdateRoom>> {
+        let mut rooms = Vec::with_capacity(self.ranks.len());
+        for rank in &self.ranks {
+            let rank = lock(rank);
+            let room = room_of(&rank)?;
+            let room = room.quota.min(room.free);
+            let extra = extra(rank.device);
+
+            // A rank without a cache has no unit to give up: its room stands as it is.
+            let unit_bytes = rank
+                .cache
+                .as_ref()
+                .map_or(0, |cache| lock(cache).unit_bytes());
+            let lacking = extra.saturating_sub(room);
+            let kv_units = if unit_bytes == 0 {
+                0
+            } else {
+                lacking.div_ceil(unit_bytes)
+            };
+
+            rooms.push(UpdateRoom {
+                gpu: rank.device.uuid()?.0,
+                extra,
+                room,
+                kv_units,
+            });
+        }
+        Ok(rooms)
     }
 
     /// Runs `operation`, which the daemon commands on every rank, on every peer's ranks

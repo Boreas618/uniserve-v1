@@ -292,6 +292,7 @@ pub(crate) type DraftTable = (u32, Vec<u32>, Vec<u32>);
 /// What a target forward leaves for the drafter's forward and for the completion, in memory
 /// the runner owns: one tensor per entry of the sampling outputs, each verification's agreed
 /// length, and the hidden rows (module documentation).
+#[derive(Clone)]
 pub(crate) struct Kept {
     /// Each kept tensor, by its entry's discriminant.
     tensors: [Tensor; Entry::COUNT],
@@ -366,7 +367,12 @@ impl Kept {
         hidden: u32,
         dtype: DType,
     ) -> Result<Self> {
-        let shapes = kept_shapes(rows, tokens, candidates, hidden, dtype);
+        Self::over(stream, kept_shapes(rows, tokens, candidates, hidden, dtype))
+    }
+
+    /// Zeroed kept tensors of `shapes`, one per entry in the order of [`Entry::iter`], on the
+    /// device of `stream` (`None` for meta tensors).
+    fn over(stream: Option<&Stream>, shapes: Vec<(Shape, DType)>) -> Result<Self> {
         let (offsets, bytes) = kept_offsets(&shapes)?;
 
         let mut tensors = Vec::with_capacity(Entry::COUNT);
@@ -412,6 +418,22 @@ impl Kept {
         })
     }
 
+    /// Zeroed kept tensors of this one's shapes and element types in memory of their own, on
+    /// the device of `stream` (`None` for meta tensors): what a rehearsal's forward instance
+    /// keeps its outputs in, so it writes none a serving step reads.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal of the allocation or of the fill.
+    pub(crate) fn alike(&self, stream: Option<&Stream>) -> Result<Self> {
+        let shapes: Vec<(Shape, DType)> = self
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.shape().clone(), tensor.dtype()))
+            .collect();
+        Self::over(stream, shapes)
+    }
+
     /// Kept tensor `entry`, over its whole extent.
     pub(crate) const fn tensor(&self, entry: Entry) -> &Tensor {
         &self.tensors[entry as usize]
@@ -435,6 +457,7 @@ impl Kept {
 
 /// The speculation of one runner: its drafts, the draft cache it is lent, the sampler of its
 /// verifications and what its forwards keep.
+#[derive(Clone)]
 pub(crate) struct Speculation {
     /// The drafts a verification holds at most.
     pub(crate) drafts: u32,

@@ -1044,8 +1044,9 @@ pub(super) fn standby(launch: &EngineArgs) -> bool {
         .is_some_and(|predecessor| predecessor.epoch == launch.epoch)
 }
 
-/// Captures every bucket of every worker's runners and waits for each, the worker groups in turn
-/// ([`crate::worker::in_turn`]).
+/// Captures every bucket of every worker's runners, each worker's on its capture thread, all
+/// workers at once, and waits for each: a capture runs nothing, and a rehearsal meets no other
+/// rank, so no worker's warm-up waits for another's.
 ///
 /// The start creates its storage before the warm-up, as much of each GPU's quota as holds it, so
 /// what the warm-up adds to a process (instantiated graphs, the libraries' state) lies in the
@@ -1067,7 +1068,7 @@ fn warm_up(workers: &[Arc<Worker>]) -> Result<()> {
             Some((device.0, free))
         })
         .collect();
-    let submissions = crate::worker::in_turn(workers, |_, worker| worker.warm_up());
+    let submissions: Vec<_> = workers.iter().map(|worker| worker.warm_up()).collect();
 
     for (index, submission) in submissions.into_iter().enumerate() {
         match submission?.wait() {

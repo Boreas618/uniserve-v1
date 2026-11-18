@@ -37,6 +37,7 @@ use storage::protocol::UnitRun;
 use storage::runtime::{Completion, GroupId, Open, Opened, Request, RequestId, Segments};
 
 use crate::batch::{Batch, BatchOutput, Capacity, ErrorCode};
+use crate::worker::capture::Key;
 
 /// Engine-to-worker request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,6 +102,18 @@ pub(crate) enum MainProcessRequest {
     /// jobs of every group handed before and after it. Responds with an empty
     /// [`MainProcessResponse::Result`].
     Switch { generation: u64 },
+    /// Switches `buckets` to the prepared generation `generation` ahead of the others on every
+    /// rank of the process, between the jobs of every group handed before and after it.
+    /// Responds as [`Self::Switch`] is.
+    SwitchBuckets { generation: u64, buckets: Vec<Key> },
+    /// Responds with an empty [`MainProcessResponse::Result`] once every rank of the process
+    /// installed the outcome of every bucket of `buckets` (every bucket the generation examines,
+    /// when `None`) for the prepared generation `generation`, and with `Error` once one of them
+    /// will not. It takes no place in any group's order, and its answer waits on none.
+    Ready {
+        generation: u64,
+        buckets: Option<Vec<Key>>,
+    },
     /// Commits the trial of generation `generation` on every rank of the process, behind the
     /// jobs handed before it. Responds as [`Self::Switch`] is.
     Commit { generation: u64 },
@@ -281,6 +294,9 @@ pub enum DataOperation {
     /// in flight, each with the reason: those their preparation added and those the shadow
     /// batches that reached them could not compare. Asked once the shadow pass ended.
     Uncompared,
+    /// Answers what a generation update that replaces `operators` asks of every rank's device
+    /// of the peer (`crate::process::binding::UpdateRoom`).
+    UpdateRoom { operators: Vec<String> },
     /// Runs an operation the daemon commands on every rank beside the batches. Answers the
     /// peer's ranks' [`RankReports`].
     Rank(RankOperation),

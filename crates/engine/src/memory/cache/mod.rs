@@ -525,6 +525,12 @@ impl KvCacheMemory {
         Some((table, unit_bytes))
     }
 
+    /// The device bytes one unit of the pool's planes takes, which a segment gives back per unit
+    /// (`CacheLayout::split_bytes`).
+    pub(crate) fn unit_bytes(&self) -> u64 {
+        self.planes.unit_bytes()
+    }
+
     /// The device regions of the cache whose memory is split into segments, by number: the
     /// pool's and the state region. Empty before [`Self::set_regions`].
     pub(crate) fn split_regions(&self) -> Vec<u8> {

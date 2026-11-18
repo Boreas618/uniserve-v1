@@ -22,10 +22,12 @@
 //! - **One order.** A group's jobs are handed under one lock, so every rank's queue holds them in
 //!   the same order: the order their collectives need, and the order in which a completion
 //!   mapped before a batch is seen by that batch on every rank.
-//! - **Generations.** A generation's switch, commit and rollback reach every rank of every group,
-//!   this node's workers and once each peer link, under every group's lock: each rank takes them
-//!   between the same two jobs of each of its groups, and a peer's far end hands them to its
-//!   ranks in the order they arrived. They take no number: they address no device block table.
+//! - **Generations.** A generation's switch, the switch of some of its buckets ahead of the
+//!   others, its commit and its rollback reach every rank of every group, this node's workers
+//!   and once each peer link, under every group's lock: each rank takes them between the same
+//!   two jobs of each of its groups, and a peer's far end hands them to its ranks in the order
+//!   they arrived. They take no number: they address no device block table. Whether buckets are
+//!   ready to switch is asked of every rank too ([`Route::ready`]), outside every group's order.
 //! - **A rank alone.** A batch whose rows name a rank ([`crate::batch::MediaRow::rank`], among this
 //!   node's workers of the group), such as an audio decode, needs no other rank: the named rank
 //!   runs it, and every other rank, here or on a peer, passes its number. A video decode round
@@ -51,6 +53,7 @@ use crate::executor::peers::messages::MainProcessRequest;
 use storage::runtime::{Completion, GroupId, Request, RequestId};
 
 use super::peers::Remote;
+use crate::worker::capture::Key;
 use crate::worker::completion::Submission;
 use crate::worker::{Error, Result};
 use crate::worker::{Sequences, Worker, alone};
@@ -317,6 +320,57 @@ impl Route {
             |worker| worker.switch(generation),
             || MainProcessRequest::Switch { generation },
         )
+    }
+
+    /// Switches `buckets` to the prepared generation `generation` ahead of the others on every
+    /// rank, as [`Route::switch`] hands a switch: every rank replays them from graphs of that
+    /// generation from the same job of each group on.
+    ///
+    /// # Errors
+    ///
+    /// As [`Route::switch`].
+    pub(crate) fn switch_buckets(&self, generation: u64, buckets: Vec<Key>) -> Result<Submission> {
+        self.everywhere(
+            |worker| worker.switch_buckets(generation, buckets.clone()),
+            || MainProcessRequest::SwitchBuckets {
+                generation,
+                buckets: buckets.clone(),
+            },
+        )
+    }
+
+    /// A submission that completes once every rank of every group, this node's workers and the
+    /// peers', installed the outcome of every bucket of `buckets` (every bucket the generation
+    /// examines, when `None`) for the prepared generation `generation` (`Worker::ready`), and
+    /// fails once one of them will not. It takes no place in any group's order.
+    ///
+    /// # Errors
+    ///
+    /// What a peer link refuses.
+    pub(crate) fn ready(&self, generation: u64, buckets: Option<Vec<Key>>) -> Result<Submission> {
+        let mut links: Vec<&Arc<Remote>> = Vec::new();
+        for group in &self.groups {
+            for remote in &group.remotes {
+                if !links.iter().any(|link| Arc::ptr_eq(link, remote)) {
+                    links.push(remote);
+                }
+            }
+        }
+
+        let mut parts = Vec::new();
+        for link in links {
+            let ready = MainProcessRequest::Ready {
+                generation,
+                buckets: buckets.clone(),
+            };
+            parts.push(link.send(ready, None)?);
+        }
+        for group in &self.groups {
+            for worker in &group.workers {
+                parts.push(worker.ready(generation, buckets.clone()));
+            }
+        }
+        joined(parts)
     }
 
     /// Commits the trial of generation `generation` on every rank, behind the jobs handed before
