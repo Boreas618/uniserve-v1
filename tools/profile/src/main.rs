@@ -1,17 +1,19 @@
-//! `uniserve-profile`: reads a profiling session's files and the captures of
-//! external profilers (`docs/profiling.md`).
+//! `uniserve-profile`: reads a deployment's timeline, a profiling session's
+//! files and the captures of external profilers (`docs/profiling.md`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use profile::{calls, nsys, perfetto, session};
+use profile::admin::Admin;
+use profile::{calls, nsys, perfetto, session, timeline};
 
 #[derive(Parser)]
 #[command(
     name = "uniserve-profile",
-    about = "Reads profiling sessions' files and external profilers' captures"
+    about = "Reads a deployment's timeline, profiling sessions' files and external profilers' captures"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -20,6 +22,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// One trace of the `span` events a deployment's admin socket serves, in
+    /// the Trace Event Format: one request's, one batch's, or those of a time
+    /// window.
+    Timeline {
+        /// The daemon's admin address: `unix:<path>` of its admin socket.
+        #[arg(long)]
+        admin: String,
+        /// A request's id: its spans and those of the batches it was in.
+        #[arg(long, conflicts_with = "batch")]
+        request: Option<String>,
+        /// A batch id: its spans and its requests' membership records.
+        #[arg(long)]
+        batch: Option<String>,
+        /// The spans ending at or after this time, in nanoseconds since the
+        /// Unix epoch.
+        #[arg(long)]
+        from: Option<i64>,
+        /// The spans starting at or before this time, in nanoseconds since
+        /// the Unix epoch.
+        #[arg(long)]
+        to: Option<i64>,
+        /// The spans ending within this many seconds before the daemon's
+        /// clock.
+        #[arg(long, conflicts_with_all = ["from", "to"], value_parser = seconds)]
+        last: Option<Duration>,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// What each file of a session holds: its session, worker, collectors and
     /// rows by table.
     Summary { files: Vec<PathBuf> },
@@ -53,6 +83,15 @@ enum Command {
     },
 }
 
+/// A positive number of seconds.
+fn seconds(text: &str) -> Result<Duration, String> {
+    let value: f64 = text.parse().map_err(|error| format!("{error}"))?;
+    Duration::try_from_secs_f64(value)
+        .ok()
+        .filter(|span| !span.is_zero())
+        .ok_or_else(|| format!("`{text}` is not a positive number of seconds"))
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse().command) {
         Ok(()) => ExitCode::SUCCESS,
@@ -65,6 +104,27 @@ fn main() -> ExitCode {
 
 fn run(command: Command) -> Result<()> {
     match command {
+        Command::Timeline {
+            admin,
+            request,
+            batch,
+            from,
+            to,
+            last,
+            output,
+        } => {
+            let filter = timeline::Filter {
+                request,
+                batch,
+                from,
+                to,
+                last,
+            };
+            let spans = timeline::read(&Admin::new(&admin)?, &filter)?;
+            let trace = timeline::convert(&spans)?;
+            std::fs::write(&output, serde_json::to_string(&trace)?)?;
+            println!("wrote {} spans to {}", spans.len(), output.display());
+        }
         Command::Summary { files } => {
             let summaries: Vec<serde_json::Value> = session::open_all(&files)?
                 .iter()

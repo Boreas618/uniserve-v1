@@ -24,11 +24,11 @@ fn number(row: &Map<String, Value>, key: &str) -> i64 {
     row.get(key).and_then(Value::as_i64).unwrap_or(0)
 }
 
-fn slice(pid: i64, tid: i64, name: &str, start: i64, end: i64, args: Value) -> Value {
+pub(crate) fn slice(pid: i64, tid: i64, name: &str, start: i64, end: i64, args: Value) -> Value {
     json!({"name": name, "ph": "X", "pid": pid, "tid": tid, "ts": start, "dur": (end - start).max(0), "args": args})
 }
 
-fn track(pid: i64, tid: i64, name: &str) -> Value {
+pub(crate) fn track(pid: i64, tid: i64, name: &str) -> Value {
     json!({"name": "thread_name", "ph": "M", "pid": pid, "tid": tid, "args": {"name": name}})
 }
 
@@ -42,6 +42,13 @@ pub fn convert(paths: &[PathBuf]) -> Result<Value> {
     for profile in crate::session::open_all(paths)? {
         events.extend(file_events(&profile)?);
     }
+    Ok(document(events))
+}
+
+/// The trace of `events`, whose `ts` and `dur` are nanoseconds: times are
+/// moved to start at the earliest event and stated in microseconds, the
+/// format's unit.
+pub(crate) fn document(mut events: Vec<Value>) -> Value {
     let origin = events
         .iter()
         .filter_map(|event| event.get("ts").and_then(Value::as_i64))
@@ -55,7 +62,7 @@ pub fn convert(paths: &[PathBuf]) -> Result<Value> {
             }
         }
     }
-    Ok(json!({"traceEvents": events, "displayTimeUnit": "ns"}))
+    json!({"traceEvents": events, "displayTimeUnit": "ns"})
 }
 
 #[expect(clippy::too_many_lines, reason = "one track per table, in order")]

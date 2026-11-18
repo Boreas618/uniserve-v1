@@ -1,6 +1,6 @@
 # Execution profiling
 
-A serving deployment profiles itself without restarting a process or pausing service. Every main process subscribes to NVIDIA's CUPTI once, as it starts, and every collector below shares that subscription: two counters and the fence probes are always on and exported as Prometheus metrics, and a profiling session (`/admin/profile`) attaches further collectors to the executing epoch at a step boundary and detaches them at another, writing one SQLite file per rank that `uniserve-profile` reads and converts to a Perfetto trace. It also reads captures of Nsight Systems and cProfile, producing hints about host waits, GIL ownership, copies and language crossings. Neither changes execution, rejects a request or establishes that an operation is unnecessary: inspect each finding in its workload context, then measure any optimization without the diagnostic instrumentation.
+A serving deployment profiles itself without restarting a process or pausing service. Every main process subscribes to NVIDIA's CUPTI once, as it starts, and every collector below shares that subscription: two counters and the fence probes are always on and exported as Prometheus metrics, a profiling session (`[profiling_config.session]`) attaches further collectors to the executing epoch at a step boundary and detaches them at another, writing one SQLite file per rank that `uniserve-profile` reads and converts to a Perfetto trace, and the host stages and timed kernels of every request are `span` events of the deployment's observation store, which `uniserve-profile` exports as a request's, a batch's or a time window's Perfetto trace. It also reads captures of Nsight Systems and cProfile, producing hints about host waits, GIL ownership, copies and language crossings. Neither changes execution, rejects a request or establishes that an operation is unnecessary: inspect each finding in its workload context, then measure any optimization without the diagnostic instrumentation.
 
 ## CUPTI in a main process
 
@@ -44,17 +44,24 @@ Each probe thus costs about a microsecond of every step even when switched off, 
 
 ## Profiling sessions
 
-A session attaches collectors to every worker of the executing epoch for a window of steps or seconds, and leaves one SQLite file per worker in a directory it names. One session runs at a time:
+A session attaches collectors to every worker of the executing epoch for a window of steps or seconds, and leaves one SQLite file per worker in a directory it names. A session is the `[profiling_config.session]` table of the deployment's policy package, applied with `PUT /admin/policy` as every change is ([Policy](admin.md#policy)), so one session runs at a time: while the serving revision states the table, the serving epoch's workers run its session from the engine's next step boundary; a package that changes the table ends the running session and starts the one it states, and a package without it ends the running session. The change takes effect at a step and starts no epoch. The table's keys are the fields below:
 
-The routes are the admin API's, on the daemon's operator socket, whose path the daemon's readiness record states (`$admin`, as [Listeners](admin.md#listeners) reads it):
+```toml
+[profiling_config.session]
+collectors = ["timeline", "fence_timeline", "pm_sampling"]
+stages = ["decode"]
+start_step = 10
+steps = 200
+output_dir = "profiles"
+max_slowdown = 0.1
+```
+
+`$admin` is the daemon's admin socket, whose path the daemon's readiness record states ([Listeners](admin.md#listeners)). With `next/` the serving package and the table added to its `config.toml`:
 
 ```bash
-curl --unix-socket "$admin" -X POST http://admin/admin/profile -H 'Content-Type: application/json' -d '{
-  "collectors": ["timeline", "fence_timeline", "pm_sampling"],
-  "stages": ["decode"], "start_step": 10, "steps": 200,
-  "output_dir": "profiles", "max_slowdown": 0.1}'
-curl --unix-socket "$admin" http://admin/admin/profile             # its state
-curl --unix-socket "$admin" -X DELETE http://admin/admin/profile   # end it now
+tar -cf next.tar -C next .
+curl --unix-socket "$admin" -X PUT --data-binary @next.tar http://admin/admin/policy   # start it
+# remove the table from next/config.toml, then apply next.tar the same way to end it now
 ```
 
 | Field | Default | Meaning |
@@ -73,9 +80,16 @@ curl --unix-socket "$admin" -X DELETE http://admin/admin/profile   # end it now
 | `baseline_s` | `60` | The span before the session, in seconds, whose average step time the guard compares the session's with; at most the span the deployment keeps its statistics for (`update_config`'s `baseline` and `rollback.window`, [configuration](configuration.md)) |
 | `guard_window_s` | `10` | The span of the session, in seconds, the guard averages its step time over, and the least time between two of its actions |
 
-The session starts at the engine's next step boundary: the workers prepare their collectors and create their files, and answer with each collector's state, `prepared` or `unavailable` with the reason (a worker without CUPTI's subscription, a metric set that needs more than one pass). Each worker arms its collectors before the forward of the first step its window takes and disarms them after the forward of the last, as jobs that step's forward waits for, so that what CUPTI records begins and ends at step boundaries; it disarms them before a step of another stage and arms them again before the next selected one. A step is one batch's forward; every step during the session is listed in the file with whether the window took it. A session ends when every selected worker's window of steps ended, its seconds passed, the operator ends it, the quality-of-service guard ends it, or its epoch stops executing: an epoch change ends it before it parks the serving epoch, and a rollback ends the session of the epoch on trial; neither carries a session into the next epoch. Ending has every worker of a serving epoch disarm, release its collectors, write what remains and close its file.
+The session starts at the engine's next step boundary: the workers prepare their collectors and create their files, and answer with each collector's state, `prepared` or `unavailable` with the reason (a worker without CUPTI's subscription, a metric set that needs more than one pass). Each worker arms its collectors before the forward of the first step its window takes and disarms them after the forward of the last, as jobs that step's forward waits for, so that what CUPTI records begins and ends at step boundaries; it disarms them before a step of another stage and arms them again before the next selected one. A step is one batch's forward; every step during the session is listed in the file with whether the window took it. A session ends when every selected worker's window of steps ended, its seconds passed, a package changes or removes its table, the quality-of-service guard ends it, or its epoch stops executing: an epoch change ends it before it parks the serving epoch, and a rollback ends the session of the epoch on trial; neither carries a session into the next epoch. Ending has every worker of a serving epoch disarm, release its collectors, write what remains and close its file.
 
-`GET /admin/profile` answers with the running session, or the last that ended, under one identity on every replica of the deployment: its state (`running` while a replica's session records, `ending` while one writes its files, `ended` once every one ended), every worker's answer to its start (`workers`) and, once it ended, why and each worker's file and its rows by table (`end_reason`, `files`); the steps and the bytes the workers recorded so far (`steps`, `bytes_written`), reported with their batch results; the collectors still running; and each replica's own session (`replicas`), with the step time before the session and over its last `guard_window_s` (`overhead`) and the quality-of-service guard's actions.
+A session's state is a `log` event of the observation store, whose `source` label is `profile`, for each replica each time its session changes: as it starts, at each of the quality-of-service guard's actions and as it ends. Its labels are `replica` and `session` (the session's identity, the same on every replica), and its fields the replica's session as it stands after the change: `state` (`running` while the replica's session records, `ending` while its workers write their files, `ended`), `epoch`, every worker's answer to its start (`workers`) and, once it ended, why and each worker's file and its rows by table (`end_reason`, `files`); the steps and the bytes the workers recorded so far (`steps`, `bytes_written`), reported with their batch results, and the windows that ended (`windows_ended`); the collectors still running (`collectors`); the step time before the session and over its last `guard_window_s` (`overhead`) and the guard's actions (`guard`); and the device storage it reserved (`device_storage`). A field that is not a string is its JSON text, and `message` is the change as one line. `/admin/query` reads them ([admin](admin.md)):
+
+```bash
+curl --unix-socket "$admin" -G http://admin/admin/query --data-urlencode "q=
+  SELECT time, labels['replica'] AS replica, labels['session'] AS session, fields['state'] AS state,
+         fields['end_reason'] AS end_reason, fields['files'] AS files
+  FROM events WHERE kind = 'log' AND labels['source'] = 'profile' ORDER BY time"
+```
 
 | Collector | Mechanism | Options | What its file holds |
 | --- | --- | --- | --- |
@@ -98,7 +112,7 @@ CUPTI also needs free device addresses among the lowest ones for a pass's storag
 
 **Device storage of a session.** A `range_metrics` session reserves its pass's device storage, as each selected worker measured it at the session's start, in the quota of that worker's GPU, with the worker's process item, while it runs. Where a quota lacks the room (a KV cache sized by the quota leaves none), the worker ends the session there and states the bytes; the daemon ends it on the others, the KV cache gives back tail segments for those bytes, as an epoch change's preparation does (the requests holding them run on), and the session starts once more. The cache grows back once the session ends. A session for which even every segment past the first leaves too little room is refused, naming the bytes and every quota entry; a device without free storage for the pass's first start refuses the collector with CUPTI's error.
 
-**Collectors that share a device.** `pm_sampling`, `range_metrics` and `pc_sampling` each hold the device's performance monitors while they run, and CUPTI gives the monitors to one profiler at a time: on GB200 with `nvidia-cuda-cupti` 13.0, whichever of two starts second fails (`CUPTI_ERROR_HARDWARE_BUSY`, or an invalid parameter between the range profiler and PC sampling). A session therefore runs at most one of them, and a request naming two is refused; `timeline` and `fence_timeline` run beside any of them. CUPTI also refuses to enable activity records while PC sampling is enabled (`CUPTI_ERROR_NOT_COMPATIBLE`), so a worker enables PC sampling each time it arms its collectors, after the timeline started, and disables it each time it disarms them, before the timeline stops.
+**Collectors that share a device.** `pm_sampling`, `range_metrics` and `pc_sampling` each hold the device's performance monitors while they run, and CUPTI gives the monitors to one profiler at a time: on GB200 with `nvidia-cuda-cupti` 13.0, whichever of two starts second fails (`CUPTI_ERROR_HARDWARE_BUSY`, or an invalid parameter between the range profiler and PC sampling). A session therefore runs at most one of them, and a package whose session names two is refused; `timeline` and `fence_timeline` run beside any of them. CUPTI also refuses to enable activity records while PC sampling is enabled (`CUPTI_ERROR_NOT_COMPATIBLE`), so a worker enables PC sampling each time it arms its collectors, after the timeline started, and disables it each time it disarms them, before the timeline stops.
 
 **PC sampling and CUDA graphs.** CUPTI attributes the samples of a CUDA graph's kernels to their program counters only when PC sampling was enabled when the graph was captured, and stayed enabled since; otherwise it counts them as samples of non-user kernels, without records (on GB200 with `nvidia-cuda-cupti` 13.0, over replays of a captured graph: every one of 1.8 million samples, against all but about 1,300 when PC sampling was enabled before the capture; instantiating the graph again under PC sampling does not change it). A worker captures its graphs at warmup, so by default a session's own sampler attributes the kernels launched outside CUDA graphs, and `pc_take` counts the samples of graph kernels among its non-user samples. A deployment that profiles its graphs' kernels sets `profiling_config.graph_pc_sampling` (`docs/configuration.md`): every worker then enables PC sampling, stopped, before it captures its graphs and keeps it enabled for its life (having first enabled the activity kinds of its always-on stream record, which CUPTI refuses to enable once PC sampling is), and a session only sets the sampler's period and buffer at its first arm, starts it at each arm and stops it at each disarm. While PC sampling is enabled CUPTI refuses PM sampling (`CUPTI_ERROR_HARDWARE_BUSY`), the range profiler and the whole-graph activity record (`CUPTI_ERROR_NOT_COMPATIBLE`), so every worker of such a deployment refuses sessions of `pm_sampling`, `range_metrics` and timelines that trace graphs whole, naming the option, and the session is refused; timelines with `"graphs": "nodes"` run.
 
@@ -127,6 +141,28 @@ target/release/uniserve-profile perfetto profiles/profile-1-*.sqlite -o trace.js
 ```
 
 `summary` states each file's session, worker, collectors and rows by table. `perfetto` writes one trace of a session's files in the Trace Event Format, which the Perfetto UI opens: a process per worker, with a track per CUDA stream, host thread and device's fence probes (each probed module instance's call a slice, nested as the calls nest), the steps, and counter tracks for PM samples, all on CUPTI's clock. Any SQLite client reads a file by the schema; `uniserve-profile` is the `profile` crate's command line (`tools/profile`).
+
+## Request timelines
+
+The host stages a request passes through and the kernels timed on the device are `span` events of the observation store (`kind = 'span'`), which the leader gathers from every node as `/admin/query` reads them. A span's labels are `replica`, `process` (`daemon`, `scheduler`, `worker` or `storage`) and, for a worker's, `rank`; its fields are `start` and `end`, in nanoseconds since the Unix epoch on the host clock (device times converted through the `%globaltimer` samples above), the `request` id or the `batch` id it belongs to, and the host stage's name (`stage`) or the kernel (`kernel`, with its operator and descriptor key as the `op` and `descriptor` labels). A span that names both a request and a batch is the scheduler's membership record of the request in the batch, written as it forms the batch, which joins a request to its batches; a batch's worker spans join it to its steps and kernels.
+
+`uniserve-profile timeline` reads the spans through the admin socket and writes them as one trace in the Trace Event Format, which the Perfetto UI opens:
+
+```bash
+target/release/uniserve-profile timeline --admin "unix:$admin" --request "$REQUEST" -o request.json
+target/release/uniserve-profile timeline --admin "unix:$admin" --batch 4182 -o batch.json
+target/release/uniserve-profile timeline --admin "unix:$admin" --last 5 -o recent.json
+target/release/uniserve-profile timeline --admin "unix:$admin" --from "$FROM_NS" --to "$TO_NS" -o window.json
+```
+
+| Option | Spans selected |
+| --- | --- |
+| `--request ID` | The request's own spans, its membership records and the spans of every batch it was a member of |
+| `--batch ID` | The batch's spans, the membership records of its requests among them |
+| `--from NS`, `--to NS` | The spans that end at or after `--from` and start at or before `--to`, in nanoseconds since the Unix epoch |
+| `--last SECONDS` | The spans that end within the last `SECONDS` of the daemon's clock |
+
+The conditions combine; none selects every span the store retains. The trace has a process per place a span ran (the daemon, each replica's scheduler, each worker rank and each Storage Server), ordered along a request's path; in each, a track per request for that request's spans and tracks for the batches' spans, each slice carrying its span's other labels and fields as arguments. Spans of one track that overlap without nesting take a further track of the same name. A membership record is a slice on its request's track, with a flow arrow to its batch's first span in every process. Times start at the earliest span, in microseconds.
 
 ## Capture and inspect a CUDA timeline with Nsight Systems
 
