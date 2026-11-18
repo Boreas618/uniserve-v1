@@ -143,9 +143,19 @@
 //! ([`Runner::reshaped_capturer`]), while the serving shape serves. The switch exchanges the two
 //! whole at a batch boundary ([`Runner::switch_shape`]), the serving one kept until the commit
 //! ([`Runner::commit_shape`]) and served again after a rollback ([`Runner::rollback_shape`]).
-//! The request slots' state, the cache, the recurrent state, the scratch page set, the page
-//! work and the expert union are the runner's whatever shape serves; a step lands with the
-//! candidates of the shape that launched it.
+//! The request slots' state, the cache, the scratch page set, the page work and the expert union
+//! are the runner's whatever shape serves; a step lands with the candidates of the shape that
+//! launched it.
+//!
+//! The recurrent state is the runner's too, unless the options lay it out otherwise
+//! (`StateConfig::of`: the drafts lay a stepwise field's slots, a window's draft rows, a ring's
+//! groups and the drafter's state out, the buckets the trail and the copies' rows). Such a shape
+//! computes over the state the generation laid out for it beside the serving one
+//! (`StateMemory::prepared`), with accepted counts of its own, and its switch moves every slot's
+//! state into it from what the serving shape's steps left (`Slots::standing`,
+//! `StateMemory::switch`), each slot's state then standing in its home row; a rollback moves it
+//! back (`StateMemory::switch_back`). The runner reaches the rank's state through the owner it is
+//! lent ([`CausalLmRunner::set_state`]).
 //!
 //! ## Speculation
 //!
@@ -175,7 +185,7 @@ mod tests;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -196,7 +206,7 @@ use self::slots::Slots;
 use self::speculation::{DraftPool, DraftTable, Entry, Kept, Speculation};
 use crate::memory::buffers::BufferMemory;
 use crate::memory::cache::{CacheLayout, scratch};
-use crate::memory::state::layer_fields;
+use crate::memory::state::{StateConfig, StateMemory, Tensors as StateTensors, layer_fields};
 use crate::memory::tables::{BlockCopy, BlockTables, Change};
 use crate::runner::DeviceCopy;
 use crate::runner::buckets::{Bucket, Buckets};
@@ -205,6 +215,7 @@ use crate::runner::sampler::{self, Sampler, SamplerConfig};
 use crate::runner::{Forward, GraphOptions, Measure, Runner};
 use crate::worker::completion::Waker;
 use crate::worker::{Error, Result};
+use service::lock;
 
 /// The tokens one chunk of a scoring bucket's prompt projection holds: a chunk's logits and
 /// log-probabilities are `[SCORE_ROWS, vocabulary]` FP32 each (39 MB over 151936 tokens), and
@@ -299,6 +310,12 @@ pub struct CausalLmRunner {
     cache: Vec<KvCache>,
     /// The live and the checkpoint buffers of the recurrent state, when the model keeps one.
     state: Option<(StateBuffers, StateBuffers)>,
+    /// The rank's recurrent state, which a shape of other drafts or buckets lays out anew and
+    /// switches to ([`CausalLmRunner::set_state`]); `None` for a runner lent none.
+    state_memory: Option<Arc<Mutex<StateMemory>>>,
+    /// Whether the serving shape computes over a state its switch laid out, so a rollback moves
+    /// every slot's state back.
+    restated: bool,
     /// What issues a batch's page work; `None` for a runner that serves no batch with any.
     page_work: Option<PageWorkHook>,
     /// The scratch page set of paired forwards, group for group as `cache`; empty for a
@@ -360,8 +377,13 @@ struct Form {
     slots: Slots,
     sampler: Sampler,
     buckets: Buckets,
+    /// The live and the checkpoint buffers of the recurrent state the shape computes over.
+    state: Option<(StateBuffers, StateBuffers)>,
     speculation: Option<Speculation>,
     features: Option<Features>,
+    /// Whether the shape computes over a state laid out for it (`StateMemory::prepared`), which
+    /// its switch moves every slot's state into.
+    restates: bool,
 }
 
 /// A step the runner launched and has not landed: what its landing reads beside its batch.
@@ -670,6 +692,8 @@ impl CausalLmRunner {
             sampler,
             cache,
             state,
+            state_memory: None,
+            restated: false,
             page_work: None,
             scratch: Vec::new(),
             paired: Cell::new(false),
@@ -979,19 +1003,23 @@ impl CausalLmRunner {
     ///
     /// `model` is the serving model, or the model a generation of other drafts loads: one that
     /// loaded the drafter for a shape that verifies drafts, or released it for one that
-    /// verifies none.
+    /// verifies none, its recurrent state laid out for the drafts.
+    ///
+    /// `restated` is the recurrent state laid out for the shape when its options lay it out
+    /// otherwise than the serving one ([`CausalLmRunner::restate`]): the shape computes over it,
+    /// with accepted counts of its own, and the serving shape's state otherwise.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a catalog of a bucket that is no causal forward, of more tokens
     /// than a member of an expert union sends, or a verification longer than the recurrent
     /// state's trail, for drafts of a model that loaded no drafter or over a cache that lays no
-    /// draft cache out; [`Error::Unsupported`] for other drafts of a model whose layers or
-    /// drafter keep a recurrent state; what `graphs` and the allocations refuse.
+    /// draft cache out, or a state that is not the model's under the options; what `graphs` and
+    /// the allocations refuse.
     fn shape(
         &self,
         options: &GraphOptions,
-        model: &Arc<dyn TextModel>,
+        (model, restated): (&Arc<dyn TextModel>, Option<StateTensors>),
         device: bool,
         graphs: impl FnOnce(u64) -> Result<Graphs>,
     ) -> Result<Form> {
@@ -1003,17 +1031,6 @@ impl CausalLmRunner {
         };
         for bucket in config.buckets.iter() {
             bucket.causal_lm()?;
-        }
-        let stateful = !model.state_layers().is_empty()
-            || model
-                .drafter()
-                .is_some_and(|drafter| !drafter.state_layers().is_empty());
-        if config.drafts != self.config.drafts && stateful {
-            return Err(Error::Unsupported(format!(
-                "a model whose layers or drafter keep a recurrent state verifies {} drafts, and \
-                 {} drafts lay its state out otherwise",
-                self.config.drafts, config.drafts
-            )));
         }
         if config.drafts > 0 && config.draft_pool.is_none() {
             return Err(Error::Invalid(
@@ -1037,13 +1054,35 @@ impl CausalLmRunner {
             buckets = experts::classes(&config.buckets, member.capacity(), member.beside());
         }
 
+        // A shape over a state laid out for it computes over its buffers, which are the model's
+        // under the options; any other over the serving shape's.
+        let owned = owned_slots(&**model, &config)?;
+        let restates = restated.is_some();
+        let (state, trail, drafter_state) = match restated {
+            Some(lent) => {
+                let state = (lent.live, lent.checkpoint);
+                check_state(&**model, &config, owned, Some(&state))?;
+                let drafter_runs = model
+                    .drafter()
+                    .filter(|_| config.drafts > 0)
+                    .map(|drafter| drafter.state_layers())
+                    .unwrap_or_default();
+                check_drafter_state(&drafter_runs, config.slots, lent.drafter.as_ref())?;
+                (Some(state), lent.trail, lent.drafter)
+            }
+            None => (
+                self.state.clone(),
+                self.speculation
+                    .as_ref()
+                    .and_then(|serving| serving.trail.clone()),
+                self.speculation
+                    .as_ref()
+                    .and_then(|serving| serving.state.clone()),
+            ),
+        };
         // The trail of a recurrent state holds the state after every token of the largest
         // verification, at the rows the cache lent it.
-        if let Some(trail) = self
-            .speculation
-            .as_ref()
-            .and_then(|speculation| speculation.trail.as_ref())
-        {
+        if let Some(trail) = trail.as_ref() {
             let tokens = buckets
                 .iter()
                 .filter(|bucket| verifies(bucket.variant))
@@ -1067,6 +1106,12 @@ impl CausalLmRunner {
         let slots = match device {
             true => self.slots.with_rows(layout.rows() as u32)?,
             false => self.slots.shared().with_rows(layout.rows() as u32)?,
+        };
+        // A shape whose switch moves every slot's state into its home row holds accepted
+        // counts of its own, all one, for forwards that lend verify slots.
+        let slots = match restates {
+            true => slots.restated(owned.is_some())?,
+            false => slots,
         };
         let sampler = Sampler::new(
             SamplerConfig {
@@ -1119,14 +1164,8 @@ impl CausalLmRunner {
                     slots.bias().clone(),
                 )?,
                 draft,
-                trail: self
-                    .speculation
-                    .as_ref()
-                    .and_then(|serving| serving.trail.clone()),
-                state: self
-                    .speculation
-                    .as_ref()
-                    .and_then(|serving| serving.state.clone()),
+                trail,
+                state: drafter_state,
             })
         };
         let features = self
@@ -1152,9 +1191,63 @@ impl CausalLmRunner {
             slots,
             sampler,
             buckets,
+            state,
             speculation,
             features,
+            restates,
         })
+    }
+
+    /// The config of the recurrent state a shape of `options` computing with `model` lays out,
+    /// when it differs from the serving one's: the drafts lay a stepwise field's slots, a
+    /// window's draft rows, a ring's groups and the drafter's state out, and the buckets the
+    /// trail and the copies' rows ([`StateConfig::of`]). `None` for a model that keeps no state
+    /// or a shape over the serving state.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a model that keeps a state the runner was lent no owner of
+    /// ([`CausalLmRunner::set_state`]) while the options lay it out otherwise.
+    fn restate(
+        &self,
+        options: &GraphOptions,
+        model: &dyn TextModel,
+    ) -> Result<Option<StateConfig>> {
+        let buckets = options.buckets.with_drafts(options.drafts);
+        let Some(config) = StateConfig::of(model, self.config.slots, &buckets, options.drafts)
+        else {
+            return Ok(None);
+        };
+        // A runner lent no owner serves the state of its serving shape alone.
+        let serving = match &self.state_memory {
+            Some(owner) => Some(lock(owner).config().clone()),
+            None => {
+                let buckets = self.config.buckets.with_drafts(self.config.drafts);
+                StateConfig::of(
+                    &*self.model,
+                    self.config.slots,
+                    &buckets,
+                    self.config.drafts,
+                )
+            }
+        };
+        match serving {
+            Some(serving) if serving == config => Ok(None),
+            _ if self.state_memory.is_none() => Err(Error::Invalid(
+                "a shape lays the recurrent state out otherwise, and the runner was lent no \
+                 owner of it"
+                    .into(),
+            )),
+            _ => Ok(Some(config)),
+        }
+    }
+
+    /// Lends the runner the rank's recurrent state, whose buffers it was lent
+    /// ([`CausalLmRunner::over`]): a kernel generation whose options lay it out otherwise
+    /// computes its shape over the state it lays out ([`StateMemory::prepared`]), and its switch
+    /// and rollback move every slot's state ([`StateMemory::switch`]).
+    pub fn set_state(&mut self, state: Arc<Mutex<StateMemory>>) {
+        self.state_memory = Some(state);
     }
 
     /// The device bytes `shape` allocates beside its graphs' region: its ban masks when they
@@ -1169,6 +1262,10 @@ impl CausalLmRunner {
             Slots::ban_bytes(vocabulary, rows)
         };
         let kept = Self::kept_bytes(&shape.config, &*shape.model)?;
+        let accepted = match shape.restates && shape.slots.accepted().is_some() {
+            true => Slots::accepted_bytes(shape.config.slots),
+            false => 0,
+        };
         let features = match &self.features {
             Some(_) if shape.layout.tokens() > self.layout.tokens() => {
                 Features::bytes(&*shape.model, shape.layout.tokens())?
@@ -1176,7 +1273,7 @@ impl CausalLmRunner {
             _ => 0,
         };
 
-        Ok(bans + kept + features)
+        Ok(bans + kept + accepted + features)
     }
 
     /// A forward instance of the runner computing with `shape` (`Runner::capturer`): the model,
@@ -1192,8 +1289,10 @@ impl CausalLmRunner {
             slots,
             sampler,
             buckets,
+            state,
             speculation,
             features,
+            restates,
         } = shape;
 
         Self {
@@ -1204,7 +1303,9 @@ impl CausalLmRunner {
             slots,
             sampler,
             cache: self.cache.clone(),
-            state: self.state.clone(),
+            state,
+            state_memory: None,
+            restated: restates,
             page_work: None,
             scratch: self.scratch.clone(),
             paired: Cell::new(false),
@@ -1235,8 +1336,10 @@ impl CausalLmRunner {
         std::mem::swap(&mut self.slots, &mut shape.slots);
         std::mem::swap(&mut self.sampler, &mut shape.sampler);
         std::mem::swap(&mut self.buckets, &mut shape.buckets);
+        std::mem::swap(&mut self.state, &mut shape.state);
         std::mem::swap(&mut self.speculation, &mut shape.speculation);
         std::mem::swap(&mut self.features, &mut shape.features);
+        std::mem::swap(&mut self.restated, &mut shape.restates);
     }
 
     /// The head of input tensor `column`, as `shape`.
@@ -2195,8 +2298,10 @@ impl Runner for CausalLmRunner {
             slots: self.slots.shared(),
             sampler: self.sampler.clone(),
             buckets: self.buckets.clone(),
+            state: self.state.clone(),
             speculation,
             features: self.features.clone(),
+            restates: self.restated,
         };
 
         Ok(Box::new(self.instance(shape)))
@@ -2217,14 +2322,29 @@ impl Runner for CausalLmRunner {
         model: Option<&Arc<dyn TextModel>>,
     ) -> Result<Option<Measure>> {
         let model = model.unwrap_or(&self.model);
-        let shape = self.shape(options, model, false, |inputs| {
+
+        // A shape that lays the recurrent state out otherwise is measured over that state
+        // holding no device, whose buffers it allocates and whose copies it launches.
+        let restated = match (self.restate(options, &**model)?, &self.state_memory) {
+            (Some(config), Some(owner)) => Some(lock(owner).alike(config)?),
+            _ => None,
+        };
+        let lent = restated.as_ref().map(StateMemory::lent).transpose()?;
+        let shape = self.shape(options, (model, lent), false, |inputs| {
             self.graphs.measuring(self.graphs.kernels(), inputs)
         })?;
-        let storage = self.shape_bytes(&shape)?;
+        let mut storage = self.shape_bytes(&shape)?;
+        let mut keys = std::collections::BTreeSet::new();
+        if let Some(state) = &restated {
+            storage = storage.saturating_add(state.bytes()?);
+            keys = state.keys()?;
+        }
 
         Ok(Some(Measure {
             storage,
             instance: Box::new(self.instance(shape)),
+            state: restated.map(|state| state.config().clone()),
+            keys,
         }))
     }
 
@@ -2251,7 +2371,21 @@ impl Runner for CausalLmRunner {
         }
 
         let model = Arc::clone(model.unwrap_or(&self.model));
-        let shape = self.shape(options, &model, true, |inputs| {
+        // The state the shape lays out otherwise was laid out for the generation beside the
+        // serving one (`StateMemory::prepare`), and its copies launch with its kernels.
+        let lent = match (self.restate(options, &*model)?, &self.state_memory) {
+            (Some(config), Some(owner)) => {
+                let owner = lock(owner);
+                if owner.prepared_config(number) != Some(&config) {
+                    return Err(Error::State(
+                        "the generation laid out no state of the shape's config",
+                    ));
+                }
+                Some(owner.prepared(number, Arc::clone(&kernels))?)
+            }
+            _ => None,
+        };
+        let shape = self.shape(options, (&model, lent), true, |inputs| {
             self.graphs.over(kernels, region, inputs, values)
         })?;
         self.prepared = Some((number, shape));
@@ -2285,8 +2419,10 @@ impl Runner for CausalLmRunner {
             slots: prepared.slots.shared(),
             sampler: prepared.sampler.clone(),
             buckets: prepared.buckets.clone(),
+            state: prepared.state.clone(),
             speculation,
             features: prepared.features.clone(),
+            restates: prepared.restates,
         };
 
         Ok(Box::new(self.instance(shape)))
@@ -2302,6 +2438,22 @@ impl Runner for CausalLmRunner {
                 "generation {number} switches, and the runner prepared the shape of generation \
                  {prepared}"
             )));
+        }
+
+        // Every slot's state moves into the state laid out for the shape, behind every step the
+        // serving shape issued, as their counts left it; the shape's counts then state it
+        // stands in each slot's home row.
+        if shape.restates
+            && let Some(owner) = &self.state_memory
+        {
+            let standing = self.slots.standing()?;
+            if !lock(owner).switch(number, &standing)? {
+                self.prepared = Some((prepared, shape));
+                return Err(Error::Invariant(format!(
+                    "generation {number} switches a shape over a state it laid out none of"
+                )));
+            }
+            shape.slots.accept_one()?;
         }
 
         shape.graphs.take_over(&self.graphs)?;
@@ -2337,6 +2489,15 @@ impl Runner for CausalLmRunner {
 
         match self.kept.take() {
             Some((kept, mut shape)) if kept == number => {
+                // Every slot's state moves back into the state the switch kept.
+                if self.restated
+                    && let Some(owner) = &self.state_memory
+                {
+                    let standing = self.slots.standing()?;
+                    lock(owner).switch_back(number, &standing)?;
+                    shape.slots.accept_one()?;
+                }
+
                 shape.graphs.take_over(&self.graphs)?;
                 self.exchange(&mut shape);
                 // The rolled-back shape's graphs are released once the device passed them.

@@ -325,9 +325,74 @@ pub struct StateField {
     /// owns `draft_tokens + 1` slots of the field. A field that keeps one slot per request, such
     /// as a convolution window that holds its draft rows inside its own slot, is not stepwise.
     pub stepwise: bool,
+    /// How the rows of its first extent hold the slot's state ([`StateRows`]).
+    pub rows: StateRows,
+}
+
+/// How the rows of a state field's first extent hold a slot's state, which a deployment of
+/// other drafts lays out otherwise: what a checkpoint keeps of the field, the rows a forward
+/// that starts at a block boundary reads, which no count of drafts changes, and where a slot's
+/// state lies among them.
+///
+/// A block is a whole number of groups of every [`StateRows::Ring`], so the state a forward from
+/// a block boundary reads is what the field holds at zero drafts, its first
+/// [`StateField::kept_rows`] rows: a checkpoint keeps those, whatever the deployment drafts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateRows {
+    /// Extents no count of drafts changes: the whole field is the slot's state.
+    Whole,
+    /// A causal convolution's window: `history` inputs, then a row per token a step may draft.
+    /// A decode-phase row of a deployment whose forwards lend verify slots reads the history
+    /// from row `num_accepted − 1` ([`crate::capability::VerifySlots`]), and every other row
+    /// from row zero.
+    Window {
+        /// The inputs before a token the convolution reads.
+        history: usize,
+    },
+    /// A ring of a request's most recent rows, position `p` at row `p mod rows`, its rows a
+    /// whole number of groups of `group` positions. A forward reads only the rows of the group
+    /// open at its first position, and rows past the last committed position are overwritten
+    /// when their positions are computed again.
+    Ring {
+        /// The positions of one group, which divides the ring and every block.
+        group: usize,
+    },
 }
 
 impl StateField {
+    /// The rows of the field's first extent a checkpoint keeps: every row of a
+    /// [`StateRows::Whole`] field, a window's history, and a ring's first group, the rows each
+    /// holds at zero drafts (one for a field of no extent).
+    pub fn kept_rows(&self) -> usize {
+        match self.rows {
+            StateRows::Whole => self.dims.first().copied().unwrap_or(1),
+            StateRows::Window { history } => history,
+            StateRows::Ring { group } => group,
+        }
+    }
+
+    /// The bytes one row of the field's first extent occupies: the bytes of a slot for a field
+    /// of no extent.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bytes`].
+    pub fn row_bytes(&self) -> Result<u64> {
+        let rows = self.dims.first().copied().unwrap_or(1).max(1);
+
+        Ok(self.bytes()? / rows as u64)
+    }
+
+    /// The bytes a checkpoint keeps of one slot of the field, its first
+    /// [`Self::kept_rows`] rows: the same for every count of drafts.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bytes`].
+    pub fn kept_bytes(&self) -> Result<u64> {
+        Ok(self.kept_rows() as u64 * self.row_bytes()?)
+    }
+
     /// The bytes one slot of the field occupies.
     ///
     /// # Errors

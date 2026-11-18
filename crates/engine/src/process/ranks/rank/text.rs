@@ -141,6 +141,10 @@ impl ModelRunner {
             state.map(Arc::clone),
             stream.clone(),
         ));
+        // A kernel generation of other drafts or buckets lays the state out anew through it.
+        if let Some(state) = state {
+            runner.set_state(Arc::clone(state));
+        }
 
         // The group's one axis is its whole width: a rank's split is its position among the
         // group's ranks. The meta contexts take the split alone: a profile run issues no

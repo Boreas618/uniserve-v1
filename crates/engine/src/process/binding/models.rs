@@ -1,11 +1,14 @@
 //! The model a kernel generation of other drafts serves its shapes with (`docs/admin.md`,
-//! "Updates"): the serving checkpoint loaded again beside the weights that serve, with its
-//! drafter loaded for drafts above zero or released for none.
+//! "Updates"): the serving checkpoint loaded again beside the weights that serve, at the
+//! generation's drafts, with its drafter loaded for drafts above zero or released for none.
 //!
 //! A rank's model loads its drafter only when the deployment speculates
-//! (`nn::family::TextPlacement::drafter`), so a generation whose drafts start or stop
-//! speculating loads the model again for them, through the rank's own store: every weight the
-//! rank maps already is returned as it is, and only the drafter's weights are published. The
+//! (`nn::family::TextPlacement::drafter`), and a model whose layers keep a recurrent state lays
+//! its state out for the drafts (`nn::family::TextPlacement::draft_tokens`: a window's draft rows,
+//! a stepwise field's slots, a ring's groups). A generation of other drafts therefore loads the
+//! model again for them, through the rank's own store: every weight the rank maps already is
+//! returned as it is, and only the drafter's weights are published, when it starts speculating.
+//! The
 //! load runs twice, as an expert redistribution's does ([`crate::memory::reload`]): first over
 //! meta weights, which states what the shapes are measured with and the device bytes the
 //! drafter's weights take beside what serves ([`WeightBinding::meta_models`]), then on the
@@ -50,10 +53,10 @@ pub(super) struct Drafting {
 
 impl WeightBinding {
     /// Whether a kernel generation that drafts `drafts` tokens a step serves its shapes with a
-    /// model other than the serving one: its drafts start or stop speculating, which loads or
-    /// releases the drafter.
+    /// model other than the serving one: its drafts differ from the serving ones, which load or
+    /// release the drafter and lay the model's recurrent state out (module documentation).
     pub(crate) fn loads_model(&self, drafts: u32) -> bool {
-        (lock(&self.target).drafts == 0) != (drafts == 0)
+        lock(&self.target).drafts != drafts
     }
 
     /// The target the ranks serve, at `drafts`.

@@ -25,11 +25,13 @@
 //! candidates, the drafts) shapes the runners otherwise: [`kernels`] measures every runner's
 //! shape under them (`Worker::measure`), selects and installs the kernels their buckets launch
 //! with the serving ones, makes the room their graphs and storage take beside what serves, maps
-//! a region for a shape whose peak the runner's region does not hold, and has every worker
-//! prepare the shapes, whose every bucket its capture thread captures. Such a generation switches
-//! whole, at the boundary its policy switches at, with every scheduler's limits
-//! ([`Message::SetGraphs`]); its commit releases the regions it replaced, and its rollback the
-//! ones it mapped.
+//! a region for a shape whose peak the runner's region does not hold, lays out the recurrent state
+//! of a shape whose options lay it out otherwise beside the serving one
+//! (`WeightBinding::open_states`), and has every worker prepare the shapes, whose every bucket its
+//! capture thread captures. Such a generation switches whole, at the boundary its policy switches
+//! at, with every scheduler's limits ([`Message::SetGraphs`]), every slot's state moving into the
+//! state laid out for it; its commit releases the regions and the state it replaced, and its
+//! rollback, which moves the slots' state back, the ones it mapped.
 //!
 //! The ranks of the epoch's peers switch, commit and roll back with this process's, in the order
 //! of every group's jobs, through the node's route (`Route::switch`); each peer prepares from its
@@ -248,9 +250,9 @@ pub(crate) fn kernels(
 }
 
 /// Every worker's runners' shapes under `options`, in the workers' order ([`Worker::measure`]).
-/// Options of drafts that start or stop speculating are measured with the model they load
-/// (`WeightBinding::meta_models`), and the device bytes of the weights that load adds count in
-/// the extra of the worker's first shape, its causal runner's.
+/// Options of other drafts are measured with the model they load (`WeightBinding::meta_models`),
+/// and the device bytes of the weights that load adds count in the extra of the worker's first
+/// shape, its causal runner's.
 ///
 /// # Errors
 ///
@@ -321,11 +323,14 @@ fn grown(
 /// options, and for each runner the region its shape computes in with the bytes of a replay's
 /// input values. A shape whose peak its runner's region holds computes there; any other in a
 /// region of its own, which `binding` maps on the runner's device for `generation` until the
-/// generation commits, which replaces the runner's region with it, or is given back.
+/// generation commits, which replaces the runner's region with it, or is given back. A shape
+/// that lays the recurrent state out otherwise computes over the state `binding` lays out for
+/// it on the rank (`WeightBinding::open_states`), which the commit makes the rank's.
 ///
 /// # Errors
 ///
-/// A region the device or its quota cannot map: the regions mapped before it are given back.
+/// A region or a state the device or its quota cannot map: the regions and the state mapped
+/// before it are given back.
 fn regions(
     workers: &[Arc<Worker>],
     binding: &WeightBinding,
@@ -359,6 +364,20 @@ fn regions(
                 None
             };
             regions.push((region, shape.values));
+
+            // A shape whose options lay the recurrent state out otherwise computes over the
+            // state laid out for it beside the serving one, from the rank's resident pool.
+            if let Some(config) = &shape.state {
+                let opened = binding.open_states(worker, generation, config.clone());
+                if let Err(error) = &opened
+                    && let Err(released) = binding.release_regions(generation)
+                {
+                    tracing::warn!(%error, %released, generation, "a region was not given back");
+                }
+                opened.with_context(|| {
+                    format!("laying out the recurrent state of runner {index}'s shape")
+                })?;
+            }
         }
         reshapes.push(Some(Arc::new(Reshape {
             options: options.runners.clone(),

@@ -38,7 +38,7 @@
 //! valid entries and appends their count (`nvidia/ops/qsa_indexer.py:236-277`); the entries
 //! are the same.
 
-use nn::family::StateField;
+use nn::family::{StateField, StateRows};
 use nn::functional::Activation;
 use nn::modules::{
     Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearConfig, QkvNames, Rotary,
@@ -152,6 +152,10 @@ impl IndexedAttention {
     /// of the ring's rows.
     pub fn state_fields(config: &Config, dtype: DType, draft_tokens: u32) -> Vec<StateField> {
         let capacity = config.indexer.ring_capacity(draft_tokens) as usize;
+        // The ring holds whole groups at `position mod capacity` (module documentation).
+        let rows = StateRows::Ring {
+            group: config.indexer.compress_ratio as usize,
+        };
 
         vec![
             StateField {
@@ -159,12 +163,14 @@ impl IndexedAttention {
                 dtype,
                 dims: vec![capacity, config.indexer.head_dim as usize],
                 stepwise: false,
+                rows,
             },
             StateField {
                 name: "index_ring_positions",
                 dtype: DType::I32,
                 dims: vec![capacity, crate::qwen3::config::POSITION_AXES as usize],
                 stepwise: false,
+                rows,
             },
         ]
     }

@@ -9,7 +9,7 @@
 #![cfg(test)]
 
 use nn::collective::Split;
-use nn::family::{StateField, StateShape};
+use nn::family::{StateField, StateRows, StateShape};
 use nn::functional::{self, WeightOrder};
 use nn::modules::{GatedDeltaNet, GatedDeltaNetConfig};
 use nn::{
@@ -875,10 +875,37 @@ fn a_state_field_states_its_slot_bytes_or_refuses_a_sub_byte_element() {
         dtype,
         dims: vec![3, 32],
         stepwise: false,
+        rows: StateRows::Window { history: 3 },
     };
 
     assert_eq!(field(DType::BF16).bytes().unwrap(), 3 * 32 * 2);
     assert!(field(DType::F4).bytes().is_err());
+}
+
+/// A checkpoint keeps the rows a field holds at zero drafts: all of a field no draft count
+/// changes, a window's history before its draft rows, and a ring's first group.
+#[test]
+fn a_checkpoint_keeps_the_rows_a_field_holds_at_zero_drafts() {
+    let field = |dims: Vec<usize>, rows| StateField {
+        name: "field",
+        dtype: DType::BF16,
+        dims,
+        stepwise: false,
+        rows,
+    };
+
+    let whole = field(vec![4, 4, 4], StateRows::Whole);
+    assert_eq!(whole.kept_rows(), 4);
+    assert_eq!(whole.kept_bytes().unwrap(), whole.bytes().unwrap());
+
+    // A window of three inputs with two draft rows keeps its three inputs.
+    let window = field(vec![5, 32], StateRows::Window { history: 3 });
+    assert_eq!(window.row_bytes().unwrap(), 32 * 2);
+    assert_eq!(window.kept_bytes().unwrap(), 3 * 32 * 2);
+
+    // A ring of two groups of four keeps one group.
+    let ring = field(vec![8, 16], StateRows::Ring { group: 4 });
+    assert_eq!(ring.kept_bytes().unwrap(), 4 * 16 * 2);
 }
 
 #[test]
@@ -893,12 +920,14 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
                 dtype: DType::BF16,
                 dims: vec![3, 32],
                 stepwise: false,
+                rows: StateRows::Window { history: 3 },
             },
             StateField {
                 name: "recurrent",
                 dtype: DType::F32,
                 dims: vec![4, 4, 4],
                 stepwise: false,
+                rows: StateRows::Whole,
             },
         ]
     );

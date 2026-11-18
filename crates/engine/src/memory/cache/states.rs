@@ -333,6 +333,7 @@ mod tests {
                 dtype: DType::U8,
                 dims: vec![40],
                 stepwise: false,
+                rows: nn::family::StateRows::Whole,
             }],
         };
         CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::BFloat16, &[state])

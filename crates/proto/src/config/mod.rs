@@ -715,12 +715,13 @@ impl Tuning {
 #[serde(default, deny_unknown_fields)]
 pub struct SpeculativeConfig {
     /// The most draft tokens one verification carries per request; zero
-    /// does not speculate. The verification buckets hold the drafts, so a
-    /// change between two counts above zero is a kernel generation, whose
-    /// graphs the serving engines capture in the background; a change from
-    /// or to zero loads or releases the drafter and its draft cache, which
-    /// an epoch lays out ([`drafts_effect`]).
-    #[reload(by = drafts_effect)]
+    /// does not speculate. A change is a kernel generation, whose graphs the
+    /// serving engines capture in the background: the verification buckets
+    /// hold the drafts, the generation loads or releases the drafter's
+    /// weights beside the serving ones, and a model that keeps a recurrent
+    /// state lays it out for the drafts beside the serving one. The draft
+    /// cache is laid out whatever the drafts.
+    #[reload(generation)]
     pub num_draft_tokens: u32,
     /// The speedup speculation gives a request, the decode steps' time one
     /// of its verification steps takes the place of, stated in place of
@@ -732,17 +733,6 @@ pub struct SpeculativeConfig {
     /// negative, measured when unset.
     #[reload(program)]
     pub refill_token_cost: Option<f64>,
-}
-
-/// How a change of `speculative_config.num_draft_tokens` from `previous` to `next` takes effect: a
-/// kernel generation between two counts above zero, whose graphs hold the drafts; an epoch from
-/// or to zero, which loads or releases the drafter's weights and lays its draft cache out.
-pub fn drafts_effect(previous: Option<&u32>, next: &u32) -> crate::reload::Effect {
-    match previous {
-        Some(previous) if previous == next => crate::reload::Effect::Generation,
-        Some(previous) if *previous > 0 && *next > 0 => crate::reload::Effect::Generation,
-        _ => crate::reload::Effect::Epoch,
-    }
 }
 
 /// The kind of device the command line's shorthand places every rank on (`device_config.device`).
@@ -2115,7 +2105,8 @@ impl EngineConfig {
     /// any of these types does not compile until it is placed in the build part or named as a
     /// generation-layer value. The generation layer's values are the scheduling policy's
     /// parameters (the scheduler section, the batched token budget, the speculative cost
-    /// figures); the schedulers' roles; the values the serving engine takes at a step boundary
+    /// figures); the graph options a kernel generation captures the engine's graphs for (the
+    /// bucket catalog, `max_logprobs` and the drafts); the schedulers' roles; the values the serving engine takes at a step boundary
     /// (the probes' switches, the NVTX ranges, the queue depth, the workers' bounds, report
     /// period and copy budget); and the media section, which the frontend reads. A switch the engine takes in place only
     /// when it is switched off (`kv_cache_config.prefix_caching`, `host_tier`) stays in the
@@ -2170,7 +2161,7 @@ impl EngineConfig {
             queue_depth: _,
         } = device;
         let SpeculativeConfig {
-            num_draft_tokens,
+            num_draft_tokens: _,
             expected_speedup: _,
             refill_token_cost: _,
         } = speculative;
@@ -2205,7 +2196,6 @@ impl EngineConfig {
             standby_storage: *standby_storage,
             host_threads: *host_threads,
             host_queue_depth: *host_queue_depth,
-            speculates: *num_draft_tokens > 0,
             video,
         }
     }
@@ -2273,9 +2263,6 @@ pub struct BuildPart<'a> {
     pub standby_storage: StandbyStorage,
     pub host_threads: Option<NonZeroUsize>,
     pub host_queue_depth: NonZeroUsize,
-    /// Whether the epoch speculates, which loads the drafter and lays the draft cache out; the
-    /// count of drafts is a kernel generation's (`drafts_effect`).
-    pub speculates: bool,
     pub video: &'a VideoConfig,
 }
 

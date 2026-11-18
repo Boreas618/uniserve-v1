@@ -249,6 +249,10 @@ pub(crate) struct Measured {
     /// graphs' instantiations at the serving graphs' mean, a rehearsal's memory, the storage it
     /// does not share, and its region when the runner's does not hold it.
     pub(crate) extra: u64,
+    /// The recurrent state the shape lays out otherwise than the serving one, which the
+    /// generation lays out beside it before the worker prepares the shape
+    /// (`StateMemory::prepare`).
+    pub(crate) state: Option<crate::memory::state::StateConfig>,
 }
 
 /// A control operation: what the worker calls with its runners at a batch boundary, with
@@ -860,12 +864,16 @@ impl Worker {
                     .saturating_add(peak.max(region))
                     .saturating_add(own)
                     .saturating_add(measure.storage);
+                // The copies of a state the shape lays out launch beside its forwards.
+                let mut keys = graphs.keys();
+                keys.extend(measure.keys);
                 Ok(Some(Measured {
-                    keys: graphs.keys(),
+                    keys,
                     peak,
                     values: graphs.input_peak(),
                     region,
                     extra,
+                    state: measure.state,
                 }))
             })
             .collect()

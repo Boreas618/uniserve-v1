@@ -2003,44 +2003,116 @@ impl WeightBinding {
         lock(&graphs).open_region(runner, generation, bytes)
     }
 
+    /// Lays out, on the rank whose worker is `worker`, the recurrent state of `config` for
+    /// kernel generation `generation` beside the serving one, from the rank's resident pool
+    /// (`StateMemory::prepare`): what a shape whose options lay the state out otherwise computes
+    /// over. It is given back with the generation's regions ([`Self::commit_regions`],
+    /// [`Self::release_regions`]).
+    ///
+    /// # Errors
+    ///
+    /// A worker of no rank of this process or a rank that keeps no state, another generation's
+    /// state laid out, or a pool or a quota that cannot hold the buffers.
+    pub(crate) fn open_states(
+        &self,
+        worker: &Arc<Worker>,
+        generation: u64,
+        config: crate::memory::state::StateConfig,
+    ) -> Result<()> {
+        let rank = self
+            .ranks
+            .iter()
+            .map(|rank| lock(rank))
+            .find(|rank| {
+                rank.worker
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, worker))
+            })
+            .ok_or(Error::State("the worker serves no rank of this process"))?;
+        let graphs = Arc::clone(&rank.graphs);
+        let state = rank
+            .state
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(Error::State("the rank keeps no recurrent state"))?;
+        drop(rank);
+
+        let mut pool = lock(&graphs);
+        lock(&state).prepare(generation, config, pool.allocator())
+    }
+
     /// Kernel generation `generation` committed: on every rank of this process, each region it
     /// mapped becomes its runner's and the replaced one is given back
-    /// (`GraphPool::commit_regions`). A peer gives its own back as its process commits.
+    /// (`GraphPool::commit_regions`), and so are the buffers of the recurrent state its switch
+    /// replaced (`StateMemory::commit`). A peer gives its own back as its process commits.
     ///
     /// # Errors
     ///
     /// The first pool's refusal; every rank's are given back all the same.
     pub(crate) fn commit_regions(&self, generation: u64) -> Result<()> {
-        self.each_pool(|pool| pool.commit_regions(generation))
+        self.each_pool(|pool, state| {
+            let regions = pool.commit_regions(generation);
+            let states = match state {
+                Some(state) => lock(state).commit(generation, pool.allocator()),
+                None => Ok(()),
+            };
+            regions.and(states)
+        })
     }
 
     /// Gives back every region kernel generation `generation` mapped on this process's ranks
-    /// (`GraphPool::release_regions`).
+    /// (`GraphPool::release_regions`), and the recurrent state it laid out
+    /// (`StateMemory::release`).
     ///
     /// # Errors
     ///
     /// The first pool's refusal; every rank's are given back all the same.
     pub(crate) fn release_regions(&self, generation: u64) -> Result<()> {
-        self.each_pool(|pool| pool.release_regions(generation))
+        self.each_pool(|pool, state| {
+            let regions = pool.release_regions(generation);
+            let states = match state {
+                Some(state) => lock(state).release(generation, pool.allocator()),
+                None => Ok(()),
+            };
+            regions.and(states)
+        })
     }
 
     /// Gives back every region a kernel generation before `generation` mapped on this process's
-    /// ranks (`GraphPool::release_regions_before`).
+    /// ranks (`GraphPool::release_regions_before`), and the recurrent state it laid out
+    /// (`StateMemory::release_before`).
     ///
     /// # Errors
     ///
     /// The first pool's refusal; every rank's are given back all the same.
     pub(crate) fn release_regions_before(&self, generation: u64) -> Result<()> {
-        self.each_pool(|pool| pool.release_regions_before(generation))
+        self.each_pool(|pool, state| {
+            let regions = pool.release_regions_before(generation);
+            let states = match state {
+                Some(state) => lock(state).release_before(generation, pool.allocator()),
+                None => Ok(()),
+            };
+            regions.and(states)
+        })
     }
 
-    /// Calls `operation` on every rank's graph pool, whatever an earlier one returned, and
-    /// returns the first error.
-    fn each_pool(&self, operation: impl Fn(&mut GraphPool) -> Result<()>) -> Result<()> {
+    /// Calls `operation` on every rank's graph pool, with the rank's recurrent state, whatever
+    /// an earlier one returned, and returns the first error. The pool is locked before the
+    /// state.
+    fn each_pool(
+        &self,
+        operation: impl Fn(&mut GraphPool, Option<&Arc<Mutex<StateMemory>>>) -> Result<()>,
+    ) -> Result<()> {
         let mut first = Ok(());
         for rank in &self.ranks {
-            let graphs = Arc::clone(&lock(rank).graphs);
-            let result = operation(&mut lock(&graphs));
+            let (graphs, state) = {
+                let rank = lock(rank);
+                (
+                    Arc::clone(&rank.graphs),
+                    rank.state.as_ref().map(Arc::clone),
+                )
+            };
+            let result = operation(&mut lock(&graphs), state.as_ref());
             if first.is_ok() {
                 first = result;
             }

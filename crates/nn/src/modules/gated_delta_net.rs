@@ -28,7 +28,7 @@ use tensor::{DType, Tensor};
 use crate::capability::{RecurrentState, TokenBatch};
 use crate::collective::Split;
 use crate::error::{Error, Result};
-use crate::family::StateField;
+use crate::family::{StateField, StateRows};
 use crate::functional::{self, StateAxes, WeightOrder};
 use crate::modules::linear::{Linear, LinearConfig, Parallel};
 use crate::modules::norm::{GatedRmsNorm, GatedRmsNormConfig};
@@ -96,6 +96,9 @@ impl GatedDeltaNetConfig {
                     self.conv_channels() as usize,
                 ],
                 stepwise: false,
+                rows: StateRows::Window {
+                    history: self.conv_width.saturating_sub(1) as usize,
+                },
             },
             StateField {
                 name: "recurrent",
@@ -105,6 +108,7 @@ impl GatedDeltaNetConfig {
                     StateAxes::ValueKey => vec![heads, value, key],
                 },
                 stepwise: self.draft_tokens > 0,
+                rows: StateRows::Whole,
             },
         ]
     }

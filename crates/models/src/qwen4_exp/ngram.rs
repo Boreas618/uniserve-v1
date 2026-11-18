@@ -39,7 +39,7 @@
 //! sum, `d`, the square root and `silu(conv)`, as the kernel materializes them
 //! (`ple.py:212-239`).
 
-use nn::family::StateField;
+use nn::family::{StateField, StateRows};
 use nn::modules::Linear;
 use nn::{
     DType, Device, RecurrentState, Result, Shape, Split, Tensor, TokenBatch, VarBuilder,
@@ -387,6 +387,9 @@ impl PleLayer {
                 (config.text.hidden_size * config.hyper_connection.streams) as usize,
             ],
             stepwise: false,
+            rows: StateRows::Window {
+                history: history as usize,
+            },
         }]
     }
 

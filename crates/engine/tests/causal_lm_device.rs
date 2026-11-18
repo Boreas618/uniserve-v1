@@ -4,8 +4,10 @@
 //! a batch's page work is issued around the replay; a runner that speculates commits the
 //! prefix a verification's samples agree with and proposes the drafts after it; a kernel
 //! generation of other graph options (candidates, buckets, drafts, drafts from or to none with
-//! the model that loaded or released its drafter) serves its shape from its switch on, the
-//! slots' state carried across, and the kept shape again after a rollback.
+//! the model that loaded or released its drafter, other drafts of a model that keeps a recurrent
+//! state) serves its shape from its switch on, the slots' state carried across, a recurrent
+//! state moved into the state laid out for the drafts, and the kept shape again after a
+//! rollback.
 //!
 //! Every case needs GPU 0 and this host's Build Server (`uniserve build-server serve`). Run them
 //! on a GPU host:
@@ -26,6 +28,8 @@ use engine::batch::{
     Batch, BatchId, Columns, DraftWork, NewSlot, Phase, Row, Rows, Shape as BatchShape, StateCopy,
     StateDirection, Variant,
 };
+use engine::memory::cache::{CacheLayout, KvCacheConfig};
+use engine::memory::state::{StateConfig, StateMemory};
 use engine::memory::tables::BlockTables;
 use engine::runner::buckets::Buckets;
 use engine::runner::causal_lm::speculation::DraftPool;
@@ -33,15 +37,17 @@ use engine::runner::causal_lm::{CausalLmConfig, PageWork};
 use engine::runner::graphs::Graphs;
 use engine::runner::{CausalLmRunner, Forward, GraphOptions, Runner};
 use nn::capability::Drafter;
-use nn::family::{CacheShape, ExpertShape, StateShape, TextModel, TokenHistory};
+use nn::family::{
+    CacheShape, ExpertShape, StateField, StateRows, StateShape, TextModel, TokenHistory,
+};
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
 use nn::{CausalLm, ExpertExchange, KvCache, RecurrentState, TokenBatch};
 use ops::Generation;
-use platform::{DeviceAllocation, DeviceRange, Stream};
+use platform::{Budget, DeviceAllocation, DeviceId, DeviceRange, PoolKind, Stream};
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::{PARAMETER_COLUMNS, TOP_P};
-use proto::request::RequestId;
+use proto::request::{PrefixCacheDtype, RequestId};
 use storage::runtime::GroupId;
 use tensor::{DType, Tensor};
 
@@ -79,6 +85,9 @@ struct Tiny {
     head: Linear,
     /// The model's drafter, in a deployment that speculates.
     drafter: Option<TinyDrafter>,
+    /// The drafts the recurrent state of a model that keeps one is laid out for
+    /// ([`Tiny::stated`]); `None` for a model that keeps none.
+    drafts: Option<u32>,
     /// The weights' device memory.
     _memory: Vec<DeviceAllocation>,
 }
@@ -140,8 +149,18 @@ impl Tiny {
                 }),
                 false => None,
             },
+            drafts: None,
             _memory: Vec::new(),
         })
+    }
+
+    /// The model keeping a recurrent state laid out for `drafts` drafts, which its forward
+    /// leaves as it is (`state_layers`).
+    fn stated(self, drafts: u32) -> Self {
+        Self {
+            drafts: Some(drafts),
+            ..self
+        }
     }
 
     /// The model over weights on the device, with its drafter when `drafting`.
@@ -169,6 +188,7 @@ impl Tiny {
             gain,
             head: Linear::new(head, None, WeightOrder::NxK)?,
             drafter,
+            drafts: None,
             _memory: memory,
         })
     }
@@ -217,8 +237,32 @@ impl TextModel for Tiny {
         }
     }
 
+    /// A state of one layer for a model [`Tiny::stated`]: a window of one input of four FP32
+    /// channels with a row per draft, and four FP32 elements that keep a slot per verified token
+    /// when the model drafts.
     fn state_layers(&self) -> Vec<StateShape> {
-        Vec::new()
+        let Some(drafts) = self.drafts else {
+            return Vec::new();
+        };
+        vec![StateShape {
+            layers: 1,
+            fields: vec![
+                StateField {
+                    name: "conv",
+                    dtype: DType::F32,
+                    dims: vec![1 + drafts as usize, 4],
+                    stepwise: false,
+                    rows: StateRows::Window { history: 1 },
+                },
+                StateField {
+                    name: "recurrent",
+                    dtype: DType::F32,
+                    dims: vec![4],
+                    stepwise: drafts > 0,
+                    rows: StateRows::Whole,
+                },
+            ],
+        }]
     }
 
     fn experts(&self) -> Option<ExpertShape> {
@@ -260,6 +304,22 @@ fn config(drafts: u32) -> CausalLmConfig {
     }
 }
 
+/// A budget that books whatever it is asked.
+struct Unbounded;
+
+impl Budget for Unbounded {
+    fn book(&self, _: DeviceId, _: PoolKind, _: u64) -> platform::Result<()> {
+        Ok(())
+    }
+}
+
+/// The recurrent state a stateful bench's runner is lent, and the device's allocator its
+/// buffers and those of every generation's state are taken from.
+struct State {
+    memory: Arc<Mutex<StateMemory>>,
+    allocator: platform::Allocator,
+}
+
 /// A runner on the device with every bucket captured, and the memory its graphs address.
 struct Bench {
     runner: CausalLmRunner,
@@ -270,6 +330,8 @@ struct Bench {
     /// The memory of the tensors the runner was lent, and the regions of the shapes it was
     /// given beside its own.
     memory: Vec<DeviceAllocation>,
+    /// The recurrent state of a runner whose model keeps one ([`Bench::stateful`]).
+    state: Option<State>,
 }
 
 impl Bench {
@@ -293,11 +355,33 @@ impl Bench {
         })
     }
 
+    /// A runner that verifies at most `drafts` drafts a row, none for zero, over the draft
+    /// cache, of a model that keeps a recurrent state laid out for them: lent the state's buffers
+    /// and its owner, through which a generation of other drafts lays it out anew.
+    fn stateful(drafts: u32) -> Outcome<Self> {
+        Self::built(
+            CausalLmConfig {
+                draft_pool: Some(POOL),
+                ..config(drafts)
+            },
+            true,
+        )
+    }
+
     /// A runner of `config` with the model's drafter when it states drafts, lent the draft
     /// cache when it states a draft pool.
     fn over(config: CausalLmConfig) -> Outcome<Self> {
+        Self::built(config, false)
+    }
+
+    /// [`Bench::over`], of a model that keeps a recurrent state when `stated`.
+    fn built(config: CausalLmConfig, stated: bool) -> Outcome<Self> {
         let drafts = config.drafts;
-        let inputs = CausalLmRunner::input_bytes(&config, &Tiny::meta(drafts > 0)?)?;
+        let model = |model: Tiny| match stated {
+            true => model.stated(drafts),
+            false => model,
+        };
+        let inputs = CausalLmRunner::input_bytes(&config, &model(Tiny::meta(drafts > 0)?))?;
 
         // The draft cache of a drafter that reads none: no layer, and tensors nothing reads.
         let draft = |unread: Tensor| KvCache {
@@ -308,13 +392,27 @@ impl Bench {
         };
 
         // The profile run states the keys and the peaks before anything touches the device.
+        let meta = model(Tiny::meta(drafts > 0)?);
+        let state_config =
+            StateConfig::of(&meta, SLOTS, &config.buckets.with_drafts(drafts), drafts);
+        let cache_config = state_config
+            .as_ref()
+            .map(|state| state_cache(&state.shapes))
+            .transpose()?;
+        let meta_state = match (&state_config, &cache_config) {
+            (Some(state), Some(cache)) => Some(StateMemory::meta(state.clone(), cache)?),
+            _ => None,
+        };
+        let lent = |state: &StateMemory| {
+            Ok::<_, engine::worker::Error>((state.live()?, state.checkpoint()?))
+        };
         let mut profiled = CausalLmRunner::new(
-            Arc::new(Tiny::meta(drafts > 0)?),
+            Arc::new(meta),
             config.clone(),
             Graphs::meta(Arc::new(Generation::new(0, [])), inputs),
             None,
             Vec::new(),
-            None,
+            meta_state.as_ref().map(lent).transpose()?,
         )?;
         if config.draft_pool.is_some() {
             let unread = ops::retained(0x5_0000, &[4], DType::F32, &ops::meta())?;
@@ -342,14 +440,38 @@ impl Bench {
 
         let mut memory = Vec::new();
         let runner_pooled = config.draft_pool.is_some();
+        let state = match (state_config, cache_config) {
+            (Some(state), Some(cache)) => {
+                let mut allocator = allocator()?;
+                let opened = StateMemory::open(
+                    state,
+                    &cache,
+                    &mut allocator,
+                    stream.clone(),
+                    Arc::new(Generation::new(1, [])),
+                )?;
+                Some(State {
+                    memory: Arc::new(Mutex::new(opened)),
+                    allocator,
+                })
+            }
+            _ => None,
+        };
+        let lent = state
+            .as_ref()
+            .map(|state| lent(&state.memory.lock().unwrap()))
+            .transpose()?;
         let mut runner = CausalLmRunner::new(
-            Arc::new(Tiny::on_device(&stream, drafts > 0)?),
+            Arc::new(model(Tiny::on_device(&stream, drafts > 0)?)),
             config,
             graphs,
             Some(stream.clone()),
             Vec::new(),
-            None,
+            lent,
         )?;
+        if let Some(state) = &state {
+            runner.set_state(Arc::clone(&state.memory));
+        }
         if runner_pooled {
             let (unread_memory, unread) = device::weight(&stream, &[0.0; 4], &[4])?;
             memory.push(unread_memory);
@@ -383,6 +505,7 @@ impl Bench {
             kernels,
             region,
             memory,
+            state,
         })
     }
 
@@ -405,12 +528,17 @@ impl Bench {
         options: &GraphOptions,
         loaded: Option<bool>,
     ) -> Outcome {
+        // A model that keeps a recurrent state lays it out for the drafts it is loaded for.
+        let stated = |model: Tiny| match self.state {
+            Some(_) => model.stated(options.drafts),
+            None => model,
+        };
         let models: Option<(Arc<dyn TextModel>, Arc<dyn TextModel>)> = match loaded {
             Some(drafter) => {
                 let stream = &self.stream;
                 Some((
-                    Arc::new(Tiny::meta(drafter)?),
-                    Arc::new(Tiny::on_device(stream, drafter)?),
+                    Arc::new(stated(Tiny::meta(drafter)?)),
+                    Arc::new(stated(Tiny::on_device(stream, drafter)?)),
                 ))
             }
             None => None,
@@ -423,6 +551,15 @@ impl Bench {
         instance.graphs().profile_run(instance)?;
         let (peak, values) = (instance.graphs().peak(), instance.graphs().input_peak());
         let next = self.kernels.generation(number, &instance.graphs().keys())?;
+        // A shape that lays the state out otherwise computes over the state laid out for it
+        // beside the serving one, as the binding lays it out for the generation.
+        if let (Some(config), Some(state)) = (measure.state.clone(), self.state.as_mut()) {
+            state
+                .memory
+                .lock()
+                .unwrap()
+                .prepare(number, config, &mut state.allocator)?;
+        }
 
         let region = if peak as usize > self.region.len() {
             let own = DeviceAllocation::linear(DEVICE, peak as usize)?;
@@ -459,6 +596,88 @@ impl Bench {
         rehearsal.graphs().release_rehearsal();
         Ok(())
     }
+}
+
+impl Bench {
+    /// Rolls generation `number` back on the runner, and gives back the state it laid out, as
+    /// the binding does once the workers rolled back.
+    fn rollback(&mut self, number: u64) -> Outcome<bool> {
+        let served = self.runner.rollback_shape(number)?;
+        if let Some(state) = self.state.as_mut() {
+            state
+                .memory
+                .lock()
+                .unwrap()
+                .release(number, &mut state.allocator)?;
+        }
+        Ok(served)
+    }
+
+    /// `count` FP32 values `offset` values into field `field` of the live state the runner
+    /// computes over.
+    fn live(&self, field: usize, offset: usize, count: usize) -> Outcome<Vec<f32>> {
+        let state = self.state.as_ref().ok_or("the bench keeps no state")?;
+        let live = state.memory.lock().unwrap().live()?;
+        let mut values = vec![0_f32; count];
+
+        // SAFETY: the source lies inside the state's buffer, and the destination holds `count`
+        // values; the stream is waited for before it is read.
+        unsafe {
+            platform::memcpy_async(
+                values.as_mut_ptr() as u64,
+                ops::operand(&live[0][field])?.ptr.address() + (offset * 4) as u64,
+                count * 4,
+                &self.stream,
+            )?;
+        }
+        self.stream.synchronize()?;
+        Ok(values)
+    }
+
+    /// Writes `values` as FP32 `offset` values into field `field` of the live state.
+    fn set_live(&mut self, field: usize, offset: usize, values: &[f32]) -> Outcome {
+        let state = self.state.as_ref().ok_or("the bench keeps no state")?;
+        let live = state.memory.lock().unwrap().live()?;
+        let (_allocation, source) = device::weight(&self.stream, values, &[values.len()])?;
+
+        // SAFETY: the destination lies inside the state's buffer and the source the values
+        // just placed; the stream is waited for before either goes.
+        unsafe {
+            platform::memcpy_async(
+                ops::operand(&live[0][field])?.ptr.address() + (offset * 4) as u64,
+                ops::operand(&source)?.ptr.address(),
+                values.len() * 4,
+                &self.stream,
+            )?;
+        }
+        self.stream.synchronize()?;
+        Ok(())
+    }
+}
+
+/// The cache whose state region holds the checkpoints of the recurrent state `runs` over one
+/// attention layer of pages of the bench's tokens, which the runner reads none of.
+fn state_cache(runs: &[StateShape]) -> Outcome<KvCacheConfig> {
+    let layout = CacheLayout::hybrid(PAGE, 1, 1, 8, PrefixCacheDtype::BFloat16, runs)?;
+
+    Ok(KvCacheConfig {
+        layout: Arc::new(layout),
+        units: 16,
+        slots: SLOTS,
+        width: MAX_KV_LEN / PAGE,
+        segments: None,
+        workspace_bytes: 1 << 20,
+        states: (8, None),
+    })
+}
+
+/// The device's allocator with room for the states' buffers and their snapshot.
+fn allocator() -> Outcome<platform::Allocator> {
+    let mut allocator =
+        platform::Allocator::new(&platform::Device::new(DEVICE)?, Arc::new(Unbounded))?;
+    allocator.reserve(PoolKind::Resident, 64 << 20)?;
+    allocator.reserve(PoolKind::Scratch, 64 << 20)?;
+    Ok(allocator)
 }
 
 /// A greedy row's sampling parameters.
@@ -969,5 +1188,47 @@ fn a_generation_of_no_drafts_decodes_from_its_switch_on() -> Outcome {
     assert!(bench.runner.commit_shape(2)?);
     let output = bench.runner.execute(&step(2, 0, 7), &tables())?;
     assert_eq!(output.calls[0].tokens, [next(next(next(5)))]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_generation_of_other_drafts_moves_a_recurrent_state_from_its_switch_on() -> Outcome {
+    let mut bench = Bench::stateful(2)?;
+    let output = bench
+        .runner
+        .execute(&verification(2, &[7, 6, 5], 3), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(7), next(6), next(5)]);
+
+    // Slot 2 accepted all three tokens: under two drafts its state stands in the last of its
+    // three slots, row 8 + 2 · 1 + 1 of the stepwise field, and its window's input in row 2 of
+    // its three. The model leaves the state as it is, so it is what the bench writes there.
+    bench.set_live(1, 11 * 4, &[10.0, 11.0, 12.0, 13.0])?;
+    bench.set_live(0, (3 + 2) * 4, &[50.0, 51.0, 52.0, 53.0])?;
+
+    // Prepared with the model that released its drafter and lays its state out for no drafts,
+    // the shape decodes from its switch on, the slot's state in its home row.
+    bench.reshape_with(2, &options(&[2, 4], &[8], 2, 0), Some(false))?;
+    assert!(bench.runner.switch_shape(2)?);
+    assert_eq!(bench.live(1, 4, 4)?, [10.0, 11.0, 12.0, 13.0]);
+    assert_eq!(bench.live(0, 4, 4)?, [50.0, 51.0, 52.0, 53.0]);
+    let output = bench.runner.execute(&step(2, 0, 6), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(next(5))]);
+    assert!(
+        bench
+            .runner
+            .execute(&verification(3, &[7, 6, 5], 3), &tables())
+            .is_err()
+    );
+
+    // Rolled back, the state returns to the slot's home row of two drafts, and the runner
+    // verifies again.
+    assert!(bench.rollback(2)?);
+    assert_eq!(bench.live(1, 4, 4)?, [10.0, 11.0, 12.0, 13.0]);
+    assert_eq!(bench.live(0, 3 * 4, 4)?, [50.0, 51.0, 52.0, 53.0]);
+    let output = bench
+        .runner
+        .execute(&verification(4, &[7, 6, 5], 3), &tables())?;
+    assert_eq!(output.calls[0].tokens, [next(7), next(6), next(5)]);
     Ok(())
 }

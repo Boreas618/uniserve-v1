@@ -195,8 +195,15 @@ pub struct Measure {
     /// shape's kernels, its region's peak and its input values ([`Graphs::profile_run`]).
     pub instance: Box<dyn Forward>,
     /// The device bytes the shape allocates beside its region and its graphs: what it does not
-    /// share of the serving shape's storage.
+    /// share of the serving shape's storage, the recurrent state it lays out included.
     pub storage: u64,
+    /// The recurrent state the shape lays out otherwise than the serving one, which the
+    /// generation lays out beside it (`StateMemory::prepare`); `None` for a shape over the
+    /// serving state.
+    pub state: Option<crate::memory::state::StateConfig>,
+    /// The kernels the shape launches outside its forwards, as `(operator, key)`: the copies of
+    /// the state it lays out.
+    pub keys: std::collections::BTreeSet<(&'static str, String)>,
 }
 
 /// One stage a rank holds, as the worker and [`Graphs`] drive it.

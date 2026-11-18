@@ -474,7 +474,7 @@ impl Buckets {
     /// ([`Bucket::draft`]), which is issued behind the forward it follows. A set that
     /// verifies no draft is returned as it is.
     #[must_use]
-    pub(crate) fn with_drafts(&self, drafts: u32) -> Self {
+    pub fn with_drafts(&self, drafts: u32) -> Self {
         if drafts == 0 {
             return self.clone();
         }

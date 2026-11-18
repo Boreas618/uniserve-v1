@@ -474,8 +474,9 @@ impl CacheLayout {
     }
 
     /// Where each field of recurrent layer `layer`'s checkpoint lies in a unit of the state
-    /// region, in the order of `fields`: the field's first plane among the unit's planes and its
-    /// bytes, which fill whole planes from that one ([`Self::hybrid`]).
+    /// region, in the order of `fields`: the field's first plane among the unit's planes and the
+    /// bytes a checkpoint keeps of it (`StateField::kept_bytes`), which fill whole planes from
+    /// that one ([`Self::hybrid`]).
     ///
     /// # Errors
     ///
@@ -489,7 +490,7 @@ impl CacheLayout {
         fields
             .iter()
             .map(|field| {
-                let bytes = field.bytes()?;
+                let bytes = field.kept_bytes()?;
                 let at = (plane, bytes);
                 plane += bytes.div_ceil(self.plane_bytes.max(1)) as u32;
                 Ok(at)
@@ -552,7 +553,10 @@ impl CacheLayout {
     /// A checkpoint lays its layer's fields out in field order, each from a plane boundary over
     /// the whole planes its bytes fill ([`Self::state_planes`]), and the checkpoints follow each
     /// other, [`Self::checkpoint_planes`] planes in all ([`Self::state_bytes`]). A checkpoint
-    /// keeps one slot of every field, a stepwise one's included.
+    /// keeps one slot of every field, a stepwise one's included, and of each slot the rows it
+    /// holds at zero drafts (`StateField::kept_bytes`): what a forward from a block boundary
+    /// reads, so the state region's units, and every checkpoint they hold on the device and on
+    /// the host, are the same whatever the deployment drafts.
     ///
     /// # Errors
     ///
@@ -585,7 +589,7 @@ impl CacheLayout {
         for fields in layer_fields(runs) {
             let mut layer_planes = 0_u64;
             for field in fields {
-                let bytes = field.bytes()?;
+                let bytes = field.kept_bytes()?;
                 if bytes == 0 {
                     return Err(Error::Invalid(format!(
                         "the recurrent state's field {} holds no byte",
@@ -748,12 +752,14 @@ mod tests {
                     dtype: DType::BF16,
                     dims: vec![3, 8192],
                     stepwise: false,
+                    rows: nn::family::StateRows::Whole,
                 },
                 StateField {
                     name: "recurrent",
                     dtype: DType::F32,
                     dims: vec![32, 128, 128],
                     stepwise: false,
+                    rows: nn::family::StateRows::Whole,
                 },
             ],
         }
@@ -797,6 +803,63 @@ mod tests {
         assert_eq!(layout.unit_bytes, dense.unit_bytes);
         assert_eq!(layout.split_bytes(), 2 * 10 * layout.plane_bytes);
         assert_eq!(dense.state_bytes(), 0);
+        Ok(())
+    }
+
+    /// A checkpoint keeps each field's rows at zero drafts: a window's draft rows and a ring's
+    /// further groups take no plane, so the state region's units are those of a deployment that
+    /// drafts nothing, whatever the drafts.
+    #[test]
+    fn a_checkpoint_lays_out_the_same_planes_for_every_count_of_drafts() -> Result<()> {
+        let drafting = |drafts: usize| StateShape {
+            layers: 30,
+            fields: vec![
+                StateField {
+                    name: "conv",
+                    dtype: DType::BF16,
+                    dims: vec![3 + drafts, 8192],
+                    stepwise: false,
+                    rows: nn::family::StateRows::Window { history: 3 },
+                },
+                StateField {
+                    name: "recurrent",
+                    dtype: DType::F32,
+                    dims: vec![32, 128, 128],
+                    stepwise: drafts > 0,
+                    rows: nn::family::StateRows::Whole,
+                },
+                StateField {
+                    name: "ring",
+                    dtype: DType::BF16,
+                    dims: vec![(4 + drafts).next_multiple_of(4), 128],
+                    stepwise: false,
+                    rows: nn::family::StateRows::Ring { group: 4 },
+                },
+            ],
+        };
+        let hybrid = |runs: &StateShape| {
+            CacheLayout::hybrid(
+                64,
+                10,
+                2,
+                256,
+                PrefixCacheDtype::BFloat16,
+                std::slice::from_ref(runs),
+            )
+        };
+
+        let none = hybrid(&drafting(0))?;
+        for drafts in [1, 3, 7] {
+            let runs = drafting(drafts);
+            let layout = hybrid(&runs)?;
+            assert_eq!(layout.state_bytes(), none.state_bytes(), "{drafts} drafts");
+            assert_eq!(
+                layout.state_planes(2, &runs.fields)?,
+                none.state_planes(2, &drafting(0).fields)?
+            );
+        }
+        // The window's 48 KiB, the state's 2 MiB and the ring's 1 KiB: 1 + 32 + 1 planes.
+        assert_eq!(none.checkpoint_planes(), 30 * 34);
         Ok(())
     }
 

@@ -714,11 +714,6 @@ mod tests {
             ("lora", |config: &mut Config| {
                 config.lora = Some("org/adapter".to_owned())
             }),
-            // Speculating from none loads the drafter and lays its draft cache out.
-            (
-                "speculative_config.num_draft_tokens",
-                |config: &mut Config| config.speculative_config.num_draft_tokens = 4,
-            ),
         ];
         // The package backends and the package parameters: a `Generation` change.
         let package: Vec<Case> = vec![
@@ -734,6 +729,10 @@ mod tests {
             ("max_logprobs", |config: &mut Config| {
                 config.max_logprobs = 5
             }),
+            (
+                "speculative_config.num_draft_tokens",
+                |config: &mut Config| config.speculative_config.num_draft_tokens = 4,
+            ),
             ("cuda_graph_config", |config: &mut Config| {
                 config.cuda_graph_config.decode_batch_sizes = Some(vec![
                     NonZeroU32::new(1).unwrap(),
@@ -859,15 +858,16 @@ mod tests {
                 "{what} builds a new epoch"
             );
         }
-        // Between two counts above zero the drafts are the verification buckets' shape, which a
-        // kernel generation captures; back to none an epoch releases the drafter.
+        // The drafts are the verification buckets' shape and the drafter the generation loads or
+        // releases beside the serving weights: a kernel generation captures them from none, to
+        // none and between two counts.
         let drafting = |drafts: u32| {
             let mut config = Config::default();
             config.speculative_config.num_draft_tokens = drafts;
             Epoch::of(config).expect("the configuration resolves")
         };
         assert_eq!(change(&drafting(2), &drafting(4)), Change::Generation);
-        assert_eq!(change(&drafting(2), &base), Change::Epoch);
+        assert_eq!(change(&drafting(2), &base), Change::Generation);
         // Switched on, the capability needs the storage a new epoch lays out.
         let mut uncached = Config::default();
         uncached.kv_cache_config.prefix_caching = false;

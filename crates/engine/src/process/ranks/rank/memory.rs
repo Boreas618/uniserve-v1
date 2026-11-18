@@ -35,7 +35,6 @@
 
 use std::sync::Arc;
 
-use crate::batch::Variant;
 use crate::memory::cache::segments::{self, PlaneSegment};
 use crate::memory::cache::{ATTENTION_WORKSPACE_BYTES, CacheLayout, KvCacheConfig};
 use crate::memory::client::{StorageClient, quota_limit};
@@ -45,7 +44,7 @@ use crate::parallel::HostGroup;
 use crate::runner::buckets::Buckets;
 use crate::runner::causal_lm::{CausalLmConfig, CausalLmRunner};
 use anyhow::{Context as _, Result, bail};
-use nn::family::{StateField, TextModel};
+use nn::family::TextModel;
 use platform::DeviceId;
 use proto::config::WorkerGroupConfig;
 use storage::runtime::Segments;
@@ -191,63 +190,15 @@ impl ModelRunner {
 
     /// The recurrent state of `model` for a runner over `buckets` (step 6), with its drafter's
     /// when the deployment drafts with one that keeps a state; `None` for a model that keeps
-    /// none.
-    ///
-    /// A request owns `drafts + 1` slots of a stepwise field when the deployment speculates, and
-    /// its verifications are then lent verify slots and keep no trail; any other speculating
-    /// deployment keeps a trail of the tokens of its largest verification.
+    /// none ([`StateConfig::of`], at the rank's request slots and the deployment's drafts).
     pub(crate) fn state_config(
         &self,
         model: &dyn TextModel,
         buckets: &Buckets,
     ) -> Option<StateConfig> {
-        let shapes = model.state_layers();
-        if shapes.is_empty() {
-            return None;
-        }
-
         let drafts = self.engine_config().speculative.num_draft_tokens;
-        let stepwise = shapes
-            .iter()
-            .flat_map(|shape| shape.fields.iter())
-            .any(|field: &StateField| field.stepwise);
-        let owned = if stepwise && drafts > 0 {
-            drafts + 1
-        } else {
-            1
-        };
-        let trail = if drafts > 0 && !stepwise {
-            buckets
-                .iter()
-                .filter(|bucket| {
-                    matches!(
-                        bucket.variant,
-                        Variant::VerifyGreedy | Variant::VerifySampled
-                    )
-                })
-                .map(|bucket| bucket.tokens)
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
 
-        // A drafter whose layers keep a state of their own keeps one live row a slot of each of
-        // its fields beside the model's.
-        let drafter = model
-            .drafter()
-            .filter(|_| drafts > 0)
-            .map(|drafter| drafter.state_layers())
-            .unwrap_or_default();
-
-        Some(StateConfig {
-            shapes,
-            slots: self.slots(),
-            rows: buckets.bounds().0,
-            trail,
-            owned,
-            drafter,
-        })
+        StateConfig::of(model, self.slots(), buckets, drafts)
     }
 
     /// The bytes the graph pool and the scratch pool of `device` map for runners of `peaks` over
@@ -772,7 +723,7 @@ pub(super) fn cache_dtype(
 
 #[cfg(test)]
 mod tests {
-    use nn::family::StateShape;
+    use nn::family::{StateField, StateShape};
     use proto::request::PrefixCacheDtype;
     use storage::Segment;
 
@@ -827,6 +778,7 @@ mod tests {
                 dtype: DType::BF16,
                 dims: vec![16 << 10],
                 stepwise: false,
+                rows: nn::family::StateRows::Whole,
             }],
         };
         let layout =

@@ -44,6 +44,13 @@
 //! - a batch whose rows ban tokens copies its masks to the head of `bans`
 //!   ([`Slots::ban`]).
 //!
+//! A shape of the runner that lays the recurrent state out otherwise (`Runner::reshape`, a
+//! kernel generation of other drafts) holds accepted counts of its own, every one set to one, when
+//! its forwards lend verify slots ([`Slots::restated`]): its switch moves each slot's state into
+//! its home row, which a count of one reads, from the counts the serving shape left
+//! ([`Slots::standing`]), and a switch back sets the kept shape's counts to one again
+//! ([`Slots::accept_one`]).
+//!
 //! The copies read page-locked memory this module keeps until the step's stream work has
 //! completed: the runner brackets a step's writes with [`Slots::begin`] and
 //! [`Slots::settled`]. The forwards advance `context` and `accepted` themselves, as the commit
@@ -68,6 +75,7 @@ use tensor::{DType, Shape, Tensor};
 
 use super::columns::slot_row;
 use crate::memory::allocation::Storage;
+use crate::memory::state::Standing;
 use crate::runner::sampler::Sampler;
 use crate::worker::{Error, Result};
 
@@ -168,6 +176,9 @@ struct Device {
     /// The ban masks' memory, when they lie apart from the other tables: those of a shape of the
     /// runner whose buckets hold other rows than the tables were made for ([`Slots::with_rows`]).
     bans: Option<Arc<Storage>>,
+    /// The accepted counts' memory, when they lie apart from the other tables: those of a shape
+    /// that lays the recurrent state out otherwise ([`Slots::restated`]).
+    accepted: Option<Arc<Storage>>,
     /// Each table's offset in `storage`, by the table's discriminant.
     offsets: [u64; Table::COUNT],
     /// The page-locked blocks the step's copies read. A step that needs more than the blocks
@@ -182,8 +193,9 @@ struct Device {
 impl Device {
     /// The device address of `table`'s first byte.
     fn address(&self, table: Table) -> u64 {
-        match (&self.bans, table) {
-            (Some(bans), Table::Bans) => bans.address(),
+        match (&self.bans, &self.accepted, table) {
+            (Some(bans), _, Table::Bans) => bans.address(),
+            (_, Some(accepted), Table::Accepted) => accepted.address(),
             _ => self.storage.address() + self.offsets[table as usize],
         }
     }
@@ -276,6 +288,7 @@ impl Slots {
                     stream: device.stream.clone(),
                     storage: Arc::clone(&device.storage),
                     bans,
+                    accepted: device.accepted.clone(),
                     offsets: device.offsets,
                     blocks: Vec::new(),
                     used: 0,
@@ -300,6 +313,122 @@ impl Slots {
             accepted: self.accepted.clone(),
             device,
         })
+    }
+
+    /// The same tables for a shape of the runner that lays the recurrent state out otherwise
+    /// (`Runner::reshape`): accepted counts of its own, each set to one on the stream, when
+    /// `accepted`, for a shape whose forwards lend verify slots, and none otherwise (module
+    /// documentation).
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal of the counts' allocation or of their fill.
+    pub(crate) fn restated(mut self, accepted: bool) -> Result<Self> {
+        if !accepted {
+            self.accepted = None;
+            if let Some(device) = &mut self.device {
+                device.accepted = None;
+            }
+            return Ok(self);
+        }
+
+        let (shape, dtype): (Shape, DType) = ((self.slots as usize + 1).into(), DType::U32);
+        let bytes = (self.slots as usize + 1) * 4;
+        match &mut self.device {
+            Some(device) => {
+                let storage = Storage::linear(device.stream.device(), bytes)?;
+                // SAFETY: the range is the whole allocation, which the device side keeps for as
+                // long as the tensor over it exists.
+                unsafe { platform::memset_d32(storage.address(), 1, bytes / 4, &device.stream) }?;
+                // SAFETY: the tensor lies over the whole allocation, kept as above.
+                self.accepted = Some(unsafe { storage.external(0, shape, dtype) }?);
+                device.accepted = Some(storage);
+            }
+            None => {
+                // SAFETY: a tensor over the meta device has no memory: its address is never
+                // read or written.
+                self.accepted = Some(unsafe { ops::external(0, shape, dtype, &ops::meta()) }?);
+            }
+        }
+        Ok(self)
+    }
+
+    /// The bytes of device memory a shape's own accepted counts take ([`Slots::restated`]).
+    pub(crate) fn accepted_bytes(slots: u32) -> u64 {
+        (u64::from(slots) + 1) * 4
+    }
+
+    /// What each request slot's last step left, slot `s` at index `s − 1`: the accepted count
+    /// the slot holds (one for a runner that holds none) and its verified length, read back once
+    /// the stream passed every step issued on it. Slots of a runner that holds no device stand
+    /// at one token of none.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal of a copy or of the wait.
+    pub(crate) fn standing(&self) -> Result<Vec<Standing>> {
+        let slots = self.slots as usize;
+        let Some(device) = &self.device else {
+            return Ok(vec![
+                Standing {
+                    accepted: 1,
+                    verified: 0
+                };
+                slots
+            ]);
+        };
+
+        let mut verified = vec![0_i32; slots];
+        let mut accepted = vec![1_u32; slots];
+        // SAFETY: each destination holds the request rows the copy moves, and the stream is
+        // waited for before either is read; the sources are tables of this value's storage.
+        unsafe {
+            platform::memcpy_async(
+                verified.as_mut_ptr() as u64,
+                device.address(Table::Verified),
+                slots * 4,
+                &device.stream,
+            )?;
+            if self.accepted.is_some() {
+                platform::memcpy_async(
+                    accepted.as_mut_ptr() as u64,
+                    device.address(Table::Accepted),
+                    slots * 4,
+                    &device.stream,
+                )?;
+            }
+        }
+        device.stream.synchronize()?;
+
+        Ok(accepted
+            .into_iter()
+            .zip(verified)
+            .map(|(accepted, verified)| Standing {
+                accepted: accepted.max(1),
+                verified: u32::try_from(verified).unwrap_or(0),
+            })
+            .collect())
+    }
+
+    /// Sets every accepted count the runner holds to one, on the stream: the state of every slot
+    /// stands in its home row (module documentation).
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal of the fill.
+    pub(crate) fn accept_one(&mut self) -> Result<()> {
+        let Some(device) = &mut self.device else {
+            return Ok(());
+        };
+        if self.accepted.is_none() {
+            return Ok(());
+        }
+        let destination = device.address(Table::Accepted);
+
+        // SAFETY: the destination is the accepted counts of this value's storage, the padding
+        // row included.
+        unsafe { platform::memset_d32(destination, 1, self.slots as usize + 1, &device.stream) }?;
+        Ok(())
     }
 
     /// The bytes of device memory the ban masks of buckets of at most `rows` rows take, over a
@@ -379,6 +508,7 @@ impl Slots {
                     stream,
                     storage,
                     bans: None,
+                    accepted: None,
                     offsets,
                     blocks: Vec::new(),
                     used: 0,

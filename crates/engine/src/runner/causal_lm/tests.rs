@@ -161,6 +161,7 @@ fn drafter_ring() -> StateShape {
             dtype: DType::BF16,
             dims: vec![4, HIDDEN],
             stepwise: false,
+            rows: nn::family::StateRows::Whole,
         }],
     }
 }
@@ -2357,6 +2358,7 @@ fn state_shape() -> StateShape {
             dtype: DType::BF16,
             dims: vec![HIDDEN],
             stepwise: false,
+            rows: nn::family::StateRows::Whole,
         }],
     }
 }
@@ -2371,6 +2373,7 @@ fn stepwise_shape() -> StateShape {
             dtype: DType::F32,
             dims: vec![HIDDEN],
             stepwise: true,
+            rows: nn::family::StateRows::Whole,
         }],
     }
 }

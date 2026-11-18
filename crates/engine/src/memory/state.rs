@@ -55,7 +55,10 @@
 //!
 //! A checkpoint lays each layer's fields out in field order from plane boundaries
 //! ([`CacheLayout::state_planes`]); plane `p` of state unit `u` is row
-//! `u · checkpoint_planes + p` of the units (`KvCacheMemory::state_rows`).
+//! `u · checkpoint_planes + p` of the units (`KvCacheMemory::state_rows`). It keeps of each field
+//! the rows the field holds at zero drafts (`nn::family::StateField::kept_bytes`), the leading
+//! part of the slot's row that a keep gathers and a restore scatters: what a forward from a block
+//! boundary reads. The state region's units are thus the same whatever the deployment drafts.
 //!
 //! The two kernels name the rows they move by I64 index vectors on the device, the element type
 //! they read them in. A batch's vectors are written from the host as the copies are issued,
@@ -66,23 +69,45 @@
 //!
 //! Like the cache, the state has a form that holds no device ([`StateMemory::meta`]): its
 //! tensors are meta tensors and its copies are checked and issue nothing.
+//!
+//! ## Generations of other drafts
+//!
+//! The drafts and the buckets a kernel generation of other graph options captures for lay the
+//! buffers out otherwise ([`StateConfig::of`]): a stepwise field's slots, a window's draft rows, a
+//! ring's groups, the trail and the copies' rows. Such a generation lays its state out beside the
+//! serving one from the same pool ([`StateMemory::prepare`]), over the same state units, and its
+//! shapes are captured over that state's buffers ([`StateMemory::prepared`]). Its switch moves
+//! every slot's state into them ([`StateMemory::switch`]), as [`Standing`] states what each slot's
+//! last step left, and they serve from then on; the serving buffers are kept until the commit
+//! gives them back ([`StateMemory::commit`]), and a rollback moves the slots' state back into them
+//! ([`StateMemory::switch_back`]) before the generation's are given back
+//! ([`StateMemory::release`]).
+//!
+//! A slot's state moves field by field ([`nn::family::StateRows`]): a whole field from the row
+//! that stands, which for a stepwise field is the slot `num_accepted − 1` its verify slots name;
+//! a window's history from the row `num_accepted − 1` of the slot's window into its row zero; a
+//! ring's positions before the slot's verified length, each into its row of the other ring. The
+//! state then stands in the slot's home row in every field, as a count of one accepted token
+//! states, which the runner sets. The trail, the checkpoint buffers and the further verify slots
+//! hold nothing between two steps, and the drafter's state moves as the model's does.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::batch::StateDirection;
-use nn::family::{StateField, StateShape};
+use crate::batch::{StateDirection, Variant};
+use nn::family::{StateField, StateRows, StateShape, TextModel};
 use ops::block_copy::{
     BlockShape, CacheBlockScatter, CacheBlockSnapshot, ScatterArgs, SnapshotArgs,
 };
 use platform::{
-    Buffer, CopyBatch, DeviceId, DevicePtr, DeviceRange, Event, EventFlags, PoolKind, SourceOrder,
-    Stream,
+    Allocator, Buffer, CopyBatch, DeviceId, DevicePtr, DeviceRange, Event, EventFlags, PoolKind,
+    SourceOrder, Stream,
 };
 use tensor::{DType, Tensor};
 
 use crate::memory::cache::{CacheLayout, KvCacheConfig, KvCacheMemory};
 use crate::memory::lend;
+use crate::runner::buckets::Buckets;
 use crate::worker::{Error, Result};
 
 /// The sets of index vectors the copies write in turn: a batch's copies overlap at most those
@@ -126,6 +151,61 @@ pub(crate) fn layer_fields(runs: &[StateShape]) -> impl Iterator<Item = &[StateF
 }
 
 impl StateConfig {
+    /// The recurrent state of `model` for a runner of `slots` request slots over `buckets`, the
+    /// catalog with its verifications (`Buckets::with_drafts`) when the deployment drafts `drafts`
+    /// tokens a step, with its drafter's when it drafts with one that keeps a state; `None` for a
+    /// model that keeps none. `model` is the one the drafts load: its fields are laid out for
+    /// them.
+    ///
+    /// A request owns `drafts + 1` slots of a stepwise field when the deployment speculates, and
+    /// its verifications are then lent verify slots and keep no trail; any other speculating
+    /// deployment keeps a trail of the tokens of its largest verification.
+    pub fn of(model: &dyn TextModel, slots: u32, buckets: &Buckets, drafts: u32) -> Option<Self> {
+        let shapes = model.state_layers();
+        if shapes.is_empty() {
+            return None;
+        }
+
+        let stepwise = layer_fields(&shapes).flatten().any(|field| field.stepwise);
+        let owned = if stepwise && drafts > 0 {
+            drafts + 1
+        } else {
+            1
+        };
+        let trail = if drafts > 0 && !stepwise {
+            buckets
+                .iter()
+                .filter(|bucket| {
+                    matches!(
+                        bucket.variant,
+                        Variant::VerifyGreedy | Variant::VerifySampled
+                    )
+                })
+                .map(|bucket| bucket.tokens)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // A drafter whose layers keep a state of their own keeps one live row a slot of each of
+        // its fields beside the model's.
+        let drafter = model
+            .drafter()
+            .filter(|_| drafts > 0)
+            .map(|drafter| drafter.state_layers())
+            .unwrap_or_default();
+
+        Some(Self {
+            shapes,
+            slots,
+            rows: buckets.bounds().0,
+            trail,
+            owned,
+            drafter,
+        })
+    }
+
     /// The device bytes the state takes from the pool that lives as long as the rank serves,
     /// for a cache of `layout`: the live and checkpoint buffers of every field of every layer,
     /// each live buffer's rows ([`Self::live_rows`]), a checkpoint row per slot and the
@@ -175,7 +255,8 @@ impl StateConfig {
     }
 }
 
-/// The state's memory on a device.
+/// The state's memory on a device: the buffers of one config of it, each taken from the
+/// device's resident pool.
 struct Buffers {
     device: DeviceId,
     /// `[layer][field]` the live buffers.
@@ -187,8 +268,10 @@ struct Buffers {
     /// `[drafter layer][field]` the drafter's live buffers; empty for a drafter that keeps no
     /// state.
     drafter: Vec<Vec<Buffer>>,
-    /// What one copy moves a state unit through, `[checkpoint planes, plane_bytes]` bytes.
-    snapshot: Buffer,
+    /// The address of what one copy moves a state unit through, `[checkpoint planes,
+    /// plane_bytes]` bytes of the scratch pool, which every config of the state shares
+    /// ([`StateMemory`]'s `snapshot`).
+    snapshot: u64,
     /// The copies' index vectors, [`RING`] sets.
     indices: Vec<Buffer>,
     /// Recorded behind the last batch whose copies read each set of index vectors.
@@ -199,6 +282,66 @@ struct Buffers {
     stream: Stream,
     /// What the two kernels launch under: that stream and the serving generation.
     context: ops::Context,
+}
+
+impl Buffers {
+    /// Every buffer of the config, in no particular order.
+    fn into_buffers(self) -> impl Iterator<Item = Buffer> {
+        [self.live, self.checkpoint, self.trail, self.drafter]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .chain(self.indices)
+    }
+
+    /// Gives every buffer back to the resident pool of `allocator`, once the stream passed
+    /// every copy and forward that addresses them.
+    fn release(self, allocator: &mut Allocator) -> Result<()> {
+        self.stream.synchronize()?;
+
+        let mut released = Ok(());
+        for buffer in self.into_buffers() {
+            let result = allocator.release(buffer);
+            if released.is_ok() {
+                released = result;
+            }
+        }
+        Ok(released?)
+    }
+}
+
+/// What a slot's last step left of its state, which a switch to a state of other drafts moves
+/// it by ([`StateMemory::switch`]): how many tokens of that step stand
+/// (`nn::VerifySlots::num_accepted`; one for a runner whose forwards lend no verify slots), and
+/// the tokens the slot's cache holds, its verified length, which the next forward starts at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Standing {
+    /// Tokens of the slot's last step that stand, at least one.
+    pub accepted: u32,
+    /// Tokens the slot's cache holds: the position of the next forward's first token.
+    pub verified: u32,
+}
+
+/// The tensors a state lends a runner's forwards ([`StateMemory::lent`]): the live and the
+/// checkpoint buffers, the trail of a state that keeps one, and the drafter's live buffers of a
+/// drafter that keeps a state, each in the order and extents `nn::RecurrentState` holds them.
+pub struct Tensors {
+    pub live: Vec<Vec<Tensor>>,
+    pub checkpoint: Vec<Vec<Tensor>>,
+    pub trail: Option<Vec<Vec<Tensor>>>,
+    pub drafter: Option<Vec<Vec<Tensor>>>,
+}
+
+/// A state of another config than the serving one, which one kernel generation laid out
+/// (module documentation, generations of other drafts).
+struct Beside {
+    /// The generation's number.
+    number: u64,
+    config: StateConfig,
+    device: Option<Buffers>,
+    /// Whether this is the state the generation's switch replaced, kept until its commit or its
+    /// rollback; otherwise the generation's own, prepared or rolled back from.
+    replaced: bool,
 }
 
 /// The recurrent-state buffers of one rank and the copies that move them.
@@ -212,8 +355,15 @@ pub struct StateMemory {
     plane_bytes: u64,
     /// Units of the state region.
     units: u32,
+    /// The cache's layout, which a state of another config lays its checkpoints out by.
+    layout: Arc<CacheLayout>,
     /// The memory on a device; `None` for a state that holds none.
     device: Option<Buffers>,
+    /// The snapshot every config of the state copies through, from the scratch pool; `None` for
+    /// a state that holds no device.
+    snapshot: Option<Buffer>,
+    /// The state a kernel generation of other graph options laid out beside this one.
+    beside: Option<Beside>,
 }
 
 impl StateMemory {
@@ -225,6 +375,11 @@ impl StateMemory {
     /// A config of no slot, layer or field, a drafter's field that keeps a slot per verified
     /// token, or a cache whose layout holds no state group for the checkpoints.
     pub fn meta(config: StateConfig, cache: &KvCacheConfig) -> Result<Self> {
+        Self::meta_over(config, &cache.layout, cache.states.0)
+    }
+
+    /// [`Self::meta`] over the state region of `units` units of a cache of `layout`.
+    fn meta_over(config: StateConfig, layout: &Arc<CacheLayout>, units: u32) -> Result<Self> {
         let layers: Vec<&[StateField]> = layer_fields(&config.shapes).collect();
         let fieldless = layer_fields(&config.shapes)
             .chain(layer_fields(&config.drafter))
@@ -261,7 +416,6 @@ impl StateMemory {
             ));
         }
 
-        let layout: &CacheLayout = &cache.layout;
         if layout.state_group().is_none() {
             return Err(Error::Invalid(
                 "a model that keeps a recurrent state needs a state group".into(),
@@ -302,8 +456,11 @@ impl StateMemory {
             planes,
             page_planes: layout.checkpoint_planes(),
             plane_bytes: layout.plane_bytes,
-            units: cache.states.0,
+            units,
+            layout: Arc::clone(layout),
             device: None,
+            snapshot: None,
+            beside: None,
         })
     }
 
@@ -324,8 +481,29 @@ impl StateMemory {
         kernels: Arc<ops::Generation>,
     ) -> Result<Self> {
         let mut state = Self::meta(config, cache)?;
-        let config = state.config.clone();
+        let snapshot =
+            allocator.allocate(PoolKind::Scratch, cache.layout.state_bytes() as usize)?;
+        state.device = Some(Self::buffers(
+            &state.config,
+            &cache.layout,
+            allocator,
+            (stream, kernels),
+            snapshot.address(),
+        )?);
+        state.snapshot = Some(snapshot);
+        Ok(state)
+    }
 
+    /// The buffers of `config` over the state units of a cache of `layout`, taken from the
+    /// resident pool of `allocator`, its copies issued on the stream and launched with the
+    /// kernels of `launch` through the snapshot at `snapshot`. Their contents are unspecified.
+    fn buffers(
+        config: &StateConfig,
+        layout: &CacheLayout,
+        allocator: &mut Allocator,
+        (stream, kernels): (Stream, Arc<ops::Generation>),
+        snapshot: u64,
+    ) -> Result<Buffers> {
         // One buffer per field of every layer of `runs`, of the rows `rows` states for the
         // field.
         let mut take =
@@ -351,22 +529,20 @@ impl StateMemory {
         };
         let drafter = take(&config.drafter, &|_| config.slots)?;
 
-        let index_bytes = state.config.index_bytes(&cache.layout) as usize;
+        let index_bytes = config.index_bytes(layout) as usize;
         let indices = (0..RING)
             .map(|_| allocator.allocate(PoolKind::Resident, index_bytes))
             .collect::<platform::Result<Vec<_>>>()?;
-        let snapshot =
-            allocator.allocate(PoolKind::Scratch, cache.layout.state_bytes() as usize)?;
 
         // The context allocates nothing: every tensor of a copy is over the state's buffers,
         // its snapshot, its index vectors or the cache's state units.
         let device = allocator.device();
         let ordinal = usize::try_from(device.0)
             .map_err(|_| Error::Invalid(format!("{device} names no GPU ordinal")))?;
-        let region = DeviceRange::new(DevicePtr::from_address(snapshot.address()), 0);
+        let region = DeviceRange::new(DevicePtr::from_address(snapshot), 0);
         let context = ops::Context::new(ordinal, stream.clone(), kernels, region);
 
-        state.device = Some(Buffers {
+        Ok(Buffers {
             device,
             live,
             checkpoint,
@@ -378,8 +554,387 @@ impl StateMemory {
             turn: 0,
             stream,
             context,
+        })
+    }
+
+    /// The config the state serves.
+    pub fn config(&self) -> &StateConfig {
+        &self.config
+    }
+
+    /// The config of the state kernel generation `number` laid out beside the serving one
+    /// ([`Self::prepare`]); `None` when it laid out none.
+    pub fn prepared_config(&self, number: u64) -> Option<&StateConfig> {
+        self.beside
+            .as_ref()
+            .filter(|beside| beside.number == number && !beside.replaced)
+            .map(|beside| &beside.config)
+    }
+
+    /// The device bytes the state's buffers take from the resident pool
+    /// ([`StateConfig::bytes`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`StateConfig::bytes`].
+    pub fn bytes(&self) -> Result<u64> {
+        self.config.bytes(&self.layout)
+    }
+
+    /// The state of `config` over the same state units, holding no device: what a kernel
+    /// generation of other graph options measures a runner's shape over before it lays the
+    /// state out ([`Self::prepare`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::meta`].
+    pub fn alike(&self, config: StateConfig) -> Result<Self> {
+        Self::meta_over(config, &self.layout, self.units)
+    }
+
+    /// Lays the state of `config` out for kernel generation `number` beside the serving one,
+    /// over the same state units, its buffers taken from the resident pool of `allocator`,
+    /// which the serving ones lie in, and its copies issued on the serving state's stream
+    /// (module documentation, generations of other drafts). Its copies launch with the kernels
+    /// [`Self::prepared`] is given. A state that holds no device lays out nothing.
+    ///
+    /// # Errors
+    ///
+    /// Another generation's state held beside this one, a config of other recurrent layers or
+    /// request slots, what [`Self::meta`] refuses, or a pool that cannot hold the buffers.
+    pub fn prepare(
+        &mut self,
+        number: u64,
+        config: StateConfig,
+        allocator: &mut Allocator,
+    ) -> Result<()> {
+        if let Some(beside) = &self.beside {
+            return Err(Error::State(if beside.number == number {
+                "the generation laid its state out already"
+            } else {
+                "another generation's state lies beside the serving one"
+            }));
+        }
+        let checked = self.alike(config)?;
+        if checked.planes != self.planes || checked.config.slots != self.config.slots {
+            return Err(Error::Invalid(format!(
+                "a state of {} slots whose checkpoints lie in other planes than the {} slots' \
+                 the state units hold",
+                checked.config.slots, self.config.slots
+            )));
+        }
+        let config = checked.config;
+
+        let device = match &self.device {
+            Some(serving) => Some(Self::buffers(
+                &config,
+                &self.layout,
+                allocator,
+                (
+                    serving.stream.clone(),
+                    Arc::new(ops::Generation::new(number, [])),
+                ),
+                serving.snapshot,
+            )?),
+            None => None,
+        };
+        self.beside = Some(Beside {
+            number,
+            config,
+            device,
+            replaced: false,
         });
-        Ok(state)
+        Ok(())
+    }
+
+    /// The tensors of the state generation `number` laid out ([`Self::prepare`]), whose copies
+    /// launch with `kernels`, the generation's, once it serves.
+    ///
+    /// # Errors
+    ///
+    /// No state of the generation prepared, or a config whose buffers the state cannot lend.
+    pub fn prepared(&self, number: u64, kernels: Arc<ops::Generation>) -> Result<Tensors> {
+        let beside = self
+            .beside
+            .as_ref()
+            .filter(|beside| beside.number == number && !beside.replaced)
+            .ok_or(Error::State("the generation laid out no state"))?;
+        if let Some(device) = &beside.device {
+            device.context.set_kernels(kernels);
+        }
+        self.lent_of(&beside.config, beside.device.as_ref())
+    }
+
+    /// The tensors the serving state lends a runner's forwards.
+    ///
+    /// # Errors
+    ///
+    /// A config whose buffers the state cannot lend.
+    pub fn lent(&self) -> Result<Tensors> {
+        self.lent_of(&self.config, self.device.as_ref())
+    }
+
+    /// The tensors of the state of `config` whose memory is `device`.
+    fn lent_of(&self, config: &StateConfig, device: Option<&Buffers>) -> Result<Tensors> {
+        let slots = |_: &StateField| config.slots;
+        let tensors = |runs: &[StateShape],
+                       rows: &dyn Fn(&StateField) -> u32,
+                       buffers: &dyn Fn(&Buffers) -> &Vec<Vec<Buffer>>| {
+            self.field_tensors(device, runs, rows, false, buffers)
+        };
+
+        Ok(Tensors {
+            live: tensors(
+                &config.shapes,
+                &|field| config.live_rows(field),
+                &|buffers| &buffers.live,
+            )?,
+            checkpoint: tensors(&config.shapes, &slots, &|buffers| &buffers.checkpoint)?,
+            trail: match config.trail {
+                0 => None,
+                trail => Some(tensors(&config.shapes, &|_| trail, &|buffers| {
+                    &buffers.trail
+                })?),
+            },
+            drafter: match layer_fields(&config.drafter).next() {
+                None => None,
+                Some(_) => Some(tensors(&config.drafter, &slots, &|buffers| {
+                    &buffers.drafter
+                })?),
+            },
+        })
+    }
+
+    /// Kernel generation `number` switches the state it laid out in: every slot's state moves
+    /// from the serving buffers into the generation's, as `standing` states what each slot's
+    /// last step left, slot `s` at index `s − 1` (module documentation), and the generation's
+    /// serve from then on, the copies issued on the stream ahead of the next forward. The
+    /// buffers that served are kept until the generation commits or rolls back. Returns whether
+    /// the generation laid a state out.
+    ///
+    /// The caller issues the switch behind every forward the serving buffers took, on the same
+    /// stream, and states the counts those forwards left.
+    ///
+    /// # Errors
+    ///
+    /// Counts of other request slots than the state's, or the driver's refusal of the copies.
+    pub fn switch(&mut self, number: u64, standing: &[Standing]) -> Result<bool> {
+        let Some(beside) = self
+            .beside
+            .as_mut()
+            .filter(|beside| beside.number == number && !beside.replaced)
+        else {
+            return Ok(false);
+        };
+        Self::restate(
+            (&self.config, self.device.as_ref()),
+            (&beside.config, beside.device.as_ref()),
+            standing,
+        )?;
+
+        std::mem::swap(&mut self.config, &mut beside.config);
+        std::mem::swap(&mut self.device, &mut beside.device);
+        beside.replaced = true;
+        Ok(true)
+    }
+
+    /// Kernel generation `number` rolls back: every slot's state moves from the generation's
+    /// buffers back into those its switch kept ([`Self::switch`]), which serve again, and the
+    /// generation's are held until [`Self::release`] gives them back. Returns whether the
+    /// generation's switch kept a state.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::switch`].
+    pub fn switch_back(&mut self, number: u64, standing: &[Standing]) -> Result<bool> {
+        let Some(beside) = self
+            .beside
+            .as_mut()
+            .filter(|beside| beside.number == number && beside.replaced)
+        else {
+            return Ok(false);
+        };
+        Self::restate(
+            (&self.config, self.device.as_ref()),
+            (&beside.config, beside.device.as_ref()),
+            standing,
+        )?;
+
+        std::mem::swap(&mut self.config, &mut beside.config);
+        std::mem::swap(&mut self.device, &mut beside.device);
+        beside.replaced = false;
+        Ok(true)
+    }
+
+    /// Kernel generation `number` committed: the buffers its switch replaced, or the ones it
+    /// laid out and never served from, are given back to the resident pool of `allocator` once
+    /// the stream passed them. Nothing is held for a generation that laid out no state.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal to unmap a buffer; the rest are given back all the same.
+    pub fn commit(&mut self, number: u64, allocator: &mut Allocator) -> Result<()> {
+        match self.beside.take() {
+            Some(beside) if beside.number == number => match beside.device {
+                Some(device) => device.release(allocator),
+                None => Ok(()),
+            },
+            other => {
+                self.beside = other;
+                Ok(())
+            }
+        }
+    }
+
+    /// Gives back the buffers kernel generation `number` laid out, which never served or whose
+    /// rollback moved the slots' state out of them ([`Self::switch_back`]).
+    ///
+    /// # Errors
+    ///
+    /// The generation's state serves, since its switch was not rolled back; the driver's refusal
+    /// to unmap a buffer.
+    pub fn release(&mut self, number: u64, allocator: &mut Allocator) -> Result<()> {
+        self.release_where(allocator, |held| held == number)
+    }
+
+    /// Gives back the buffers a kernel generation before `number` laid out, whose update ended:
+    /// one a peer's process kept past its rollback while its ranks still addressed it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::release`].
+    pub fn release_before(&mut self, number: u64, allocator: &mut Allocator) -> Result<()> {
+        self.release_where(allocator, |held| held < number)
+    }
+
+    /// Gives back the generation's state beside the serving one when `given` names its number.
+    fn release_where(
+        &mut self,
+        allocator: &mut Allocator,
+        given: impl Fn(u64) -> bool,
+    ) -> Result<()> {
+        match self.beside.take() {
+            Some(beside) if given(beside.number) && beside.replaced => {
+                self.beside = Some(beside);
+                Err(Error::State(
+                    "the generation's state serves: its switch is not rolled back",
+                ))
+            }
+            Some(beside) if given(beside.number) => match beside.device {
+                Some(device) => device.release(allocator),
+                None => Ok(()),
+            },
+            other => {
+                self.beside = other;
+                Ok(())
+            }
+        }
+    }
+
+    /// Moves every slot's state from the buffers of `from` into those of `to`, two configs of
+    /// the same recurrent layers over the same request slots, as `standing` states each slot's
+    /// last step (module documentation, generations of other drafts): one copy batch on the
+    /// stream, which a state that holds no device checks and issues nothing of.
+    ///
+    /// # Errors
+    ///
+    /// Configs of other layers, fields or request slots, counts of other slots, a field whose
+    /// rows the other config does not hold, or the driver's refusal.
+    fn restate(
+        (from, source): (&StateConfig, Option<&Buffers>),
+        (to, target): (&StateConfig, Option<&Buffers>),
+        standing: &[Standing],
+    ) -> Result<()> {
+        if from.slots != to.slots || standing.len() != from.slots as usize {
+            return Err(Error::Invalid(format!(
+                "a state of {} slots moves into one of {} by the counts of {} slots",
+                from.slots,
+                to.slots,
+                standing.len()
+            )));
+        }
+
+        // The addresses of the live buffers of the model's layers, then of the drafter's when
+        // both configs keep its state; none for a state that holds no device.
+        let addresses = |device: Option<&Buffers>, drafter: bool| -> Vec<Vec<u64>> {
+            device
+                .map(|device| {
+                    if drafter {
+                        &device.drafter
+                    } else {
+                        &device.live
+                    }
+                })
+                .map(|buffers| {
+                    buffers
+                        .iter()
+                        .map(|fields| fields.iter().map(Buffer::address).collect())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut batch = CopyBatch::new(SourceOrder::Stream);
+        let drafters = !from.drafter.is_empty() && !to.drafter.is_empty();
+        let parts = [(false, &from.shapes, &to.shapes, from.owned)]
+            .into_iter()
+            .chain(drafters.then_some((true, &from.drafter, &to.drafter, 1)));
+        for (drafter, runs, into, owned) in parts {
+            let layers: Vec<&[StateField]> = layer_fields(runs).collect();
+            let targets: Vec<&[StateField]> = layer_fields(into).collect();
+            if layers.len() != targets.len() {
+                return Err(Error::Invalid(format!(
+                    "a state of {} recurrent layers moves into one of {}",
+                    layers.len(),
+                    targets.len()
+                )));
+            }
+            let (sources, destinations) = (addresses(source, drafter), addresses(target, drafter));
+            // The drafter's forwards are lent its live rows alone: its state stands where a
+            // count of one reads it.
+            let standing: Vec<Standing> = standing
+                .iter()
+                .map(|slot| Standing {
+                    accepted: if drafter { 1 } else { slot.accepted },
+                    ..*slot
+                })
+                .collect();
+
+            for (layer, (fields, other)) in layers.iter().zip(&targets).enumerate() {
+                if fields.len() != other.len() {
+                    return Err(Error::Invalid(format!(
+                        "recurrent layer {layer} keeps {} fields and moves into {}",
+                        fields.len(),
+                        other.len()
+                    )));
+                }
+                for (index, (field, into)) in fields.iter().zip(other.iter()).enumerate() {
+                    let at = |addresses: &Vec<Vec<u64>>| {
+                        addresses
+                            .get(layer)
+                            .and_then(|fields| fields.get(index))
+                            .copied()
+                    };
+                    let moved = moves(field, into, from.slots, owned, &standing)?;
+                    if let (Some(from), Some(to)) = (at(&sources), at(&destinations)) {
+                        for (destination, source, bytes) in moved {
+                            batch.push(to + destination, from + source, bytes as usize);
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(device) = source else {
+            return Ok(());
+        };
+        // SAFETY: every range is one slot's rows inside a buffer of one of the two states,
+        // bounded by `moves`; the sources and the destinations are buffers of two states, so no
+        // destination is read or written twice, and the copies are ordered on the stream behind
+        // the forwards that wrote the sources and ahead of every forward that reads the
+        // destinations.
+        unsafe { batch.submit(&device.stream) }?;
+        Ok(())
     }
 
     /// The home row request slot `slot` owns of the live and checkpoint buffers: what the
@@ -398,41 +953,37 @@ impl StateMemory {
         Ok(slot - 1)
     }
 
-    /// The tensor of `shape` elements of `dtype` `offset` bytes into `buffer` of the device
-    /// side, or the meta tensor of that shape.
+    /// The tensor of `shape` elements of `dtype` `offset` bytes past the address `address`
+    /// states of the device side `device`, or the meta tensor of that shape.
     fn tensor(
-        &self,
-        buffer: impl FnOnce(&Buffers) -> &Buffer,
+        device: Option<&Buffers>,
+        address: impl FnOnce(&Buffers) -> u64,
         offset: u64,
         shape: &[usize],
         dtype: DType,
     ) -> Result<Tensor> {
-        match &self.device {
+        match device {
             // SAFETY: the callers bound the window to the buffer, which the state owns for as
             // long as it lives; only the forwards of the runner that holds the state and the
             // copies this state issues, all on one stream, address it.
             Some(device) => unsafe {
-                lend(
-                    buffer(device).address() + offset,
-                    shape,
-                    dtype,
-                    Some(device.device),
-                )
+                lend(address(device) + offset, shape, dtype, Some(device.device))
             },
             // SAFETY: a meta tensor has no data and its address is never read.
             None => unsafe { lend(0, shape, dtype, None) },
         }
     }
 
-    /// The tensors of one kind of buffer of the layers of `runs`, `[layer][field]`: each
-    /// `[rows, …]` in its field's element type and extents, or `[rows, bytes]` U8 when `raw`,
-    /// as a copy moves it, `rows` being what `rows` states for the field.
-    fn tensors(
+    /// The tensors of one kind of buffer of the layers of `runs` in `device`, `[layer][field]`:
+    /// each `[rows, …]` in its field's element type and extents, or `[rows, bytes]` U8 when
+    /// `raw`, as a copy moves it, `rows` being what `rows` states for the field.
+    fn field_tensors(
         &self,
+        device: Option<&Buffers>,
         runs: &[StateShape],
-        rows: impl Fn(&StateField) -> u32,
+        rows: &dyn Fn(&StateField) -> u32,
         raw: bool,
-        buffers: impl Fn(&Buffers) -> &Vec<Vec<Buffer>>,
+        buffers: &dyn Fn(&Buffers) -> &Vec<Vec<Buffer>>,
     ) -> Result<Vec<Vec<Tensor>>> {
         let shape = |field: &StateField| -> Result<Vec<usize>> {
             let mut dims = vec![rows(field) as usize];
@@ -452,8 +1003,9 @@ impl StateMemory {
                     .enumerate()
                     .map(|(index, field)| {
                         let dtype = if raw { DType::U8 } else { field.dtype };
-                        self.tensor(
-                            |device| &buffers(device)[layer][index],
+                        Self::tensor(
+                            device,
+                            |device| buffers(device)[layer][index].address(),
                             0,
                             &shape(field)?,
                             dtype,
@@ -468,38 +1020,19 @@ impl StateMemory {
     /// the layer's fields in the order of its run's `StateShape`, `[rows, …]`: a home row per
     /// slot, and the further slots of a stepwise field ([`StateConfig::live_rows`]).
     pub fn live(&self) -> Result<Vec<Vec<Tensor>>> {
-        self.tensors(
-            &self.config.shapes,
-            |field| self.config.live_rows(field),
-            false,
-            |buffers| &buffers.live,
-        )
+        Ok(self.lent()?.live)
     }
 
     /// The checkpoint buffers, in the same order and extents as [`Self::live`] but a row per
     /// slot of every field: a checkpoint keeps the state a home row holds.
     pub fn checkpoint(&self) -> Result<Vec<Vec<Tensor>>> {
-        self.tensors(
-            &self.config.shapes,
-            |_| self.config.slots,
-            false,
-            |buffers| &buffers.checkpoint,
-        )
+        Ok(self.lent()?.checkpoint)
     }
 
     /// The trail buffers, in the same order, `[trail, …]`; `None` in a deployment that keeps
     /// no trail.
     pub fn trail(&self) -> Result<Option<Vec<Vec<Tensor>>>> {
-        if self.config.trail == 0 {
-            return Ok(None);
-        }
-        self.tensors(
-            &self.config.shapes,
-            |_| self.config.trail,
-            false,
-            |buffers| &buffers.trail,
-        )
-        .map(Some)
+        Ok(self.lent()?.trail)
     }
 
     /// The drafter's live buffers (module documentation, the drafter's state): one entry per
@@ -507,16 +1040,7 @@ impl StateMemory {
     /// `[slots, …]`, as `nn::RecurrentState::live` holds them for the drafter's forwards;
     /// `None` for a drafter that keeps no state.
     pub(crate) fn drafter(&self) -> Result<Option<Vec<Vec<Tensor>>>> {
-        if layer_fields(&self.config.drafter).next().is_none() {
-            return Ok(None);
-        }
-        self.tensors(
-            &self.config.drafter,
-            |_| self.config.slots,
-            false,
-            |buffers| &buffers.drafter,
-        )
-        .map(Some)
+        Ok(self.lent()?.drafter)
     }
 
     /// The descriptor of a block copy over `field`, a `[blocks, width]` byte tensor.
@@ -577,13 +1101,14 @@ impl StateMemory {
         (units, planes): (&Tensor, &Tensor),
         snapshot: &dyn Fn(u64, usize, u64) -> Result<Tensor>,
     ) -> Result<()> {
-        // One launch per field of every layer, between the slot's row and the field's planes
-        // of the snapshot.
+        // One launch per field of every layer, between the part of the slot's row a checkpoint
+        // keeps, its leading bytes, and the field's planes of the snapshot.
         let rows = |gather: bool| -> Result<()> {
             for (layer, fields) in self.planes.iter().enumerate() {
                 for (index, (first, bytes)) in fields.iter().enumerate() {
                     let part = snapshot(u64::from(*first) * self.plane_bytes, 1, *bytes)?;
-                    Self::launch_move(gather, &buffers[layer][index], slot, &part)?;
+                    let kept = buffers[layer][index].narrow(1, 0, *bytes as usize)?;
+                    Self::launch_move(gather, &kept, slot, &part)?;
                 }
             }
             Ok(())
@@ -733,16 +1258,20 @@ impl StateMemory {
         };
         // A copy moves a slot's home row, which the first `slots` rows of every buffer hold.
         let (model, slots) = (&self.config.shapes, |_: &StateField| self.config.slots);
+        let held = Some(device);
         let buffers = match direction {
-            StateDirection::Restore => self.tensors(model, slots, true, |buffers| &buffers.live)?,
+            StateDirection::Restore => {
+                self.field_tensors(held, model, &slots, true, &|buffers| &buffers.live)?
+            }
             StateDirection::Keep => {
-                self.tensors(model, slots, true, |buffers| &buffers.checkpoint)?
+                self.field_tensors(held, model, &slots, true, &|buffers| &buffers.checkpoint)?
             }
         };
         let units = cache.state_tensor()?;
         let snapshot = |offset: u64, rows: usize, width: u64| {
-            self.tensor(
-                |device| &device.snapshot,
+            Self::tensor(
+                held,
+                |device| device.snapshot,
                 offset,
                 &[rows, width as usize],
                 DType::U8,
@@ -755,8 +1284,9 @@ impl StateMemory {
             for index in 0..pages.len() {
                 let at = index * stride;
                 let entries = |first: usize, count: usize| {
-                    self.tensor(
-                        |device| &device.indices[turn],
+                    Self::tensor(
+                        held,
+                        |device| device.indices[turn].address(),
                         ((at + first) * 8) as u64,
                         &[count],
                         DType::I64,
@@ -826,6 +1356,101 @@ impl StateMemory {
     }
 }
 
+/// The copies that move every slot's state of `field` into `into`, the same field of another
+/// config, as `standing` states each slot's last step, slot `s` at index `s − 1`:
+/// `(destination, source, bytes)`, the two offsets into the fields' live buffers. `slots` are
+/// the request slots and `owned` the slots a request owns of a stepwise field under the config
+/// of `field` (module documentation, generations of other drafts):
+///
+/// - a field no draft count changes moves whole from the row that stands: for a stepwise field
+///   that a count above one names, the request's further slot `accepted − 2`
+///   ([`StateConfig::live_rows`]), and the home row otherwise;
+/// - a window moves its history, from row `accepted − 1` of the slot's window to row zero;
+/// - a ring moves the positions before the slot's verified length that both rings hold, each
+///   from its row of one ring to its row of the other, in runs of rows that follow each other in
+///   both.
+///
+/// # Errors
+///
+/// Fields of other names, element types, rows or trailing extents, a field no draft count
+/// changes whose extents differ, or a count of accepted tokens past the slots or the rows the
+/// field holds.
+fn moves(
+    field: &StateField,
+    into: &StateField,
+    slots: u32,
+    owned: u32,
+    standing: &[Standing],
+) -> Result<Vec<(u64, u64, u64)>> {
+    if field.name != into.name
+        || field.dtype != into.dtype
+        || field.rows != into.rows
+        || field.dims.get(1..) != into.dims.get(1..)
+    {
+        return Err(Error::Invalid(format!(
+            "the state's field {} of {:?} moves into the field {} of {:?}",
+            field.name, field.dims, into.name, into.dims
+        )));
+    }
+    let (bytes, target, row) = (field.bytes()?, into.bytes()?, field.row_bytes()?);
+    let (held, holds) = (
+        field.dims.first().copied().unwrap_or(1) as u64,
+        into.dims.first().copied().unwrap_or(1) as u64,
+    );
+
+    let mut moves = Vec::with_capacity(standing.len());
+    for (slot, standing) in (0_u64..).zip(standing) {
+        let accepted = u64::from(standing.accepted.max(1));
+        if field.stepwise && accepted > u64::from(owned) {
+            return Err(Error::Invalid(format!(
+                "slot {} accepted {accepted} tokens, and a request owns {owned} slots of the \
+                 field {}",
+                slot + 1,
+                field.name
+            )));
+        }
+        let stands = if field.stepwise && accepted > 1 {
+            u64::from(slots) + slot * u64::from(owned - 1) + accepted - 2
+        } else {
+            slot
+        };
+        let (source, destination) = (stands * bytes, slot * target);
+
+        match field.rows {
+            StateRows::Whole => {
+                if bytes != target {
+                    return Err(Error::Invalid(format!(
+                        "the state's field {} of {:?} moves into one of {:?}",
+                        field.name, field.dims, into.dims
+                    )));
+                }
+                moves.push((destination, source, bytes));
+            }
+            StateRows::Window { history } => {
+                let (first, history) = (accepted - 1, history as u64);
+                if first + history > held || history > holds {
+                    return Err(Error::Invalid(format!(
+                        "a window of {held} rows reads {history} inputs from row {first}, into \
+                         one of {holds}",
+                    )));
+                }
+                moves.push((destination, source + first * row, history * row));
+            }
+            StateRows::Ring { .. } => {
+                let end = u64::from(standing.verified);
+                let mut position = end.saturating_sub(held.min(holds));
+                while position < end {
+                    let (from, to) = (position % held, position % holds);
+                    let run = (held - from).min(holds - to).min(end - position);
+                    moves.push((destination + to * row, source + from * row, run * row));
+                    position += run;
+                }
+            }
+        }
+    }
+    Ok(moves)
+}
+
 #[cfg(test)]
 mod tests {
     use ops::Op;
@@ -843,12 +1468,14 @@ mod tests {
                     dtype: DType::BF16,
                     dims: vec![2, 3],
                     stepwise: false,
+                    rows: nn::family::StateRows::Whole,
                 },
                 StateField {
                     name: "recurrent",
                     dtype: DType::F32,
                     dims: vec![10],
                     stepwise: false,
+                    rows: nn::family::StateRows::Whole,
                 },
             ],
         }
@@ -1016,6 +1643,7 @@ mod tests {
                     dtype: DType::F32,
                     dims: vec![4],
                     stepwise: true,
+                    rows: nn::family::StateRows::Whole,
                 }],
             },
         ]
@@ -1100,12 +1728,14 @@ mod tests {
                     dtype: DType::BF16,
                     dims: vec![4, 8],
                     stepwise: false,
+                    rows: nn::family::StateRows::Whole,
                 },
                 StateField {
                     name: "index_ring_positions",
                     dtype: DType::I32,
                     dims: vec![4, 3],
                     stepwise: false,
+                    rows: nn::family::StateRows::Whole,
                 },
             ],
         }
