@@ -927,28 +927,38 @@ impl EngineClient {
         }
     }
 
-    /// The spans every process of the engine keeps in its rings (`ReadSpans`), each process's
-    /// as it named them, with the epoch the engine executes, which qualifies their batch ids.
+    /// The spans every process of the engine keeps in its rings that ended at or after `since`
+    /// (nanoseconds since the Unix epoch), each as its process named it, with the epoch the
+    /// engine executes, which qualifies their batch ids. The engine answers each `ReadSpans` with
+    /// one page of them (`service::span::page`), which fits a message, and the read asks for
+    /// pages until the last.
     ///
     /// # Errors
     ///
-    /// Fails with the reason the engine could not read them, a process's list that does not
-    /// decode, or when the engine ends first.
-    pub async fn read_spans(&self) -> Result<(u64, Vec<service::span::Span>), String> {
-        match self
-            .ask(|id| wire::engine_command::Kind::ReadSpans(wire::ReadSpans { id }))
-            .await?
-        {
-            Some(wire::operated::Reports::Spans(spans)) => {
-                let mut read = Vec::new();
-                for process in &spans.processes {
-                    let decoded: Vec<service::span::Span> = service::msgpack::decode(process)
-                        .map_err(|error| format!("a process's spans do not decode: {error}"))?;
-                    read.extend(decoded);
-                }
-                Ok((spans.epoch, read))
+    /// Fails with the reason the engine could not read them, a page that does not decode, or
+    /// when the engine ends first.
+    pub async fn read_spans(&self, since: u64) -> Result<(u64, Vec<service::span::Span>), String> {
+        let mut read = Vec::new();
+        let mut start = since;
+        loop {
+            let page = match self
+                .ask(|id| {
+                    wire::engine_command::Kind::ReadSpans(wire::ReadSpans { id, since: start })
+                })
+                .await?
+            {
+                Some(wire::operated::Reports::Spans(page)) => page,
+                other => return Err(unexpected("read_spans", other)),
+            };
+            let spans: Vec<service::span::Span> =
+                service::msgpack::decode(&page.spans).map_err(|error| {
+                    format!("a page of the engine's spans does not decode: {error}")
+                })?;
+            read.extend(spans);
+            match page.next {
+                Some(next) => start = next,
+                None => return Ok((page.epoch, read)),
             }
-            other => Err(unexpected("read_spans", other)),
         }
     }
 

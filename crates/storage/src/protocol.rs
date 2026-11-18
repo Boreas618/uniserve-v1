@@ -1531,9 +1531,10 @@ pub enum Request {
     /// outputs fared since the last such request, oldest first; the server
     /// keeps them no longer. Responded with [`Response::ProgramRecords`].
     ProgramRecords,
-    /// From a head: the spans the server keeps in its rings (`service::span`), which a read of
-    /// the deployment's request timelines gathers. Responded with [`Response::Spans`].
-    Spans,
+    /// From a head: the spans the server keeps in its rings (`service::span`) that ended at or
+    /// after `since` (nanoseconds since the Unix epoch), which a read of the deployment's request
+    /// timelines gathers. Responded with [`Response::Spans`].
+    Spans { since: u64 },
     /// From another host's Storage Server ([`Role::Peer`]), every period of its
     /// `storage_config.directory_period_ms`: what its node `node` holds of `deployment`'s pages
     /// on each tier, which replaces what this server's cluster directory held of that node. The

@@ -334,8 +334,9 @@ pub enum RankOperation {
         off: Vec<String>,
         kernels: bool,
     },
-    /// Reads the spans the process keeps in its rings. Answers [`RankReports::Spans`].
-    ReadSpans,
+    /// Reads the spans the process keeps in its rings that ended at or after `since`
+    /// (nanoseconds since the Unix epoch). Answers [`RankReports::Spans`].
+    ReadSpans { since: u64 },
 }
 
 /// What the ranks report of a [`RankOperation`], every rank's in rank order, the main process's

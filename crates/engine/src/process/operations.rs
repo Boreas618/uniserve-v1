@@ -423,18 +423,20 @@ fn here(binding: &Arc<WeightBinding>, operation: &RankOperation) -> Result<RankR
             off,
             kernels,
         } => RankReports::Fences(vec![switch_fences(*enabled, off, *kernels)?]),
-        RankOperation::ReadSpans => RankReports::Spans(vec![read_spans()]),
+        RankOperation::ReadSpans { since } => RankReports::Spans(vec![read_spans(*since)]),
     })
 }
 
-/// The spans this process keeps in its rings (`docs/profiling.md`): its control thread's, its
-/// schedulers', its workers' and the timed kernels of its devices, which the range markers name
-/// by their sites.
-fn read_spans() -> Vec<service::span::Span> {
+/// The spans this process keeps in its rings (`docs/profiling.md`) that ended at or after
+/// `since` (nanoseconds since the Unix epoch): its control thread's, its schedulers', its
+/// workers' and the timed kernels of its devices, which the range markers name by their sites.
+fn read_spans(since: u64) -> Vec<service::span::Span> {
     let markers = crate::profiling::markers::Markers::installed();
-    service::span::spans(&service::span::records(), |site| {
+    let mut spans = service::span::spans(&service::span::records(), |site| {
         markers.and_then(|markers| markers.kernel(site))
-    })
+    });
+    spans.retain(|span| span.end >= since);
+    spans
 }
 
 /// The end of a process's own preparation of a generation, as its control thread states it: the

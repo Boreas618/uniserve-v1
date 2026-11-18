@@ -509,16 +509,21 @@ message ProgramRecordsQuery {
 
 // The spans a node's daemon and the deployment's Storage Server on the node
 // keep in their rings (`docs/profiling.md`).
+// One page of a node's spans (`service::span::page`): its daemon's and its
+// Storage Server's that ended at or after `since`, nanoseconds since the Unix
+// epoch on the host clock.
 message SpansQuery {
   string host = 1;
   string deployment = 2;
+  uint64 since = 3;
 }
 
 message NodeSpans {
-  // The daemon's spans and the Storage Server's, each the MessagePack
-  // encoding of a `service::span::Span` list the process named itself.
-  bytes daemon = 1;
-  bytes storage = 2;
+  // The MessagePack encoding of a `service::span::Span` list, each span as
+  // the process that recorded it named it, within `proto::SPAN_PAGE_BYTES`.
+  bytes spans = 1;
+  // The `since` of the next page; unset on the last page.
+  optional uint64 next = 2;
 }
 
 message ProgramRecords {

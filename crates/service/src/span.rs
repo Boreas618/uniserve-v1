@@ -24,6 +24,11 @@
 //! names a request and a batch and becomes a span of the request over the scheduler's
 //! formation of the batch ([`Stage::Batch`]); a byte count belongs to the next end its thread
 //! writes of the same owner and point.
+//!
+//! **Pages.** A reader asks for the spans that ended since a time and receives them in pages
+//! ([`page`]): the spans of the earliest ends first, each page's encoding within the bytes a
+//! message of its interface takes, and the end the next page starts from. A process reads its
+//! rings again for each page, so a page holds what its rings keep then.
 
 use std::cell::Cell;
 use std::sync::Mutex;
@@ -667,6 +672,53 @@ pub fn spans(
     spans
 }
 
+/// The page of `spans` that starts at `since` (nanoseconds since the Unix epoch): of the spans
+/// that ended at or after it, those of the earliest ends, in the order of their ends, as many as
+/// their MessagePack encoding (a `Span` list, [`crate::msgpack`]) holds within `bytes`. Returns
+/// the encoding and, when spans are left, the end the next page starts from. The spans of one end
+/// are never divided between two pages, so a page that starts at the next end holds every span
+/// this one left; a first end whose spans alone take more than `bytes` makes a page of its own.
+///
+/// # Errors
+///
+/// Fails with `InvalidInput` when a span has no MessagePack form.
+pub fn page(
+    mut spans: Vec<Span>,
+    since: u64,
+    bytes: usize,
+) -> std::io::Result<(Vec<u8>, Option<u64>)> {
+    spans.retain(|span| span.end >= since);
+    // A stable sort: the spans of one end keep the order they began in.
+    spans.sort_by_key(|span| span.end);
+
+    // A list's encoding is its length's (at most 5 bytes) and then each span's.
+    let mut taken = 5;
+    let mut cut = spans.len();
+    for (at, span) in spans.iter().enumerate() {
+        taken += crate::msgpack::encode(span)?.len();
+        if taken <= bytes {
+            continue;
+        }
+        let first = spans[..at]
+            .iter()
+            .rposition(|earlier| earlier.end != span.end)
+            .map_or(0, |before| before + 1);
+        cut = if first > 0 {
+            first
+        } else {
+            spans
+                .iter()
+                .position(|later| later.end != span.end)
+                .unwrap_or(spans.len())
+        };
+        break;
+    }
+
+    let next = spans.get(cut).map(|span| span.end);
+    spans.truncate(cut);
+    Ok((crate::msgpack::encode(&spans)?, next))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,6 +978,73 @@ mod tests {
         assert_eq!(spans[0].batch, Some(5));
         assert_eq!(spans[0].process, Process::Worker);
         assert!(matches!(&spans[0].name, Name::Kernel(kernel) if kernel.layers == 48));
+    }
+
+    /// A read of many spans pages them: every page's encoding fits the bytes it is given, the
+    /// pages hold every span that ended since the first page's start exactly once, in the order
+    /// of their ends, and no end's spans are divided between two pages.
+    #[test]
+    fn a_read_of_many_spans_pages_them_within_the_bytes_a_page_takes() {
+        // Three spans end at every even time; the ones ended before the read's start are left.
+        let spans: Vec<Span> = (0..30_000_u64)
+            .map(|at| Span {
+                start: at,
+                end: 1_000 + (at / 3) * 2,
+                process: Process::Daemon,
+                label: Label::None,
+                name: stage("receive"),
+                request: Some(at),
+                batch: None,
+                bytes: None,
+            })
+            .collect();
+        let since = 1_100;
+        const BYTES: usize = 64 << 10;
+
+        let mut read: Vec<Span> = Vec::new();
+        let mut start = Some(since);
+        let mut pages = 0;
+        while let Some(from) = start {
+            let (encoded, next) = page(spans.clone(), from, BYTES).unwrap();
+            assert!(encoded.len() <= BYTES, "a page of {} bytes", encoded.len());
+            let part: Vec<Span> = crate::msgpack::decode(&encoded).unwrap();
+            if let (Some(last), Some(next)) = (part.last(), next) {
+                assert!(
+                    next > last.end,
+                    "the next page starts past this page's last end"
+                );
+            }
+            read.extend(part);
+            start = next;
+            pages += 1;
+        }
+
+        let mut expected: Vec<Span> = spans.into_iter().filter(|span| span.end >= since).collect();
+        expected.sort_by_key(|span| span.end);
+        assert!(pages > 1, "the spans take more than one page");
+        assert_eq!(read, expected);
+    }
+
+    /// An end whose spans alone take more than a page's bytes makes a page of its own, so a read
+    /// always advances.
+    #[test]
+    fn an_end_whose_spans_exceed_a_page_makes_a_page_of_its_own() {
+        let span = |request: u64, end: u64| Span {
+            start: 0,
+            end,
+            process: Process::Daemon,
+            label: Label::None,
+            name: stage("receive"),
+            request: Some(request),
+            batch: None,
+            bytes: None,
+        };
+        let spans = vec![span(1, 10), span(2, 10), span(3, 10), span(4, 20)];
+
+        let (encoded, next) = page(spans.clone(), 0, 16).unwrap();
+        let part: Vec<Span> = crate::msgpack::decode(&encoded).unwrap();
+        assert_eq!(part, spans[..3]);
+        assert_eq!(next, Some(20));
     }
 
     /// The cost of one record on this host: a clock read and the three stores, measured over a

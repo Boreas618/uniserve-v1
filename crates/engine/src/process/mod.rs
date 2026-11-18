@@ -1704,7 +1704,7 @@ impl MainProcess {
                 };
                 self.on_ranks(front, switch.id, Ok(operation));
             }
-            Kind::ReadSpans(read) => self.read_spans(front, read.id),
+            Kind::ReadSpans(read) => self.read_spans(front, read.id, read.since),
             Kind::Tune(tune) => self.tune(front, &tune),
             Kind::MeasureRoom(measure) => self.measure_room(front, measure),
             Kind::ResizeCache(resize) => self.resize_cache(front, &resize),
@@ -1910,9 +1910,12 @@ impl MainProcess {
         }));
     }
 
-    /// `ReadSpans`: every process's spans, this one's and its peers', with the epoch that
-    /// qualifies their batch ids. Each process encodes its own list, which the daemon decodes.
-    fn read_spans(&mut self, front: usize, id: u64) {
+    /// `ReadSpans`: one page of every process's spans, this one's and its peers', that ended at
+    /// or after `since` (`service::span::page`), with the epoch that qualifies their batch ids.
+    /// Each process names its own spans and leaves out those that ended before `since`; the page
+    /// holds the earliest ends of all of them within `proto::SPAN_PAGE_BYTES`, so no answer
+    /// exceeds what a message of the request interface takes, and states where the next starts.
+    fn read_spans(&mut self, front: usize, id: u64, since: u64) {
         let Some(binding) = self
             .engine
             .as_ref()
@@ -1922,20 +1925,19 @@ impl MainProcess {
         };
         let epoch = self.launch.epoch;
         self.work(Box::new(move || {
-            let read =
-                operations::on_ranks(&binding, &RankOperation::ReadSpans).and_then(|reports| {
+            let read = operations::on_ranks(&binding, &RankOperation::ReadSpans { since })
+                .and_then(|reports| {
                     let RankReports::Spans(processes) = reports else {
                         anyhow::bail!(
                             "the processes answered a read of their spans with {reports:?}"
                         );
                     };
-                    let processes = processes
-                        .iter()
-                        .map(service::msgpack::encode)
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    let spans = processes.into_iter().flatten().collect();
+                    let (spans, next) = service::span::page(spans, since, proto::SPAN_PAGE_BYTES)?;
                     Ok(Some(wire::operated::Reports::Spans(wire::Spans {
-                        processes,
+                        spans,
                         epoch,
+                        next,
                     })))
                 });
             done(move |main| main.operated(front, id, read))
@@ -2091,6 +2093,25 @@ impl MainProcess {
                 error: format!("{error:#}"),
                 reports: None,
             },
+        };
+        // An answer too long for a message is refused at the sender and the connection carries
+        // the next frame, so the daemon is told why instead of waiting for it.
+        let Some(Some(connection)) = self.fronts.get_mut(front) else {
+            return;
+        };
+        let sent = daemon::send(connection, from_engine::Kind::Operated(operated), None);
+        let refused = match sent {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => error,
+            Err(error) => {
+                tracing::warn!(%error, front, "writing to a daemon front failed");
+                return;
+            }
+        };
+        let operated = wire::Operated {
+            id,
+            error: format!("the answer cannot be sent: {refused}"),
+            reports: None,
         };
         self.send(front, from_engine::Kind::Operated(operated), None);
     }

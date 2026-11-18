@@ -284,15 +284,16 @@ impl Local {
                 }
                 Err(error) => reply.error = format!("{error:#}"),
             },
-            // The node's spans: this daemon's own, which it names itself, and its Storage
-            // Server's.
+            // A page of the node's spans: this daemon's own, which it names itself, and its
+            // Storage Server's, within what a reply takes.
             Some(request::Kind::Spans(query)) => {
-                match self.claims.spans(&query.deployment).and_then(|storage| {
-                    let daemon = service::span::spans(&service::span::records(), |_| None);
-                    Ok(NodeSpans {
-                        daemon: service::msgpack::encode(&daemon)?,
-                        storage: service::msgpack::encode(&storage)?,
-                    })
+                let read = self.claims.spans(&query.deployment, query.since);
+                match read.and_then(|mut spans| {
+                    let mut daemon = service::span::spans(&service::span::records(), |_| None);
+                    spans.append(&mut daemon);
+                    let (spans, next) =
+                        service::span::page(spans, query.since, proto::SPAN_PAGE_BYTES)?;
+                    Ok(NodeSpans { spans, next })
                 }) {
                     Ok(spans) => reply.kind = Some(reply::Kind::Spans(spans)),
                     Err(error) => reply.error = format!("{error:#}"),

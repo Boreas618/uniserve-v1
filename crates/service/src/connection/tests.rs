@@ -405,6 +405,37 @@ fn a_frame_beyond_its_messages_bound_is_refused() {
     assert_eq!(error.kind(), ErrorKind::InvalidData);
 }
 
+/// A message longer than its bound is refused at its sender, which queues nothing of it, and the
+/// connection carries the next message to its peer as before.
+#[test]
+fn a_sender_refuses_a_message_beyond_its_bound_and_carries_the_next() {
+    /// A message of at most 8 bytes: its bytes as they are.
+    #[derive(Debug, PartialEq)]
+    struct Bounded(Vec<u8>);
+
+    impl Message for Bounded {
+        const MAX_BYTES: usize = 8;
+
+        fn encode(&self) -> io::Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+
+        fn decode(payload: &[u8]) -> io::Result<Self> {
+            Ok(Self(payload.to_vec()))
+        }
+    }
+
+    let (left, right) = UnixStream::pair().unwrap();
+    let mut sender = Connection::new(left).unwrap();
+    let mut receiver = Connection::new(right).unwrap();
+
+    let error = sender.deliver(&Bounded(vec![1; 9])).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    sender.deliver(&Bounded(vec![2; 8])).unwrap();
+    let received: Bounded = receiver.recv(Duration::from_secs(60)).unwrap().unwrap();
+    assert_eq!(received, Bounded(vec![2; 8]));
+}
+
 /// A hangup observer sees the peer's close without the connection being called; unread data from
 /// the peer does not hide or fake it, and its owner can cancel the wait.
 #[test]

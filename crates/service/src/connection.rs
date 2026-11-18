@@ -257,7 +257,9 @@ impl Connection {
     /// # Errors
     ///
     /// The terminal failure once the connection failed, a message that does not encode or does
-    /// not fit a frame, and a failure of the write.
+    /// not fit a frame, and a failure of the write. A message longer than its protocol's
+    /// [`Message::MAX_BYTES`], which the peer would refuse as a corrupt stream, is refused with
+    /// `InvalidInput` and nothing queued: the connection carries the next message as before.
     pub fn send<M: Message>(&mut self, message: &M) -> io::Result<()> {
         self.queue(message, Vec::new())
     }
@@ -573,6 +575,16 @@ impl Connection {
     fn queue<M: Message>(&mut self, message: &M, descriptors: Vec<OwnedFd>) -> io::Result<()> {
         self.failed()?;
         let payload = message.encode()?;
+        if payload.len() > M::MAX_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "a frame of {} bytes exceeds the {} bytes a message takes",
+                    payload.len(),
+                    M::MAX_BYTES
+                ),
+            ));
+        }
         self.outbox.extend(frame::segments(&payload, descriptors)?);
         self.try_flush().map(drop)
     }

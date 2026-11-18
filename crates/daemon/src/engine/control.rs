@@ -754,41 +754,53 @@ impl EngineControl {
         Ok(records)
     }
 
-    /// The spans every node of the deployment keeps in its rings, each with its node's host:
-    /// its daemon's, then its Storage Server's (`Request::Spans`).
+    /// The spans every node of the deployment keeps in its rings that ended at or after `since`
+    /// (nanoseconds since the Unix epoch), each node's daemon's and Storage Server's together
+    /// with the node's host (`Request::Spans`).
     ///
     /// # Errors
     ///
     /// Fails when a node's daemon cannot be reached or cannot read them.
-    pub(crate) fn node_spans(&self) -> anyhow::Result<Vec<(String, Vec<service::span::Span>)>> {
+    pub(crate) fn node_spans(
+        &self,
+        since: u64,
+    ) -> anyhow::Result<Vec<(String, Vec<service::span::Span>)>> {
         let (mut connection, nodes) = self.connect()?;
         let mut spans = Vec::new();
-        for (index, node) in nodes.iter().enumerate() {
-            connection.deliver(&process::Upstream {
-                kind: Some(upstream::Kind::Request(process::Request {
-                    id: index as u64 + 1,
-                    kind: Some(request::Kind::Spans(process::SpansQuery {
-                        host: node.host.clone(),
-                        deployment: self.deployment.clone(),
+        let mut id = 0;
+        for node in &nodes {
+            // Each reply is one page of the node's spans, which fits a message; the read asks
+            // for pages until the last.
+            let mut read = Vec::new();
+            let mut start = Some(since);
+            while let Some(since) = start {
+                id += 1;
+                connection.deliver(&process::Upstream {
+                    kind: Some(upstream::Kind::Request(process::Request {
+                        id,
+                        kind: Some(request::Kind::Spans(process::SpansQuery {
+                            host: node.host.clone(),
+                            deployment: self.deployment.clone(),
+                            since,
+                        })),
                     })),
-                })),
-            })?;
-            let reply = await_reply(&mut connection, index as u64 + 1)
-                .context("awaiting a node's spans")?;
-            anyhow::ensure!(
-                reply.error.is_empty(),
-                "the spans of {}: {}",
-                node.host,
-                reply.error
-            );
-            let Some(reply::Kind::Spans(read)) = reply.kind else {
-                anyhow::bail!("the daemon of {} answered its spans with none", node.host);
-            };
-            for encoded in [&read.daemon, &read.storage] {
-                let decoded: Vec<service::span::Span> = service::msgpack::decode(encoded)
+                })?;
+                let reply = await_reply(&mut connection, id).context("awaiting a node's spans")?;
+                anyhow::ensure!(
+                    reply.error.is_empty(),
+                    "the spans of {}: {}",
+                    node.host,
+                    reply.error
+                );
+                let Some(reply::Kind::Spans(page)) = reply.kind else {
+                    anyhow::bail!("the daemon of {} answered its spans with none", node.host);
+                };
+                let decoded: Vec<service::span::Span> = service::msgpack::decode(&page.spans)
                     .with_context(|| format!("reading the spans of {}", node.host))?;
-                spans.push((node.host.clone(), decoded));
+                read.extend(decoded);
+                start = page.next;
             }
+            spans.push((node.host.clone(), read));
         }
         Ok(spans)
     }

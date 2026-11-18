@@ -520,17 +520,24 @@ message SwitchFences {
   bool kernels = 4;
 }
 
-// Read every process's spans (`docs/profiling.md`); answered with `Spans`.
+// Read one page of the spans every process of the engine keeps
+// (`docs/profiling.md`, `service::span::page`): those that ended at or after
+// `since`, nanoseconds since the Unix epoch on the host clock. Answered with
+// `Spans`.
 message ReadSpans {
   uint64 id = 1;
+  uint64 since = 2;
 }
 
-// Each process's spans, in process order: the MessagePack encoding of the
-// process's `service::span::Span` list, which it named itself.
+// A page of the engine's spans: the MessagePack encoding of a
+// `service::span::Span` list, each span as the process that recorded it named
+// it, within `proto::SPAN_PAGE_BYTES`.
 message Spans {
-  repeated bytes processes = 1;
+  bytes spans = 1;
   // The epoch the engine executes, which qualifies its batch ids.
   uint64 epoch = 2;
+  // The `since` of the next page; unset on the last page.
+  optional uint64 next = 3;
 }
 
 // A profiling session as the daemon starts it (`proto::profile::SessionStart`).

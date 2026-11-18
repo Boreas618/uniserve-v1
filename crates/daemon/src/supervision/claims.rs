@@ -270,26 +270,30 @@ impl ClaimHolder {
             .with_context(|| format!("reading the KV program records of deployment {deployment}"))
     }
 
-    /// The spans the deployment's Storage Server on this node keeps in its rings
-    /// (`storage::protocol::Request::Spans`); none where no server serves.
+    /// The spans the deployment's Storage Server on this node keeps in its rings that ended at
+    /// or after `since` (`storage::protocol::Request::Spans`); none where no server serves.
     ///
     /// # Errors
     ///
     /// Fails when `deployment` is not this daemon's, or the server cannot be reached.
-    pub(crate) fn spans(&mut self, deployment: &str) -> anyhow::Result<Vec<service::span::Span>> {
+    pub(crate) fn spans(
+        &mut self,
+        deployment: &str,
+        since: u64,
+    ) -> anyhow::Result<Vec<service::span::Span>> {
         anyhow::ensure!(
             deployment == self.deployment,
             "this node's daemon serves deployment {}, not {deployment}",
             self.deployment
         );
         let spans = match &mut self.claim {
-            Some((client, _)) => client.spans(),
+            Some((client, _)) => client.spans(since),
             None => {
                 let socket = self.socket()?;
                 if service::host::running::<storage::Settings>(&socket)?.is_none() {
                     return Ok(Vec::new());
                 }
-                self.head()?.spans()
+                self.head()?.spans(since)
             }
         };
         spans.with_context(|| format!("reading the Storage Server's spans of {deployment}"))

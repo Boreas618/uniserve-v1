@@ -927,9 +927,10 @@ impl Client {
         }
     }
 
-    /// See [`Request::Spans`]: the spans the server keeps in its rings.
-    pub fn spans(&mut self) -> Result<Vec<service::span::Span>> {
-        match self.request(&Request::Spans, &[])?.0 {
+    /// See [`Request::Spans`]: the spans the server keeps in its rings that ended at or after
+    /// `since`.
+    pub fn spans(&mut self, since: u64) -> Result<Vec<service::span::Span>> {
+        match self.request(&Request::Spans { since }, &[])?.0 {
             Response::Spans { spans } => Ok(spans),
             other => Err(unexpected("spans", &other)),
         }
@@ -1155,9 +1156,10 @@ impl ClaimClient {
         self.client.program_records()
     }
 
-    /// The spans the server keeps in its rings ([`Client::spans`]).
-    pub fn spans(&mut self) -> Result<Vec<service::span::Span>> {
-        self.client.spans()
+    /// The spans the server keeps in its rings that ended at or after `since`
+    /// ([`Client::spans`]).
+    pub fn spans(&mut self, since: u64) -> Result<Vec<service::span::Span>> {
+        self.client.spans(since)
     }
 
     /// Passes the claim to another process ([`ClaimClient::resume`]): its

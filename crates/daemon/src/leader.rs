@@ -1846,7 +1846,7 @@ impl Leader {
     /// Storage Server's, read through the nodes' daemons. A process that cannot be read is
     /// logged, and the others' spans are read.
     pub(crate) async fn spans(&self) -> Vec<crate::observation::Event> {
-        use crate::observation::spans::{Place, event, recent};
+        use crate::observation::spans::{Place, event, since};
 
         let replicas = self.replicas();
         let Some(first) = replicas.first() else {
@@ -1854,26 +1854,22 @@ impl Leader {
         };
         let window = service::lock(&first.config).profiling_config.span_window;
         let revision = self.recorder.revision();
-        let now = std::time::SystemTime::now();
+        // Every process leaves out what ended before the window, so no read carries it.
+        let since = since(std::time::SystemTime::now(), window);
 
         let mut events = Vec::new();
         for replica in &replicas {
             let Some(client) = replica.hold().client() else {
                 continue;
             };
-            match client.read_spans().await {
+            match client.read_spans(since).await {
                 Ok((epoch, spans)) => {
                     let place = Place {
                         replica: Some(replica.ordinal),
                         epoch: Some(epoch),
                         host: None,
                     };
-                    events.extend(
-                        spans
-                            .iter()
-                            .filter(|span| recent(span, now, window))
-                            .map(|span| event(span, place, revision)),
-                    );
+                    events.extend(spans.iter().map(|span| event(span, place, revision)));
                 }
                 Err(error) => warn!(
                     replica = replica.ordinal,
@@ -1885,19 +1881,14 @@ impl Leader {
         let Some(control) = first.control.get().cloned() else {
             return events;
         };
-        match tokio::task::spawn_blocking(move || control.node_spans()).await {
+        match tokio::task::spawn_blocking(move || control.node_spans(since)).await {
             Ok(Ok(nodes)) => {
                 for (host, spans) in &nodes {
                     let place = Place {
                         host: Some(host),
                         ..Place::default()
                     };
-                    events.extend(
-                        spans
-                            .iter()
-                            .filter(|span| recent(span, now, window))
-                            .map(|span| event(span, place, revision)),
-                    );
+                    events.extend(spans.iter().map(|span| event(span, place, revision)));
                 }
             }
             Ok(Err(error)) => warn!("the nodes' spans were not read: {error:#}"),

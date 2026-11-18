@@ -1128,8 +1128,9 @@ impl Server {
                 ))
             }
             // The rings are the process's, whichever deployment's head reads them.
-            (Request::Spans, Role::Head { .. }) => {
-                let spans = service::span::spans(&service::span::records(), |_| None);
+            (Request::Spans { since }, Role::Head { .. }) => {
+                let mut spans = service::span::spans(&service::span::records(), |_| None);
+                spans.retain(|span| span.end >= *since);
                 Ok(Handling::Response(Response::Spans { spans }, Vec::new()))
             }
             (

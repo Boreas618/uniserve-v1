@@ -105,14 +105,15 @@ pub(crate) fn event(span: &Span, place: Place<'_>, revision: u64) -> Event {
     }
 }
 
-/// Whether `span` ended within `window` before `now`.
-pub(crate) fn recent(span: &Span, now: SystemTime, window: Duration) -> bool {
-    let since = now
-        .checked_sub(window)
+/// The start of `window` before `now`, in nanoseconds since the Unix epoch: a read of spans
+/// leaves out each span that ended before it.
+pub(crate) fn since(now: SystemTime, window: Duration) -> u64 {
+    now.checked_sub(window)
         .unwrap_or(SystemTime::UNIX_EPOCH)
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    u128::from(span.end) >= since
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 /// The trace id of the next request the daemon receives: the daemon's start second in the high
@@ -216,17 +217,13 @@ mod tests {
         assert_eq!(event.fields.get("stage"), Some(&"handoff".into()));
     }
 
-    /// Only the spans that ended within the window are recent.
+    /// A read's window starts its length before now, and at the Unix epoch when it is longer
+    /// than the time since.
     #[test]
-    fn a_span_is_recent_while_its_end_is_within_the_window() {
+    fn a_window_starts_its_length_before_now() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let ended = |end: u64| Span {
-            end,
-            ..span(Process::Daemon, Label::None, stage("send"), 0)
-        };
-        let window = Duration::from_secs(10);
-        assert!(recent(&ended(90_000_000_000), now, window));
-        assert!(!recent(&ended(89_999_999_999), now, window));
+        assert_eq!(since(now, Duration::from_secs(10)), 90_000_000_000);
+        assert_eq!(since(now, Duration::from_secs(1_000)), 0);
     }
 
     /// The spans a source reads, as the leader's does.
