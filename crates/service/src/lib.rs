@@ -20,6 +20,9 @@
 //! socket, framed by [`frame`], whose messages each protocol encodes
 //! ([`Message`]). [`lock`] is the one way a thread takes a mutex, and [`wait`],
 //! [`wait_while`] and [`wait_timeout`] the one way it waits on a condition variable.
+//!
+//! Every process records the stages its requests and batches pass through in rings of its
+//! own ([`span`]), which a reader turns into the spans of the deployment's request timelines.
 
 mod connection;
 mod directories;
@@ -30,6 +33,7 @@ pub mod logging;
 pub mod msgpack;
 mod readiness;
 mod runtime;
+pub mod span;
 
 pub use connection::{
     Connection, Handed, Hangup, Listener, Liveness, Message, Socket, Wake, Waker,
