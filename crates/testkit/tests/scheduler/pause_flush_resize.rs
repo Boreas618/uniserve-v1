@@ -255,3 +255,65 @@ fn a_shrink_stopped_short_goes_on_as_the_units_held_past_its_bound_come_free() {
             .any(|output| matches!(output, Output::Shrunk(..)))
     );
 }
+
+/// A bound gives back the region's tail (SD §2.4 `Resize`), as a release of the KV cache's tail
+/// segments needs it: the cached blocks that lie past the bound are evicted while units below
+/// it are free, a demotion first stores them to the host tier, and the bound is reached once a
+/// running request lets go of the blocks it holds there, after which no block lies past it.
+#[test]
+fn a_bound_empties_the_tail_of_cached_and_running_blocks() {
+    // The units past the reserved one the region keeps: of its 256, the 32 lowest.
+    const BOUND: u32 = 32;
+    let mut harness = Deployment::tokens().host(256).build();
+    let kv = harness.region("kv-0");
+
+    // Requests one after another leave their prompts' blocks cached, each request's above the
+    // last's, and a running request holds blocks above them all.
+    for id in 1..=8 {
+        harness.submit(token(id, 64, 1));
+        harness.settle(200);
+    }
+    let running = harness.submit(token(9, 40, 24));
+    harness.run_until(30, |harness| harness.tokens(running).len() >= 2);
+    let tail = |harness: &mut Harness| match &harness.elsewhere(&[Request::Tail {
+        region: kv,
+        units: BOUND,
+    }])[..]
+    {
+        [Completion::Tail { keys }] => keys.clone(),
+        other => panic!("{other:?}"),
+    };
+    let cached = tail(&mut harness);
+    assert!(
+        cached.len() > 8,
+        "the cache fills the tail: {}",
+        cached.len()
+    );
+
+    let (demoted, demotion) = bounded(1);
+    harness.apply(Message::Demote(kv, BOUND, demoted));
+    harness.run_until(100, |_| !demotion.is_empty());
+    demotion.try_recv().unwrap();
+    let listing = match &harness.elsewhere(&[Request::List])[..] {
+        [Completion::Listing { keys }] => keys.clone(),
+        other => panic!("{other:?}"),
+    };
+    for key in &cached {
+        let (.., tiers, _, _) = listing.iter().find(|listed| listed.0 == *key).unwrap();
+        assert_ne!(tiers & 0b10, 0, "a demoted block has a host copy");
+    }
+
+    let (reply, replied) = bounded(1);
+    harness.apply(Message::Bound(kv, BOUND, reply));
+    harness.run(5);
+    assert!(
+        replied.is_empty(),
+        "the running request still holds blocks past the bound"
+    );
+    harness.settle(400);
+    assert!(harness.terminal(running).is_some());
+    harness.run_until(50, |_| !replied.is_empty());
+    let reached = replied.try_recv().unwrap();
+    assert!(reached <= BOUND, "{reached}");
+    assert_eq!(tail(&mut harness), Vec::new());
+}

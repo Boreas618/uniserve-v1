@@ -1,11 +1,12 @@
 //! The engine's `Resize` of a region (SD §2.4 `Resize`): the units it asks for bound what the
-//! region holds from then on. The buffer pool's shrink evicts in this queue pair's installed
-//! order and never takes a private or pinned block, so it stops short while requests hold units
-//! past the bound, this scheduler's or those of an epoch of the same layout that shares the
-//! region, and its `Resized` states the units the region reached. Until the region reaches its
+//! region holds from then on. The buffer pool's shrink gives back the region's tail past the
+//! bound: it evicts the blocks of this queue pair's installed order that lie there and never
+//! takes a private or pinned block, so it stops short while requests hold units in the tail,
+//! this scheduler's or those of an epoch of the same layout that shares the region, and its
+//! `Resized` states the units the region reached. Until the region reaches its
 //! bound, the scheduler installs the whole of its eviction order there (`install_victims`), takes
 //! none of the units past the bound for its own allocations (`read_capacity`), and asks the
-//! buffer pool again once something there may leave ([`Scheduler::shrink_to_bounds`]); each such
+//! buffer pool again once something there may have left ([`Scheduler::shrink_to_bounds`]); each such
 //! answer sets the region's capacity, and is no drain's `Output::Shrunk`. The bound and the
 //! units are the KV decisions' (`Kv::bound`, `Kv::declared`, `Kv::excess`); the requests and
 //! their replies are the scheduler's.
@@ -31,17 +32,28 @@ use super::Scheduler;
 
 impl Scheduler {
     /// `Message::Demote`: the cached blocks of region `region` (by number) a shrink to `units`
-    /// evicts, in the eviction order this scheduler installs, beyond the units the region has
-    /// free, and of those the blocks with no host copy are offered to the host tier
-    /// (`Scheduler::offload`, which skips a block its class or the step's values give no host
-    /// tier). `reply` is answered with the blocks offered once every store they started ended
-    /// ([`Scheduler::answer_demotions`]); a region the session does not name demotes nothing.
+    /// may evict, those that lie past its first `units` units, which the buffer pool names
+    /// (`Request::Tail`, answered in [`Scheduler::demote_tail`]); a region the session does not
+    /// name demotes nothing.
     pub(super) fn demote(&mut self, region: u8, units: u32, reply: Sender<u32>) {
-        let Some(index) = self.kv.region_index(region) else {
+        if self.kv.region_index(region).is_none() {
             let _ = reply.send(0);
             return;
+        }
+        self.submit(runtime::Request::Tail { region, units });
+        self.tails.push((region, reply));
+    }
+
+    /// The answer to a demotion's `Tail`: of the blocks `keys` names, those with no host copy are
+    /// offered to the host tier (`Scheduler::offload`, which skips a block its class or the
+    /// step's values give no host tier), and the demotion's reply is answered with the blocks
+    /// offered once every store they started ended ([`Scheduler::answer_demotions`]).
+    pub(super) fn demote_tail(&mut self, region: u8, keys: &[storage::Key]) {
+        let Some(at) = self.tails.iter().position(|(owed, _)| *owed == region) else {
+            return;
         };
-        let pages = self.kv.demotion(index, units);
+        let (_, reply) = self.tails.remove(at);
+        let pages = self.kv.undemoted(keys);
         let ids: Vec<PageId> = pages.iter().map(|(page, _)| *page).collect();
         self.offload(&ids);
 
@@ -95,6 +107,9 @@ impl Scheduler {
     fn set_bound(&mut self, region: u8, units: u32) {
         if let Some(index) = self.kv.region_index(region) {
             self.kv.bound(index, units);
+            if let Some(released) = self.released.get_mut(index) {
+                *released = false;
+            }
         }
         self.submit(runtime::Request::Resize { region, units });
     }
@@ -135,19 +150,18 @@ impl Scheduler {
     }
 
     /// Asks each region that holds more units than its bound to shrink to it again, one `Resize`
-    /// of a region at a time, once something there may leave: a free unit, or a unit of a block
-    /// of this queue pair's installed order that nothing holds (the buffer pool's `available`
-    /// word, which counts the units held past the bound as well). None is asked while nothing
-    /// may leave, so the region reaches its bound as the units held past it come free, at the
-    /// passes after they do.
+    /// of a region at a time, once something there may leave: a request of this scheduler that
+    /// gives units back was answered since the region's last `Resize` (`Scheduler::released`).
+    /// The units held past the bound lie in the region's tail, which a block leaves only once
+    /// its holders let it go, so none is asked while nothing was let go, and the region reaches
+    /// its bound at the passes after the last of them is.
     pub(super) fn shrink_to_bounds(&mut self) {
-        self.read_words();
         for (number, index) in self.kv.used().to_vec() {
             let Some(bound) = self.kv.bound_of(index) else {
                 continue;
             };
-            let leaves = self.kv.word(index, 0) > 0;
-            if self.kv.excess(index) == 0 || self.resizing_region(number) || !leaves {
+            let released = self.released.get(index).copied().unwrap_or(false);
+            if self.kv.excess(index) == 0 || self.resizing_region(number) || !released {
                 continue;
             }
 
@@ -156,6 +170,9 @@ impl Scheduler {
                 units: bound,
             });
             self.resizing.push((number, None));
+            if let Some(released) = self.released.get_mut(index) {
+                *released = false;
+            }
         }
     }
 }

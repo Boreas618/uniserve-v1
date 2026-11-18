@@ -1059,30 +1059,17 @@ impl Kv {
             .collect()
     }
 
-    /// The cached blocks of region `region` (an index) a shrink to `units` evicts, in the
-    /// eviction order the scheduler installs, beyond the units the region has available, each
-    /// with its key: those with no host copy, which a demotion offers to the host tier first
-    /// (`Message::Demote`).
-    pub(crate) fn demotion(&self, region: usize, units: u32) -> Vec<(PageId, Key)> {
-        let held = self.capacity(region);
-        let free = self.available(region);
-        let wanted = held.saturating_sub(units).saturating_sub(free);
-
-        let mut freed = 0u32;
-        let mut pages = Vec::new();
-        for &(_, id) in self.order.get(region).into_iter().flatten() {
-            if freed >= wanted {
-                break;
-            }
-            let Some(row) = self.cache.get(&id) else {
-                continue;
-            };
-            freed = freed.saturating_add(self.class_units(row.class, region));
-            if row.tiers & HOST == 0 {
-                pages.push((PageId(id), row.key));
-            }
-        }
-        pages
+    /// Of `keys`, the cached blocks with a device copy and no host copy, each with its key: what
+    /// a demotion offers to the host tier first (`Message::Demote`), of the blocks the buffer
+    /// pool states a shrink evicts (`Request::Tail`).
+    pub(crate) fn undemoted(&self, keys: &[Key]) -> Vec<(PageId, Key)> {
+        keys.iter()
+            .filter_map(|key| {
+                let id = Cached::id(key);
+                let row = self.cache.get(&id).filter(|row| row.key == *key)?;
+                (row.tiers & DEVICE != 0 && row.tiers & HOST == 0).then_some((PageId(id), *key))
+            })
+            .collect()
     }
 
     /// `Flush` (SD §2.4): `Evict`s that name every key of `cache`, as many per record as a record

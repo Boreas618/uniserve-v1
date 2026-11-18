@@ -333,35 +333,46 @@ impl Region {
         self.give(run);
     }
 
-    /// Shrinks the region by up to `count` free units, highest first, and
-    /// returns the byte ranges that left it.
-    pub(crate) fn shrink(&mut self, count: u32) -> Vec<(u64, u64)> {
+    /// The first unit past the region's first `units` units, counted from
+    /// the first it allocates: where a shrink to `units` starts its tail.
+    pub(crate) fn tail_of(&self, units: u32) -> u32 {
+        self.span.0.saturating_add(units).min(self.span.1)
+    }
+
+    /// Whether `run` has a unit at or past `end`.
+    pub(crate) fn lies_past(run: &Run, end: u32) -> bool {
+        run.first + run.count > end
+    }
+
+    /// Shrinks the region to its units below `end`: every free unit at or
+    /// past it leaves the region, and the byte ranges that left are
+    /// returned. A unit there in a block stays until the block is given
+    /// back and a later shrink takes it, so the memory the tail occupies is
+    /// released only once no block lies in it.
+    pub(crate) fn shrink_from(&mut self, end: u32) -> Vec<(u64, u64)> {
         let mut left = Vec::new();
-        let mut wanted = count;
-        while wanted > 0 {
-            let Some(first) = self.free.keys().next_back().copied() else {
-                break;
-            };
+        let firsts: Vec<u32> = self
+            .free
+            .range(..)
+            .filter(|(_, run)| Self::lies_past(run, end))
+            .map(|(first, _)| *first)
+            .collect();
+        for first in firsts {
             let Some(mut run) = self.free.remove(&first) else {
-                break;
+                continue;
             };
-            // Take the run's tail when it is longer than what is wanted.
-            let taken = if run.count > wanted {
-                let keep = run.count - wanted;
-                let head = run.split(keep);
+            // A run that starts below the end keeps its head free in the region.
+            if run.first < end {
+                let head = run.split(end - run.first);
                 self.free.insert(head.first, head);
-                run
-            } else {
-                run
-            };
-            wanted -= taken.count;
-            self.units -= taken.count;
-            self.free_units -= taken.count;
+            }
+            self.units -= run.count;
+            self.free_units -= run.count;
             left.push((
-                u64::from(taken.first) * self.unit_bytes,
-                u64::from(taken.count) * self.unit_bytes,
+                u64::from(run.first) * self.unit_bytes,
+                u64::from(run.count) * self.unit_bytes,
             ));
-            insert_joined(&mut self.outside, taken);
+            insert_joined(&mut self.outside, run);
         }
         left
     }
@@ -521,8 +532,8 @@ mod tests {
         let mut region = region(6, 7);
         let held = region.take(2).unwrap();
 
-        // Four units are free; a shrink of ten stops at them.
-        let left = region.shrink(10);
+        // Four units are free; a shrink to nothing stops at them.
+        let left = region.shrink_from(region.tail_of(0));
         assert_eq!(left, [(3 * 64, 4 * 64)]);
         assert_eq!((region.units(), region.free_units()), (2, 0));
         assert_eq!(region.outside_runs().collect::<Vec<_>>(), [(3, 4)]);
@@ -534,5 +545,30 @@ mod tests {
         assert_eq!(region.outside_runs().collect::<Vec<_>>(), [(5, 2)]);
         region.give(held);
         assert_eq!(region.free_runs().collect::<Vec<_>>(), [(1, 4)]);
+    }
+
+    /// A shrink gives back the tail past the units it keeps: the free units below it stay
+    /// whatever their number, and a block in the tail keeps its units in the region until it is
+    /// given back and a later shrink takes them.
+    #[test]
+    fn a_shrink_gives_back_the_tail_and_a_block_there_holds_its_units_until_given_back() {
+        let mut region = region(8, 9);
+        let low = region.take(2).unwrap();
+        let high = region.take(4).unwrap();
+        region.give(low);
+        assert_eq!(high.stated(), (0, 3, 4));
+
+        // Kept: units 1 to 4. The free units 1 and 2 stay; units 7 and 8 leave; 5 and 6 are held.
+        let left = region.shrink_from(region.tail_of(4));
+        assert_eq!(left, [(7 * 64, 2 * 64)]);
+        assert_eq!((region.units(), region.free_units()), (6, 2));
+        assert_eq!(region.free_runs().collect::<Vec<_>>(), [(1, 2)]);
+
+        region.give(high);
+        let left = region.shrink_from(region.tail_of(4));
+        assert_eq!(left, [(5 * 64, 2 * 64)]);
+        assert_eq!((region.units(), region.free_units()), (4, 4));
+        assert_eq!(region.free_runs().collect::<Vec<_>>(), [(1, 4)]);
+        assert_eq!(region.outside_runs().collect::<Vec<_>>(), [(5, 4)]);
     }
 }

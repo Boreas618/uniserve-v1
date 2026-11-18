@@ -2295,6 +2295,53 @@ fn a_resize_moves_free_units_between_a_region_and_the_quota() {
     );
 }
 
+/// A shrink gives back the region's tail past the units it keeps, as the release of its tail
+/// segments needs: a cached block of the order that lies there is evicted though units below it
+/// are free, which stay, and `Tail` names the cached blocks there beforehand.
+#[test]
+fn a_shrink_gives_back_the_tail_where_a_cached_block_lies() {
+    let mut fixture = Fixture::new();
+    // Unit 1 and unit 4 hold cached blocks; units 2 and 3 are free.
+    assert_eq!(fixture.cached(1, 1), 1);
+    fixture.attach(2, PREFILL);
+    assert_eq!(fixture.allocate(2, 0, 2), [2, 3]);
+    assert_eq!(fixture.cached(3, 3), 4);
+    assert_eq!(fixture.detach(2, Vec::new()), Some(Completion::Done));
+    fixture.ask(Request::Victims {
+        region: UNITS,
+        keys: vec![key(1), key(3)],
+    });
+
+    // The two units kept are units 1 and 2: the tail from unit 3 on holds the block of key 3.
+    let tail = Request::Tail {
+        region: UNITS,
+        units: 2,
+    };
+    assert_eq!(
+        fixture.ask(tail.clone()),
+        Some(Completion::Tail { keys: vec![key(3)] })
+    );
+    assert_eq!(
+        fixture.ask(Request::Resize {
+            region: UNITS,
+            units: 2,
+        }),
+        Some(Completion::Resized {
+            units: 2,
+            evicted: vec![key(3)]
+        })
+    );
+    assert_eq!(fixture.free(UNITS), 1);
+    assert_eq!(
+        fixture.ask(tail),
+        Some(Completion::Tail { keys: Vec::new() })
+    );
+
+    // The tail's bytes left every region and can be withdrawn; unit 2's stay in the region.
+    assert!(!fixture.pool.withdraw(0, 2 * 64, 64));
+    assert!(fixture.pool.withdraw(0, 3 * 64, 2 * 64));
+}
+
 #[test]
 fn a_move_s_hold_keeps_a_host_copy_until_it_is_released() {
     let mut fixture = Fixture::new();

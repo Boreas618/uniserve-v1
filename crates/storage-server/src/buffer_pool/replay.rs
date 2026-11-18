@@ -448,6 +448,7 @@ fn stated_request(request: &Request, session: &str) -> String {
         Request::Victims { .. } => "victims".into(),
         Request::List => "list".into(),
         Request::Resize { .. } => "resize".into(),
+        Request::Tail { .. } => "tail".into(),
         Request::Load {
             owner,
             class,

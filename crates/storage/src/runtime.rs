@@ -29,7 +29,7 @@ use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface that this build's engine and buffer pool
 /// speak, the one version either accepts.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 /// The clock every instant of this interface is stated in: the host's
 /// monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds since an unspecified
@@ -427,8 +427,16 @@ pub enum Request {
     },
     /// State every cached key.
     List,
-    /// Take units out of the region's free list or put them back, up to `units` in all.
+    /// Size the region to `units` units, counted from the first it allocates. A shrink gives
+    /// back the units past the first `units`, the region's tail: each free one leaves the
+    /// region, and each block of the queue pair's eviction order that lies there is evicted
+    /// first; a private or pinned block there stays, so the shrink may stop short, and a later
+    /// one takes its units once it is reclaimed. A grow takes units outside the region, the
+    /// lowest first, up to `units` in all.
     Resize { region: u8, units: u32 },
+    /// State the keys of the cached blocks in the region that lie past its first `units` units:
+    /// every block a `Resize` to `units` may evict, now or once nothing holds it.
+    Tail { region: u8, units: u32 },
     /// Copy the block at `at` of the owner's table of a class from its run in
     /// region `from` into each memory the group reads the class in (the
     /// memories of its regions and receiving regions of the class) that does
@@ -569,6 +577,10 @@ pub enum Completion {
     Resized {
         units: u32,
         evicted: Vec<Key>,
+    },
+    /// The keys a `Tail` names, in the order of the keys.
+    Tail {
+        keys: Vec<Key>,
     },
     /// The block a `Replicate` named is valid in every memory the group
     /// reads its class in: its runs in the group's regions and receiving
@@ -935,6 +947,11 @@ impl Request {
                 writer.byte(*region);
                 writer.word(*units);
             }
+            Self::Tail { region, units } => {
+                writer.byte(20);
+                writer.byte(*region);
+                writer.word(*units);
+            }
             Self::Replicate {
                 owner,
                 class,
@@ -1081,6 +1098,10 @@ impl Request {
             },
             16 => Self::List,
             17 => Self::Resize {
+                region: reader.byte()?,
+                units: reader.word()?,
+            },
+            20 => Self::Tail {
                 region: reader.byte()?,
                 units: reader.word()?,
             },
@@ -1237,6 +1258,10 @@ impl Completion {
                 writer.runs(runs);
                 writer.keys(evicted);
             }
+            Self::Tail { keys } => {
+                writer.byte(21);
+                writer.keys(keys);
+            }
         }
     }
 
@@ -1340,6 +1365,9 @@ impl Completion {
             20 => Self::Replicated {
                 runs: reader.runs()?,
                 evicted: reader.keys()?,
+            },
+            21 => Self::Tail {
+                keys: reader.keys()?,
             },
             other => {
                 return Err(Error::Protocol(format!(
@@ -1477,6 +1505,10 @@ mod tests {
                 region: 1,
                 units: 4096,
             },
+            Request::Tail {
+                region: 1,
+                units: 2048,
+            },
             Request::Replicate {
                 owner: OwnerId(3),
                 class: 2,
@@ -1557,6 +1589,9 @@ mod tests {
             Completion::Resized {
                 units: 100,
                 evicted: vec![key(7)],
+            },
+            Completion::Tail {
+                keys: vec![key(9), key(3)],
             },
             Completion::Replicated {
                 runs: vec![(5, 0, 2), (9, 4, 2)],

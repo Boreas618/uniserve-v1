@@ -1032,6 +1032,9 @@ impl Scheduler {
             (runtime::Request::Resize { region, .. }, Completion::Resized { units, .. }) => {
                 return self.resized(*region, *units);
             }
+            (runtime::Request::Tail { region, .. }, Completion::Tail { keys }) => {
+                return self.demote_tail(*region, keys);
+            }
             (runtime::Request::Prefetch { .. }, Completion::Prefetched { .. }) => {
                 return self.prefetched(&request, &completion);
             }

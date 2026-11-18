@@ -86,11 +86,11 @@ pub(crate) fn drain(
 /// and the bytes released on each, which the daemon is told per host (`Shrunk`, [`by_host`]);
 /// no process and no byte when nothing was released.
 ///
-/// The region holds `units` units from its reserved ones on, the lowest first, so a segment none
-/// of whose units past the reserved ones lies below `reserved + units` holds none of the region's.
-/// A shrink takes the free units from the top and never a held block, so the region may still
-/// hold a unit higher up: the Storage Server then refuses that segment's withdrawal, and it and
-/// the segments below it stay for a later shrink.
+/// A shrink to `units` gives back the region's units from `reserved + units` on, so a segment
+/// none of whose units past the reserved ones lies below `reserved + units` holds none of the
+/// region's once nothing holds a block there. A held block keeps its units in the region until
+/// it is let go: the Storage Server then refuses that segment's withdrawal, and it and the
+/// segments below it stay for a later shrink.
 ///
 /// # Errors
 ///

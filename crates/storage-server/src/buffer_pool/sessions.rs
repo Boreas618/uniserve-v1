@@ -273,7 +273,7 @@ impl BufferPool {
         }
         let found = &mut self.regions[usize::from(region)];
         let space = usize::from(found.space);
-        for (offset, bytes) in found.shrink(u32::MAX) {
+        for (offset, bytes) in found.shrink_from(0) {
             insert_range(&mut self.quota[space], offset, bytes);
         }
         found.closed = true;

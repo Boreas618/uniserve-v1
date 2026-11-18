@@ -76,6 +76,9 @@ pub(crate) struct Kv {
     /// Per region of the session: the number completions and requests name it by, and its tier
     /// and unit size as the layout states them.
     regions: Vec<(u8, runtime::Region)>,
+    /// Per region of the session: the units its numbering holds past its reserved ones, as the
+    /// buffer pool numbers it (`Opened::limits`), the most a region resized to none holds.
+    numbered: Vec<u32>,
     /// The regions the scheduler's queue pair has capacity words of: each one's number and its
     /// index in `regions`, in the order the session states them (`Registers::capacity`).
     used: Vec<(u8, usize)>,
@@ -186,6 +189,15 @@ impl Kv {
             .map(|(&(number, _), region)| (number, region.clone()))
             .collect();
         let capacity: Vec<u32> = opened.regions.iter().map(|&(_, units)| units).collect();
+        // A pool that states no limit numbers the region as the layout does.
+        let numbered = regions
+            .iter()
+            .enumerate()
+            .map(|(at, (_, region))| {
+                let limit = opened.limits.get(at).copied().unwrap_or(region.limit);
+                limit.saturating_sub(region.reserved)
+            })
+            .collect();
         let count = regions.len();
         let used = registers
             .capacity
@@ -200,6 +212,7 @@ impl Kv {
             classes: layout.classes.clone(),
             trajectory: layout.trajectory,
             regions,
+            numbered,
             used,
             record,
             available: capacity.clone(),
@@ -380,6 +393,14 @@ impl Kv {
     /// `Resized` stated them.
     pub(crate) fn capacity(&self, region: usize) -> u32 {
         self.capacity.get(region).copied().unwrap_or(0)
+    }
+
+    /// The most units of region `region` (an index) a shrink to `units` finds in its tail, the
+    /// units past its first `units`: those its numbering holds there, and no more than the region
+    /// holds.
+    pub(crate) fn tail_units(&self, region: usize, units: u32) -> u32 {
+        let numbered = self.numbered.get(region).copied().unwrap_or(u32::MAX);
+        numbered.saturating_sub(units).min(self.capacity(region))
     }
 
     /// A `Resized` stated that region `region` (an index) holds `units`.

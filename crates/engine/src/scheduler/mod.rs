@@ -447,6 +447,10 @@ pub struct Scheduler {
     /// `Resized` states that the region holds no more than its bound, or when a drain ends the
     /// bound.
     bounded: Vec<(u8, Sender<u32>)>,
+    /// The replies owed to `Message::Demote` whose `Tail` is outstanding, each with its region
+    /// by number, in the order submitted: the buffer pool answers the requests of one queue pair
+    /// in the order it takes them.
+    tails: Vec<(u8, Sender<u32>)>,
     /// The replies owed to `Message::Demote`: the keys of the host stores each demotion issued
     /// and the blocks it demoted, answered once no store of those keys is held or outstanding.
     demoting: Vec<(std::collections::HashSet<storage::Key>, u32, Sender<u32>)>,
@@ -619,6 +623,7 @@ impl Scheduler {
             warm_ups: HashMap::new(),
             resizing: Vec::new(),
             bounded: Vec::new(),
+            tails: Vec::new(),
             demoting: Vec::new(),
             // Batch numbers carry the data-parallel rank from bit 40, so the batches of one
             // process's schedulers, and the spans that name them, never share a number.
@@ -1271,6 +1276,7 @@ impl Scheduler {
             | runtime::Request::Victims { .. }
             | runtime::Request::Prefetch { .. }
             | runtime::Request::List
+            | runtime::Request::Tail { .. }
             | runtime::Request::Resize { .. } => false,
         }
     }
@@ -2536,11 +2542,12 @@ impl Scheduler {
                     })
             }
             runtime::Request::Lend { .. } => Some(0),
+            // A shrink evicts the blocks in the region's tail, at most one a unit there.
             runtime::Request::Resize { region, units } => self
                 .kv
                 .region_index(*region)
-                .map(|index| self.kv.capacity(index))
-                .map(|capacity| 4 + LIST + KEY * capacity.saturating_sub(*units) as usize),
+                .map(|index| self.kv.tail_units(index, *units))
+                .map(|tail| 4 + LIST + KEY * tail as usize),
             // The block's runs in the group's regions and receiving regions of the class, and a
             // key evicted per unit its receiving runs take.
             runtime::Request::Replicate {
@@ -2559,7 +2566,8 @@ impl Scheduler {
                     let evicted = receiving.iter().map(|(_, units)| *units as usize).sum();
                     LIST + RUN.saturating_mul(runs) + LIST + KEY.saturating_mul(evicted)
                 }),
-            runtime::Request::List => None,
+            // Every cached block in the region's tail, which other queue pairs' blocks share.
+            runtime::Request::List | runtime::Request::Tail { .. } => None,
         };
 
         // The number, the variant, and at least the one byte of a `Refused` or a `Full`.

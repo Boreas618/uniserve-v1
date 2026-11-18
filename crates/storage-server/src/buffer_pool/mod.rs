@@ -797,6 +797,7 @@ impl BufferPool {
             Request::Victims { region, keys } => self.victims(queue, region, keys),
             Request::List => Ok(Some(self.list(queue.0))),
             Request::Resize { region, units } => self.resize(queue, region, units),
+            Request::Tail { region, units } => self.tail(region, units),
             Request::Clone {
                 owner,
                 class,
@@ -1737,24 +1738,56 @@ impl BufferPool {
             .collect()
     }
 
+    /// `Request::Tail`: the keys of the cached blocks in region `region` that lie past its
+    /// first `units` units, in the order of their keys: every block a shrink to `units` may
+    /// evict, now or once nothing holds it.
+    fn tail(&self, region: u8, units: u32) -> Taken {
+        let found = self.regions.get(usize::from(region)).ok_or(Cause::Class)?;
+        let end = found.tail_of(units);
+        let mut keys: Vec<Key> = self
+            .cache
+            .keys()
+            .filter(|key| self.lies_past(key, region, end))
+            .copied()
+            .collect();
+        keys.sort_unstable();
+        Ok(Some(Completion::Tail { keys }))
+    }
+
+    /// Whether the device copy of `key` in region `region` has a unit at or past `end`.
+    fn lies_past(&self, key: &Key, region: u8, end: u32) -> bool {
+        let Some(block) = self.cache.get(key).and_then(|entry| entry.copy_in(region)) else {
+            return false;
+        };
+        let runs = block.runs.borrow();
+        runs.iter()
+            .any(|run| run.region() == region && Region::lies_past(run, end))
+    }
+
     fn resize(&mut self, queue: QueueId, region: u8, units: u32) -> Taken {
         let found = self.regions.get(usize::from(region)).ok_or(Cause::Class)?;
         let (now, space) = (found.units(), usize::from(found.space));
         let mut evicted = Vec::new();
 
         if units < now {
-            // A shrink evicts in the queue pair's order and never takes a
-            // private or pinned block; it may stop short.
-            let wanted = now - units;
-            for key in found.orders.get(&queue).cloned().unwrap_or_default() {
-                if self.regions[usize::from(region)].free_units() >= wanted {
-                    break;
-                }
+            // A shrink gives back the region's tail past the units it keeps: it evicts the
+            // blocks of the queue pair's order that lie there and never takes a private or
+            // pinned block, so it may stop short. The units below the tail stay, free or not:
+            // the memory a region gives back is released by its tail segments, which a free
+            // unit below them would not empty.
+            let end = found.tail_of(units);
+            let order = found.orders.get(&queue).map_or(&[][..], Vec::as_slice);
+            let past: Vec<Key> = order
+                .iter()
+                .filter(|key| self.lies_past(key, region, end))
+                .copied()
+                .collect();
+            for key in past {
                 if self.evict_in(&key, region) {
                     evicted.push(key);
                 }
             }
-            for (offset, bytes) in self.regions[usize::from(region)].shrink(wanted) {
+            for (offset, bytes) in self.regions[usize::from(region)].shrink_from(end) {
                 insert_range(&mut self.quota[space], offset, bytes);
             }
         } else if units > now {
