@@ -73,6 +73,11 @@ pub trait Events: Send {
     /// the position a successor takes the stream over from.
     fn progress(&self) -> (u64, u64);
 
+    /// Where the request's stop-string acknowledgements stand on the stream a
+    /// successor takes over: `None` for a request whose tokens await no
+    /// decoder decision.
+    fn acknowledgement(&self) -> Option<proto::handoff::Acknowledgement>;
+
     /// The request as submitted, encoded as JSON for a handoff's record.
     fn submitted(&self) -> Option<Vec<u8>>;
 }

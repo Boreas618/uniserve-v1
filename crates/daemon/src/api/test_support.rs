@@ -285,6 +285,10 @@ impl crate::api::events::Events for ChannelEvents {
         (0, 0)
     }
 
+    fn acknowledgement(&self) -> Option<proto::handoff::Acknowledgement> {
+        None
+    }
+
     fn submitted(&self) -> Option<Vec<u8>> {
         None
     }

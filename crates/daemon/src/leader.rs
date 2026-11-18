@@ -1625,7 +1625,9 @@ impl Leader {
     /// consumed it, going on after the position it reached:
     /// the request keeps generating in the engine that serves it,
     /// and is neither cancelled nor submitted again. Both kinds of response
-    /// in a handoff call it, with the replica and identity their state carries.
+    /// in a handoff call it, with the replica and identity their state carries
+    /// and where its stop-string acknowledgements stand
+    /// (`EngineClient::take_over`).
     ///
     /// # Errors
     ///
@@ -1636,6 +1638,7 @@ impl Leader {
         engine_replica: u32,
         engine_request_id: &str,
         consumed: u64,
+        acknowledgement: Option<&proto::handoff::Acknowledgement>,
     ) -> anyhow::Result<RequestEvents> {
         let replica = self
             .replicas()
@@ -1651,7 +1654,7 @@ impl Leader {
                 .parse()
                 .context("the engine identity of the response's handoff")?,
         );
-        let stream = client.take_over(id, consumed)?;
+        let stream = client.take_over(id, consumed, acknowledgement)?;
         Ok(RequestEvents::taken_over(stream, consumed))
     }
 

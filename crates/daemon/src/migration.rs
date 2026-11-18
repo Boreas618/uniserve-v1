@@ -725,6 +725,10 @@ impl Events for RequestEvents {
         (self.stream.consumed(), tokens)
     }
 
+    fn acknowledgement(&self) -> Option<proto::handoff::Acknowledgement> {
+        self.stream.acknowledgement()
+    }
+
     fn submitted(&self) -> Option<Vec<u8>> {
         // The record is the request interface's own message, the one the
         // handoff schema names (`uniserve.request.Request`).
@@ -1089,7 +1093,7 @@ mod tests {
             Arrival::TakenOver(RequestId(5)) => vec![migratable(MigrationCause::Drain, 0, &[])],
             Arrival::TakenOver(_) | Arrival::Submitted(_) => Vec::new(),
         });
-        let stream = client.take_over(RequestId(5), 0).unwrap();
+        let stream = client.take_over(RequestId(5), 0, None).unwrap();
         let mut events = RequestEvents::taken_over(stream, 0);
         assert!(matches!(events.recv().await, Some(Event::Error { .. })));
     }

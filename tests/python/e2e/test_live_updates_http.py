@@ -617,6 +617,13 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
 #: the number each stream must carry with no gap and no repetition.
 HANDED_STREAMS = (200, 500, 900)
 
+#: The count a restart hands over with a stop string, and the number whose
+#: text stops it: the engine holds a request with stop strings for the
+#: daemon's acknowledgements, so the successor must go on acknowledging its
+#: tokens for the count to reach the stop string well after the restart.
+STOPPED_STREAM = 900
+STOP_AT = 800
+
 #: The prompt of the one-body request a restart hands over: long enough that
 #: its generation is certainly in flight when the restart pauses it.
 JSON_PROMPT = _counting_to(1500)
@@ -678,7 +685,16 @@ def _restart_while_streaming(
         _count(server.base_url, name, _counting_to(last))
         for last in HANDED_STREAMS
     ]
-    for stream in streams:
+    # One more, which a stop string ends after the restart.
+    stopped = Stream(
+        server.base_url,
+        {
+            **_request(name, _counting_to(STOPPED_STREAM), COUNT_TOKENS),
+            "stream": True,
+            "stop": [f"{STOP_AT},"],
+        },
+    )
+    for stream in [*streams, stopped]:
         stream.wait_for(
             lambda streamed: len(streamed.deltas) >= 32,
             "the counts did not stream",
@@ -686,6 +702,7 @@ def _restart_while_streaming(
     successor, _ = _restart(server, successors)
     assert successor != server.pid
     before_restart = [len(stream.deltas) for stream in streams]
+    stopped_before = numbers("".join(stopped.deltas))
 
     # The successor serves the same deployment, so it holds the same modules'
     # server: a deployment reaches its scheduling policy only through it, and
@@ -732,6 +749,17 @@ def _restart_while_streaming(
         # names why it stopped.
         assert stream.reasons, f"stream {index} ended without a finish reason"
         assert stream.reasons[-1] in ("stop", "length"), stream.reasons
+
+    # The count with a stop string ends at it, under the successor: every
+    # number before it, whole, and a finish by the stop string.
+    stopped.join()
+    assert stopped.error is None, f"the stopped count failed: {stopped.error!r}"
+    assert len(stopped_before) < STOP_AT - 1, stopped_before[-1:]
+    counted = numbers(stopped.text)
+    assert counted == list(range(1, STOP_AT)), (
+        f"the stopped count broke: {stopped.text[-400:]}"
+    )
+    assert stopped.reasons == ["stop"], stopped.reasons
 
     # A one-body chat response in flight at a further restart is written by
     # its successor too, whole (design 7.5.1: every response in flight moves).

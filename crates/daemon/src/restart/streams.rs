@@ -401,6 +401,7 @@ fn take_over(
                 chat.engine_replica,
                 &chat.engine_request_id,
                 chat.consumed_events,
+                chat.acknowledgement.as_ref(),
             )?;
             let started = crate::api::output::started_instant(
                 chat.assembly
@@ -423,6 +424,7 @@ fn take_over(
                 chat.engine_replica,
                 &chat.engine_request_id,
                 chat.consumed_events,
+                chat.acknowledgement.as_ref(),
             )?;
             let started = crate::api::output::started_instant(
                 chat.assembly

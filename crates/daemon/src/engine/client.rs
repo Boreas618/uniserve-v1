@@ -506,6 +506,16 @@ impl EngineClient {
     /// cancelled nor submitted again. This connection gives the request an
     /// identity of its own, which the stream's events and commands carry.
     ///
+    /// `acknowledgement` is where the previous consumer's stop-string
+    /// acknowledgements stood, for a request whose tokens await the decoder
+    /// ([`EventStream::acknowledgement`]): the stream counts its text tokens on
+    /// from what that consumer received, and states what it acknowledged on
+    /// this connection right after the takeover. The previous consumer's own
+    /// last acknowledgement travels on its connection, which the engine reads
+    /// in no order with this one, and one that arrives after the takeover
+    /// names an identity the stream no longer carries; the engine keeps the
+    /// highest count it is told, so stating it again is harmless.
+    ///
     /// The local receiver is registered before the command is sent, so the
     /// engine's replay of the events after `consumed` reaches the returned
     /// stream even if it arrives first. The engine sends no acceptance for a
@@ -514,7 +524,12 @@ impl EngineClient {
     /// # Errors
     ///
     /// Fails when the engine serves no requests.
-    pub fn take_over(&self, engine: RequestId, consumed: u64) -> Result<EventStream, SubmitError> {
+    pub fn take_over(
+        &self,
+        engine: RequestId,
+        consumed: u64,
+        acknowledgement: Option<&proto::handoff::Acknowledgement>,
+    ) -> Result<EventStream, SubmitError> {
         if let EngineState::Failed(reason) = self.state() {
             return Err(SubmitError::Unavailable(reason));
         }
@@ -531,16 +546,17 @@ impl EngineClient {
                 scheduler: None,
             },
         );
+        // Text-token counts as the engine counts them: of the tokens it
+        // generated for the request, which the previous consumer received.
+        let count = |tokens: u64| usize::try_from(tokens).unwrap_or(usize::MAX);
         let stream = EventStream {
             id: request,
             engine: Some(engine),
             events: receiver,
             shared: Arc::clone(&self.shared),
-            // The event stream the predecessor consumed already told the
-            // engine whether the request awaits its decoder.
-            awaits_decoder: false,
-            text_tokens: 0,
-            acknowledged: consumed as usize,
+            awaits_decoder: acknowledgement.is_some(),
+            text_tokens: acknowledgement.map_or(0, |at| count(at.received_tokens)),
+            acknowledged: acknowledgement.map_or(0, |at| count(at.acknowledged_tokens)),
             consumed,
             reported: consumed,
             open: true,
@@ -552,6 +568,16 @@ impl EngineClient {
                 engine_request: engine.0,
             }),
         );
+        // Behind the takeover on this connection, so the engine files it
+        // under the identity the takeover gave the request.
+        if let Some(at) = acknowledgement.filter(|at| at.acknowledged_tokens > 0) {
+            self.shared.command(
+                request,
+                wire::command::Kind::Acknowledge(wire::Acknowledge {
+                    output_tokens: at.acknowledged_tokens,
+                }),
+            );
+        }
         Ok(stream)
     }
 
@@ -1431,6 +1457,19 @@ impl EventStream {
         self.consumed
     }
 
+    /// Where the request's stop-string acknowledgements stand, for a request
+    /// whose tokens await the decoder: the text tokens received and those
+    /// acknowledged as completing no stop string, which a successor that takes
+    /// the stream over goes on from ([`EngineClient::take_over`]). `None` for a
+    /// request without stop strings.
+    pub fn acknowledgement(&self) -> Option<proto::handoff::Acknowledgement> {
+        self.awaits_decoder
+            .then_some(proto::handoff::Acknowledgement {
+                received_tokens: self.text_tokens as u64,
+                acknowledged_tokens: self.acknowledged as u64,
+            })
+    }
+
     /// Gives the request's event stream up without cancelling the request:
     /// the engine's next consumer takes it over from the position this one
     /// reached.
@@ -1686,7 +1725,7 @@ mod tests {
             }],
             Arrival::TakenOver(_) | Arrival::Submitted(_) => Vec::new(),
         });
-        let mut stream = client.take_over(RequestId(42), 3).unwrap();
+        let mut stream = client.take_over(RequestId(42), 3, None).unwrap();
         assert_eq!(stream.engine_id(), Some(RequestId(42)));
         assert!(matches!(stream.recv().await, Some(Event::Finished { .. })));
         let takeover = engine.commands.recv().unwrap();
@@ -1703,6 +1742,91 @@ mod tests {
         let (submitted, _) = client.submit(request(0), None).await.unwrap();
         assert_eq!(submitted.engine_id(), Some(submitted.id()));
         assert_ne!(submitted.id(), stream.id());
+    }
+
+    /// The next count of text tokens the engine is told acknowledged under the identity
+    /// `request` on its connection, waiting for it within [`testkit::LONG`].
+    fn next_acknowledged(engine: &ScriptedEngine, request: RequestId) -> u64 {
+        let deadline = std::time::Instant::now() + testkit::LONG;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let command = engine
+                .commands
+                .recv_timeout(left)
+                .expect("the engine was told no acknowledgement in time");
+            if let (true, Some(wire::command::Kind::Acknowledge(acknowledge))) =
+                (command.request == request.0, command.kind)
+            {
+                return acknowledge.output_tokens;
+            }
+        }
+    }
+
+    /// A text token of the scripted engine.
+    fn token() -> Event {
+        Event::TextToken {
+            id: u32::from(b'a'),
+            logprob: None,
+        }
+    }
+
+    /// A request with stop strings is held in the engine at a bounded number of tokens its
+    /// consumer has not acknowledged. A successor that takes its stream over goes on
+    /// acknowledging where its predecessor stood: it states the predecessor's acknowledged
+    /// count on its own connection at once, since the predecessor's last acknowledgement may
+    /// reach the engine after the takeover, and counts the tokens it receives on from the
+    /// predecessor's, so its decoder's next acknowledgement covers every token the engine
+    /// generated for the request.
+    #[tokio::test]
+    async fn a_takeover_goes_on_acknowledging_a_request_with_stop_strings() {
+        let (client, engine) = scripted_client(1, |arrival| match arrival {
+            Arrival::Submitted(_) => vec![token(), token(), token()],
+            Arrival::TakenOver(_) => vec![token(), token()],
+        });
+        let Request::Generation(mut stopped) = request(8) else {
+            unreachable!("a token request");
+        };
+        stopped.stop_strings = vec!["stop".to_owned()];
+
+        // The predecessor's decoder passes the three tokens it received, then hands the stream
+        // over at its position.
+        let (mut predecessor, _) = client
+            .submit(Request::Generation(stopped), None)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                predecessor.recv().await,
+                Some(Event::TextToken { .. })
+            ));
+        }
+        predecessor.acknowledge_consumed_prefix();
+        let acknowledgement = predecessor.acknowledgement();
+        assert_eq!(
+            acknowledgement,
+            Some(proto::handoff::Acknowledgement {
+                received_tokens: 3,
+                acknowledged_tokens: 3,
+            })
+        );
+        predecessor.hand_over();
+        let engine_id = predecessor.engine_id().unwrap();
+        let consumed = predecessor.consumed();
+
+        let mut successor = client
+            .take_over(engine_id, consumed, acknowledgement.as_ref())
+            .unwrap();
+        // Before its decoder passes a token of its own, the engine reads the predecessor's
+        // acknowledgement under the successor's identity.
+        assert_eq!(next_acknowledged(&engine, successor.id()), 3);
+        for _ in 0..2 {
+            assert!(matches!(
+                successor.recv().await,
+                Some(Event::TextToken { .. })
+            ));
+        }
+        successor.acknowledge_consumed_prefix();
+        assert_eq!(next_acknowledged(&engine, successor.id()), 5);
     }
 
     /// An engine's report of what it serves leaves out none of what the request interface

@@ -120,6 +120,28 @@ message ChatStream {
   // Which of the deployment's engine replicas serves the request: the
   // successor's connection to that one takes the stream over.
   uint32 engine_replica = 11;
+  // Where the engine stream's stop-string acknowledgements stand, for a
+  // request whose tokens await the daemon's decoder; absent for one that
+  // does not.
+  Acknowledgement acknowledgement = 12;
+}
+
+// Where a request's stop-string acknowledgements stand on its engine stream
+// (`uniserve.request.Command.Acknowledge`). The engine holds a request with
+// stop strings at a bounded number of tokens its consumer has not
+// acknowledged as completing none, so a successor that takes the stream over
+// goes on acknowledging from here: it states `acknowledged_tokens` on its own
+// connection at once, since this process's last acknowledgement travels on
+// another and may reach the engine after the takeover, which drops it, and it
+// counts the tokens it receives on from `received_tokens`.
+message Acknowledgement {
+  // The text tokens of the engine stream this process received: the count
+  // an acknowledgement states, of the tokens the engine that serves the
+  // request generated.
+  uint64 received_tokens = 1;
+  // Of those, the tokens this process's decoder acknowledged as completing
+  // no stop string.
+  uint64 acknowledged_tokens = 2;
 }
 
 // One chat completion answered as a single JSON body.
@@ -147,6 +169,9 @@ message ChatResponse {
   // Which of the deployment's engine replicas serves the request, as
   // `ChatStream.engine_replica`.
   uint32 engine_replica = 10;
+  // Where its stop-string acknowledgements stand, as
+  // `ChatStream.acknowledgement`.
+  Acknowledgement acknowledgement = 11;
 }
 
 // A video job's artifact streamed as the response body.

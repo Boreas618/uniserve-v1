@@ -179,6 +179,7 @@ impl ResponseSink for ChatStreamEmitter {
             usage_owed,
             engine_request_id: engine_request_id(events),
             engine_replica: output.engine(),
+            acknowledgement: events.acknowledgement(),
         }))
     }
 
@@ -251,6 +252,7 @@ impl ResponseSink for ChatBodySink {
             consumed_events,
             consumed_tokens,
             engine_replica: output.engine(),
+            acknowledgement: events.acknowledgement(),
         }))
     }
 
