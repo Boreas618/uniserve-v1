@@ -485,6 +485,9 @@ fn answer(
                         metadata: String::new(),
                         interface_version: proto::ENGINE_INTERFACE_VERSION,
                         executable: name,
+                        // The stand-in is no revision of a repository.
+                        commit: None,
+                        clean: false,
                     },
                 )),
             };
@@ -513,6 +516,7 @@ pub(crate) fn module_set() -> proto::module::ModuleSet {
         )]
         .into_iter()
         .collect(),
+        programs: Default::default(),
     }
 }
 

@@ -137,7 +137,7 @@ impl Drop for StorageServer {
 #[expect(clippy::unwrap_used, reason = "test support fails the test that asks")]
 pub fn policy_revision(stated: &str) -> proto::module::PackageRevision {
     let manifest = build_server::manifest::Manifest::load(&crate::policy::package(
-        proto::config::DEFAULT_SCHEDULING_POLICY,
+        proto::config::DEFAULT_SCHEDULING,
     ))
     .unwrap();
     let mut arguments: toml::Table = manifest.parameters.into_iter().collect();
@@ -180,6 +180,7 @@ pub fn launch() -> EngineArgs {
         engine: package("uniserve", ""),
         policy: policy_revision(""),
         kernels: Default::default(),
+        programs: Default::default(),
     };
     let sizes = |sizes: &[u32]| {
         Some(

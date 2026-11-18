@@ -30,7 +30,7 @@ use scheduling::{Limits, Parameters};
 /// When the package's manifest cannot be read or declares parameters the policy interface does
 /// not name.
 pub fn packaged_parameters() -> Parameters {
-    let root = package(proto::config::DEFAULT_SCHEDULING_POLICY);
+    let root = package(proto::config::DEFAULT_SCHEDULING);
     let manifest = build_server::manifest::Manifest::load(&root)
         .unwrap_or_else(|error| panic!("reading the policy package {}: {error}", root.display()));
     toml::Value::Table(manifest.parameters.into_iter().collect())
@@ -96,7 +96,7 @@ pub fn packaged_policy(ceilings: &Limits) -> Result<(Arc<wasmtime::Module>, Para
 ///
 /// As [`module`].
 pub fn packaged_module() -> Vec<u8> {
-    module(proto::config::DEFAULT_SCHEDULING_POLICY)
+    module(proto::config::DEFAULT_SCHEDULING)
 }
 
 /// The directory of the workspace's scheduling policy package whose backend is `backend`: the

@@ -62,6 +62,10 @@ minijinja-contrib.workspace = true
 build-server.workspace = true
 prost.workspace = true
 processing.workspace = true
+# The program host, which runs the policy package's control and routing programs on the leader
+# (`programs`), and the program SDK whose inputs and outputs they read and give.
+program.workspace = true
+scheduling.workspace = true
 proto.workspace = true
 service.workspace = true
 reqwest = { workspace = true, features = ["http2", "rustls-tls"] }

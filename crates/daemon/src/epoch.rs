@@ -350,12 +350,41 @@ pub fn modules_of(config: &Config) -> ModuleSet {
             arguments: toml::Table::new(),
         },
         kernels,
+        // The installed default until the package's programs are fixed ([`with_programs`]).
         policy: PackageRevision {
-            backend: config.scheduler_config.policy.clone(),
+            backend: proto::config::DEFAULT_SCHEDULING.to_owned(),
             revision: 0,
             arguments: policy_arguments(config),
         },
+        programs: Default::default(),
     }
+}
+
+/// `named`, the module set of `config` ([`modules_of`]), with the package's programs as their
+/// apply fixed them: every program recorded, and the scheduling program, when the package lists
+/// one, the engines' policy, its `args` over the configuration's policy arguments. A package
+/// that lists none keeps the installed default.
+pub fn with_programs(
+    mut named: ModuleSet,
+    config: &Config,
+    programs: BTreeMap<String, proto::module::Program>,
+) -> ModuleSet {
+    let scheduling = programs
+        .iter()
+        .find(|(_, program)| program.kind == scheduling::program::Kind::Scheduling);
+    if let Some((name, program)) = scheduling {
+        let mut arguments = policy_arguments(config);
+        if let Some(entry) = config.programs.get(name) {
+            arguments.extend(entry.args.clone());
+        }
+        named.policy = PackageRevision {
+            backend: program.backend.clone(),
+            revision: program.revision,
+            arguments,
+        };
+    }
+    named.programs = programs;
+    named
 }
 
 /// The attention operator's modules: one entry for every phase when the
@@ -395,21 +424,19 @@ fn attention_packages(config: &Config) -> Vec<(KernelKey, PackageRevision)> {
         .collect()
 }
 
-/// The scheduling policy package's parameters: the configuration's values the scheduling policy
-/// decides with. The step's budget, its prefill chunk and the waiting queue's bound are no
-/// argument of the policy: the schedulers read them at every step (`proto::config::Tuning`).
+/// The scheduling policy's arguments the configuration states beside its program's `args`: the
+/// speculation's decision values. The step's budget, its prefill chunk and the waiting queue's
+/// bound are no argument of the policy: the schedulers read them at every step
+/// (`proto::config::Tuning`).
 fn policy_arguments(config: &Config) -> toml::Table {
     #[derive(Serialize)]
     struct Arguments {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        order: Option<proto::config::QueueOrder>,
         #[serde(skip_serializing_if = "Option::is_none")]
         expected_speedup: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         refill_token_cost: Option<f64>,
     }
     let arguments = Arguments {
-        order: config.scheduler_config.order,
         expected_speedup: config.speculative_config.expected_speedup,
         refill_token_cost: config.speculative_config.refill_token_cost,
     };
@@ -639,22 +666,47 @@ mod tests {
         assert_eq!(tuning.max_queued_requests, NonZeroUsize::new(8));
     }
 
-    /// The order a deployment states for its waiting queue is the policy's `order` argument;
-    /// one that states none leaves the package's declared default.
+    /// The package's scheduling program is the engines' policy, its `args` the policy's
+    /// arguments over the configuration's; a package that lists none runs the installed default,
+    /// and its other programs are recorded without changing the policy.
     #[test]
-    fn the_queue_order_is_the_policys_order_argument() {
+    fn the_scheduling_program_is_the_engines_policy() {
+        let program = |kind, backend: &str| proto::module::Program {
+            source: format!("uniserve:{backend}"),
+            backend: backend.to_owned(),
+            revision: 3,
+            kind,
+            digest: "ab".repeat(32),
+        };
         let mut config = Config::default();
-        assert!(
-            !crate::epoch::modules_of(&config)
-                .policy
-                .arguments
-                .contains_key("order")
-        );
+        config.speculative_config.expected_speedup = Some(2.0);
+        let chunk = BTreeMap::from([(
+            "chunk".to_owned(),
+            program(scheduling::program::Kind::Control, "chunk"),
+        )]);
+        let named = with_programs(modules_of(&config), &config, chunk.clone());
+        assert_eq!(named.policy.backend, proto::config::DEFAULT_SCHEDULING);
+        assert_eq!(named.programs, chunk);
 
-        config.scheduler_config.order = Some(proto::config::QueueOrder::Priority);
+        config.programs.insert(
+            "fair".to_owned(),
+            toml::from_str("source = \"uniserve:fair\"\nargs = { order = \"priority\" }\n")
+                .unwrap(),
+        );
+        let mut programs = chunk;
+        programs.insert(
+            "fair".to_owned(),
+            program(scheduling::program::Kind::Scheduling, "fair"),
+        );
+        let named = with_programs(modules_of(&config), &config, programs);
         assert_eq!(
-            crate::epoch::modules_of(&config).policy.arguments["order"],
-            toml::Value::String("priority".into())
+            (named.policy.backend.as_str(), named.policy.revision),
+            ("fair", 3)
+        );
+        assert_eq!(named.policy.arguments["order"].as_str(), Some("priority"));
+        assert_eq!(
+            named.policy.arguments["expected_speedup"].as_float(),
+            Some(2.0)
         );
     }
 
@@ -732,12 +784,6 @@ mod tests {
         ];
         // The package backends and the package parameters: a `Generation` change.
         let package: Vec<Case> = vec![
-            ("scheduler_config.policy", |config: &mut Config| {
-                config.scheduler_config.policy = "another".to_owned()
-            }),
-            ("scheduler_config.order", |config: &mut Config| {
-                config.scheduler_config.order = Some(proto::config::QueueOrder::Priority)
-            }),
             (
                 "speculative_config.expected_speedup",
                 |config: &mut Config| config.speculative_config.expected_speedup = Some(2.5),

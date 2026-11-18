@@ -78,7 +78,7 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
     let mut client = build_server::protocol::Client::connect(&socket).unwrap();
     let installed = client
         .install(&testkit::policy::package(
-            proto::config::DEFAULT_SCHEDULING_POLICY,
+            proto::config::DEFAULT_SCHEDULING,
         ))
         .unwrap();
     assert_eq!(installed.revision, 1);

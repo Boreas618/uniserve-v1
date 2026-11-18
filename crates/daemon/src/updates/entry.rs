@@ -21,6 +21,7 @@
 //! does beside it for a replica (moving requests to the engine that serves, reading the trial's
 //! thresholds, committing at the trial's end) is [`Replica::follow`].
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -98,7 +99,9 @@ fn retain_devices(served: &EngineConfig, target: &mut EngineConfig) {
 
 impl Leader {
     /// Changes the deployment to `target`, whose `config.toml` states `stated`, as operation
-    /// `number`: the least its declared effects need (module documentation).
+    /// `number`, with the package's `programs` as its apply fixed them: the least its declared
+    /// effects need (module documentation). The scheduling program among the programs is the
+    /// engines' policy; a change of the others' alone moves no engine.
     ///
     /// An update it starts runs on after this returns: its phases end on the engines'
     /// acknowledgements, it commits by itself at its trial's end, and `GET /admin/status` and
@@ -116,6 +119,7 @@ impl Leader {
         force: bool,
         number: u64,
         revision: u64,
+        programs: BTreeMap<String, proto::module::Program>,
     ) -> Result<Applied, UpdateError> {
         let _replacing = self
             .replicas
@@ -146,7 +150,7 @@ impl Leader {
             return self.apply_in_place(target, stated, revision).await;
         }
         let mut next = crate::leader::deployment(&target)?;
-        next.modules = self.fix_modules(&target).await?;
+        next.modules = self.fix_modules(&target, programs).await?;
         let Some((serving, record)) = self.updates.epochs().serving() else {
             return self.apply_in_place(target, stated, revision).await;
         };
@@ -183,8 +187,12 @@ impl Leader {
     /// # Errors
     ///
     /// As [`Leader::apply`] when the module set cannot be fixed.
-    pub(crate) async fn reselects(&self, target: &Config) -> Result<bool, UpdateError> {
-        let modules = self.fix_modules(target).await?;
+    pub(crate) async fn reselects(
+        &self,
+        target: &Config,
+        programs: BTreeMap<String, proto::module::Program>,
+    ) -> Result<bool, UpdateError> {
+        let modules = self.fix_modules(target, programs).await?;
         let Some((_, record)) = self.updates.epochs().serving() else {
             return Ok(false);
         };
@@ -220,8 +228,12 @@ impl Leader {
     /// the deployment's Build Server on this node selects it with `cover`, with every module built
     /// on every host `target`'s processes run on before anything starts from
     /// it.
-    async fn fix_modules(&self, target: &Config) -> Result<crate::epoch::ModuleSet, UpdateError> {
-        let named = crate::epoch::modules_of(target);
+    async fn fix_modules(
+        &self,
+        target: &Config,
+        programs: BTreeMap<String, proto::module::Program>,
+    ) -> Result<crate::epoch::ModuleSet, UpdateError> {
+        let named = crate::epoch::with_programs(crate::epoch::modules_of(target), target, programs);
         // A daemon that starts no engine of its own has no Build Server to
         // select at, no daemons of other hosts to reach, and no engine to move.
         let control = Arc::clone(
@@ -674,8 +686,15 @@ impl Replica {
             ));
         }
         let current = service::lock(&self.config).clone();
-        let changes = proto::reload::changes(Some(&current), &target);
+        // The programs are replaced by their hosts between two calls: the leader's by the node,
+        // the scheduling program by a generation of its module, the KV program by the Storage
+        // Servers. No engine moves for them here.
+        let changes: Vec<_> = proto::reload::changes(Some(&current), &target)
+            .into_iter()
+            .filter(|change| change.effect != Effect::Program)
+            .collect();
         if changes.is_empty() {
+            *service::lock(&self.config) = target;
             return Ok(Applied::Unchanged);
         }
         // The daemon orchestrates what changes in its own options: a hot restart applies them

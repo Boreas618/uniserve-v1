@@ -188,8 +188,8 @@ mod tests {
             ),
             ("max_running_requests = 0\n", "max_running_requests"),
             (
-                "[scheduler_config]\npolicy = [\"fcfs\"]\n",
-                "scheduler_config.policy",
+                "[programs.chunk]\nsource = \"chunk\"\n",
+                "programs.chunk.source",
             ),
             ("max_batch = 4\n", "max_batch"),
             ("[quantization]\nmode = \"fastest\"\n", "quantization.mode"),

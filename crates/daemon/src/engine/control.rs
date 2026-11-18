@@ -1391,7 +1391,7 @@ fn candidates(
 
 /// Fixes the revision of the package `package` names for `op`: the one it states, checked, or
 /// its latest installed one.
-fn fix_revision(
+pub(crate) fn fix_revision(
     client: &mut build_server::Client,
     op: &str,
     package: &mut proto::module::PackageRevision,
@@ -1530,6 +1530,8 @@ fn prepare_at(
         engine,
         kernels,
         policy,
+        // The programs were fixed before the set: the Build Servers prepare the engines' modules.
+        programs: filled.programs.clone(),
     })
 }
 

@@ -172,6 +172,8 @@ struct Pending {
     /// Sent the request's admission once the engine accepts it, or `None`
     /// when the request ends first.
     accepted: Option<oneshot::Sender<Option<Admission>>>,
+    /// The scheduler that serves it, once the engine accepted it.
+    scheduler: Option<u32>,
 }
 
 /// How an engine admitted a request: the scheduler that serves it, and the
@@ -458,6 +460,7 @@ impl EngineClient {
             Pending {
                 events,
                 accepted: Some(accepted),
+                scheduler: None,
             },
         );
         // The stream exists before the acceptance arrives, so that dropping
@@ -525,6 +528,7 @@ impl EngineClient {
             Pending {
                 events,
                 accepted: None,
+                scheduler: None,
             },
         );
         let stream = EventStream {
@@ -607,6 +611,21 @@ impl EngineClient {
                 return Ok(Some(exit.status));
             }
         }
+    }
+
+    /// The requests in flight on each of the engine's schedulers, by its index: those the engine
+    /// accepted and that have not ended.
+    pub fn in_flight_by_scheduler(&self) -> Vec<u32> {
+        let mut counts = vec![0_u32; self.info.schedulers as usize];
+        for pending in lock(&self.shared.requests).values() {
+            if let Some(count) = pending
+                .scheduler
+                .and_then(|scheduler| counts.get_mut(scheduler as usize))
+            {
+                *count = count.saturating_add(1);
+            }
+        }
+        counts
     }
 
     /// The requests submitted to the engine that have not ended.
@@ -1099,12 +1118,12 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             }
             Some(from_engine::Kind::Accepted(accepted)) => {
                 let mut requests = lock(&shared.requests);
-                if let Some(responder) = requests
-                    .get_mut(&RequestId(accepted.request))
-                    .and_then(|pending| pending.accepted.take())
-                {
-                    let engine = RequestId(accepted.engine_request);
-                    let _ = responder.send(Some((accepted.scheduler, engine)));
+                if let Some(pending) = requests.get_mut(&RequestId(accepted.request)) {
+                    pending.scheduler = Some(accepted.scheduler);
+                    if let Some(responder) = pending.accepted.take() {
+                        let engine = RequestId(accepted.engine_request);
+                        let _ = responder.send(Some((accepted.scheduler, engine)));
+                    }
                 }
             }
             Some(from_engine::Kind::Metrics(metrics)) => {

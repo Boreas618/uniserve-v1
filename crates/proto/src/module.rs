@@ -150,6 +150,28 @@ pub struct ModuleSet {
     /// Written as a list of pairs, because a launch file is JSON and a slot is no JSON key.
     #[serde_as(as = "Vec<(_, _)>")]
     pub kernels: BTreeMap<ModuleSlot, PackageRevision>,
+    /// The policy package's programs, by their names in its `config.toml`: the program package
+    /// revision each one's source fixed to and what its module states. The scheduling program
+    /// among them is also [`Self::policy`], which the engines run; the others run on the leader
+    /// daemon and the Storage Servers, so the engines' wire form of the set leaves them out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub programs: BTreeMap<String, Program>,
+}
+
+/// One program of a module set: where it came from, the program package revision its apply
+/// fixed, and what its module states.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Program {
+    /// Its source as the configuration writes it: `programs/<dir>` or `uniserve:<package>`.
+    pub source: String,
+    /// The installed program package that builds its module, at the fixed revision; a crate of
+    /// the policy package is installed as the package `programs.<dir>`.
+    pub backend: String,
+    pub revision: u32,
+    /// The kind of program its module states.
+    pub kind: scheduling::program::Kind,
+    /// The SHA-256 of its wasm32 module, in hex.
+    pub digest: String,
 }
 
 /// The operators of this build, by the name their packages are filed under.

@@ -136,6 +136,7 @@ impl TryFrom<wire::ModuleSet> for ModuleSet {
             engine: engine.try_into()?,
             policy: policy.try_into()?,
             kernels,
+            programs: BTreeMap::new(),
         })
     }
 }
@@ -237,6 +238,7 @@ mod tests {
                     package("triton", 1),
                 ),
             ]),
+            programs: Default::default(),
         };
 
         let wire = wire::ModuleSet::from(&modules);

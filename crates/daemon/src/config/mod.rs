@@ -15,6 +15,7 @@
 //! another kind rather than ignoring it ([`Stated::refuse_foreign_options`]).
 
 mod args;
+pub mod program;
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -157,10 +158,9 @@ impl Config {
             video_config: Of(Kind::Video),
             media_config: Of(Kind::Video),
             video_job_config: Of(Kind::Video),
+            programs: Every,
         });
         let scheduler = classified!(SchedulerConfig, "scheduler_config.", {
-            policy: Every,
-            order: Every,
             max_queued_requests: Every,
             chunked_prefill_size: Of(Kind::Chat),
             max_batch: Every,
@@ -409,6 +409,13 @@ pub struct Config {
     pub media_config: MediaConfig,
     #[reload(daemon)]
     pub video_job_config: VideoJobConfig,
+    /// The package's programs, by name (`[programs.<name>]`): each one's source, period and
+    /// arguments. A change replaces the instance of each program whose entry or module changed
+    /// between two of its calls; the others keep theirs. A package that lists no scheduling
+    /// program runs `uniserve:arrival`.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[reload(program)]
+    pub programs: std::collections::BTreeMap<String, program::Program>,
 }
 
 impl Default for Config {
@@ -459,6 +466,7 @@ impl Default for Config {
             video_config: VideoConfig::default(),
             media_config: MediaConfig::default(),
             video_job_config: VideoJobConfig::default(),
+            programs: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -732,7 +740,7 @@ impl Config {
     /// (0, 1], a rank layout-shorthand option is stated with `worker_groups`, the
     /// server host or Unix socket path is blank, or
     /// `video_config.max_seconds` lies outside the durations the video API
-    /// admits.
+    /// admits, or a program's name is not one plain name or its period is zero.
     pub fn validate(&self, stated: &Stated) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.states_model(),
@@ -748,6 +756,17 @@ impl Config {
             "`admin_config.join` is the port the other nodes reach the leader at: a deployment of \
              several nodes states a fixed one"
         );
+        // A program's name names its saved state's file and the revisions it writes.
+        for (name, program) in &self.programs {
+            anyhow::ensure!(
+                program::plain(name),
+                "`programs.{name}` is not one plain name (letters, digits, `-`, `_`, `.`)"
+            );
+            anyhow::ensure!(
+                program.period.is_none_or(|period| !period.is_zero()),
+                "`programs.{name}.period` is zero: state how often the program steps"
+            );
+        }
         // A token bound the deployment states above its own graph catalog is
         // refused here, by the option, before any weight loads: the engine
         // admits no batch larger than its largest captured bucket, so the

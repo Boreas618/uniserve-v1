@@ -448,6 +448,7 @@ impl Restarter {
                             engine: record.engine,
                             kernels: record.kernels,
                             policy: record.policy,
+                            programs: Default::default(),
                         }
                     }),
                 })),

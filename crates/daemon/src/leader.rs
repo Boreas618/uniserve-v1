@@ -80,6 +80,9 @@ pub struct Leader {
     log_requests: bool,
     /// The deployment's writer of the observation store.
     recorder: Recorder,
+    /// The routing program every new request is routed through, while one runs
+    /// (`crate::programs`).
+    router: Arc<crate::programs::Router>,
     /// Periodic throughput logging, stopped with the engine.
     _stats_logger: Option<StatsLogger>,
 }
@@ -421,6 +424,66 @@ impl Leader {
                 }
             }
         }
+    }
+
+    /// The replica and the scheduler of it a new request goes to: the routing program's choice
+    /// among every serving replica's schedulers while one runs (`crate::programs::Router`), and
+    /// otherwise, or when its route is refused, the least loaded replica, whose engine gives the
+    /// request to its least loaded scheduler.
+    ///
+    /// Every replica serves both phases, so the request is computed and decoded where the
+    /// route's prefill names: a deployment of mixed replicas hands no request between two.
+    async fn route(&self, request: &Request) -> Result<(Arc<Replica>, Option<u32>), SubmitError> {
+        let least = self.replica_for_request().await?;
+        if !self.router.routes() {
+            return Ok((least, None));
+        }
+
+        let serving: Vec<Arc<Replica>> = self
+            .replicas()
+            .into_iter()
+            .filter(|replica| replica.hold.is_serving())
+            .collect();
+        let mut schedulers = Vec::new();
+        let mut views = Vec::new();
+        for (index, replica) in serving.iter().enumerate() {
+            let Some(client) = replica.hold.client() else {
+                continue;
+            };
+            for (scheduler, running) in client.in_flight_by_scheduler().into_iter().enumerate() {
+                let scheduler = u32::try_from(scheduler).unwrap_or(u32::MAX);
+                schedulers.push((index, scheduler));
+                views.push(scheduling::routing::Replica {
+                    id: format!("{}.{scheduler}", replica.ordinal),
+                    role: scheduling::routing::Role::Mixed,
+                    queued: 0,
+                    remaining: scheduling::time::Duration(0),
+                    running,
+                    usage: Vec::new(),
+                    reservable: 0,
+                    hits: Vec::new(),
+                });
+            }
+        }
+        let prompt = match request {
+            Request::Generation(generation) => generation.prompt_token_ids.len(),
+            Request::Diffusion(_) => 0,
+        };
+        let routing = scheduling::routing::Routing {
+            request: scheduling::routing::Request {
+                prompt: u32::try_from(prompt).unwrap_or(u32::MAX),
+                prefix: Vec::new(),
+                session: None,
+            },
+            replicas: views,
+        };
+        Ok(match self.router.route(&routing) {
+            Some(route) => {
+                let (index, scheduler) = schedulers[route.prefill];
+                (Arc::clone(&serving[index]), Some(scheduler))
+            }
+            None => (least, None),
+        })
     }
 
     /// Ends every replica's parked standby.
@@ -1242,8 +1305,14 @@ impl Leader {
             updates,
             log_requests: logging.log_requests,
             recorder,
+            router: Arc::default(),
             _stats_logger: stats_logger,
         })
+    }
+
+    /// The slot of the routing program every new request is routed through.
+    pub(crate) fn router(&self) -> &Arc<crate::programs::Router> {
+        &self.router
     }
 
     /// The loaded model's input processor.
@@ -1476,8 +1545,8 @@ impl Leader {
         &self,
         request: Request,
     ) -> Result<(RequestEvents, Placement), SubmitError> {
-        let replica = self.replica_for_request().await?;
-        let (events, scheduler) = replica.migrator.submit(request, None).await?;
+        let (replica, scheduler) = self.route(&request).await?;
+        let (events, scheduler) = replica.migrator.submit(request, scheduler).await?;
         let placement = Placement {
             replica: replica.ordinal as u32,
             scheduler,

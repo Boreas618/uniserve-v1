@@ -24,7 +24,9 @@
 //! - `config`: the serving option tree (`config::Config`);
 //! - `observation`: the deployment's observation store, the `stats` and
 //!   `events` tables queried with SQL, and its writers (`observation::record`);
-//! - `programs`: the policy package's programs the leader runs or hands the Storage Servers;
+//! - `origins`: where the modules each replica runs come from (`uniserve_replica_module`);
+//! - `programs`: the policy package's control and routing programs, which the leader runs in
+//!   the program host, and the KV program it hands the Storage Servers;
 //! - `restart`: the hot restart that hands a deployment to a successor
 //!   daemon.
 
@@ -39,6 +41,7 @@ mod leader;
 pub mod migration;
 pub mod observation;
 pub mod observe;
+pub(crate) mod origins;
 pub mod policy;
 pub mod profiling;
 pub(crate) mod programs;

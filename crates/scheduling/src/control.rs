@@ -58,8 +58,11 @@ impl State {
     }
 }
 
-/// A deployment's configuration, as its policy package's `config.toml` states it: a table of
-/// options addressed by dotted paths such as `scheduler_config.chunked_prefill_size`.
+/// A deployment's whole configuration, every option at its value, the defaults included: the
+/// JSON of the leader's configuration type, which reads back as exactly that configuration, so a
+/// program sees every option and an output it changes nothing else of changes nothing else.
+/// Options are addressed by dotted paths such as `scheduler_config.chunked_prefill_size`; an
+/// option the configuration leaves unset reads as `None`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Config(pub Value);

@@ -551,6 +551,7 @@ mod tests {
                 arguments: toml::Table::new(),
             },
             kernels: BTreeMap::new(),
+            programs: Default::default(),
         };
         revisions.lock(one, &modules).unwrap();
         assert_eq!(revisions.load(one).unwrap().lock, Some(modules));

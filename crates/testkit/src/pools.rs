@@ -78,6 +78,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
         engine: package("uniserve"),
         policy: package("arrival"),
         kernels: Default::default(),
+        programs: Default::default(),
     };
     let config = proto::config::EngineConfig {
         executable: proto::BUILD.to_owned(),

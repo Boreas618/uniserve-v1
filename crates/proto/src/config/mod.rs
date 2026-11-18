@@ -305,30 +305,24 @@ pub const DEFAULT_MAX_BATCH: usize = 128;
 pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 /// Default maximum number of concurrently running requests.
 pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
-/// The order a scheduling policy's waiting queue admits by, which `scheduler_config.order` states.
+/// The order a scheduling policy's waiting queue admits by, which its `order` argument states.
 pub use scheduling::QueueOrder;
 
-/// The scheduling policy package a deployment runs when its configuration names none
-/// (`crates/scheduling/policies/arrival`).
-pub const DEFAULT_SCHEDULING_POLICY: &str = "arrival";
+/// The installed scheduling program a deployment runs when its policy package lists none
+/// (`uniserve:arrival`, `crates/scheduling/policies/arrival`).
+pub const DEFAULT_SCHEDULING: &str = "arrival";
 
 /// Admission and batching (`scheduler_config`), and the limits a scheduler runs with once the
 /// engine resolved them.
 ///
-/// The section states the policy, the waiting queue, the prefill chunk and the batch. When the
+/// The section states the waiting queue, the prefill chunk and the batch; the scheduling policy
+/// is the policy package's scheduling program (`[programs.<name>]`). When the
 /// engine starts a scheduler it resolves the rest from the configuration and the ranks' captured
 /// catalog ([`SchedulerConfig::of`]): those fields are never read from a configuration file and
 /// never written to one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulerConfig {
-    /// The scheduling policy package's backend (`arrival`): a package the Build Server holds.
-    #[reload(program)]
-    pub policy: String,
-    /// The order the policy's waiting queue admits by (its `order` argument): by arrival, or by
-    /// the request's own priority and then arrival; the package's default when unset.
-    #[reload(program)]
-    pub order: Option<QueueOrder>,
     /// Waiting requests, and finished ones with undelivered events, before
     /// a submission is refused as overloaded; unbounded when unset.
     #[reload(step)]
@@ -456,8 +450,6 @@ impl Default for PolicyBudget {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            policy: DEFAULT_SCHEDULING_POLICY.to_owned(),
-            order: None,
             max_queued_requests: None,
             chunked_prefill_size: None,
             max_batch: positive(DEFAULT_MAX_BATCH),
@@ -489,8 +481,6 @@ impl SchedulerConfig {
         graph_tiers: Vec<u32>,
     ) -> Self {
         Self {
-            policy: engine.scheduler.policy.clone(),
-            order: engine.scheduler.order,
             max_queued_requests: engine.scheduler.max_queued_requests,
             chunked_prefill_size: engine.scheduler.chunked_prefill_size,
             max_batch: positive(max_batch),

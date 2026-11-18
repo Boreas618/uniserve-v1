@@ -16,6 +16,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, ensure};
 
+use crate::config::program::Source;
 use crate::config::{Config, Stated};
 
 /// The file of a package that holds its configuration.
@@ -42,30 +43,68 @@ impl Package {
     ///
     /// # Errors
     ///
-    /// Fails when the configuration has no TOML form.
+    /// Fails when the configuration has no TOML form, or takes a program from a crate
+    /// `programs` lacks.
     pub fn of(config: Config, programs: BTreeMap<PathBuf, Vec<u8>>) -> anyhow::Result<Self> {
         // The stated paths are the printed file's: what a reader of the package's `config.toml`
         // finds stated, which is what a start from that file would read.
         let (config, stated) = crate::config::parse(&crate::config::printed(&config)?)?;
-        Ok(Self {
+        let package = Self {
             config,
             stated,
             programs,
-        })
+        };
+        package.check_sources()?;
+        Ok(package)
+    }
+
+    /// Checks that every program the configuration takes from the package has its crate there:
+    /// a `Cargo.toml` in its directory under `programs/`.
+    ///
+    /// # Errors
+    ///
+    /// Fails naming the first program whose crate the package lacks.
+    fn check_sources(&self) -> anyhow::Result<()> {
+        for (name, program) in &self.config.programs {
+            if let Source::Package(directory) = &program.source {
+                ensure!(
+                    self.programs
+                        .contains_key(&Path::new(directory).join("Cargo.toml")),
+                    "`programs.{name}` takes its source from `{PROGRAMS}/{directory}`, where the \
+                     package holds no `Cargo.toml`"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The files of the crate in the package's `programs/<directory>`, by their path relative to
+    /// that directory: what the Build Server compiles the program from.
+    pub fn crate_files(&self, directory: &str) -> BTreeMap<PathBuf, Vec<u8>> {
+        self.programs
+            .iter()
+            .filter_map(|(path, contents)| {
+                let relative = path.strip_prefix(directory).ok()?;
+                Some((relative.to_owned(), contents.clone()))
+            })
+            .collect()
     }
 
     /// The package `text`, a `config.toml`, and `programs` make.
     ///
     /// # Errors
     ///
-    /// Fails when `text` is no configuration ([`crate::config::parse`]).
+    /// Fails when `text` is no configuration ([`crate::config::parse`]), or takes a program from
+    /// a crate `programs` lacks.
     fn from_parts(text: &str, programs: BTreeMap<PathBuf, Vec<u8>>) -> anyhow::Result<Self> {
         let (config, stated) = crate::config::parse(text)?;
-        Ok(Self {
+        let package = Self {
             config,
             stated,
             programs,
-        })
+        };
+        package.check_sources()?;
+        Ok(package)
     }
 
     /// Reads the package in `directory`: its `config.toml` and every file under its `programs/`.

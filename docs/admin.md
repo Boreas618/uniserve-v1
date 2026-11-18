@@ -39,6 +39,14 @@ curl --unix-socket "$admin" -X PUT -H "If-Match: $(sed -n 's/^etag: //Ip' header
 
 To undo a change that converged, apply the package of the revision before it (`GET /admin/policy?revision=N`) as the next change.
 
+The package's programs write through the same apply (`docs/configuration.md`, Programs). A control program's output is a change whose revision names the program as its `writer`: the options it changed of the revision it read take its values, the rest keep those of the revision that serves when it is applied, and an output a start would refuse writes no revision. A `PUT` replaces the running programs: a program whose `source`, `args` and module are unchanged keeps its instance, and any other gets a new one, restored from the old one's saved state when the arguments are the same and the state decodes. What a program logs, an output refused, a route the leader refused and a program that ended are `log` events of `/admin/query` with the program's name as their `writer`, and the outcome of each write is its revision's `revision` event:
+
+```sql
+SELECT time, labels, fields FROM events WHERE kind = 'log' AND labels['writer'] = 'chunk' ORDER BY time DESC LIMIT 20
+```
+
+`uniserve_replica_module` states, for every replica and every module it runs (`op`, `backend`, `revision`), the git commit its Build Server revision was installed from and whether that tree was clean (`commit`, `clean` labels; a policy package's own program crate has no commit): `1` for a module the replica runs, `0` once it no longer does, so `SELECT * FROM stats WHERE name = 'uniserve_replica_module' AND value = 1 AND labels['clean'] = 'false'` finds the replicas that run a revision no release holds.
+
 ## Updates
 
 An update moves a deployment to another set of modules while it serves, as a trial that commits by itself or rolls back. A deployment runs the package revisions its epoch names; installing a package at the Build Server selects nothing, and an apply (`PUT /admin/policy`) is what moves them. The daemon fixes the target's module set once, when the package is applied, and records it in the revision's `lock.toml`: it asks the Build Server's `cover` for the revision of the engine package, the scheduling policy and every kernel package, builds every module on every host the target runs on, and compares the fixed set with what the serving epoch runs. A change then does the least it needs:
