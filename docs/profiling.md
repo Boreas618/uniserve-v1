@@ -164,13 +164,64 @@ target/release/uniserve-profile perfetto profiles/profile-1-*.sqlite -o trace.js
 
 ## Request timelines
 
-The host stages a request passes through and the kernels timed on the device are `span` events of the observation store (`kind = 'span'`), which the leader gathers from every node as `/admin/query` reads them. A span's labels are `replica`, `process` (`daemon`, `scheduler`, `worker` or `storage`) and, for a worker's, `rank`; its fields are `start` and `end`, in nanoseconds since the Unix epoch on the host clock (device times converted through the `%globaltimer` samples above), the `request` id or the `batch` id it belongs to, and the host stage's name (`stage`) or the kernel (`kernel`, with its operator and descriptor key as the `op` and `descriptor` labels). A span that names both a request and a batch is the scheduler's membership record of the request in the batch, written as it forms the batch, which joins a request to its batches; a batch's worker spans join it to its steps and kernels.
+Every request has a timeline of its own: the stages it passes through in the daemon, its scheduler, its workers and the Storage Server, the steps of the batches it was a member of and the kernels of those steps. They are `span` events of the observation store (`kind = 'span'`), which stay in the rings of the processes that recorded them until `/admin/query` reads them.
+
+**Host stages.** Each stage writes two records of 16 bytes into a ring of its thread, one as it begins and one as it ends: the host's `CLOCK_REALTIME` in nanoseconds and one word holding the owner's id (48 bits), the stage (14 bits) and the record's mark (2 bits). A record takes a clock read and three stores, with no lock and no allocation (`service::span`); a thread claims its ring at its first record and frees it as it exits, and a ring keeps the last 65,536 records of its thread, overwriting the oldest. The stages, by process:
+
+| Process | Stage | Owner | What it spans |
+| --- | --- | --- | --- |
+| daemon | `receive` | request | The request's head read, through the HTTP layers, until its route takes it |
+| | `parse` | request | Its body read, parsed and validated |
+| | `fetch` | request | Its media downloaded and decoded |
+| | `template` | request | The chat template rendered |
+| | `tokenize` | request | The prompt tokenized |
+| | `preprocess` | request | Its media prepared for the model's encoders |
+| | `route` | request | The replica and scheduler chosen |
+| | `submit` | request | The hand-over to the engine, until the engine accepted it |
+| | `detokenize` | request | One engine event's tokens decoded and parsed |
+| | `assemble` | request | One event's outputs assembled into the response's chunks or document |
+| | `send` | request | One event's chunks handed to the connection |
+| scheduler | `enqueue` | request | From the main process's receipt until its scheduler took it |
+| | `admit` | request | The admission: from its first round at the buffer pool until its last answer settled it |
+| | `schedule` | batch | The call of the scheduling program in the step that formed the batch |
+| | `batch` | batch | The batch's formation; each request in it writes a membership record |
+| worker | `copy_in` | batch | The batch's columns, slots and inputs, up to the replay |
+| | `launch` | batch | The replay of its graph |
+| | `copy_out` | batch | From the issue of its outputs' copy until the host holds them |
+| | `postprocess` | batch | The calls' outputs assembled on the host: sampled tokens, stop conditions, logprobs |
+| | `step` | batch | The batch's step on the device, between its step markers |
+| storage | `handoff` | request | A prefill-to-decode handoff: the buffer pool's copy of the request's blocks into the decode group's memory, with the `bytes` it copied |
+
+A request's id is its trace id, which the daemon gives it as it receives it and which the request carries to the engine (`Request.trace`) and to the Storage Server (`Transfer.trace`); it stays the same when the request migrates, and the request's `request` event states it as its `request` field. A batch's id is its scheduler's number of it, which carries the scheduler's data-parallel rank from bit 40. As the scheduler forms a batch it writes a membership record for each request in it, which joins the request to the batch.
+
+**Kernels.** The device side reuses the fence probes. A capture of a forward that enters the family's step stack also places a probe before and after kernels: the stack's child ranges are its layers, two layers are of one kind when their module classes and the operators and descriptor keys of their launch tables are the same, and of each kind the instance `profiling_config.kernel_instance` names (by its position in launch order, the last of a kind with fewer) carries a probe pair around each of its launches, cuBLASLt's and other libraries' included, as does every launch outside the layers (embedding, the final norm, the head, sampling). Qwen3-30B-A3B's decoder layers are two kinds, its first layer and the 47 after it, whose launch tables differ; a hybrid model's linear-attention, full-attention, dense and MoE layers are a kind each. Each probed launch is a site named by its operator, descriptor key and module path from the launch table, and by the layers of its kind. A step's device time comes from its step markers; a representative kernel's time times its `layers`, beside the kernels outside the layers, decomposes the step. Each device's reader writes the step's span and the span of every probe pair of the step into the device's ring as the step's end marker is read, converting `%globaltimer` to the host's `CLOCK_REALTIME` through the device's latest calibration (above), which it takes again every 10 s, the least uncertain of three samples.
+
+Moving the kernel probes (`kernel_instance`) captures every bucket again, so it is a kernel generation (`docs/admin.md`); switching them (`kernel_probes`) writes their switch word at the engine's next step and keeps the graphs, as `fence_probes` does.
+
+**Reading.** A query whose `kind` condition admits `span`, or that states none, has the leader read the spans: every replica's engine reads its processes' rings (its control thread's, schedulers', workers' and devices'; a peer's through the peer link), and every node's daemon reads its own and its Storage Server's. Each process names its own records, so a reader of another build reads them. The spans that ended within `profiling_config.span_window` (5 minutes by default) are read. They are the query's rows only: an SSE stream of `events` carries none.
+
+A span's labels are where it ran: `process` (`daemon`, `scheduler`, `worker` or `storage`), an engine's `replica`, a daemon's or Storage Server's `host`, a scheduler's `scheduler`, a worker's `group` and `rank`, and a kernel's `op`, `descriptor` and `module`. Its fields are `start` and `end`, in nanoseconds since the Unix epoch on the host clock, the `request` (the trace id) or the `batch` (`<epoch>.<batch id>`), the host stage's name (`stage`) or the kernel's operator (`kernel`, with the `layers` it stands for), and the `bytes` a stage moved. A span that names both a request and a batch is the scheduler's membership record of the request in the batch, spanning the batch's formation, which joins a request to its batches; a batch's worker spans join it to its steps and kernels.
+
+```bash
+curl --unix-socket "$admin" -G http://admin/admin/query --data-urlencode "q=
+  SELECT fields['request'] AS request, fields['latency'] AS latency
+  FROM events WHERE kind = 'request' ORDER BY time DESC LIMIT 5"
+```
+
+**Cost.** On GB200, a host record (`the_cost_of_one_record` in `service::span`, a release build) took 36.0 ns on the Grace CPU, of which 30.6 ns is the read of `CLOCK_REALTIME`: a request that decodes 512 tokens writes about 3,000 records in the daemon (three stages per engine event), about 110 µs of the daemon's CPU over its life. The kernel probes were measured as the fence probes were (Qwen3-30B-A3B in bfloat16 on one GB200, greedy decode of 512 tokens per request, 60 s per point, the decode step time as the point's seconds over its graph replays): with `kernel_instance = 0` the decode graph carries 104 kernel probes a step (52 kernels: layer 0 and layers 1 to 47 as two kinds of layer, and the kernels outside the layers), and switching `kernel_probes` on and off in one server, four pairs a point, gave
+
+| Requests | Step time, probes on | Step time, probes off | On against off, by pair |
+| --- | --- | --- | --- |
+| 1 | 5.008 ms | 4.878 ms | +2.65% (+0.08 to +4.14%) |
+| 32 | 6.258 ms | 6.001 ms | +4.29% (+3.41 to +5.10%) |
+
+A server that places no kernel probe stepped in 4.755 ms at one request and 6.133 ms at 32, so the placed probes cost about 2.6% switched off at one request, within the spread between servers at 32. Recording the kernels of one instance of each kind of layer thus costs 3 to 5% of a decode step beside the probes' placement, above the always-on budget, and `kernel_instance` is unset by default: a deployment, or a control program, places the probes as a kernel generation when it wants a step's kernels, and switches them off in place between reads.
 
 `uniserve-profile timeline` reads the spans through the admin socket and writes them as one trace in the Trace Event Format, which the Perfetto UI opens:
 
 ```bash
 target/release/uniserve-profile timeline --admin "unix:$admin" --request "$REQUEST" -o request.json
-target/release/uniserve-profile timeline --admin "unix:$admin" --batch 4182 -o batch.json
+target/release/uniserve-profile timeline --admin "unix:$admin" --batch 7.4182 -o batch.json
 target/release/uniserve-profile timeline --admin "unix:$admin" --last 5 -o recent.json
 target/release/uniserve-profile timeline --admin "unix:$admin" --from "$FROM_NS" --to "$TO_NS" -o window.json
 ```
