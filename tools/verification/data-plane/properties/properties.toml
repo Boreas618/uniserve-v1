@@ -1,0 +1,110 @@
+# The property list of the KV data plane (specs/kv-data-plane.md §2).
+#
+# One entry per property: its identifier, the module that states it, its kind,
+# its statement, the formulas that state it, the assumptions it rests on, the
+# hazards that violate it, and its status: checked (model checking on stated
+# configurations) or proposed.
+
+[[property]]
+id = "D1"
+file = "PlaneSafety.tla"
+name = "Faithful reads"
+kind = "safety"
+statement = """Every content a request reads, a page its prefill reuses from its device cache and \
+every item in its decode's pages when it decodes, is the content it needs; every item the decode \
+holds as delivered holds it until the request ends. It holds through role switches, epoch \
+switches, a stale directory and moves in flight."""
+formulas = ["Faithful", "Filled"]
+assumptions = ["E1", "E2", "E3", "E4", "M1", "B1"]
+violated_by = ["StaleAddress", "Unfenced", "KeyedTail", "SeedBlind", "SeedlessKey", "EarlyRelease", "UnreservedPush", "RoleFlush"]
+status = "checked"
+
+[[property]]
+id = "D2"
+file = "PlaneSafety.tla"
+name = "Integrity"
+kind = "safety"
+statement = "Every page a tier indexes by a key, a device cache, a host tier or the store, holds that key's content."
+formulas = ["Integrity"]
+assumptions = ["M1", "B1"]
+violated_by = ["StaleAddress"]
+status = "checked"
+
+[[property]]
+id = "D3"
+file = "PlaneSafety.tla"
+name = "Reservation"
+kind = "safety"
+statement = "Every copy of a handoff writes a page its request's decode reserved and still holds."
+formulas = ["Reserved"]
+assumptions = ["E1"]
+violated_by = ["UnreservedPush", "RoleFlush"]
+status = "checked"
+
+[[property]]
+id = "D4"
+file = "PlaneSafety.tla"
+name = "Lease"
+kind = "safety"
+statement = "A page leased to a request stays that request's, private or cached and pinned by it, until the lease ends."
+formulas = ["LeaseHeld"]
+assumptions = ["E1"]
+violated_by = ["EarlyRelease", "RoleFlush"]
+status = "checked"
+
+[[property]]
+id = "D5"
+file = "PlaneSafety.tla"
+name = "Holding"
+kind = "safety"
+statement = """A request under way holds the decode's pages of its items, and the prefill's until it \
+releases them; a copy keeps what its holder resolved for it."""
+formulas = ["Holding"]
+assumptions = ["E1", "B1"]
+violated_by = ["RoleFlush"]
+status = "checked"
+
+[[property]]
+id = "D6"
+file = "PlaneSafety.tla"
+name = "Unkeyed items"
+kind = "safety"
+statement = "An item without a key, the tail after the last full page or the live recurrent state, is never pulled."
+formulas = ["UnkeyedPushed"]
+assumptions = []
+violated_by = ["KeyedTail"]
+status = "checked"
+
+[[property]]
+id = "D7"
+file = "PlaneSafety.tla"
+name = "One key, one page"
+kind = "safety"
+statement = "A replica's device cache indexes a key by one page and a node's host tier by one page; a private page is not cached."
+formulas = ["OneKey"]
+assumptions = ["B1"]
+violated_by = []
+status = "checked"
+
+[[property]]
+id = "D8"
+file = "PlaneFinality.tla"
+name = "Finality"
+kind = "liveness"
+statement = """Under weak fairness of each request's own steps, a routed request ends and its \
+prefill's pages are released, whatever the directory states."""
+formulas = ["Finality", "Released"]
+assumptions = ["E1", "M1"]
+violated_by = []
+status = "checked"
+
+[[property]]
+id = "G1"
+file = "PlaneSafety.tla"
+name = "Configuration untouched"
+kind = "safety"
+statement = "Only the environment's switches change a role or a seed: the data plane's guarantee to the convergence model."
+formulas = ["ConfigUntouched"]
+assumptions = []
+violated_by = []
+status = "checked"
