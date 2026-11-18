@@ -103,6 +103,7 @@ mod tests {
             deployment: "model".to_owned(),
             epoch: 12,
             revision: 3,
+            replica: 1,
             predecessor: Some(Predecessor { epoch: 11 }),
             host: "rank-0".to_owned(),
             // The interfaces are data the engine reads; no socket is opened here.
@@ -142,6 +143,7 @@ mod tests {
             "engine_config",
             "epoch",
             "revision",
+            "replica",
             "predecessor",
             "deployment",
             "host",
@@ -165,6 +167,7 @@ mod tests {
         assert_eq!(value["engine"], json!(7));
         assert_eq!(value["deployment"], json!("model"));
         assert_eq!(value["epoch"], json!(12));
+        assert_eq!(value["replica"], json!(1));
         assert_eq!(value["devices"], json!([0, 1]));
         assert_eq!(value["world_size"], json!(1));
         assert_eq!(value["predecessor"]["epoch"], json!(11));

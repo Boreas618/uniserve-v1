@@ -46,6 +46,7 @@
 
 mod cache;
 mod drain;
+mod events;
 mod group;
 mod memory;
 pub mod policy;
@@ -366,6 +367,8 @@ pub struct Scheduler {
     retiring: Vec<u32>,
     /// Every cached block the scheduler knows of, by [`Cached::id`].
     cache: HashMap<u64, Cached>,
+    /// The KV events it publishes of the cached blocks it commits (`kv_events_config`).
+    events: events::Events,
     /// Per region, the cached blocks no request of this scheduler holds, by last use and id: the
     /// eviction order it installs.
     order: Vec<BTreeSet<(u64, u64)>>,
@@ -638,6 +641,7 @@ impl Scheduler {
             bounds: vec![None; count],
             retiring: vec![0; count],
             cache: HashMap::new(),
+            events: events::Events::new(u32::try_from(rank).unwrap_or(u32::MAX)),
             order: vec![BTreeSet::new(); count],
             ordered: vec![0; count],
             installed: vec![Vec::new(); count],
@@ -694,6 +698,14 @@ impl Scheduler {
     /// the slots its groups hold.
     pub(crate) fn max_running_requests(&self) -> usize {
         self.config.max_running_requests
+    }
+
+    /// Numbers the scheduler `ordinal` across the deployment (`EngineArgs::replica` plus its
+    /// index in its engine): the offset of the ports its own endpoints bind
+    /// (`kv_events_config.endpoint`) and the rank its KV event batches state. Its index in its
+    /// engine until numbered.
+    pub(crate) fn number(&mut self, ordinal: u32) {
+        self.events.number(ordinal);
     }
 }
 
@@ -949,6 +961,7 @@ impl Scheduler {
     /// than its new depth submits none until they end.
     fn retune(&mut self, tuning: &Tuning) {
         self.config.report_period = tuning.report_period;
+        self.events.configure(&tuning.kv_events);
         for group in &mut self.groups {
             let Some(depth) = tuning.queue_depths.get(group.config.id.0.as_str()) else {
                 continue;
@@ -1058,6 +1071,8 @@ impl Scheduler {
         self.shrink_to_bounds();
         self.reply_at_boundary();
         self.publish_stats(now);
+        // What the step changed of the cache leaves as one batch of KV events.
+        self.events.flush();
         self.settle_shutdown();
         formed
     }

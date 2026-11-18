@@ -583,6 +583,9 @@ pub struct Tuning {
     pub compare_timeout: Duration,
     /// Whether the processes emit their NVTX ranges (`profiling_config.nvtx_ranges`).
     pub nvtx_ranges: bool,
+    /// Where and how the schedulers publish their KV events (`kv_events_config`).
+    #[serde(default)]
+    pub kv_events: KvEventsConfig,
 }
 
 impl Tuning {
@@ -608,6 +611,7 @@ impl Tuning {
             watchdog_timeout: config.worker.watchdog_timeout,
             compare_timeout: config.worker.compare_timeout,
             nvtx_ranges: config.profiling.nvtx_ranges,
+            kv_events: config.kv_events.clone(),
         }
     }
 
@@ -634,6 +638,10 @@ impl Tuning {
             watchdog_timeout_ms: millis(self.watchdog_timeout),
             compare_timeout_ms: millis(self.compare_timeout),
             nvtx_ranges: self.nvtx_ranges,
+            kv_events_endpoint: self.kv_events.endpoint.clone(),
+            kv_events_replay_endpoint: self.kv_events.replay_endpoint.clone(),
+            kv_events_topic: self.kv_events.topic.clone(),
+            kv_events_buffer_steps: count(self.kv_events.buffer_steps),
         }
     }
 
@@ -660,6 +668,12 @@ impl Tuning {
             watchdog_timeout: Duration::from_millis(command.watchdog_timeout_ms),
             compare_timeout: Duration::from_millis(command.compare_timeout_ms),
             nvtx_ranges: command.nvtx_ranges,
+            kv_events: KvEventsConfig {
+                endpoint: command.kv_events_endpoint.clone(),
+                replay_endpoint: command.kv_events_replay_endpoint.clone(),
+                topic: command.kv_events_topic.clone(),
+                buffer_steps: count(command.kv_events_buffer_steps)?,
+            },
         })
     }
 }
@@ -1504,6 +1518,66 @@ impl Default for ProfilingConfig {
     }
 }
 
+/// The KV events every scheduler publishes (`kv_events_config`): which pages its cache holds
+/// on which medium, in SGLang's ZMQ format (`storage::events`), for KV-aware routers outside
+/// the deployment (Dynamo's, `sgl-router`, Mooncake's conductor). Each field takes effect at the
+/// schedulers' next step: a scheduler that starts publishing states the pages it commits from
+/// then on, after an `AllBlocksCleared`, and one whose endpoint changes publishes at the new one
+/// from its next step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, crate::reload::Reload)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvEventsConfig {
+    /// The `tcp://<host>:<port>` endpoint the schedulers' publishers bind, `*` for every
+    /// interface: the deployment's scheduler `n` (the schedulers numbered across its replicas
+    /// in order, [`EngineArgs::replica`]) binds the port plus `n`, as SGLang's data-parallel
+    /// rank `n` does. Unset, no scheduler publishes.
+    #[reload(step)]
+    pub endpoint: Option<String>,
+    /// The endpoint each publisher's replay socket binds, offset as `endpoint` is: a subscriber
+    /// that missed batches asks it for those from a sequence number on. Unset, there is none.
+    #[reload(step)]
+    pub replay_endpoint: Option<String>,
+    /// The topic every batch is published under; empty unless stated, as SGLang's.
+    #[reload(step)]
+    pub topic: String,
+    /// The batches a publisher keeps for its replay socket ([`DEFAULT_REPLAY_BATCHES`] unless
+    /// stated, as SGLang's `buffer_steps`).
+    #[reload(step)]
+    pub buffer_steps: NonZeroUsize,
+}
+
+/// The batches a KV event publisher keeps for replay when the deployment states none
+/// (`kv_events_config.buffer_steps`): SGLang's 10000.
+pub const DEFAULT_REPLAY_BATCHES: NonZeroUsize = match NonZeroUsize::new(10_000) {
+    Some(count) => count,
+    None => NonZeroUsize::MIN,
+};
+
+impl Default for KvEventsConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            replay_endpoint: None,
+            topic: String::new(),
+            buffer_steps: DEFAULT_REPLAY_BATCHES,
+        }
+    }
+}
+
+impl KvEventsConfig {
+    /// `endpoint` with its port offset by `ordinal` and `*` bound as every interface: what
+    /// scheduler `ordinal` of the deployment binds. `None` for an endpoint that is no
+    /// `tcp://<host>:<port>` or whose offset port leaves the port range.
+    pub fn offset(endpoint: &str, ordinal: u32) -> Option<String> {
+        let address = endpoint.strip_prefix("tcp://")?;
+        let (host, port) = address.rsplit_once(':')?;
+        let port = port.parse::<u16>().ok()?;
+        let port = u16::try_from(u32::from(port).checked_add(ordinal)?).ok()?;
+        let host = if host == "*" { "0.0.0.0" } else { host };
+        Some(format!("tcp://{host}:{port}"))
+    }
+}
+
 /// The shape a chat template takes message `content` in.
 ///
 /// A configuration states `string` or `openai`, or leaves the shape to be detected from the
@@ -1846,6 +1920,8 @@ pub struct EngineConfig {
     pub speculative: SpeculativeConfig,
     pub video: VideoConfig,
     pub profiling: ProfilingConfig,
+    /// The KV events the schedulers publish, a step value ([`Tuning::kv_events`]).
+    pub kv_events: KvEventsConfig,
 }
 
 impl EngineConfig {
@@ -1903,6 +1979,7 @@ impl EngineConfig {
             speculative,
             video,
             profiling,
+            kv_events: _,
         } = self;
         let MoeConfig {
             expert_parallel,
@@ -2100,6 +2177,13 @@ pub struct EngineArgs {
     /// revision's values arrive.
     #[serde(default)]
     pub revision: u64,
+    /// The ordinal of the process's replica among the epoch's replicas, in the order the
+    /// deployment's worker groups state them: what numbers its schedulers across the
+    /// deployment, scheduler `s` of replica `r` being the deployment's scheduler `r + s` (an
+    /// engine of several schedulers is the deployment's one replica, whose experts they share).
+    /// It offsets the ports of each scheduler's own endpoints (`kv_events_config.endpoint`).
+    #[serde(default)]
+    pub replica: u32,
     /// The deployment, by its policy package's name: the name its daemon, Storage Server and
     /// Build Server on every node serve it under, which keys its claims and pages at the
     /// Storage Server.
@@ -2194,6 +2278,7 @@ impl EngineArgs {
             epoch: 0,
             predecessor: None,
             revision: 0,
+            replica: 0,
             deployment: String::new(),
             host: String::new(),
             requests: String::new(),

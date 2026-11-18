@@ -130,6 +130,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
         speculative: Default::default(),
         video: Default::default(),
         profiling: Default::default(),
+        kv_events: Default::default(),
     };
     let mut args = EngineArgs::new(config, modules);
     args.deployment = format!("deployment-{}", uuid::Uuid::new_v4().simple());

@@ -290,7 +290,7 @@ impl Engine {
             let (executor, shadow) = executor_of(index, listed, inbox.clone())?;
 
             // The scheduler instantiates its policy on its own state.
-            let scheduler = Scheduler::new(
+            let mut scheduler = Scheduler::new(
                 scheduling.clone(),
                 limits.clone(),
                 open,
@@ -306,6 +306,9 @@ impl Engine {
                 Arc::clone(&tuning),
             )
             .with_context(|| format!("starting scheduler {index}"))?;
+            // Scheduler `index` of replica `launch.replica` is the deployment's scheduler
+            // `replica + index` (`EngineArgs::replica`).
+            scheduler.number(launch.replica + u32::try_from(index).unwrap_or(u32::MAX));
             features |= scheduler.limits().features;
             max_running_requests = max_running_requests.min(scheduler.max_running_requests());
 

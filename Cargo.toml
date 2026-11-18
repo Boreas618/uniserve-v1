@@ -205,6 +205,9 @@ prost-build = "0.14.1"
 protox = "0.9.0"
 # Image URL fetching shares the rustls/webpki TLS backend `hf-hub` already uses.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+# The MessagePack writer of the KV events' batches, which states their layout field by field
+# (`storage::events`).
+rmp = "0.8.15"
 rmp-serde = "1.3.1"
 # A profiling session's file: SQLite, built from its amalgamation so the
 # engine depends on no system SQLite.
@@ -244,6 +247,9 @@ tokio = { version = "1.47.1", features = [
     "time",
 ] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
+# ZeroMQ in Rust: the PUB and ROUTER sockets the schedulers publish their KV events from in
+# SGLang's format (`engine::scheduler::events`), and the SUB sockets that read them.
+zeromq = { version = "0.7.0", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 toml = "1.1.3"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.8", features = ["trace"] }

@@ -71,6 +71,8 @@ strum.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+# The thread each scheduler's KV event publisher runs its sockets on (`scheduler::events`).
+zeromq.workspace = true
 # A package's arguments, which the daemon's `Prepare` carries as the TOML text of each value
 # (`proto::module::PackageRevision::arguments`).
 toml.workspace = true
@@ -80,6 +82,8 @@ tracing.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
+# SGLang's block hashes, which the KV events' test computes as SGLang does.
+sha2.workspace = true
 # What the unit and integration tests serve from: a Storage Server on a thread of the test's
 # process, the launch of a fixture checkpoint and the bound of a wait (`testkit::serving`), and the
 # released checkpoints an ignored test reads (`testkit::assets`). The unit tests link it beside

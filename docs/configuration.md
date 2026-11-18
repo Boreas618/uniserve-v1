@@ -550,6 +550,19 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 | `kernel_probes` | `true` | Whether the kernel probes the graphs carry record, while `fence_probes` is on; a change switches every worker's kernel probes in place, at the engine's next step boundary |
 | `span_window` | `5m` | How far back a read of the `span` events reaches: spans that ended longer ago are not read, whatever the processes' rings still hold. The leader reads it at each query |
 
+### `kv_events_config`
+
+**Destination, per field:** every field takes effect at the schedulers' next step (`step`); token models only.
+
+Each scheduler publishes which pages its KV cache holds on which medium as KV events in SGLang's ZMQ format, for KV-aware routers outside the deployment: Dynamo's router, `sgl-router` and Mooncake's conductor (`crates/storage/src/events.rs`, `crates/engine/src/scheduler/events.rs`). The events state the pages of the model's first full-attention cache group that the scheduler's queue pair commits, as the scheduler learns them enter and leave the device (`GPU`), the host KV cache (`CPU_PINNED`) and Mooncake (`EXTERNAL`): `BlockStored` with the pages' `block_hashes`, the `parent_block_hash` of the first, their `token_ids`, `block_size` (the page size, `kv_cache_config.block_size`) and `medium`, `BlockRemoved` with the hashes and the medium, and `AllBlocksCleared` when a publisher starts, followed by a store of every page it tracks. A step's events are one batch, sent as three frames: the topic, the batch's sequence number (eight bytes, big-endian, from 0) and the batch in MessagePack, `[ts, events, attn_dp_rank]`, each event a map tagged by `type`, the rank being the scheduler's number. A page's block hash is SGLang's: the SHA-256 digest of the previous page's digest (none for a request's first page) and the page's tokens as little-endian 32-bit integers, its first eight bytes read as a big-endian signed integer, so a consumer that hashes the tokens itself (Dynamo, with the page size as its block size) needs no mapping of UniServe's page keys, and one that indexes SGLang's hashes (the conductor) finds them. The hashes of a request with an isolation key (a cache salt or an adapter) are namespaced by it, as SGLang namespaces an adapter's, and match no other request's. A scheduler states what its queue pair committed and what it learned of those pages since: a page committed before its publisher started, or held only by another scheduler's commit, has no event, which costs a router reuse and never a wrong page.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `endpoint` | Unset | The `tcp://<host>:<port>` endpoint the publishers bind, `*` for every interface; the deployment's scheduler `n` binds the port plus `n`, as SGLang's data-parallel rank `n` does, the schedulers numbered across the replicas in the order the worker groups state them. Unset publishes nothing |
+| `replay_endpoint` | Unset | The endpoint each publisher's replay socket binds, offset as `endpoint` is: a subscriber that sends a starting sequence number (eight bytes, big-endian) after an empty frame receives every batch the publisher still keeps from there, each as the subscriber's three frames after an empty one, then an empty topic, sequence number -1 and an empty payload. Unset, there is none |
+| `topic` | `""` | The topic every batch is published under |
+| `buffer_steps` | `10000` | The batches a publisher keeps for its replay socket |
+
 ### `logging_config`
 
 **Destination: host layer, daemon.**

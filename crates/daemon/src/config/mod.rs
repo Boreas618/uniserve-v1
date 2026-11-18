@@ -149,6 +149,7 @@ impl Config {
             cuda_graph_config: Every,
             worker_config: Every,
             profiling_config: Every,
+            kv_events_config: Of(Kind::Chat),
             logging_config: Every,
             export_config: Every,
             chat_config: Of(Kind::Chat),
@@ -394,6 +395,9 @@ pub struct Config {
     pub worker_config: WorkerConfig,
     #[reload(fields)]
     pub profiling_config: ProfilingConfig,
+    /// The KV events the schedulers publish in SGLang's ZMQ format (`kv_events_config`).
+    #[reload(fields)]
+    pub kv_events_config: proto::config::KvEventsConfig,
     #[reload(daemon)]
     pub logging_config: LoggingConfig,
     #[reload(daemon)]
@@ -483,6 +487,7 @@ impl Default for Config {
             cuda_graph_config: CudaGraphConfig::default(),
             worker_config: WorkerConfig::default(),
             profiling_config: ProfilingConfig::default(),
+            kv_events_config: proto::config::KvEventsConfig::default(),
             logging_config: LoggingConfig::default(),
             export_config: ExportConfig::default(),
             chat_config: ChatConfig::default(),
@@ -699,6 +704,7 @@ impl Config {
             speculative: self.speculative_config.clone(),
             video: self.video_config.clone(),
             profiling: self.profiling_config.clone(),
+            kv_events: self.kv_events_config.clone(),
         })
     }
 
@@ -766,6 +772,19 @@ impl Config {
             self.states_model(),
             "the package names no model: set `model` or `model_dir` in its `config.toml`"
         );
+        // Every scheduler binds the KV events' endpoints offset by its number from the first's.
+        let events = &self.kv_events_config;
+        for (name, endpoint) in [
+            ("endpoint", &events.endpoint),
+            ("replay_endpoint", &events.replay_endpoint),
+        ] {
+            if let Some(endpoint) = endpoint {
+                anyhow::ensure!(
+                    proto::config::KvEventsConfig::offset(endpoint, 0).is_some(),
+                    "`kv_events_config.{name}` {endpoint} is no `tcp://<host>:<port>` endpoint"
+                );
+            }
+        }
         let mut hosts = std::collections::BTreeSet::new();
         for host in &self.hosts {
             anyhow::ensure!(!host.trim().is_empty(), "`hosts` names an empty host");

@@ -2360,7 +2360,9 @@ impl Scheduler {
         commits
     }
 
-    /// Hands request `id`'s commits to the executor and raises `shared` over each.
+    /// Hands request `id`'s commits to the executor and raises `shared` over each. The full
+    /// pages of the request's first full-attention class are offered to its KV events with
+    /// their tokens (`super::events`).
     fn hand_commits(&mut self, id: RequestId, commits: Vec<(u8, u32, Key, u16)>) {
         let Some(owner) = self
             .requests
@@ -2369,6 +2371,41 @@ impl Scheduler {
         else {
             return;
         };
+        if self.events.publishing()
+            && let Some(request) = self.requests.get(&id)
+        {
+            // The events are taken out while the request and its shapes are read, and put back.
+            let mut events = std::mem::take(&mut self.events);
+            let shapes = self.shapes(request);
+            let published = shapes
+                .iter()
+                .position(|(kind, _)| *kind == CacheGroupKind::Full);
+            let isolation = request
+                .generation()
+                .and_then(|input| input.cache.isolation_key);
+            for &(class, at, key, tokens) in &commits {
+                let Some(published) = published.filter(|&index| index == usize::from(class)) else {
+                    continue;
+                };
+                let block = shapes[published].1;
+                if u32::from(tokens) != block {
+                    continue;
+                }
+                let keys = request.keys.get(published);
+                let previous = at
+                    .checked_sub(1)
+                    .and_then(|previous| keys?.get(previous as usize));
+                events.offer(
+                    key,
+                    previous,
+                    at as usize,
+                    block as usize,
+                    &request.token_ids,
+                    isolation,
+                );
+            }
+            self.events = events;
+        }
         for (class, at, key, tokens) in commits {
             self.submit(commit(owner, class, at, key, tokens));
             let table = self
@@ -3548,6 +3585,221 @@ mod tests {
             keys: vec![cached],
         };
         assert_eq!(written, [victims, allocate(1, 0, 3, 1)]);
+    }
+
+    /// A port no socket of the host listens on now.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A ZMQ payload read as SGLang's consumers read it (`sgl-router`'s `kv_events/wire.rs`):
+    /// a MessagePack array `[ts, events, attn_dp_rank]` whose events are maps tagged by `type`.
+    fn decoded(payload: &[u8]) -> (f64, Vec<serde_json::Value>, serde_json::Value) {
+        let batch: serde_json::Value = rmp_serde::from_slice(payload).unwrap();
+        let [time, events, rank] = batch.as_array().unwrap().as_slice() else {
+            panic!("a batch is an array of three: {batch}");
+        };
+        (
+            time.as_f64().unwrap(),
+            events.as_array().unwrap().clone(),
+            rank.clone(),
+        )
+    }
+
+    /// SGLang's block hashes of `tokens` in pages of `block` (`mem_cache/utils.py`,
+    /// `get_hash_str` and `hash_str_to_int64`): each page's SHA-256 over the previous digest and
+    /// its tokens as little-endian `u32`s, its leading eight bytes as a big-endian `i64`.
+    fn sglang_hashes(tokens: &[u32], block: usize) -> Vec<i64> {
+        use sha2::Digest as _;
+        let mut previous: Option<Vec<u8>> = None;
+        let mut hashes = Vec::new();
+        for page in tokens.chunks_exact(block) {
+            let mut digest = sha2::Sha256::new();
+            if let Some(previous) = &previous {
+                digest.update(previous);
+            }
+            for token in page {
+                digest.update(token.to_le_bytes());
+            }
+            let digest = digest.finalize().to_vec();
+            hashes.push(i64::from_be_bytes(digest[..8].try_into().unwrap()));
+            previous = Some(digest);
+        }
+        hashes
+    }
+
+    /// With `kv_events_config` stated, the scheduler publishes the pages its queue pair commits
+    /// and learns evicted in SGLang's ZMQ format: a subscriber reads each step's batch as
+    /// three frames, the stores of a request's full pages with their tokens, SGLang's block
+    /// hashes and the page size, and the removal of the page the cache no longer lists; the
+    /// replay socket answers every batch from a sequence number on, then its end marker.
+    #[test]
+    fn the_pages_it_commits_and_loses_are_published_as_sglang_kv_events() {
+        use zeromq::{Socket as _, SocketRecv as _, SocketSend as _};
+
+        let mut session = serving(&[full(4)], KvCacheConfig::default());
+        let (live, replay) = (free_port(), free_port());
+        session.scheduler.tune(|tuning| {
+            tuning.kv_events.endpoint = Some(format!("tcp://127.0.0.1:{live}"));
+            tuning.kv_events.replay_endpoint = Some(format!("tcp://127.0.0.1:{replay}"));
+            tuning.kv_events.topic = "kv".to_owned();
+            // No page is offloaded, so the cache's requests are the case's own.
+            tuning.host_tier = false;
+        });
+        // The step takes the settings: the publisher binds and states that it holds nothing.
+        session.scheduler.step();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut subscriber = zeromq::SubSocket::new();
+        let mut dealer = zeromq::DealerSocket::new();
+        runtime.block_on(async {
+            subscriber
+                .connect(&format!("tcp://127.0.0.1:{live}"))
+                .await
+                .unwrap();
+            subscriber.subscribe("kv").await.unwrap();
+            dealer
+                .connect(&format!("tcp://127.0.0.1:{replay}"))
+                .await
+                .unwrap();
+            // The subscription reaches the publisher before the next batch is sent.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        // A request of ten tokens fills two pages of four, whose commits are answered.
+        let id = session.request(1, (1..=10).collect());
+        let keys = session.row(id).keys[0].clone();
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        request.num_computed_tokens = 10;
+        request.blocks[0] = Blocks {
+            first: 0,
+            shared: 0,
+            end: 3,
+            asked: 3,
+        };
+        session
+            .scheduler
+            .commit_filled(id, &batch(Phase::Prefill, 0), 0);
+        let commits: Vec<runtime::Request> = session
+            .stamped()
+            .into_iter()
+            .map(|mut commit| {
+                if let runtime::Request::Commit { after, .. } = &mut commit {
+                    after.push((A, 1));
+                }
+                commit
+            })
+            .collect();
+        assert_eq!(commits.len(), 2);
+        session.scheduler.stamped(commits);
+        session.scheduler.post().unwrap();
+        let mut record = Vec::new();
+        while session.pool.next_request(&mut record).unwrap() {
+            let (number, _) = runtime::Request::decode(&record).unwrap();
+            record.clear();
+            Completion::Committed.encode(number, &mut record);
+            assert!(session.pool.complete(&record).unwrap());
+            record.clear();
+        }
+        session.scheduler.step();
+
+        // The buffer pool lists only the first page: the second left the device.
+        session.list(&[(keys[0], 0, DEVICE)]);
+        session.scheduler.step();
+
+        let hashes = sglang_hashes(&(1..=8).collect::<Vec<u32>>(), 4);
+        let received = runtime.block_on(async {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), subscriber.recv())
+                        .await
+                        .expect("a batch arrives")
+                        .unwrap();
+                received.push(message.into_vec());
+            }
+            received
+        });
+
+        // Batch 1: the two pages, stored on the device as one chain from no parent.
+        let [topic, sequence, payload] = &received[0][..] else {
+            panic!("a batch is three frames");
+        };
+        assert_eq!(&topic[..], b"kv");
+        assert_eq!(&sequence[..], &1u64.to_be_bytes());
+        let (time, events, rank) = decoded(payload);
+        assert!(time > 1.0e9, "the publisher's wall clock in seconds");
+        assert_eq!(rank, serde_json::json!(0));
+        assert_eq!(
+            events,
+            [serde_json::json!({
+                "type": "BlockStored",
+                "block_hashes": hashes,
+                "parent_block_hash": null,
+                "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+                "block_size": 4,
+                "lora_id": null,
+                "medium": "GPU",
+            })]
+        );
+
+        // Batch 2: the second page left the device.
+        let [_, sequence, payload] = &received[1][..] else {
+            panic!("a batch is three frames");
+        };
+        assert_eq!(&sequence[..], &2u64.to_be_bytes());
+        assert_eq!(
+            decoded(payload).1,
+            [serde_json::json!({
+                "type": "BlockRemoved",
+                "block_hashes": [hashes[1]],
+                "medium": "GPU",
+            })]
+        );
+
+        // The replay answers from batch 0, the publisher's start, which states it holds nothing.
+        let replayed = runtime.block_on(async {
+            let mut request = zeromq::ZmqMessage::from(Vec::new());
+            request.push_back(0u64.to_be_bytes().to_vec().into());
+            dealer.send(request).await.unwrap();
+            let mut replayed = Vec::new();
+            loop {
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), dealer.recv())
+                        .await
+                        .expect("the replay answers")
+                        .unwrap()
+                        .into_vec();
+                let end = message[2][..] == (-1i64).to_be_bytes();
+                replayed.push(message);
+                if end {
+                    break replayed;
+                }
+            }
+        });
+        let sequences: Vec<&[u8]> = replayed.iter().map(|message| &message[2][..]).collect();
+        assert_eq!(
+            sequences,
+            [
+                &0u64.to_be_bytes()[..],
+                &1u64.to_be_bytes()[..],
+                &2u64.to_be_bytes()[..],
+                &(-1i64).to_be_bytes()[..],
+            ]
+        );
+        assert_eq!(
+            decoded(&replayed[0][3]).1,
+            [serde_json::json!({"type": "AllBlocksCleared"})]
+        );
+        assert_eq!(&replayed[1][3], &received[0][2]);
     }
 
     #[test]

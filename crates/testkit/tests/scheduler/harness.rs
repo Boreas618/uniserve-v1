@@ -842,6 +842,7 @@ impl Deployment {
             watchdog_timeout: proto::config::DEFAULT_WATCHDOG_TIMEOUT,
             compare_timeout: proto::config::DEFAULT_COMPARE_TIMEOUT,
             nvtx_ranges: false,
+            kv_events: Default::default(),
         }
     }
 }

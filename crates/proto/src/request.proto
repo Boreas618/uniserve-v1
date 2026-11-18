@@ -423,6 +423,12 @@ message Tune {
   uint64 watchdog_timeout_ms = 12;
   uint64 compare_timeout_ms = 13;
   bool nvtx_ranges = 14;
+  // Where and how the schedulers publish their KV events (`kv_events_config`): the endpoint
+  // unset publishes none.
+  optional string kv_events_endpoint = 15;
+  optional string kv_events_replay_endpoint = 16;
+  string kv_events_topic = 17;
+  uint64 kv_events_buffer_steps = 18;
 }
 
 message CommitExperts {

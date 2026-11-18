@@ -300,6 +300,12 @@ fn step_values_come_back_from_their_command() {
         watchdog_timeout: Duration::from_secs(90),
         compare_timeout: Duration::from_secs(120),
         nvtx_ranges: true,
+        kv_events: proto::config::KvEventsConfig {
+            endpoint: Some("tcp://*:5557".to_owned()),
+            replay_endpoint: Some("tcp://*:5600".to_owned()),
+            topic: "kv".to_owned(),
+            buffer_steps: NonZeroUsize::new(64).unwrap(),
+        },
     };
     let unstated = Tuning {
         revision: 1,
@@ -315,6 +321,7 @@ fn step_values_come_back_from_their_command() {
         watchdog_timeout: Duration::from_secs(150),
         compare_timeout: Duration::from_secs(300),
         nvtx_ranges: false,
+        kv_events: Default::default(),
     };
     let mut no_depth = stated.command(3);
     no_depth.queue_depths.insert("model".to_owned(), 0);

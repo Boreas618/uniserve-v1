@@ -357,6 +357,10 @@ impl Scheduler {
             }
             _ => {}
         }
+        // A commit answered without a copy leaves no page to publish.
+        if let R::Commit { key, .. } = request {
+            self.events.settled(key);
+        }
     }
 
     /// Records that a `Store` to the host stored nothing for `keys`: with `full` it was answered
@@ -601,6 +605,7 @@ impl Scheduler {
             Some(row) => self.cache.insert(id, row),
             None => self.cache.remove(&id),
         };
+        self.events.changed(key, after.map_or(0, |row| row.tiers));
         self.tell(before, after);
     }
 

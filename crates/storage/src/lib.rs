@@ -20,6 +20,8 @@
 //! - [`settings`]: the settings a server serves with, which a deployment
 //!   states and a server reports in its readiness record, and which of them
 //!   a running server takes and which need a new server process.
+//! - [`events`]: the KV events of the pages a cache holds, in SGLang's ZMQ
+//!   format, which KV-aware routers outside the deployment read.
 //! - [`connector`]: the settings of the Mooncake connector a server runs,
 //!   which keeps committed pages in the KV storage (L3).
 //! - [`manifest`]: what retained state's bytes are (the parts of logical
@@ -35,6 +37,7 @@
 pub mod client;
 pub mod connector;
 mod error;
+pub mod events;
 pub mod key;
 pub mod manifest;
 pub mod protocol;

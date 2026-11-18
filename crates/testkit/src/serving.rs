@@ -234,6 +234,7 @@ pub fn launch() -> EngineArgs {
         speculative: Default::default(),
         video: Default::default(),
         profiling: Default::default(),
+        kv_events: Default::default(),
     };
 
     let mut launch = EngineArgs::new(config, modules);

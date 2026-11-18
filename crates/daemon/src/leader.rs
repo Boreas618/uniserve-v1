@@ -348,10 +348,12 @@ pub(crate) fn epoch_launches(
 ) -> anyhow::Result<Vec<proto::config::EngineArgs>> {
     Ok(replica_configs(config)?
         .into_iter()
-        .map(|replica| {
+        .zip(0u32..)
+        .map(|(replica, ordinal)| {
             let mut args = proto::config::EngineArgs::new(replica, modules.clone());
             args.epoch = epoch;
             args.revision = revision;
+            args.replica = ordinal;
             args
         })
         .collect())
