@@ -71,8 +71,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::batch::{Batch, BatchId, BatchOutput, Capacity, Generations, Phase};
 use crate::executor::Executor;
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use arc_swap::ArcSwap;
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use proto::config::{SchedulerConfig, Tuning, WorkerGroupConfig};
 use proto::report::SchedulerStats;
 use proto::request::{Event, FinishReason, GenerationLimits, MigrationCause, RequestId};

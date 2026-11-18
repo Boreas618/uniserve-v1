@@ -1352,8 +1352,14 @@ mod tests {
         let budget = PolicyBudget::default();
         let ceilings = policy::ceilings([], &budget);
         let arguments = packaged_arguments("");
-        bench.scheduler.policy =
-            Policy::new(packaged("arrival"), arguments, snapshot, &ceilings.limits, &budget).unwrap();
+        bench.scheduler.policy = Policy::new(
+            packaged("arrival"),
+            arguments,
+            snapshot,
+            &ceilings.limits,
+            &budget,
+        )
+        .unwrap();
 
         let pin = runtime::Request::Pin {
             owner: OWNER_A,
@@ -1430,8 +1436,14 @@ mod tests {
         let ceilings = policy::ceilings([], &budget);
         let empty = bench.scheduler.snapshot();
         let arguments = packaged_arguments("");
-        bench.scheduler.policy =
-            Policy::new(packaged("arrival"), arguments, empty, &ceilings.limits, &budget).unwrap();
+        bench.scheduler.policy = Policy::new(
+            packaged("arrival"),
+            arguments,
+            empty,
+            &ceilings.limits,
+            &budget,
+        )
+        .unwrap();
 
         let listed: Vec<(Key, u8)> = (0..ON_DEVICE)
             .map(|number| (numbered(number), DEVICE | HOST))

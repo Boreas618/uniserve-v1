@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::batch::cache::CacheGroupKind;
 use crate::batch::{Phase, Shape, Variant};
-use crossbeam_channel::{Receiver, Sender};
 use arc_swap::ArcSwap;
+use crossbeam_channel::{Receiver, Sender};
 use proto::config::{
     BlockConfig, BlockDistribution, HostBlock, SchedulerConfig, Tuning, WorkerGroupConfig,
     WorkerRank,

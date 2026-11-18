@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::events::{Event, Kind};
-use proto::histogram::Histogram;
 use super::stats::{Instrument, Value};
 use super::{Store, WRITER, nanos};
+use proto::histogram::Histogram;
 
 /// The `stats` table, by metric name.
 #[derive(Clone, Debug)]

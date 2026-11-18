@@ -1757,7 +1757,10 @@ impl State {
     fn settle(&mut self) {
         for ((bucket, generation), forwards) in self.pending.drain() {
             let table = match generation {
-                Some(generation) => self.graphs.get(&(bucket, generation)).map(|graph| &graph.table),
+                Some(generation) => self
+                    .graphs
+                    .get(&(bucket, generation))
+                    .map(|graph| &graph.table),
                 None => self.profiles.get(&bucket),
             };
             for (operator, key, _) in table.into_iter().flatten() {
