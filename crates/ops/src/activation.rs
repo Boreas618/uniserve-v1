@@ -318,13 +318,15 @@ impl Op for ActAndMul {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The activation evaluates in FP32 against a rounded output: the sigmoid or error function,
         // its product with the gate and the product with the value, three roundings in the output
-        // type at most, and no reduction.
+        // type at most, and no reduction. A strongly negative gate drives the activation towards
+        // zero (the GELU's `x·Φ(x)` falls below FP16's smallest normal past `x ≈ −4.2` and BF16's
+        // past `x ≈ −13.2`), so the output's subnormal unit is the absolute part.
         let roundings = match descriptor.activation {
             Activation::Silu | Activation::Sigmoid => 3.0,
             Activation::Gelu | Activation::GeluTanh => 4.0,
         };
         Tolerance::new(
-            0.0,
+            tolerance::underflow(descriptor.dtype) as f32,
             roundings * tolerance::unit_roundoff(descriptor.dtype) as f32,
         )
     }

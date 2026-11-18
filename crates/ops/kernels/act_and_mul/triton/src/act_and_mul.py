@@ -18,6 +18,10 @@ from uniserve_kernels import dependent_launch
 _SQRT_8_OVER_PI = tl.constexpr(1.5957691216057308)
 _SQRT_HALF = tl.constexpr(0.7071067811865476)
 
+#: The gate below which the exact GELU takes its scaled tail form: erfc of
+#: -x / sqrt(2) is still normal in FP32 here (about 4e-33).
+_GELU_TAIL = tl.constexpr(-12.0)
+
 
 @triton.jit
 def _activate(gate, ACTIVATION: tl.constexpr):  # noqa: N803
@@ -25,7 +29,8 @@ def _activate(gate, ACTIVATION: tl.constexpr):  # noqa: N803
     if ACTIVATION == "silu":
         return gate / (1.0 + tl.exp(-gate))
     elif ACTIVATION == "sigmoid":
-        # An attention's output gate: the logistic sigmoid alone, saturating to exact 0 and 1.
+        # An attention's output gate: the logistic sigmoid alone, saturating
+        # to exact 0 and 1.
         return 1.0 / (1.0 + tl.exp(-gate))
     elif ACTIVATION == "gelu_tanh":
         # 0.5 * x * (1 + tanh(u)) equals x * sigmoid(2u) for
@@ -34,7 +39,28 @@ def _activate(gate, ACTIVATION: tl.constexpr):  # noqa: N803
         inner = _SQRT_8_OVER_PI * (gate + 0.044715 * gate * gate * gate)
         return gate / (1.0 + tl.exp(-inner))
     else:
-        return 0.5 * gate * (1.0 + libdevice.erf(gate * _SQRT_HALF))
+        # x * Phi(x) with Phi(x) = erfc(z) / 2, z = -x / sqrt(2). The
+        # complementary error function keeps its relative accuracy for a
+        # negative gate, where `1 + erf(x / sqrt(2))` cancels (to exactly zero
+        # in FP32 below about x = -5.5), so the activation's tail of tiny
+        # values survives instead of collapsing to zero. For a positive gate
+        # erfc lies in [1, 2] and equals `1 + erf` to its rounding.
+        z = -gate * _SQRT_HALF
+        head = 0.5 * gate * libdevice.erfc(z)
+        # A negative gate's erfc(z) falls below FP32's smallest normal past
+        # x = -13.0, where libdevice, compiled flushing subnormals to zero,
+        # returns zero. Past x = -12 the tail is therefore erfcx(z) exp(-z^2),
+        # the scaled function (about 1 / (z sqrt(pi))) times the Gaussian,
+        # with the Gaussian split into two normal factors exp(-x^2 / 4):
+        # every factor stays normal down to x = -18.7, and only the last plain
+        # multiply, which keeps subnormals, steps below 2^-126. The
+        # exponential's argument carries its rounding into the result, a few
+        # ulps of FP32 at these gates, so the direct form serves every gate
+        # above the threshold. An unselected lane's overflow (erfcx of a
+        # large negative z) is discarded by the select.
+        root = tl.exp(-0.25 * gate * gate)
+        tail = 0.5 * gate * libdevice.erfcx(z) * root * root
+        return tl.where(gate < _GELU_TAIL, tail, head)
 
 
 @triton.jit(

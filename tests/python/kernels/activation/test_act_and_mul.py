@@ -9,11 +9,15 @@ program honoured them, so the cases build the two strides different as well as
 equal, and one case interleaves nothing at all.
 
 The reference is torch in FP64: ``silu`` as ``g * sigmoid(g)``, the logistic
-``sigmoid`` of an attention's output gate, and the exact GELU as ``0.5 g (1 +
-erf(g / sqrt(2)))``. The bound is the operator's: no reduction, so
-``roundings * u_out`` with three roundings for ``silu`` and ``sigmoid`` and
-four for the GELU, a relative comparison with no tolerance of the check's own
-choosing. The element type is the fixture's, ``bf16``.
+``sigmoid`` of an attention's output gate, and the exact GELU as ``g Phi(g) =
+0.5 g erfc(-g / sqrt(2))``, the form that keeps its relative accuracy for a
+negative gate, where ``1 + erf(g / sqrt(2))`` cancels to nothing even in FP64.
+The gates span about sixteen units either side of zero, so the GELU's tail of
+tiny values is held to its own magnitude. The bound is the operator's: no
+reduction, so ``roundings * u_out`` with three roundings for ``silu`` and
+``sigmoid`` and four for the GELU, and as its absolute part the output type's
+subnormal unit, which the GELU's tail reaches past ``g = -13``; no tolerance
+of the check's own choosing. The element type is the fixture's, ``bf16``.
 
 The exact GELU needs ``libdevice.erf``, which Triton's interpreter does not
 provide: it runs on a device only.
@@ -33,6 +37,9 @@ ROUNDINGS = {"silu": 3.0, "gelu": 4.0, "sigmoid": 3.0}
 #: (`ops::tolerance::unit_roundoff`), its width and the block one program
 #: covers.
 DTYPE, UNIT_ROUNDOFF = torch.bfloat16, 2.0**-8
+
+#: The output type's subnormal unit, as `ops::tolerance::underflow` gives it.
+UNDERFLOW = 2.0**-133
 WIDTH, BLOCK = 25600, 1024
 
 #: The cases, cheapest and most diverse first: the rows, their width, each
@@ -71,7 +78,7 @@ def activate(gate, name):
         return torch.sigmoid(gate)
     if name == "silu":
         return gate * torch.sigmoid(gate)
-    return 0.5 * gate * (1.0 + torch.erf(gate * math.sqrt(0.5)))
+    return 0.5 * gate * torch.erfc(-gate * math.sqrt(0.5))
 
 
 def launch(kernels, gate, value, out, case, activation):
@@ -141,11 +148,12 @@ def test_both_halves_match_torch_within_the_operators_bound(
     difference = (got - expected).abs()
     # A difference that is not a number is never inside a bound: `>` says
     # otherwise.
-    outside = int((~(difference <= bound * expected.abs())).sum())
+    outside = int((~(difference <= UNDERFLOW + bound * expected.abs())).sum())
     largest = (difference / expected.abs().clamp(min=1e-30)).max().item()
     assert outside == 0, (
         f"{rows} x {width}, {activation}, gate_stride "
         f"{shape['gate_stride']}, value_stride {shape['value_stride']}: "
-        f"{outside} of {expected.numel()} outside the bound {bound:.3e}, max "
+        f"{outside} of {expected.numel()} outside the bound {bound:.3e} "
+        f"(atol {UNDERFLOW:.3e}), max "
         f"relative error {largest:.3e}"
     )
