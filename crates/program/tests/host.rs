@@ -10,8 +10,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use program::{
-    Budget, Call, Config, Control, Error, Filter, Function, Host, Instance, Kind, Level, Module,
-    Query, Reason, Record, Report, State,
+    Budget, Call, Config, Control, Error, Filter, Function, Group, Host, Instance, Kind, Level,
+    Module, Query, Reason, Record, Report, State,
 };
 use scheduling::kv::{
     Directory, Found, Handoff, Holding, Hook, Key, Location, Move, Node, Path, Tier, Tiering,
@@ -123,6 +123,11 @@ impl Control for Leader {
         }
     }
 
+    fn group(&mut self, group: &Group) -> BTreeMap<String, f64> {
+        self.calls.lock().unwrap().stats.push(group.query.clone());
+        BTreeMap::new()
+    }
+
     fn events(&mut self, filter: &Filter) -> Vec<Record> {
         self.calls.lock().unwrap().events.push(filter.clone());
         self.records
@@ -167,6 +172,7 @@ fn chunk_args() -> serde_json::Value {
 
 fn state(chunk: u32) -> State {
     State::new(
+        "chunk",
         Instant(1_000_000_000_000),
         Config(json!({ "scheduler_config": { "chunked_prefill_size": chunk } })),
     )

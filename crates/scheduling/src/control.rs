@@ -11,7 +11,8 @@
 //!
 //! ```ignore
 //! let tpot = state.stats["uniserve_tpot_seconds"].window(secs(10)).p99();
-//! let last = state.events["revision"].writer("layout").last();
+//! let ttft = state.stats["uniserve_ttft_seconds"].window(secs(10)).by("replica").p99();
+//! let last = state.events["revision"].writer(&state.name).last();
 //! ```
 
 use std::collections::BTreeMap;
@@ -27,6 +28,10 @@ use crate::time::{Duration, Instant};
 /// The input of a control program's step.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
+    /// The program's name in its package (`[programs.<name>]`): the writer the revisions of its
+    /// outputs are recorded under, which its `events` select its own writes by.
+    #[serde(default)]
+    pub name: String,
     /// The step's instant.
     pub time: Instant,
     /// The deployment's current configuration.
@@ -40,9 +45,11 @@ pub struct State {
 }
 
 impl State {
-    /// The input of a step at `time` with the deployment's configuration `config`.
-    pub fn new(time: Instant, config: Config) -> State {
+    /// The input of program `name`'s step at `time` with the deployment's configuration
+    /// `config`.
+    pub fn new(name: impl Into<String>, time: Instant, config: Config) -> State {
         State {
+            name: name.into(),
             time,
             config,
             stats: Stats::default(),
@@ -55,6 +62,30 @@ impl State {
     /// by the same validation `apply` runs.
     pub fn validate(&self, config: &Config) -> Result<Report, String> {
         guest::validate(config)
+    }
+
+    /// Whether the latest revision this program wrote was rolled back less than `span` before
+    /// the step's instant: what a program holds back for after a change of its own failed its
+    /// trial or was refused, read from its `revision` events.
+    pub fn rolled_back(&self, span: Duration) -> bool {
+        let Some(last) = self.events.kind("revision").writer(&self.name).last() else {
+            return false;
+        };
+        let result = last.get::<String>("result");
+        result.as_deref() == Some("rolled_back") && self.time < last.time + span
+    }
+
+    /// Whether `config` may be output: validation accepts it and serving goes on while it takes
+    /// effect. A refusal is logged with its reason, since the program's own arithmetic produced
+    /// a configuration the deployment does not take.
+    pub fn admits(&self, config: &Config) -> bool {
+        match self.validate(config) {
+            Ok(report) => !report.interrupts,
+            Err(reason) => {
+                log::warn!("the change is refused: {reason}");
+                false
+            }
+        }
     }
 }
 
@@ -268,6 +299,97 @@ impl Window {
     pub fn last(&self) -> f64 {
         self.compute(Function::Last)
     }
+
+    /// The selection split by the values of its label `key`, as PromQL's `by (key)`: each
+    /// aggregate of it is one value per label value, over the series that carry that value.
+    pub fn by(&self, key: impl Into<String>) -> Groups {
+        Groups {
+            query: self.query.clone(),
+            key: key.into(),
+        }
+    }
+
+    /// The values the selection's series in the window carry for label `key`, in order.
+    pub fn values(&self, key: impl Into<String>) -> Vec<String> {
+        self.by(key).count().into_keys().collect()
+    }
+}
+
+/// A selection of a series split by the values of one label ([`Window::by`]). Each aggregate is
+/// a map from a label value to the aggregate over the series that carry it; a value whose series
+/// hold nothing in the window is absent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Groups {
+    query: Query,
+    key: String,
+}
+
+impl Groups {
+    fn compute(&self, function: Function) -> BTreeMap<String, f64> {
+        let group = Group {
+            query: Query {
+                function,
+                ..self.query.clone()
+            },
+            key: self.key.clone(),
+        };
+        guest::group(&group)
+    }
+
+    /// The `q` quantile of each group, `q` in `[0, 1]`.
+    pub fn quantile(&self, q: f64) -> BTreeMap<String, f64> {
+        self.compute(Function::Quantile(q))
+    }
+
+    /// The median of each group.
+    pub fn p50(&self) -> BTreeMap<String, f64> {
+        self.quantile(0.5)
+    }
+
+    /// The 0.9 quantile of each group.
+    pub fn p90(&self) -> BTreeMap<String, f64> {
+        self.quantile(0.9)
+    }
+
+    /// The 0.99 quantile of each group.
+    pub fn p99(&self) -> BTreeMap<String, f64> {
+        self.quantile(0.99)
+    }
+
+    /// The mean of each group.
+    pub fn mean(&self) -> BTreeMap<String, f64> {
+        self.compute(Function::Mean)
+    }
+
+    /// The smallest value of each group.
+    pub fn min(&self) -> BTreeMap<String, f64> {
+        self.compute(Function::Min)
+    }
+
+    /// The largest value of each group.
+    pub fn max(&self) -> BTreeMap<String, f64> {
+        self.compute(Function::Max)
+    }
+
+    /// The sum of each group's values.
+    pub fn sum(&self) -> BTreeMap<String, f64> {
+        self.compute(Function::Sum)
+    }
+
+    /// The number of each group's values (of observations, for a histogram).
+    pub fn count(&self) -> BTreeMap<String, f64> {
+        self.compute(Function::Count)
+    }
+
+    /// Each group's counter increase per second over the window.
+    pub fn rate(&self) -> BTreeMap<String, f64> {
+        self.compute(Function::Rate)
+    }
+
+    /// The latest value of each group.
+    pub fn last(&self) -> BTreeMap<String, f64> {
+        self.compute(Function::Last)
+    }
 }
 
 /// One aggregate of the `stats` table: the message of `uniserve.stats`, which the host answers
@@ -284,6 +406,17 @@ pub struct Query {
     pub revision: Option<u64>,
     /// The aggregate.
     pub function: Function,
+}
+
+/// One aggregate of the `stats` table split by a label: the message of `uniserve.group`, which
+/// the host answers with the aggregate of each value of the label among the selected series, a
+/// value whose selection holds nothing left out.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    /// The selection and the aggregate.
+    pub query: Query,
+    /// The label whose values split the selection.
+    pub key: String,
 }
 
 /// An aggregate over a window.
@@ -470,6 +603,34 @@ impl Record {
     }
 }
 
+/// An exponentially weighted moving average: what a program keeps in its state of a measurement
+/// it compares over a longer history than the observation store keeps, or under conditions the
+/// store does not label, such as the layout or the backend a value was measured under.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Ema {
+    /// The average; meaningless while `samples` is zero.
+    pub mean: f64,
+    /// The values averaged.
+    pub samples: u64,
+}
+
+impl Ema {
+    /// Averages in `value` with weight `weight` in `(0, 1]`: the first value is the average,
+    /// each later one moves it by `weight` of the difference. A value that is not finite, which
+    /// is what an aggregate of an empty selection is, is not averaged.
+    pub fn update(&mut self, value: f64, weight: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        if self.samples == 0 {
+            self.mean = value;
+        } else {
+            self.mean += weight * (value - self.mean);
+        }
+        self.samples += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,13 +663,35 @@ mod tests {
         assert_eq!(config.get::<u64>("model.revision"), Some(3));
     }
 
-    /// The step's input carries the instant and the configuration; the views carry nothing,
-    /// since the host computes what the program reads of them.
+    /// The step's input carries the program's name, the instant and the configuration; the
+    /// views carry nothing, since the host computes what the program reads of them.
     #[test]
-    fn the_state_carries_the_instant_and_the_configuration() {
-        let state = State::new(Instant(7), Config(serde_json::json!({ "a": 1 })));
+    fn the_state_carries_the_name_the_instant_and_the_configuration() {
+        let state = State::new("chunk", Instant(7), Config(serde_json::json!({ "a": 1 })));
         let wire = serde_json::to_value(&state).unwrap();
-        assert_eq!(wire, serde_json::json!({ "time": 7, "config": { "a": 1 } }));
+        assert_eq!(
+            wire,
+            serde_json::json!({ "name": "chunk", "time": 7, "config": { "a": 1 } })
+        );
         assert_eq!(serde_json::from_value::<State>(wire).unwrap(), state);
+    }
+
+    /// The first value is the average, later ones move it by their weight, and the NaN of an
+    /// empty selection is not averaged.
+    #[test]
+    fn a_moving_average_weighs_each_later_value() {
+        let mut average = Ema::default();
+        average.update(f64::NAN, 0.5);
+        assert_eq!(average.samples, 0);
+
+        average.update(10.0, 0.5);
+        average.update(20.0, 0.5);
+        assert_eq!(
+            average,
+            Ema {
+                mean: 15.0,
+                samples: 2
+            }
+        );
     }
 }

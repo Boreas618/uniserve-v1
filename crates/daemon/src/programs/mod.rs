@@ -51,22 +51,11 @@ use crate::config::Config;
 use crate::observation::Store;
 use crate::policy::Package;
 
-/// What a control program's call runs within: a second's worth of instructions, ample for a
-/// decision over a few series, with the fuel of decoding the configuration on top of it; and the
-/// memory of a program that keeps moving averages over its own history.
-const CONTROL: Budget = Budget {
-    fuel: 1_000_000_000,
-    per_byte: 200,
-    memory: 256 << 20,
-};
+/// What a control program's call runs within ([`Budget::CONTROL`]).
+const CONTROL: Budget = Budget::CONTROL;
 
-/// What a routing program's call runs within: it is on every request's path, so its budget is a
-/// small fraction of a request's admission, beside decoding the replicas' states.
-const ROUTING: Budget = Budget {
-    fuel: 20_000_000,
-    per_byte: 200,
-    memory: 64 << 20,
-};
+/// What a routing program's call runs within ([`Budget::ROUTING`]).
+const ROUTING: Budget = Budget::ROUTING;
 
 /// How often a routing program's state is saved when its entry states no `period`.
 const SAVE: std::time::Duration = std::time::Duration::from_secs(60);

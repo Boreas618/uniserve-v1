@@ -25,6 +25,27 @@ pub struct Budget {
     pub memory: usize,
 }
 
+impl Budget {
+    /// What a control program's call runs within on the leader daemon: a second's worth of
+    /// instructions, ample for a decision over a few series, with the fuel of decoding the
+    /// configuration on top of it; and the memory of a program that keeps moving averages over
+    /// its own history.
+    pub const CONTROL: Budget = Budget {
+        fuel: 1_000_000_000,
+        per_byte: 200,
+        memory: 256 << 20,
+    };
+
+    /// What a routing program's call runs within on the leader daemon: it is on every request's
+    /// path, so its budget is a small fraction of a request's admission, beside decoding the
+    /// replicas' states.
+    pub const ROUTING: Budget = Budget {
+        fuel: 20_000_000,
+        per_byte: 200,
+        memory: 64 << 20,
+    };
+}
+
 /// One call into a program, by the export it enters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Call {

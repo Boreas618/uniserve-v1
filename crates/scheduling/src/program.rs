@@ -45,6 +45,7 @@
 //! | --- | --- | --- | --- | --- |
 //! | `log` | `(level: u32, ptr: u32, len: u32)` | all | the record's text | |
 //! | `stats` | `(ptr: u32, len: u32) -> f64` | control | [`crate::control::Query`] | the value |
+//! | `group` | `(ptr: u32, len: u32) -> u64` | control | [`crate::control::Group`] | `BTreeMap<String, f64>` |
 //! | `events` | `(ptr: u32, len: u32) -> u64` | control | [`crate::control::Filter`] | `Vec<Record>` |
 //! | `validate` | `(ptr: u32, len: u32) -> u64` | control | `Config` | `Result<Report, String>` |
 //!
@@ -198,6 +199,7 @@ pub mod name {
 
     pub const LOG: &str = "log";
     pub const STATS: &str = "stats";
+    pub const GROUP: &str = "group";
     pub const EVENTS: &str = "events";
     pub const VALIDATE: &str = "validate";
 }
@@ -494,6 +496,11 @@ pub mod guest {
         imports::stats(bytes.as_ptr() as usize as u32, len)
     }
 
+    /// `uniserve.group`: one aggregate of each value of a label among a selection's series.
+    pub fn group(group: &crate::control::Group) -> std::collections::BTreeMap<String, f64> {
+        exchange(imports::group, group, "grouping")
+    }
+
     /// `uniserve.events`: the records of one kind a filter selects.
     pub fn events(filter: &crate::control::Filter) -> Vec<crate::control::Record> {
         exchange(imports::events, filter, "filter")
@@ -514,6 +521,8 @@ pub mod guest {
             fn host_log(level: u32, ptr: u32, len: u32);
             #[link_name = "stats"]
             fn host_stats(ptr: u32, len: u32) -> f64;
+            #[link_name = "group"]
+            fn host_group(ptr: u32, len: u32) -> u64;
             #[link_name = "events"]
             fn host_events(ptr: u32, len: u32) -> u64;
             #[link_name = "validate"]
@@ -528,6 +537,11 @@ pub mod guest {
         pub(super) fn stats(ptr: u32, len: u32) -> f64 {
             // SAFETY: the host reads the message during the call; the caller keeps it alive.
             unsafe { host_stats(ptr, len) }
+        }
+
+        pub(super) fn group(ptr: u32, len: u32) -> u64 {
+            // SAFETY: as in `stats`.
+            unsafe { host_group(ptr, len) }
         }
 
         pub(super) fn events(ptr: u32, len: u32) -> u64 {
@@ -551,6 +565,10 @@ pub mod guest {
         }
 
         pub(super) fn stats(_: u32, _: u32) -> f64 {
+            panic!("{HOSTLESS}")
+        }
+
+        pub(super) fn group(_: u32, _: u32) -> u64 {
             panic!("{HOSTLESS}")
         }
 

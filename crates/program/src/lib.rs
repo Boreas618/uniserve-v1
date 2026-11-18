@@ -15,7 +15,7 @@
 //!     Err(Error::State(_)) => Instance::new(&module, leader, &budget, &args)?,
 //!     instance => instance?,
 //! };
-//! let config: Option<Config> = chunk.step(&State::new(now, config))?;
+//! let config: Option<Config> = chunk.step(&State::new("chunk", now, config))?;
 //! let saved = chunk.save()?;
 //! ```
 //!
@@ -26,8 +26,8 @@
 //! - Every call is given a fuel budget ([`Budget`]), the instructions it may execute, and its
 //!   memory is bounded.
 //! - The host functions are answered by the embedder: `uniserve.log` by [`Host`], which every
-//!   program may call, and `uniserve.stats`, `uniserve.events` and `uniserve.validate` by
-//!   [`Control`], which only a control program's module is linked with.
+//!   program may call, and `uniserve.stats`, `uniserve.group`, `uniserve.events` and
+//!   `uniserve.validate` by [`Control`], which only a control program's module is linked with.
 //! - A program that panics, runs past its fuel, traps or breaks the protocol ends its instance
 //!   ([`Error::Ended`] with its [`Reason`]); the embedder records it. The host never panics on
 //!   a program's behaviour.
@@ -42,7 +42,9 @@ use std::sync::OnceLock;
 
 pub use host::{Control, Host};
 pub use instance::{Budget, Call, Error, Instance, Reason, Usage};
-pub use scheduling::control::{Config, Filter, Function, Query, Record, Report, Room, State};
+pub use scheduling::control::{
+    Config, Filter, Function, Group, Query, Record, Report, Room, State,
+};
 pub use scheduling::program::{Kind, Level};
 
 /// The process's one wasmtime engine, which compiles and runs every program module.
@@ -183,7 +185,7 @@ impl<H: Host> Module<H> {
 
 impl<H: Control> Module<H> {
     /// Compiles `bytes`, a wasm32 module, as a control program: linked with `uniserve.log`,
-    /// `uniserve.stats`, `uniserve.events` and `uniserve.validate`.
+    /// `uniserve.stats`, `uniserve.group`, `uniserve.events` and `uniserve.validate`.
     ///
     /// # Errors
     ///

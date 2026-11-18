@@ -139,8 +139,11 @@ async fn run(
 
         let input = Arc::clone(&current.borrow());
         let config = input.package.config.clone();
-        let stepped =
-            tokio::task::spawn_blocking(move || (step(&mut instance, &config), instance)).await;
+        let stepped = {
+            let name = name.clone();
+            tokio::task::spawn_blocking(move || (step(&mut instance, &name, &config), instance))
+                .await
+        };
         let (result, returned) = match stepped {
             Ok(stepped) => stepped,
             Err(error) => {
@@ -253,11 +256,12 @@ impl Linked for Module<Logs> {
     }
 }
 
-/// One step: the input of the instant now with `config`, the deployment's whole configuration
-/// as JSON; the output read back as a configuration, or why the step failed or its output does
-/// not read.
+/// One step of program `name`: the input of the instant now with `config`, the deployment's
+/// whole configuration as JSON; the output read back as a configuration, or why the step failed
+/// or its output does not read.
 fn step(
     instance: &mut Instance<Reader>,
+    name: &str,
     config: &crate::config::Config,
 ) -> Result<Option<crate::config::Config>, String> {
     let time = SystemTime::now()
@@ -267,7 +271,7 @@ fn step(
         });
     let json = serde_json::to_value(config)
         .map_err(|error| format!("the configuration has no JSON form: {error}"))?;
-    let state = State::new(Instant(time), program::Config(json));
+    let state = State::new(name, Instant(time), program::Config(json));
     let output: Option<program::Config> =
         instance.step(&state).map_err(|error| error.to_string())?;
     output

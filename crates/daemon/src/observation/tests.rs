@@ -434,6 +434,64 @@ async fn windows_read_quantiles_rates_and_latest_values() {
     );
 }
 
+/// A selection split by a label is one window per value, each combining the series that carry
+/// it as a whole selection combines its series; a series without the label is in none, and a
+/// value with no bucket in the window is absent.
+#[tokio::test]
+async fn a_selection_split_by_a_label_combines_each_values_series() {
+    let (store, clock) = store(Retention::default());
+    let tokens = "uniserve_expert_tokens_total";
+    let pages = "uniserve_kv_pages";
+
+    // Old tokens of expert 9, outside the window.
+    at(&clock, 0.0);
+    let old = labels(&[("layer", "l0"), ("expert", "9"), ("scheduler", "0")]);
+    store.add(tokens, &old, 1, 1000.0).unwrap();
+
+    for second in 0..10 {
+        at(&clock, 100.0 + f64::from(second));
+        for scheduler in ["0", "1"] {
+            for (expert, count) in [("0", 3.0), ("1", 1.0)] {
+                let at = labels(&[
+                    ("layer", "l0"),
+                    ("expert", expert),
+                    ("scheduler", scheduler),
+                ]);
+                store.add(tokens, &at, 1, count).unwrap();
+            }
+            let at = labels(&[("replica", scheduler)]);
+            store.set(pages, &at, 1, f64::from(second)).unwrap();
+        }
+        store
+            .add(tokens, &labels(&[("layer", "l0")]), 1, 7.0)
+            .unwrap();
+    }
+
+    let span = Duration::from_secs(10);
+    let experts = store
+        .stats()
+        .series(tokens)
+        .label("layer", "l0")
+        .by(span, "expert");
+    let sums: Vec<(&str, Option<f64>)> = experts
+        .iter()
+        .map(|(expert, window)| (expert.as_str(), window.sum()))
+        .collect();
+    assert_eq!(sums, [("0", Some(60.0)), ("1", Some(20.0))]);
+
+    // A gauge's latest value per group is the total of its series' latest readings.
+    let replicas = store.stats().series(pages).by(span, "replica");
+    assert_eq!(replicas["0"].last(), Some(9.0));
+    assert_eq!(replicas["1"].last(), Some(9.0));
+    assert!(
+        store
+            .stats()
+            .series("uniserve_absent")
+            .by(span, "replica")
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn event_views_select_by_kind_and_writer() {
     let (store, clock) = store(Retention::default());

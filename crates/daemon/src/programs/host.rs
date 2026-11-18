@@ -5,7 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use program::{Filter, Function, Level, Query, Record, Report};
+use std::collections::BTreeMap;
+
+use program::{Filter, Function, Group, Level, Query, Record, Report};
 use scheduling::time::Instant;
 use tokio::sync::watch;
 
@@ -95,6 +97,10 @@ impl program::Control for Reader {
         stats(&self.logs.store, query)
     }
 
+    fn group(&mut self, group: &Group) -> BTreeMap<String, f64> {
+        self::group(&self.logs.store, group)
+    }
+
     fn events(&mut self, filter: &Filter) -> Vec<Record> {
         events(&self.logs.store, filter)
     }
@@ -107,6 +113,25 @@ impl program::Control for Reader {
 
 /// The value of one aggregate of the `stats` table; NaN when the selection holds no value.
 pub(crate) fn stats(store: &Store, query: &Query) -> f64 {
+    let (series, span) = select(store, query);
+    measure(&series.window(span), query.function).unwrap_or(f64::NAN)
+}
+
+/// The aggregate of each value of label `group.key` among the series `group.query` selects; a
+/// value whose selection holds no value is left out.
+pub(crate) fn group(store: &Store, group: &Group) -> BTreeMap<String, f64> {
+    let (series, span) = select(store, &group.query);
+    series
+        .by(span, &group.key)
+        .into_iter()
+        .filter_map(|(value, window)| {
+            measure(&window, group.query.function).map(|measured| (value, measured))
+        })
+        .collect()
+}
+
+/// The series of `query` and the span of its window.
+fn select(store: &Store, query: &Query) -> (crate::observation::Series, Duration) {
     let mut series = store.stats().series(&query.name);
     for (key, value) in &query.labels {
         series = series.label(key, value);
@@ -118,8 +143,12 @@ pub(crate) fn stats(store: &Store, query: &Query) -> f64 {
         0 => LATEST,
         nanos => Duration::from_nanos(nanos),
     };
-    let window = series.window(span);
-    let value = match query.function {
+    (series, span)
+}
+
+/// The aggregate `function` of `window`; `None` when the window holds no value.
+fn measure(window: &crate::observation::Window, function: Function) -> Option<f64> {
+    match function {
         Function::Quantile(q) => window.quantile(q),
         Function::Mean => window.mean(),
         Function::Min => window.min(),
@@ -128,8 +157,7 @@ pub(crate) fn stats(store: &Store, query: &Query) -> f64 {
         Function::Count => window.count(),
         Function::Rate => window.rate(),
         Function::Last => window.last(),
-    };
-    value.unwrap_or(f64::NAN)
+    }
 }
 
 /// The records of the `events` table `filter` selects, oldest first: of its kind, with its

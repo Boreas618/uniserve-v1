@@ -2,14 +2,15 @@
 //!
 //! The [`Program`] trait and its [`export!`] macro, the inputs and outputs of the four programs,
 //! durations and instants, serde's derives (a program crate depends on `serde` itself, which
-//! the derives expand to) and the `log` crate's macros, whose records reach the host's `events`
-//! table.
+//! the derives expand to), the JSON value a configuration's options are, and the `log` crate's
+//! macros, whose records reach the host's `events` table.
 
 pub use log::{debug, error, info, trace, warn};
 pub use serde::{Deserialize, Serialize};
+pub use serde_json::Value;
 
 pub use crate::control::{
-    Config, Events, Kind, Record, Records, Report, Series, State, Stats, Window,
+    Config, Ema, Events, Groups, Kind, Record, Records, Report, Series, State, Stats, Window,
 };
 pub use crate::export;
 pub use crate::kv::{

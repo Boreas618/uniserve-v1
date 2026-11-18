@@ -66,25 +66,41 @@ impl Series {
     /// gauge over several label sets is their total, so a gauge that does
     /// not add up is selected down to one label set), histograms merge.
     pub fn window(&self, span: Duration) -> Window {
+        let (instrument, mut windows) = self.fold(span, None);
+        windows
+            .remove("")
+            .unwrap_or_else(|| Window::empty(instrument, span))
+    }
+
+    /// The selected series over the last `span` split by the values of
+    /// their label `key`: one window per value, each combining the series
+    /// that carry it as [`Self::window`] combines a selection. A series
+    /// without the label is in none, and a value is present only when a
+    /// series carrying it has a bucket in the window.
+    pub fn by(&self, span: Duration, key: &str) -> BTreeMap<String, Window> {
+        self.fold(span, Some(key)).1
+    }
+
+    /// One pass over the selected rows of the last `span`, combining each
+    /// row into the window of its value of label `key`, or into the one
+    /// window `""` when no key splits them.
+    fn fold(
+        &self,
+        span: Duration,
+        key: Option<&str>,
+    ) -> (Option<Instrument>, BTreeMap<String, Window>) {
         let now = nanos(self.store.now());
         let start = now.saturating_sub(i64::try_from(span.as_nanos()).unwrap_or(i64::MAX));
 
-        let mut window = Window {
-            instrument: None,
-            span,
-            buckets: BTreeMap::new(),
-            latest: 0.0,
-        };
-
+        let mut instrument = None;
+        let mut windows = BTreeMap::new();
         self.store.read_stats(now, |table| {
-            window.instrument = table.instrument(&self.name);
-            let Some(instrument) = window.instrument else {
+            instrument = table.instrument(&self.name);
+            let Some(instrument) = instrument else {
                 return;
             };
 
-            // The newest row of the series being visited; rows of a series
-            // arrive together and in time order.
-            let mut current: Option<(&super::Labels, u64, f64)> = None;
+            let mut folds: BTreeMap<String, Fold<'_>> = BTreeMap::new();
             let names = [self.name.clone()];
             table.rows(Some(&names), now, |row| {
                 if row.bucket.start < start {
@@ -103,36 +119,71 @@ impl Series {
                 {
                     return;
                 }
-
-                match current {
-                    Some((labels, revision, _))
-                        if std::ptr::eq(labels, row.labels) && revision == row.revision => {}
-                    Some((_, _, last)) => window.latest += last,
-                    None => {}
-                }
-                current = Some((row.labels, row.revision, row.bucket.value.number()));
-
-                let fold = match instrument {
-                    // Across series a gauge adds; within one, `Value::fold`
-                    // would keep the later reading.
-                    Instrument::Gauge => Instrument::Counter,
-                    instrument => instrument,
+                let group = match key {
+                    None => String::new(),
+                    Some(key) => match row.labels.get(key) {
+                        Some(value) => value.clone(),
+                        None => return,
+                    },
                 };
-                match window.buckets.get_mut(&row.bucket.start) {
-                    Some(value) => value.fold(&row.bucket.value, fold),
-                    None => {
-                        window
-                            .buckets
-                            .insert(row.bucket.start, row.bucket.value.clone());
-                    }
-                }
+
+                folds
+                    .entry(group)
+                    .or_insert_with(|| Fold {
+                        window: Window::empty(Some(instrument), span),
+                        current: None,
+                    })
+                    .add(&row, instrument);
             });
-            if let Some((_, _, last)) = current {
-                window.latest += last;
-            }
+            windows = folds
+                .into_iter()
+                .map(|(group, fold)| (group, fold.finish()))
+                .collect();
         });
 
-        window
+        (instrument, windows)
+    }
+}
+
+/// One window being combined from rows, with the newest row of the series
+/// being visited: rows of a series arrive together and in time order, so a
+/// change of series ends the previous one's newest reading.
+struct Fold<'a> {
+    window: Window,
+    current: Option<(&'a super::Labels, u64, f64)>,
+}
+
+impl<'a> Fold<'a> {
+    fn add(&mut self, row: &super::stats::Row<'a>, instrument: Instrument) {
+        match self.current {
+            Some((labels, revision, _))
+                if std::ptr::eq(labels, row.labels) && revision == row.revision => {}
+            Some((_, _, last)) => self.window.latest += last,
+            None => {}
+        }
+        self.current = Some((row.labels, row.revision, row.bucket.value.number()));
+
+        let fold = match instrument {
+            // Across series a gauge adds; within one, `Value::fold`
+            // would keep the later reading.
+            Instrument::Gauge => Instrument::Counter,
+            instrument => instrument,
+        };
+        match self.window.buckets.get_mut(&row.bucket.start) {
+            Some(value) => value.fold(&row.bucket.value, fold),
+            None => {
+                self.window
+                    .buckets
+                    .insert(row.bucket.start, row.bucket.value.clone());
+            }
+        }
+    }
+
+    fn finish(mut self) -> Window {
+        if let Some((_, _, last)) = self.current {
+            self.window.latest += last;
+        }
+        self.window
     }
 }
 
@@ -152,6 +203,16 @@ pub struct Window {
 }
 
 impl Window {
+    /// The window of no row over `span` of a metric of `instrument`.
+    fn empty(instrument: Option<Instrument>, span: Duration) -> Self {
+        Self {
+            instrument,
+            span,
+            buckets: BTreeMap::new(),
+            latest: 0.0,
+        }
+    }
+
     fn numbers(&self) -> impl Iterator<Item = f64> + '_ {
         self.buckets.values().map(Value::number)
     }

@@ -1,7 +1,9 @@
 //! The host functions: what the embedder answers ([`Host`], [`Control`]) and how a module's
 //! calls of `uniserve.*` reach it.
 
-use scheduling::control::{Config, Filter, Query, Record, Report};
+use std::collections::BTreeMap;
+
+use scheduling::control::{Config, Filter, Group, Query, Record, Report};
 use scheduling::program::{IMPORTS, Level, PANIC, name};
 use scheduling::wire::{decode, encode, pack};
 use wasmtime::{Caller, Extern, Linker};
@@ -19,7 +21,7 @@ pub trait Host: Send + 'static {
 }
 
 /// The embedder of a control program: what answers the host functions behind its
-/// `State` (`uniserve.stats`, `uniserve.events`, `uniserve.validate`).
+/// `State` (`uniserve.stats`, `uniserve.group`, `uniserve.events`, `uniserve.validate`).
 ///
 /// Each is called only when the program reads the view or validates, during its step: a step
 /// that reads no series computes none.
@@ -27,6 +29,11 @@ pub trait Control: Host {
     /// The value of one aggregate of the `stats` table; NaN when the query selects no value.
     /// The query's window ends at the step's instant.
     fn stats(&mut self, query: &Query) -> f64;
+
+    /// The aggregate of each value of the label `group.key` among the series the query selects,
+    /// leaving out a value whose selection holds nothing. The query's window ends at the step's
+    /// instant.
+    fn group(&mut self, group: &Group) -> BTreeMap<String, f64>;
 
     /// The records of the `events` table the filter selects, oldest first. The filter's window
     /// ends at the step's instant.
@@ -62,7 +69,7 @@ pub(crate) fn log<H: Host>(linker: &mut Linker<Context<H>>) -> Result<(), Error>
     Ok(())
 }
 
-/// Links `uniserve.stats`, `uniserve.events` and `uniserve.validate`.
+/// Links `uniserve.stats`, `uniserve.group`, `uniserve.events` and `uniserve.validate`.
 pub(crate) fn control<H: Control>(linker: &mut Linker<Context<H>>) -> Result<(), Error> {
     linker
         .func_wrap(
@@ -71,6 +78,18 @@ pub(crate) fn control<H: Control>(linker: &mut Linker<Context<H>>) -> Result<(),
             |mut caller: Caller<'_, Context<H>>, ptr: u32, len: u32| {
                 let query: Query = message(&mut caller, ptr, len, "stats query")?;
                 Ok(caller.data_mut().host.stats(&query))
+            },
+        )
+        .map_err(link)?;
+
+    linker
+        .func_wrap(
+            IMPORTS,
+            name::GROUP,
+            |mut caller: Caller<'_, Context<H>>, ptr: u32, len: u32| {
+                let group: Group = message(&mut caller, ptr, len, "grouping")?;
+                let values = caller.data_mut().host.group(&group);
+                reply(&mut caller, &values)
             },
         )
         .map_err(link)?;
