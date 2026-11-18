@@ -1390,6 +1390,7 @@ fn import(owner: u64, at: u32, count: u32, lent: u64) -> Request {
         tables: vec![(KV, at, count)],
         lender: lender(SERVING, lent),
         push: false,
+        transport: scheduling::kv::Transport::Nixl,
         trace: 0,
     }
 }
@@ -1536,6 +1537,7 @@ fn an_import_spans_its_handoff_with_the_bytes_it_writes() {
         tables: vec![(KV, 0, 2)],
         lender: lender(SERVING, 1),
         push: false,
+        transport: scheduling::kv::Transport::Nixl,
         trace: TRACE,
     };
     let id = fixture.submit(QUEUE, traced);
@@ -1597,6 +1599,7 @@ fn an_import_without_a_standing_lend_or_of_taken_positions_changes_nothing() {
                 owner: OwnerId(1),
             },
             push: true,
+            transport: scheduling::kv::Transport::Nixl,
             trace: 0,
         },
     );

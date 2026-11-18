@@ -101,6 +101,7 @@ fn an_import_reads_a_lend_of_another_host_through_this_host_s_transfer_server() 
         tables: vec![(KV, 0, 2)],
         lender: lent.clone(),
         push: false,
+        transport: scheduling::kv::Transport::Nixl,
         trace: 0,
     };
     let units = imported_units(decode.ask(import));
@@ -112,6 +113,7 @@ fn an_import_reads_a_lend_of_another_host_through_this_host_s_transfer_server() 
         tables: vec![(KV, 2, 2)],
         lender: lent,
         push: false,
+        transport: scheduling::kv::Transport::Nixl,
         trace: 0,
     };
     assert_eq!(decode.ask(again), Completion::Failed);
@@ -130,6 +132,7 @@ fn an_import_pushed_from_another_host_is_written_by_that_host_s_transfer_server(
         tables: vec![(KV, 0, 2)],
         lender: lent,
         push: true,
+        transport: scheduling::kv::Transport::Nixl,
         trace: 0,
     };
     let units = imported_units(decode.ask(import));

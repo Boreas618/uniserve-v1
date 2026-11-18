@@ -866,6 +866,7 @@ mod tests {
                 owner: OwnerId(1),
             },
             push: false,
+            transport: scheduling::kv::Transport::Nixl,
             trace: 0,
         };
         let imported = bench.ask(B, 1, import(2));
@@ -892,6 +893,7 @@ mod tests {
                 owner: OwnerId(1),
             },
             push: true,
+            transport: scheduling::kv::Transport::Nixl,
             trace: 0,
         };
         assert_eq!(bench.ask(B, 4, remote), Completion::Failed);

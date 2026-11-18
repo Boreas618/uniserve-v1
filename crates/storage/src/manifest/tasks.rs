@@ -134,9 +134,12 @@ impl Binding {
         };
         let region = Region::Tensor { key, at: Some(at) };
         Ok(match self {
+            // A manifest's copies between hosts (weights, a media deployment's products) take
+            // NIXL; only a handoff's pages choose their transport.
             Self::Remote { endpoint, .. } => Region::Remote {
                 endpoint: endpoint.clone(),
                 region: Box::new(region),
+                transport: scheduling::kv::Transport::Nixl,
             },
             _ => region,
         })

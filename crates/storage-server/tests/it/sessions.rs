@@ -771,6 +771,7 @@ fn an_import_reshards_a_lent_owner_s_pages_into_its_owner_s_ranks_through_the_tr
         tables: vec![(KV, 0, 2)],
         lender: lender.clone(),
         push: false,
+        transport: scheduling::kv::Transport::Nixl,
         trace: 0,
     };
     let units = imported_units(schedulers[1].ask(import));
@@ -782,6 +783,7 @@ fn an_import_reshards_a_lent_owner_s_pages_into_its_owner_s_ranks_through_the_tr
         tables: vec![(KV, 2, 2)],
         lender,
         push: true,
+        transport: scheduling::kv::Transport::Nixl,
         trace: 0,
     };
     assert_eq!(schedulers[1].ask(again), Completion::Failed);

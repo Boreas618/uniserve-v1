@@ -39,6 +39,8 @@ pub struct ImportWork {
     /// Whether the lender's host's Transfer Server writes the pages (a push), or this host's
     /// reads them.
     pub push: bool,
+    /// The transport the pages cross between the two hosts by.
+    pub transport: scheduling::kv::Transport,
     /// The memory the importing owner's group addresses.
     pub memory: String,
     /// Per page, its class and position, the runs of the importing owner's block, and for a
@@ -55,6 +57,7 @@ pub(super) struct Importing {
     pub(super) owner: OwnerId,
     pub(super) lender: Lender,
     pub(super) push: bool,
+    pub(super) transport: scheduling::kv::Transport,
     /// The keys evicted for its blocks, which its answer lists.
     pub(super) evicted: Vec<storage::protocol::Key>,
 }
@@ -233,7 +236,7 @@ impl BufferPool {
         request: RequestId,
         owner: OwnerId,
         tables: &[(u8, u32, u32)],
-        (lender, push): (Lender, bool),
+        (lender, push, transport): (Lender, bool, scheduling::kv::Transport),
     ) -> Taken {
         let client = queue.0;
         let group = self.settled(client, owner)?.group;
@@ -350,6 +353,7 @@ impl BufferPool {
                 owner,
                 lender,
                 push,
+                transport,
                 evicted: evictions.into_iter().flat_map(|(_, keys)| keys).collect(),
             },
         );
@@ -398,6 +402,7 @@ impl BufferPool {
         Some(ImportWork {
             lender: importing.lender.clone(),
             push: importing.push,
+            transport: importing.transport,
             memory,
             pages,
             lender_memory,

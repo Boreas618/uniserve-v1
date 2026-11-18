@@ -91,6 +91,39 @@ pub(crate) fn calibration(paths: Paths) -> Calibration {
     calibration
 }
 
+/// This host's calibration of its GPUs, with a rate of copies from another host into each of its
+/// ends that paces the Transfer Engine's transfers. The calibration step times those copies with
+/// NIXL READs; the cases that cross hosts over the Transfer Engine state the rate it keeps on one
+/// host's adapters instead, a third of the 78 GB/s it reached between two GB200 hosts' GPUs
+/// (`docs/mooncake.md`).
+pub(crate) fn engine_calibration() -> Calibration {
+    use storage_server::transfer::calibration::{Cost, RemoteCost, RemotePath};
+
+    let mut calibration = calibration(Paths {
+        gpus: true,
+        reads: false,
+        fabric: false,
+    });
+    let ends: Vec<LinkEnd> = calibration
+        .gpus
+        .iter()
+        .map(|context| LinkEnd::Device { gpu: context.gpu })
+        .chain([LinkEnd::Host])
+        .collect();
+    calibration.remote = ends
+        .into_iter()
+        .map(|destination| RemoteCost {
+            path: RemotePath::Read,
+            destination,
+            cost: Cost {
+                bytes_per_second: 25_000_000_000,
+                overhead_ns: 20_000,
+            },
+        })
+        .collect();
+    calibration
+}
+
 /// A server whose Transfer Server is connected and reported its links.
 pub(crate) fn serving(gpus: Gpus) -> Running {
     let paths = Paths {
@@ -196,11 +229,21 @@ pub(crate) fn tensor_region(byte: u8) -> Region {
     }
 }
 
-/// `region` at the Storage Server of another host listening at `endpoint`.
+/// `region` at the Storage Server of another host listening at `endpoint`, over NIXL.
 pub(crate) fn remote_region(endpoint: &str, region: Region) -> Region {
+    remote_region_over(endpoint, region, scheduling::kv::Transport::Nixl)
+}
+
+/// `region` at the Storage Server of another host listening at `endpoint`, over `transport`.
+pub(crate) fn remote_region_over(
+    endpoint: &str,
+    region: Region,
+    transport: scheduling::kv::Transport,
+) -> Region {
     Region::Remote {
         endpoint: endpoint.into(),
         region: Box::new(region),
+        transport,
     }
 }
 

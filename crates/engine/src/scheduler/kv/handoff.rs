@@ -91,7 +91,8 @@ impl Kv {
                 },
             ],
             local,
-            transports: vec![Transport::Nixl],
+            // The decode side's Storage Server states the transports both sides have.
+            transports: Vec::new(),
         })
     }
 
@@ -115,16 +116,18 @@ impl Kv {
         };
         // The Storage Server's span of the handoff names the request.
         let trace = request.input.trace();
-        let push = match path {
-            Path::Push(_) => true,
-            Path::Read(_) => false,
+        let (push, transport) = match path {
+            Path::Push(transport) => (true, transport),
+            Path::Read(transport) => (false, transport),
             Path::Pull(_) => {
+                // An import of no page copies nothing: it only ends the lend.
                 let mut asks = self.admission_requests(request, step);
                 asks.push(runtime::Request::Import {
                     owner,
                     tables: Vec::new(),
                     lender,
                     push: false,
+                    transport: Transport::Nixl,
                     trace,
                 });
                 return asks;
@@ -151,6 +154,7 @@ impl Kv {
             tables,
             lender,
             push,
+            transport,
             trace,
         }]
     }

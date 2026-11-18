@@ -155,7 +155,7 @@ use crate::runtime::{Open, Opened};
 /// speaks: the one version either accepts. Each process that talks to the
 /// server checks it at its own `Hello`, independently of the other
 /// interfaces it speaks.
-pub const VERSION: u32 = 32;
+pub const VERSION: u32 = 33;
 
 /// How long a server of another host may take to answer a request it answers from what it holds
 /// (a hello, a borrow or return of a lend, a task's submission or cancellation, a connector's
@@ -703,19 +703,20 @@ pub enum Region {
         offset: u64,
     },
     /// Storage of another host that this host's Transfer Server READs or
-    /// WRITEs through NIXL: `region`, a retained tensor or a host region's
-    /// part of the caller's deployment, as a client of that host names it, at
-    /// the Storage Server listening at `endpoint` (that server's
-    /// [`Request::Status`], `peer`). Offsets count as they do in `region`. A
-    /// span's source lies on another host, and this host posts a READ, or
-    /// its destination does, of a span whose source is this host's, and this
-    /// host posts a WRITE; never both. That host's server checks the region
-    /// and its Transfer Server registers it once the task runs, so a region
-    /// of another deployment, or a span past its end, fails the task instead
-    /// of refusing it.
+    /// WRITEs over `transport` (NIXL, or Mooncake Transfer Engine): `region`, a
+    /// retained tensor or a host region's part of the caller's deployment, as
+    /// a client of that host names it, at the Storage Server listening at
+    /// `endpoint` (that server's [`Request::Status`], `peer`). Offsets count as
+    /// they do in `region`. A span's source lies on another host, and this host
+    /// posts a READ, or its destination does, of a span whose source is this
+    /// host's, and this host posts a WRITE; never both. That host's server
+    /// checks the region and its Transfer Server registers it with the
+    /// transport once the task runs, so a region of another deployment, or a
+    /// span past its end, fails the task instead of refusing it.
     Remote {
         endpoint: String,
         region: Box<Region>,
+        transport: scheduling::kv::Transport,
     },
 }
 
@@ -908,12 +909,13 @@ pub enum Allocation {
     },
     /// The region `region` of `deployment` at the Storage Server of another
     /// host listening at `endpoint`, as a [`Region::Remote`] names it: the
-    /// Transfer Server has that server expose it ([`Request::Expose`]) and
-    /// READs it.
+    /// Transfer Server has that server expose it over `transport`
+    /// ([`Request::Expose`]) and READs or WRITEs it.
     Remote {
         endpoint: String,
         deployment: String,
         region: Box<Region>,
+        transport: scheduling::kv::Transport,
     },
 }
 
@@ -1312,9 +1314,10 @@ pub enum Request {
     },
     /// From another host's Transfer Server ([`Role::Peer`]): have this
     /// host's Transfer Server register `regions`, retained tensors or page
-    /// pools of `deployment` on this host, with its NIXL agent, for that
-    /// Transfer Server's READs. Responded with [`Response::Exposed`] once they
-    /// are registered; refused when a region is not storage of the
+    /// pools of `deployment` on this host, with its agent of `transport` (its
+    /// NIXL agent, or its Mooncake Transfer Engine), for that Transfer
+    /// Server's READs and WRITEs. Responded with [`Response::Exposed`] once
+    /// they are registered; refused when a region is not storage of the
     /// deployment, when no Transfer Server is connected, or when it cannot
     /// register them. The regions stay registered for the exposure until
     /// the peer ends it ([`Request::Unexpose`]) or its connection closes,
@@ -1324,6 +1327,7 @@ pub enum Request {
     Expose {
         deployment: String,
         regions: Vec<Region>,
+        transport: scheduling::kv::Transport,
     },
     /// From another host's Transfer Server: the reads of the peer's exposure
     /// `exposure` ended. This host's Transfer Server lets its registrations
@@ -1332,7 +1336,9 @@ pub enum Request {
     /// caller's previous connection) gets its response alike.
     Unexpose { exposure: u64 },
     /// From the Transfer Server: the allocations of the server's
-    /// [`Event::Register`] `request` are registered with its NIXL agent:
+    /// [`Event::Register`] `request` are registered with its agent of the
+    /// event's transport (its NIXL agent, or its Transfer Engine, whose
+    /// `metadata` is its segment name):
     /// each allocation's range, in the order the event listed them, and
     /// the agent's `metadata` taken after the registrations; or `failure`
     /// says why they are not.
@@ -1510,11 +1516,14 @@ pub enum Request {
     Program { program: Option<KvProgram> },
     /// From a head or a worker of the deployment, on the decode side of a
     /// prefill-to-decode handoff: how its full pages reach the decode
-    /// replica. The deployment's KV program decides; an output the handoff
-    /// cannot take (a transport `handoff.transports` lacks, a pull from a
-    /// tier that does not hold every full page, a pull from the device), a
-    /// program that failed or none at all takes the default rule: push over
-    /// the first transport both sides have. Responded with
+    /// replica. The server states the transports both sides have
+    /// (`handoff.transports`) as the deployment's
+    /// `storage_config.handoff_transports`, which every node serves with. The
+    /// deployment's KV program decides; an output the handoff cannot take (a
+    /// transport the sides lack, a pull from a tier that does not hold every
+    /// full page, a pull from the device), a program that failed or none at
+    /// all takes the default rule: push over the first transport both sides
+    /// have. Responded with
     /// [`Response::Handoff`]; refused when the sides have no transport in
     /// common, since the tail is pushed or read whatever the full pages do.
     Handoff { handoff: scheduling::kv::Handoff },
@@ -1732,11 +1741,13 @@ pub enum Response {
         storages: u64,
         bytes: u64,
     },
-    /// The regions of a [`Request::Expose`], registered with the NIXL agent
-    /// of this host's Transfer Server for the exposure `exposure`: the
-    /// agent's `metadata`, which a READ's agent loads to reach them, and
-    /// each region's range, in order, from the region's first byte to the
-    /// end of its allocation.
+    /// The regions of a [`Request::Expose`], registered with the agent of its
+    /// transport in this host's Transfer Server for the exposure `exposure`:
+    /// the agent's `metadata`, which the other side's agent loads to reach
+    /// them (a NIXL agent's metadata; a Transfer Engine's segment name,
+    /// `host:port`, which the other side's engine opens), and each region's
+    /// range, in order, from the region's first byte to the end of its
+    /// allocation.
     Exposed {
         exposure: u64,
         metadata: Vec<u8>,
@@ -2087,11 +2098,12 @@ pub enum Event {
     /// milliseconds (`storage_config.transfer_chunk_us`, `transfer_progress_ms`).
     Pace { chunk_us: u64, progress_ms: u64 },
     /// To the Transfer Server: register `allocations`, each given before,
-    /// with its NIXL agent for another host's READs, and report with
-    /// [`Request::Registered`].
+    /// with its agent of `transport` for another host's READs and WRITEs, and
+    /// report with [`Request::Registered`].
     Register {
         request: u64,
         allocations: Vec<Allocation>,
+        transport: scheduling::kv::Transport,
     },
     /// To the Transfer Server: create device storage of at least `bytes` on
     /// GPU `gpu`, retainable through a POSIX descriptor and addressed by

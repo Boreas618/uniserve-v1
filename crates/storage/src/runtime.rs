@@ -29,7 +29,7 @@ use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface that this build's engine and buffer pool
 /// speak, the one version either accepts.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 /// The clock every instant of this interface is stated in: the host's
 /// monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds since an unspecified
@@ -449,7 +449,7 @@ pub enum Request {
     /// the count), all or none, filled from the blocks at the same positions of the lender's
     /// owner: a task of the Transfer Server of this host when `push` is false (a read), of the
     /// lender's host when it is true (a push), which reshards each page's heads between the two
-    /// layouts. The blocks enter the owner's table once the task copied every page; otherwise
+    /// layouts and crosses between two hosts over `transport`. The blocks enter the owner's table once the task copied every page; otherwise
     /// they are released. The lend ends once the task has, whatever its outcome; an import of
     /// no position only ends the lend. The import is the handoff of the request of trace id
     /// `trace` (zero for one nothing traces), whose span the server records from its task's start
@@ -459,6 +459,7 @@ pub enum Request {
         tables: Vec<(u8, u32, u32)>,
         lender: Lender,
         push: bool,
+        transport: scheduling::kv::Transport,
         trace: u64,
     },
 }
@@ -955,6 +956,7 @@ impl Request {
                 tables,
                 lender,
                 push,
+                transport,
                 trace,
             } => {
                 writer.byte(19);
@@ -969,6 +971,10 @@ impl Request {
                 writer.word(lender.session);
                 writer.long(lender.owner.0);
                 writer.byte(u8::from(*push));
+                writer.byte(match transport {
+                    scheduling::kv::Transport::Nixl => 0,
+                    scheduling::kv::Transport::Mooncake => 1,
+                });
                 writer.long(*trace);
             }
         }
@@ -1096,11 +1102,22 @@ impl Request {
                     session: reader.word()?,
                     owner: OwnerId(reader.long()?),
                 };
+                let push = reader.flag()?;
+                let transport = match reader.byte()? {
+                    0 => scheduling::kv::Transport::Nixl,
+                    1 => scheduling::kv::Transport::Mooncake,
+                    other => {
+                        return Err(Error::Protocol(format!(
+                            "an import names transport {other}"
+                        )));
+                    }
+                };
                 Self::Import {
                     owner,
                     tables,
                     lender,
-                    push: reader.flag()?,
+                    push,
+                    transport,
                     trace: reader.long()?,
                 }
             }
@@ -1403,6 +1420,7 @@ mod tests {
                     owner: OwnerId(7),
                 },
                 push: true,
+                transport: scheduling::kv::Transport::Mooncake,
                 trace: 1 << 40,
             },
             Request::Import {
@@ -1414,6 +1432,7 @@ mod tests {
                     owner: OwnerId(3),
                 },
                 push: false,
+                transport: scheduling::kv::Transport::Nixl,
                 trace: 0,
             },
             Request::Evict { keys: vec![] },

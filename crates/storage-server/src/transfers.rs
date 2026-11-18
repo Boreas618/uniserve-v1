@@ -63,6 +63,14 @@ use ::storage::protocol::{
 use crate::child::Process;
 use crate::{Attachment, ClientId, Handling, Server, StorageId, invalid};
 
+/// An exposure's allocations, each region's allocation and offset in it, and each allocation's
+/// fabric handle with its bytes, as [`Server::expose`] resolved them.
+pub(super) type Exposed = (
+    Vec<Allocation>,
+    Vec<(usize, u64)>,
+    Vec<Option<(FabricHandle, u64)>>,
+);
+
 /// A task the Transfer Server runs, as the server keeps it.
 pub(super) struct Task {
     /// Who learns of the task's progress and end.
@@ -382,6 +390,7 @@ impl Server {
         &mut self,
         deployment: &str,
         regions: &[Region],
+        transport: scheduling::kv::Transport,
     ) -> Result<Handling, (ErrorKind, String)> {
         let Some(transfer_server) = self.transfers.client else {
             return Err(unavailable());
@@ -434,19 +443,19 @@ impl Server {
             allocations,
             regions: placed,
             fabric,
+            transport,
         })
     }
 
-    /// Have the Transfer Server register an exposure's allocations, and hold
-    /// the connection of `client`, the peer, until it reports them and
+    /// Have the Transfer Server register an exposure's allocations with its agent of
+    /// `transport`, and hold the connection of `client`, the peer, until it reports them and
     /// `request` gets its response: requests get their responses in order.
     pub(super) fn begin_exposure(
         &mut self,
         client: ClientId,
         request: u64,
-        allocations: Vec<Allocation>,
-        regions: Vec<(usize, u64)>,
-        fabric: Vec<Option<(FabricHandle, u64)>>,
+        (allocations, regions, fabric): Exposed,
+        transport: scheduling::kv::Transport,
     ) {
         let Some(transfer_server) = self.transfers.client else {
             self.respond(client, request, error_reply(unavailable()), &[]);
@@ -467,6 +476,7 @@ impl Server {
             Event::Register {
                 request: number,
                 allocations,
+                transport,
             },
             Vec::new(),
         ));
@@ -622,7 +632,12 @@ impl Server {
             );
             // Another host's destination: that host checks it once the Transfer Server asks
             // it to expose the region, and the span's source is this host's.
-            if let Region::Remote { endpoint, region } = &span.destination {
+            if let Region::Remote {
+                endpoint,
+                region,
+                transport,
+            } = &span.destination
+            {
                 if matches!(span.source, Region::Remote { .. }) {
                     return Err(crossing);
                 }
@@ -644,7 +659,7 @@ impl Server {
                 moves.push(Move {
                     source: source.allocation.clone(),
                     source_offset,
-                    destination: remote(deployment, endpoint, region)?,
+                    destination: remote(deployment, endpoint, region, *transport)?,
                     destination_offset: span.destination_offset,
                     bytes: span.bytes,
                     rows: span.rows,
@@ -665,11 +680,16 @@ impl Server {
                 // Another host's region: that host checks it, and the span
                 // against it, once the Transfer Server asks it to expose
                 // the region.
-                Region::Remote { endpoint, region } => {
+                Region::Remote {
+                    endpoint,
+                    region,
+                    transport,
+                } => {
                     if matches!(destination.allocation, Allocation::Fabric { .. }) {
                         return Err(crossing);
                     }
-                    (remote(deployment, endpoint, region)?, span.source_offset)
+                    let source = remote(deployment, endpoint, region, *transport)?;
+                    (source, span.source_offset)
                 }
                 region => {
                     let source = self.resolve(deployment, region, false)?;
@@ -1238,6 +1258,7 @@ fn remote(
     deployment: &str,
     endpoint: &str,
     region: &Region,
+    transport: scheduling::kv::Transport,
 ) -> Result<Allocation, (ErrorKind, String)> {
     if !matches!(region, Region::Tensor { .. } | Region::Part { .. }) {
         return Err(invalid(
@@ -1253,6 +1274,7 @@ fn remote(
         endpoint: endpoint.to_owned(),
         deployment: deployment.to_owned(),
         region: Box::new(region.clone()),
+        transport,
     })
 }
 

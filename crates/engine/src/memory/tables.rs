@@ -1883,6 +1883,7 @@ mod tests {
                 owner: OwnerId(9),
             },
             push: false,
+            transport: scheduling::kv::Transport::Nixl,
             trace: 0,
         };
         let short = Completion::Imported {

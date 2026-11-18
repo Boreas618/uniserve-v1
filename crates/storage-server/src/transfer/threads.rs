@@ -65,7 +65,8 @@ use platform::{
 
 use super::calibration::{Calibration, Cost, RemotePath, Sizing};
 use super::contexts::{Contexts, Hold};
-use super::network::{Network, Source};
+use super::mooncake;
+use super::network::{Network, Reach, Source};
 use super::nixl;
 use super::storage::{Fabric, Mapping};
 use super::storage_name;
@@ -77,8 +78,8 @@ pub(super) enum Runner {
     Device(DeviceId),
     /// The CPU, between host buffers.
     Host,
-    /// This process's NIXL agent, with READs from another host through
-    /// the network adapters.
+    /// This process's NIXL agent or Transfer Engine, with READs from and
+    /// WRITEs into another host through the network adapters.
     Network,
 }
 
@@ -1041,7 +1042,7 @@ impl Copier for HostCopier {
     }
 }
 
-/// This process's NIXL agent, with READs from another host's storage into
+/// This process's NIXL agent and Transfer Engine, with READs from another host's storage into
 /// this host's and WRITEs the other way.
 struct NetworkCopier<'a> {
     network: &'a Network,
@@ -1051,9 +1052,26 @@ struct NetworkCopier<'a> {
     due: Instant,
 }
 
+/// A READ or a WRITE posted, by the transport that carries it.
+enum Flight {
+    Nixl(nixl::Transfer),
+    Mooncake(mooncake::Batch),
+}
+
+impl Flight {
+    /// Waits until the transfer completed, from `due` on ([`nixl::Transfer::wait`],
+    /// [`mooncake::Batch::wait`]).
+    fn wait(self, due: Instant) -> Result<(), String> {
+        match self {
+            Flight::Nixl(transfer) => transfer.wait(due).map_err(|error| error.to_string()),
+            Flight::Mooncake(batch) => batch.wait(due).map_err(|error| error.to_string()),
+        }
+    }
+}
+
 impl Copier for NetworkCopier<'_> {
-    /// The READ, and when its bytes are due.
-    type Flight = (nixl::Transfer, Instant);
+    /// The READ or WRITE, and when its bytes are due.
+    type Flight = (Flight, Instant);
 
     const ASYNCHRONOUS: bool = true;
 
@@ -1077,11 +1095,11 @@ impl Copier for NetworkCopier<'_> {
     }
 }
 
-/// Post `piece` as one READ of `network`'s agent: from another host's
-/// storage, which its Transfer Server registered, into an allocation of this
-/// host's, registered here at its first READ: device storage in its GPU's
-/// session, host storage with the allocation.
-fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
+/// Post `piece` as one READ of `network`'s agent of the piece's transport: from another host's
+/// storage, which its Transfer Server registered, into an allocation of this host's, registered
+/// here at its first READ: device storage in its GPU's session, host storage with the
+/// allocation; or as one WRITE the other way.
+fn post(network: &Network, piece: &Piece) -> Result<Flight, String> {
     let (remote, mapped, hold, write) = match (&piece.source, &piece.destination) {
         (End::Remote(source), End::Given { mapped, hold }) => (source, mapped, hold, false),
         (End::Given { mapped, hold }, End::Remote(destination)) => {
@@ -1092,6 +1110,13 @@ fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
                 "a READ or a WRITE moves bytes between another host's storage and this host's"
                     .into(),
             );
+        }
+    };
+    let (peer, remote_region) = match &remote.reach {
+        Reach::Nixl { peer, region } => (peer, *region),
+        Reach::Mooncake { segment, address } => {
+            return post_mooncake(network, piece, (remote, *segment, *address), (mapped, hold))
+                .map(Flight::Mooncake);
         }
     };
     let agent = network.agent()?;
@@ -1123,20 +1148,20 @@ fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
             if write {
                 nixl::Span {
                     source: source(local),
-                    destination: destination(remote.region),
+                    destination: destination(remote_region),
                 }
             } else {
                 nixl::Span {
-                    source: source(remote.region),
+                    source: source(remote_region),
                     destination: destination(local),
                 }
             }
         })
         .collect();
     let (transfer, what) = if write {
-        (agent.write(&remote.peer, &spans), "WRITE into")
+        (agent.write(peer, &spans), "WRITE into")
     } else {
-        (agent.read(&remote.peer, &spans), "READ from")
+        (agent.read(peer, &spans), "READ from")
     };
     let transfer =
         transfer.map_err(|error| format!("posting a {what} {}: {error}", remote.endpoint))?;
@@ -1147,7 +1172,73 @@ fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
         write,
         "posted a transfer with another host"
     );
-    Ok(transfer)
+    Ok(Flight::Nixl(transfer))
+}
+
+/// Posts `piece` over `network`'s Transfer Engine: a READ of the region of `remote` the
+/// engine's `segment` registered from `address` on, into `mapped`, an allocation of this host's
+/// registered here at its first transfer (in its GPU's session, which `hold` holds, for device
+/// storage); or a WRITE the other way. One transfer moves each row of the chunk.
+fn post_mooncake(
+    network: &Network,
+    piece: &Piece,
+    (remote, segment, address): (&Source, mooncake::SegmentId, u64),
+    (mapped, hold): (&Mapping, &Option<Hold>),
+) -> Result<mooncake::Batch, String> {
+    let engine = network.engine()?;
+    let local = match hold {
+        Some(hold) => hold.session()?.mooncake_address(engine, mapped)?,
+        None => mapped.mooncake_host_address(engine)?,
+    };
+    let write = matches!(piece.destination, End::Remote(_));
+    // The server checked this host's end of the span against its allocation, and the
+    // exposure's resolution the other end against its region's range.
+    let row = |base: u64, offset: u64, pitch: u64, row: u64| base + offset + row * pitch;
+    let spans: Vec<mooncake::Span> = (0..piece.rows)
+        .map(|index| {
+            let source = |base| row(base, piece.source_offset, piece.source_pitch, index);
+            let destination = |base| {
+                row(
+                    base,
+                    piece.destination_offset,
+                    piece.destination_pitch,
+                    index,
+                )
+            };
+            if write {
+                mooncake::Span {
+                    local: source(local),
+                    remote: destination(address),
+                    len: piece.bytes,
+                }
+            } else {
+                mooncake::Span {
+                    local: destination(local),
+                    remote: source(address),
+                    len: piece.bytes,
+                }
+            }
+        })
+        .collect();
+    let (posted, what) = if write {
+        (engine.write(segment, &spans), "WRITE into")
+    } else {
+        (engine.read(segment, &spans), "READ from")
+    };
+    let batch = posted.map_err(|error| {
+        format!(
+            "posting a Transfer Engine {what} {}: {error}",
+            remote.endpoint
+        )
+    })?;
+    tracing::debug!(
+        task = piece.task,
+        bytes = piece.bytes,
+        endpoint = remote.endpoint,
+        write,
+        "posted a Transfer Engine transfer with another host"
+    );
+    Ok(batch)
 }
 
 /// End the process after a device fault: its CUDA contexts are no longer

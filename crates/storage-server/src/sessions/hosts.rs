@@ -25,6 +25,7 @@ use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
+use scheduling::kv::Transport;
 use storage::client::Waited;
 use storage::protocol::{Priority, Region, Role, Span, TaskStatus};
 use storage::{Client, Error, Result};
@@ -35,15 +36,15 @@ use crate::Server;
 
 /// Which end of a span that runs on another host is storage of this host, which that host
 /// reaches as a region of another host ([`Region::Remote`]) at the address the connection leaves
-/// this host from.
+/// this host from, over the transport stated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Here {
     /// Neither: both lie on the running host or on a host the span names.
     Neither,
     /// The source, which the running host READs.
-    Source,
+    Source(Transport),
     /// The destination, which the running host WRITEs.
-    Destination,
+    Destination(Transport),
 }
 
 /// How the main loop stops a helper that waits for another host's task: the write end of a pipe
@@ -136,14 +137,17 @@ fn transfer(
     let spans = spans
         .into_iter()
         .map(|(mut span, end)| {
-            let remote = |region: Region, here: &String| Region::Remote {
+            let remote = |region: Region, here: &String, transport| Region::Remote {
                 endpoint: here.clone(),
                 region: Box::new(region),
+                transport,
             };
             match (end, &here) {
-                (Here::Source, Some(here)) => span.source = remote(span.source, here),
-                (Here::Destination, Some(here)) => {
-                    span.destination = remote(span.destination, here);
+                (Here::Source(transport), Some(here)) => {
+                    span.source = remote(span.source, here, transport);
+                }
+                (Here::Destination(transport), Some(here)) => {
+                    span.destination = remote(span.destination, here, transport);
                 }
                 _ => {}
             }

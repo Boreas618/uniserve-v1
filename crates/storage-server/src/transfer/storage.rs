@@ -34,6 +34,7 @@ use platform::{DeviceId, PeerMapping, ShareableHandle};
 
 use super::contexts::Contexts;
 use super::devices::Gpus;
+use super::mooncake;
 use super::nixl;
 
 /// A mapping made once, or why it could not be made.
@@ -68,6 +69,9 @@ pub(super) struct Mapping {
     /// at its first READ or exposure. It is undone before the mapping it
     /// registers is unmapped: fields drop in declaration order.
     nixl: Once<nixl::Registration>,
+    /// A host allocation's registration with the process's Transfer Engine, made at its first
+    /// transfer or exposure over Mooncake, undone before the mapping as `nixl` is.
+    mooncake: Once<mooncake::Registration>,
     host: Once<HostMap>,
     /// The host NUMA node a host allocation's first page lies on, found at
     /// its first use.
@@ -101,6 +105,7 @@ impl Mapping {
             device,
             contexts,
             nixl: OnceLock::new(),
+            mooncake: OnceLock::new(),
             host: OnceLock::new(),
             node: OnceLock::new(),
             descriptor,
@@ -237,6 +242,38 @@ impl Mapping {
         registration
             .as_ref()
             .map(nixl::Registration::region)
+            .map_err(Clone::clone)
+    }
+
+    /// A host allocation's address, registered with `engine` at the first call: the range
+    /// this engine's transfers write into or read from, or another host's engine does. The
+    /// process has one engine, which every call names. A read-only allocation is refused: the
+    /// Transfer Engine registers every range for remote writes, which a read-only mapping
+    /// cannot grant, so such storage crosses hosts over NIXL alone. A device allocation
+    /// registers in its GPU's session instead
+    /// ([`Session::mooncake_address`](super::contexts::Session::mooncake_address)).
+    pub(super) fn mooncake_host_address(&self, engine: &mooncake::Engine) -> Result<u64, String> {
+        if self.end != LinkEnd::Host {
+            return Err("a device allocation registers in its GPU's session".into());
+        }
+        if !self.writable {
+            return Err(
+                "a read-only allocation crosses hosts over NIXL: the Transfer Engine registers \
+                 storage for remote writes"
+                    .into(),
+            );
+        }
+        let registration = self.mooncake.get_or_init(|| {
+            let (address, len) = (self.host_address()?, self.length()?);
+            // SAFETY: the host mapping is a field declared after `mooncake`, so it stays mapped
+            // writable until the registration dropped; the Transfer Server holds no Rust
+            // reference to the bytes, which its copies reach through raw addresses only.
+            unsafe { engine.register(address, len) }
+                .map_err(|error| format!("registering storage with the Transfer Engine: {error}"))
+        });
+        registration
+            .as_ref()
+            .map(mooncake::Registration::address)
             .map_err(Clone::clone)
     }
 

@@ -97,6 +97,10 @@ pub struct ServerSettings {
     /// How often the server reports its node's pages to the cluster directory, in milliseconds:
     /// what the directory states of a node lags its pages by up to this period. Default 1000.
     pub directory_period_ms: u64,
+    /// The transports a handoff's pages may cross hosts by, which the KV program's handoff hook
+    /// chooses among: NIXL (`nixl`) and Mooncake Transfer Engine (`mooncake`). Default
+    /// `["nixl"]`.
+    pub handoff_transports: Vec<scheduling::kv::Transport>,
     /// How long a process the server shot down, or an engine's process it follows, may take
     /// after its exit to leave every GPU whose storage it held, in seconds: past it the
     /// shoot-down fails (the GPU needs a reset) and the requests that waited for it fail.
@@ -121,6 +125,7 @@ impl Default for ServerSettings {
             shoot_down_s: 60,
             directory: None,
             directory_period_ms: 1000,
+            handoff_transports: vec![scheduling::kv::Transport::Nixl],
         }
     }
 }
@@ -174,7 +179,8 @@ impl ServerSettings {
     /// too. Every other setting the server reads each time it acts on it: the host reserve at an
     /// admission, the deadlines at a task's start, the chunk and progress period at the Transfer
     /// Server's next chunk, the waits before a child starts again and the shoot-down's deadline
-    /// when they begin; the cluster directory's leader and period at the next report.
+    /// when they begin; the cluster directory's leader and period, and the handoff's transports,
+    /// at the next report and handoff.
     pub fn restarts(&self, next: &Self) -> bool {
         // Every setting is named, so a new one does not compile until it is classified here.
         let Self {
@@ -192,6 +198,7 @@ impl ServerSettings {
             shoot_down_s: _,
             directory: _,
             directory_period_ms: _,
+            handoff_transports: _,
         } = self;
         let traced = buffer_pool_trace.is_some();
         let deadlines = *transfer_deadline_s != next.transfer_deadline_s
@@ -291,6 +298,10 @@ mod tests {
             shoot_down_s: 20,
             directory: Some("10.0.0.1:7100".parse().unwrap()),
             directory_period_ms: 250,
+            handoff_transports: vec![
+                scheduling::kv::Transport::Nixl,
+                scheduling::kv::Transport::Mooncake,
+            ],
             ..serving.clone()
         };
         assert!(!serving.restarts(&taken));

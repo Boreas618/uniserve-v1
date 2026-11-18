@@ -1414,14 +1414,16 @@ impl Server {
                     for mut span in spans(source, destination, firsts, *count)? {
                         let here = match (source_at, at) {
                             (source_at, at) if source_at == at => Here::Neither,
+                            // A media deployment's products cross hosts over NIXL.
                             (Some(endpoint), _) => {
                                 span.source = Region::Remote {
                                     endpoint: endpoint.clone(),
                                     region: Box::new(span.source),
+                                    transport: scheduling::kv::Transport::Nixl,
                                 };
                                 Here::Neither
                             }
-                            (None, _) => Here::Source,
+                            (None, _) => Here::Source(scheduling::kv::Transport::Nixl),
                         };
                         tasks.entry(at.clone()).or_default().push((span, here));
                     }

@@ -823,12 +823,13 @@ impl BufferPool {
                 tables,
                 lender,
                 push,
+                transport,
                 trace,
             } => {
                 if trace != 0 {
                     self.traces.insert((queue, id), trace);
                 }
-                self.import(queue, id, owner, &tables, (lender, push))
+                self.import(queue, id, owner, &tables, (lender, push, transport))
             }
             Request::Prefetch {
                 group,

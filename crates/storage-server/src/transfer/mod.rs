@@ -30,7 +30,7 @@
 //! | host → GPU, GPU → host | the GPU's copy engines, with the host storage registered |
 //! | another host's GPU of the NVLink fabric ↔ this host | the local GPU's copy engines (for host storage, those of the GPU nearest the storage's NUMA node with the fastest calibrated link to it), with the fabric handle imported |
 //! | host → host | the CPU |
-//! | another host's GPU or host storage → this host | NIXL READs this host's agent posts, through the network adapters ([`network`]) |
+//! | another host's GPU or host storage → this host | READs this host's NIXL agent or Transfer Engine posts, through the network adapters, by the transport the span names ([`network`]) |
 //!
 //! No compute kernel runs: copies use copy engines or the network adapters
 //! only, so the epoch executing beside them keeps its compute units. A
@@ -40,7 +40,7 @@
 //! destination, reported when it first copies ([`Request::Measured`]), with
 //! the chunks, priorities and budget of every copy thread.
 //!
-//! The same agent serves other hosts' READs of this host's storage: the
+//! The same agent, or engine, serves other hosts' READs and WRITEs of this host's storage: the
 //! server has it register the allocations a peer asks to expose
 //! ([`Event::Register`]), and it reports the ranges and its metadata
 //! ([`Request::Registered`]); the registrations, and the GPU contexts they
@@ -66,6 +66,7 @@
 pub mod calibration;
 mod contexts;
 mod devices;
+pub(crate) mod mooncake;
 mod network;
 pub(crate) mod nixl;
 mod storage;
@@ -108,6 +109,10 @@ pub struct Options {
     pub serves_peers: bool,
     /// The transports the NIXL agent takes between hosts.
     pub transports: Transports,
+    /// Whether handoffs may cross hosts over Mooncake Transfer Engine (the server's
+    /// `handoff_transports`): a server that serves other hosts then starts its engine with the
+    /// process, as it starts its NIXL agent.
+    pub mooncake: bool,
     /// The host's calibration: the GPUs to copy on (the CUDA driver loads only when it states
     /// one), and the cost of every path.
     pub calibration: Calibration,
@@ -121,6 +126,9 @@ impl Options {
             progress: settings.transfer_progress(),
             serves_peers: settings.tcp.is_some(),
             transports: settings.nixl_transports,
+            mooncake: settings
+                .handoff_transports
+                .contains(&scheduling::kv::Transport::Mooncake),
             calibration,
         }
     }
@@ -166,6 +174,18 @@ pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error>
             .spawn(move || {
                 if let Err(error) = starting.agent() {
                     tracing::warn!(%error, "the NIXL agent did not start");
+                }
+            })?;
+    }
+    // The Transfer Engine discovers the host's adapters and starts its handshake listener when
+    // it starts: a server that serves other hosts' handoffs over it starts it now as well.
+    if options.serves_peers && options.mooncake {
+        let starting = Arc::clone(&network);
+        std::thread::Builder::new()
+            .name("mooncake-engine".into())
+            .spawn(move || {
+                if let Err(error) = starting.engine() {
+                    tracing::warn!(%error, "the Transfer Engine did not start");
                 }
             })?;
     }
@@ -548,7 +568,8 @@ impl TransferServer {
             Event::Register {
                 request,
                 allocations,
-            } => self.register(request, &allocations),
+                transport,
+            } => self.register(request, &allocations, transport),
             Event::Allocate {
                 request,
                 gpu,
@@ -586,6 +607,7 @@ impl TransferServer {
                     endpoint,
                     deployment,
                     region,
+                    transport,
                 } => self.given(&copy.destination).and_then(|destination| {
                     let hold = match destination.end {
                         LinkEnd::Device { .. } => {
@@ -597,6 +619,7 @@ impl TransferServer {
                         endpoint: endpoint.clone(),
                         deployment: deployment.clone(),
                         direction: Direction::Read,
+                        transport: *transport,
                         region: (**region).clone(),
                         remote_offset: copy.source_offset,
                         local: destination,
@@ -615,6 +638,7 @@ impl TransferServer {
                         endpoint,
                         deployment,
                         region,
+                        transport,
                     } = &copy.destination
                     else {
                         unreachable!("matched as another host's region");
@@ -630,6 +654,7 @@ impl TransferServer {
                             endpoint: endpoint.clone(),
                             deployment: deployment.clone(),
                             direction: Direction::Write,
+                            transport: *transport,
                             region: (**region).clone(),
                             remote_offset: copy.destination_offset,
                             local: source,
@@ -689,10 +714,15 @@ impl TransferServer {
         }
     }
 
-    /// Register `allocations` with the NIXL agent for another host's READs,
-    /// on a helper: registering device storage retains its GPU's context and
+    /// Register `allocations` with the agent of `transport` for another host's READs and
+    /// WRITEs, on a helper: registering device storage retains its GPU's context and
     /// pins the storage, which takes a while for a large host region's part.
-    fn register(&mut self, request: u64, allocations: &[Allocation]) {
+    fn register(
+        &mut self,
+        request: u64,
+        allocations: &[Allocation],
+        transport: scheduling::kv::Transport,
+    ) {
         let mut holds = TaskHolds::new();
         let exposed: Result<Vec<Exposed>, String> = allocations
             .iter()
@@ -710,7 +740,7 @@ impl TransferServer {
             let registered = exposed
                 .as_deref()
                 .map_err(Clone::clone)
-                .and_then(|exposed| network::register(&network, exposed));
+                .and_then(|exposed| network::register(&network, exposed, transport));
             Some(Done::Registered {
                 request,
                 holds: holds.into_values().collect(),

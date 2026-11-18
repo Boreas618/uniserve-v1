@@ -286,6 +286,7 @@ fn imported(id: u64, owner: u64, slot: u32, units: &[u32]) -> Hand {
             owner: OwnerId(9),
         },
         push: false,
+        transport: scheduling::kv::Transport::Nixl,
         trace: 0,
     };
     let filled = Completion::Imported {

@@ -1126,7 +1126,10 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
     );
     for span in manifest.bind(&request, &request.source).spans() {
         let span = span.unwrap();
-        let crate::protocol::Region::Remote { endpoint, region } = span.source else {
+        let crate::protocol::Region::Remote {
+            endpoint, region, ..
+        } = span.source
+        else {
             panic!("remote host READ")
         };
         assert_eq!(endpoint, "host-b:4100");
@@ -1216,7 +1219,10 @@ fn one_gpu_copy_manifest_binds_to_each_submitting_host() {
         256
     );
     for (local, remote) in local_spans.iter().zip(&remote_spans) {
-        let crate::protocol::Region::Remote { endpoint, region } = &remote.source else {
+        let crate::protocol::Region::Remote {
+            endpoint, region, ..
+        } = &remote.source
+        else {
             panic!("the submitting host reads remote bytes")
         };
         assert_eq!(endpoint, "source:4100");

@@ -48,6 +48,7 @@ use std::time::Instant;
 
 use platform::{DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
 
+use super::mooncake;
 use super::nixl;
 use super::storage::{HostMap, Mapping};
 
@@ -273,6 +274,7 @@ impl Slot {
             read_only_registration: self.gpu.read_only_registration,
             live: Mutex::new(Some(Live {
                 nixl: HashMap::new(),
+                mooncake: HashMap::new(),
                 host: HashMap::new(),
                 mappings: HashMap::new(),
                 _context: context,
@@ -367,6 +369,7 @@ pub(super) struct Session {
 /// registrations before the context they live in.
 struct Live {
     nixl: HashMap<u64, Arc<Once<nixl::Registration>>>,
+    mooncake: HashMap<u64, Arc<Once<mooncake::Registration>>>,
     host: HashMap<u64, Arc<Once<HostRange>>>,
     mappings: HashMap<u64, Arc<Once<PeerMapping>>>,
     _context: PrimaryContext,
@@ -511,6 +514,36 @@ impl Session {
         }
     }
 
+    /// `mapped`, a device allocation on this GPU, at its address in the session, registered
+    /// with `engine` at the first call: the range this engine's transfers write into or read
+    /// from, or another host's engine does. It registers the session's mapping.
+    pub(super) fn mooncake_address(
+        &self,
+        engine: &mooncake::Engine,
+        mapped: &Mapping,
+    ) -> Result<u64, String> {
+        let address = self.device_address(mapped)?;
+        let entry = self.entry(
+            |live| &mut live.mooncake,
+            mapped.id(),
+            || {
+                // SAFETY: the session keeps the mapping until after the registration dropped
+                // (`Live`'s field order, and `forget` drops them in the same order); the
+                // Transfer Server holds no Rust reference to the bytes, which its copies reach
+                // through raw addresses only.
+                unsafe { engine.register(address, mapped.length()?) }.map_err(|error| {
+                    format!("registering storage with the Transfer Engine: {error}")
+                })
+            },
+        )?;
+        let made = entry.get().map(Result::as_ref);
+        match made {
+            Some(Ok(registration)) => Ok(registration.address()),
+            Some(Err(message)) => Err(message.clone()),
+            None => Err("a Transfer Engine registration was not made".into()),
+        }
+    }
+
     /// Drop what the session made for the allocation `id`, registration
     /// first.
     fn forget(&self, id: u64) {
@@ -519,6 +552,7 @@ impl Session {
             live.as_mut().map(|live| {
                 (
                     live.nixl.remove(&id),
+                    live.mooncake.remove(&id),
                     live.host.remove(&id),
                     live.mappings.remove(&id),
                 )

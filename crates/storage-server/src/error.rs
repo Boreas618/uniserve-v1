@@ -36,4 +36,25 @@ pub enum Error {
     /// An argument NIXL would reject or misread, refused before any call.
     #[error("{0}")]
     NixlArgument(String),
+    /// Mooncake Transfer Engine's library cannot be used: it is not installed where the loader's
+    /// default search finds it, or it lacks an entry point the bindings of `release` call.
+    #[error("Mooncake Transfer Engine ({library}, of Mooncake {release}) cannot be used: {reason}")]
+    TransferEngineLibrary {
+        library: &'static str,
+        release: &'static str,
+        reason: String,
+    },
+    /// A Transfer Engine call failed with a code of its `error.h`; the engine logs the cause.
+    #[error("{call} failed: {name} ({code})", name = crate::transfer::mooncake::code_name(*.code))]
+    TransferEngine { call: &'static str, code: i32 },
+    /// A transfer the Transfer Engine posted ended without completing, after `transferred`
+    /// bytes.
+    #[error(
+        "a Transfer Engine transfer ended {name} after {transferred} bytes",
+        name = crate::transfer::mooncake::status_name(*.status)
+    )]
+    TransferStatus { status: i32, transferred: u64 },
+    /// An argument the Transfer Engine would reject or misread, refused before any call.
+    #[error("{0}")]
+    TransferEngineArgument(String),
 }

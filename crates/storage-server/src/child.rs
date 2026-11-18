@@ -56,6 +56,19 @@ impl Launch {
             Self::Transfer(_) => Child::TransferServer,
         }
     }
+
+    /// The environment variables the child takes beside this process's own.
+    ///
+    /// The Transfer Server's Transfer Engine registers device storage through its dma-buf
+    /// (`WITH_NVIDIA_PEERMEM=0`), as UCX registers it for NIXL: the server's device storage is
+    /// CUDA VMM allocations, which the engine's default, a registration of the address through
+    /// nvidia-peermem, refuses.
+    fn environment(&self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Connector(_) => &[],
+            Self::Transfer(_) => &[("WITH_NVIDIA_PEERMEM", "0")],
+        }
+    }
 }
 
 /// A launch crosses the channel in the storage protocol's encoding and the workspace's frames.
@@ -147,7 +160,8 @@ impl Program {
     }
 
     /// Starts a process of the image with `entry` after the prefix, which inherits each of
-    /// `inherited` at its own descriptor number and `stdin` as its standard input; every other
+    /// `inherited` at its own descriptor number and `stdin` as its standard input, and this
+    /// process's environment with each of `set` replacing or adding its variable; every other
     /// descriptor of this process is close-on-exec, and stays so.
     ///
     /// # Errors
@@ -158,13 +172,20 @@ impl Program {
         entry: &[OsString],
         inherited: &[BorrowedFd<'_>],
         stdin: Stdio,
+        set: &[(&str, &str)],
     ) -> io::Result<(std::process::Child, Arc<OwnedFd>)> {
         let arguments = std::iter::once(self.name.as_os_str())
             .chain(self.prefix.iter().map(OsStr::new))
             .chain(entry.iter().map(OsString::as_os_str))
             .map(c_string)
             .collect::<io::Result<Vec<_>>>()?;
-        let environment = std::env::vars_os()
+        let inherited_environment = std::env::vars_os()
+            .filter(|(name, _)| !set.iter().any(|(named, _)| name.as_os_str() == *named));
+        let stated = set
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+        let environment = inherited_environment
+            .chain(stated)
             .map(|(name, value)| {
                 let mut pair = name;
                 pair.push("=");
@@ -460,6 +481,7 @@ impl Process {
                 &child_entry(theirs.as_raw_fd()),
                 &[theirs.as_fd()],
                 Stdio::null(),
+                launch.environment(),
             )?;
             drop(theirs);
             let mut connection = Connection::new(ours)?;

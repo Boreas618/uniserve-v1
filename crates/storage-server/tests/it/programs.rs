@@ -147,18 +147,6 @@ fn a_kv_program_chooses_each_handoff_path_and_its_state_passes_to_its_replacemen
         head.handoff_path(handoff(2, nixl.clone())).unwrap(),
         Path::Push(Transport::Nixl)
     );
-    // Sides without a common transport cannot hand the tail over.
-    let refused = head.handoff_path(handoff(3, Vec::new()));
-    assert!(
-        matches!(
-            refused,
-            Err(Error::Server {
-                kind: ErrorKind::Invalid,
-                ..
-            })
-        ),
-        "{refused:?}"
-    );
     assert_eq!(
         head.program(Some(kv.clone())).unwrap(),
         Some(ProgramStart::Kept)
@@ -228,6 +216,43 @@ fn a_kv_program_chooses_each_handoff_path_and_its_state_passes_to_its_replacemen
     assert_eq!(
         head.handoff_path(handoff(3, nixl)).unwrap(),
         Path::Push(Transport::Nixl)
+    );
+}
+
+/// The transports both sides of a handoff have are the deployment's, which the server states
+/// whatever the asker did: sides that have none cannot hand the tail over.
+#[test]
+fn a_handoff_takes_the_transports_the_server_serves_with() {
+    let server = Running::with_settings(::storage::Settings {
+        server: ::storage::ServerSettings {
+            handoff_transports: vec![Transport::Mooncake, Transport::Nixl],
+            ..::storage::ServerSettings::default()
+        },
+        connector: None,
+    });
+    let mut head = head(&server.socket);
+    assert_eq!(
+        head.handoff_path(handoff(3, Vec::new())).unwrap(),
+        Path::Push(Transport::Mooncake)
+    );
+
+    let none = Running::with_settings(::storage::Settings {
+        server: ::storage::ServerSettings {
+            handoff_transports: Vec::new(),
+            ..::storage::ServerSettings::default()
+        },
+        connector: None,
+    });
+    let refused = crate::server::head(&none.socket).handoff_path(handoff(3, vec![Transport::Nixl]));
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Server {
+                kind: ErrorKind::Invalid,
+                ..
+            })
+        ),
+        "{refused:?}"
     );
 }
 

@@ -583,16 +583,19 @@ impl Client {
     }
 
     /// See [`Request::Expose`]. Returns the exposure, which
-    /// [`Client::unexpose`] ends, the NIXL agent metadata of the server's
-    /// Transfer Server, and each region's registered range, in order.
+    /// [`Client::unexpose`] ends, the metadata of the agent of `transport` in
+    /// the server's Transfer Server, and each region's registered range, in
+    /// order.
     pub fn expose(
         &mut self,
         deployment: String,
         regions: Vec<Region>,
+        transport: scheduling::kv::Transport,
     ) -> Result<(u64, Vec<u8>, Vec<Registration>)> {
         let request = Request::Expose {
             deployment,
             regions,
+            transport,
         };
         match self.request(&request, &[])?.0 {
             Response::Exposed {

@@ -2,7 +2,8 @@
 //! blocks of its own from the pages the prefill replica lent, resharded by head range from the
 //! prefill rank, which holds both heads, into the two decode ranks, which hold one each. A read
 //! runs on the decode host's Transfer Server and a push on the lender's: device to device on one
-//! host, and through NIXL from or into another server's GPU storage.
+//! host, and through NIXL or Mooncake Transfer Engine from or into another server's GPU
+//! storage.
 
 #[cfg(test)]
 mod device {
@@ -20,7 +21,8 @@ mod device {
         rank, write_pages,
     };
     use crate::transfer::device::{device_bytes, device_storage, gpus, record};
-    use crate::transfer::{Paths, calibration, read, transfer_pid};
+    use crate::transfer::{Paths, calibration, engine_calibration, read, transfer_pid};
+    use scheduling::kv::Transport;
 
     /// A server whose Transfer Server copies on every GPU the driver shows and, with `reads`,
     /// reads other servers' storage through NIXL at the rate its calibration states. The
@@ -38,6 +40,20 @@ mod device {
         let server = Running::with_children(Some(transfer_child(calibration(paths))));
         transfer_pid(&server.socket, None);
         server
+    }
+
+    /// A server whose Transfer Server copies on every GPU the driver shows and crosses to other
+    /// servers' storage over `transport`: NIXL at the rate the calibration step timed, the
+    /// Transfer Engine at the rate [`engine_calibration`] states.
+    fn crossing_server(transport: Transport) -> Running {
+        match transport {
+            Transport::Nixl => gpu_server(true),
+            Transport::Mooncake => {
+                let server = Running::with_children(Some(transfer_child(engine_calibration())));
+                transfer_pid(&server.socket, None);
+                server
+            }
+        }
     }
 
     /// A rank of `group` whose units lie in GPU storage on `gpu`, holding `heads` heads from
@@ -124,13 +140,15 @@ mod device {
         }
     }
 
-    /// The import of the two lent pages into owner 2's positions 0 and 1.
-    fn import(lender: Lender, push: bool) -> Request {
+    /// The import of the two lent pages into owner 2's positions 0 and 1, over `transport`
+    /// between two hosts.
+    fn import(lender: Lender, push: bool, transport: Transport) -> Request {
         Request::Import {
             owner: OwnerId(2),
             tables: vec![(KV, 0, 2)],
             lender,
             push,
+            transport,
             trace: 0,
         }
     }
@@ -180,7 +198,7 @@ mod device {
         let lender = lend_two_pages(&mut schedulers, &opened, |units| {
             upload(&prefill.allocation, &pages(units, (0, HEADS)));
         });
-        let units = imported_units(schedulers[1].ask(import(lender, push)));
+        let units = imported_units(schedulers[1].ask(import(lender, push, Transport::Nixl)));
         assert_imported(&[&decode[0], &decode[1]], &units);
     }
 
@@ -198,12 +216,12 @@ mod device {
 
     /// The prefill replica's engine and rank on one server, its rank on the first GPU; the decode
     /// replica's engine and its two ranks on another, on the next two GPUs. Each server's Transfer
-    /// Server reaches the other's GPU storage through NIXL: a read runs on the decode replica's
-    /// server and a push on the prefill replica's.
-    fn across_servers(push: bool) {
+    /// Server reaches the other's GPU storage over `transport`: a read runs on the decode
+    /// replica's server and a push on the prefill replica's.
+    fn across_servers(push: bool, transport: Transport) {
         let [first, second, third] = gpus::<3>();
-        let lending = gpu_server(true);
-        let importing = gpu_server(true);
+        let lending = crossing_server(transport);
+        let importing = crossing_server(transport);
         let lending_claim = head(&lending.socket)
             .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
             .unwrap();
@@ -252,7 +270,7 @@ mod device {
         });
         lender.endpoint = Some(lending.tcp.clone());
         let [_lending_scheduler, mut decode_scheduler] = both;
-        let units = imported_units(decode_scheduler.ask(import(lender, push)));
+        let units = imported_units(decode_scheduler.ask(import(lender, push, transport)));
         assert_imported(&[&decode[0], &decode[1]], &units);
         assert!(matches!(
             decode_scheduler.ask(Request::Release {
@@ -269,12 +287,24 @@ mod device {
     #[test]
     #[ignore = "requires three CUDA devices, the NIXL package and a usable RDMA port"]
     fn an_import_reads_a_lend_in_another_server_s_gpu_through_nixl() {
-        across_servers(false);
+        across_servers(false, Transport::Nixl);
     }
 
     #[test]
     #[ignore = "requires three CUDA devices, the NIXL package and a usable RDMA port"]
     fn an_import_pushed_into_this_server_s_gpus_is_written_through_nixl() {
-        across_servers(true);
+        across_servers(true, Transport::Nixl);
+    }
+
+    #[test]
+    #[ignore = "requires three CUDA devices, Mooncake Transfer Engine and a usable RDMA port"]
+    fn an_import_reads_a_lend_in_another_server_s_gpu_through_the_transfer_engine() {
+        across_servers(false, Transport::Mooncake);
+    }
+
+    #[test]
+    #[ignore = "requires three CUDA devices, Mooncake Transfer Engine and a usable RDMA port"]
+    fn an_import_pushed_into_this_server_s_gpus_is_written_through_the_transfer_engine() {
+        across_servers(true, Transport::Mooncake);
     }
 }

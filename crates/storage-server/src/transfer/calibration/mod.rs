@@ -83,7 +83,8 @@ pub enum RemotePath {
     /// Another host's device storage of the NVLink fabric, imported by its fabric handle and
     /// copied by the copy engines of the destination's GPU.
     Fabric,
-    /// A NIXL READ this host's agent posts, through the host's RDMA ports.
+    /// A READ this host posts through its RDMA ports, NIXL's or the Transfer Engine's (and a
+    /// WRITE the other way, at the same rate). The calibration step times NIXL's READs.
     Read,
 }
 

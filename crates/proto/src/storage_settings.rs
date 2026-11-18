@@ -1,7 +1,9 @@
 //! A Storage Server's settings as the process interface carries them: the claim a node's daemon
 //! receives states the settings of the Storage Server it starts (`process::Claim::storage`).
 
-use crate::process::{MooncakeConnector, MooncakeTransport, NixlTransports, StorageSettings};
+use crate::process::{
+    HandoffTransport, MooncakeConnector, MooncakeTransport, NixlTransports, StorageSettings,
+};
 
 impl From<&storage::Settings> for StorageSettings {
     fn from(settings: &storage::Settings) -> Self {
@@ -38,6 +40,16 @@ impl From<&storage::Settings> for StorageSettings {
                 .map(ToString::to_string)
                 .unwrap_or_default(),
             directory_period_ms: server.directory_period_ms,
+            handoff_transports: server
+                .handoff_transports
+                .iter()
+                .map(|transport| {
+                    i32::from(match transport {
+                        scheduling::kv::Transport::Nixl => HandoffTransport::Nixl,
+                        scheduling::kv::Transport::Mooncake => HandoffTransport::Mooncake,
+                    })
+                })
+                .collect(),
             connector: settings
                 .connector
                 .as_ref()
@@ -101,6 +113,15 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 events: endpoint(&connector.events)?,
             }),
         };
+        let handoff_transports = message
+            .handoff_transports
+            .iter()
+            .map(|transport| match HandoffTransport::try_from(*transport) {
+                Ok(HandoffTransport::Nixl) => Ok(scheduling::kv::Transport::Nixl),
+                Ok(HandoffTransport::Mooncake) => Ok(scheduling::kv::Transport::Mooncake),
+                Err(_) => Err(format!("{transport} names no handoff transport")),
+            })
+            .collect::<Result<_, String>>()?;
         let nixl_transports = match NixlTransports::try_from(message.nixl_transports) {
             Ok(NixlTransports::Selected) => storage::settings::Transports::Selected,
             Ok(NixlTransports::Rdma) => storage::settings::Transports::Rdma,
@@ -127,6 +148,7 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 shoot_down_s: message.shoot_down_s,
                 directory: endpoint(&message.directory)?,
                 directory_period_ms: message.directory_period_ms,
+                handoff_transports,
             },
             connector,
         })
@@ -147,6 +169,10 @@ mod tests {
                 nixl_transports: storage::settings::Transports::Rdma,
                 directory: Some("10.0.0.1:7100".parse().unwrap()),
                 directory_period_ms: 250,
+                handoff_transports: vec![
+                    scheduling::kv::Transport::Mooncake,
+                    scheduling::kv::Transport::Nixl,
+                ],
                 ..storage::ServerSettings::default()
             },
             connector: Some(storage::connector::Settings {

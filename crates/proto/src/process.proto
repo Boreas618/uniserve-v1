@@ -364,6 +364,13 @@ message StorageSettings {
   // leader's node.
   string directory = 17;
   uint64 directory_period_ms = 18;
+  // The transports a handoff's pages may cross hosts by, in order.
+  repeated HandoffTransport handoff_transports = 19;
+}
+
+enum HandoffTransport {
+  HANDOFF_TRANSPORT_NIXL = 0;
+  HANDOFF_TRANSPORT_MOONCAKE = 1;
 }
 
 enum NixlTransports {

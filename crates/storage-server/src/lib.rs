@@ -201,6 +201,7 @@ enum Handling {
         allocations: Vec<Allocation>,
         regions: Vec<(usize, u64)>,
         fabric: Vec<Option<(::storage::protocol::FabricHandle, u64)>>,
+        transport: scheduling::kv::Transport,
     },
     /// A response whose descriptors travel with it and are not the
     /// server's to keep: the queue pairs of a session.
@@ -790,10 +791,11 @@ impl Server {
                     allocations,
                     regions,
                     fabric,
+                    transport,
                 }) => {
                     // Holds the connection until the Transfer Server
                     // reports, unless it is refused at once.
-                    self.begin_exposure(id, request_id, allocations, regions, fabric);
+                    self.begin_exposure(id, request_id, (allocations, regions, fabric), transport);
                     self.send_events();
                 }
                 Ok(Handling::Moving {
@@ -899,9 +901,10 @@ impl Server {
                 Request::Expose {
                     deployment,
                     regions,
+                    transport,
                 },
                 Role::Peer,
-            ) => self.expose(deployment, regions),
+            ) => self.expose(deployment, regions, *transport),
             (Request::Unexpose { exposure }, Role::Peer) => Ok(self.unexpose(id, *exposure)),
             (Request::Finished { task, results }, Role::Connector) => {
                 self.finished(*task, results);
@@ -1105,9 +1108,15 @@ impl Server {
                     ..
                 },
             ) => {
+                // The transports both sides have are the deployment's, which every node's server
+                // serves with: this server states them, whatever the asker did.
+                let handoff = scheduling::kv::Handoff {
+                    transports: self.settings.server.handoff_transports.clone(),
+                    ..handoff.clone()
+                };
                 let path = self
                     .programs
-                    .handoff(&deployment, handoff)
+                    .handoff(&deployment, &handoff)
                     .map_err(|reason| invalid(&reason))?;
                 Ok(Handling::Response(Response::Handoff { path }, Vec::new()))
             }

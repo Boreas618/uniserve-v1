@@ -232,18 +232,20 @@ impl Server {
                 destination.clone()
             };
             let mut here = Here::Neither;
+            let transport = work.transport;
             let mut name = |end: Option<String>, region: Region, destination: bool| match end {
                 end if end == runs_on => region,
                 Some(endpoint) => Region::Remote {
                     endpoint,
                     region: Box::new(region),
+                    transport,
                 },
                 // This host's storage, which the host that runs the span reaches by address.
                 None => {
                     here = if destination {
-                        Here::Destination
+                        Here::Destination(transport)
                     } else {
-                        Here::Source
+                        Here::Source(transport)
                     };
                     region
                 }

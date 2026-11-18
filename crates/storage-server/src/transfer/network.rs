@@ -1,12 +1,15 @@
-//! The path between hosts outside one NVLink fabric: NIXL READs this host's
+//! The path between hosts outside one NVLink fabric: READs this host's
 //! Transfer Server posts, from storage another host's Transfer Server
-//! registered with its own agent, and NIXL WRITEs into such storage from this
-//! host's (a handoff's push).
+//! registered with its own agent, and WRITEs into such storage from this
+//! host's (a handoff's push), over the transport each span names
+//! ([`Region::Remote`]): NIXL, or Mooncake Transfer Engine.
 //!
 //! The process has one NIXL agent with the UCX backend, over the host's
 //! usable RDMA ports with the transports the server's settings state, created
 //! at its first use ([`Network::agent`]), so a host whose tasks never cross
-//! hosts never loads NIXL. The agent serves both ends of a READ:
+//! hosts never loads NIXL; and one Transfer Engine, which names its segment by
+//! this host's name and a port of its own, created at its first use too
+//! ([`Network::engine`]). Either serves both ends of a READ:
 //!
 //! - **Source.** The server has the Transfer Server register allocations a
 //!   peer asked it to expose ([`Event::Register`]): host storage with the
@@ -37,9 +40,14 @@
 //! An agent's name is unique to its process, so a peer whose Transfer
 //! Server restarted responds with another agent: its metadata is loaded and
 //! the previous agent's forgotten, and the new one registers the regions
-//! afresh, since its server gives it every allocation again. Regions are
-//! exposed for each task, not remembered between tasks: a region's
-//! allocation, and its registration, may change between two tasks.
+//! afresh, since its server gives it every allocation again. A Transfer
+//! Engine's segment is opened afresh at each exposure, so its description
+//! states what the engine registered for it. Regions are exposed for each
+//! task, not remembered between tasks: a region's allocation, and its
+//! registration, may change between two tasks.
+//!
+//! A source whose span takes the Transfer Engine is the engine's to carry: no
+//! fabric handle replaces its READ.
 //!
 //! The connection to another host's Storage Server stays open between tasks.
 //! A server that ended or restarted since closed it, which a read of the
@@ -58,9 +66,11 @@ use ::storage::Client;
 use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration, TaskFailure};
 use ::storage::settings::Transports;
 use platform::DeviceId;
+use scheduling::kv::Transport;
 
 use super::calibration::RemotePath;
 use super::contexts::Hold;
+use super::mooncake;
 use super::nixl;
 use super::storage::{Fabric, Mapping};
 use super::threads::{End, Piece, Runner, ThreadKey};
@@ -72,6 +82,8 @@ pub(super) struct Network {
     transports: Transports,
     /// The agent, or why it could not start, once something needed it.
     agent: OnceLock<Result<nixl::Agent, String>>,
+    /// The Transfer Engine, or why it could not start, once something needed it.
+    engine: OnceLock<Result<mooncake::Engine, String>>,
     /// Other hosts' Storage Servers by endpoint, each locked by the helper
     /// thread that exposes a task's regions there.
     hosts: Mutex<HashMap<String, Arc<Mutex<Host>>>>,
@@ -88,20 +100,35 @@ struct Host {
 }
 
 /// A region of another host's storage that its Transfer Server registered,
-/// which READs read.
+/// which READs read and WRITEs write.
 pub(super) struct Source {
     /// The host's Storage Server, which names it in errors.
     pub(super) endpoint: String,
     /// The link end the region is: the host and its GPU or host storage.
     pub(super) end: LinkEnd,
-    /// The agent that registered it.
-    pub(super) peer: String,
-    /// The range from the region's first byte to the end of its
-    /// allocation, as that agent registered it.
-    pub(super) region: nixl::Region,
+    /// How this process's transfers reach the region.
+    pub(super) reach: Reach,
+    /// The bytes from the region's first byte to the end of its allocation,
+    /// as the other host registered them.
+    pub(super) len: u64,
     /// The device allocation's fabric handle, when its creator recorded
     /// one.
     pub(super) fabric: Option<FabricExport>,
+}
+
+/// How this process's transfers reach a region of another host, by the
+/// transport its span takes.
+pub(super) enum Reach {
+    /// The NIXL agent that registered it, and the range as this agent's
+    /// transfers name it.
+    Nixl { peer: String, region: nixl::Region },
+    /// The segment of the Transfer Engine that registered it, as this
+    /// process's engine opened it, and the region's first byte in the
+    /// process that registered it.
+    Mooncake {
+        segment: mooncake::SegmentId,
+        address: u64,
+    },
 }
 
 /// Which way a move between this host and another host goes.
@@ -119,6 +146,8 @@ pub(super) struct Inbound {
     pub(super) endpoint: String,
     pub(super) deployment: String,
     pub(super) direction: Direction,
+    /// The transport the move crosses between the hosts by.
+    pub(super) transport: Transport,
     /// The other host's region and the offset of the move in it.
     pub(super) region: Region,
     pub(super) remote_offset: u64,
@@ -167,7 +196,53 @@ impl Network {
         Self {
             transports,
             agent: OnceLock::new(),
+            engine: OnceLock::new(),
             hosts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The process's Transfer Engine, started at the first call: other hosts' engines reach it
+    /// at this host's name (as the Mooncake connector names its host) and the port it picks; an
+    /// error says why it cannot start, for every task that needs it.
+    pub(super) fn engine(&self) -> Result<&mooncake::Engine, String> {
+        self.engine
+            .get_or_init(|| {
+                let host = crate::host_name().map_err(|error| {
+                    format!("naming this host for the Transfer Engine: {error}")
+                })?;
+                let engine = mooncake::Engine::new(&host)
+                    .map_err(|error| format!("starting the Transfer Engine: {error}"))?;
+                tracing::info!(segment = engine.name(), "started the Transfer Engine");
+                Ok(engine)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Registers `mapped`, an allocation of this host, with the agent of `transport`, as the
+    /// end of a READ or a WRITE: device storage in its GPU's session, which `hold` holds, host
+    /// storage with the allocation. A registration is made once, at the first call.
+    pub(super) fn register_local(
+        &self,
+        transport: Transport,
+        mapped: &Mapping,
+        hold: Option<&Hold>,
+    ) -> Result<(), String> {
+        match transport {
+            Transport::Nixl => {
+                let agent = self.agent()?;
+                match hold {
+                    Some(hold) => hold.session()?.nixl_region(agent, mapped).map(drop),
+                    None => mapped.nixl_host_region(agent).map(drop),
+                }
+            }
+            Transport::Mooncake => {
+                let engine = self.engine()?;
+                match hold {
+                    Some(hold) => hold.session()?.mooncake_address(engine, mapped).map(drop),
+                    None => mapped.mooncake_host_address(engine).map(drop),
+                }
+            }
         }
     }
 
@@ -215,19 +290,25 @@ impl Network {
         moves: Vec<Inbound>,
         leases: &mut Vec<Lease>,
     ) -> Result<Vec<(ThreadKey, Piece)>, Failed> {
-        let mut wanted: HashMap<(String, String), Vec<Region>> = HashMap::new();
+        type Wanted = (String, String, Transport);
+        let mut wanted: HashMap<Wanted, Vec<Region>> = HashMap::new();
         for copy in &moves {
             let regions = wanted
-                .entry((copy.endpoint.clone(), copy.deployment.clone()))
+                .entry((
+                    copy.endpoint.clone(),
+                    copy.deployment.clone(),
+                    copy.transport,
+                ))
                 .or_default();
             if !regions.contains(&copy.region) {
                 regions.push(copy.region.clone());
             }
         }
 
-        let mut sources: HashMap<(String, String, Region), Arc<Source>> = HashMap::new();
-        for ((endpoint, deployment), regions) in wanted {
-            let (peer, exposure, ranges) = self.expose(&endpoint, &deployment, regions.clone())?;
+        let mut sources: HashMap<(String, String, Transport, Region), Arc<Source>> = HashMap::new();
+        for ((endpoint, deployment, transport), regions) in wanted {
+            let (peer, exposure, ranges) =
+                self.expose(&endpoint, &deployment, regions.clone(), transport)?;
             leases.push(Lease {
                 endpoint: endpoint.clone(),
                 exposure,
@@ -240,6 +321,16 @@ impl Network {
                 )));
             }
             for (region, range) in regions.into_iter().zip(ranges) {
+                let reach = match &peer {
+                    Peer::Nixl(peer) => Reach::Nixl {
+                        peer: peer.clone(),
+                        region: source_region(&range).map_err(copy)?,
+                    },
+                    Peer::Mooncake(segment) => Reach::Mooncake {
+                        segment: *segment,
+                        address: range.address,
+                    },
+                };
                 let source = Source {
                     end: LinkEnd::Remote {
                         endpoint: endpoint.clone(),
@@ -248,24 +339,26 @@ impl Network {
                             _ => None,
                         },
                     },
-                    region: source_region(&range).map_err(copy)?,
+                    reach,
+                    len: range.bytes,
                     endpoint: endpoint.clone(),
-                    peer: peer.clone(),
                     fabric: range.fabric,
                 };
                 sources.insert(
-                    (endpoint.clone(), deployment.clone(), region),
+                    (endpoint.clone(), deployment.clone(), transport, region),
                     Arc::new(source),
                 );
             }
         }
 
-        let agent = self.agent().map_err(copy)?;
         let mut pieces = Vec::with_capacity(moves.len());
         // Each fabric handle is imported once per task and GPU.
         let mut imports: HashMap<([u8; 64], DeviceId), Arc<Fabric>> = HashMap::new();
         for copy in moves {
-            let Some(source) = sources.get(&(copy.endpoint, copy.deployment, copy.region)) else {
+            let transport = copy.transport;
+            let Some(source) =
+                sources.get(&(copy.endpoint, copy.deployment, transport, copy.region))
+            else {
                 return Err(self::copy("a region was not exposed".into()));
             };
             // Another host checked the region; the span is checked here,
@@ -275,7 +368,7 @@ impl Network {
                 .checked_mul(copy.remote_pitch)
                 .and_then(|start| start.checked_add(copy.remote_offset))
                 .and_then(|start| start.checked_add(copy.bytes))
-                .is_some_and(|end| end <= source.region.len as u64);
+                .is_some_and(|end| end <= source.len);
             if !within {
                 return Err(self::copy(format!(
                     "a span's end of {} rows of {} bytes at offset {} and pitch {} reaches \
@@ -284,7 +377,7 @@ impl Network {
                     copy.bytes,
                     copy.remote_offset,
                     copy.remote_pitch,
-                    source.region.len,
+                    source.len,
                     source.endpoint
                 )));
             }
@@ -294,13 +387,8 @@ impl Network {
             };
             if copy.direction == Direction::Write {
                 // A WRITE posts from this host's allocation into the other host's region.
-                match &copy.hold {
-                    Some(hold) => hold
-                        .session()
-                        .and_then(|session| session.nixl_region(agent, &copy.local)),
-                    None => copy.local.nixl_host_region(agent),
-                }
-                .map_err(self::copy)?;
+                self.register_local(transport, &copy.local, copy.hold.as_ref())
+                    .map_err(self::copy)?;
                 let link = Link {
                     source: copy.local.end.clone(),
                     destination: source.end.clone(),
@@ -339,7 +427,9 @@ impl Network {
             let End::Given { mapped, hold } = &read.destination else {
                 unreachable!("a READ's destination is this host's allocation");
             };
-            if let (Some(fabric), Some(hold)) = (source.fabric, hold) {
+            // A span over the Transfer Engine is the engine's to carry.
+            let fabric = source.fabric.filter(|_| transport == Transport::Nixl);
+            if let (Some(fabric), Some(hold)) = (fabric, hold) {
                 match over_fabric(source, fabric, mapped, hold, &mut imports) {
                     Ok((thread, import)) => {
                         let source_offset = fabric
@@ -363,13 +453,8 @@ impl Network {
                     ),
                 }
             }
-            match hold {
-                Some(hold) => hold
-                    .session()
-                    .and_then(|session| session.nixl_region(agent, mapped)),
-                None => mapped.nixl_host_region(agent),
-            }
-            .map_err(self::copy)?;
+            self.register_local(transport, mapped, hold.as_ref())
+                .map_err(self::copy)?;
             let link = Link {
                 source: source.end.clone(),
                 destination: mapped.end.clone(),
@@ -413,17 +498,18 @@ impl Network {
     }
 
     /// Have the Storage Server at `endpoint` expose `regions` of
-    /// `deployment`, and load the metadata of the agent that registered
-    /// them: returns that agent's name, the exposure and each region's
-    /// range. A server that cannot be reached fails it as
-    /// [`TaskFailure::Unreachable`], one that refuses as
+    /// `deployment` over `transport`, and load what reaches the agent that
+    /// registered them: returns that agent as this process reaches it, the
+    /// exposure and each region's range. A server that cannot be reached
+    /// fails it as [`TaskFailure::Unreachable`], one that refuses as
     /// [`TaskFailure::Refused`] with its error's kind.
     fn expose(
         &self,
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
-    ) -> Result<(String, u64, Vec<Registration>), Failed> {
+        transport: Transport,
+    ) -> Result<(Peer, u64, Vec<Registration>), Failed> {
         let host = self.host(endpoint);
         let mut host = ::service::lock(&host);
         tracing::debug!(
@@ -432,23 +518,41 @@ impl Network {
             regions = regions.len(),
             "asking another host to expose regions"
         );
-        let (exposure, metadata, ranges) =
-            host.expose(endpoint, deployment, regions)
-                .map_err(|error| {
-                    let failure = match &error {
-                        ::storage::Error::Server { kind, .. } => {
-                            TaskFailure::Refused { kind: *kind }
-                        }
-                        ::storage::Error::Io(_) | ::storage::Error::Protocol(_) => {
-                            TaskFailure::Unreachable
-                        }
-                        _ => TaskFailure::Copy,
-                    };
-                    let message =
-                        format!("{endpoint} did not expose the regions of {deployment}: {error}");
-                    (failure, message)
-                })?;
+        let (exposure, metadata, ranges) = host
+            .expose(endpoint, deployment, regions, transport)
+            .map_err(|error| {
+                let failure = match &error {
+                    ::storage::Error::Server { kind, .. } => TaskFailure::Refused { kind: *kind },
+                    ::storage::Error::Io(_) | ::storage::Error::Protocol(_) => {
+                        TaskFailure::Unreachable
+                    }
+                    _ => TaskFailure::Copy,
+                };
+                let message =
+                    format!("{endpoint} did not expose the regions of {deployment}: {error}");
+                (failure, message)
+            })?;
 
+        if transport == Transport::Mooncake {
+            // The metadata is the engine's segment name, opened afresh so that its description
+            // states the regions just registered.
+            let name = String::from_utf8(metadata)
+                .map_err(|_| copy(format!("{endpoint} named its Transfer Engine in no UTF-8")))?;
+            let engine = self.engine().map_err(copy)?;
+            let segment = engine.open(&name).map_err(|error| {
+                copy(format!(
+                    "opening the Transfer Engine segment {name} of {endpoint}: {error}"
+                ))
+            })?;
+            tracing::debug!(
+                endpoint,
+                exposure,
+                segment = name,
+                regions = ranges.len(),
+                "another host exposed regions"
+            );
+            return Ok((Peer::Mooncake(segment), exposure, ranges));
+        }
         let agent = self.agent().map_err(copy)?;
         let peer = agent.load_peer(&metadata).map_err(|error| {
             copy(format!(
@@ -471,8 +575,15 @@ impl Network {
             regions = ranges.len(),
             "another host exposed regions"
         );
-        Ok((peer, exposure, ranges))
+        Ok((Peer::Nixl(peer), exposure, ranges))
     }
+}
+
+/// The agent of another host that registered an exposure's regions, as this process reaches
+/// it: a NIXL agent by its name, a Transfer Engine by its segment.
+enum Peer {
+    Nixl(String),
+    Mooncake(mooncake::SegmentId),
 }
 
 impl Host {
@@ -483,6 +594,7 @@ impl Host {
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
+        transport: Transport,
     ) -> ::storage::Result<(u64, Vec<u8>, Vec<Registration>)> {
         // A server that ended or restarted since the last task closed the
         // connection: reading what it sent shows the end.
@@ -495,7 +607,7 @@ impl Host {
             Some(client) => client,
             None => self.client.insert(Client::connect_peer(endpoint)?),
         };
-        let responded = client.expose(deployment.to_owned(), regions);
+        let responded = client.expose(deployment.to_owned(), regions, transport);
         // The server's response, an exposure or a refusal, leaves the
         // connection usable; a failed connection is not used again.
         if let Err(::storage::Error::Io(_) | ::storage::Error::Protocol(_)) = &responded {
@@ -548,14 +660,36 @@ fn over_fabric(
     ))
 }
 
-/// Register `allocations` with `network`'s agent for other hosts' READs,
-/// each with the hold on its GPU for device storage: each one's range, in
-/// order, and the agent's metadata taken after the registrations, which
-/// carries them.
+/// Register `allocations` with `network`'s agent of `transport` for other hosts' READs and
+/// WRITEs, each with the hold on its GPU for device storage: each one's range, in order, and the
+/// agent's metadata taken after the registrations, which carries them (a Transfer Engine's
+/// segment name, whose description the other side fetches when it opens it).
 pub(super) fn register(
     network: &Network,
     allocations: &[Exposed],
+    transport: Transport,
 ) -> Result<(Vec<u8>, Vec<Registration>), String> {
+    if transport == Transport::Mooncake {
+        let engine = network.engine()?;
+        let ranges = allocations
+            .iter()
+            .map(|(mapped, hold)| {
+                let address = match hold {
+                    Some(hold) => hold.session()?.mooncake_address(engine, mapped)?,
+                    None => mapped.mooncake_host_address(engine)?,
+                };
+                Ok(Registration {
+                    end: mapped.end.clone(),
+                    // The engine names a registration by its address alone.
+                    key: 0,
+                    address,
+                    bytes: mapped.bytes,
+                    fabric: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        return Ok((engine.name().as_bytes().to_vec(), ranges));
+    }
     let agent = network.agent()?;
     let ranges = allocations
         .iter()

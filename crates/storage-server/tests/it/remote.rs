@@ -481,7 +481,11 @@ mod device {
         let endpoint = endpoint(&source_host.socket);
         let mut peer = Client::connect_peer(&endpoint).unwrap();
         let (exposure, _, registered) = peer
-            .expose("model".into(), vec![tensor_region(1), tensor_region(3)])
+            .expose(
+                "model".into(),
+                vec![tensor_region(1), tensor_region(3)],
+                scheduling::kv::Transport::Nixl,
+            )
             .unwrap();
         let exported = |handle, offset| FabricExport {
             handle,
@@ -673,6 +677,155 @@ mod device {
         assert_eq!(
             first_difference(&device_bytes(&destination), &expected),
             None
+        );
+    }
+
+    /// A server whose Transfer Server copies on this process's GPUs, its copies from another
+    /// host paced at the Transfer Engine's rate
+    /// ([`engine_calibration`](crate::transfer::engine_calibration)).
+    fn engine_host() -> crate::server::Running {
+        let settings = ::storage::ServerSettings::default();
+        let options =
+            storage_server::transfer::Options::of(&settings, crate::transfer::engine_calibration());
+        let server = crate::server::Running::with_children(Some(storage_server::Children {
+            program: crate::server::helper(),
+            connector: None,
+            transfer: Some(options),
+        }));
+        crate::transfer::transfer_pid(&server.socket, None);
+        server
+    }
+
+    /// A span between two hosts that names Mooncake Transfer Engine crosses through the two
+    /// Transfer Servers' engines: a READ of the source host's device storage into the
+    /// destination host's, rows at their pitches, and a WRITE back of the destination's bytes
+    /// into the source host's storage, as a handoff's push writes. Every byte arrives, and the
+    /// destination host lists the link from the source host at its calibrated rate.
+    #[test]
+    #[ignore = "requires two CUDA devices, a usable RDMA port and Mooncake Transfer Engine"]
+    fn spans_over_the_transfer_engine_read_and_write_another_host_s_device_storage() {
+        use crate::transfer::remote_region_over;
+        use scheduling::kv::Transport;
+
+        const BYTES: usize = 64 << 20;
+        const ROWS: usize = 64;
+        const ROW: usize = 4096;
+        const PITCH: usize = 3 * ROW;
+
+        let source_host = engine_host();
+        let destination_host = engine_host();
+        let [first, last] = gpus::<2>();
+        let granularity = DeviceAllocation::granularity(first).unwrap();
+        let len = BYTES.next_multiple_of(granularity);
+
+        let mut source_head = head(&source_host.socket);
+        let claim = source_head
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+            .unwrap();
+        let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
+        let source_bytes = pattern(len, 3);
+        let (source, source_fd) = device_storage(first, &source_bytes);
+        source_worker
+            .put(
+                vec![tensor(key(1), "lent", 0, 0, Access::Exclusive)],
+                &[(record(first, len), source_fd.as_fd())],
+            )
+            .unwrap();
+
+        let mut destination_head = head(&destination_host.socket);
+        let claim = destination_head
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+            .unwrap();
+        let mut destination_worker = worker(&destination_host.socket, scope("text", 0), 1, claim);
+        let (destination, destination_fd) = device_storage(last, &vec![0; len]);
+        destination_worker
+            .put(
+                vec![tensor(key(3), "imported", 0, 0, Access::Exclusive)],
+                &[(record(last, len), destination_fd.as_fd())],
+            )
+            .unwrap();
+        let source_endpoint = endpoint(&source_host.socket);
+
+        // A READ of the whole source, and of rows at a pitch into the destination's tail.
+        let started = Instant::now();
+        let remote = || remote_region_over(&source_endpoint, tensor_region(1), Transport::Mooncake);
+        let pitched = ::storage::protocol::Span {
+            source: remote(),
+            source_offset: 17,
+            destination: tensor_region(3),
+            destination_offset: (BYTES / 2) as u64,
+            bytes: ROW as u64,
+            rows: ROWS as u64,
+            source_pitch: PITCH as u64,
+            destination_pitch: ROW as u64,
+        };
+        let task = destination_worker
+            .copy(
+                vec![
+                    span(remote(), 0, tensor_region(3), 0, (BYTES / 2) as u64),
+                    pitched,
+                ],
+                Priority::Request,
+                1,
+            )
+            .unwrap();
+        let moved = (BYTES / 2 + ROWS * ROW) as u64;
+        assert_eq!(
+            end_of(&mut destination_worker, task),
+            (moved, TaskStatus::Complete)
+        );
+        let elapsed = started.elapsed();
+        eprintln!(
+            "the Transfer Engine READ {} MiB in {elapsed:?}: {:.1} GB/s",
+            moved >> 20,
+            moved as f64 / elapsed.as_secs_f64() / 1e9
+        );
+        let mut expected = vec![0; len];
+        expected[..BYTES / 2].copy_from_slice(&source_bytes[..BYTES / 2]);
+        for row in 0..ROWS {
+            let from = 17 + row * PITCH;
+            let to = BYTES / 2 + row * ROW;
+            expected[to..to + ROW].copy_from_slice(&source_bytes[from..from + ROW]);
+        }
+        let read = device_bytes(&destination);
+        assert_eq!(first_difference(&read, &expected), None);
+
+        // A WRITE of the destination's first half into the source's second half.
+        let task = destination_worker
+            .copy(
+                vec![span(
+                    tensor_region(3),
+                    0,
+                    remote(),
+                    (BYTES / 2) as u64,
+                    (BYTES / 2) as u64,
+                )],
+                Priority::Request,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            end_of(&mut destination_worker, task),
+            ((BYTES / 2) as u64, TaskStatus::Complete)
+        );
+        let mut written = source_bytes.clone();
+        written[BYTES / 2..BYTES].copy_from_slice(&read[..BYTES / 2]);
+        assert_eq!(first_difference(&device_bytes(&source), &written), None);
+
+        let transfer = destination_head.list().unwrap().transfer.unwrap();
+        let link = Link {
+            source: LinkEnd::Remote {
+                endpoint: source_endpoint.clone(),
+                gpu: Some(first.uuid().unwrap().0),
+            },
+            destination: LinkEnd::Device {
+                gpu: last.uuid().unwrap().0,
+            },
+        };
+        assert!(
+            transfer.links.iter().any(|measured| measured.link == link),
+            "{:?}",
+            transfer.links
         );
     }
 }

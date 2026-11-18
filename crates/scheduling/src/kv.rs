@@ -52,7 +52,7 @@ pub enum Tier {
 }
 
 /// A transfer implementation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     /// NIXL.
@@ -74,7 +74,8 @@ pub struct Handoff {
     pub found: Vec<Found>,
     /// Whether the prefill replica runs on the decode side's node.
     pub local: bool,
-    /// The transports both sides have.
+    /// The transports both sides have, as the decode side's Storage Server states them (its
+    /// `storage_config.handoff_transports`, which every node of the deployment shares).
     pub transports: Vec<Transport>,
 }
 
