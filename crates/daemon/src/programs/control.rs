@@ -22,6 +22,8 @@ pub(super) struct Start {
     pub(super) states: States,
     pub(super) current: watch::Receiver<Arc<Current>>,
     pub(super) outputs: mpsc::UnboundedSender<Output>,
+    /// What its validation measures of a change that starts a kernel generation.
+    pub(super) measure: super::host::Measure,
 }
 
 /// A running control program: the task that steps it, its period, and what ends it.
@@ -71,8 +73,10 @@ async fn instantiate(start: &Start) -> Option<Instance<Reader>> {
     let logs = Logs::new(name.clone(), start.store.clone(), start.current.clone());
     let (program, states) = (start.program.clone(), start.states.clone());
     let (store, current) = (start.store.clone(), start.current.clone());
+    let measure = Arc::clone(&start.measure);
     let reader = move || Reader {
         logs: Logs::new(name.clone(), store.clone(), current.clone()),
+        measure: Arc::clone(&measure),
     };
     let created =
         tokio::task::spawn_blocking(move || create(&program, &states, &logs, reader)).await;

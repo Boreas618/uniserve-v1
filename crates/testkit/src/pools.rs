@@ -141,7 +141,6 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
     args.host = "localhost".to_owned();
     args.group = groups[0].id.0.clone();
     args.world_size = 1;
-    args.queue_depth = 2;
     args
 }
 
@@ -160,7 +159,8 @@ pub fn cache() -> CacheLayout {
 ///
 /// # Panics
 ///
-/// For a launch of more request slots than the protocol addresses, or of no batch in flight.
+/// For a launch of more request slots than the protocol addresses, or whose worker group the
+/// launch's configuration does not place.
 pub fn capacity(launch: &EngineArgs, cache: &CacheLayout) -> Capacity {
     let config = &launch.engine_config;
     #[expect(clippy::expect_used, reason = "a fixture's launch states its slots")]
@@ -180,15 +180,21 @@ pub fn capacity(launch: &EngineArgs, cache: &CacheLayout) -> Capacity {
     let decodes = [Variant::DecodeGreedy, Variant::DecodeSampled]
         .into_iter()
         .map(|variant| Shape::decode(BATCH_CALLS, variant));
+    // The batches the launch's worker group keeps in flight, as a rank of it reports its window.
     #[expect(
         clippy::expect_used,
-        reason = "a fixture's launch has batches in flight"
+        reason = "a fixture's launch serves a group of its configuration"
     )]
-    let window = engine::memory::division::call_window(
-        launch.queue_depth.max(1) as usize,
-        BATCH_CALLS as usize,
-    )
-    .expect("positive bounds");
+    let depth = config
+        .parallel
+        .worker_groups
+        .iter()
+        .find(|group| group.id.0 == launch.group)
+        .map(|group| group.queue_depth)
+        .expect("the launch's group is placed");
+    #[expect(clippy::expect_used, reason = "a placed group keeps batches in flight")]
+    let window = engine::memory::division::call_window(depth, BATCH_CALLS as usize)
+        .expect("positive bounds");
 
     // The page identity of a fake's model: its name, as the weights of a served model are.
     let mut identity = storage::key::Digest::new(b"testkit-page-identity");

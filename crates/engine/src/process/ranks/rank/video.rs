@@ -1322,7 +1322,7 @@ impl ModelRunner {
             0
         };
         let calls = buckets.iter().map(|shape| shape.rows).max().unwrap_or(1);
-        let window = call_window(self.queue_depth(), calls.max(1) as usize)
+        let window = call_window(self.queue_depth()?, calls.max(1) as usize)
             .context("bounding the calls of a request the group holds unresolved")?;
         let config = &self.engine_config().model;
 

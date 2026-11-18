@@ -855,6 +855,39 @@ impl EngineClient {
         }
     }
 
+    /// What a generation update to the kernel packages `kernels` would take on every rank's
+    /// device beside the serving graphs, each rank's device's extra bytes, room and the KV units
+    /// its cache would give up; measured without installing anything, empty when it replaces no
+    /// kernel.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason the engine could not measure it, or when the engine ends first.
+    pub async fn measure_room(
+        &self,
+        kernels: &proto::module::Packages,
+    ) -> Result<Vec<wire::DeviceRoom>, String> {
+        let kernels: Vec<wire::RoomKernel> = kernels
+            .iter()
+            .map(|(slot, package)| wire::RoomKernel {
+                op: slot.op.clone(),
+                key: slot.key.clone(),
+                part: slot.part.clone(),
+                backend: package.backend.clone(),
+                revision: package.revision,
+            })
+            .collect();
+        match self
+            .ask(move |id| {
+                wire::engine_command::Kind::MeasureRoom(wire::MeasureRoom { id, kernels })
+            })
+            .await?
+        {
+            Some(wire::operated::Reports::Rooms(rooms)) => Ok(rooms.devices),
+            other => Err(unexpected("measure_room", other)),
+        }
+    }
+
     /// Switches the fence probes on (`enabled`) or off, with the probed classes `off` switched
     /// off whatever `enabled` says, in place at the next step boundary; returns each process's
     /// switch.

@@ -42,7 +42,7 @@ use std::sync::OnceLock;
 
 pub use host::{Control, Host};
 pub use instance::{Budget, Call, Error, Instance, Reason, Usage};
-pub use scheduling::control::{Config, Filter, Function, Query, Record, Report, State};
+pub use scheduling::control::{Config, Filter, Function, Query, Record, Report, Room, State};
 pub use scheduling::program::{Kind, Level};
 
 /// The process's one wasmtime engine, which compiles and runs every program module.

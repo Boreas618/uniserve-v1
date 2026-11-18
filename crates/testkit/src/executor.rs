@@ -1056,6 +1056,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape::prefill(calls.len() as u32, tokens, Variant::DecodeSampled),
             requests: calls.iter().map(|call| RequestId(call.0)).collect(),
             columns: Columns {

@@ -31,7 +31,9 @@ use crate::executor::peers::Operate;
 use crate::executor::peers::messages::{DataOperation, FencesSwitched, RankOperation, RankReports};
 use crate::process::binding::WeightsUpdated;
 use anyhow::{Context as _, Result, anyhow, bail};
+use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender};
+use proto::config::Tuning;
 
 use service::lock;
 
@@ -176,7 +178,10 @@ pub(crate) fn wake(
 /// device's quota must hold beside everything it reserves: `bytes`, or for a GPU `devices` names
 /// by its identity, the bytes stated for it (`ResizeCache { MakeRoom }`, a profiling session's
 /// storage). The requests that hold the tail run on, and the release takes it once they let it
-/// go; [`epoch::grow`] takes it back.
+/// go; [`epoch::grow`] takes it back. With `demote`, as a generation update's room asks, each
+/// region's scheduler first stores to the host tier the cached blocks its shrink evicts that have
+/// no host copy (`Message::Demote`), so the prefixes the yield takes from the device stay
+/// reusable from host memory.
 ///
 /// For each region of the KV planes, the segments released are the fewest from the tail whose
 /// release leaves every device of the region's ranks the room; segment 0 is kept. Every region
@@ -193,6 +198,7 @@ pub(crate) fn make_room(
     binding: &WeightBinding,
     bytes: u64,
     devices: &BTreeMap<[u8; 16], u64>,
+    demote: bool,
 ) -> Result<()> {
     let needed = |gpu: &[u8; 16]| devices.get(gpu).copied().unwrap_or(bytes);
 
@@ -252,6 +258,17 @@ pub(crate) fn make_room(
         let inbox = schedulers
             .get(scheduler)
             .ok_or_else(|| stopped(scheduler))?;
+        if demote {
+            let demoted = ask(std::slice::from_ref(inbox), |reply| {
+                Message::Demote(number, kept, reply)
+            })?;
+            tracing::info!(
+                region = number,
+                kept,
+                demoted = demoted.first().copied().unwrap_or(0),
+                "the KV cache demoted the blocks its yield evicts to the host tier"
+            );
+        }
         let reached = ask(std::slice::from_ref(inbox), |reply| {
             Message::Bound(number, kept, reply)
         })?;
@@ -361,6 +378,10 @@ fn here(binding: &Arc<WeightBinding>, operation: &RankOperation) -> Result<RankR
         RankOperation::UnloadAdapter { slot } => {
             RankReports::Adapters(binding.unload_adapter(*slot))
         }
+        // The step values are no rank's: each process's control thread takes them from its
+        // snapshot, which the scheduler node stores at `Tune` and a peer as it is relayed
+        // ([`operate`]).
+        RankOperation::Tune(_) => RankReports::None,
         RankOperation::StartProfile(start) => {
             RankReports::ProfileStarts(binding.start_profile(start)?)
         }
@@ -385,15 +406,16 @@ pub(crate) type Preparation = (u64, std::result::Result<(), String>);
 /// What a peer runs each operation of the scheduler node's data plane with
 /// (`crate::executor::peers::Upstream::serve`): [`operate`] on `binding` and `workers`, this
 /// process's, reading the ends of this process's own preparations from `preparations`, which it
-/// waits for at most `bound`.
+/// waits for at most the comparison bound of `tuning`, the peer's step values, which a relayed
+/// `Tune` replaces.
 pub(crate) fn operator(
     binding: Arc<WeightBinding>,
     workers: Vec<Arc<Worker>>,
     preparations: Receiver<Preparation>,
-    bound: Duration,
+    tuning: Arc<ArcSwap<Tuning>>,
 ) -> Operate {
     Box::new(move |operation| {
-        let preparations = (&preparations, bound);
+        let preparations = (&preparations, &*tuning);
         operate(&binding, &workers, preparations, operation).map_err(|error| format!("{error:#}"))
     })
 }
@@ -407,7 +429,7 @@ pub(crate) fn operator(
 fn operate(
     binding: &Arc<WeightBinding>,
     workers: &[Arc<Worker>],
-    preparations: (&Receiver<Preparation>, Duration),
+    (preparations, tuning): (&Receiver<Preparation>, &ArcSwap<Tuning>),
     operation: DataOperation,
 ) -> Result<Vec<u8>> {
     use DataOperation as Operation;
@@ -454,11 +476,18 @@ fn operate(
         Operation::CommitExperts { order } => encoded(&binding.commit_experts(&order)?),
         Operation::ServingOrder => encoded(&binding.served_here()),
         Operation::Prepared { generation } => {
-            let (preparations, bound) = preparations;
+            // Within the comparison bound of the step values this peer holds now.
+            let bound = tuning.load().compare_timeout;
             encoded(&prepared(preparations, generation, bound)?)
         }
         Operation::Uncompared => encoded(&super::generation::uncompared(workers)),
         // A peer runs the operation on its own ranks alone: the scheduler node asks every peer.
+        // The scheduler node's step values become this peer's snapshot, which its control
+        // thread takes at its next turn (`MainProcess::retune`).
+        Operation::Rank(RankOperation::Tune(values)) => {
+            tuning.store(Arc::new(*values));
+            encoded(&RankReports::None)
+        }
         Operation::Rank(operation) => encoded(&here(binding, &operation)?),
     };
     reply.context("encoding the operation's value")

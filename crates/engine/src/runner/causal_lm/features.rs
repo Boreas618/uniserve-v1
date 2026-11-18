@@ -370,6 +370,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape::prefill(2, 12, Variant::PrefillWrite),
             requests: Vec::new(),
             columns: Columns {

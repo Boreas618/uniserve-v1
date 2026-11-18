@@ -539,6 +539,7 @@ impl Scheduler {
         batch.kernels = self.generations.kernels();
         batch.policy = self.generations.policy();
         batch.revision = self.budget.revision;
+        batch.copy_budget = self.budget.copy_budget;
         batch.new_slots.sort_unstable_by_key(|new| new.slot);
         if let Some(shape) = self.shape(batch) {
             batch.shape = shape;
@@ -1113,6 +1114,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape::decode(0, Variant::DecodeGreedy),
             requests: Vec::new(),
             columns: Columns::default(),

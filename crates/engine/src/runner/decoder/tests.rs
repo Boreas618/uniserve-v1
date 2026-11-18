@@ -301,6 +301,7 @@ fn dealt(
         kernels: 0,
         policy: 0,
         revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         shape: Shape {
             rows: 1,
             tokens: 0,

@@ -284,6 +284,12 @@ impl Scheduler {
             .flatten()
     }
 
+    /// Whether the step caches prefixes for `request`'s group: its cache was laid out for them
+    /// and the step's values keep them on (`kv_cache_config.prefix_caching`).
+    fn caches_prefixes(&self, request: &Request) -> bool {
+        self.budget.prefix_caching && self.kv_config(request).is_some_and(|kv| kv.prefix_caching)
+    }
+
     /// Whether an admission reads its cached prefix (SD §4.3 "Reading"): the deployment caches
     /// prefixes and the request reads them, or it resumes, whose own chain it reads whatever
     /// the switches say; never with context images.
@@ -291,7 +297,7 @@ impl Scheduler {
         let Some(input) = request.generation() else {
             return false;
         };
-        let caching = self.kv_config(request).is_some_and(|kv| kv.prefix_caching);
+        let caching = self.caches_prefixes(request);
         keyed(request) && (request.resumes() || (caching && input.cache.read))
     }
 
@@ -302,7 +308,7 @@ impl Scheduler {
         let Some(input) = request.generation() else {
             return false;
         };
-        let caching = self.kv_config(request).is_some_and(|kv| kv.prefix_caching);
+        let caching = self.caches_prefixes(request);
         let cache = &input.cache;
         keyed(request) && caching && cache.write && cache.state_seeds.is_empty()
     }
@@ -2565,10 +2571,12 @@ impl Scheduler {
                 let prompt = self
                     .request_of(*owner)
                     .map(|request| request.num_prompt_tokens);
+                // The step's values switch the host tier off where the epoch opened it.
+                let tier = kv.host_tier && self.budget.host_tier;
                 let stores = match kind {
-                    CacheGroupKind::Full => kv.host_tier,
+                    CacheGroupKind::Full => tier,
                     CacheGroupKind::SlidingWindow { window } => {
-                        kv.host_tier && before_boundary(shapes, kv, prompt, *at, block, window)
+                        tier && before_boundary(shapes, kv, prompt, *at, block, window)
                     }
                     CacheGroupKind::State | CacheGroupKind::Draft => false,
                 };
@@ -3024,6 +3032,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape::decode(1, Variant::DecodeGreedy),
             requests: Vec::new(),
             columns: Columns {

@@ -358,7 +358,6 @@ fn spawn(
         tables,
         Arc::clone(sequences),
         rank,
-        BUDGET,
     )
     .unwrap()
 }
@@ -389,6 +388,7 @@ fn batch(id: u64, phase: Phase, rows: u32) -> Batch {
         kernels: 1,
         policy: 1,
         revision: 0,
+        copy_budget: BUDGET,
         shape: BatchShape::decode(rows, Variant::DecodeGreedy),
         requests: vec![RequestId(id)],
         columns: Columns::default(),

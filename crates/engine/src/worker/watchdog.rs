@@ -53,6 +53,22 @@ impl Watchdog {
         })
     }
 
+    /// Reports a job in flight for `watchdog_timeout` from now on: a job already reported stays
+    /// reported, and one in flight past the new bound is reported at the next look.
+    ///
+    /// # Errors
+    ///
+    /// When the timeout is zero, with the bound unchanged.
+    pub(crate) fn set_bound(&mut self, watchdog_timeout: Duration) -> Result<()> {
+        if watchdog_timeout.is_zero() {
+            return Err(Error::Invalid(
+                "the watchdog timeout must be positive".into(),
+            ));
+        }
+        self.stall_bound = watchdog_timeout;
+        Ok(())
+    }
+
     /// The instant the control thread must look again: when the job in flight longest reaches
     /// the stall bound. `None` while no job is in flight, when the control thread may wait for
     /// its channels indefinitely.

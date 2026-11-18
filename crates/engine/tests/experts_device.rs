@@ -240,6 +240,7 @@ fn batch(ids: &[u32]) -> Batch {
         kernels: 1,
         policy: 1,
         revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         shape: BatchShape::decode(ids.len() as u32, Variant::DecodeGreedy),
         requests: Vec::new(),
         columns: Columns {

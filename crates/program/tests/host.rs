@@ -143,6 +143,7 @@ impl Control for Leader {
         self.report.clone().unwrap_or(Ok(Report {
             effect: Some("step".into()),
             interrupts: false,
+            rooms: Vec::new(),
         }))
     }
 }
@@ -271,6 +272,7 @@ fn a_control_program_reads_its_revisions_and_validates() {
     chunk.host_mut().report = Some(Ok(Report {
         effect: Some("epoch".into()),
         interrupts: true,
+        rooms: Vec::new(),
     }));
     let output: Option<Config> = chunk.step(&state(2048)).unwrap();
     assert_eq!(output, None);

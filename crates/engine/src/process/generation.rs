@@ -104,17 +104,7 @@ pub(crate) fn kernels(
 ) -> Result<Packages> {
     let (client, targets) = build;
     let held = serving_kernels(workers)?;
-
-    // An update changes implementations and never the keys: the serving generations' keys are
-    // every key the devices' forwards launch.
-    let mut keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for kernels in &held {
-        for (operator, key, _) in kernels.iter() {
-            keys.entry(operator.to_owned())
-                .or_default()
-                .insert(key.to_owned());
-        }
-    }
+    let keys = launched_keys(&held);
 
     let mut client = lock(client);
     let (selected, routes) = select(&mut client, targets, named, &keys)
@@ -174,6 +164,48 @@ pub(crate) fn kernels(
         .collect();
     prepared.extend(packages);
     Ok(prepared)
+}
+
+/// Every descriptor key the devices' forwards launch, by operator: the keys of the generations
+/// `held` serve. An update changes implementations and never the keys.
+fn launched_keys(held: &[Arc<ops::Generation>]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for kernels in held {
+        for (operator, key, _) in kernels.iter() {
+            keys.entry(operator.to_owned())
+                .or_default()
+                .insert(key.to_owned());
+        }
+    }
+    keys
+}
+
+/// What a generation update to the packages `named` would take on every rank's device, this
+/// process's ranks then every peer's ([`update_room`]), measured without installing anything:
+/// the Build Server selects the packages of every key the devices launch as the update's
+/// preparation would ([`kernels`]), and the operators whose packages differ from `serving`'s
+/// are those whose graphs it captures again. None when it replaces no operator. What a
+/// validation of a change reports before the change begins (`MeasureRoom`).
+///
+/// # Errors
+///
+/// The Build Server's refusal, a worker that closed, or a rank's quota or device that cannot be
+/// read, here or on a peer.
+pub(crate) fn room(
+    workers: &[Arc<Worker>],
+    build: &(Arc<Mutex<Client>>, Vec<Target>),
+    (named, serving): (&Packages, &Packages),
+    binding: &WeightBinding,
+) -> Result<Vec<UpdateRoom>> {
+    let (client, targets) = build;
+    let keys = launched_keys(&serving_kernels(workers)?);
+    let (selected, _) = select(&mut lock(client), targets, named, &keys)
+        .context("selecting the generation's packages at the Build Server")?;
+    let replaced = replaced_operators(&selected, serving);
+    if replaced.is_empty() {
+        return Ok(Vec::new());
+    }
+    update_room(workers, binding, &replaced)
 }
 
 /// The generation of kernels each worker's device serves, in the workers' order: what the

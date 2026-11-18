@@ -3032,6 +3032,15 @@ impl Replica {
                         standbys.promoted(host, *generation);
                     }
                 }
+                // A standby parked with the step values of its launch: it takes the replica's
+                // current ones before it serves a request.
+                let served = service::lock(&self.served).clone();
+                if let Some(served) = served {
+                    let tuning = proto::config::Tuning::of(&served.engine_config, served.revision);
+                    if let Err(error) = standby.client.tune(&tuning).await {
+                        warn!(%error, "the promoted standby keeps its launch's step values");
+                    }
+                }
                 // The promoted world is the engine that serves; the rules over it start anew.
                 *service::lock(&self.domain) = None;
                 self.hold.serve(Arc::clone(&standby.client));

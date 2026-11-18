@@ -183,6 +183,12 @@ pub enum Message {
     /// the bound let them go (`resize.rs`), with the units it holds then. A drain that ends the
     /// bound first is answered with the units the region holds at that moment.
     Bound(u8, u32, Sender<u32>),
+    /// Before a region (by number) gives back its units past `units`, as a generation update's
+    /// room does, store to the host tier the cached blocks the shrink to `units` evicts that have
+    /// no host copy, so a later prompt finds them there; the reply is sent, with the blocks
+    /// demoted, once every store issued ended. A region of a class without a host tier, or a
+    /// step whose values switch the tier off, demotes nothing.
+    Demote(u8, u32, Sender<u32>),
     /// End every request the scheduler holds, aborted, and stop.
     Shutdown,
 }
@@ -225,6 +231,13 @@ pub(crate) struct Budget {
     pub(crate) chunk: u32,
     /// Waiting requests before a submission is refused; unbounded when `None`.
     pub(crate) queued: Option<usize>,
+    /// Whether the step reads and writes cached prefixes, where the group's cache does.
+    pub(crate) prefix_caching: bool,
+    /// Whether the step offloads pages to the host tier, where the group's cache does.
+    pub(crate) host_tier: bool,
+    /// The bytes the copies started with each of the step's batches move together over the
+    /// batch's group, which the batch carries to every rank.
+    pub(crate) copy_budget: u64,
 }
 
 impl Budget {
@@ -256,6 +269,9 @@ impl Budget {
             calls,
             chunk,
             queued: tuning.max_queued_requests.map(NonZeroUsize::get),
+            prefix_caching: tuning.prefix_caching,
+            host_tier: tuning.host_tier,
+            copy_budget: tuning.copy_budget,
         }
     }
 }
@@ -449,6 +465,9 @@ pub struct Scheduler {
     /// `Resized` states that the region holds no more than its bound, or when a drain ends the
     /// bound.
     bounded: Vec<(u8, Sender<u32>)>,
+    /// The replies owed to `Message::Demote`: the keys of the host stores each demotion issued
+    /// and the blocks it demoted, answered once no store of those keys is held or outstanding.
+    demoting: Vec<(std::collections::HashSet<storage::Key>, u32, Sender<u32>)>,
     /// The `List`s submitted, and those answered, which the buffer pool answers in the order it
     /// takes them: a resumed request waits for one asked after it arrived (SD §4.4, §4.5).
     lists_asked: u64,
@@ -644,6 +663,7 @@ impl Scheduler {
             warm_ups: HashMap::new(),
             resizing: Vec::new(),
             bounded: Vec::new(),
+            demoting: Vec::new(),
             lists_asked: 0,
             lists_answered: 0,
             next_batch: 0,
@@ -907,7 +927,34 @@ impl Scheduler {
             }
             Message::Resize(region, units, reply) => self.resize(region, units, reply),
             Message::Bound(region, units, reply) => self.bound(region, units, reply),
+            Message::Demote(region, units, reply) => self.demote(region, units, reply),
             Message::Shutdown => self.shutdown(),
+        }
+    }
+
+    /// Takes the step values of `tuning` the scheduler keeps beside the step's budget: the
+    /// report period of its statistics, and each group's queue depth with the call window it
+    /// bounds a request's unresolved calls to (`crate::memory::division::call_window`, of the
+    /// group's widest bucket, as its ranks stated it). A group that has more batches in flight
+    /// than its new depth submits none until they end.
+    fn retune(&mut self, tuning: &Tuning) {
+        self.config.report_period = tuning.report_period;
+        for group in &mut self.groups {
+            let Some(depth) = tuning.queue_depths.get(group.config.id.0.as_str()) else {
+                continue;
+            };
+            if group.config.queue_depth == depth.get() {
+                continue;
+            }
+            group.config.queue_depth = depth.get();
+            let calls = group.capacity.buckets.iter().map(|shape| shape.rows).max();
+            let window = crate::memory::division::call_window(
+                depth.get(),
+                calls.unwrap_or(1).max(1) as usize,
+            );
+            if let Ok(window) = window {
+                group.capacity.call_window = u32::try_from(window).unwrap_or(u32::MAX);
+            }
         }
     }
 
@@ -934,7 +981,10 @@ impl Scheduler {
 
         // The step values this step reads, whatever arrives while it runs: the snapshot the
         // control thread replaces is taken once here.
-        self.budget = Budget::of(&self.tuning.load(), &self.ceilings, &self.config);
+        let tuning = self.tuning.load_full();
+        self.budget = Budget::of(&tuning, &self.ceilings, &self.config);
+        self.retune(&tuning);
+        self.answer_demotions();
 
         // What the buffer pool published before this look at the pair: anything it publishes
         // later keeps the loop from sleeping after the step (`run`).

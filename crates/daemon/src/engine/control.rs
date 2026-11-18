@@ -1735,8 +1735,6 @@ fn place_on(
         !config.model.model.is_empty(),
         "the engine configuration names no model"
     );
-    let queue_depth = u32::try_from(config.device.queue_depth.get())
-        .context("`device_config.queue_depth` exceeds the launch file's field")?;
     let scheduler_node = host.host == config.parallel.engine_host;
     // A new epoch takes the identity of its first engine; an engine that
     // replaces a lost one goes on with its epoch.
@@ -1756,7 +1754,6 @@ fn place_on(
     args.scheduler_node = scheduler_node;
     // The world is stated by the start that reserves its sockets.
     args.world = None;
-    args.queue_depth = queue_depth;
     Ok(args)
 }
 
@@ -1997,7 +1994,6 @@ mod tests {
             ..Default::default()
         };
         options.device_config.devices = vec![0];
-        options.device_config.queue_depth = std::num::NonZeroUsize::new(4).unwrap();
         let mut args = EngineArgs::new(
             options.engine_config().expect("the configuration resolves"),
             modules(),
@@ -2015,7 +2011,6 @@ mod tests {
             service::Endpoint::unix(directory.path().join("processes.sock")).to_string()
         );
         assert_eq!(launch.requests, control.request_address());
-        assert_eq!(launch.queue_depth, 4);
         assert_eq!(launch.world_size, 1);
         assert_eq!(launch.modules, modules());
         assert!(!launch.parked());

@@ -117,7 +117,6 @@ mod tests {
             scheduler_node: true,
             world: None,
             standby_storage: crate::config::StandbyStorage::Resident,
-            queue_depth: 4,
             world_size: 1,
         }
     }
@@ -157,7 +156,6 @@ mod tests {
             "scheduler_node",
             "world",
             "standby_storage",
-            "queue_depth",
             "world_size",
         ]
         .into_iter()
@@ -168,7 +166,6 @@ mod tests {
         assert_eq!(value["deployment"], json!("model"));
         assert_eq!(value["epoch"], json!(12));
         assert_eq!(value["devices"], json!([0, 1]));
-        assert_eq!(value["queue_depth"], json!(4));
         assert_eq!(value["world_size"], json!(1));
         assert_eq!(value["predecessor"]["epoch"], json!(11));
         assert_eq!(

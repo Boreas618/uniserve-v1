@@ -1223,7 +1223,6 @@ fn worker(
         BlockTables::new(GROUP, &[KV, HOST], &UNIT_BYTES),
         Arc::clone(sequences),
         place,
-        proto::config::DEFAULT_COPY_BUDGET,
     )
     .unwrap();
 
@@ -1386,6 +1385,7 @@ fn batch(number: u64) -> Batch {
         kernels: 1,
         policy: 1,
         revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         shape: Shape::decode(1, Variant::DecodeGreedy),
         requests: vec![proto::request::RequestId(number)],
         columns: Columns::default(),

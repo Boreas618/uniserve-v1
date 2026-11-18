@@ -1101,6 +1101,9 @@ fn a_step_takes_the_step_values_it_began_with_within_the_workers_capture() {
             calls: 4,
             chunk: 64,
             queued: Some(3),
+            prefix_caching: true,
+            host_tier: true,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         }
     );
 
@@ -1121,8 +1124,48 @@ fn a_step_takes_the_step_values_it_began_with_within_the_workers_capture() {
             calls: 8,
             chunk: 512,
             queued: None,
+            prefix_caching: true,
+            host_tier: true,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         }
     );
+}
+
+/// The step values a scheduler keeps beside the budget follow the snapshot from the next step
+/// on: a group's queue depth and the call window it bounds, the statistics' report period, and
+/// the copy budget and the cache switches the step's batches and blocks are given.
+#[test]
+fn a_step_takes_the_groups_depths_and_the_switches_of_its_snapshot() {
+    let groups = configs().into_iter().map(|config| (config, capacity()));
+    let policy = (packaged("arrival"), packaged_arguments(""));
+    let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect(), policy) else {
+        panic!("the startup checks pass both groups");
+    };
+    let named = bench.scheduler.groups[0].config.id.0.clone();
+    let other = bench.scheduler.groups[1].config.queue_depth;
+
+    bench.scheduler.tune(|tuning| {
+        tuning.revision = 9;
+        tuning
+            .queue_depths
+            .insert(named.clone(), NonZeroUsize::new(5).unwrap());
+        tuning.report_period = std::time::Duration::from_millis(250);
+        tuning.copy_budget = 4096;
+        tuning.prefix_caching = false;
+        tuning.host_tier = false;
+    });
+    bench.scheduler.step();
+    let group = &bench.scheduler.groups[0];
+    assert_eq!(group.config.queue_depth, 5);
+    assert_eq!(group.capacity.call_window, 5);
+    assert_eq!(bench.scheduler.groups[1].config.queue_depth, other);
+    assert_eq!(
+        bench.scheduler.config.report_period,
+        std::time::Duration::from_millis(250)
+    );
+    let budget = bench.scheduler.budget;
+    assert_eq!(budget.copy_budget, 4096);
+    assert!(!budget.prefix_caching && !budget.host_tier);
 }
 
 /// A flush evicts every cached block the scheduler knows of by `Evict`, as many keys per record
@@ -1312,6 +1355,14 @@ pub(crate) fn tuned() -> Arc<ArcSwap<Tuning>> {
         max_batch: NonZeroUsize::new(proto::config::DEFAULT_MAX_BATCH).unwrap(),
         max_num_batched_tokens: None,
         max_queued_requests: None,
+        queue_depths: Default::default(),
+        prefix_caching: true,
+        host_tier: true,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
+        report_period: proto::config::DEFAULT_REPORT_PERIOD,
+        watchdog_timeout: proto::config::DEFAULT_WATCHDOG_TIMEOUT,
+        compare_timeout: proto::config::DEFAULT_COMPARE_TIMEOUT,
+        nvtx_ranges: false,
     }))
 }
 

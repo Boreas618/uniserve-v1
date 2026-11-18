@@ -43,7 +43,7 @@ use program::{Budget, Kind};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::info;
 
-pub(crate) use self::host::validate;
+pub(crate) use self::host::{Measure, validate};
 pub(crate) use self::kv::KvSetup;
 pub(crate) use self::routing::Router;
 pub(crate) use self::state::States;
@@ -127,6 +127,8 @@ pub(crate) struct Programs {
     outputs: mpsc::UnboundedSender<Output>,
     control: Mutex<BTreeMap<String, control::Task>>,
     router: Arc<Router>,
+    /// What a validation measures of a change that starts a kernel generation.
+    measure: Measure,
     /// Cancelled once every program ended ([`Self::stop`]).
     ended: tokio_util::sync::CancellationToken,
 }
@@ -134,13 +136,15 @@ pub(crate) struct Programs {
 impl Programs {
     /// The programs of the deployment `current` serves, recording into `store`, saving their
     /// states in `states` and handing their outputs to `outputs`; none runs until
-    /// [`Self::replace`] starts them. `router` is the slot the leader routes requests through.
+    /// [`Self::replace`] starts them. `router` is the slot the leader routes requests through,
+    /// and `measure` what a control program's validation reports of a kernel generation.
     pub(crate) fn new(
         store: Store,
         states: States,
         current: Current,
         outputs: mpsc::UnboundedSender<Output>,
         router: Arc<Router>,
+        measure: Measure,
     ) -> Self {
         Self {
             store,
@@ -149,6 +153,7 @@ impl Programs {
             outputs,
             control: Mutex::default(),
             router,
+            measure,
             ended: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -260,6 +265,7 @@ impl Programs {
                 states: self.states.clone(),
                 current: self.current.subscribe(),
                 outputs: self.outputs.clone(),
+                measure: Arc::clone(&self.measure),
             })
             .await;
             service::lock(&self.control).insert(name.to_owned(), task);

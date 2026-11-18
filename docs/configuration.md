@@ -105,7 +105,7 @@ Every option declares how a change of it takes effect, and a change takes the le
 
 | Effect | What happens |
 | --- | --- |
-| `step` | Each scheduler reads the new value at its next step |
+| `step` | Each scheduler reads the new value at its next step, and every main process of the epoch the values it reads beside its batches at the next turn of its control loop (`proto::config::Tuning`, which the scheduler node relays to its peers before its schedulers read it); an option only a start reads (`worker_config.join_timeout`) is read by the next start of a process |
 | `order` | The experts' new order is prepared beside the batches and committed at one computation boundary |
 | `program` | The changed programs are replaced between two of their calls ([Programs](#programs)): the leader's by the leader, the KV program by the Storage Servers, and the scheduling program by a generation of the engines, as an update on trial |
 | `generation` | The serving engines prepare the new kernel modules, capture their graphs in the background and switch to them, as an update on trial |
@@ -255,7 +255,7 @@ The Transfer Server copies by its host's calibration, which `uniserve storage-se
 
 ### `kv_cache_config`
 
-**Destination: build config.**
+**Destination: build config**, except two switches. `prefix_caching` and `host_tier` switched off take effect at the schedulers' next step (`step`): from it on no step reads or writes a cached prefix, or offloads a page to the host tier, and the pages cached so far leave by eviction. Switched on, each takes a new epoch (`epoch`), which lays out the storage the capability needs (the host region, a converted load's buffers). The host tier's size (`host_ratio`, `host_gib`) takes a new epoch: the host region is created at its size when the deployment's first epoch opens it, under a name its size is no part of.
 
 
 | Option | Default | Meaning |
@@ -355,7 +355,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `device_config`
 
-**Destination: build config** — it decides where ranks run, by the rule that places `worker_groups` and `engine_host` there.
+**Destination: build config** — it decides where ranks run, by the rule that places `worker_groups` and `engine_host` there — except `queue_depth`, which no storage is sized by: the schedulers keep that many of each group's batches in flight from their next step on (`step`), a group with more in flight submitting none until they end, and so does a change of the queue depths of `worker_groups` alone.
 
 
 `device`, `devices`, `worker_hosts` and `queue_depth` place ranks without a deployment layout, so each is refused together with `worker_groups`, as is `tensor_parallel_size`.
@@ -393,7 +393,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `worker_config`
 
-**Destination: build config.**
+**Destination, per field:** `engine`, `engine_revision`, `mesh`, `standby`, `standby_storage`, `host_threads` and `host_queue_depth` are build config. `watchdog_timeout`, `compare_timeout`, `report_period` and `copy_budget` take effect at the engines' next step (`step`): every main process takes the bounds and the period at the next turn of its control loop, and every batch carries the copy budget of the step that assembled it, so every rank of a group starts the same copies with it. `join_timeout` is read only as processes start, so a change of it bounds the next start (a relaunch, a standby, another epoch) and moves no process. The media pool (`host_threads`, `host_queue_depth`) is a pool of threads of the main process, which a video epoch creates with the host phase's request capacity the scheduler admits under, so a change of it takes a new epoch.
 
 
 | Option | Default | Meaning |
@@ -415,7 +415,7 @@ A worker compiles no kernel. A main process resolves the modules its forwards la
 
 ### `profiling_config`
 
-**Destination, per field:** `fence_modules`, `graph_pc_sampling` and `nvtx_ranges` are build config; `fence_probes` and `fence_probes_off` are profiling switches rather than deployment content and keep switching in place at a step boundary.
+**Destination, per field:** `fence_modules` and `graph_pc_sampling` are build config; `nvtx_ranges` switches every main process's host ranges at the engines' next step (`step`), a running `timeline` session keeping them on until it ends; `fence_probes` and `fence_probes_off` are profiling switches rather than deployment content and keep switching in place at a step boundary.
 
 
 The workers' always-on profiling: the fence probes at the entry and exit of the model's modules, recorded as per-step durations by module class (`uniserve_step_device_seconds`, [execution profiling](profiling.md#fence-probes)). Profiling sessions take their options with their request (`POST /admin/profile`).

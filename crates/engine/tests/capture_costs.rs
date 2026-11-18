@@ -203,6 +203,7 @@ fn step_batch(rows: u32) -> Batch {
         kernels: 1,
         policy: 1,
         revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         shape: BatchShape::decode(rows, Variant::DecodeGreedy),
         requests: Vec::new(),
         columns: Columns {

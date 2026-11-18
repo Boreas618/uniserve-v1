@@ -156,6 +156,10 @@ pub struct Batch {
     /// The configuration revision of the step values the batch was assembled under: the
     /// snapshot its step began with (`proto::config::Tuning`), the same on every rank.
     pub revision: u64,
+    /// The bytes, summed over the group's ranks, the copies started with this batch may move
+    /// together (`worker_config.copy_budget` of the batch's revision): every rank of the group
+    /// starts the same copies with it.
+    pub copy_budget: u64,
     /// The rows, tokens, variant and extent the scheduler wrote: what selects the bucket.
     pub shape: Shape,
     /// The requests the batch advances, one call each, in row order: the order of
@@ -1398,6 +1402,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape::prefill(4, 8, Variant::VerifyGreedy),
             requests: vec![RequestId(7), RequestId(9)],
             columns: Columns {
@@ -1525,6 +1530,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape {
                 rows: 1,
                 tokens: 0,

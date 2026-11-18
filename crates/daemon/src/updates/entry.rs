@@ -167,6 +167,54 @@ impl Leader {
         }
     }
 
+    /// What a generation update to `target`'s kernels would take on every serving engine's
+    /// devices beside the graphs they serve: the kernel packages `target` names fixed at this
+    /// node's Build Server as an apply fixes them (`with_store_modules`, nothing built), and each
+    /// replica's engine measuring the graphs the packages that differ from the serving epoch's
+    /// would capture again (`MeasureRoom`). Empty when the kernels are the serving epoch's, or
+    /// no engine serves.
+    ///
+    /// # Errors
+    ///
+    /// The Build Server's refusal of `target`'s pins, or an engine's failure to measure.
+    pub(crate) async fn rooms(
+        &self,
+        target: &Config,
+    ) -> Result<Vec<proto::request::wire::DeviceRoom>, UpdateError> {
+        let Some((_, record)) = self.updates.epochs().serving() else {
+            return Ok(Vec::new());
+        };
+        let Some(control) = self.replicas()[0].control.get().cloned() else {
+            return Ok(Vec::new());
+        };
+        let local = crate::engine::control::BuildServer {
+            host: control.host().to_owned(),
+            socket: control.build_server().to_owned(),
+            targets: Vec::new(),
+        };
+        let named = crate::epoch::modules_of(target);
+        let fixed = tokio::task::spawn_blocking(move || {
+            crate::engine::control::with_store_modules(&local, &named)
+        })
+        .await
+        .map_err(|error| UpdateError::Failed(anyhow::anyhow!("fixing the kernels: {error}")))?
+        .map_err(|error| UpdateError::Refused(format!("fixing the kernels: {error:#}")))?;
+        if fixed.kernels == record.kernels {
+            return Ok(Vec::new());
+        }
+        let mut rooms = Vec::new();
+        for replica in self.replicas() {
+            let Some(client) = replica.hold().client() else {
+                continue;
+            };
+            let measured = client.measure_room(&fixed.kernels).await.map_err(|error| {
+                UpdateError::Failed(anyhow::anyhow!("measuring the generation's room: {error}"))
+            })?;
+            rooms.extend(measured);
+        }
+        Ok(rooms)
+    }
+
     /// Whether `target`, the current configuration again, selects other module revisions than
     /// the serving epoch runs: a `latest` the Build Servers resolve to a revision installed since
     /// the serving epoch's apply. Such a target is a change though no option changed

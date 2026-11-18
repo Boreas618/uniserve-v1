@@ -554,6 +554,7 @@ impl Scheduler {
             kernels: self.generations.kernels(),
             policy: self.generations.policy(),
             revision: self.budget.revision,
+            copy_budget: self.budget.copy_budget,
             shape: Shape {
                 rows: 0,
                 tokens: 0,
@@ -745,22 +746,10 @@ impl Scheduler {
                 .any(|(_, request, _)| gives_up(request))
     }
 
-    /// The policy's `offload` (SD §3.4): one `Store` to the host per group whose memory holds
-    /// the device copies of the blocks it names, with their keys in its order. A `PageId` that is
-    /// not in `cache`, not on the device, already on the host or being stored there (a block is
-    /// offered to the host once, SD §4.4), whose last `Store` stored nothing while nothing that
-    /// could change that has happened since ([`Scheduler::store_refused`]), or of a class without
-    /// a host region is skipped.
-    ///
-    /// A policy names a block once. A block whose last `Store` to the host stored nothing is
-    /// offered again by the scheduler, after the policy's blocks and least recently used first,
-    /// once something that could change that answer has happened, while no request holds it and
-    /// it has a device copy and no host copy (SD §4.4 "The write policy").
-    fn offload(&mut self, pages: &[PageId]) {
-        // The keys a `Store` to the host held or outstanding names: until its answer, `cache`
-        // does not show them on the host.
-        let storing: HashSet<Key> = self
-            .held
+    /// The keys a `Store` to the host held or outstanding names: until its answer, `cache` does
+    /// not show them on the host.
+    pub(super) fn host_stores(&self) -> HashSet<Key> {
+        self.held
             .iter()
             .chain(self.outstanding.values().map(|(_, request, _)| request))
             .filter_map(|request| match request {
@@ -773,7 +762,26 @@ impl Scheduler {
             })
             .flatten()
             .copied()
-            .collect();
+            .collect()
+    }
+
+    /// The policy's `offload` (SD §3.4): one `Store` to the host per group whose memory holds
+    /// the device copies of the blocks it names, with their keys in its order. A `PageId` that is
+    /// not in `cache`, not on the device, already on the host or being stored there (a block is
+    /// offered to the host once, SD §4.4), whose last `Store` stored nothing while nothing that
+    /// could change that has happened since ([`Scheduler::store_refused`]), or of a class without
+    /// a host region is skipped.
+    ///
+    /// A policy names a block once. A block whose last `Store` to the host stored nothing is
+    /// offered again by the scheduler, after the policy's blocks and least recently used first,
+    /// once something that could change that answer has happened, while no request holds it and
+    /// it has a device copy and no host copy (SD §4.4 "The write policy"). A step whose values
+    /// switch the host tier off offloads nothing (`kv_cache_config.host_tier`).
+    pub(super) fn offload(&mut self, pages: &[PageId]) {
+        if !self.budget.host_tier {
+            return;
+        }
+        let storing = self.host_stores();
 
         // The blocks offered again; one still held back stays recorded, and one with a host copy
         // or no device copy leaves the record.

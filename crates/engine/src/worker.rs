@@ -77,9 +77,10 @@
 //! starts the oldest queued copies, in the order they were queued, while their bytes stay within
 //! the budget, and the first copy that would pass it waits, with every copy behind it, for a
 //! later batch. A copy larger than the budget starts alone, as the only copy of its batch. The
-//! bytes are those [`BlockTables::queued_copies`] counts over the group's ranks, and every rank
-//! of a group has the same budget, so all start the same copies with the same batch and return
-//! the same `Finish`es.
+//! bytes are those [`BlockTables::queued_copies`] counts over the group's ranks, and the budget is
+//! the one the batch carries ([`Batch::copy_budget`], of the step values it was assembled under),
+//! so every rank of a group starts the same copies with the same batch and returns the same
+//! `Finish`es, and a change of the budget takes effect with the next step's batches.
 //!
 //! Each copy a batch starts is run by a runner whose memory holds both runs of each of its pairs
 //! ([`Runner::maps`]), whichever runner serves the batch: the batch's own when it does, otherwise
@@ -496,12 +497,10 @@ impl Worker {
     /// `rank` of the worker group whose device block tables `tables` holds for this rank, and
     /// which states its ended sequence to `sequences`.
     ///
-    /// `copy_budget` is the bytes, summed over the group's ranks, that the copies started with
-    /// one batch may move together (`worker_config.copy_budget`); the copies run on the device's
-    /// copy stream beside the batch's forward, and the batch ends with them. Every worker of a
-    /// group is given the
-    /// same budget and tables given the same unit sizes, or the ranks would start different
-    /// copies with one batch and the group's submission would fail.
+    /// The copies a batch starts are those its copy budget admits ([`Batch::copy_budget`]); they
+    /// run on the device's copy stream beside the batch's forward, and the batch ends with them.
+    /// Every worker of a group is given tables of the same unit sizes, or the ranks would start
+    /// different copies with one batch and the group's submission would fail.
     ///
     /// `device` is the CUDA device the runners issue on: the worker keeps its context current on
     /// the thread and checks it for a sticky error. `None` is a worker of runners that hold no
@@ -521,7 +520,6 @@ impl Worker {
         tables: BlockTables,
         sequences: Arc<Sequences>,
         rank: usize,
-        copy_budget: u64,
     ) -> Result<Self> {
         let group = tables.group();
         if sequences.group() != group || rank >= sequences.ranks() {
@@ -575,7 +573,6 @@ impl Worker {
             forwards: (0, 0),
             counts_stated: std::time::Instant::now(),
             tables,
-            copy_budget,
             sequences,
             rank,
             launched: 0,
@@ -1029,9 +1026,6 @@ struct Thread {
     counts_stated: std::time::Instant,
     /// The rank's device block tables.
     tables: BlockTables,
-    /// The bytes, summed over the group's ranks, that the copies started with one batch may
-    /// move together.
-    copy_budget: u64,
     /// Where the rank states its ended sequence, as rank `rank`.
     sequences: Arc<Sequences>,
     rank: usize,
@@ -1369,7 +1363,7 @@ impl Thread {
         }
         self.write_tables()?;
         let copies = if sequence.is_some() && alone(&batch)?.is_none() {
-            self.start_copies(index)
+            self.start_copies(index, batch.copy_budget)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1606,17 +1600,14 @@ impl Thread {
     }
 
     /// Starts, for the batch runner `index` runs next, the oldest copies no batch has started
-    /// that the copy budget admits, each on the runner whose memory holds it
+    /// that the batch's copy budget `budget` admits, each on the runner whose memory holds it
     /// ([`Thread::copier`]). Returns the copies with whether each was issued, and the runners
     /// that were handed some: a copy its runner cannot issue, or that no runner maps, is
     /// reported failed, and the batch still runs.
-    fn start_copies(&mut self, index: usize) -> Started {
+    fn start_copies(&mut self, index: usize, budget: u64) -> Started {
         // The queue's order and each copy's bytes over the group are the same on every rank, so
         // every rank starts the same copies with this batch.
-        let admitted = admitted(
-            self.tables.queued_copies().map(|(_, bytes)| bytes),
-            self.copy_budget,
-        );
+        let admitted = admitted(self.tables.queued_copies().map(|(_, bytes)| bytes), budget);
         let copies: Vec<BlockCopy> = std::iter::from_fn(|| self.tables.start_copy())
             .take(admitted)
             .collect();

@@ -75,7 +75,7 @@ impl ModelRunner {
         }
 
         let (calls, _) = config.buckets.bounds();
-        let window = call_window(self.queue_depth(), calls as usize)
+        let window = call_window(self.queue_depth()?, calls as usize)
             .context("bounding the calls of a request the group holds unresolved")?;
         let model = &self.engine_config().model;
 

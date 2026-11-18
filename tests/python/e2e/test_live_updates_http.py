@@ -2068,3 +2068,37 @@ def test_step_changes_under_a_request_keep_its_stream_whole(
             _assert_whole(stream)
     print("switches:", switches)
     assert switches >= 20, switches
+
+
+#: Options each change of which takes effect at the engines' next step: what
+#: every main process reads beside its batches, what a start reads, and the
+#: cache's switches turned off. Each value differs from the deployment's.
+STEP_OPTIONS: list[Config] = [
+    {"worker_config": {"watchdog_timeout": "100s"}},
+    {"worker_config": {"join_timeout": "100s"}},
+    {"worker_config": {"compare_timeout": "100s"}},
+    {"worker_config": {"report_period": "500ms"}},
+    {"worker_config": {"copy_budget": "64MiB"}},
+    {"device_config": {"queue_depth": 3}},
+    {"profiling_config": {"nvtx_ranges": True}},
+    {"kv_cache_config": {"host_tier": False}},
+    {"kv_cache_config": {"prefix_caching": False}},
+]
+
+
+def test_step_options_change_with_no_new_process(deployments: Deployments):
+    """A change of an option that takes effect at the next step starts no
+    process: the replica serves the same epoch with the same processes, and
+    a request streamed across the changes is whole.
+    """  # noqa: D205
+    name = "qwen3-live-step-options"
+    with _serve(deployments, name) as server:
+        epoch = admin.replica(server).epoch
+        launched = admin.processes(server)
+        stream = _start_count(server, name)
+        for change in STEP_OPTIONS:
+            record = _apply(server, change)
+            assert record["effect"] == "step", (change, record)
+            assert admin.replica(server).epoch == epoch, change
+        _assert_whole(stream)
+        assert admin.processes(server) == launched

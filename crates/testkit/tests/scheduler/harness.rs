@@ -834,6 +834,14 @@ impl Deployment {
                 .then(|| NonZeroUsize::new(self.tokens as usize))
                 .flatten(),
             max_queued_requests: self.queued.and_then(NonZeroUsize::new),
+            queue_depths: Default::default(),
+            prefix_caching: true,
+            host_tier: true,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
+            report_period: proto::config::DEFAULT_REPORT_PERIOD,
+            watchdog_timeout: proto::config::DEFAULT_WATCHDOG_TIMEOUT,
+            compare_timeout: proto::config::DEFAULT_COMPARE_TIMEOUT,
+            nvtx_ranges: false,
         }
     }
 }

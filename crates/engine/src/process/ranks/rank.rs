@@ -697,9 +697,21 @@ impl ModelRunner {
         &self.buckets
     }
 
-    /// Batches the rank's groups keep in flight (the launch's `queue_depth`).
-    pub(crate) fn queue_depth(&self) -> usize {
-        self.launch.queue_depth as usize
+    /// Batches the rank's worker group keeps in flight: the group's `queue_depth`, which the
+    /// rank-layout shorthand takes from `device_config.queue_depth`. A change of it reaches the
+    /// schedulers at their next step (`proto::config::Tuning::queue_depths`).
+    ///
+    /// # Errors
+    ///
+    /// The rank's group is none the configuration places.
+    pub(crate) fn queue_depth(&self) -> Result<usize> {
+        self.engine_config()
+            .parallel
+            .worker_groups
+            .iter()
+            .find(|group| group.id.0 == self.group)
+            .map(|group| group.queue_depth)
+            .with_context(|| format!("the configuration places no worker group {}", self.group))
     }
 
     /// The rank's position in its worker group's parallel order, which names its part of the

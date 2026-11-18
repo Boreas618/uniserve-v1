@@ -664,6 +664,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape::decode(0, Variant::DecodeGreedy),
             requests: (0..calls).map(RequestId).collect(),
             columns: Columns::default(),

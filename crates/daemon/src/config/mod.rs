@@ -339,9 +339,10 @@ pub struct Config {
     /// The deployment layout: one `[[worker_groups]]` table per group of
     /// workers, placing its ranks on devices and hosts and naming the blocks
     /// it runs. Unset, the rank-layout shorthand (`tensor_parallel_size`,
-    /// `data_parallel_size`, `device_config`) places the ranks.
+    /// `data_parallel_size`, `device_config`) places the ranks. A change of the groups' queue
+    /// depths alone takes effect at the next step; any other is a new epoch ([`groups_effect`]).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[reload(epoch)]
+    #[reload(by = groups_effect)]
     pub worker_groups: Option<Vec<proto::config::WorkerGroupConfig>>,
     /// The deployment's nodes, by host name, the leader first: each node runs `uniserve serve`
     /// with the same package, finds itself in the list by its own host name (`uname -n`), and
@@ -370,7 +371,7 @@ pub struct Config {
     pub storage_config: storage::ServerSettings,
     #[reload(epoch)]
     pub load_config: LoadConfig,
-    #[reload(epoch)]
+    #[reload(fields)]
     pub kv_cache_config: KvCacheConfig,
     #[reload(fields)]
     pub scheduler_config: SchedulerConfig,
@@ -380,13 +381,13 @@ pub struct Config {
     pub migration_config: MigrationConfig,
     #[reload(daemon)]
     pub update_config: UpdateConfig,
-    #[reload(epoch)]
+    #[reload(fields)]
     pub device_config: DeviceConfig,
     #[reload(fields)]
     pub moe_config: MoeConfig,
     #[reload(epoch)]
     pub cuda_graph_config: CudaGraphConfig,
-    #[reload(epoch)]
+    #[reload(fields)]
     pub worker_config: WorkerConfig,
     #[reload(fields)]
     pub profiling_config: ProfilingConfig,
@@ -817,6 +818,17 @@ impl Config {
                 .validate()
                 .map_err(|error| anyhow::anyhow!("`profiling_config.session`: {error}"))?;
         }
+        // A zero watchdog bound would report every job as it starts, and a zero report period
+        // would report at every turn of a control loop, whether a start or a change states it.
+        for (name, value) in [
+            ("watchdog_timeout", self.worker_config.watchdog_timeout),
+            ("report_period", self.worker_config.report_period),
+        ] {
+            anyhow::ensure!(
+                !value.is_zero(),
+                "invalid `worker_config.{name}`: it must be positive"
+            );
+        }
         // A program's name names its saved state's file and the revisions it writes.
         for (name, program) in &self.programs {
             anyhow::ensure!(
@@ -1099,6 +1111,30 @@ fn storage_effect(
     match previous {
         Some(previous) if !previous.restarts(next) => proto::reload::Effect::Step,
         _ => proto::reload::Effect::Storage,
+    }
+}
+
+/// How a change of `worker_groups` from `previous` to `next` takes effect: at the next step when
+/// the groups differ in their queue depths alone, which no storage is sized by (the schedulers
+/// keep each group's depth of batches in flight from their next step's snapshot); otherwise, and
+/// at a start, as a new epoch, since the groups place the ranks.
+fn groups_effect(
+    previous: Option<&Option<Vec<proto::config::WorkerGroupConfig>>>,
+    next: &Option<Vec<proto::config::WorkerGroupConfig>>,
+) -> proto::reload::Effect {
+    let without_depths = |groups: &Option<Vec<proto::config::WorkerGroupConfig>>| {
+        groups.clone().map(|mut groups| {
+            for group in &mut groups {
+                group.queue_depth = 0;
+            }
+            groups
+        })
+    };
+    match previous {
+        Some(previous) if without_depths(previous) == without_depths(next) => {
+            proto::reload::Effect::Step
+        }
+        _ => proto::reload::Effect::Epoch,
     }
 }
 

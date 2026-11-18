@@ -249,6 +249,7 @@ fn batch(variant: Variant, step: u32, results: Vec<u32>, reads: u32) -> Batch {
         kernels: 0,
         policy: 0,
         revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         shape: Shape {
             rows: 1,
             tokens: 0,

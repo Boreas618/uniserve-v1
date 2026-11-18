@@ -63,6 +63,7 @@ fn group_batch() -> batch::Batch {
         kernels: 3,
         policy: 3,
         revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         shape: batch::Shape::decode(2, batch::Variant::DecodeSampled),
         requests: vec![RequestId(1), RequestId(2)],
         columns: batch::Columns {

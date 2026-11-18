@@ -244,6 +244,5 @@ pub fn launch() -> EngineArgs {
     launch.devices = vec![0];
     launch.group = group.id.0.clone();
     launch.world_size = 1;
-    launch.queue_depth = 2;
     launch
 }

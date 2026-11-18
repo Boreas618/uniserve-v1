@@ -1672,6 +1672,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape {
                 rows: u32::try_from(rows.len()).unwrap(),
                 tokens: 0,
@@ -2107,7 +2108,6 @@ mod tests {
                     tables(rank),
                     Arc::clone(&sequences),
                     rank,
-                    proto::config::DEFAULT_COPY_BUDGET,
                 );
                 Arc::new(worker.unwrap())
             })
@@ -2142,6 +2142,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape::decode(1, Variant::DecodeGreedy),
             requests: vec![RequestId(100 + id)],
             columns: Columns::default(),

@@ -105,6 +105,25 @@ pub struct Report {
     /// Whether serving would stop while the change takes effect: the new engine fits beside the
     /// old one neither whole nor by shrinking it, so the old one drains first.
     pub interrupts: bool,
+    /// What a kernel generation the change starts takes on each GPU of the serving engines
+    /// beside the graphs they serve, and the KV pages each device's cache demotes to host memory
+    /// and gives back while both generations' graphs are held; empty when the change starts no
+    /// generation or it replaces no kernel.
+    #[serde(default)]
+    pub rooms: Vec<Room>,
+}
+
+/// One GPU's share of a kernel generation ([`Report::rooms`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Room {
+    /// The GPU's UUID, in lowercase hexadecimal.
+    pub gpu: String,
+    /// The bytes the generation's graphs take beside what serves until its commit.
+    pub extra_bytes: u64,
+    /// What the device holds of them now.
+    pub room_bytes: u64,
+    /// The KV pages the device's cache demotes and gives back when the room lacks them.
+    pub kv_pages: u64,
 }
 
 /// The `stats` table: values over time, each a number or a histogram in time buckets, by name

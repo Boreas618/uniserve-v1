@@ -126,6 +126,7 @@ fn programs(
         current(1, 8192),
         outputs,
         Arc::clone(&router),
+        Arc::new(|_| Ok(Vec::new())),
     );
     (programs, store, written, router)
 }

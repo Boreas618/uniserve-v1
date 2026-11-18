@@ -136,6 +136,22 @@ struct SharedTimeline {
 
 static TIMELINE: Mutex<Option<SharedTimeline>> = Mutex::new(None);
 
+/// Switches the process's NVTX ranges as the configuration states them
+/// (`profiling_config.nvtx_ranges`): at once, or, while a timeline session records with them on,
+/// once it ends, which restores the switch it found.
+pub(crate) fn configure_nvtx(enabled: bool) {
+    let mut timeline = service::lock(&TIMELINE);
+    match timeline
+        .as_mut()
+        .and_then(|shared| shared.nvtx_before.as_mut())
+    {
+        Some(before) => *before = enabled,
+        None => {
+            super::ranges::set_enabled(enabled);
+        }
+    }
+}
+
 /// Where each recording rank's records go, by the device ordinal CUPTI names.
 ///
 /// Apart from [`TIMELINE`] because a timeline that stops delivers what remains from under that

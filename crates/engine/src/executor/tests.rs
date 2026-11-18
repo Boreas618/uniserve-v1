@@ -152,7 +152,6 @@ pub(crate) fn node(
                 BlockTables::new(GROUP, &[DEVICE, HOST], &[(DEVICE, 64), (HOST, 64)]),
                 Arc::clone(&sequences),
                 rank,
-                proto::config::DEFAULT_COPY_BUDGET,
             );
             Arc::new(worker.unwrap())
         })
@@ -194,6 +193,7 @@ fn decode(id: u64, rows: u32) -> Batch {
         kernels: 1,
         policy: 1,
         revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         shape: Shape::decode(rows, Variant::DecodeGreedy),
         requests: (0..u64::from(rows))
             .map(|row| RequestId(100 * id + row))
@@ -232,6 +232,7 @@ pub(crate) fn host_batch(id: u64, group: GroupId, phase: Phase, variant: Variant
         kernels: 1,
         policy: 1,
         revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
         shape: Shape {
             rows: 1,
             tokens: 0,

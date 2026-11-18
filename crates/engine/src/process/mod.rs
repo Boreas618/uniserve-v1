@@ -324,6 +324,9 @@ pub(crate) struct MainProcess {
     metrics: wire::Metrics,
     lifetime: Vec<[u64; 4]>,
     next_metrics: Instant,
+    /// The step values this control thread last took from the engine's snapshot
+    /// ([`MainProcess::retune`]).
+    tuned: Option<Arc<Tuning>>,
     /// What the engine last announced it serves, which an attaching daemon is told.
     announced: Option<wire::EngineInfo>,
     /// Why the control thread ends: a shutdown or the daemon gone (`Ok`), or a failure.
@@ -395,6 +398,7 @@ impl MainProcess {
             metrics: wire::Metrics::default(),
             lifetime: Vec::new(),
             next_metrics: Instant::now() + report_period,
+            tuned: None,
             announced: None,
             ending: None,
         })
@@ -430,6 +434,7 @@ impl MainProcess {
         }
 
         loop {
+            self.retune();
             if let Some(ending) = self.ending.take() {
                 return self.end(ending);
             }
@@ -903,7 +908,7 @@ impl MainProcess {
 
             tracing::info!(?rooms, "the KV cache gives room to a generation's graphs");
             yielded.store(true, std::sync::atomic::Ordering::Release);
-            operations::make_room(schedulers, head, binding, 0, &lacking)
+            operations::make_room(schedulers, head, binding, 0, &lacking, true)
         };
         self.work(Box::new(move || {
             let prepared =
@@ -1399,19 +1404,8 @@ impl MainProcess {
                 };
                 self.on_ranks(front, switch.id, Ok(operation));
             }
-            Kind::Tune(tune) => {
-                // The step values every scheduler reads from its next step on: one store of the
-                // snapshot they share, which a step that runs does not see.
-                let tuned = match (self.engine.as_ref(), Tuning::of_command(&tune)) {
-                    (None, _) => Err(starting()),
-                    (_, None) => Err(anyhow::anyhow!("a step of no call")),
-                    (Some(engine), Some(tuning)) => {
-                        engine.tuning.store(Arc::new(tuning));
-                        Ok(None)
-                    }
-                };
-                self.operated(front, tune.id, tuned);
-            }
+            Kind::Tune(tune) => self.tune(front, &tune),
+            Kind::MeasureRoom(measure) => self.measure_room(front, measure),
             Kind::ResizeCache(resize) => self.resize_cache(front, &resize),
             Kind::CommitExperts(commit) => {
                 let order: BTreeMap<String, Vec<u32>> = commit
@@ -1452,6 +1446,114 @@ impl MainProcess {
                 }));
             }
         }
+    }
+
+    /// `Tune`: the step values of a configuration revision. Every peer holds them before any
+    /// scheduler of this process reads them, so a batch that names their revision reaches no
+    /// rank that lacks them: they are relayed to the peers first, on a thread of their own, and
+    /// then stored as the snapshot the schedulers share, which a step that runs does not see.
+    /// The control threads take what they read themselves at their next turn
+    /// ([`MainProcess::retune`]).
+    fn tune(&mut self, front: usize, tune: &proto::request::wire::Tune) {
+        let ((binding, snapshot), tuning) = match (self.engine.as_ref(), Tuning::of_command(tune)) {
+            (None, _) => return self.operated(front, tune.id, Err(starting())),
+            (_, None) => {
+                return self.operated(front, tune.id, Err(anyhow::anyhow!("a step of no call")));
+            }
+            (Some(engine), Some(tuning)) => (
+                (Arc::clone(&engine.binding), Arc::clone(&engine.tuning)),
+                tuning,
+            ),
+        };
+        let id = tune.id;
+        self.work(Box::new(move || {
+            let relayed = binding
+                .on_peers(&RankOperation::Tune(Box::new(tuning.clone())))
+                .map(|_| {
+                    snapshot.store(Arc::new(tuning));
+                    None
+                })
+                .map_err(anyhow::Error::from);
+            done(move |main| main.operated(front, id, relayed))
+        }));
+    }
+
+    /// `MeasureRoom`: what a generation update to the command's kernel packages would take on
+    /// every rank's device beside the serving graphs, measured on a thread of its own, since the
+    /// Build Server selects the packages ([`generation::room`]); nothing is installed.
+    fn measure_room(&mut self, front: usize, measure: proto::request::wire::MeasureRoom) {
+        let named: Packages = measure
+            .kernels
+            .into_iter()
+            .map(|kernel| {
+                let slot = proto::module::ModuleSlot {
+                    op: kernel.op,
+                    key: kernel.key,
+                    part: kernel.part,
+                };
+                let package = proto::module::PackageRevision {
+                    backend: kernel.backend,
+                    revision: kernel.revision,
+                    arguments: toml::Table::new(),
+                };
+                (slot, package)
+            })
+            .collect();
+        let Some((engine, build)) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| Some((engine, engine.build.clone()?)))
+        else {
+            return self.operated(front, measure.id, Err(starting()));
+        };
+        let workers = engine.workers.clone();
+        let binding = Arc::clone(&engine.binding);
+        let serving = kernels_of(&self.serving);
+        let id = measure.id;
+        self.work(Box::new(move || {
+            let rooms =
+                generation::room(&workers, &build, (&named, &serving), &binding).map(|rooms| {
+                    let devices = rooms
+                        .into_iter()
+                        .map(|room| wire::DeviceRoom {
+                            gpu: room.gpu.to_vec(),
+                            extra: room.extra,
+                            room: room.room,
+                            kv_units: room.kv_units,
+                        })
+                        .collect();
+                    Some(wire::operated::Reports::Rooms(wire::Rooms { devices }))
+                });
+            done(move |main| main.operated(front, id, rooms))
+        }));
+    }
+
+    /// Takes the step values of the engine's snapshot this control thread reads itself, once per
+    /// revision they arrive at: its watchdog's bound, the period of its metrics (the next report
+    /// is due within the new period), the comparison bound of its next preparation, and its NVTX
+    /// ranges, which a running timeline session keeps on until it ends.
+    fn retune(&mut self) {
+        let Some(tuning) = self.engine.as_ref().map(|engine| engine.tuning.load_full()) else {
+            return;
+        };
+        if self
+            .tuned
+            .as_ref()
+            .is_some_and(|tuned| Arc::ptr_eq(tuned, &tuning))
+        {
+            return;
+        }
+        if let Err(error) = self.watchdog.set_bound(tuning.watchdog_timeout) {
+            tracing::warn!(%error, "the watchdog keeps its bound");
+        }
+        let worker = &mut self.launch.engine_config.worker;
+        worker.watchdog_timeout = tuning.watchdog_timeout;
+        worker.report_period = tuning.report_period;
+        worker.compare_timeout = tuning.compare_timeout;
+        self.launch.engine_config.profiling.nvtx_ranges = tuning.nvtx_ranges;
+        self.next_metrics = self.next_metrics.min(Instant::now() + tuning.report_period);
+        crate::profiling::collectors::configure_nvtx(tuning.nvtx_ranges);
+        self.tuned = Some(tuning);
     }
 
     /// Runs `operation`, an operation the daemon commands on every rank, beside the batches, and
@@ -1555,7 +1657,8 @@ impl MainProcess {
                     Err(error) => return self.operated(front, id, Err(error)),
                 };
                 Box::new(move || {
-                    let made = operations::make_room(&schedulers, &head, &binding, room, &devices);
+                    let made =
+                        operations::make_room(&schedulers, &head, &binding, room, &devices, false);
                     done(move |main| main.operated(front, id, made.map(|()| None)))
                 })
             }

@@ -274,29 +274,49 @@ fn limits_come_back_from_their_message_unchanged() {
 }
 
 /// The step values a `Tune` command carries come back as they went in, stated and unstated
-/// values alike, and a command of a step of no call is refused.
+/// values alike, and a command of a step of no call, or of a group of no batch in flight, is
+/// refused.
 #[test]
 fn step_values_come_back_from_their_command() {
     use std::num::NonZeroUsize;
+    use std::time::Duration;
 
     use proto::config::Tuning;
 
-    for tuning in [
-        Tuning {
-            revision: 42,
-            chunked_prefill_size: NonZeroUsize::new(4096),
-            max_batch: NonZeroUsize::new(64).unwrap(),
-            max_num_batched_tokens: NonZeroUsize::new(8192),
-            max_queued_requests: NonZeroUsize::new(32),
-        },
-        Tuning {
-            revision: 1,
-            chunked_prefill_size: None,
-            max_batch: NonZeroUsize::MIN,
-            max_num_batched_tokens: None,
-            max_queued_requests: None,
-        },
-    ] {
+    let stated = Tuning {
+        revision: 42,
+        chunked_prefill_size: NonZeroUsize::new(4096),
+        max_batch: NonZeroUsize::new(64).unwrap(),
+        max_num_batched_tokens: NonZeroUsize::new(8192),
+        max_queued_requests: NonZeroUsize::new(32),
+        queue_depths: [("model".to_owned(), NonZeroUsize::new(3).unwrap())].into(),
+        prefix_caching: true,
+        host_tier: false,
+        copy_budget: 64 << 20,
+        report_period: Duration::from_millis(250),
+        watchdog_timeout: Duration::from_secs(90),
+        compare_timeout: Duration::from_secs(120),
+        nvtx_ranges: true,
+    };
+    let unstated = Tuning {
+        revision: 1,
+        chunked_prefill_size: None,
+        max_batch: NonZeroUsize::MIN,
+        max_num_batched_tokens: None,
+        max_queued_requests: None,
+        queue_depths: Default::default(),
+        prefix_caching: false,
+        host_tier: true,
+        copy_budget: 0,
+        report_period: Duration::from_secs(1),
+        watchdog_timeout: Duration::from_secs(150),
+        compare_timeout: Duration::from_secs(300),
+        nvtx_ranges: false,
+    };
+    let mut no_depth = stated.command(3);
+    no_depth.queue_depths.insert("model".to_owned(), 0);
+    assert_eq!(Tuning::of_command(&no_depth), None);
+    for tuning in [stated, unstated] {
         let command = tuning.command(7);
         assert_eq!(command.id, 7);
         assert_eq!(Tuning::of_command(&command), Some(tuning));

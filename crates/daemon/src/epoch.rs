@@ -762,6 +762,36 @@ mod tests {
             ("max_num_batched_tokens", |config: &mut Config| {
                 config.max_num_batched_tokens = NonZeroUsize::new(4096)
             }),
+            // What every main process reads beside its batches, and what the next start of a
+            // process reads: no option of these sizes a storage or shapes a graph.
+            ("worker_config.watchdog_timeout", |config: &mut Config| {
+                config.worker_config.watchdog_timeout = std::time::Duration::from_secs(60)
+            }),
+            ("worker_config.join_timeout", |config: &mut Config| {
+                config.worker_config.join_timeout = std::time::Duration::from_secs(60)
+            }),
+            ("worker_config.compare_timeout", |config: &mut Config| {
+                config.worker_config.compare_timeout = std::time::Duration::from_secs(60)
+            }),
+            ("worker_config.report_period", |config: &mut Config| {
+                config.worker_config.report_period = std::time::Duration::from_millis(250)
+            }),
+            ("worker_config.copy_budget", |config: &mut Config| {
+                config.worker_config.copy_budget = 64 << 20
+            }),
+            ("device_config.queue_depth", |config: &mut Config| {
+                config.device_config.queue_depth = NonZeroUsize::new(4).unwrap()
+            }),
+            ("profiling_config.nvtx_ranges", |config: &mut Config| {
+                config.profiling_config.nvtx_ranges = true
+            }),
+            // Switched off, a capability the epoch laid out storage for goes unused.
+            ("kv_cache_config.prefix_caching", |config: &mut Config| {
+                config.kv_cache_config.prefix_caching = false
+            }),
+            ("kv_cache_config.host_tier", |config: &mut Config| {
+                config.kv_cache_config.host_tier = false
+            }),
         ];
 
         let base = Epoch::of(Config::default()).expect("the configuration resolves");
@@ -805,6 +835,12 @@ mod tests {
                 "{what} builds a new epoch"
             );
         }
+        // Switched on, the capability needs the storage a new epoch lays out.
+        let mut uncached = Config::default();
+        uncached.kv_cache_config.prefix_caching = false;
+        uncached.kv_cache_config.host_tier = false;
+        let uncached = Epoch::of(uncached).expect("the configuration resolves");
+        assert_eq!(change(&uncached, &base), Change::Epoch, "switching on");
         for (what, edit) in &package {
             let next = Epoch::of(set(*edit)).expect("the configuration resolves");
             assert_eq!(

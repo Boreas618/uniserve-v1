@@ -369,6 +369,7 @@ impl Member {
             kernels: step.kernels,
             policy: step.policy,
             revision: step.revision,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: BatchShape::decode(1, Variant::ExpertJoin),
             requests: Vec::new(),
             columns: Columns::default(),

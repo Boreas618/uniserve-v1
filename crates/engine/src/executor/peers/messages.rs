@@ -298,6 +298,11 @@ pub enum RankOperation {
     LoadAdapter { slot: u32, path: PathBuf },
     /// Releases `slot`'s adapter. Answers [`RankReports::Adapters`].
     UnloadAdapter { slot: u32 },
+    /// The step values of a configuration revision (`proto::config::Tuning`), which the
+    /// scheduler node relays to every peer before its own schedulers read them: the peer's
+    /// control thread takes what it reads itself (its watchdog's bound, its report period, its
+    /// comparison bound, its NVTX ranges). Answers [`RankReports::None`].
+    Tune(Box<proto::config::Tuning>),
     /// Starts a profiling session. Answers [`RankReports::ProfileStarts`].
     StartProfile(Box<SessionStart>),
     /// Ends profiling session `session` for `reason`. Answers [`RankReports::ProfileStops`].

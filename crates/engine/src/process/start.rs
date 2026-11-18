@@ -883,10 +883,20 @@ fn start_peer(
         .context("answering the scheduler node's session")?;
 
     let (prepared, preparations) = crossbeam_channel::unbounded();
-    // A peer waits for its own preparation of a generation within the epoch's comparison bound,
-    // as the scheduler node's shadow pass does.
-    let bound = launch.engine_config.worker.compare_timeout;
-    let operate = operations::operator(Arc::clone(&binding), workers.clone(), preparations, bound);
+    // A peer runs no scheduler: its step values are the launch's until the scheduler node relays
+    // a revision's, which its control thread takes (its watchdog's bound, its report period, its
+    // NVTX ranges); it waits for its own preparation of a generation within their comparison
+    // bound, as the scheduler node's shadow pass does.
+    let tuning = Arc::new(ArcSwap::from_pointee(Tuning::of(
+        &launch.engine_config,
+        launch.revision,
+    )));
+    let operate = operations::operator(
+        Arc::clone(&binding),
+        workers.clone(),
+        preparations,
+        Arc::clone(&tuning),
+    );
     let upstream = Upstream::serve(channel, Arc::clone(&route), Arc::clone(&liveness), operate)?;
 
     let hosts = Mutex::new(hosts);
@@ -901,11 +911,7 @@ fn start_peer(
         limits: launch.engine_config.model.generation_limits.clone(),
         capacities,
         ceilings,
-        // A peer runs no scheduler: its step values are the launch's and go nowhere.
-        tuning: Arc::new(ArcSwap::from_pointee(Tuning::of(
-            &launch.engine_config,
-            launch.revision,
-        ))),
+        tuning,
         // A peer runs no scheduler: the scheduler node serves the deployment's requests within
         // its ranks' slots, and the peer states the launch's bound.
         max_running_requests: launch.engine_config.max_running_requests.get(),

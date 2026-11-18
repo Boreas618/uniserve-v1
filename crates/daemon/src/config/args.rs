@@ -420,6 +420,28 @@ mod tests {
         }
     }
 
+    /// A change of the deployment groups' queue depths alone takes effect at the next step, and
+    /// reaches the engines' step values by group; any other change of the groups is an epoch's.
+    #[test]
+    fn a_groups_queue_depth_takes_effect_at_the_next_step() {
+        let groups = |depth: usize, ranks: &str| {
+            package(&format!(
+                "[[worker_groups]]\nid = \"model\"\nranks = [\"{ranks}\"]\nqueue_depth = {depth}\n\
+                 [worker_groups.blocks.model]\ntensor_parallel_size = 2\n"
+            ))
+        };
+        let (served, _) = lowered(&groups(2, "cuda:0-1")).unwrap();
+        let (deeper, engine) = lowered(&groups(4, "cuda:0-1")).unwrap();
+        let (moved, _) = lowered(&groups(2, "cuda:2-3")).unwrap();
+        let effect = |target: &Config| {
+            proto::reload::Effects::of(&proto::reload::changes(Some(&served), target)).heaviest()
+        };
+        assert_eq!(effect(&deeper), Some(proto::reload::Effect::Step));
+        assert_eq!(effect(&moved), Some(proto::reload::Effect::Epoch));
+        let tuning = proto::config::Tuning::of(&engine, 3);
+        assert_eq!(tuning.queue_depths["model"].get(), 4);
+    }
+
     /// The precision policy, expert parallelism, prefix caching and the scheduler budgets reach
     /// the engine configuration as stated, and unstated budgets stay unstated for the engine to
     /// default.

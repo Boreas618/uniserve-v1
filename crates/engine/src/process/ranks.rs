@@ -3920,8 +3920,6 @@ pub(crate) fn spawn(
             tables,
             Arc::clone(group_sequences),
             *place,
-            // The epoch's one budget, so that every worker of a group starts the same copies.
-            rank.model_runner.engine_config().worker.copy_budget,
         )?;
         workers.push(Arc::new(worker));
     }

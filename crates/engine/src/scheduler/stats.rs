@@ -460,6 +460,7 @@ mod tests {
             kernels: 0,
             policy: 0,
             revision: 0,
+            copy_budget: proto::config::DEFAULT_COPY_BUDGET,
             shape: Shape {
                 rows: calls.len() as u32,
                 tokens: columns.input_ids.len() as u32,

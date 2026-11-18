@@ -1085,12 +1085,30 @@ impl Node {
             }
         };
         let package = current.package.clone();
+        // A control program steps on a blocking thread, which waits here while the engines
+        // measure what a kernel generation would take of their devices.
+        let measuring = Arc::clone(leader);
+        let measure: crate::programs::Measure = Arc::new(move |target| {
+            let rooms = tokio::runtime::Handle::current()
+                .block_on(measuring.rooms(target))
+                .map_err(|error| format!("{:#}", anyhow::Error::from(error)))?;
+            Ok(rooms
+                .into_iter()
+                .map(|room| program::Room {
+                    gpu: room.gpu.iter().map(|byte| format!("{byte:02x}")).collect(),
+                    extra_bytes: room.extra,
+                    room_bytes: room.room,
+                    kv_pages: room.kv_units,
+                })
+                .collect())
+        });
         let programs = Arc::new(Programs::new(
             self.recorder.store().clone(),
             states,
             current,
             outputs,
             Arc::clone(leader.router()),
+            measure,
         ));
         tokio::spawn(Arc::clone(&self).start_programs(
             Arc::clone(leader),
@@ -1230,7 +1248,7 @@ impl Node {
             let json = serde_json::to_value(&merged)
                 .map_err(|error| format!("the output has no JSON form: {error}"))?;
             // Refused by the validation a start runs, the output writes no revision.
-            crate::programs::validate(&current_state, &program::Config(json))?;
+            crate::programs::validate(&current_state, &program::Config(json), None)?;
             let package = Package::of(merged, stored.package.programs.clone())
                 .map_err(|error| format!("{error:#}"))?;
             match self.apply(package, &output.writer, current, false).await {

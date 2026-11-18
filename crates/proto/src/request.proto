@@ -388,11 +388,17 @@ message EngineCommand {
     // Replace the step values every scheduler reads from its next step on
     // (`proto::config::Tuning`); answered with no reports.
     Tune tune = 29;
+    // Measure what a generation update to the kernel packages `kernels`
+    // takes on every rank's device beside the serving graphs, and the KV
+    // units each rank's cache gives up when the device's room does not hold
+    // it; nothing is installed. Answered with `Rooms`.
+    MeasureRoom measure_room = 31;
   }
 }
 
 // The step values of configuration revision `revision`
 // (`proto::config::Tuning`); an unset value is the deployment's default.
+// The scheduler node relays them to every peer of the epoch.
 message Tune {
   uint64 id = 1;
   uint64 revision = 2;
@@ -400,6 +406,16 @@ message Tune {
   uint64 max_batch = 4;
   optional uint64 max_num_batched_tokens = 5;
   optional uint64 max_queued_requests = 6;
+  // Batches each worker group keeps in flight, by the group's id.
+  map<string, uint64> queue_depths = 7;
+  bool prefix_caching = 8;
+  bool host_tier = 9;
+  // Bytes the copies started with one batch move together over a group's ranks.
+  uint64 copy_budget = 10;
+  uint64 report_period_ms = 11;
+  uint64 watchdog_timeout_ms = 12;
+  uint64 compare_timeout_ms = 13;
+  bool nvtx_ranges = 14;
 }
 
 message CommitExperts {
@@ -542,7 +558,43 @@ message Operated {
     ProfileReleases profile_releases = 8;
     FenceSwitches fence_switches = 9;
     WeightReports weight_reports = 10;
+    Rooms rooms = 12;
   }
+}
+
+
+// The kernel packages of a generation update whose room is measured: each
+// package by its slot (the operator, the descriptor key a pin names, the
+// part of a candidate) and its fixed revision.
+message MeasureRoom {
+  uint64 id = 1;
+  repeated RoomKernel kernels = 2;
+}
+
+message RoomKernel {
+  string op = 1;
+  optional string key = 2;
+  optional string part = 3;
+  string backend = 4;
+  uint32 revision = 5;
+}
+
+// What a generation update takes on each rank's device, the scheduler
+// node's ranks first and then each peer's; none when it replaces no kernel.
+message Rooms {
+  repeated DeviceRoom devices = 1;
+}
+
+message DeviceRoom {
+  // The GPU's UUID, its sixteen bytes.
+  bytes gpu = 1;
+  // The bytes the update's graphs and rehearsals take beside what serves.
+  uint64 extra = 2;
+  // What the device holds of them now.
+  uint64 room = 3;
+  // The KV units the rank's cache demotes and gives back while the update
+  // holds both generations' graphs; zero when the room holds them.
+  uint64 kv_units = 4;
 }
 
 // Each rank's prepared allocation for a new expert order, in rank order.

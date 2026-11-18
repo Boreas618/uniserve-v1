@@ -22,11 +22,73 @@
 //! promotion included.
 
 use crossbeam_channel::Sender;
+use scheduling::ids::PageId;
 use storage::runtime;
 
 use super::Scheduler;
+use super::cache::HOST;
 
 impl Scheduler {
+    /// `Message::Demote`: the cached blocks of region `region` (by number) a shrink to `units`
+    /// evicts, in the eviction order this scheduler installs, beyond the units the region has
+    /// free, and of those the blocks with no host copy are offered to the host tier
+    /// (`Scheduler::offload`, which skips a block its class or the step's values give no host
+    /// tier). `reply` is answered with the blocks offered once every store they started ended
+    /// ([`Scheduler::answer_demotions`]); a region the session does not name demotes nothing.
+    pub(super) fn demote(&mut self, region: u8, units: u32, reply: Sender<u32>) {
+        let Some(index) = self.region_index(region) else {
+            let _ = reply.send(0);
+            return;
+        };
+        let held = self.capacity.get(index).copied().unwrap_or(0);
+        let free = self.available.get(index).copied().unwrap_or(0);
+        let wanted = held.saturating_sub(units).saturating_sub(free);
+
+        let mut freed = 0u32;
+        let mut pages = Vec::new();
+        for &(_, id) in self.order.get(index).into_iter().flatten() {
+            if freed >= wanted {
+                break;
+            }
+            let Some(row) = self.cache.get(&id) else {
+                continue;
+            };
+            freed = freed.saturating_add(self.class_units(row.class, index));
+            if row.tiers & HOST == 0 {
+                pages.push((PageId(id), row.key));
+            }
+        }
+        let ids: Vec<PageId> = pages.iter().map(|(page, _)| *page).collect();
+        self.offload(&ids);
+
+        // The demotion waits for the stores it started, of the keys now stored or storing.
+        let storing = self.host_stores();
+        let keys = pages
+            .into_iter()
+            .map(|(_, key)| key)
+            .filter(|key| storing.contains(key))
+            .collect::<std::collections::HashSet<_>>();
+        let demoted = u32::try_from(keys.len()).unwrap_or(u32::MAX);
+        self.demoting.push((keys, demoted, reply));
+        self.answer_demotions();
+    }
+
+    /// Answers each `Message::Demote` whose stores all ended.
+    pub(super) fn answer_demotions(&mut self) {
+        if self.demoting.is_empty() {
+            return;
+        }
+        let storing = self.host_stores();
+        let (ended, owed): (Vec<_>, Vec<_>) = std::mem::take(&mut self.demoting)
+            .into_iter()
+            .partition(|(keys, _, _)| keys.is_disjoint(&storing));
+        self.demoting = owed;
+        // A requester that stopped waiting needs no reply.
+        for (_, demoted, reply) in ended {
+            let _ = reply.send(demoted);
+        }
+    }
+
     /// `Message::Resize`: `Resize { region, units }` at the buffer pool, whose `Resized` answers
     /// `reply` with the units the region reached. From here on the region holds at most `units`,
     /// whatever this shrink reaches.
