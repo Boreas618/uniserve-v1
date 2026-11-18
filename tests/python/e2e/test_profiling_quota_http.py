@@ -9,8 +9,9 @@ rank's process item reserves the pass while the session runs, and the region
 grows back into new segments once it ends. A pass that even every segment
 past the first cannot make room for is refused, naming its bytes.
 
-A pass's device storage is what its worker measures when the session starts
-(``docs/profiling.md``, Range profiler passes), which the session's
+A pass's device storage is what its worker measures when the session starts,
+in the device storage the quota leaves free (``docs/profiling.md``, Range
+profiler passes), which the session's
 ``profile`` event reports (``workers``' ``device_storage``); the quota is
 what the leader states of it each second (``uniserve_gpu_quota_bytes``,
 ``uniserve_gpu_reserved_bytes``).
@@ -40,13 +41,26 @@ pytestmark = [
 DEFAULT_RANGES = 512
 
 
+#: The deployment's share of its GPU (``mem_fraction_static``). A worker
+#: measures a pass in the device storage the quota leaves free, so a pass
+#: larger than every segment of the cache is measured, and refused by its
+#: bytes, only where the device's storage outside the quota exceeds the
+#: cache: a share `f` of a device of `T` bytes holding `W` bytes of weights
+#: needs ``f * T - W < (1 - f) * T``. Qwen3's 61 GB of weights on GB200's
+#: 199 GB need a share below 0.65; at the default 0.7 the pass's first start
+#: finds too little free storage and CUPTI refuses the collector instead.
+SHARE = 0.5
+
+
 @pytest.fixture(scope="module")
 def served(module_deployments: Deployments) -> Iterator[Server]:
-    """A Qwen3 deployment whose KV cache is sized by its GPU's quota: no
-    ``kv_cache_config.max_tokens``, so the KV region takes the quota's rest
-    beside the graph pool the profile run sized.
+    """A Qwen3 deployment whose KV cache is sized by its GPU's quota of
+    :data:`SHARE`: no ``kv_cache_config.max_tokens``, so the KV region takes
+    the quota's rest beside the graph pool the profile run sized.
     """  # noqa: D205
-    with profiling.serve(module_deployments, {}) as server:
+    with profiling.serve(
+        module_deployments, {"mem_fraction_static": SHARE}
+    ) as server:
         yield server
 
 
