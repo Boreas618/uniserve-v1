@@ -207,7 +207,7 @@ def test_a_sparse_module_matches_the_operators_definition(
     counts = torch.full(
         (HEADS, TILES), SELECTED, dtype=torch.int32, device=torch_device
     )
-    counts[:, 0, 0] = 1
+    counts[:, 0] = 1
     valid = torch.full(
         (key_blocks,), block, dtype=torch.int32, device=torch_device
     )
