@@ -691,6 +691,12 @@ impl Node {
         } = brought;
         let name = leader.served_model_name().to_string();
         let programs = Arc::clone(&self).run_programs(&leader);
+        // The deployment's registration in Dynamo, when its package states one.
+        let sidecar = crate::sidecar::Sidecar::start(
+            &config.dynamo_config,
+            Arc::clone(&leader),
+            Arc::clone(&programs),
+        );
         let daemon = Arc::new(Mutex::new(daemon));
         let (listener, descriptors) = {
             let held = service::lock(&self.listener);
@@ -788,8 +794,11 @@ impl Node {
         }
         let handed_over = restarter.handoff_sent.load(Ordering::Acquire);
         let ended = finish(&self.deployment, &leader, daemon, handed_over).await;
-        // The programs end with their states saved, which a successor's or the next start's
-        // instances restore.
+        // Dynamo reaches the deployment's workers no more, and the programs end with their
+        // states saved, which a successor's or the next start's instances restore.
+        if let Some(sidecar) = sidecar {
+            sidecar.stop().await;
+        }
         programs.stop().await;
         match &ended {
             // A successor's store records what the deployment does from now on.

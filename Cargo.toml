@@ -247,6 +247,10 @@ tokio = { version = "1.47.1", features = [
     "time",
 ] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
+# The BLAKE3 checksums a Dynamo model card states of the checkpoint's files (`daemon::sidecar`).
+blake3 = "1.8.7"
+# XXH3, the hash Dynamo's router keys a KV page's tokens by (`daemon::sidecar`).
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # ZeroMQ in Rust: the PUB and ROUTER sockets the schedulers publish their KV events from in
 # SGLang's format (`engine::scheduler::events`), and the SUB sockets that read them.
 zeromq = { version = "0.7.0", default-features = false, features = ["tokio-runtime", "tcp-transport"] }

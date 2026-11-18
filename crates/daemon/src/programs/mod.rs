@@ -152,6 +152,17 @@ impl Programs {
         self.ended.clone()
     }
 
+    /// The revision that serves from now on, as each change replaces it.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<Current>> {
+        self.current.subscribe()
+    }
+
+    /// Where a writer beside the programs hands its outputs to the node's apply, as a control
+    /// program's are (the Dynamo sidecar's, `crate::sidecar`).
+    pub(crate) fn writer(&self) -> mpsc::UnboundedSender<Output> {
+        self.outputs.clone()
+    }
+
     /// The KV program among `loaded`, as the leader hands it to every node's Storage Server;
     /// `None` when the package runs none.
     pub(crate) fn kv(loaded: &[Loaded]) -> Option<KvSetup> {

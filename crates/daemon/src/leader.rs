@@ -456,12 +456,20 @@ impl Leader {
             let Some(client) = replica.hold.client() else {
                 continue;
             };
+            // Each scheduler is the replica `replicas.<id>` names by its number, of the role
+            // stated there.
+            let roles = service::lock(&replica.config).replicas.clone();
             for (scheduler, running) in client.in_flight_by_scheduler().into_iter().enumerate() {
                 let scheduler = u32::try_from(scheduler).unwrap_or(u32::MAX);
                 schedulers.push((index, scheduler));
+                let number = u32::try_from(replica.ordinal).unwrap_or(u32::MAX) + scheduler;
+                let id = number.to_string();
+                let role = roles
+                    .get(&id)
+                    .map_or(scheduling::routing::Role::Mixed, |stated| stated.role);
                 views.push(scheduling::routing::Replica {
-                    id: format!("{}.{scheduler}", replica.ordinal),
-                    role: scheduling::routing::Role::Mixed,
+                    id,
+                    role,
                     queued: 0,
                     remaining: scheduling::time::Duration(0),
                     running,
@@ -1505,6 +1513,78 @@ impl Leader {
             scheduler,
         };
         Ok((events, placement))
+    }
+}
+
+/// A scheduler of a serving replica, numbered across the deployment: scheduler `s` of replica
+/// `r` is the deployment's scheduler `r + s` (an engine of several schedulers is the
+/// deployment's one replica), the number `replicas.<id>` and `kv_events_config` name it by.
+pub(crate) struct Numbered {
+    pub(crate) number: u32,
+    pub(crate) replica: Arc<Replica>,
+    pub(crate) scheduler: u32,
+    /// The configuration its engine serves with: its arguments', or the one its options
+    /// resolve to for an engine the daemon started with none.
+    pub(crate) engine: Option<proto::config::EngineConfig>,
+    /// What its engine reported it serves.
+    pub(crate) info: Option<crate::engine::client::EngineInfo>,
+}
+
+impl Leader {
+    /// Every scheduler of the replicas that serve, in the order of their numbers.
+    pub(crate) fn numbered(&self) -> Vec<Numbered> {
+        let mut numbered = Vec::new();
+        for replica in self.replicas() {
+            let Some(client) = replica.hold.client().filter(|_| replica.hold.is_serving()) else {
+                continue;
+            };
+            let served = service::lock(&replica.served)
+                .as_ref()
+                .map(|args| args.engine_config.clone());
+            let engine = served.or_else(|| service::lock(&replica.config).engine_config().ok());
+            let info = client.info().clone();
+            for scheduler in 0..info.schedulers.max(1) {
+                numbered.push(Numbered {
+                    number: u32::try_from(replica.ordinal).unwrap_or(u32::MAX) + scheduler,
+                    replica: Arc::clone(&replica),
+                    scheduler,
+                    engine: engine.clone(),
+                    info: Some(info.clone()),
+                });
+            }
+        }
+        numbered.sort_by_key(|numbered| numbered.number);
+        numbered
+    }
+
+    /// Submits `request` routed as its submitter chose, without the routing program: its prompt
+    /// to the deployment's scheduler `prefill` and its tokens to scheduler `decode`, as a
+    /// routing program's route names them. The submitter checked the replicas' roles. The
+    /// prefill's replica serves the request's whole until replicas hand a request's KV over
+    /// (`specs/tasks.md`, T32), as a route of the routing program is served.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no serving replica is scheduler `prefill`, or as [`Leader::submit`] fails.
+    pub(crate) async fn submit_routed(
+        &self,
+        request: Request,
+        prefill: u32,
+        decode: u32,
+    ) -> Result<RequestEvents, SubmitError> {
+        let serving = self.numbered();
+        let found = |number: u32| serving.iter().find(|numbered| numbered.number == number);
+        let (Some(at), Some(_)) = (found(prefill), found(decode)) else {
+            return Err(SubmitError::Unavailable(format!(
+                "no serving replica is scheduler {prefill} or {decode}"
+            )));
+        };
+        let (events, _) = at
+            .replica
+            .migrator
+            .submit(request, Some(at.scheduler))
+            .await?;
+        Ok(events)
     }
 }
 

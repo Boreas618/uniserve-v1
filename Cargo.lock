@@ -1356,6 +1356,7 @@ dependencies = [
  "asynk-strim-attr",
  "axum",
  "base64 0.22.1",
+ "blake3",
  "build-server",
  "bytes",
  "clap",
@@ -1389,12 +1390,14 @@ dependencies = [
  "prost",
  "proto",
  "reqwest",
+ "rmp-serde",
  "rustix",
  "safetensors",
  "scheduling",
  "serde",
  "serde-aux",
  "serde-json-fmt",
+ "serde_bytes",
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
@@ -1418,6 +1421,8 @@ dependencies = [
  "url",
  "uuid",
  "validator",
+ "xxhash-rust",
+ "zeromq",
 ]
 
 [[package]]
@@ -7896,6 +7901,12 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "yoke"

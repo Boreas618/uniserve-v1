@@ -99,6 +99,14 @@ tracing.workspace = true
 tracing-futures.workspace = true
 url.workspace = true
 uuid.workspace = true
+# The Dynamo sidecar (`sidecar`): the checksums its model cards state of the checkpoint's files
+# (BLAKE3), the hash Dynamo's router keys a page's tokens by (XXH3), and the ZMQ sockets it reads
+# the schedulers' KV events from and publishes Dynamo's events on.
+blake3.workspace = true
+rmp-serde.workspace = true
+serde_bytes.workspace = true
+xxhash-rust.workspace = true
+zeromq.workspace = true
 validator.workspace = true
 
 [dev-dependencies]

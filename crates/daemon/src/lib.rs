@@ -28,7 +28,9 @@
 //! - `programs`: the policy package's control and routing programs, which the leader runs in
 //!   the program host, and the KV program it hands the Storage Servers;
 //! - `restart`: the hot restart that hands a deployment to a successor
-//!   daemon.
+//!   daemon;
+//! - `sidecar`: the deployment's registration in Dynamo, whose frontends and planner reach
+//!   its replicas as workers.
 
 pub mod api;
 pub mod config;
@@ -46,6 +48,7 @@ pub mod policy;
 pub mod profiling;
 pub(crate) mod programs;
 pub mod restart;
+pub(crate) mod sidecar;
 pub mod standby;
 pub(crate) mod status;
 pub mod supervision;

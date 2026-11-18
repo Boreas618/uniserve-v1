@@ -152,6 +152,8 @@ impl Config {
             kv_events_config: Of(Kind::Chat),
             logging_config: Every,
             export_config: Every,
+            dynamo_config: Of(Kind::Chat),
+            replicas: Of(Kind::Chat),
             chat_config: Of(Kind::Chat),
             image_fetch_config: Of(Kind::Chat),
             video_config: Of(Kind::Video),
@@ -402,6 +404,9 @@ pub struct Config {
     pub logging_config: LoggingConfig,
     #[reload(daemon)]
     pub export_config: ExportConfig,
+    /// The Dynamo sidecar of the leader daemon (`dynamo_config`).
+    #[reload(daemon)]
+    pub dynamo_config: DynamoConfig,
     #[reload(daemon)]
     pub chat_config: ChatConfig,
     #[reload(daemon)]
@@ -446,6 +451,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[reload(step)]
     pub adapters: std::collections::BTreeMap<String, String>,
+    /// Each replica's options, by its id (`[replicas.<id>]`): its role, which decides which
+    /// requests it takes and which a change sets from the next request on.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[reload(step)]
+    pub replicas: std::collections::BTreeMap<String, ReplicaConfig>,
 }
 
 impl Default for Config {
@@ -490,6 +500,7 @@ impl Default for Config {
             kv_events_config: proto::config::KvEventsConfig::default(),
             logging_config: LoggingConfig::default(),
             export_config: ExportConfig::default(),
+            dynamo_config: DynamoConfig::default(),
             chat_config: ChatConfig::default(),
             image_fetch_config: ImageFetchConfig::default(),
             video_config: VideoConfig::default(),
@@ -501,6 +512,7 @@ impl Default for Config {
             flush: 0,
             retire: false,
             adapters: std::collections::BTreeMap::new(),
+            replicas: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -565,6 +577,75 @@ impl Default for ExportConfig {
             period: EXPORT_PERIOD,
         }
     }
+}
+
+/// The Dynamo sidecar (`dynamo_config`): the leader daemon registers the deployment in Dynamo,
+/// as Dynamo's sidecars register an engine that serves on its own, over Dynamo's default
+/// planes: etcd discovery, the TCP request plane and the ZMQ event plane
+/// (`crate::sidecar`). With no `etcd`, the deployment is no Dynamo worker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DynamoConfig {
+    /// The etcd the workers register in and the planner's decisions are read from, as the base
+    /// URL of its JSON gateway (`http://etcd:2379`, Dynamo's `ETCD_ENDPOINTS`).
+    pub etcd: Option<String>,
+    /// The Dynamo namespace the workers register in (`DYN_NAMESPACE`).
+    pub namespace: String,
+    /// What a worker is: each replica, or the whole deployment.
+    pub workers: Workers,
+    /// The host the frontends reach the sidecar's request plane and its event publishers at;
+    /// the leader's host name when unset.
+    pub host: Option<String>,
+    /// The TCP port of the request plane, on every interface; 0, the default, picks a free one.
+    pub port: u16,
+    /// The time to live of each worker's etcd lease, which the sidecar renews at a third of it
+    /// (Dynamo's `ETCD_LEASE_TTL`).
+    #[serde(with = "values::duration")]
+    pub lease_ttl: Duration,
+    /// How often the sidecar reads the planner's decision and publishes the workers' loads.
+    #[serde(with = "values::duration")]
+    pub period: Duration,
+}
+
+impl Default for DynamoConfig {
+    fn default() -> Self {
+        Self {
+            etcd: None,
+            namespace: "dynamo".to_owned(),
+            workers: Workers::Replicas,
+            host: None,
+            port: 0,
+            lease_ttl: Duration::from_secs(30),
+            period: Duration::from_secs(1),
+        }
+    }
+}
+
+/// What a Dynamo worker of the deployment is (`dynamo_config.workers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Workers {
+    /// Each replica is a worker of its role (`replicas.<id>.role`), which a frontend pairs and
+    /// routes to itself, and which the planner's decisions set.
+    Replicas,
+    /// The deployment is one aggregated worker, whose data-parallel ranks are its replicas; its
+    /// routing program chooses within it.
+    Deployment,
+}
+
+/// One replica's options (`[replicas.<id>]`), the replica being the deployment's scheduler
+/// `<id>`: its schedulers numbered across its replicas in the order the worker groups state
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaConfig {
+    /// Which requests the replica takes: `prefill`, `decode` or `mixed`.
+    #[serde(default = "mixed")]
+    pub role: scheduling::routing::Role,
+}
+
+fn mixed() -> scheduling::routing::Role {
+    scheduling::routing::Role::Mixed
 }
 
 /// The default `admin_config.join`: a fixed port, since the other nodes of a deployment reach the
@@ -772,6 +853,13 @@ impl Config {
             self.states_model(),
             "the package names no model: set `model` or `model_dir` in its `config.toml`"
         );
+        // A replica is named by its scheduler's number.
+        for id in self.replicas.keys() {
+            anyhow::ensure!(
+                id.parse::<u32>().is_ok(),
+                "`replicas.{id}` names no replica: a replica's id is its scheduler's number"
+            );
+        }
         // Every scheduler binds the KV events' endpoints offset by its number from the first's.
         let events = &self.kv_events_config;
         for (name, endpoint) in [
