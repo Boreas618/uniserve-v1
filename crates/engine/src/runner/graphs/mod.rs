@@ -942,8 +942,9 @@ impl Graphs {
     ///
     /// # Errors
     ///
-    /// A profile run that fails, a launch `next` holds no kernel for, or a forward whose peak
-    /// the runner's region cannot hold.
+    /// A profile run that fails, a launch `next` holds no kernel for (on graphs that hold no
+    /// device, one the serving generation holds a kernel for), or a forward whose peak the
+    /// runner's region cannot hold.
     pub fn examine(
         &self,
         runner: &dyn Forward,
@@ -954,10 +955,14 @@ impl Graphs {
     ) -> Result<Plan> {
         let profiled = self.profile(runner, bucket)?;
 
-        // A generation must hold a kernel for every launch of the bucket: one it cannot launch
-        // is an incomplete generation, not one to switch to.
+        // A generation must hold a kernel for every launch of the bucket that it launches: on a
+        // device every launch, and for graphs that hold none, which launch nothing, every launch
+        // the serving generation holds a kernel for. One it cannot launch is an incomplete
+        // generation, not one to switch to.
         for (operator, key, _) in &profiled {
-            if *operator != BREAK && !next.contains(operator, key) {
+            let launched = self.device.is_some()
+                || serving.is_some_and(|serving| serving.contains(operator, key));
+            if *operator != BREAK && launched && !next.contains(operator, key) {
                 return Err(Error::Interface(format!(
                     "generation {} holds no kernel of `{operator}` for `{key}`, which bucket \
                      {bucket} launches",
