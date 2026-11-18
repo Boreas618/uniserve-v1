@@ -998,19 +998,27 @@ mod tests {
         }
     }
 
-    /// Every deployment the repository publishes for `--worker-groups` places and validates with
-    /// each host it names as the engine's, as the node of that host reads it, and places no rank
+    /// Every deployment the repository publishes (`configs/*/*`, policy packages) places and
+    /// validates with each host it names as the engine's, as the node of that host reads it, and places no rank
     /// on a CPU, which a node refuses: a main process serves CUDA devices.
     #[test]
     fn published_deployments_place() {
         let root = std::path::Path::new(crate::WORKSPACE).join("configs");
         let mut files = 0;
         for model in std::fs::read_dir(&root).unwrap() {
+            // Each published deployment is a policy package, whose `config.toml` states its
+            // layout.
             for entry in std::fs::read_dir(model.unwrap().path()).unwrap() {
-                let path = entry.unwrap().path();
+                let path = entry.unwrap().path().join("config.toml");
                 let text = std::fs::read_to_string(&path).unwrap();
+                // The package's layout is its configuration's `[[worker_groups]]` tables.
+                let mut config: toml::Table = toml::from_str(&text).unwrap();
+                let stated: Vec<WorkerGroupConfig> = config
+                    .remove("worker_groups")
+                    .map(|groups| groups.try_into().unwrap())
+                    .unwrap_or_default();
                 let place = |host: &str| {
-                    WorkerGroupConfig::parse_file(&text, host).unwrap_or_else(|error| {
+                    WorkerGroupConfig::place(stated.clone(), host).unwrap_or_else(|error| {
                         panic!("{} does not place on {host}: {error:#}", path.display())
                     })
                 };
