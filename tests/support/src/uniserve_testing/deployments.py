@@ -7,12 +7,14 @@ for a :class:`Deployments`, which writes each deployment's policy package
 
 - on the GPUs the case leases, which the daemon sees as ``cuda:0`` onwards
   (CUDA's device visibility, stated in its environment);
-- at the run's Build Server (``build_config``), which holds the tree's
-  packages;
+- with a Build Server of its own (``build_config``), which reads the run's
+  store, where the tree's packages are installed, and keeps what it compiles
+  in the run's data directory under the deployment's name
+  (:func:`uniserve_testing.builds.deployment_config`);
 - under a runtime directory of its own (``XDG_RUNTIME_DIR``, which the
-  caller of a UniServe server creates and names), where its daemon starts a
-  Storage Server that serves this deployment alone and that the case stops
-  when the deployment ends;
+  caller of a UniServe server creates and names), where its daemon starts
+  the deployment's Storage Server and Build Server, which serve this
+  deployment alone and which the case stops when the deployment ends;
 - with the persistent state of its deployments (``XDG_STATE_HOME``, which
   holds each deployment's revisions under the package directory's name) in
   the case's directory, so that no case starts from a revision another case
@@ -26,13 +28,17 @@ The daemon binds port 0 and reports what it bound in its readiness record
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import fcntl
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -47,7 +53,6 @@ from uniserve_testing.servers import (
     Server,
     environment,
     launch,
-    socket_path,
 )
 
 #: The host tier a deployment holds unless its case sizes it, in GiB: every
@@ -115,36 +120,71 @@ def two_hosts(host: RemoteHost) -> dict[str, Any]:
     }
 
 
+#: How long a deployment's Build Server may take to end once it was sent
+#: SIGTERM, in seconds: it ends its builds' compiler processes.
+BUILD_SERVER_STOP_S = 60.0
+
+
 @contextmanager
 def runtime_directory(
     uniserve: Path, kept: Path | None = None
 ) -> Iterator[Path]:
     """A runtime directory (``XDG_RUNTIME_DIR``) of the caller's own, whose
-    Storage Server is stopped when the block ends.
+    deployments' servers are stopped when the block ends.
 
-    A daemon started under it starts its host's Storage Server there, which
-    outlives the daemon with the deployment's host and device storage; the
-    block's end stops it, keeps the logs it wrote beside its socket in the
-    directory `kept` when one is named, and removes the runtime directory. A
-    Unix socket's path holds at most 107 bytes, so the directory lies in the
-    system's temporary directory.
+    A daemon started under it starts its deployment's Storage Server and
+    Build Server there, which outlive the daemon; the block's end stops them
+    (:func:`stop_deployment_servers`), keeps the logs they wrote beside their
+    sockets in the directory `kept` when one is named, and removes the
+    runtime directory. A Unix socket's path holds at most 107 bytes, so the
+    directory lies in the system's temporary directory.
     """  # noqa: D205
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     try:
         yield runtime
     finally:
-        stop_storage_server(uniserve, runtime, kept)
+        stop_deployment_servers(uniserve, runtime, kept)
         shutil.rmtree(runtime, ignore_errors=True)
 
 
-def storage_status(uniserve: Path, runtime: Path) -> dict | None:
-    """The readiness record of the Storage Server serving under the runtime
+def deployments_under(runtime: Path) -> list[str]:
+    """The deployments whose servers keep their sockets under the runtime
+    directory `runtime`, by name.
+    """  # noqa: D205
+    directory = runtime / "uniserve" / "deployments"
+    if not directory.is_dir():
+        return []
+    return sorted(entry.name for entry in directory.iterdir() if entry.is_dir())
+
+
+def storage_socket(runtime: Path, deployment: str | None = None) -> Path:
+    """The socket of the Storage Server of `deployment` under the runtime
+    directory `runtime`, or of its one deployment when unnamed.
+    """  # noqa: D205
+    if deployment is None:
+        (deployment,) = deployments_under(runtime)
+    return builds.deployment_socket(runtime, deployment, "storage-server")
+
+
+def storage_status(
+    uniserve: Path, runtime: Path, deployment: str | None = None
+) -> dict | None:
+    """The readiness record of the Storage Server of `deployment` (the one
+    deployment under `runtime` when unnamed) serving under the runtime
     directory `runtime` (``storage-server status``), or ``None`` when none
     serves there.
     """  # noqa: D205
+    if deployment is None and len(deployments_under(runtime)) != 1:
+        return None
     answered = subprocess.run(
-        [str(uniserve), "storage-server", "status"],
-        env=environment(XDG_RUNTIME_DIR=str(runtime)),
+        [
+            str(uniserve),
+            "storage-server",
+            "status",
+            "--socket",
+            str(storage_socket(runtime, deployment)),
+        ],
+        env=environment(),
         capture_output=True,
         text=True,
         check=False,
@@ -154,28 +194,55 @@ def storage_status(uniserve: Path, runtime: Path) -> dict | None:
     return json.loads(answered.stdout)
 
 
-def stop_storage_server(
+def stop_deployment_servers(
     uniserve: Path, runtime: Path, kept: Path | None = None
 ) -> None:
-    """Stop the Storage Server serving under `runtime`, if one serves, with
-    its ``stop`` request, which returns once it ended; keep the logs beside
-    its socket in `kept` when one is named.
+    """Stop the servers of every deployment under `runtime` and keep the
+    logs beside their sockets in `kept` when one is named.
+
+    A Storage Server stops on its ``stop`` request, which returns once it
+    ended. A Build Server has no stop request: it ends on SIGTERM, and it
+    holds the lock beside its socket for its life, so taking the lock waits
+    until it ended, before its package root and its directory go.
     """  # noqa: D205
-    record = storage_status(uniserve, runtime)
-    if record is None:
-        return
-    subprocess.run(
-        [str(uniserve), "storage-server", "stop"],
-        env=environment(XDG_RUNTIME_DIR=str(runtime)),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    if kept is not None:
-        kept.mkdir(parents=True, exist_ok=True)
-        directory = socket_path(record["endpoints"]["storage"]).parent
-        for log in directory.glob("*.log"):
-            shutil.copy(log, kept / log.name)
+    for deployment in deployments_under(runtime):
+        if storage_status(uniserve, runtime, deployment) is not None:
+            subprocess.run(
+                [
+                    str(uniserve),
+                    "storage-server",
+                    "stop",
+                    "--socket",
+                    str(storage_socket(runtime, deployment)),
+                ],
+                env=environment(),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        build = builds.deployment_socket(runtime, deployment, builds.SERVICE)
+        ready = build.with_suffix(".ready")
+        if ready.exists():
+            pid = json.loads(ready.read_text())["pid"]
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+            with build.with_suffix(".lock").open("a") as lock:
+                deadline = time.monotonic() + BUILD_SERVER_STOP_S
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() > deadline:
+                            with contextlib.suppress(ProcessLookupError):
+                                os.kill(pid, signal.SIGKILL)
+                            fcntl.flock(lock, fcntl.LOCK_EX)
+                            break
+                        time.sleep(0.1)
+        if kept is not None:
+            kept.mkdir(parents=True, exist_ok=True)
+            for log in build.parent.glob("*.log"):
+                shutil.copy(log, kept / log.name)
 
 
 class Deployments:
@@ -210,20 +277,18 @@ class Deployments:
         )
         return merged(engine, self.settings.config)
 
-    def config(
-        self, config: Config, build_settings: Mapping[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """The ``config.toml`` of a deployment of the run whose own options
-        are `config`: its host's Build Server, stated by the settings
-        `build_settings` (the run's server's by default,
-        :func:`uniserve_testing.builds.build_config`), and the run's
+    def config(self, name: str, config: Config) -> dict[str, Any]:
+        """The ``config.toml`` of the deployment `name` of the run whose own
+        options are `config`: its Build Server over the run's store, with a
+        package root of the case's own
+        (:func:`uniserve_testing.builds.deployment_config`), and the run's
         :meth:`run_config` over `config`.
         """  # noqa: D205
-        if build_settings is None and self.build_server is not None:
-            build_settings = self.build_server.settings
         build = (
-            builds.build_config(build_settings)
-            if build_settings is not None
+            builds.deployment_config(
+                self.build_server, self.directory / f"{name}.packages"
+            )
+            if self.build_server is not None
             else {}
         )
         return merged(config, build, self.run_config())
@@ -233,16 +298,22 @@ class Deployments:
         `config` (:meth:`config`) into the case's directory; its directory,
         whose name is the deployment's.
         """  # noqa: D205
-        return packages.write(self.directory / name, self.config(config))
+        return packages.write(self.directory / name, self.config(name, config))
 
     def environment(self, runtime: Path) -> dict[str, str]:
         """The environment of a daemon under the runtime directory
-        `runtime`: on the leased GPUs, with the case's own state directory.
+        `runtime`: on the leased GPUs, with the case's own state directory,
+        and with the run's data directory for deployments
+        (:attr:`uniserve_testing.builds.BuildServer.data`), where each
+        deployment's Build Server keeps its modules under its name.
         """  # noqa: D205
         declared = {
             "XDG_RUNTIME_DIR": str(runtime),
             "XDG_STATE_HOME": str(self.directory / "state"),
         }
+        if self.build_server is not None and self.build_server.data is not None:
+            declared["XDG_DATA_HOME"] = str(self.build_server.data / "data")
+            declared["XDG_CACHE_HOME"] = str(self.build_server.data / "cache")
         if self.lease is not None:
             declared["CUDA_VISIBLE_DEVICES"] = self.lease.visible
         return environment(**declared)
@@ -309,6 +380,10 @@ class Deployments:
             server.package = package
             owned.callback(server.stop)
             server.wait("serving" if serving else "listening", timeout_s)
+            # The deployment's Build Server, which its daemon started before
+            # its engines: where a case installs a revision the deployment
+            # selects next.
+            server.build_server = BuildServer.of(self.uniserve, runtime, name)
             yield server
 
     def calibration(self, *, reads: bool = False) -> Path:
@@ -360,9 +435,10 @@ class Deployments:
         when stated), which this waits for before the block begins. Each
         host resolves the other's name (``docs/testing.md``, Two hosts).
 
-        The second host serves the leader's package with its own Build
-        Server (:func:`remote_build_server`) as ``build_config``, in a
-        package directory of the same name, so the deployment is the same
+        The second host serves the leader's package, with the deployment's
+        Build Server of that host its daemon starts from the repository's
+        packages as ``build_config``, in a package directory of the same
+        name, so the deployment is the same
         on both hosts. Its daemon runs on `devices` of the host (all of its
         GPUs without them) under a runtime directory of its own there,
         which also holds its state directory. A deployment that names a
@@ -377,12 +453,15 @@ class Deployments:
         assert leader.package is not None, "the leader serves no package"
         with ExitStack() as owned:
             runtime = owned.enter_context(host.runtime_directory())
-            settings = owned.enter_context(
-                remote_build_server(host, repository, runtime)
-            )
-            config = merged(
-                packages.read(leader.package), builds.build_config(settings)
-            )
+            # The deployment's Build Server on the second host is that host's
+            # own, which its daemon starts: it installs the tree's packages
+            # from the repository's path, which the other host mounts at the
+            # same path, into a package root of the case's runtime directory.
+            config = packages.read(leader.package)
+            config["build_config"] = {
+                "source": str(repository),
+                "package_root": f"{runtime}/packages",
+            }
             package = f"{runtime}/{leader.package.name}"
             host.run("mkdir", "-p", package)
             host.write(f"{package}/{packages.CONFIG}", packages.text(config))
@@ -411,7 +490,9 @@ class Deployments:
                 self.directory / f"{name}.log",
                 environment=declared,
             )
-            owned.callback(stop_remote_storage_server, host, runtime)
+            owned.callback(
+                stop_remote_servers, host, runtime, leader.package.name
+            )
             try:
                 leader.wait("serving", timeout_s)
                 yield Follower(runtime=runtime)
@@ -427,54 +508,30 @@ class Deployments:
                     ) from None
 
 
-@contextmanager
-def remote_build_server(
-    host: RemoteHost, repository: Path, runtime: str
-) -> Iterator[dict]:
-    """A Build Server on `host` under its runtime directory `runtime`, with
-    the tree's packages installed, until the block ends; the settings it
-    serves with, as its readiness record states them.
-
-    A main process resolves its modules at its own host's Build Server, which
-    installs the tree's packages from its source tree, this repository's
-    path, which the other host must mount at the same path. The server starts
-    detached (``--daemon``) and its starter prints its readiness record once
-    it has installed them and serves.
+def stop_remote_servers(
+    host: RemoteHost, runtime: str, deployment: str
+) -> None:
+    """Stop the servers of the deployment `deployment` under the runtime
+    directory `runtime` of `host`: its Storage Server with its ``stop``
+    request, and its Build Server, which has no stop request, with SIGTERM,
+    waiting on the lock it holds for its life until it ended.
     """  # noqa: D205
-    started = host.run(
+    under = (
         "env",
         f"XDG_RUNTIME_DIR={runtime}",
         "uniserve",
-        "build-server",
-        "serve",
-        "--source",
-        str(repository),
-        "--package-root",
-        f"{runtime}/packages",
-        "--store-root",
-        f"{runtime}/modules",
-        "--daemon",
-        timeout_s=builds.START_S,
+        "storage-server",
     )
-    record = json.loads(started.splitlines()[-1])
-    socket = socket_path(record["endpoints"]["build"])
     try:
-        yield record["settings"]
-    finally:
-        # The Build Server has no stop request: it ends on SIGTERM, and it
-        # holds the lock beside its socket for its life, so taking the lock
-        # waits until it ended, before its directory goes.
-        host.run("kill", str(record["pid"]))
-        host.run("flock", str(socket.parent / "build-server.lock"), "true")
-
-
-def stop_remote_storage_server(host: RemoteHost, runtime: str) -> None:
-    """Stop the Storage Server serving under the runtime directory `runtime`
-    of `host`, if one serves, with its ``stop`` request.
-    """  # noqa: D205
-    under = ("env", f"XDG_RUNTIME_DIR={runtime}", "uniserve", "storage-server")
+        host.run(*under, "status", "--deployment", deployment)
+    except subprocess.CalledProcessError:
+        pass
+    else:
+        host.run(*under, "stop", "--deployment", deployment)
+    build = builds.deployment_socket(Path(runtime), deployment, builds.SERVICE)
     try:
-        host.run(*under, "status")
+        record = json.loads(host.run("cat", str(build.with_suffix(".ready"))))
     except subprocess.CalledProcessError:
         return
-    host.run(*under, "stop")
+    host.run("kill", str(record["pid"]))
+    host.run("flock", str(build.with_suffix(".lock")), "true")

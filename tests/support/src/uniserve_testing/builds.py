@@ -1,18 +1,27 @@
-"""A Build Server of a test session, through its command-line interface.
+"""The Build Servers of a test session, through their command-line interface.
 
-A deployment's epoch is resolved at its host's Build Server before its main
-processes serve, and a package's module exists nowhere else, so every test
-that serves names one, as does a kernel check that loads a built module.
-:func:`build_server` starts one over a fresh package root and store under a
-runtime directory of its own, where it binds its default socket, which its
-readiness record states (``endpoints.build``), with the repository as its
-source tree (``--source``): its Build Server environment compiles, and the
-server installs the tree's serving packages (every kernel package of the
-operator tree, the scheduling policy and the engine) before it serves. It
-builds for the architectures of this host's devices, which it reads from the
-driver itself. :class:`BuildServer` installs further packages and resolves
-modules with the ``--json`` forms of ``uniserve build-server install`` and
-``resolve``.
+A deployment's epoch is resolved at its own Build Server on its node before
+its main processes serve: the deployment's daemon starts it, and it compiles
+and keeps its modules apart from every other deployment's. A run starts one
+Build Server of its own (:func:`build_server`) over a fresh store under its
+work directory (``store/packages`` and ``store/modules``, the layout of a
+``build-server build --store`` store), with the repository as its source tree
+(``--source``): its Build Server environment compiles, and the server installs
+the tree's serving packages (every kernel package of the operator tree, the
+scheduling policy and the engine) before it serves, as a kernel check that
+loads a built module needs. Every deployment of the run reads that store as a
+read-only store (``build_config.read_only_stores``, :func:`deployment_config`),
+so its own Build Server finds the tree's packages installed and installs none
+of them again, and keeps what it compiles in the run's data directory for
+deployments (:attr:`BuildServer.data`, which holds the ``XDG_DATA_HOME``
+and ``XDG_CACHE_HOME`` of the run's daemons), under the deployment's name: the
+cases of a run that serve a deployment of one name compile its modules once,
+and deployments of other names never read them. A deployment's packages are
+its case's own (``build_config.package_root``), so a revision one case
+installs is selected by no other case. :class:`BuildServer` installs further
+packages and resolves modules with the ``--json`` forms of ``uniserve
+build-server install`` and ``resolve``, at the run's server or at a
+deployment's (:meth:`BuildServer.of`).
 """
 
 from __future__ import annotations
@@ -29,7 +38,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from uniserve_testing.servers import Server, environment, launch, socket_path
+from uniserve_testing.servers import environment, launch, socket_path
 
 #: The deployment a check's Build Server serves: a server builds for one
 #: deployment, and a check's is the only one in its runtime directory.
@@ -81,27 +90,46 @@ class Resolved:
         )
 
 
+#: The directory of a Build Server's store under its work directory, as
+#: ``build-server build --store`` lays one out: its ``packages`` and
+#: ``modules``.
+STORE = "store"
+
+
+@dataclasses.dataclass(frozen=True)
 class BuildServer:
-    """A running Build Server and the commands a test sends it."""
+    """A running Build Server and the commands a test sends it: the run's
+    (:func:`build_server`), whose `store` and `data` its deployments read and
+    write, or a deployment's (:meth:`of`).
+    """  # noqa: D205
 
-    def __init__(self, uniserve: Path, server: Server) -> None:
-        """The server `server` started with the executable `uniserve`."""
-        self.uniserve = uniserve
-        self.server = server
+    #: The executable the commands run.
+    uniserve: Path
+    #: The server's socket.
+    socket: Path
+    #: The settings it serves with, as its readiness record states them
+    #: (``build_server::command::Settings``).
+    settings: Mapping[str, Any]
+    #: The store it writes, which the run's deployments read; ``None`` for a
+    #: deployment's server.
+    store: Path | None = None
+    #: The data directory of the run's deployments, which holds the
+    #: ``XDG_DATA_HOME`` (``data``) and ``XDG_CACHE_HOME`` (``cache``) of
+    #: their daemons, where each deployment's Build Server keeps its modules
+    #: and caches under the deployment's name; ``None`` for a deployment's
+    #: server.
+    data: Path | None = None
 
-    @property
-    def socket(self) -> Path:
-        """The server's socket, as its readiness record states it."""
-        return socket_path(self.server.endpoint("build"))
-
-    @property
-    def settings(self) -> dict[str, Any]:
-        """The settings the server serves with, as its readiness record
-        states them (``build_server::command::Settings``, its socket
-        explicit): what a deployment at this server states as its
-        ``build_config`` (:func:`build_config`).
+    @classmethod
+    def of(cls, uniserve: Path, runtime: Path, deployment: str) -> BuildServer:
+        """The Build Server of the deployment `deployment` serving under the
+        runtime directory `runtime`, which its daemon started: its socket in
+        the deployment's runtime directory and the settings the readiness
+        record beside it states.
         """  # noqa: D205
-        return self.server.record["settings"]
+        socket = deployment_socket(runtime, deployment, SERVICE)
+        record = json.loads(socket.with_suffix(".ready").read_text())
+        return cls(uniserve, socket, record["settings"])
 
     def install(self, package: Path) -> Installed:
         """Install the package directory `package` and return its revision.
@@ -174,24 +202,50 @@ class BuildServer:
         return json.loads(completed.stdout)
 
 
-def build_config(settings: Mapping[str, Any]) -> dict[str, Any]:
-    """The options of a package's ``config.toml`` that state a Build
-    Server's `settings` as a deployment's ``build_config``.
+#: The server name of the Build Server: its command, and its socket's name
+#: in a deployment's runtime directory.
+SERVICE = "build-server"
 
-    The deployment states its host's Build Server, and its daemon refuses a
-    server that serves with other settings (decision D15), so a deployment
-    at a server a test started states exactly the settings that server's
-    readiness record states.
+
+def deployment_socket(runtime: Path, deployment: str, service: str) -> Path:
+    """The socket of the server `service` (``build-server`` or
+    ``storage-server``) of the deployment `deployment` under the runtime
+    directory `runtime`: its daemon starts it there, in the deployment's own
+    directory.
     """  # noqa: D205
-    return {"build_config": dict(settings)}
+    return runtime / "uniserve" / "deployments" / deployment / f"{service}.sock"
+
+
+def deployment_config(run: BuildServer, packages: Path) -> dict[str, Any]:
+    """The options of a package's ``config.toml`` that state the Build Server
+    of a deployment of the run whose server is `run`: the run's source tree,
+    targets and limits, the run's store as a read-only store beside the ones
+    the run's server reads, and `packages`, the case's own directory, as its
+    package root. Its modules are kept in its default store root, the
+    deployment's directory of the run's data directory
+    (:attr:`BuildServer.data`).
+    """  # noqa: D205
+    assert run.store is not None, "a deployment's server derives from a run's"
+    settings = {
+        key: value
+        for key, value in run.settings.items()
+        if key not in ("package_root", "store_roots", "upstream")
+    }
+    settings["read_only_stores"] = [
+        *settings.get("read_only_stores", []),
+        str(run.store),
+    ]
+    settings["package_root"] = str(packages)
+    return {"build_config": settings}
 
 
 @contextmanager
 def build_server(
     uniserve: Path, repository: Path, work: Path, *, scale: float = 1.0
 ) -> Iterator[BuildServer]:
-    """A Build Server over a fresh package root and store under `work`,
-    with `repository` as its source tree, until the block ends.
+    """A Build Server over a fresh store under `work` (:data:`STORE`), with
+    `repository` as its source tree, until the block ends; its deployments'
+    data directory is ``work/deployments``.
 
     The server serves the deployment :data:`DEPLOYMENT`, whose socket it binds
     in a runtime directory of its own, which this creates in the system's
@@ -200,9 +254,12 @@ def build_server(
     as long as the block: a revision counts from 1 in a fresh package root, so
     a store kept across runs would answer a changed package with the module
     older source built.
-    It serves once it has installed the tree's packages, so a deployment's
-    start builds what it launches and later deployments reuse it.
+    It serves once it has installed the tree's packages, which the run's
+    deployments then read from its store.
     """  # noqa: D205
+    store = work / STORE
+    data = work / "deployments"
+    data.mkdir(parents=True, exist_ok=True)
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     server = launch(
         [
@@ -214,9 +271,9 @@ def build_server(
             "--source",
             str(repository),
             "--package-root",
-            str(work / "packages"),
+            str(store / "packages"),
             "--store-root",
-            str(work / "modules"),
+            str(store / "modules"),
         ],
         work / "build-server.log",
         environment(XDG_RUNTIME_DIR=str(runtime)),
@@ -224,7 +281,13 @@ def build_server(
     )
     try:
         server.wait("serving", START_S)
-        yield BuildServer(uniserve, server)
+        yield BuildServer(
+            uniserve,
+            socket_path(server.endpoint("build")),
+            server.record["settings"],
+            store=store,
+            data=data,
+        )
     finally:
         server.stop()
         shutil.rmtree(runtime, ignore_errors=True)

@@ -72,7 +72,6 @@ import httpx
 import pytest
 from uniserve_testing import admin, chat, client, updates
 from uniserve_testing.assets import CHECKPOINTS
-from uniserve_testing.builds import BuildServer
 from uniserve_testing.deployments import HOST_CACHE_GIB, Deployments
 from uniserve_testing.packages import Config, merged
 from uniserve_testing.servers import Server
@@ -567,7 +566,6 @@ def _reused_by_the_migrated_request(
 )
 def test_an_epoch_change_continues_a_streaming_request_and_commits(
     deployments: Deployments,
-    build_server: BuildServer,
     repository: Path,
     topology: str,
 ):
@@ -580,7 +578,7 @@ def test_an_epoch_change_continues_a_streaming_request_and_commits(
         for item in EPOCH_ITEMS:
             assert _epochs_of(quotas, item) == {(serving,)}, quotas
 
-        change = updates.engine_revision(build_server, repository)
+        change = updates.engine_revision(server.build_server, repository)
         streaming = Streaming(server)
         streaming.wait_for(EARLY_TOKENS)
         _query_reported(
@@ -634,7 +632,7 @@ def test_an_epoch_change_continues_a_streaming_request_and_commits(
 
 
 def test_a_target_continues_a_request_from_its_predecessors_device_blocks(
-    deployments: Deployments, build_server: BuildServer, repository: Path
+    deployments: Deployments, repository: Path
 ):
     """A target of the same layout reads the streaming request's blocks
     where the serving epoch left them: with no host tier, every token the
@@ -644,7 +642,7 @@ def test_a_target_continues_a_request_from_its_predecessors_device_blocks(
     with _serve(
         deployments, {"kv_cache_config": {"host_tier": False}}, SHORT_TRIAL
     ) as server:
-        change = updates.engine_revision(build_server, repository)
+        change = updates.engine_revision(server.build_server, repository)
         streaming = Streaming(server)
         streaming.wait_for(EARLY_TOKENS)
         _query_reported(
@@ -720,7 +718,7 @@ def test_a_resource_change_continues_requests_with_a_smaller_cache(
 
 
 def test_a_change_of_the_engine_alone_invalidates_nothing(
-    deployments: Deployments, build_server: BuildServer, repository: Path
+    deployments: Deployments, repository: Path
 ):
     with _serve(deployments, READ_TRIAL) as server:
         serving = _executing(server)
@@ -740,7 +738,7 @@ def test_a_change_of_the_engine_alone_invalidates_nothing(
 
         # Another engine revision changes none of the weights or keys: the
         # target maps every weight the serving epoch holds.
-        change = updates.engine_revision(build_server, repository)
+        change = updates.engine_revision(server.build_server, repository)
         with _on_trial(server, change) as trial:
             weights = _epochs_of(_quotas(server, trial.began), "weights")
             assert weights == {(serving, trial.epoch)}, weights

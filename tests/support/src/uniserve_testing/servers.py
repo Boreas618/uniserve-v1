@@ -104,6 +104,10 @@ class Server:
         #: wrote it (:meth:`uniserve_testing.deployments.Deployments.serve`);
         #: ``None`` for another server.
         self.package: Path | None = None
+        #: The Build Server of a daemon's deployment, which its daemon
+        #: started (:class:`uniserve_testing.builds.BuildServer`), once the
+        #: daemon serves; ``None`` for another server.
+        self.build_server: Any = None
         self._records = records
         self._pending = b""
         self._address = address

@@ -43,6 +43,7 @@ import httpx
 
 from uniserve_testing import builds, chat
 from uniserve_testing.builds import BuildServer
+from uniserve_testing.deployments import storage_socket
 from uniserve_testing.devices import Lease
 from uniserve_testing.servers import environment
 
@@ -109,8 +110,15 @@ def listing(uniserve: Path, runtime: Path) -> dict[str, Any]:
     ``buffer_pools`` of the deployments with a session.
     """  # noqa: D205
     listed = subprocess.run(
-        [str(uniserve), "storage-server", "list", "--json"],
-        env=environment(XDG_RUNTIME_DIR=str(runtime)),
+        [
+            str(uniserve),
+            "storage-server",
+            "list",
+            "--json",
+            "--socket",
+            str(storage_socket(runtime)),
+        ],
+        env=environment(),
         capture_output=True,
         text=True,
         check=True,

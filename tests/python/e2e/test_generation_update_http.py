@@ -60,8 +60,7 @@ import httpx
 import pytest
 from uniserve_testing import admin, builds, chat, updates
 from uniserve_testing.assets import CHECKPOINTS
-from uniserve_testing.builds import BuildServer
-from uniserve_testing.deployments import Deployments, Settings
+from uniserve_testing.deployments import Deployments
 from uniserve_testing.packages import merged
 from uniserve_testing.servers import Server
 from uniserve_testing.updates import Stream
@@ -130,8 +129,9 @@ TRICKLE_S = 5
 
 @pytest.fixture(scope="module")
 def server(module_deployments: Deployments) -> Iterator[Server]:
-    """The module's deployment, beside the run's Build Server.
+    """The module's deployment, at its own Build Server.
 
+    A case installs there the revisions its next epoch selects.
     Module-scoped because the cases are one epoch history — a rebind, a
     recapture with its policy, a rollback and a refusal — each read back
     through the observation store against the same deployment's records.
@@ -148,28 +148,6 @@ def server(module_deployments: Deployments) -> Iterator[Server]:
         name="deployment",
     ) as served:
         yield served
-
-
-@pytest.fixture(scope="module")
-def build_server(
-    uniserve: Path,
-    repository: Path,
-    e2e_settings: Settings,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[BuildServer]:
-    """The module's own Build Server, with the tree's packages installed.
-
-    A revision the module installs is what every later epoch selects, so the
-    module installs its revisions at a server of its own, which no other
-    module's deployment resolves at.
-    """
-    with builds.build_server(
-        uniserve,
-        repository,
-        tmp_path_factory.mktemp("build-server"),
-        scale=e2e_settings.time_scale,
-    ) as server:
-        yield server
 
 
 def _resident(base_url: str, prompt: str) -> Stream:
@@ -382,14 +360,13 @@ def assert_no_failures(step: str, traffic: Traffic) -> None:
 
 def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
     server: Server,
-    build_server: BuildServer,
     repository: Path,
     traffic: Traffic,
     tmp_path: Path,
 ) -> None:
     package = updates.derived(repository, "rms_norm", "rebind", tmp_path)
     before = epoch_record(server)
-    revision = build_server.install(package).revision
+    revision = server.build_server.install(package).revision
 
     _update(server)
     after = epoch_record(server)
@@ -409,16 +386,15 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
 
 def test_the_recapture_swap_and_the_policy_swap_keep_serving(
     server: Server,
-    build_server: BuildServer,
     repository: Path,
     traffic: Traffic,
     tmp_path: Path,
 ) -> None:
     package = updates.derived(repository, "gemm", "recapture", tmp_path)
     before = epoch_record(server)
-    build_server.install(package)
+    server.build_server.install(package)
     # The serving policy installed again: its next revision, the same code.
-    build_server.install(repository / builds.POLICY_PACKAGE)
+    server.build_server.install(repository / builds.POLICY_PACKAGE)
 
     # The shadow compares on a step of a running request; without one the
     # preparation refuses by name and the swap below would be asserted on an
@@ -443,7 +419,6 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
 
 def test_a_rollback_restores_the_previous_generation(
     server: Server,
-    build_server: BuildServer,
     repository: Path,
     traffic: Traffic,
 ) -> None:
@@ -452,7 +427,7 @@ def test_a_rollback_restores_the_previous_generation(
     """  # noqa: D205
     before = epoch_record(server)
     # The serving policy installed again: its next revision, the same code.
-    build_server.install(repository / builds.POLICY_PACKAGE)
+    server.build_server.install(repository / builds.POLICY_PACKAGE)
 
     after_event = admin.now(server)
     with admin.changing(server, {}) as change:
@@ -492,14 +467,13 @@ def test_a_rollback_restores_the_previous_generation(
 
 def test_a_wrong_kernel_is_refused_by_shadow_execution(
     server: Server,
-    build_server: BuildServer,
     repository: Path,
     traffic: Traffic,
     tmp_path: Path,
 ) -> None:
     package = updates.derived(repository, "rms_norm", "wrong", tmp_path)
     before = epoch_record(server)
-    build_server.install(package)
+    server.build_server.install(package)
 
     # The comparison needs a request the scheduler is stepping when the
     # preparation shadows: a wrong kernel can only be refused by a comparison

@@ -50,16 +50,16 @@ from typing import Any
 
 import httpx
 import pytest
-from uniserve_testing import admin, builds, chat, packages, updates
+from uniserve_testing import admin, chat, packages, updates
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.builds import BuildServer
 from uniserve_testing.caching import cached_tokens
 from uniserve_testing.deployments import (
     HOST_CACHE_GIB,
     Deployments,
-    Settings,
     free_port,
     runtime_directory,
+    storage_socket,
     storage_status,
 )
 from uniserve_testing.devices import Lease
@@ -85,28 +85,6 @@ FAULT_TRIAL = "60s"
 
 #: The options every deployment of the module serves with.
 OPTIONS = merged(updates.PROFILE, {"update_config": {"trial": TRIAL}})
-
-
-@pytest.fixture(scope="module")
-def build_server(
-    uniserve: Path,
-    repository: Path,
-    e2e_settings: Settings,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[BuildServer]:
-    """The module's own Build Server, with the tree's packages installed.
-
-    The cases install engine revisions and a slower attention package, and
-    an installed revision is what a later epoch selects, so they install at
-    a server of their own, which no other module's deployment resolves at.
-    """
-    with builds.build_server(
-        uniserve,
-        repository,
-        tmp_path_factory.mktemp("build-server"),
-        scale=e2e_settings.time_scale,
-    ) as server:
-        yield server
 
 
 #: A change of the options that only a new epoch executes: graphs of other
@@ -652,9 +630,7 @@ def test_a_hot_restart_hands_the_deployment_to_a_successor_daemon(
         _serve(deployments, name) as server,
         updates.successors() as successors,
     ):
-        _restart_while_streaming(
-            server, name, deployments.build_server, successors
-        )
+        _restart_while_streaming(server, name, server.build_server, successors)
 
 
 def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
@@ -667,14 +643,14 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
     maps that storage.
     """  # noqa: E501
     name = "qwen3-live-restart-switch"
-    revisions = [
-        updates.engine_revision(deployments.build_server, repository)
-        for _ in range(2)
-    ]
     with (
         _serve(deployments, name) as server,
         updates.successors() as successors,
     ):
+        revisions = [
+            updates.engine_revision(server.build_server, repository)
+            for _ in range(2)
+        ]
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         _change_epoch(server, revisions[0])
         _restart(server, successors)
@@ -717,9 +693,10 @@ def _restart_while_streaming(
     # command line of its own (design 7.5).
     assert build_server is not None
     inherited = admin.policy(server).config
-    assert inherited["build_config"]["socket"] == str(build_server.socket), (
-        f"the successor did not inherit the modules' server: {inherited}"
-    )
+    assert (
+        inherited["build_config"]["package_root"]
+        == build_server.settings["package_root"]
+    ), f"the successor did not inherit the modules' server: {inherited}"
 
     # New requests are served while the old daemon finishes its streams.
     for _ in range(3):
@@ -989,8 +966,14 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
 
         stream = _streaming(server, name)
         subprocess.run(
-            [str(uniserve), "storage-server", "restart"],
-            env=environment(XDG_RUNTIME_DIR=str(runtime)),
+            [
+                str(uniserve),
+                "storage-server",
+                "restart",
+                "--socket",
+                str(storage_socket(runtime)),
+            ],
+            env=environment(),
             check=True,
             capture_output=True,
             text=True,
@@ -1303,8 +1286,8 @@ def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
     """
     name = "qwen3-live-standby-switch"
     options = merged(OPTIONS, {"worker_config": {"standby": True}})
-    revision = updates.engine_revision(deployments.build_server, repository)
     with _serve(deployments, name, options=options) as server:
+        revision = updates.engine_revision(server.build_server, repository)
         first = _wait_for_standby(server)
         _change_epoch(server, revision)
         _wait_for_standby(server, replaced=first)
@@ -1346,15 +1329,15 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
     of the second update is lost on trial, which rolls it back.
     """
     name = "qwen3-live-relaunched-storage"
-    revisions = [
-        updates.engine_revision(deployments.build_server, repository)
-        for _ in range(3)
-    ]
     options = merged(
         OPTIONS,
         {"update_config": {"previous_epoch": "weights", "trial": FAULT_TRIAL}},
     )
     with _serve(deployments, name, options=options) as server:
+        revisions = [
+            updates.engine_revision(server.build_server, repository)
+            for _ in range(3)
+        ]
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         _change_epoch(server, revisions[0])
         _lose_the_serving_engine(
@@ -1383,8 +1366,8 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
     service the client sees.
     """
     name = "qwen3-live-executable"
-    revision = updates.engine_revision(deployments.build_server, repository)
     with _serve(deployments, name) as server:
+        revision = updates.engine_revision(server.build_server, repository)
         before = _engine_pids(server)
         failed = _failed_requests(server)
         baseline = _ask(server.base_url, name, RECOVERY_PROMPT, RECOVERY_TOKENS)
@@ -1496,7 +1479,6 @@ def test_a_fault_on_trial_returns_to_the_previous_epoch_under_a_request(
     outlasts the case, which ends it by ending the target's main process.
     """
     name = "qwen3-live-rollback"
-    revision = updates.engine_revision(deployments.build_server, repository)
     options = merged(
         OPTIONS,
         {
@@ -1507,6 +1489,7 @@ def test_a_fault_on_trial_returns_to_the_previous_epoch_under_a_request(
         },
     )
     with _serve(deployments, name, options=options) as server:
+        revision = updates.engine_revision(server.build_server, repository)
         before = _engine_pids(server)
         previous = admin.replica(server).epoch
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
@@ -1600,8 +1583,8 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
             }
         },
     )
-    slower = _slower_target(deployments.build_server, repository, tmp_path)
     with _serve(deployments, name, options=thresholds) as server:
+        slower = _slower_target(server.build_server, repository, tmp_path)
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         current = admin.policy(server).revision
         # The stream runs through the preparation, the switch, a whole window
@@ -1671,7 +1654,7 @@ def test_a_package_update_past_a_threshold_rolls_back_in_its_epoch(
     with _serve(deployments, name, options=options) as server:
         # The package is built for the decode keys this deployment ran.
         repeated = _repeated_attention(
-            deployments.build_server, repository, tmp_path
+            server.build_server, repository, tmp_path
         )
         engines = _engine_pids(server)
         stream = _start_count(server, name)
