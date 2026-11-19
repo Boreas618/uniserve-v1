@@ -877,10 +877,14 @@ def _restart_while_streaming(
         what="the successor recorded no converged revision of the change",
     )
     assert ended.labels["update"] == str(both["revision"]), (ended, both)
-    # The configuration is the target's from then on.
+    # The configuration is the target's from then on: its request slots and
+    # its address, the port it named on the default host (`127.0.0.1`),
+    # which the policy read back leaves out.
     served = admin.policy(server).config
     assert served["max_running_requests"] == 64, served
-    assert served["admin_config"]["host"] == "127.0.0.1", served
+    address = served["admin_config"]
+    assert address.get("host", "127.0.0.1") == "127.0.0.1", served
+    assert address["port"] == port, served
     assert _ask(both_url, name, "Say hello.")
     updates.wait_for_end(previous)
 
