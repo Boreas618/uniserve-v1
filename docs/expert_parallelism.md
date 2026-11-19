@@ -28,6 +28,8 @@ The token transport is the package that fills the `expert_exchange` operator's d
 | `megamoe` | The fused MegaMoE kernel: one launch exchanges, runs the experts and combines | NVFP4 expert weights, Blackwell GPUs |
 | `deepep` | DeepEP elastic dispatch and combine | Dedicated expert workers |
 
+`alltoall` and `deepep` dispatch the activation rows and combine their sums in two launches, and each rank runs its own experts' grouped products between them: BF16 experts, or the MXFP4 experts of a block-scaled export (DeepSeek-V4.1), whose first product encodes the received rows into MXFP8 as it reads them. `megamoe` runs calibrated NVFP4 experts inside its one launch.
+
 Each step's capacity is the smallest power of two (or the batch token bound) that holds the largest participating batch, so startup captures every graph shape at every capacity that can hold it; this lengthens startup in proportion to the number of capacities. Different peer batches change the expert kernels' batching and can change floating-point rounding.
 
 ## Tensor-parallel ranks sharing their experts
