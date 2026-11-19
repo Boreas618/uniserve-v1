@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Expert routing: softmax over each token's router scores, the top-k experts,
-// optional renormalization and an optional per-expert scale.
+// Expert routing: each token's scores from its router logits (a softmax, or a
+// sqrt-softplus per expert), the top-k experts by the scores plus an optional
+// selection bias, optional renormalization and an optional per-expert scale.
 //
 // The operator `topk_softmax` documents the arithmetic, and the numbers are the
 // ones UniServe's tensor composition defined. One warp owns one token and
@@ -9,11 +10,17 @@
 //
 // - softmax as PyTorch's warp softmax evaluates a row: lane l holds scores
 //   l + 32 * i, the maximum and the sum of expf(score - max) reduce by xor
-//   butterflies, and each probability is exp / sum;
-// - the k largest probabilities in descending order, equal ones in ascending
-//   expert order, by repeated warp arg-max;
+//   butterflies, and each probability is exp / sum; or, compiled for
+//   sqrt-softplus (UNISERVE_SQRTSOFTPLUS), each score is
+//   sqrtf(log1pf(expf(logit))), the logit itself above PyTorch's softplus
+//   threshold of 20;
+// - the k largest selection keys in descending order, equal ones in ascending
+//   expert order, by repeated warp arg-max; a key is the score plus the
+//   expert's selection bias when there is one, and a route's weight is the
+//   unbiased score;
 // - their sum by the xor butterfly over k lanes that PyTorch's row sum of a
-//   [tokens, k] tensor uses, clamped below by FLT_EPSILON, divides them;
+//   [tokens, k] tensor uses divides them: clamped below by FLT_EPSILON after a
+//   softmax, plus 1e-20 after sqrt-softplus, as the reference router does;
 // - a per-expert scale multiplies the result in FP32;
 // - a route's expert is written as the slot the logical-to-physical map names,
 //   when there is a map. The selection above is over logical ids, so the picks
@@ -42,8 +49,9 @@
 #include <climits>
 #include <cstdint>
 
-#if !defined(UNISERVE_EXPERTS) || !defined(UNISERVE_TOP) || !defined(UNISERVE_WARPS)
-#error "the package's manifest defines UNISERVE_EXPERTS, UNISERVE_TOP and UNISERVE_WARPS"
+#if !defined(UNISERVE_EXPERTS) || !defined(UNISERVE_TOP) || !defined(UNISERVE_WARPS) || \
+    !defined(UNISERVE_SQRTSOFTPLUS)
+#error "the package's manifest defines UNISERVE_EXPERTS, UNISERVE_TOP, UNISERVE_WARPS and UNISERVE_SQRTSOFTPLUS"
 #endif
 
 namespace {
@@ -63,6 +71,15 @@ constexpr int butterfly(int top) {
 constexpr int kIterations = (UNISERVE_EXPERTS + kWarp - 1) / kWarp;
 constexpr int kTop = butterfly(UNISERVE_TOP);
 
+// Whether the scores are sqrt(softplus(logit)) rather than the row's softmax.
+constexpr bool kSqrtSoftplus = UNISERVE_SQRTSOFTPLUS != 0;
+
+// PyTorch's softplus threshold: above it softplus(x) is x itself.
+constexpr float kSoftplusThreshold = 20.f;
+
+// What the reference router adds to the selected scores' sum before dividing by it.
+constexpr float kRenormalizeEpsilon = 1e-20f;
+
 // Storage kinds of the scores and of the per-expert scale.
 constexpr int kAbsent = -1;
 constexpr int kFloat = 0;
@@ -77,18 +94,18 @@ __device__ __forceinline__ float load_value(const void* data, int kind, int64_t 
 
 }  // namespace
 
-// The arguments are the operator's packed launch parameters: the scores, their
+// The arguments are the operator's packed launch parameters: the logits, their
 // storage kind, the row stride in elements, the token count, the expert count,
 // the top-k width, the renormalize flag, the per-expert scale and its kind, the
-// two outputs, the logical-to-physical expert map (null for none), the count of
-// live token rows (null: every row is live) and the expert load the live rows'
-// routes add into (null for none).
+// FP32 selection bias (null for none), the two outputs, the logical-to-physical
+// expert map (null for none), the count of live token rows (null: every row is
+// live) and the expert load the live rows' routes add into (null for none).
 extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_kind,
                                                  int64_t row_stride, int rows, int experts,
                                                  int top, int renormalize, const void* scale,
-                                                 int scale_kind, int32_t* ids, float* weights,
-                                                 const int32_t* map, const int32_t* live,
-                                                 unsigned long long* load) {
+                                                 int scale_kind, const float* bias, int32_t* ids,
+                                                 float* weights, const int32_t* map,
+                                                 const int32_t* live, unsigned long long* load) {
   // `experts` and `top` arrive as launch arguments while the iteration count and
   // the butterfly width are compiled into this cubin. A call arriving with a
   // different expert count would reduce over part of the row and write
@@ -113,29 +130,48 @@ extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_k
                      : -INFINITY;
   }
 
-  float maximum = values[0];
+  if constexpr (kSqrtSoftplus) {
+    // Each expert's score on its own; a padding lane's stays -inf, which no key beats.
 #pragma unroll
-  for (int it = 0; it < kIterations; ++it) maximum = maximum > values[it] ? maximum : values[it];
+    for (int it = 0; it < kIterations; ++it) {
+      const float logit = values[it];
+      const float softplus = logit > kSoftplusThreshold ? logit : log1pf(expf(logit));
+      values[it] = lane + it * kWarp < experts ? sqrtf(softplus) : -INFINITY;
+    }
+  } else {
+    float maximum = values[0];
 #pragma unroll
-  for (int offset = kWarp / 2; offset > 0; offset /= 2) {
-    const float other = __shfl_xor_sync(0xffffffffu, maximum, offset);
-    maximum = maximum < other ? other : maximum;
+    for (int it = 0; it < kIterations; ++it) maximum = maximum > values[it] ? maximum : values[it];
+#pragma unroll
+    for (int offset = kWarp / 2; offset > 0; offset /= 2) {
+      const float other = __shfl_xor_sync(0xffffffffu, maximum, offset);
+      maximum = maximum < other ? other : maximum;
+    }
+    float sum = 0.f;
+#pragma unroll
+    for (int it = 0; it < kIterations; ++it) {
+      values[it] = expf(values[it] - maximum);
+      sum += values[it];
+    }
+#pragma unroll
+    for (int offset = kWarp / 2; offset > 0; offset /= 2) {
+      sum = sum + __shfl_xor_sync(0xffffffffu, sum, offset);
+    }
+#pragma unroll
+    for (int it = 0; it < kIterations; ++it) values[it] = values[it] / sum;
   }
-  float sum = 0.f;
+
+  // The keys the top-k selects by: the scores, plus the selection bias when there is one.
+  float keys[kIterations];
 #pragma unroll
   for (int it = 0; it < kIterations; ++it) {
-    values[it] = expf(values[it] - maximum);
-    sum += values[it];
+    const int expert = lane + it * kWarp;
+    keys[it] = bias != nullptr && expert < experts ? values[it] + bias[expert] : values[it];
   }
-#pragma unroll
-  for (int offset = kWarp / 2; offset > 0; offset /= 2) {
-    sum = sum + __shfl_xor_sync(0xffffffffu, sum, offset);
-  }
-#pragma unroll
-  for (int it = 0; it < kIterations; ++it) values[it] = values[it] / sum;
 
-  // Top-k by repeated warp arg-max; every lane ends with all k picks, in
-  // descending order with equal values in ascending expert order.
+  // Top-k by repeated warp arg-max over the keys; every lane ends with all k
+  // picks and their unbiased scores, in descending order of key with equal keys
+  // in ascending expert order.
   float top_value[kTop];
   int top_expert[kTop];
   unsigned taken = 0u;
@@ -146,26 +182,31 @@ extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_k
       top_expert[j] = 0;
       continue;
     }
-    float best = -1.f;
+    float best = -INFINITY;
+    float best_value = 0.f;
     int best_expert = INT_MAX;
 #pragma unroll
     for (int it = 0; it < kIterations; ++it) {
       const int expert = lane + it * kWarp;
-      if (expert < experts && !(taken >> it & 1u) && values[it] > best) {
-        best = values[it];
+      if (expert < experts && !(taken >> it & 1u) &&
+          (keys[it] > best || (keys[it] == best && expert < best_expert))) {
+        best = keys[it];
+        best_value = values[it];
         best_expert = expert;
       }
     }
 #pragma unroll
     for (int offset = kWarp / 2; offset > 0; offset /= 2) {
       const float other = __shfl_xor_sync(0xffffffffu, best, offset);
+      const float other_value = __shfl_xor_sync(0xffffffffu, best_value, offset);
       const int other_expert = __shfl_xor_sync(0xffffffffu, best_expert, offset);
       if (other > best || (other == best && other_expert < best_expert)) {
         best = other;
+        best_value = other_value;
         best_expert = other_expert;
       }
     }
-    top_value[j] = best;
+    top_value[j] = best_value;
     top_expert[j] = best_expert;
     if (best_expert % kWarp == lane) taken |= 1u << (best_expert / kWarp);
   }
@@ -194,7 +235,8 @@ extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_k
 #pragma unroll
       for (int j = 0; j < kTop; ++j) partial[j] = next[j];
     }
-    const float total = partial[0] < FLT_EPSILON ? FLT_EPSILON : partial[0];
+    const float total = kSqrtSoftplus ? partial[0] + kRenormalizeEpsilon
+                                      : (partial[0] < FLT_EPSILON ? FLT_EPSILON : partial[0]);
     weight = weight / total;
   }
   if (scale_kind != kAbsent) weight = weight * load_value(scale, scale_kind, expert);

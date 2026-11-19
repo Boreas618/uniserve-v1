@@ -2,10 +2,11 @@
 #
 # The descriptor is the gating's own: the element type, the output row width,
 # the tile one program walks, the activation, the two input row strides, whether
-# the views span 2**31 elements (the module then addresses in 64 bits), and the
-# dependent-launch and stepwise flags. The key is the one
-# `ActAndMulDescriptor`'s `Display` prints, e.g.
-# `dtype_bf16_width_3072_block_4096_activation_silu_gate_stride_6144_value_stride_3072_wide_false_pdl_false_stepwise_false`.
+# the views span 2**31 elements (the module then addresses in 64 bits), the
+# dependent-launch and stepwise flags, and whether both halves are clamped at the
+# call's limit before the activation (the gate from above, the value on both
+# sides). The key is the one `ActAndMulDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_width_3072_block_4096_activation_silu_gate_stride_6144_value_stride_3072_wide_false_pdl_false_stepwise_false_clamp_false`.
 #
 # The row strides are whole multiples of the row width — the two halves of one
 # packed projection, or two separately written ones. The module states
@@ -14,7 +15,7 @@
 
 op = "act_and_mul"
 backend = "triton"
-interface_version = 1
+interface_version = 2
 
 [source]
 kind = "triton"
@@ -34,6 +35,7 @@ out_ptr = { pointer = "dtype" }
 elements = { field = "wide", values = { true = "i64", false = "i32" } }
 gate_row_stride = { field = "wide", values = { true = "i64", false = "i32" } }
 value_row_stride = { field = "wide", values = { true = "i64", false = "i32" } }
+limit = "fp32"
 
 [launch.constants]
 n_cols = { field = "width" }
@@ -41,6 +43,7 @@ ACTIVATION = { field = "activation" }
 BLOCK = { field = "block" }
 WIDE = { field = "wide" }
 stepwise = { field = "stepwise" }
+CLAMP = { field = "clamp" }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], width = { multiple = 16 }, block = { power_of_two = true }, activation = ["gelu", "gelu_tanh", "silu", "sigmoid"], gate_stride = { multiple = 16 }, value_stride = { multiple = 16 }, wide = ["false", "true"], pdl = ["false", "true"], stepwise = ["false", "true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], width = { multiple = 16 }, block = { power_of_two = true }, activation = ["gelu", "gelu_tanh", "silu", "sigmoid"], gate_stride = { multiple = 16 }, value_stride = { multiple = 16 }, wide = ["false", "true"], pdl = ["false", "true"], stepwise = ["false", "true"], clamp = ["false", "true"] }

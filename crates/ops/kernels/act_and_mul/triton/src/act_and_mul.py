@@ -64,7 +64,12 @@ def _activate(gate, ACTIVATION: tl.constexpr):  # noqa: N803
 
 
 @triton.jit(
-    do_not_specialize=["elements", "gate_row_stride", "value_row_stride"]
+    do_not_specialize=[
+        "elements",
+        "gate_row_stride",
+        "value_row_stride",
+        "limit",
+    ]
 )
 def _act_and_mul_kernel(
     gate_ptr,
@@ -73,14 +78,21 @@ def _act_and_mul_kernel(
     elements,
     gate_row_stride,
     value_row_stride,
+    limit,
     n_cols: tl.constexpr,  # noqa: N803
     ACTIVATION: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
     WIDE: tl.constexpr,  # noqa: N803
     PDL: tl.constexpr,  # noqa: N803
     stepwise: tl.constexpr,
+    CLAMP: tl.constexpr,  # noqa: N803
 ):
     """Store ``act(gate) * value`` for one block of the flattened output.
+
+    With ``CLAMP`` the gate is first clamped from above at ``limit`` and the
+    value on both sides, ``act(min(gate, limit)) * clamp(value, -limit,
+    limit)``, in FP32: a clamp is exact, so the product rounds once as without
+    it.
 
     Grid: ``ceil(elements / BLOCK)`` programs over the contiguous
     ``[rows, n_cols]`` output. Gate rows start ``gate_row_stride`` and value
@@ -105,6 +117,9 @@ def _act_and_mul_kernel(
     value = tl.load(
         value_ptr + row * value_row_stride + column, mask=mask, other=0.0
     ).to(tl.float32)
+    if CLAMP:
+        gate = tl.minimum(gate, limit)
+        value = tl.minimum(tl.maximum(value, -limit), limit)
     activated = _activate(gate, ACTIVATION)
     if stepwise:
         activated = activated.to(gate_ptr.dtype.element_ty).to(tl.float32)

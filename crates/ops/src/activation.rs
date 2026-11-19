@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! act_and_mul        out = act(gate) · value            gate and value are two views
+//!                    out = act(min(gate, L)) · clamp(value, ±L)        clamped at the limit L
 //! value_first_swiglu out = value · silu(gate)          one packed [value, gate] view
 //! ```
 //!
@@ -108,6 +109,9 @@ pub struct ActAndMulDescriptor {
     /// Evaluate the activation step by step instead of contraction-free, for a caller that needs
     /// the eager expression's rounding rather than the kernel's default evaluation.
     pub stepwise: bool,
+    /// Clamp both halves before the activation at the call's limit ([`ActAndMulArgs::limit`]):
+    /// the gate from above, the value on both sides, as DeepSeek's SwiGLU does.
+    pub clamp: bool,
 }
 
 impl ActAndMulDescriptor {
@@ -120,7 +124,12 @@ impl ActAndMulDescriptor {
     /// # Errors
     ///
     /// [`Error::Argument`] when the rows are wider than a descriptor's 32 bits.
-    pub fn of(args: &ActAndMulArgs, activation: Activation, stepwise: bool) -> Result<Self> {
+    pub fn of(
+        args: &ActAndMulArgs,
+        activation: Activation,
+        stepwise: bool,
+        clamp: bool,
+    ) -> Result<Self> {
         let width = row_width(ActAndMul::NAME, &args.out)?;
         let (gate_stride, value_stride) = (args.gate.stride(0), args.value.stride(0));
 
@@ -141,6 +150,7 @@ impl ActAndMulDescriptor {
             wide: span >= 1 << 31,
             pdl: PDL,
             stepwise,
+            clamp,
         })
     }
 }
@@ -157,6 +167,7 @@ impl fmt::Display for ActAndMulDescriptor {
             .field("wide", self.wide)
             .field("pdl", self.pdl)
             .field("stepwise", self.stepwise)
+            .field("clamp", self.clamp)
             .finish(formatter)
     }
 }
@@ -170,6 +181,8 @@ pub struct ActAndMulArgs {
     pub value: Operand,
     /// `[..., width]`, contiguous: receives `act(gate) · value`.
     pub out: Operand,
+    /// The clamp's limit `L`, positive: read only when the descriptor clamps.
+    pub limit: f32,
 }
 
 /// The activation of the gate half times the value half.
@@ -300,7 +313,8 @@ impl Op for ActAndMul {
             .view("out_ptr", &args.out)
             .u64("elements", elements)
             .u64("gate_row_stride", descriptor.gate_stride)
-            .u64("value_row_stride", descriptor.value_stride);
+            .u64("value_row_stride", descriptor.value_stride)
+            .f32("limit", args.limit);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

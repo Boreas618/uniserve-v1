@@ -43,17 +43,24 @@ use ops::moe::grouped::{
     GatherGemmNvfp4Descriptor, RouteGemm, RouteGemmArgs, RouteGemmDescriptor, RouteGemmNvfp4,
     RouteGemmNvfp4Args, RouteGemmNvfp4Descriptor,
 };
-use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
+use ops::moe::mxfp4::{
+    GATED_SCALE_LAYOUT, GatherGemmMxfp4, GatherGemmMxfp4Args, GatherGemmMxfp4Descriptor,
+    RouteGemmMxfp4, RouteGemmMxfp4Args, RouteGemmMxfp4Descriptor, TOKEN_SCALE_LAYOUT,
+    WEIGHT_SCALE_LAYOUT,
+};
+use ops::moe::routing::{Scoring, TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
+use ops::mx::{ScaleLayout, ScaleRule};
 use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescriptor};
 use tensor::{D, DType, Device, Tensor};
 
 use super::activation::activate;
+use super::mx::{decoded_mxfp4, decoded_mxfp8, encoded_rows, mxfp8_quantize};
 use super::nvfp4::{decoded, encoded, integer, launch_quantize};
 use super::{ACCUMULATE, Activation, Fused, as_rows, columns, compute, same_rows};
 use crate::capability::ExpertExchange;
 use crate::error::{Error, Result};
-use crate::quantization::Nvfp4Stack;
+use crate::quantization::{Mxfp4Stack, Nvfp4Stack};
 
 /// The rows of the route maps [`moe_sort`] returns, `[SORT_MAPS, permuted rows]` U32: each row is
 /// one map, in its leading entries.
@@ -87,21 +94,54 @@ const ABSENT: u32 = u32::MAX;
 /// The map entry of a route of a token row the batch does not fill: the kernels' `-2`.
 const NOT_LIVE: u32 = u32::MAX - 1;
 
-/// The router's choice: `(ids, weights)`, the `top` most probable experts of each token and
-/// their probabilities, `[tokens, top]` U32 and FP32.
+/// How a router routes a token: its scores, which experts it selects and how their weights are
+/// formed ([`topk_softmax`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Routing<'t> {
+    /// Experts each token routes to.
+    pub top: u32,
+    /// How the logits become scores.
+    pub scoring: Scoring,
+    /// Whether the selected scores are divided by their sum.
+    pub renormalize: bool,
+    /// `[experts]` F32: added to the scores the selection is made by, and to no weight.
+    pub bias: Option<&'t Tensor>,
+    /// `[experts]` in a floating type: each selected expert's factor of its weight (a routed
+    /// scaling factor is this, the same for every expert).
+    pub scale: Option<&'t Tensor>,
+}
+
+impl Routing<'_> {
+    /// A softmax router of `top` routes, renormalized when `renormalize`, with no bias or scale.
+    pub const fn softmax(top: u32, renormalize: bool) -> Self {
+        Self {
+            top,
+            scoring: Scoring::Softmax,
+            renormalize,
+            bias: None,
+            scale: None,
+        }
+    }
+}
+
+/// The router's choice: `(ids, weights)`, the `top` experts of each token and their weights,
+/// `[tokens, top]` U32 and FP32.
 ///
 /// ```text
-/// p        = softmax(scores)                       over the experts, in FP32
-/// ids      = the top largest p, descending; equal ones in ascending expert order
-/// weights  = p[ids] / max(Σ p[ids], FLT_EPSILON)   when `renormalize`
-///          · scale[ids]                            when a scale is given
-/// ids      = map[ids]                              when a map is given
+/// s        = softmax(logits)                         over the experts, in FP32   (Softmax)
+///          = sqrt(softplus(logits))                  per expert, in FP32         (SqrtSoftplus)
+/// ids      = the top largest s + bias, descending; equal ones in ascending expert order
+/// weights  = s[ids] / max(Σ s[ids], FLT_EPSILON)     when `renormalize`          (Softmax)
+///          = s[ids] / (Σ s[ids] + 1e-20)             when `renormalize`          (SqrtSoftplus)
+///          · scale[ids]                              when a scale is given
+/// ids      = map[ids]                                when a map is given
 /// ```
 ///
-/// `scores` is `[tokens, experts]`; `scale`, when given, one factor per expert in a floating
-/// type; `map`, when given, the `[experts]` U32 weight row of each expert, for a block whose
-/// experts are not stacked in their own order. The selection is over the experts' own ids, so
-/// which experts a token picks, and the order of equal scores, do not depend on the map.
+/// `softplus(x)` is `ln(1 + eˣ)`, and `x` itself above 20 (PyTorch's threshold). `scores` is the
+/// router's `[tokens, experts]` logits; `routing` states the scoring, the bias (selection only)
+/// and the scale; `map`, when given, the `[experts]` U32 weight row of each expert, for a block
+/// whose experts are not stacked in their own order. The selection is over the experts' own ids,
+/// so which experts a token picks, and the order of equal keys, do not depend on the map.
 ///
 /// `load`, when given, is the `[experts]` I64 counters of an expert load
 /// ([`ops::moe::ExpertLoad`]), device memory execution lends: each route of a live token adds one
@@ -114,14 +154,13 @@ const NOT_LIVE: u32 = u32::MAX - 1;
 ///
 /// # Errors
 ///
-/// When `scores` is not a matrix, `top` is not between one and the expert count, the scale, the
-/// map or the load is not one entry per expert, a load is given for CPU scores (the counters are
-/// device memory a launch adds into), or the operator refuses its arguments.
+/// When `scores` is not a matrix, `top` is not between one and the expert count, the bias, the
+/// scale, the map or the load is not one entry per expert, the bias is not F32, a load is given
+/// for CPU scores (the counters are device memory a launch adds into), or the operator refuses
+/// its arguments.
 pub fn topk_softmax(
     scores: &Tensor,
-    top: u32,
-    renormalize: bool,
-    scale: Option<&Tensor>,
+    routing: &Routing<'_>,
     map: Option<&Tensor>,
     live_tokens: Option<&Tensor>,
     load: Option<&Tensor>,
@@ -134,13 +173,19 @@ pub fn topk_softmax(
             format!("scores of {:?} are not [tokens, experts]", scores.dims()),
         ));
     };
+    let top = routing.top;
     if top == 0 || top as usize > experts {
         return Err(Error::shape(
             OWNER,
             format!("a top of {top} is outside 1..={experts}"),
         ));
     }
-    for (name, table) in [("scale", scale), ("map", map), ("load", load)] {
+    for (name, table) in [
+        ("bias", routing.bias),
+        ("scale", routing.scale),
+        ("map", map),
+        ("load", load),
+    ] {
         if let Some(table) = table
             && table.dims() != [experts]
         {
@@ -153,13 +198,22 @@ pub fn topk_softmax(
             ));
         }
     }
+    if let Some(bias) = routing.bias
+        && bias.dtype() != DType::F32
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "a selection bias is F32, not {}",
+                ops::abi::name(bias.dtype())
+            ),
+        ));
+    }
     let kept = top as usize;
 
     compute(TopkSoftmaxCall {
         scores,
-        top,
-        renormalize,
-        scale,
+        routing: *routing,
         map,
         live_tokens,
         load,
@@ -172,9 +226,7 @@ pub fn topk_softmax(
 /// A checked call of [`topk_softmax`]: `kept` is its routes a token.
 struct TopkSoftmaxCall<'t> {
     scores: &'t Tensor,
-    top: u32,
-    renormalize: bool,
-    scale: Option<&'t Tensor>,
+    routing: Routing<'t>,
     map: Option<&'t Tensor>,
     live_tokens: Option<&'t Tensor>,
     load: Option<&'t Tensor>,
@@ -187,6 +239,12 @@ impl TopkSoftmaxCall<'_> {
     const OWNER: &'static str = "topk_softmax";
 }
 
+/// PyTorch's softplus threshold: above it `softplus(x)` is `x` itself.
+const SOFTPLUS_THRESHOLD: f32 = 20.0;
+
+/// What the reference sqrt-softplus router adds to the selected scores' sum before dividing.
+const RENORMALIZE_EPSILON: f64 = 1e-20;
+
 impl Fused for TopkSoftmaxCall<'_> {
     type Output = (Tensor, Tensor);
 
@@ -197,8 +255,7 @@ impl Fused for TopkSoftmaxCall<'_> {
     fn cpu(self) -> Result<Self::Output> {
         let Self {
             scores,
-            renormalize,
-            scale,
+            routing,
             map,
             load,
             tokens,
@@ -214,15 +271,39 @@ impl Fused for TopkSoftmaxCall<'_> {
             ));
         }
         let logits = scores.to_dtype(ACCUMULATE)?;
-        let shifted = logits
-            .broadcast_sub(&logits.max_keepdim(D::Minus1)?)?
-            .exp()?;
-        let probabilities = shifted.broadcast_div(&shifted.sum_keepdim(D::Minus1)?)?;
+        let probabilities = match routing.scoring {
+            Scoring::Softmax => {
+                let shifted = logits
+                    .broadcast_sub(&logits.max_keepdim(D::Minus1)?)?
+                    .exp()?;
+                shifted.broadcast_div(&shifted.sum_keepdim(D::Minus1)?)?
+            }
+            Scoring::SqrtSoftplus => {
+                let scored: Vec<f32> = logits
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .into_iter()
+                    .map(|logit| {
+                        let softplus = if logit > SOFTPLUS_THRESHOLD {
+                            logit
+                        } else {
+                            logit.exp().ln_1p()
+                        };
+                        softplus.sqrt()
+                    })
+                    .collect();
+                Tensor::from_vec(scored, (tokens, experts), &Device::Cpu)?
+            }
+        };
+        let keys = match routing.bias {
+            Some(bias) => probabilities.broadcast_add(&bias.unsqueeze(0)?)?,
+            None => probabilities.clone(),
+        };
 
-        // Descending, with equal probabilities in ascending expert order: the positions of one
-        // probability are numbered as a group, and each group is ordered by expert.
-        let descending = probabilities.arg_sort_last_dim(false)?;
-        let sorted = probabilities.gather(&descending, D::Minus1)?;
+        // Descending, with equal keys in ascending expert order: the positions of one key are
+        // numbered as a group, and each group is ordered by expert.
+        let descending = keys.arg_sort_last_dim(false)?;
+        let sorted = keys.gather(&descending, D::Minus1)?;
         let previous = Tensor::cat(
             &[
                 sorted.narrow(D::Minus1, 0, 1)?,
@@ -242,15 +323,17 @@ impl Fused for TopkSoftmaxCall<'_> {
             .narrow(D::Minus1, 0, kept)?
             .contiguous()?;
         let mut weights = probabilities.gather(&ids, D::Minus1)?;
-        if renormalize {
-            let total = weights
-                .sum_keepdim(D::Minus1)?
-                .maximum(f64::from(f32::EPSILON))?;
+        if routing.renormalize {
+            let sum = weights.sum_keepdim(D::Minus1)?;
+            let total = match routing.scoring {
+                Scoring::Softmax => sum.maximum(f64::from(f32::EPSILON))?,
+                Scoring::SqrtSoftplus => sum.affine(1.0, RENORMALIZE_EPSILON)?,
+            };
             weights = weights.broadcast_div(&total)?;
         }
 
         let selected = ids.flatten_all()?;
-        if let Some(scale) = scale {
+        if let Some(scale) = routing.scale {
             let factors = scale.to_dtype(ACCUMULATE)?.index_select(&selected, 0)?;
             weights = (weights * factors.reshape((tokens, kept))?)?;
         }
@@ -264,9 +347,7 @@ impl Fused for TopkSoftmaxCall<'_> {
     fn launch(self) -> Result<Self::Output> {
         let Self {
             scores,
-            top,
-            renormalize,
-            scale,
+            routing,
             map,
             live_tokens,
             load,
@@ -281,13 +362,16 @@ impl Fused for TopkSoftmaxCall<'_> {
             &TopkDescriptor {
                 scores: scores.dtype(),
                 experts: experts as u32,
-                top,
-                renormalize,
-                scale: scale.map(Tensor::dtype),
+                top: routing.top,
+                scoring: routing.scoring,
+                renormalize: routing.renormalize,
+                bias: routing.bias.is_some(),
+                scale: routing.scale.map(Tensor::dtype),
             },
             TopkArgs {
                 scores: ops::operand(scores)?,
-                scale: scale.map(ops::operand).transpose()?,
+                scale: routing.scale.map(ops::operand).transpose()?,
+                bias: routing.bias.map(ops::operand).transpose()?,
                 ids: ops::operand(&ids)?,
                 weights: ops::operand(&weights)?,
                 map: map.map(ops::operand).transpose()?,
@@ -1150,6 +1234,384 @@ impl Fused for RouteGemmNvfp4Call<'_> {
                 weights: ops::operand(&down.values)?,
                 scales: ops::operand(&down.scales)?,
                 global_scale: ops::operand(&down.global_scale)?,
+                tile_to_expert: map_operand(maps, TILE_TO_EXPERT, tiles)?,
+                tile_to_limit: map_operand(maps, TILE_TO_LIMIT, tiles)?,
+                permuted_to_expanded: map_operand(maps, PERMUTED_TO_EXPANDED, rows)?,
+                num_non_exiting_tiles: map_operand(maps, NUM_NON_EXITING_TILES, 1)?,
+                out: ops::operand(&out)?,
+                workspace: ops::operand(&workspace)?,
+            },
+        )?;
+        Ok(out)
+    }
+}
+
+/// The first product of the routed experts over an MXFP4 `[up; gate]` stack: the hidden rows
+/// are encoded into MXFP8, each permuted row's gated product is taken over the two encodings with
+/// the clamped SwiGLU, and the gated rows are encoded into MXFP8 again.
+///
+/// ```text
+/// x̂[t]    = mxfp8_quantize(hidden[t])                          per 32 elements, covering scales
+/// up      = Ŵ_up,e · x̂[t]       gate = Ŵ_gate,e · x̂[t]        over the decoded values, in FP32
+/// g[p]    = silu(min(gate, L_e)) · clamp(up, −L_e, L_e)
+/// out[p]  = mxfp8(g[p], ScaleRule::Ocp)                        codes, scales in the 128 × 4 atom
+/// ```
+///
+/// The gated rows are encoded where the device's product encodes them, in its epilogue, and by
+/// its rule: the OCP Microscaling scale `2^(⌊log₂ amax⌋ − 8)`, under which a block whose largest
+/// magnitude has a significand above 1.75 saturates its largest quotients at ±448
+/// ([`ScaleRule::Ocp`]). The reference encodes the down projection's input by the covering rule,
+/// so such a block's largest elements differ from it by up to an eighth.
+///
+/// `hidden` is `[tokens, hidden]` BF16; `up_gate` holds the experts of the sort's window, its rows
+/// interleaved and shuffled and its scales swizzled as the product reads them; `limit` is the
+/// `[experts]` F32 clamp `L_e` of each expert of the stack; `top` is the routes of a token. The
+/// result is `(codes, scales)`: `[permuted rows, intermediate]` E4M3 and their UE8M0 scales in
+/// [`GATED_SCALE_LAYOUT`], which [`route_gemm_mxfp4`] reads.
+///
+/// The CPU formula encodes the hidden rows as [`mxfp8_quantize`](super::mxfp8_quantize)'s formula
+/// does and the gated rows by the OCP rule, evaluates SiLU exactly and writes the encoding of
+/// zeros on padding rows; the device's product leaves them unspecified. A device check compares the decoded live rows under the operator's tolerance, which
+/// covers a code one step apart.
+///
+/// # Errors
+///
+/// When the stack is not `[experts, 2 · intermediate, hidden / 2]` over `hidden`'s rows, the
+/// limits are not one F32 per expert, the maps are not a sort's, or an operator refuses its
+/// arguments.
+pub fn gather_gemm_mxfp4(
+    hidden: &Tensor,
+    up_gate: &Mxfp4Stack,
+    limit: &Tensor,
+    maps: &Tensor,
+    top: u32,
+) -> Result<(Tensor, Tensor)> {
+    const OWNER: &str = GatherGemmMxfp4Call::OWNER;
+
+    let width = columns(OWNER, hidden)?;
+    let &[experts, gated, packed] = up_gate.codes.dims() else {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "an MXFP4 [up; gate] stack is [experts, 2 · intermediate, hidden / 2], not {:?}",
+                up_gate.codes.dims()
+            ),
+        ));
+    };
+    if packed * 2 != width as usize
+        || gated % 2 != 0
+        || hidden.rank() != 2
+        || top == 0
+        || up_gate.values != GatherGemmMxfp4Descriptor::WEIGHT_VALUES
+        || up_gate.layout != WEIGHT_SCALE_LAYOUT
+        || limit.dims() != [experts]
+        || limit.dtype() != DType::F32
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "an MXFP4 stack of {:?} ({}, {} scales) over rows of {:?} with {top} routes a \
+                 token and limits of {:?}",
+                up_gate.codes.dims(),
+                up_gate.values,
+                up_gate.layout,
+                hidden.dims(),
+                limit.dims()
+            ),
+        ));
+    }
+    let tokens = hidden.dims()[0];
+    let (tiles, rows) = sorted(OWNER, maps, tokens * top as usize)?;
+
+    compute(GatherGemmMxfp4Call {
+        hidden,
+        up_gate,
+        limit,
+        maps,
+        top,
+        width,
+        experts,
+        tiles,
+        rows,
+        intermediate: gated / 2,
+    })
+}
+
+/// A checked call of [`gather_gemm_mxfp4`].
+struct GatherGemmMxfp4Call<'t> {
+    hidden: &'t Tensor,
+    up_gate: &'t Mxfp4Stack,
+    limit: &'t Tensor,
+    maps: &'t Tensor,
+    top: u32,
+    width: u32,
+    experts: usize,
+    tiles: usize,
+    rows: usize,
+    intermediate: usize,
+}
+
+impl GatherGemmMxfp4Call<'_> {
+    const OWNER: &'static str = "gather_gemm_mxfp4";
+}
+
+impl Fused for GatherGemmMxfp4Call<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.hidden.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            hidden,
+            up_gate,
+            limit,
+            maps,
+            rows,
+            intermediate,
+            ..
+        } = self;
+        let live = live_rows(maps, rows)?;
+        let expert = row_experts(maps, &live, rows)?;
+        let token = map(maps, PERMUTED_TO_TOKEN, rows)?;
+        let token = live.where_cond(&token, &token.zeros_like()?)?;
+
+        let (encoded, scales) = mxfp8_quantize(hidden, ScaleLayout::Linear)?;
+        let x = decoded_mxfp8(&encoded, &scales, ScaleLayout::Linear)?.index_select(&token, 0)?;
+
+        // The stack's rows in their own order, read back out of the arrangement the product
+        // declares.
+        let stored = decoded_mxfp4(&up_gate.codes, &up_gate.scales, up_gate.layout)?;
+        let order = stored_order(up_gate.values, 2 * intermediate)?;
+        let weight = stored.index_select(&order, 1)?.index_select(&expert, 0)?;
+        let projected = weight.matmul(&x.unsqueeze(2)?)?.squeeze(2)?;
+
+        // DeepSeek's clamped SwiGLU, each row at its expert's limit.
+        let bound = limit.index_select(&expert, 0)?.unsqueeze(1)?;
+        let up = projected.narrow(1, 0, intermediate)?;
+        let up = up
+            .broadcast_maximum(&bound.neg()?)?
+            .broadcast_minimum(&bound)?;
+        let gate = projected
+            .narrow(1, intermediate, intermediate)?
+            .broadcast_minimum(&bound)?;
+        let product = zero_padding(&(gate.silu()? * up)?, &live)?;
+
+        // The gated rows' MXFP8 encoding by the OCP rule the device's epilogue applies, its scales
+        // in the atom the second product reads.
+        let (quotients, linear) = encoded_rows(&product, ScaleRule::Ocp)?;
+        let codes = Tensor::from_vec(quotients, (rows, intermediate), &Device::Cpu)?
+            .to_dtype(DType::F8E4M3)?;
+        let table = ops::mx::arranged(
+            &linear,
+            rows as u64,
+            intermediate as u64,
+            GATED_SCALE_LAYOUT,
+        );
+        let shape = GATED_SCALE_LAYOUT.shape(rows as u64, intermediate as u64);
+        let scales = Tensor::from_raw_buffer(
+            &table,
+            DType::U8,
+            &[shape[0] as usize, shape[1] as usize],
+            &Device::Cpu,
+        )?;
+        Ok((codes, scales))
+    }
+
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            hidden,
+            up_gate,
+            limit,
+            maps,
+            top,
+            width,
+            experts,
+            tiles,
+            rows,
+            intermediate,
+        } = self;
+        // 1. The hidden rows' MXFP8 encoding, in the layout the gated product gathers it in.
+        let (codes, scales) = mxfp8_quantize(hidden, TOKEN_SCALE_LAYOUT)?;
+
+        // 2. The product, token-major: it gathers each permuted row's token itself, and encodes
+        //    its gated rows in its epilogue.
+        let descriptor =
+            GatherGemmMxfp4Descriptor::new(width, intermediate as u32, experts as u32, top);
+        let out = ops::empty((rows, intermediate), DType::F8E4M3)?;
+        let shape = GATED_SCALE_LAYOUT.shape(rows as u64, intermediate as u64);
+        let out_scale = ops::empty((shape[0] as usize, shape[1] as usize), DType::U8)?;
+        let workspace = ops::empty(descriptor.workspace_bytes(rows as u64) as usize, DType::U8)?;
+        ops::launch::<GatherGemmMxfp4>(
+            &descriptor,
+            GatherGemmMxfp4Args {
+                hidden: ops::operand(&codes)?,
+                hidden_scale: ops::operand(&scales)?,
+                weights: ops::operand(&up_gate.codes)?,
+                scales: ops::operand(&up_gate.scales)?,
+                limit: ops::operand(limit)?,
+                tile_to_expert: map_operand(maps, TILE_TO_EXPERT, tiles)?,
+                tile_to_limit: map_operand(maps, TILE_TO_LIMIT, tiles)?,
+                permuted_to_token: map_operand(maps, PERMUTED_TO_TOKEN, rows)?,
+                num_non_exiting_tiles: map_operand(maps, NUM_NON_EXITING_TILES, 1)?,
+                out: ops::operand(&out)?,
+                out_scale: ops::operand(&out_scale)?,
+                workspace: ops::operand(&workspace)?,
+            },
+        )?;
+        Ok((out, out_scale))
+    }
+}
+
+/// The second product of the routed experts over an MXFP4 `down` stack: each permuted row's
+/// MXFP8 gated row times its expert's weight.
+///
+/// ```text
+/// out[p] = Ŵ_down,e · ĝ[p]          over the decoded values, in FP32, rounded once into BF16
+/// ```
+///
+/// `codes` and `scales` are the gated rows [`gather_gemm_mxfp4`] wrote; `down` holds the experts
+/// of the sort's window, its rows shuffled and its scales swizzled as the product reads them. The
+/// result is `[permuted rows, hidden]` BF16, each route's product unweighted, which
+/// [`moe_unpermute`] sums; the CPU formula writes zeros on padding rows.
+///
+/// # Errors
+///
+/// When the stack is not `[experts, hidden, intermediate / 2]` over the gated rows, the maps are
+/// not a sort's of these rows, or the operator refuses its arguments.
+pub fn route_gemm_mxfp4(
+    codes: &Tensor,
+    scales: &Tensor,
+    down: &Mxfp4Stack,
+    maps: &Tensor,
+    top: u32,
+) -> Result<Tensor> {
+    const OWNER: &str = RouteGemmMxfp4Call::OWNER;
+
+    let intermediate = columns(OWNER, codes)?;
+    let &[experts, width, packed] = down.codes.dims() else {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "an MXFP4 down stack is [experts, hidden, intermediate / 2], not {:?}",
+                down.codes.dims()
+            ),
+        ));
+    };
+    let &[_, rows] = maps.dims() else {
+        return Err(Error::shape(
+            OWNER,
+            format!("route maps of {:?}", maps.dims()),
+        ));
+    };
+    let (tiles, _) = sorted(OWNER, maps, 0)?;
+    if packed * 2 != intermediate as usize
+        || codes.dims() != [rows, intermediate as usize]
+        || codes.dtype() != DType::F8E4M3
+        || top == 0
+        || down.values != RouteGemmMxfp4Descriptor::WEIGHT_VALUES
+        || down.layout != WEIGHT_SCALE_LAYOUT
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "an MXFP4 stack of {:?} ({}, {} scales) over gated {} rows of {:?} for {rows} \
+                 permuted rows",
+                down.codes.dims(),
+                down.values,
+                down.layout,
+                ops::abi::name(codes.dtype()),
+                codes.dims()
+            ),
+        ));
+    }
+
+    compute(RouteGemmMxfp4Call {
+        codes,
+        scales,
+        down,
+        maps,
+        top,
+        intermediate,
+        experts,
+        width,
+        rows,
+        tiles,
+    })
+}
+
+/// A checked call of [`route_gemm_mxfp4`].
+struct RouteGemmMxfp4Call<'t> {
+    codes: &'t Tensor,
+    scales: &'t Tensor,
+    down: &'t Mxfp4Stack,
+    maps: &'t Tensor,
+    top: u32,
+    intermediate: u32,
+    experts: usize,
+    width: usize,
+    rows: usize,
+    tiles: usize,
+}
+
+impl RouteGemmMxfp4Call<'_> {
+    const OWNER: &'static str = "route_gemm_mxfp4";
+}
+
+impl Fused for RouteGemmMxfp4Call<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.codes.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            codes,
+            scales,
+            down,
+            maps,
+            width,
+            rows,
+            ..
+        } = self;
+        let live = live_rows(maps, rows)?;
+        let expert = row_experts(maps, &live, rows)?;
+
+        let x = decoded_mxfp8(codes, scales, GATED_SCALE_LAYOUT)?;
+        let stored = decoded_mxfp4(&down.codes, &down.scales, down.layout)?;
+        let order = stored_order(down.values, width)?;
+        let weight = stored.index_select(&order, 1)?.index_select(&expert, 0)?;
+        let product = weight.matmul(&x.unsqueeze(2)?)?.squeeze(2)?;
+
+        Ok(zero_padding(&product, &live)?.to_dtype(DType::BF16)?)
+    }
+
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            codes,
+            scales,
+            down,
+            maps,
+            top,
+            intermediate,
+            experts,
+            width,
+            rows,
+            tiles,
+        } = self;
+        let descriptor =
+            RouteGemmMxfp4Descriptor::new(width as u32, intermediate, experts as u32, top);
+        let out = ops::empty((rows, width), DType::BF16)?;
+        let workspace = ops::empty(descriptor.workspace_bytes(rows as u64) as usize, DType::U8)?;
+        ops::launch::<RouteGemmMxfp4>(
+            &descriptor,
+            RouteGemmMxfp4Args {
+                hidden: ops::operand(codes)?,
+                hidden_scale: ops::operand(scales)?,
+                weights: ops::operand(&down.codes)?,
+                scales: ops::operand(&down.scales)?,
                 tile_to_expert: map_operand(maps, TILE_TO_EXPERT, tiles)?,
                 tile_to_limit: map_operand(maps, TILE_TO_LIMIT, tiles)?,
                 permuted_to_expanded: map_operand(maps, PERMUTED_TO_EXPANDED, rows)?,

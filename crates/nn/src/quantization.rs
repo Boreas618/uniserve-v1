@@ -3,9 +3,10 @@
 //!
 //! A quantized checkpoint states it in its metadata, not in its tensors: `config.json`'s
 //! `quantization_config`, whose `quant_method` names the producer whose schema the rest of the
-//! object follows. [`Declaration::read`] is the one place it is read, and it reads one
-//! producer's schema in that producer's spelling: ModelOpt's (`modelopt`). Another producer, or
-//! an algorithm no operator of this build serves, is refused by name before any tensor is read.
+//! object follows. [`Declaration::read`] is the one place it is read, and it reads each producer's
+//! schema in that producer's spelling: ModelOpt's (`modelopt`) and the block-scaled FP8 producer's
+//! (`fp8`, [`mx`]). Another producer, or an algorithm no operator of this build serves, is refused
+//! by name before any tensor is read.
 //!
 //! ## The shard decides
 //!
@@ -13,8 +14,8 @@
 //! differ — an exclusion list that names a module the export then packed, or a declaration that
 //! quantizes a vocabulary matrix the shard holds in BF16 — and the tensor is the fact.
 //! [`Declaration::resolve`] reads the shard headers once and records which weights they store
-//! packed (a `weight_scale` beside the weight) into a [`Representation`], the one record
-//! [`Representation::scheme`] reads.
+//! packed (a `weight_scale` beside the weight, or a block-scaled export's `scale`) into a
+//! [`Representation`], the one record [`Representation::scheme`] reads.
 //!
 //! ## Mixed precision
 //!
@@ -22,13 +23,22 @@
 //! each packed weight takes the scheme its module states: per-tensor FP8 ([`Scheme::Fp8`]) or
 //! NVFP4 with encoded activations ([`Scheme::Nvfp4`]).
 //!
+//! ## Block-scaled exports
+//!
+//! The `fp8` producer's export (DeepSeek's) stores each quantized projection's `weight` with one
+//! UE8M0 `scale` per 32 × 32 block and states that activations are encoded per call
+//! (`activation_scheme: dynamic`); with `expert_dtype: fp4` a weight stored as packed bytes is
+//! MXFP4, one scale per 32 elements of each row. The shard decides per weight
+//! ([`Scheme::Mxfp8`], [`Scheme::Mxfp4`]), and [`mx`] reads both.
+//!
 //! ## Representations without an operator
 //!
 //! No operator of this build multiplies weight-only representations: NVFP4 weights under 16-bit
-//! activations (ModelOpt's `W4A16_NVFP4`) and FP8 weights scaled per block (ModelOpt's
-//! `FP8_PB_WO`, the `fp8` producer's `weight_block_size`, a `weight_scale_inv` beside a weight in
-//! a shard). A checkpoint that declares or stores one is refused, naming the module, until an
-//! operator serves it; it is never decoded into a dense matrix in its place.
+//! activations (ModelOpt's `W4A16_NVFP4`) and FP8 weights scaled per block under 16-bit
+//! activations (ModelOpt's `FP8_PB_WO`, a `weight_scale_inv` beside a weight in a shard), nor FP8
+//! blocks other than 32 × 32 UE8M0 ones. A checkpoint that declares or stores one is refused,
+//! naming the module, until an operator serves it; it is never decoded into a dense matrix in its
+//! place.
 //!
 //! ## The method follows the module
 //!
@@ -77,9 +87,11 @@ use crate::error::{Error, Result};
 
 pub(crate) mod dynamic;
 mod modelopt;
+pub mod mx;
 mod nvfp4;
 
 pub use modelopt::ModeloptManifest;
+pub use mx::{BlockScaled, Mxfp4Stack, Mxfp8Part, Mxfp8Weight};
 pub use nvfp4::{Nvfp4Names, Nvfp4Share, Nvfp4Stack, Nvfp4Weight};
 
 /// The spelling of a ModelOpt unified checkpoint's calibrated NVFP4 projection: the four fields
@@ -115,6 +127,15 @@ pub enum Scheme {
     /// stores them. Its product encodes each activation into NVFP4 at a scale measured from
     /// that activation on every call.
     DynamicNvfp4,
+    /// A block-scaled FP8 export's weight: E4M3 codes with one UE8M0 scale per 32 × 32 block,
+    /// read as an MXFP8 matrix (each block's scale repeated over its 32 rows, which is exact).
+    /// Its product encodes each activation into MXFP8 per 32 elements on every call
+    /// ([`ops::mx`]).
+    Mxfp8,
+    /// MXFP4: packed E2M1 codes, two a byte along the contraction, with one UE8M0 scale per 32
+    /// elements of each row (the `fp8` producer's `expert_dtype: fp4`). Its products encode each
+    /// activation into MXFP8 on every call.
+    Mxfp4,
 }
 
 /// What a checkpoint declares about the representation of its weights, before its shards are
@@ -137,6 +158,8 @@ pub struct Declaration {
     /// The projections of a dense checkpoint converted at load: a module pattern and the scheme
     /// the module's `weight` takes, [`Scheme::DynamicFp8`] or [`Scheme::DynamicNvfp4`].
     converted: Vec<(String, Scheme)>,
+    /// A block-scaled export's declaration (the `fp8` producer's); `None` for every other.
+    blocks: Option<BlockScaled>,
 }
 
 impl Declaration {
@@ -148,6 +171,7 @@ impl Declaration {
             names: UNIFIED_EXPORT,
             activations: None,
             converted: Vec::new(),
+            blocks: None,
         }
     }
 
@@ -184,9 +208,10 @@ impl Declaration {
     ///
     /// A checkpoint that states no `quantization_config` is [`Self::dense`]: the absence of a
     /// declaration is a statement about the checkpoint (nothing was quantized), not a gap to
-    /// fill with a guess. The producer served is ModelOpt (`quant_method: modelopt`), read in
-    /// its own spelling ([`modelopt_config`]); every other producer is refused by name, because
-    /// its fields would be read under names that mean something else.
+    /// fill with a guess. The producers served are ModelOpt (`quant_method: modelopt`, read in
+    /// its own spelling: [`modelopt_config`]) and the block-scaled FP8 producer (`fp8`,
+    /// [`BlockScaled::read`]); every other producer is refused by name, because its fields would
+    /// be read under names that mean something else.
     ///
     /// # Errors
     ///
@@ -206,29 +231,35 @@ impl Declaration {
         let fields = Fields::of("config.json.quantization_config", stated)?;
         match fields.text("quant_method")? {
             "modelopt" => modelopt_config(&fields),
+            "fp8" => Ok(Self {
+                blocks: Some(BlockScaled::read(&fields)?),
+                ..Self::dense()
+            }),
             other => Err(fields.refuse(
                 "quant_method",
                 format!(
                     "names the producer `{other}`; this build reads ModelOpt's declaration \
-                     (`modelopt`), and another producer's fields would be read under names that \
-                     mean something else"
+                     (`modelopt`) and the block-scaled FP8 one (`fp8`), and another producer's \
+                     fields would be read under names that mean something else"
                 ),
             )),
         }
     }
 
     /// This declaration with every weight's packing taken from what `checkpoint`'s shards hold:
-    /// a weight is packed when its shard stores the block scale (`weight_scale`) beside it.
+    /// a weight is packed when its shard stores the block scale (`weight_scale`) beside it, or,
+    /// for a block-scaled export, its `scale` ([`BlockScaled::resolve`]).
     ///
-    /// Both spellings name the block scales `weight_scale`, so a packed module's weight is
-    /// `<module>.weight` under either, whichever tensor holds its values.
+    /// Both ModelOpt spellings name the block scales `weight_scale`, so a packed module's weight
+    /// is `<module>.weight` under either, whichever tensor holds its values.
     ///
     /// # Errors
     ///
-    /// When a shard stores block-scaled FP8 (a `weight_scale_inv` beside a weight), which no
-    /// operator of this build multiplies, or a manifest calibrates a module whose shard stores
-    /// no packed weight: the export states an activation scale for a product the checkpoint
-    /// cannot compute encoded.
+    /// When a shard stores FP8 scaled per block under a `weight_scale_inv` beside a weight,
+    /// which no operator of this build multiplies, a block-scaled export's weight or scale is not
+    /// the format its declaration states, or a manifest calibrates a module whose shard stores no
+    /// packed weight: the export states an activation scale for a product the checkpoint cannot
+    /// compute encoded.
     pub fn resolve(&self, checkpoint: &Checkpoint) -> Result<Representation> {
         let beside = |suffix: &'static str| -> BTreeSet<String> {
             checkpoint
@@ -242,10 +273,18 @@ impl Declaration {
         if let Some(weight) = beside("_scale_inv").into_iter().next() {
             return Err(Error::weight(
                 &weight,
-                "is stored block-scaled (a `weight_scale_inv` beside it), and no operator of \
-                 this build multiplies block-scaled FP8 weights: the checkpoint is refused \
-                 until one does",
+                "is stored block-scaled under a `weight_scale_inv` beside it, and the block-scaled \
+                 weights this build multiplies are 32 x 32 blocks under UE8M0 `scale` tensors (the \
+                 `fp8` producer's `scale_fmt: ue8m0`): the checkpoint is refused until an operator \
+                 serves it",
             ));
+        }
+        if let Some(blocks) = &self.blocks {
+            return Ok(Representation {
+                declaration: self.clone(),
+                packed: BTreeSet::new(),
+                scaled: blocks.resolve(checkpoint)?,
+            });
         }
 
         let packed = if self.scheme == Scheme::Dense && self.layers.is_none() {
@@ -269,6 +308,7 @@ impl Declaration {
         Ok(Representation {
             declaration: self.clone(),
             packed,
+            scaled: BTreeMap::new(),
         })
     }
 
@@ -321,6 +361,9 @@ pub struct Representation {
     declaration: Declaration,
     /// The weights whose shards store a block scale beside them.
     packed: BTreeSet<String>,
+    /// A block-scaled export's scaled weights and the scheme each is read in,
+    /// [`Scheme::Mxfp8`] or [`Scheme::Mxfp4`], by the weight's full name.
+    scaled: BTreeMap<String, Scheme>,
 }
 
 impl Representation {
@@ -329,12 +372,17 @@ impl Representation {
         Self {
             declaration: Declaration::dense(),
             packed: BTreeSet::new(),
+            scaled: BTreeMap::new(),
         }
     }
 
     /// How the checkpoint stores `weight`, a weight's full checkpoint name.
     pub fn scheme(&self, weight: &str) -> Scheme {
         let declaration = &self.declaration;
+        if declaration.blocks.is_some() {
+            // A block-scaled export's weights are their shards' alone: scaled or dense.
+            return self.scaled.get(weight).copied().unwrap_or(Scheme::Dense);
+        }
         let packed = self.packed.contains(weight);
 
         if let Some(layers) = &declaration.layers {
@@ -360,6 +408,15 @@ impl Representation {
     /// The spelling the checkpoint's calibrated NVFP4 fields are read in.
     pub fn names(&self) -> Nvfp4Names {
         self.declaration.names
+    }
+
+    /// The UE8M0 scale tensor beside a block-scaled export's `weight`, a weight's full name, when
+    /// the export is one and the weight is scaled ([`BlockScaled::scale_of`]).
+    pub fn block_scale(&self, weight: &str) -> Option<String> {
+        let blocks = self.declaration.blocks?;
+        self.scaled
+            .contains_key(weight)
+            .then(|| blocks.scale_of(weight))
     }
 
     /// The calibrated activation tensor scale of `module` ([`Declaration::activation_scale`]).
@@ -563,6 +620,7 @@ mod tests {
         Representation {
             declaration,
             packed: weights.iter().map(|weight| (*weight).to_owned()).collect(),
+            scaled: BTreeMap::new(),
         }
     }
 

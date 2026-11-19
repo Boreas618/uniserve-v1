@@ -1147,6 +1147,18 @@ fn header_tensors(
 /// wrong number with a right shape. The variants the ABI has no type for are refused by name: they
 /// are real format types this operator set does not speak, and reading one as another type would be
 /// worse than refusing the shard.
+///
+/// Two format types are read as their bytes, `U8`, because what an export stores in them is bytes
+/// a quantized format's operators read, never values a tensor computes with:
+///
+/// - `F8_E8M0` holds UE8M0 block scales, each byte the biased exponent of a power of two
+///   (`2^(byte − 127)`), which the MX operators read as bytes ([`ops::mx`]);
+/// - `I8` holds packed E2M1 codes, two a byte, which a torch export stores as `int8` for want of a
+///   packed FP4 type.
+///
+/// No conversion reads `U8` as a number ([`crate::weights::convert`] converts floating types
+/// only), so such a tensor reaches a product only through a format's own reader
+/// ([`crate::quantization`]), which states what the bytes mean.
 fn element_type(path: &Path, tensor: &str, dtype: FormatDtype) -> Result<DType> {
     let refuses = |kind: &str| {
         Err(Error::Checkpoint {
@@ -1168,15 +1180,14 @@ fn element_type(path: &Path, tensor: &str, dtype: FormatDtype) -> Result<DType> 
         FormatDtype::F64 => Ok(DType::F64),
         FormatDtype::F8_E4M3 => Ok(DType::F8E4M3),
         FormatDtype::F4 => Ok(DType::F4),
+        FormatDtype::F8_E8M0 | FormatDtype::I8 => Ok(DType::U8),
         FormatDtype::BOOL => refuses("BOOL"),
-        FormatDtype::I8 => refuses("I8"),
         FormatDtype::U16 => refuses("U16"),
         FormatDtype::U64 => refuses("U64"),
         FormatDtype::C64 => refuses("C64"),
         FormatDtype::F6_E2M3 => refuses("F6_E2M3"),
         FormatDtype::F6_E3M2 => refuses("F6_E3M2"),
         FormatDtype::F8_E5M2 => refuses("F8_E5M2"),
-        FormatDtype::F8_E8M0 => refuses("F8_E8M0"),
         FormatDtype::F8_E4M3FNUZ => refuses("F8_E4M3FNUZ"),
         FormatDtype::F8_E5M2FNUZ => refuses("F8_E5M2FNUZ"),
         // The crate marks `Dtype` `#[non_exhaustive]`, so the language requires a catch-all: a
@@ -1365,6 +1376,30 @@ mod tests {
 
             // The ABI numbers every type a checkpoint may hold.
             assert!(ops::abi::code(dtype).is_ok(), "{name}");
+        }
+    }
+
+    /// UE8M0 block scales (`F8_E8M0`) and packed E2M1 pairs an export stores as `I8` are read as
+    /// their bytes, unchanged: a format's reader states what they mean.
+    #[test]
+    fn exponent_scales_and_packed_codes_are_read_as_their_bytes() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        let scales: [u8; 4] = [127, 128, 0, 254];
+        let packed: [u8; 4] = [0x21, 0xf7, 0x80, 0x0f];
+        shard(
+            root.path(),
+            &[
+                ("block.scale", FormatDtype::F8_E8M0, &[2, 2], &scales),
+                ("block.weight", FormatDtype::I8, &[2, 2], &packed),
+            ],
+        );
+
+        let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
+        for (name, bytes) in [("block.scale", scales), ("block.weight", packed)] {
+            let located = checkpoint.locate(name).expect(name);
+            assert_eq!(located.dtype, DType::U8, "{name}");
+            assert_eq!(located.shape.dims(), [2, 2], "{name}");
+            assert_eq!(checkpoint.read(name).expect(name), bytes, "{name}");
         }
     }
 

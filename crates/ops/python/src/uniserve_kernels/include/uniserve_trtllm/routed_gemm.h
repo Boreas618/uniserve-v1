@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// The entry of a routed, block-scaled NVFP4 product of trtllm-gen's batched-GEMM library: the
-// operator's call, checked against the geometry the module was compiled for, handed to the
-// library's runner.
+// The entry of a routed, block-scaled product of trtllm-gen's batched-GEMM library (NVFP4, or MXFP8
+// activations against MXFP4 weights): the operator's call, checked against the geometry the module
+// was compiled for, handed to the library's runner.
 //
 // What the entry owns: the checks that turn a misplaced operand into a message (the compiled
 // geometry, the operand dtypes, the scratch floor), the per-call tactic choice, and the device word
 // the GEMM bounds its M by -- the padded route count. What it does not own: any arithmetic. The
 // product is the library's, and everything the call states is either its geometry or an operand.
 //
-// The routed products (`gather_gemm_nvfp4`'s first matrix, `route_gemm_nvfp4`'s second) differ
-// only in their runner, the rows the runner sizes its tactics by, what the call's counts must
+// The routed products (`gather_gemm_nvfp4`'s and `gather_gemm_mxfp4`'s first matrix,
+// `route_gemm_nvfp4`'s and `route_gemm_mxfp4`'s second) differ only in their runner, the rows the
+// runner sizes its tactics by, the element types a call may state, what the call's counts must
 // satisfy and the operands the runner takes. A package's entry unit includes its operator's
-// generated header (its call structure), then this one, states those differences as a
-// `Product` (`using Runner`, `runner()`, `rows(call)`, `counts(call)`, `run(...)`) and defines its
-// C entry as `uniserve::trtllm::routed::entry<Product>(call, stream)`.
+// generated header (its call structure), then this one, states those differences as a `Product`
+// (`using Runner`, `runner()`, `rows(call)`, `refused_types(call)`, `counts(call)`, `run(...)`)
+// and defines its C entry as `uniserve::trtllm::routed::entry<Product>(call, stream)`.
 //
 // The build states the geometry as definitions (`uniserve_build_server.trtllm.geometry`).
 
@@ -134,8 +135,10 @@ int refuse_geometry(Call* call) {
 template <typename Product, typename Call>
 int launch(Call* call, void* stream) {
   std::memset(call->error, 0, sizeof(call->error));
-  if (call->dtype != UNISERVE_DTYPE_BF16) {
-    return refuse(call, "the product's output is compiled as bf16 and this module is the bf16 one");
+  // The element types are compiled in with the cubins; a call that states others belongs to
+  // another module.
+  if (char const* refusal = Product::refused_types(call)) {
+    return refuse(call, refusal);
   }
   if (!compiled_for<Product>(call)) {
     return refuse_geometry(call);

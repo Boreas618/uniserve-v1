@@ -1,0 +1,66 @@
+# The gather_gemm_mxfp4 operator's trtllm-gen backend.
+#
+# One native module per descriptor: the trtllm-gen batched-GEMM launch code that
+# FlashInfer's FP4 block-scale MoE calls for its routed first matrix
+# (`PermuteGemm1::Runner`), compiled out of the FlashInfer distribution against the
+# pinned `trtllm-gen-bmm` artifact, with the artifact's cubins this descriptor's
+# options select published beside the module under `cubins/`. The entry is the
+# operator's `GatherMxfp4Call`.
+#
+# The kernels take MXFP8 activations (E4M3 codes, one UE8M0 scale per 32 elements, the
+# tokens' own table) against MXFP4 weights (E2M1 codes two a byte, one UE8M0 scale per 32
+# elements, swizzled), fuse the gated SwiGLU with its clamp (`gate <= L`, `|up| <= L`,
+# one `L` per expert) into the epilogue and encode the gated rows into MXFP8 there, their
+# scales in the 128x4 atom `route_gemm_mxfp4` reads. The epilogue's scale is the OCP rule's
+# (`ops::mx::ScaleRule::Ocp`: `2^(floor(log2 amax) - 8)`, quotients above 448 saturating).
+
+op = "gather_gemm_mxfp4"
+backend = "trtllm"
+interface_version = 1
+
+[toolchain]
+packages = ["flashinfer-python"]
+
+[module.entries]
+# The cubin loader's load entry (`uniserve_trtllm/cubins.h`): `ops` hands it the directory of the
+# module's files once it has opened the library, and the module reads its cubins from there.
+load = "uniserve_trtllm_load"
+
+[source]
+kind = "cuda"
+unit = "src/entry.cu"
+
+[kernel]
+requires = ["tensor_memory"]
+
+# `hidden_5120_intermediate_2304_experts_384_top_6_tile_128x128_cluster_2x1`.
+#
+# `tile` and `cluster` are the MMA tactic's, enforced where a tactic is chosen: the build
+# publishes only the library's kernels built with them, so the runner's configuration list is
+# exactly this geometry. The artifact's MxE4m3 x MxE2m1 gated kernels of 128-token tiles are
+# two-block clusters whose output scales are the 128x4 atom. The weights' rows are whole
+# 128-row tiles of the shuffled gated matrix and both contractions whole 32-element scale
+# blocks; the runner refuses at launch a size no published tactic divides.
+[[kernel.descriptors]]
+dimensions = { hidden = { multiple = 128 }, intermediate = { multiple = 64 }, experts = { min = 1 }, top = { min = 1 }, tile = ["128x128"], cluster = ["2x1"] }
+
+# The options the published kernels were built with, as the library's table states them. The
+# artifact's gated kernels all carry a per-expert, per-column f32 bias (`mBiasType = M`); this
+# operator has none, and the entry hands them a null pointer, which the runner takes as no
+# bias. `mClampBeforeAct` is the clamp the entry's limit table feeds.
+[parameters.selected]
+mDtypeA = "Dtype::MxE2m1"
+mDtypeB = "Dtype::MxE4m3"
+mDtypeC = "Dtype::MxE4m3"
+mDtypeAcc = "Dtype::Fp32"
+mSfLayoutA = "SfLayout::R128c4"
+mSfLayoutB = "SfLayout::Linear"
+mSfLayoutC = "SfLayout::R128c4"
+mSfBlockSizeA = 32
+mUsePerTokenSfA = 0
+mUsePerTokenSfB = 0
+mUseShuffledMatrix = 1
+mBiasType = "BiasType::M"
+mFusedAct = 1
+mActType = "ActType::SwiGlu"
+mClampBeforeAct = 1

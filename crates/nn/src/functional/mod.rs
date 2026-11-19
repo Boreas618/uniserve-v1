@@ -56,6 +56,7 @@ mod indexed;
 mod linear;
 mod logits;
 mod moe;
+mod mx;
 mod noise;
 mod norm;
 mod nvfp4;
@@ -87,14 +88,17 @@ pub use indexed::{index_scores, indexed_attention};
 pub use linear::{WeightOrder, dynamic_scales, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
 pub use moe::{
-    EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN,
+    EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN, Routing,
     SORT_MAPS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, expert_combine, expert_dispatch,
-    expert_exchange_fused, gather_gemm, gather_gemm_nvfp4, moe_sort, moe_unpermute, route_gemm,
-    route_gemm_nvfp4, sigmoid_gated_add_, topk_softmax,
+    expert_exchange_fused, gather_gemm, gather_gemm_mxfp4, gather_gemm_nvfp4, moe_sort,
+    moe_unpermute, route_gemm, route_gemm_mxfp4, route_gemm_nvfp4, sigmoid_gated_add_,
+    topk_softmax,
 };
+pub use mx::{linear_mxfp8, mxfp8_quantize};
 pub use noise::{philox_normal, philox_normal_like, philox_normal_rows};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
 pub use nvfp4::nvfp4_quantize;
+pub use ops::moe::routing::Scoring;
 pub use pool::adaptive_avg_pool2d;
 pub use recurrent::{StateAxes, causal_conv1d, gated_delta_rule};
 pub use residual_norm::{

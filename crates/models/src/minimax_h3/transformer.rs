@@ -92,6 +92,7 @@ pub(crate) fn mlp_config(config: &TransformerConfig, tensor: Split) -> MlpConfig
         intermediate: config.intermediate_size,
         activation: Activation::Silu,
         rounding: Rounding::Stepwise,
+        limit: None,
         gate_up: GateUp::ValueFirst(gate_up),
         down,
         bias: false,

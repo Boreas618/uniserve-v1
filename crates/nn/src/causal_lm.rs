@@ -25,7 +25,7 @@ use proto::config::Quantization;
 
 use crate::error::{ModelId, Result};
 use crate::family::{ExpertOrder, TextCheckpoint, TextFamily, TextModel, TextPlacement};
-use crate::functional::Activation;
+use crate::functional::{Activation, Scoring};
 use crate::modules::{ExpertLayout, MoE, MoEConfig};
 use crate::quantization::Declaration;
 use crate::{Checkpoint, ExpertExchange, VarBuilder, WeightLoader};
@@ -237,6 +237,10 @@ impl MoeConfig {
             top: self.num_experts_per_tok,
             activation,
             renormalize: self.norm_topk_prob,
+            scoring: Scoring::Softmax,
+            selection_bias: None,
+            routed_scale: None,
+            limit: None,
             router: "gate",
             list: "experts",
             up: "up_proj",

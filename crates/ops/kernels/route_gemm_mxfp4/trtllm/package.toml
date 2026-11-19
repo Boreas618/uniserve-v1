@@ -1,0 +1,56 @@
+# The route_gemm_mxfp4 operator's trtllm-gen backend.
+#
+# One native module per descriptor: the trtllm-gen batched-GEMM launch code that
+# FlashInfer's FP4 block-scale MoE calls for its routed second matrix (`Gemm2::Runner`),
+# compiled out of the FlashInfer distribution against the pinned `trtllm-gen-bmm`
+# artifact, with the artifact's cubins this descriptor's options select published beside
+# the module under `cubins/`. The entry is the operator's `RouteMxfp4Call`.
+#
+# The kernels read the gated MXFP8 rows `gather_gemm_mxfp4` wrote (E4M3 codes, scales in
+# the 128x4 atom) against MXFP4 down weights and write BF16, one row per route.
+
+op = "route_gemm_mxfp4"
+backend = "trtllm"
+interface_version = 1
+
+[toolchain]
+packages = ["flashinfer-python"]
+
+[module.entries]
+# The cubin loader's load entry (`uniserve_trtllm/cubins.h`): `ops` hands it the directory of the
+# module's files once it has opened the library, and the module reads its cubins from there.
+load = "uniserve_trtllm_load"
+
+[source]
+kind = "cuda"
+unit = "src/entry.cu"
+
+[kernel]
+requires = ["tensor_memory"]
+
+# `hidden_5120_intermediate_2304_experts_384_top_6_tile_128x128_cluster_2x1`.
+#
+# The tile and cluster are the MMA tactic's, as `gather_gemm_mxfp4` states them: the artifact's
+# MxE4m3 x MxE2m1 kernels of 128-token tiles are two-block clusters reading 128x4 activation
+# scales. The output rows are whole 128-row tiles of the shuffled down matrix and the
+# contraction whole 32-element scale blocks.
+[[kernel.descriptors]]
+dimensions = { hidden = { multiple = 128 }, intermediate = { multiple = 64 }, experts = { min = 1 }, top = { min = 1 }, tile = ["128x128"], cluster = ["2x1"] }
+
+# The options the published kernels were built with, as the library's table states them. The
+# BF16-output kernels carry a per-expert, per-column f32 bias (`mBiasType = M`); the entry hands
+# them a null pointer, which the runner takes as no bias.
+[parameters.selected]
+mDtypeA = "Dtype::MxE2m1"
+mDtypeB = "Dtype::MxE4m3"
+mDtypeC = "Dtype::Bfloat16"
+mDtypeAcc = "Dtype::Fp32"
+mSfLayoutA = "SfLayout::R128c4"
+mSfLayoutB = "SfLayout::R128c4"
+mSfBlockSizeA = 32
+mUsePerTokenSfA = 0
+mUsePerTokenSfB = 0
+mUseShuffledMatrix = 1
+mBiasType = "BiasType::M"
+mFusedAct = 0
+mEltwiseActType = "EltwiseActType::None"

@@ -1,4 +1,5 @@
-//! Expert routing: the router's softmax top-k, and the logical-to-physical expert map.
+//! Expert routing: the router's top-k over softmax or sqrt-softplus scores, and the
+//! logical-to-physical expert map.
 //!
 //! Both operators are single cubins whose launch shapes follow from the token count, so this module
 //! computes their grids; everything a module bakes in — the score dtype, the expert count, the top-k
@@ -6,10 +7,21 @@
 //!
 //! # `topk_softmax`
 //!
-//! One warp routes one token: it takes the row's maximum, sums `expf(score − max)` over the warp by
-//! xor butterflies, keeps the `top` largest probabilities in descending order with equal ones in
-//! ascending expert order, and divides them by their sum clamped below by `FLT_EPSILON` when
-//! `Descriptor::renormalize` holds; an optional per-expert scale multiplies the result in FP32.
+//! One warp routes one token. Its scores are the descriptor's [`Scoring`] of the row's logits:
+//!
+//! - `softmax`: it takes the row's maximum, sums `expf(logit − max)` over the warp by xor
+//!   butterflies, and a score is `exp / sum`; the selected scores are divided by their sum
+//!   clamped below by `FLT_EPSILON` when `Descriptor::renormalize` holds;
+//! - `sqrtsoftplus` (DeepSeek-V4's router): a score is `sqrtf(softplus(logit))`, `softplus(x)`
+//!   being `log1pf(expf(x))` and `x` itself above 20 (PyTorch's threshold); the selected scores
+//!   are divided by their sum plus `1e-20`, the reference's renormalization.
+//!
+//! It keeps the `top` largest selection keys in descending order with equal ones in ascending
+//! expert order. A key is the score, or the score plus the expert's selection bias when the
+//! descriptor reads one (`[experts]` FP32): the bias decides which experts a token takes and never
+//! enters a weight, which is the selected experts' unbiased scores. An optional per-expert scale
+//! multiplies the result in FP32; a router's routed scaling factor is that scale, the same for
+//! every expert.
 //! With a map, each route's id is written as the weight row the map names: the selection is over
 //! logical ids, so which experts a token picks, and the order of equal scores, do not depend on
 //! where the experts lie (`docs/admin.md`, Expert redistribution). The map is a launch value, a
@@ -50,17 +62,40 @@ use crate::{Error, Op, Result, Twins};
 
 use super::row_stride;
 
+/// How a router turns a token's logits into the scores it selects experts by and weighs their
+/// routes with.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Scoring {
+    /// The softmax over the experts.
+    Softmax,
+    /// `sqrt(softplus(logit))`, each expert's on its own.
+    SqrtSoftplus,
+}
+
+impl fmt::Display for Scoring {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Softmax => "softmax",
+            Self::SqrtSoftplus => "sqrtsoftplus",
+        })
+    }
+}
+
 /// One compilation of `topk_softmax`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TopkDescriptor {
-    /// Element type of the router scores.
+    /// Element type of the router logits.
     pub scores: DType,
     /// Experts in the router's vocabulary: the softmax reduction length.
     pub experts: u32,
     /// Experts each token routes to.
     pub top: u32,
-    /// Divide the selected probabilities by their sum.
+    /// How the logits become scores.
+    pub scoring: Scoring,
+    /// Divide the selected scores by their sum.
     pub renormalize: bool,
+    /// Whether an `[experts]` FP32 selection bias is added to the scores the top-k selects by.
+    pub bias: bool,
     /// Element type of the optional per-expert scale vector.
     pub scale: Option<DType>,
 }
@@ -75,7 +110,9 @@ impl fmt::Display for TopkDescriptor {
             .field("scores", abi::name(self.scores))
             .field("experts", self.experts)
             .field("top", self.top)
+            .field("scoring", self.scoring)
             .field("renormalize", self.renormalize)
+            .field("bias", self.bias)
             .variant("scale", &scale)
             .finish(formatter)
     }
@@ -88,6 +125,9 @@ pub struct TopkArgs {
     pub scores: Operand,
     /// `[experts]` per-expert scale multiplied into the weights, when the descriptor has one.
     pub scale: Option<Operand>,
+    /// `[experts]` FP32 selection bias added to the scores the top-k selects by, exactly when
+    /// the descriptor reads one.
+    pub bias: Option<Operand>,
     /// `[tokens, top]` u32 expert ids, written.
     pub ids: Operand,
     /// `[tokens, top]` FP32 route weights, written.
@@ -204,6 +244,20 @@ impl Op for TopkSoftmax {
             }
         }
 
+        match (descriptor.bias, &args.bias) {
+            (true, Some(bias)) => {
+                bias.require_shape(Self::NAME, &[experts])?;
+                bias.require_row(Self::NAME, DType::F32, experts)?;
+            }
+            (false, None) => {}
+            _ => {
+                return Err(Error::argument(
+                    Self::NAME,
+                    "the selection bias and the descriptor disagree",
+                ));
+            }
+        }
+
         if let Some(map) = &args.map {
             map.require_shape(Self::NAME, &[experts])?;
             if map.dtype != DType::U32 {
@@ -286,13 +340,14 @@ impl Op for TopkSoftmax {
                     .i32("scale_kind", scale_kind);
             }
         }
-        arguments
-            .view("ids", &args.ids)
-            .view("weights", &args.weights);
         // Each optional table is a null pointer without one, which the program reads as absent.
         let pointer = |operand: Option<Operand>| {
             operand.map_or(DevicePtr::from_address(0), |operand| operand.ptr)
         };
+        arguments
+            .pointer("bias", pointer(args.bias))
+            .view("ids", &args.ids)
+            .view("weights", &args.weights);
         arguments
             .pointer("map", pointer(args.map))
             .pointer("live", pointer(args.live))
@@ -312,10 +367,16 @@ impl Op for TopkSoftmax {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        let reduction = u64::from(descriptor.experts);
+        // A softmax reduces over every expert; a sqrt-softplus score is its expert's own and the
+        // renormalization sums the selected ones.
+        let reduction = match descriptor.scoring {
+            Scoring::Softmax => u64::from(descriptor.experts),
+            Scoring::SqrtSoftplus => u64::from(descriptor.top),
+        };
         let accumulate = DType::F32;
-        // The softmax's maximum, its `expf` (one ulp of FP32), the butterfly sum and the divide cost
-        // at most a few `u` on top of the reduction's own `γₙ`; the ids are exact.
+        // The softmax's maximum or the softplus's `expf` and `log1pf` and the root (one ulp of FP32
+        // each), the butterfly sum and the divide cost at most a few `u` on top of the reduction's
+        // own `γₙ`; the ids are exact.
         let rounding = Tolerance::rounding(reduction, accumulate, DType::F32);
         Tolerance::new(
             rounding.atol,
