@@ -352,7 +352,7 @@ impl Scheduler {
         columns.rows.calls.push(Row {
             slot,
             kind: phase,
-            cache_group: 0,
+            replay: request.replay.clone(),
             rows: row..row + 1,
         });
         columns.rows.positions.extend(rotary);
@@ -1062,6 +1062,7 @@ mod tests {
             num_prompt_tokens: prompt_tokens,
             num_computed_tokens: computed,
             num_cached_tokens: 0,
+            replay: 0..0,
             num_host_tokens: 0,
             listing: 0,
             keys: Vec::new(),
@@ -1158,7 +1159,7 @@ mod tests {
         let row = |slot, rows| Row {
             slot,
             kind: Phase::Prefill,
-            cache_group: 0,
+            replay: 0..0,
             rows,
         };
         assert_eq!(rows.calls, vec![row(1, 0..1), row(2, 1..2)]);

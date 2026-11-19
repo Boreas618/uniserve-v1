@@ -73,7 +73,6 @@ fn batch(phase: Phase, page_size: u32, on_meta: bool) -> TokenBatch {
 
     TokenBatch {
         positions: column(DType::I32),
-        slot_mapping: column(DType::U32),
         seq_lens: column(DType::U32),
         query_offsets: column(DType::U32),
         logits_rows: column(DType::U32),

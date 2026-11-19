@@ -34,8 +34,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::batch::{Batch, BatchOutput, Phase, TimingCounters, Variant};
+use nn::TokenBatch;
 use nn::capability::{Encoder, PatchFormat};
-use nn::{NO_SLOT, TokenBatch};
 use platform::Stream;
 use tensor::{DType, Tensor};
 
@@ -52,14 +52,14 @@ use ops::allocator::ALIGNMENT;
 const PHASES: &[Phase] = &[Phase::TextEncode];
 
 /// The input columns, in the order they lie in the input block, each of 4-byte elements:
-/// `[tokens]` U32 ids, `[tokens]` I32 positions, `[tokens]` U32 slot mapping, `[rows]` U32
-/// sequence lengths, `[rows + 1]` U32 query offsets, `[rows]` U32 logits rows.
+/// `[tokens]` U32 ids, `[tokens]` I32 positions, `[rows]` U32 sequence lengths, `[rows + 1]` U32
+/// query offsets, `[rows]` U32 logits rows. An encode reads no cache, so its tokens write no
+/// slot.
 const IDS: usize = 0;
 const POSITIONS: usize = 1;
-const SLOT_MAPPING: usize = 2;
-const SEQ_LENS: usize = 3;
-const QUERY_OFFSETS: usize = 4;
-const LOGITS_ROWS: usize = 5;
+const SEQ_LENS: usize = 2;
+const QUERY_OFFSETS: usize = 3;
+const LOGITS_ROWS: usize = 4;
 
 /// What a deployment fixes of an encoder runner. Immutable once the runner is built.
 #[derive(Clone, Debug)]
@@ -102,7 +102,7 @@ pub(crate) struct EncoderRunner {
     /// The rank's media memory, where the products lie.
     memory: Arc<BufferMemory>,
     /// Each input column's byte offset in the input block.
-    offsets: [u64; 6],
+    offsets: [u64; 5],
     /// The prompt ids of the step being prepared, padded to its bucket's tokens: what the
     /// encode computes its host values from (`Encoder::encode`).
     prompt: RefCell<Vec<u32>>,
@@ -112,14 +112,14 @@ pub(crate) struct EncoderRunner {
 }
 
 /// The elements of each input column for `rows` rows and `tokens` tokens.
-const fn extents(rows: usize, tokens: usize) -> [usize; 6] {
-    [tokens, tokens, tokens, rows, rows + 1, rows]
+const fn extents(rows: usize, tokens: usize) -> [usize; 5] {
+    [tokens, tokens, rows, rows + 1, rows]
 }
 
 /// Each input column's byte offset for buckets of at most `rows` rows and `tokens` tokens, and
 /// the bytes of the input block.
-fn offsets(rows: usize, tokens: usize) -> ([u64; 6], u64) {
-    let mut offsets = [0; 6];
+fn offsets(rows: usize, tokens: usize) -> ([u64; 5], u64) {
+    let mut offsets = [0; 5];
     let mut bytes = 0;
     for (offset, extent) in offsets.iter_mut().zip(extents(rows, tokens)) {
         *offset = bytes;
@@ -439,7 +439,6 @@ impl EncoderRunner {
                 as_u32(&columns.rows.positions).into_iter(),
                 (tokens, 0),
             )?;
-            self.write(block, SLOT_MAPPING, std::iter::empty(), (tokens, NO_SLOT))?;
             self.write(
                 block,
                 SEQ_LENS,
@@ -532,14 +531,7 @@ impl Forward for EncoderRunner {
     /// row per row of the encode's layout.
     fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
         let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
-        let [
-            _,
-            positions,
-            slot_mapping,
-            seq_lens,
-            query_offsets,
-            logits_rows,
-        ] = extents(rows, tokens);
+        let [_, positions, seq_lens, query_offsets, logits_rows] = extents(rows, tokens);
 
         // A profile run computes over a prompt of its bucket's tokens like any other.
         let prompt = {
@@ -552,7 +544,6 @@ impl Forward for EncoderRunner {
 
         let batch = TokenBatch {
             positions: self.column(POSITIONS, positions, DType::I32)?,
-            slot_mapping: self.column(SLOT_MAPPING, slot_mapping, DType::U32)?,
             seq_lens: self.column(SEQ_LENS, seq_lens, DType::U32)?,
             query_offsets: self.column(QUERY_OFFSETS, query_offsets, DType::U32)?,
             logits_rows: self.column(LOGITS_ROWS, logits_rows, DType::U32)?,
@@ -607,8 +598,7 @@ impl Forward for EncoderRunner {
         *self.prompt.borrow_mut() = vec![0; tokens];
         self.images.borrow_mut().clear();
         for (column, elements) in extents(rows, tokens).into_iter().enumerate() {
-            let padding = if column == SLOT_MAPPING { NO_SLOT } else { 0 };
-            self.write(columns, column, std::iter::empty(), (elements, padding))?;
+            self.write(columns, column, std::iter::empty(), (elements, 0))?;
         }
         Ok(())
     }

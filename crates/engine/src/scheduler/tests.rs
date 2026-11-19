@@ -297,6 +297,7 @@ pub(super) fn attached(attachments: &[(GroupId, OwnerId, u32)]) -> Request {
         num_prompt_tokens: 3,
         num_computed_tokens: 0,
         num_cached_tokens: 0,
+        replay: 0..0,
         num_host_tokens: 0,
         listing: 0,
         keys: Vec::new(),

@@ -91,6 +91,10 @@ pub(crate) struct Request {
     pub num_computed_tokens: u32,
     /// The tokens of its prefix hit, over all tiers.
     pub num_cached_tokens: u32,
+    /// The positions of its prefix hit it recomputes the sliding windows of (SD §4.4 "Bounded
+    /// replay"): from where it computes on to the end of the hit, set when it is admitted;
+    /// `0..0` for a request that replays nothing. Its calls state it ([`crate::batch::Row::replay`]).
+    pub replay: std::ops::Range<u32>,
     /// Of `num_cached_tokens`, the tokens its admission loaded from the host tier: the hit
     /// beyond what its `Pin`s found on the device. Set with the hit once the admission's last
     /// answer arrived, and counted as host hits at admission.
@@ -257,6 +261,7 @@ impl Request {
             num_prompt_tokens,
             num_computed_tokens: 0,
             num_cached_tokens: 0,
+            replay: 0..0,
             num_host_tokens: 0,
             listing: 0,
             keys: Vec::new(),

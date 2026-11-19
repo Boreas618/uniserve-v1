@@ -472,7 +472,7 @@ mod tests {
             columns.rows.calls.push(Row {
                 slot: row + 1,
                 kind: phase,
-                cache_group: 0,
+                replay: 0..0,
                 rows: row..row + 1,
             });
             columns.input_ids.extend_from_slice(inputs);

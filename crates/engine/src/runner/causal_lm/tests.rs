@@ -16,12 +16,12 @@ use crate::batch::{
     Rows, Shape as BatchShape, StateCopy, StateDirection, Variant,
 };
 use nn::capability::Drafter;
-use nn::family::{CacheShape, ExpertShape, StateField, StateShape, TextModel, TokenHistory};
+use nn::family::{CacheField, ExpertShape, StateField, StateShape, TextModel, TokenHistory};
 use nn::functional::{
     WeightOrder, embedding, kv_write_, paged_attention, rms_norm, zero_arrival_counters_,
 };
 use nn::modules::Linear;
-use nn::{CausalLm, ExpertExchange, KvCache, KvPlanes, NO_SLOT, RecurrentState, TokenBatch};
+use nn::{CausalLm, ExpertExchange, KvCache, NO_SLOT, RecurrentState, TokenBatch};
 use ops::Generation;
 use ops::moe::exchange::{Mode, TransportShape};
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
@@ -84,6 +84,12 @@ const CANDIDATES: u32 = 3;
 /// position before a request's first token.
 const HISTORY: u32 = 2;
 const FILL: u32 = 0;
+
+/// The cache fields of the test model and of its drafter: the keys and values of one layer of
+/// [`HEADS`] heads of [`DIM`].
+fn fields() -> Vec<CacheField> {
+    CacheField::keys_and_values(1, HEADS as u32, DIM as u32)
+}
 
 /// A meta tensor: a shape and an element type at an address nothing reads.
 fn meta(shape: impl Into<tensor::Shape>, dtype: DType) -> Tensor {
@@ -226,13 +232,8 @@ impl TinyDrafter {
 }
 
 impl Drafter for TinyDrafter {
-    fn cache(&self) -> CacheShape {
-        CacheShape {
-            index_keys: None,
-            layers: 1,
-            kv_heads: HEADS as u32,
-            head_dim: DIM as u32,
-        }
+    fn cache(&self) -> Vec<CacheField> {
+        fields()
     }
 
     fn state_layers(&self) -> Vec<StateShape> {
@@ -406,13 +407,8 @@ impl TextModel for Tiny {
         DType::BF16
     }
 
-    fn cache(&self) -> CacheShape {
-        CacheShape {
-            index_keys: None,
-            layers: 1,
-            kv_heads: HEADS as u32,
-            head_dim: DIM as u32,
-        }
+    fn cache(&self) -> Vec<CacheField> {
+        fields()
     }
 
     fn state_layers(&self) -> Vec<StateShape> {
@@ -444,23 +440,18 @@ impl TextModel for Tiny {
     }
 }
 
-/// One attention group of one layer over `pages` meta pages, with the page table `table`.
+/// One attention group of one layer over `pages` meta pages, with the page table `table`; a
+/// forward lends it the batch's slot mapping.
 fn group(pages: usize, table: Tensor) -> KvCache {
-    let plane = || meta((pages, PAGE as usize, HEADS, DIM), DType::BF16);
-    let flags = || meta((pages, 1, 1, 1), DType::U8);
-
     KvCache {
         block_tables: table,
+        slot_mapping: meta(0, DType::U32),
+        starts: None,
         page_size: PAGE,
-        layers: vec![KvPlanes {
-            index_keys: None,
-            key: plane(),
-            value: plane(),
-            key_initialized: flags(),
-            value_initialized: flags(),
-            key_scale: None,
-            value_scale: None,
-        }],
+        planes: KvCache::planes_of(&fields(), DType::BF16, pages, PAGE, |shape, dtype| {
+            Ok(meta(shape, dtype))
+        })
+        .unwrap(),
         workspace: meta(1 << 16, DType::U8),
     }
 }
@@ -580,7 +571,7 @@ fn decode(slots: &[i32], temperatures: &[f32]) -> Batch {
                 .map(|row| Row {
                     slot: slots[row as usize] as u32,
                     kind: Phase::Decode,
-                    cache_group: 0,
+                    replay: 0..0,
                     rows: row..row + 1,
                 })
                 .collect(),
@@ -623,7 +614,7 @@ fn prefill(variant: Variant) -> Batch {
     let call = |slot: u32, rows: std::ops::Range<u32>| Row {
         slot,
         kind: Phase::Prefill,
-        cache_group: 0,
+        replay: 0..0,
         rows,
     };
 
@@ -691,7 +682,7 @@ fn filled(
     mapping: &[u32],
     scratch: Option<&[std::ops::Range<u32>]>,
 ) -> (Layout, Vec<u8>) {
-    let layout = Layout::of(config().buckets.iter(), 0, 0, HISTORY).unwrap();
+    let layout = Layout::of(config().buckets.iter(), 1, 0, 0, HISTORY).unwrap();
     let mut block = vec![0xA5_u8; layout.bytes() as usize];
 
     columns::fill(
@@ -700,7 +691,7 @@ fn filled(
         VOCABULARY as u32,
         &batch.columns,
         bucket,
-        mapping,
+        &[mapping.to_vec()],
         scratch,
         &mut block,
     )
@@ -793,12 +784,13 @@ fn written(slot: u32, position: u32) -> u32 {
     unit(slot, position / PAGE) * PAGE + position % PAGE
 }
 
-/// The cache slot each token of `batch` writes through `tables`, of a batch none of whose calls
-/// is refused.
+/// The cache slot each token of `batch` writes through `tables` in the test model's one
+/// attention group, of a batch none of whose calls is refused.
 fn mapping(batch: &Batch, tables: &BlockTables) -> Vec<u32> {
-    let (mapping, refused) = columns::slot_mapping(&batch.columns.rows, tables, PAGE, 1).unwrap();
+    let (mapping, refused) =
+        columns::slot_mapping(&batch.columns.rows, tables, PAGE, &[false]).unwrap();
     assert_eq!(refused, []);
-    mapping
+    mapping.concat()
 }
 
 /// The operators of `bucket`'s launch table, in launch order.
@@ -1066,7 +1058,7 @@ fn a_row_s_adjustments_are_its_bias_flag_and_its_ban_mask() {
 #[test]
 fn the_idle_inputs_of_every_bucket_write_and_commit_nothing() {
     let runner = runner(false);
-    let layout = Layout::of(config().buckets.iter(), 0, 0, HISTORY).unwrap();
+    let layout = Layout::of(config().buckets.iter(), 1, 0, 0, HISTORY).unwrap();
 
     for bucket in runner.buckets() {
         let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
@@ -1130,7 +1122,7 @@ fn chunk(cache_positions: &[i32]) -> Batch {
         calls: vec![Row {
             slot: 2,
             kind: Phase::Prefill,
-            cache_group: 0,
+            replay: 0..0,
             rows: 0..1,
         }],
         positions: vec![3; tokens],
@@ -1192,9 +1184,10 @@ fn a_token_whose_entry_is_read_only_or_missing_writes_nothing_and_fails_its_call
     // is refused while slot 2's call writes its tokens.
     let mut tables = held(&[2, 4]);
     commit_entry(&mut tables, 4, 0, 0);
-    let (mapping, refused) = columns::slot_mapping(&batch.columns.rows, &tables, PAGE, 1).unwrap();
+    let (mapping, refused) =
+        columns::slot_mapping(&batch.columns.rows, &tables, PAGE, &[false]).unwrap();
     assert_eq!(
-        mapping,
+        mapping[0],
         [
             written(2, 0),
             written(2, 1),
@@ -1220,8 +1213,9 @@ fn a_token_whose_entry_is_read_only_or_missing_writes_nothing_and_fails_its_call
 
     // A slot whose table holds no entry at a position its call writes is refused alike.
     let missing = held(&[2]);
-    let (mapping, refused) = columns::slot_mapping(&batch.columns.rows, &missing, PAGE, 1).unwrap();
-    assert_eq!(mapping[3..], [NO_SLOT, NO_SLOT]);
+    let (mapping, refused) =
+        columns::slot_mapping(&batch.columns.rows, &missing, PAGE, &[false]).unwrap();
+    assert_eq!(mapping[0][3..], [NO_SLOT, NO_SLOT]);
     assert!(refused[0].1.contains("holds no entry"), "{}", refused[0].1);
     let message = runner
         .prepare_inputs(&batch, &missing)
@@ -1252,19 +1246,6 @@ fn a_token_whose_entry_is_read_only_or_missing_writes_nothing_and_fails_its_call
         ..BatchOutput::default()
     };
     output.check(&batch).unwrap();
-}
-
-#[test]
-fn a_call_writes_only_the_attention_groups_the_runner_is_lent() {
-    let mut runner = captured();
-    let mut batch = prefill(Variant::PrefillGreedy);
-    batch.columns.rows.calls[1].cache_group = 1;
-
-    let message = runner
-        .prepare_inputs(&batch, &held(&[2, 4]))
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("cache group 1"), "{message}");
 }
 
 // ---- The choice of a bucket and the refusals ----------------------------------------------------
@@ -1974,7 +1955,7 @@ fn a_call_of_several_rows_reports_one_state_and_its_rows_tokens_in_order() {
     batch.columns.rows.calls = vec![Row {
         slot: 2,
         kind: Phase::Decode,
-        cache_group: 0,
+        replay: 0..0,
         rows: 0..2,
     }];
     batch.requests = vec![RequestId(9)];
@@ -2382,22 +2363,23 @@ fn stepwise_shape() -> StateShape {
 /// [`PAGES`] units, a row of [`TABLE_WIDTH`] pages per request slot, and a state region of 32
 /// checkpoints for a model that keeps a recurrent state.
 fn cache_config(stateful: bool) -> KvCacheConfig {
-    let (heads, dim) = (HEADS as u32, DIM as u32);
     let dtype = proto::request::PrefixCacheDtype::BFloat16;
+    let layout = CacheLayout::of(PAGE, &fields(), dtype).unwrap();
     let layout = if stateful {
-        CacheLayout::hybrid(PAGE, 1, heads, dim, dtype, &[state_shape()])
+        layout.with_state(&[state_shape()]).unwrap()
     } else {
-        CacheLayout::dense(PAGE, 1, heads, dim, dtype).validated()
+        layout
     };
 
     KvCacheConfig {
-        layout: Arc::new(layout.unwrap()),
+        layout: Arc::new(layout),
         units: PAGES as u32,
         slots: SLOTS,
         width: TABLE_WIDTH as u32,
         segments: None,
         workspace_bytes: 1 << 16,
         states: (if stateful { 32 } else { 0 }, None),
+        windows: Vec::new(),
     }
 }
 
@@ -2750,6 +2732,7 @@ fn regions(cache: &KvCacheMemory) -> CacheRegions {
         units: UNITS,
         states: cache.layout().state_group().map(|_| STATES),
         host: (0..groups).map(|group| Some(4 + group as u8)).collect(),
+        windows: Vec::new(),
     }
 }
 
@@ -3133,21 +3116,16 @@ fn speculating_config() -> CausalLmConfig {
 /// The draft cache of the test drafter: one layer over the pool's runs.
 fn draft_cache() -> KvCache {
     let pages = (POOL.span * POOL.units) as usize;
-    let plane = || meta((pages, POOL.page as usize, HEADS, DIM), DType::BF16);
-    let flags = || meta((pages, 1, 1, 1), DType::U8);
 
     KvCache {
         block_tables: meta((1, 1), DType::U32),
+        slot_mapping: meta(0, DType::U32),
+        starts: None,
         page_size: POOL.page,
-        layers: vec![KvPlanes {
-            index_keys: None,
-            key: plane(),
-            value: plane(),
-            key_initialized: flags(),
-            value_initialized: flags(),
-            key_scale: None,
-            value_scale: None,
-        }],
+        planes: KvCache::planes_of(&fields(), DType::BF16, pages, POOL.page, |shape, dtype| {
+            Ok(meta(shape, dtype))
+        })
+        .unwrap(),
         workspace: meta(1 << 16, DType::U8),
     }
 }
@@ -3190,7 +3168,7 @@ fn verification(temperature: f32) -> Batch {
     let call = |slot: u32, row: u32| Row {
         slot,
         kind: Phase::Verify,
-        cache_group: 0,
+        replay: 0..0,
         rows: row..row + 1,
     };
 
@@ -3250,7 +3228,7 @@ fn verification(temperature: f32) -> Batch {
 /// holds something else.
 fn speculating_block() -> (Layout, Vec<u8>) {
     let buckets = config().buckets.with_drafts(DRAFTS);
-    let layout = Layout::of(buckets.iter(), DRAFTS, POOL.width(MAX_KV_LEN), HISTORY).unwrap();
+    let layout = Layout::of(buckets.iter(), 1, DRAFTS, POOL.width(MAX_KV_LEN), HISTORY).unwrap();
     let block = vec![0xA5_u8; layout.bytes() as usize];
 
     (layout, block)
@@ -3421,7 +3399,7 @@ fn a_verification_batch_is_one_row_per_token_and_one_sequence_per_call() {
         &batch.columns,
         &speculation::token_rows(&batch.columns),
         &bucket,
-        &mapping,
+        &[mapping],
         &mut block,
     )
     .unwrap();
@@ -4112,10 +4090,10 @@ fn a_draft_page_is_read_as_runs_of_the_pool_s_pages() {
 
 #[test]
 fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
-    let (heads, dim) = (HEADS as u32, DIM as u32);
     let dtype = proto::request::PrefixCacheDtype::BFloat16;
-    let layout = CacheLayout::hybrid(PAGE, 1, heads, dim, dtype, &[state_shape()])
-        .and_then(|layout| layout.with_draft(1, heads, dim))
+    let layout = CacheLayout::of(PAGE, &fields(), dtype)
+        .and_then(|layout| layout.with_state(&[state_shape()]))
+        .and_then(|layout| layout.with_draft(&fields()))
         .unwrap();
     let cache_config = KvCacheConfig {
         layout: Arc::new(layout),
@@ -4354,7 +4332,7 @@ fn a_model_that_reads_token_ids_is_lent_them_by_every_forward() {
 #[test]
 fn a_slot_continues_from_as_many_ids_as_its_model_reads() {
     const WIDTH: usize = 3;
-    let layout = Layout::of(config().buckets.iter(), 0, 0, WIDTH as u32).unwrap();
+    let layout = Layout::of(config().buckets.iter(), 1, 0, 0, WIDTH as u32).unwrap();
     let bucket = Bucket::prefill(4, 8, Variant::PrefillWrite);
 
     // Slot 2's context is 1 2 3 before each chunk.
@@ -4546,17 +4524,10 @@ fn a_runner_over_stepwise_state_lends_verify_slots_to_every_forward_and_keeps_no
     let runs = model.state_layers();
     let model = Arc::new(model);
 
-    let (heads, dim) = (HEADS as u32, DIM as u32);
-    let layout = CacheLayout::hybrid(
-        PAGE,
-        1,
-        heads,
-        dim,
-        proto::request::PrefixCacheDtype::BFloat16,
-        &runs,
-    )
-    .and_then(|layout| layout.with_draft(1, heads, dim))
-    .unwrap();
+    let layout = CacheLayout::of(PAGE, &fields(), proto::request::PrefixCacheDtype::BFloat16)
+        .and_then(|layout| layout.with_state(&runs))
+        .and_then(|layout| layout.with_draft(&fields()))
+        .unwrap();
     let cache_config = KvCacheConfig {
         layout: Arc::new(layout),
         ..cache_config(true)

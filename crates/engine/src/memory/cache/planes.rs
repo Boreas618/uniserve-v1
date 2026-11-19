@@ -1,58 +1,62 @@
-//! The cache's planes: the device storage of the unit pool and its unit-level resets and copies.
+//! The cache's planes: the device storage of a pool of units and its unit-level resets and copies.
 //!
-//! Each field (keys, values) owns separate storages, cell-major, a cell being one column of one
-//! unit at `column · units + unit`:
+//! Each field of a pool ([`super::layout::PoolLayout`]) owns three storages, column-major, a cell
+//! being one column (an owner) of one unit:
 //!
 //! | Storage | Element | Shape |
 //! | --- | --- | --- |
-//! | `prefix_cache.{key,value}.values` | bytes | `[columns, units, plane_bytes]` |
-//! | `prefix_cache.{key,value}.scale` (FP8 only) | F32 | `[columns, units]` |
-//! | `prefix_cache.{key,value}.initialized` | U8 | `[columns, units]` |
-//! | `prefix_cache.index_key.values` (index keys only) | bytes | `[columns, units, index_bytes]` |
+//! | `prefix_cache.{field}.values` | bytes | column `c`: `[units, plane bytes of c]`, columns back to back |
+//! | `prefix_cache.{field}.initialized` | U8 | `[columns, units]` |
+//! | `prefix_cache.{field}.scale` (a field in the deployment's FP8 only) | F32 | `[columns, units]` |
 //!
-//! The names key the storages at the Storage Server, where every epoch that names the cache's
-//! region and a restarted engine find them, so they stay as they are whatever this module is
-//! called. Every storage of the planes is the memory of the region: the segments of the value
-//! planes are keyed by the segments the region's segment table names, and the other
-//! storages by the epoch of its first segment, the epoch whose ranks created the region's memory.
-//! Two epochs of one layout therefore address the same cells, and the worker that is given a unit
-//! resets its flags and scales before a batch writes it ([`Planes::reset_units`]).
+//! The names key the KV pool's storages at the Storage Server, where every epoch that names the
+//! cache's region and a restarted engine find them, so they stay as they are whatever this module
+//! is called; a model of keys and values names its fields `key` and `value`, and an indexer's keys
+//! are `index_key`, the names a handoff between replicas reads a rank's fields by
+//! (`storage::protocol::planes`). Every storage of the KV pool is the memory of the region: the
+//! segments of the value storages are keyed by the segments the region's segment table names, and
+//! the other storages by the epoch of its first segment, the epoch whose ranks created the
+//! region's memory. Two epochs of one layout therefore address the same cells, and the worker that
+//! is given a unit resets its flags and scales before a batch writes it ([`Planes::reset_units`]).
+//! A sliding window's pool is memory of the rank's own process ([`LocalStorage`]): nothing in it
+//! outlives a request, so no other epoch maps it.
 //!
-//! An attention group's page is one unit and each of its layers one column, so a layer's keys
-//! are the contiguous `[units, block_size, kv_heads, head_dim]` of its column and a page id is
-//! a unit id. A draft layer lies over `span` columns, so its pages are the `span · units`
-//! planes of those columns. A layer's index keys are its column's cells of the index-key
-//! storage in the same way, `[units, block_size / ratio, width]`, so a page's keys, values and
-//! index keys are addressed by one page id.
+//! A field group's page is one unit and each owner one column, so an owner's entries are the
+//! contiguous `[units, page / ratio, heads, width]` of its column and a page id is a unit id. A
+//! draft layer lies over `span` columns of the KV pool's keys and values, so its pages are the
+//! `span · units` planes of those columns.
 //!
-//! On a device whose cache splits ([`super::segments`]), each value storage is segmented alike:
+//! On a device whose KV pool splits ([`super::segments`]), each value storage is segmented alike:
 //! the last segments are given back ([`Planes::release_segments`]) and created again at their
-//! addresses ([`Planes::restore_segments`]). The flags, the scales and the index keys are not
-//! segmented: they are one storage each that stays mapped, a fraction of a plane's bytes. The
-//! state region's units are split by the same functions ([`take_split`], [`release_split`],
-//! [`restore_split`]) over segments of their own ([`super::states`]).
+//! addresses ([`Planes::restore_segments`]). The flags and the scales are not segmented: they are
+//! one storage each that stays mapped, a byte or four of a plane. The state region's units are
+//! split by the same functions ([`take_split`], [`release_split`], [`restore_split`]) over
+//! segments of their own ([`super::states`]).
 
 use std::sync::Arc;
 
-use nn::KvPlanes;
+use nn::KvPlane;
 use platform::{CopyBatch, DeviceId, SourceOrder, Stream, memset_2d_d8, memset_2d_d32};
 use tensor::{DType, Tensor};
 
-use super::layout::{CacheLayout, GroupLayout};
+use super::layout::{FieldLayout, GroupLayout, PoolLayout};
 use super::segments::{self, PlaneSegment};
 use crate::memory::allocation::Storage;
-use crate::memory::exclusive::{ExclusiveConfig, ExclusiveStorage, SegmentPart, SegmentedConfig};
+use crate::memory::exclusive::{
+    ExclusiveConfig, ExclusiveStorage, LocalStorage, SegmentPart, SegmentedConfig,
+};
 use crate::memory::lend;
 use crate::worker::{Error, Result};
-
-/// The storages' names, which a handoff between replicas reads a rank's fields by
-/// (`storage::protocol::planes`): the value storages, keys then values; their initialization
-/// flags; their FP8 scales; and the index keys.
-use ::storage::protocol::planes::{FLAGS, INDEX_KEYS, SCALES, VALUES};
 
 /// The neutral FP8 scale, `1.0f32`, as the bits a 32-bit fill writes: what every scale of a new
 /// unit of the planes and of a scratch page set holds.
 pub(super) const UNIT_SCALE: u32 = 1.0_f32.to_bits();
+
+/// The names of the storages of field `name`: its entries, its initialization flags and its page
+/// scales.
+pub(crate) fn storage_names(name: &str) -> [String; 3] {
+    ["values", "initialized", "scale"].map(|part| format!("prefix_cache.{name}.{part}"))
+}
 
 /// The consecutive runs of `units`, as `(first, count)` in ascending order, each unit once.
 pub(crate) fn unit_runs(units: &[u32]) -> Vec<(u32, u32)> {
@@ -70,20 +74,19 @@ pub(crate) fn unit_runs(units: &[u32]) -> Vec<(u32, u32)> {
     runs
 }
 
-/// The segments of a split storage set (a device cache's value planes, or a state region's
+/// One storage of a split set: its name and the bytes one unit takes in each of its columns.
+pub(super) type SplitStorage = (String, Vec<u64>);
+
+/// The segments of a split storage set (a device cache's value storages, or a state region's
 /// units) and which of them are mapped.
 pub(super) struct Segments {
     /// The segments in unit order.
     segments: Vec<crate::memory::cache::info::CacheSegment>,
     /// The first segment given back; the segment count while none is.
     released_from: u32,
-    /// The columns `parts` is laid out by: the cache's columns, or one for the state units.
-    columns: u32,
-    /// Each split storage's parts, column-major: the part of segment `k` that column `c` holds
-    /// is `c · segments.len() + k`.
-    parts: Vec<SegmentPart>,
-    /// The names of the split storages, in the order their storages are kept.
-    names: Vec<String>,
+    /// Each split storage's name and parts, column-major: the part of segment `k` that column
+    /// `c` holds is `c · segments.len() + k`, in the order the storages are kept.
+    storages: Vec<(String, Vec<SegmentPart>)>,
 }
 
 impl Segments {
@@ -134,19 +137,24 @@ impl Segments {
         runs
     }
 
-    /// The bytes the parts of the segments given back take in one split storage.
+    /// The bytes the parts of the segments given back take over every split storage.
     pub(super) fn released_bytes(&self) -> u64 {
-        self.parts_of(self.released_from..self.count())
-            .into_iter()
-            .map(|part| self.parts[part].length as u64)
+        (0..self.storages.len())
+            .flat_map(|storage| {
+                let parts = &self.storages[storage].1;
+                self.parts_of(storage, self.released_from..self.count())
+                    .into_iter()
+                    .map(move |part| parts[part].length as u64)
+            })
             .sum()
     }
 
-    /// The parts of segments `range`, every column's.
-    fn parts_of(&self, range: std::ops::Range<u32>) -> Vec<usize> {
+    /// The parts of segments `range` of split storage `storage`, every column's.
+    fn parts_of(&self, storage: usize, range: std::ops::Range<u32>) -> Vec<usize> {
         let count = self.count();
+        let columns = self.storages[storage].1.len() as u32 / count.max(1);
 
-        (0..self.columns)
+        (0..columns)
             .flat_map(|column| {
                 range
                     .clone()
@@ -156,64 +164,53 @@ impl Segments {
     }
 }
 
-/// The storages of a cache on a device.
+/// The storages of one field of a pool on a device.
+struct FieldStorages {
+    /// The entries of every column, column-major.
+    values: Arc<Storage>,
+    /// One U8 flag per cell.
+    initialized: Arc<Storage>,
+    /// One F32 scale per cell, for a scaled field.
+    scale: Option<Arc<Storage>>,
+}
+
+/// The storages of a pool on a device.
 struct DevicePlanes {
     device: DeviceId,
     /// Other local devices that address the planes: readers there copy pages directly.
     peers: Vec<DeviceId>,
-    values: [Arc<Storage>; 2],
-    initialized: [Arc<Storage>; 2],
-    /// The per-plane scales of an FP8 cache.
-    scales: Option<[Arc<Storage>; 2]>,
-    /// The index-key planes of a cache whose layers keep index keys.
-    index_keys: Option<Arc<Storage>>,
-    /// The segments of the value planes, when the cache splits into them.
+    /// One per field of the pool, in its order.
+    fields: Vec<FieldStorages>,
+    /// The segments of the value storages, when the pool splits into them.
     segments: Option<Segments>,
     /// Where the Storage Server retains every unit's bytes, run by run.
     runs: Vec<crate::memory::cache::info::CachePlaneRun>,
 }
 
-impl DevicePlanes {
-    /// The storages that split into segments, each with its name: both value planes. Empty when
-    /// the planes do not split.
-    fn split(&self) -> Vec<(&str, &Arc<Storage>)> {
-        let Some(segments) = &self.segments else {
-            return Vec::new();
-        };
-        segments
-            .names
-            .iter()
-            .map(String::as_str)
-            .zip(self.values.iter())
-            .collect()
-    }
-}
-
-/// The unit pool's storage: on one device, or none for a cache that holds no device, whose
-/// tensors are meta tensors.
+/// A pool's storage: on one device, or none for a cache that holds no device, whose tensors are
+/// meta tensors.
 pub(crate) struct Planes {
-    layout: Arc<CacheLayout>,
+    pool: PoolLayout,
     units: u32,
     device: Option<DevicePlanes>,
 }
 
 impl Planes {
-    /// Planes of `units` units that hold no storage: every tensor is a meta tensor.
-    pub(crate) fn meta(layout: Arc<CacheLayout>, units: u32) -> Result<Self> {
-        check(&layout, units)?;
+    /// Planes of `units` units of `pool` that hold no storage: every tensor is a meta tensor.
+    pub(crate) fn meta(pool: PoolLayout, units: u32) -> Result<Self> {
+        check(&pool, units)?;
 
         Ok(Self {
-            layout,
+            pool,
             units,
             device: None,
         })
     }
 
-    /// Takes the planes of `units` units (the padding unit included) on `device` from `owner`,
-    /// addressed by `device` and each of `peers`, the value planes in `parts` segments when the
-    /// cache splits, and resets what was created
-    /// for this rank on `stream`, which is synchronized before returning: values, flags and index
-    /// keys zero, scales one.
+    /// Takes the planes of `units` units of `pool` (the padding unit included) on `device` from
+    /// `owner`, addressed by `device` and each of `peers`, the value storages in `parts`
+    /// segments when the pool splits, and resets what was created for this rank on `stream`,
+    /// which is synchronized before returning: values and flags zero, scales one.
     ///
     /// Planes that exist keep their contents, which are finite whatever they hold: another
     /// epoch that names the region serves from them, a restarted engine reads the pages its
@@ -224,17 +221,17 @@ impl Planes {
     ///
     /// # Errors
     ///
-    /// When the segments do not hold `units` units, the segments of one plane are not given
+    /// When the segments do not hold `units` units, the segments of one storage are not given
     /// back from one segment on in every column, `owner` refuses a storage, or a reset fails.
     pub(crate) fn open(
-        layout: Arc<CacheLayout>,
+        pool: PoolLayout,
         units: u32,
         parts: Option<&[PlaneSegment]>,
         (device, peers): (DeviceId, &[DeviceId]),
         owner: &dyn ExclusiveStorage,
         stream: &Stream,
     ) -> Result<Self> {
-        check(&layout, units)?;
+        check(&pool, units)?;
         if parts.is_some_and(|parts| segments::units(parts) != units) {
             return Err(Error::Invalid(
                 "a cache's segments do not hold its units".into(),
@@ -242,9 +239,22 @@ impl Planes {
         }
 
         let peers = peers.to_vec();
-        let cells = layout.columns as usize * units as usize;
-        let plane_bytes = cells * layout.plane_bytes as usize;
-        let index_bytes = cells * layout.index_bytes() as usize;
+        let block = pool.block_size;
+        let names: Vec<[String; 3]> = pool
+            .fields
+            .iter()
+            .map(|field| storage_names(field.name))
+            .collect();
+        // The bytes of every column's plane of each field.
+        let columns: Vec<Vec<u64>> = pool
+            .fields
+            .iter()
+            .map(|field| {
+                (0..field.owners.len())
+                    .map(|column| field.plane_bytes(column, block))
+                    .collect()
+            })
+            .collect();
 
         // The epoch whose ranks created the region's memory: that of its first segment, which
         // holds unit 0. A segment given back and created again keeps its identity, so the epoch
@@ -252,134 +262,123 @@ impl Planes {
         let epoch = parts
             .and_then(|parts| parts.first())
             .map(|part| part.segment.epoch);
-        let config = |name, bytes| ExclusiveConfig {
-            name,
-            device,
-            bytes,
-            access: &peers,
-            epoch,
-        };
+        let held = (device, peers.as_slice(), epoch);
 
-        // The exclusive storages, in the order they are taken apart below: the value planes of
-        // a cache that does not split, the flags, the scales and the index keys. A split cache
-        // takes its value planes in segments.
+        // The exclusive storages, field by field in the order they are taken apart below: the
+        // values of a pool that does not split, the flags, and the scales of a scaled field. A
+        // split pool takes its values in segments.
+        let units_bytes = u64::from(units);
         let mut configs = Vec::new();
-        if parts.is_none() {
-            configs.extend(VALUES.map(|name| config(name, plane_bytes)));
-        }
-        configs.extend(FLAGS.map(|name| config(name, cells)));
-        if layout.quantized {
-            configs.extend(SCALES.map(|name| config(name, cells * 4)));
-        }
-        if index_bytes > 0 {
-            configs.push(config(INDEX_KEYS, index_bytes));
+        let mut cells = Vec::new();
+        for ((field, names), columns) in pool.fields.iter().zip(&names).zip(&columns) {
+            let cell_count = field.owners.len() * units as usize;
+            if parts.is_none() {
+                let bytes: u64 = columns.iter().sum::<u64>() * units_bytes;
+                configs.push(exclusive(&names[0], bytes as usize, held));
+                cells.push(columns.clone());
+            }
+            configs.push(exclusive(&names[1], cell_count, held));
+            cells.push(vec![1; field.owners.len()]);
+            if field.scaled {
+                configs.push(exclusive(&names[2], cell_count * 4, held));
+                cells.push(vec![4; field.owners.len()]);
+            }
         }
 
         let mut runs = Vec::new();
-        for config in &configs {
-            let cell_bytes = (config.bytes / cells) as u64;
-            runs.extend(cell_runs(owner, config, layout.columns, units, cell_bytes)?);
+        for (config, cells) in configs.iter().zip(&cells) {
+            runs.extend(cell_runs(owner, config, cells, units)?);
+        }
+        let mut taken = owner.exclusive(&configs)?.into_iter();
+        let mut next = || -> Result<(Arc<Storage>, bool)> {
+            taken
+                .next()
+                .ok_or_else(|| Error::Invariant("an exclusive storage is missing".into()))
+        };
+
+        // The values of a split pool, in segments, one split storage per field.
+        let mut segmented = None;
+        let mut created_segments: Vec<u32> = Vec::new();
+        let mut split_values = Vec::new();
+        let mut values_created = false;
+        if let Some(parts) = parts {
+            let storages: Vec<SplitStorage> = names
+                .iter()
+                .zip(&columns)
+                .map(|(names, columns)| (names[0].clone(), columns.clone()))
+                .collect();
+            let (storages, segments, created) =
+                take_split(&storages, parts, (device, &peers), owner, &mut runs)?;
+            values_created = created.len() == parts.len();
+            if !values_created {
+                created_segments = created;
+            }
+            segmented = Some(segments);
+            split_values = storages;
         }
 
-        let mut taken = owner.exclusive(&configs)?.into_iter();
-        let mut pair = || -> Result<([Arc<Storage>; 2], bool)> {
-            match (taken.next(), taken.next()) {
-                (Some((key, key_created)), Some((value, value_created))) => {
-                    Ok(([key, value], key_created || value_created))
+        let mut split_values = split_values.into_iter();
+        let mut fields = Vec::with_capacity(pool.fields.len());
+        let mut created = Vec::with_capacity(pool.fields.len());
+        for field in &pool.fields {
+            let (values, values_made) = match parts {
+                None => next()?,
+                Some(_) => (
+                    split_values.next().ok_or_else(|| {
+                        Error::Invariant("a split value storage is missing".into())
+                    })?,
+                    values_created,
+                ),
+            };
+            let (initialized, flags_made) = next()?;
+            let (scale, scale_made) = match field.scaled {
+                true => {
+                    let (scale, made) = next()?;
+                    (Some(scale), made)
                 }
-                _ => Err(Error::Invariant("an exclusive storage is missing".into())),
-            }
-        };
-
-        // Whether the values are new as a whole, and the segments created beside ones that
-        // exist, whose units are reset alone.
-        let values_created;
-        let mut created_segments: Vec<u32> = Vec::new();
-        let mut segmented = None;
-
-        let values = match parts {
-            None => {
-                let (values, created) = pair()?;
-                values_created = created;
-                values
-            }
-            Some(parts) => {
-                let names: Vec<String> = VALUES.iter().map(|name| (*name).to_owned()).collect();
-                let (storages, segments, created) = take_split(
-                    &names,
-                    (parts, layout.columns, layout.plane_bytes),
-                    (device, &peers),
-                    owner,
-                    &mut runs,
-                )?;
-                let mut storages = storages.into_iter();
-                let (Some(key), Some(value)) = (storages.next(), storages.next()) else {
-                    return Err(Error::Invariant(
-                        "a cache holds a key plane and a value plane".into(),
-                    ));
-                };
-                values_created = created.len() == parts.len();
-                if !values_created {
-                    created_segments = created;
-                }
-                segmented = Some(segments);
-                [key, value]
-            }
-        };
-        let (initialized, flags_created) = pair()?;
-        let (scales, scales_created) = if layout.quantized {
-            let (scales, created) = pair()?;
-            (Some(scales), created)
-        } else {
-            (None, false)
-        };
-        let (index_keys, index_keys_created) = if index_bytes > 0 {
-            let (storage, created) = taken
-                .next()
-                .ok_or_else(|| Error::Invariant("the index-key storage is missing".into()))?;
-            (Some(storage), created)
-        } else {
-            (None, false)
-        };
+                false => (None, false),
+            };
+            fields.push(FieldStorages {
+                values,
+                initialized,
+                scale,
+            });
+            created.push((values_made, flags_made, scale_made));
+        }
 
         let planes = Self {
-            layout,
+            pool,
             units,
             device: Some(DevicePlanes {
                 device,
                 peers,
-                values,
-                initialized,
-                scales,
-                index_keys,
+                fields,
                 segments: segmented,
                 runs,
             }),
         };
         let held = planes.device()?;
 
-        for field in 0..2 {
+        for ((storages, &(values, flags, scales)), field) in
+            held.fields.iter().zip(&created).zip(&planes.pool.fields)
+        {
+            let cells = field.owners.len() * units as usize;
             // SAFETY: each fill spans exactly one storage this value owns, whose segments are
             // all mapped when its values were created as a whole; the stream is drained below.
             unsafe {
-                if values_created {
-                    fill(stream, held.values[field].address(), 0, 1, plane_bytes)?;
+                if values {
+                    let bytes = field.unit_bytes(block) as usize * units as usize;
+                    fill(stream, storages.values.address(), 0, 1, bytes)?;
                 }
-                if flags_created {
-                    fill(stream, held.initialized[field].address(), 0, 1, cells)?;
+                if flags {
+                    fill(stream, storages.initialized.address(), 0, 1, cells)?;
                 }
-                if let Some(scales) = &held.scales
-                    && scales_created
+                if let Some(scale) = &storages.scale
+                    && scales
                 {
-                    fill(stream, scales[field].address(), UNIT_SCALE, 4, cells)?;
+                    fill(stream, scale.address(), UNIT_SCALE, 4, cells)?;
                 }
             }
-        }
-        if let Some(storage) = &held.index_keys
-            && index_keys_created
-        {
-            // SAFETY: the fill spans exactly the storage, which this value owns.
-            unsafe { fill(stream, storage.address(), 0, 1, index_bytes) }?;
         }
         if let Some(segments) = &held.segments {
             for (first, count) in segments.unit_runs(&created_segments) {
@@ -389,6 +388,28 @@ impl Planes {
         stream.synchronize()?;
 
         Ok(planes)
+    }
+
+    /// Takes the planes of `units` units of a sliding window's `pool` on `device` from the
+    /// process's own memory ([`LocalStorage`]), addressed by `device` and each of `peers`, and
+    /// resets them on `stream`, which is synchronized before returning: a window's pages are a
+    /// running request's alone, so no other process or epoch maps them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`].
+    pub(crate) fn open_local(
+        pool: PoolLayout,
+        units: u32,
+        (device, peers): (DeviceId, &[DeviceId]),
+        stream: &Stream,
+    ) -> Result<Self> {
+        Self::open(pool, units, None, (device, peers), &LocalStorage, stream)
+    }
+
+    /// The units of the pool, the padding unit included.
+    pub(crate) fn units(&self) -> u32 {
+        self.units
     }
 
     /// The device side, or the refusal of planes that hold no device.
@@ -411,7 +432,7 @@ impl Planes {
             .map_or(&[], |device| device.runs.as_slice())
     }
 
-    /// The segments the value planes are made of, in unit order; `None` for planes that are
+    /// The segments the value storages are made of, in unit order; `None` for planes that are
     /// not split.
     pub(crate) fn segments(&self) -> Option<&[crate::memory::cache::info::CacheSegment]> {
         let segments = self.device.as_ref()?.segments.as_ref()?;
@@ -426,37 +447,33 @@ impl Planes {
             .map_or(0, |segments| segments.released_from)
     }
 
-    /// The device bytes one unit of the split planes holds over every column
-    /// ([`CacheLayout::split_bytes`]): what a segment gives back per unit, which the flags,
-    /// scales and index keys are no part of.
+    /// The device bytes one unit of the split storages holds over every column of every field
+    /// ([`PoolLayout::split_bytes`]): what a segment gives back per unit, which the flags and
+    /// scales are no part of.
     pub(crate) fn unit_bytes(&self) -> u64 {
-        self.layout.split_bytes()
+        self.pool.split_bytes()
     }
 
-    /// The bytes the planes map on the device: the value planes' mapped segments, the flags,
-    /// the scales and the index keys. A sleeping rank's segments are not in it.
+    /// The bytes the planes map on the device: the value storages' mapped segments, the flags
+    /// and the scales. A sleeping rank's segments are not in it.
     pub(crate) fn mapped_bytes(&self) -> u64 {
         let Some(device) = &self.device else {
             return 0;
         };
-        let bytes = |storages: &[Arc<Storage>]| -> u64 {
-            storages.iter().map(|storage| storage.bytes() as u64).sum()
-        };
+        let bytes = |storage: &Arc<Storage>| storage.bytes() as u64;
 
-        // A segment is given back from every split storage, and the storages keep their length
-        // while their segments are unmapped.
-        let released = device.segments.as_ref().map_or(0, |segments| {
-            segments.released_bytes() * device.split().len() as u64
-        });
-
-        bytes(&device.values).saturating_sub(released)
-            + bytes(&device.initialized)
-            + device.scales.as_ref().map_or(0, |scales| bytes(scales))
-            + bytes(device.index_keys.as_slice())
-    }
-
-    fn cell(&self, column: u32, unit: u32) -> u64 {
-        u64::from(column) * u64::from(self.units) + u64::from(unit)
+        // The storages keep their length while their segments are unmapped.
+        let released = device.segments.as_ref().map_or(0, Segments::released_bytes);
+        let held: u64 = device
+            .fields
+            .iter()
+            .map(|field| {
+                bytes(&field.values)
+                    + bytes(&field.initialized)
+                    + field.scale.as_ref().map_or(0, bytes)
+            })
+            .sum();
+        held.saturating_sub(released)
     }
 
     /// Refuses a unit outside the pool.
@@ -470,214 +487,201 @@ impl Planes {
         Ok(())
     }
 
+    /// The field at `field` of the pool, or the refusal of one the pool does not hold.
+    fn field(&self, field: usize) -> Result<&FieldLayout> {
+        self.pool.fields.get(field).ok_or_else(|| {
+            Error::Invalid(format!(
+                "the pool holds {} fields, not field {field}",
+                self.pool.fields.len()
+            ))
+        })
+    }
+
     /// The tensor of `shape` elements of `dtype` whose first element lies `offset` bytes into
-    /// `storage` of the device side, or the meta tensor of that shape.
+    /// `storage` of field `field` of the device side, or the meta tensor of that shape.
     fn tensor(
         &self,
-        storage: impl FnOnce(&DevicePlanes) -> &Arc<Storage>,
-        offset: u64,
+        storage: impl FnOnce(&FieldStorages) -> Option<&Arc<Storage>>,
+        (field, offset): (usize, u64),
         shape: &[usize],
         dtype: DType,
     ) -> Result<Tensor> {
         match &self.device {
-            // SAFETY: the planes own the storage for as long as they live, and the holder of a
-            // cache keeps it for as long as tensors over it and work issued on them exist; a
-            // window over segments given back is addressed by no unit the engine allocates.
-            Some(device) => unsafe { storage(device).external(offset as usize, shape, dtype) },
+            Some(device) => {
+                let held =
+                    device.fields.get(field).and_then(storage).ok_or_else(|| {
+                        Error::Invariant(format!("field {field} holds no storage"))
+                    })?;
+                // SAFETY: the planes own the storage for as long as they live, and the holder of
+                // a cache keeps it for as long as tensors over it and work issued on them exist;
+                // a window over segments given back is addressed by no unit the engine
+                // allocates.
+                unsafe { held.external(offset as usize, shape, dtype) }
+            }
             // SAFETY: a meta tensor has no data and its address is never read.
             None => unsafe { lend(0, shape, dtype, None) },
         }
     }
 
-    /// The scales of `field` from cell `cell` on, as `shape` F32 elements; `None` for a dense
-    /// cache, which stores none.
-    fn scales(&self, field: usize, cell: u64, shape: &[usize]) -> Result<Option<Tensor>> {
-        if !self.layout.quantized {
-            return Ok(None);
-        }
-
-        let scales = match &self.device {
-            Some(device) => {
-                let scales = device.scales.as_ref().ok_or_else(|| {
-                    Error::Invariant("an FP8 cache holds no scale storage".into())
-                })?;
-
-                // SAFETY: as in `Self::tensor`: the planes own the storage.
-                unsafe { scales[field].external((cell * 4) as usize, shape, DType::F32) }?
+    /// The planes of `group`, a field group whose pages are units of this pool: every owner of
+    /// every field, fields in order and owners ascending, each its column's entries as
+    /// `[units, block_size / ratio, heads, width]` with the flags and scales of the same cells
+    /// as `[units, 1, 1, 1]`. A page id of the group is a unit id.
+    pub(crate) fn planes(&self, group: &GroupLayout) -> Result<Vec<KvPlane>> {
+        let mut planes = Vec::new();
+        for (index, field) in self.pool.fields.iter().enumerate() {
+            for (column, owner) in field.owners.iter().enumerate() {
+                planes.push(self.columns(
+                    (index, field),
+                    (column, 1),
+                    owner.layer,
+                    group.block_size,
+                )?);
             }
-            // SAFETY: a meta tensor has no data and its address is never read.
-            None => unsafe { lend(0, shape, DType::F32, None) }?,
-        };
-        Ok(Some(scales))
+        }
+        Ok(planes)
     }
 
-    /// The index keys of `group`'s layers from cell `cell` on, as `pages` pages of `tokens`
-    /// tokens: `[pages, tokens / ratio, width]` in the group's compute type; `None` for a
-    /// group whose layers keep none.
-    fn index_keys(
-        &self,
-        group: &GroupLayout,
-        cell: u64,
-        pages: usize,
-        tokens: u32,
-    ) -> Result<Option<Tensor>> {
-        let Some(shape) = self.layout.index_shape(group, pages, tokens)? else {
-            return Ok(None);
-        };
-        let dtype = group.compute_dtype;
-
-        let keys = match &self.device {
-            Some(device) => {
-                let storage = device.index_keys.as_ref().ok_or_else(|| {
-                    Error::Invariant(
-                        "a cache that keeps index keys holds no storage of them".into(),
-                    )
-                })?;
-                let offset = cell * self.layout.index_bytes();
-
-                // SAFETY: as in `Self::tensor`: the planes own the storage, and a page's keys
-                // fill one index-key plane, so the window is the storage's cells from `cell`.
-                unsafe { storage.external(offset as usize, &shape, dtype) }?
+    /// The planes of the draft group `group`'s layers, lying over `span` columns each of every
+    /// field of the KV pool: layer `k`'s plane of a field is its columns `k · span ..` as pages of
+    /// `block_size / span` tokens, `[span · units, block_size / span, heads, width]`, page
+    /// `c · units + u` holding the `c`-th run of the draft page in unit `u`, with the flags and
+    /// scales of the same cells. Planes are in the drafter's layer order, fields in order within
+    /// a layer.
+    pub(crate) fn draft_planes(&self, group: &GroupLayout, span: u32) -> Result<Vec<KvPlane>> {
+        let mut planes = Vec::new();
+        for layer in 0..group.layers.len() as u32 {
+            for (index, field) in self.pool.fields.iter().enumerate() {
+                let first = (layer * span) as usize;
+                if first + span as usize > field.owners.len() {
+                    return Err(Error::Invalid(format!(
+                        "the draft group's layer {layer} lies over columns {first}.. of the field \
+                         {}, which holds {}",
+                        field.name,
+                        field.owners.len()
+                    )));
+                }
+                planes.push(self.columns(
+                    (index, field),
+                    (first, span as usize),
+                    layer,
+                    group.block_size / span,
+                )?);
             }
-            // SAFETY: a meta tensor has no data and its address is never read.
-            None => unsafe { lend(0, &shape, dtype, None) }?,
-        };
-        Ok(Some(keys))
-    }
-
-    /// Layer `layer` of the attention group `group`: its column's keys and values as
-    /// `[units, block_size, kv_heads, head_dim]`, the flags and scales of the same cells as
-    /// `[units, 1, 1, 1]`, and the index keys of a group that keeps them as
-    /// `[units, block_size / ratio, width]`. A page id of the group is a unit id.
-    pub(crate) fn layer(&self, group: &GroupLayout, layer: usize) -> Result<KvPlanes> {
-        if layer >= group.layers.len() {
-            return Err(Error::Invalid(format!(
-                "a cache group of {} layers holds no layer {layer}",
-                group.layers.len()
-            )));
         }
-
-        // The group's page is one unit, so its layers are the cache's columns.
-        self.column_planes(group, layer as u32, 1, group.block_size)
+        Ok(planes)
     }
 
-    /// Layer `layer` of the draft group `group`, lying over `span` columns: pages of
-    /// `block_size / span` tokens, `[span · units, block_size / span, kv_heads, head_dim]`,
-    /// page `c · units + u` holding the `c`-th run of the draft page in unit `u`, with the
-    /// flags, scales and index keys of the same cells.
-    pub(crate) fn draft_layer(
+    /// The plane of `columns` columns of `field` from `first`, as pages of `tokens` tokens, lent
+    /// as `layer`'s: the columns' cells lie contiguously in each storage, so columns of equal
+    /// planes are one tensor of their pages.
+    fn columns(
         &self,
-        group: &GroupLayout,
-        layer: usize,
-        span: u32,
-    ) -> Result<KvPlanes> {
-        if layer >= group.layers.len() {
-            return Err(Error::Invalid(format!(
-                "the draft group holds {} layers, not {layer}",
-                group.layers.len()
-            )));
-        }
-        self.column_planes(group, layer as u32 * span, span, group.block_size / span)
-    }
-
-    /// The planes of `columns` columns from `first`, as pages of `tokens` tokens of `group`'s
-    /// rows: the columns' cells lie contiguously in each storage.
-    fn column_planes(
-        &self,
-        group: &GroupLayout,
-        first: u32,
-        columns: u32,
+        (index, field): (usize, &FieldLayout),
+        (first, columns): (usize, usize),
+        layer: u32,
         tokens: u32,
-    ) -> Result<KvPlanes> {
-        if u64::from(tokens) * group.row_bytes() != self.layout.plane_bytes {
+    ) -> Result<KvPlane> {
+        let owner = field.owners[first];
+        let block = self.pool.block_size;
+        let entries = tokens / owner.ratio;
+        let bytes = u64::from(entries) * field.entry_bytes();
+        if (first..first + columns).any(|column| field.plane_bytes(column, block) != bytes) {
             return Err(Error::Invariant(format!(
-                "a page of {tokens} tokens of {} bytes does not fill a plane of {} bytes",
-                group.row_bytes(),
-                self.layout.plane_bytes
+                "pages of {tokens} tokens of the field {} do not fill its columns {first}..{}",
+                field.name,
+                first + columns
             )));
         }
 
-        let cell = self.cell(first, 0);
-        let pages = columns as usize * self.units as usize;
-        let values = [
-            pages,
-            tokens as usize,
-            group.num_kv_heads as usize,
-            group.head_dim as usize,
-        ];
+        let pages = columns * self.units as usize;
+        let cell = first as u64 * u64::from(self.units);
+        let offset = field.column_offset(first, self.units, block);
+        let [heads, width] = field.dims;
+        let values = [pages, entries as usize, heads as usize, width as usize];
         let cells = [pages, 1, 1, 1];
-        let plane_bytes = self.layout.plane_bytes;
 
-        let value = |field: usize| {
-            self.tensor(
-                |device| &device.values[field],
-                cell * plane_bytes,
+        Ok(KvPlane {
+            field: field.name,
+            layer,
+            readers: if columns == 1 {
+                field
+                    .readers
+                    .iter()
+                    .filter(|reader| reader.owner == owner.layer)
+                    .map(|reader| reader.layer)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            ratio: owner.ratio,
+            entries: self.tensor(
+                |storages| Some(&storages.values),
+                (index, offset),
                 &values,
-                group.dtype,
-            )
-        };
-        let flags = |field: usize| {
-            self.tensor(|device| &device.initialized[field], cell, &cells, DType::U8)
-        };
-        let scale = |field: usize| self.scales(field, cell, &cells);
-
-        Ok(KvPlanes {
-            key: value(0)?,
-            value: value(1)?,
-            key_initialized: flags(0)?,
-            value_initialized: flags(1)?,
-            key_scale: scale(0)?,
-            value_scale: scale(1)?,
-            index_keys: self.index_keys(group, cell, pages, tokens)?,
+                field.dtype,
+            )?,
+            initialized: self.tensor(
+                |storages| Some(&storages.initialized),
+                (index, cell),
+                &cells,
+                DType::U8,
+            )?,
+            scale: field
+                .scaled
+                .then(|| {
+                    self.tensor(
+                        |storages| storages.scale.as_ref(),
+                        (index, cell * 4),
+                        &cells,
+                        DType::F32,
+                    )
+                })
+                .transpose()?,
         })
     }
 
-    /// The address of the plane of `field` in `column` of `unit`.
+    /// The address of field `field`'s plane in `column` of `unit`.
     pub(crate) fn plane_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         self.require_unit(unit)?;
-        let device = self.device()?;
-        Ok(device.values[field].address() + self.cell(column, unit) * self.layout.plane_bytes)
+        let laid = self.field(field)?;
+        let block = self.pool.block_size;
+        let offset = laid.column_offset(column as usize, self.units, block)
+            + u64::from(unit) * laid.plane_bytes(column as usize, block);
+        Ok(self.device()?.fields[field].values.address() + offset)
     }
 
-    /// The address of the FP8 scale of `field` in `column` of `unit`.
+    /// The address of field `field`'s FP8 scale in `column` of `unit`.
     pub(crate) fn scale_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         self.require_unit(unit)?;
-        let scales = self
-            .device()?
-            .scales
-            .as_ref()
-            .ok_or_else(|| Error::Invalid("a dense cache's planes carry no scales".into()))?;
-        Ok(scales[field].address() + self.cell(column, unit) * 4)
+        let scale = self.device()?.fields[field].scale.as_ref().ok_or_else(|| {
+            Error::Invalid(format!(
+                "field {field} of the cache's planes carries no scale"
+            ))
+        })?;
+        Ok(scale.address() + self.cell(column, unit) * 4)
     }
 
-    /// The address of the index-key plane in `column` of `unit`.
-    pub(crate) fn index_address(&self, column: u32, unit: u32) -> Result<u64> {
-        self.require_unit(unit)?;
-        let storage = self
-            .device()?
-            .index_keys
-            .as_ref()
-            .ok_or_else(|| Error::Invalid("the cache's planes carry no index keys".into()))?;
-        Ok(storage.address() + self.cell(column, unit) * self.layout.index_bytes())
-    }
-
-    /// The address of the initialization flag of `field` in `column` of `unit`.
+    /// The address of field `field`'s initialization flag in `column` of `unit`.
     pub(crate) fn flag_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         self.require_unit(unit)?;
-        Ok(self.device()?.initialized[field].address() + self.cell(column, unit))
+        Ok(self.device()?.fields[field].initialized.address() + self.cell(column, unit))
     }
 
-    /// Resets units `[first, first + count)` of every column with fills issued on `stream`:
-    /// flags zero, scales one, and the values zero when `values`. The index
-    /// keys stay as they are: they have no flag, and a unit's next owner reads no key before it
-    /// stored it.
+    /// The index of the cell of `column` and `unit` in a field's flags and scales.
+    fn cell(&self, column: u32, unit: u32) -> u64 {
+        u64::from(column) * u64::from(self.units) + u64::from(unit)
+    }
+
+    /// Resets units `[first, first + count)` of every column of every field with fills issued
+    /// on `stream`: flags zero, scales one, and the values zero when `values`.
     ///
-    /// The values are filled with one fill per mapped extent: a column's units are consecutive
-    /// and mapped, while the columns of a split cache lie apart by the segments given back from
-    /// each column's tail, which a fill's range may not span although no row touches them. The
-    /// values are reset only where units are created, so their fills are rare; the flags and
-    /// scales, reset with every allocation, are storages that never split and take one strided
-    /// fill each.
+    /// The values are filled with one fill per column: a column's units are consecutive and
+    /// mapped, while the columns of a split cache lie apart by the segments given back from each
+    /// column's tail, which a fill's range may not span although no row touches them. The values
+    /// are reset only where units are created, so their fills are rare; the flags and scales,
+    /// reset with every allocation, are storages that never split and take one strided fill
+    /// each.
     pub(crate) fn reset_units(
         &self,
         first: u32,
@@ -690,64 +694,68 @@ impl Planes {
         }
         self.require_unit(first + count - 1)?;
         let device = self.device()?;
-
         let units = self.units as usize;
-        let columns = self.layout.columns as usize;
-        let plane = self.layout.plane_bytes as usize;
-        let (first, count) = (first as usize, count as usize);
+        let block = self.pool.block_size;
 
-        if values {
-            for storage in &device.values {
-                let base = storage.address() + (first * plane) as u64;
-                let (rows, pitch) = (count * plane, units * plane);
-
+        for (storages, field) in device.fields.iter().zip(&self.pool.fields) {
+            let columns = field.owners.len();
+            if values {
                 for column in 0..columns {
+                    let plane = field.plane_bytes(column, block);
+                    let base = storages.values.address()
+                        + field.column_offset(column, self.units, block)
+                        + u64::from(first) * plane;
                     // SAFETY: the range lies inside a storage this value owns: units
                     // `[first, first + count)` of one column. The caller has those units mapped
                     // and orders the fills before their readers.
-                    unsafe { fill(stream, base + (column * pitch) as u64, 0, 1, rows) }?;
+                    unsafe { fill(stream, base, 0, 1, (u64::from(count) * plane) as usize) }?;
                 }
             }
-        }
 
-        for field in 0..2 {
             // SAFETY: every row lies inside a storage this value owns: units
             // `[first, first + count)` of each column, a column's units apart. The caller has
             // those units mapped and orders the fills before their readers.
             unsafe {
-                let flags = device.initialized[field].address() + first as u64;
-                fill_rows(stream, flags, units, 0, 1, count, columns)?;
+                let flags = storages.initialized.address() + u64::from(first);
+                fill_rows(stream, flags, units, 0, 1, count as usize, columns)?;
 
-                if let Some(scales) = &device.scales {
-                    let scales = scales[field].address() + (first * 4) as u64;
-                    fill_rows(stream, scales, units * 4, UNIT_SCALE, 4, count, columns)?;
+                if let Some(scale) = &storages.scale {
+                    let scales = scale.address() + u64::from(first) * 4;
+                    fill_rows(
+                        stream,
+                        scales,
+                        units * 4,
+                        UNIT_SCALE,
+                        4,
+                        count as usize,
+                        columns,
+                    )?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Raises both fields' initialization flags of `units` in every column on `stream`: the
+    /// Raises every field's initialization flags of `units` in every column on `stream`: the
     /// units' values and scales are in place and a reader may use them.
     pub(crate) fn mark_initialized(&self, units: &[u32], stream: &Stream) -> Result<()> {
         let device = self.device()?;
-        let columns = self.layout.columns as usize;
 
         for (first, count) in unit_runs(units) {
             self.require_unit(first + count - 1)?;
 
-            for initialized in &device.initialized {
+            for (storages, field) in device.fields.iter().zip(&self.pool.fields) {
                 // SAFETY: the rows lie inside the flag storage this value owns, and the caller
                 // orders the fill behind the copies that filled the units.
                 unsafe {
                     fill_rows(
                         stream,
-                        initialized.address() + u64::from(first),
+                        storages.initialized.address() + u64::from(first),
                         self.units as usize,
                         1,
                         1,
                         count as usize,
-                        columns,
+                        field.owners.len(),
                     )?;
                 }
             }
@@ -783,40 +791,35 @@ impl Planes {
 
     /// Copies whole units on `stream`, in stream order: every field a unit holds, whatever
     /// block it is part of, so a copy of an attention or a draft block is the same copy. That is
-    /// the values of every column with their flags, an FP8 cache's scales and the index keys of
-    /// a cache that keeps them. The copies were checked ([`Self::check_copies`]).
+    /// the planes of every column of every field with their flags and the scales of a scaled
+    /// field. The copies were checked ([`Self::check_copies`]).
     pub(crate) fn copy_units(&self, copies: &[(u32, u32)], stream: &Stream) -> Result<()> {
         let device = self.device()?;
+        let block = self.pool.block_size;
         let mut batch = CopyBatch::new(SourceOrder::Stream);
 
         for &(from, to) in copies {
-            for column in 0..self.layout.columns {
-                for field in 0..2 {
+            for (index, (storages, field)) in
+                device.fields.iter().zip(&self.pool.fields).enumerate()
+            {
+                for column in 0..field.owners.len() as u32 {
                     batch.push(
-                        self.plane_address(field, column, to)?,
-                        self.plane_address(field, column, from)?,
-                        self.layout.plane_bytes as usize,
+                        self.plane_address(index, column, to)?,
+                        self.plane_address(index, column, from)?,
+                        field.plane_bytes(column as usize, block) as usize,
                     );
                     batch.push(
-                        self.flag_address(field, column, to)?,
-                        self.flag_address(field, column, from)?,
+                        self.flag_address(index, column, to)?,
+                        self.flag_address(index, column, from)?,
                         1,
                     );
-                    if device.scales.is_some() {
+                    if storages.scale.is_some() {
                         batch.push(
-                            self.scale_address(field, column, to)?,
-                            self.scale_address(field, column, from)?,
+                            self.scale_address(index, column, to)?,
+                            self.scale_address(index, column, from)?,
                             4,
                         );
                     }
-                }
-
-                if device.index_keys.is_some() {
-                    batch.push(
-                        self.index_address(column, to)?,
-                        self.index_address(column, from)?,
-                        self.layout.index_bytes() as usize,
-                    );
                 }
             }
         }
@@ -828,7 +831,7 @@ impl Planes {
         Ok(())
     }
 
-    /// Gives back the storage of the segments of the value planes from `first` on, every
+    /// Gives back the storage of the segments of the value storages from `first` on, every
     /// column's, through `owner`, which retained them. The buffer pool gives none of their units
     /// to a block and no device work addresses them any more.
     ///
@@ -845,7 +848,11 @@ impl Planes {
                 "the cache holds no device: it has no segment to give back",
             ));
         };
-        let storages: Vec<Arc<Storage>> = device.values.to_vec();
+        let storages: Vec<Arc<Storage>> = device
+            .fields
+            .iter()
+            .map(|field| Arc::clone(&field.values))
+            .collect();
         let Some(segments) = &mut device.segments else {
             return Err(Error::Invalid(format!(
                 "the cache planes of {} units are not split into segments, which is what \
@@ -881,7 +888,11 @@ impl Planes {
         let Some(device) = self.device.as_ref() else {
             return Err(Error::State("the cache holds no device: it has no segment"));
         };
-        let storages: Vec<Arc<Storage>> = device.values.to_vec();
+        let storages: Vec<Arc<Storage>> = device
+            .fields
+            .iter()
+            .map(|field| Arc::clone(&field.values))
+            .collect();
         let (device_id, peers) = (device.device, device.peers.clone());
 
         // The segments are taken out of the planes for the call, so the reset reads the planes
@@ -913,25 +924,42 @@ impl Planes {
     }
 }
 
-/// The config the split storage `name` was taken with, over `segments`' parts, on `device`,
-/// which `peers` address.
+/// The config the split storage `storage` of `segments` was taken with, on `device`, which
+/// `peers` address.
 fn segmented_config<'a>(
     (device, peers): (DeviceId, &'a [DeviceId]),
     segments: &'a Segments,
-    name: &'a str,
+    storage: usize,
 ) -> SegmentedConfig<'a> {
+    let (name, parts) = &segments.storages[storage];
     SegmentedConfig {
         name,
         device,
-        parts: &segments.parts,
+        parts,
         access: peers,
     }
 }
 
+/// The exclusive storage `name` of `bytes` bytes on `device`, addressed by `access`, keyed by
+/// `epoch` ([`ExclusiveConfig::epoch`]).
+fn exclusive<'a>(
+    name: &'a str,
+    bytes: usize,
+    (device, access, epoch): (DeviceId, &'a [DeviceId], Option<u64>),
+) -> ExclusiveConfig<'a> {
+    ExclusiveConfig {
+        name,
+        device,
+        bytes,
+        access,
+        epoch,
+    }
+}
+
 /// Gives back the storage of the segments of a split set from `first` on, every column's part of
-/// each of `storages` (named as `segments` names them), through `owner`, which retained them. The
-/// buffer pool gives none of their units to a block and no device work addresses them any more.
-/// Segments given back already are not given back twice.
+/// each of `storages` (in the order `segments` keeps them), through `owner`, which retained them.
+/// The buffer pool gives none of their units to a block and no device work addresses them any
+/// more. Segments given back already are not given back twice.
 ///
 /// # Errors
 ///
@@ -953,15 +981,19 @@ pub(super) fn release_split(
         return Ok(());
     }
 
-    let indices = segments.parts_of(first..from);
-    for (name, storage) in segments.names.iter().zip(storages) {
-        owner.release_segments(&segmented_config(device, segments, name), storage, &indices)?;
+    for (index, storage) in storages.iter().enumerate() {
+        let indices = segments.parts_of(index, first..from);
+        owner.release_segments(
+            &segmented_config(device, segments, index),
+            storage,
+            &indices,
+        )?;
     }
 
     let released = segments.first_unit(from) - segments.first_unit(first);
     segments.released_from = first;
     tracing::info!(
-        names = ?segments.names,
+        names = ?segments.storages.iter().map(|(name, _)| name).collect::<Vec<_>>(),
         first,
         segments = from - first,
         units = released,
@@ -997,12 +1029,12 @@ pub(super) fn restore_split(
     }
     let first_unit = segments.first_unit(from);
     let units = segments.first_unit(count) - first_unit;
-    let indices = segments.parts_of(from..count);
 
     let mut restored = 0;
     let mut failure = None;
-    for (name, storage) in segments.names.iter().zip(storages) {
-        let config = segmented_config(device, segments, name);
+    for (index, storage) in storages.iter().enumerate() {
+        let config = segmented_config(device, segments, index);
+        let indices = segments.parts_of(index, from..count);
         if let Err(error) = owner.restore_segments(&config, storage, &indices) {
             failure = Some(error);
             break;
@@ -1022,8 +1054,9 @@ pub(super) fn restore_split(
     if let Some(error) = failure {
         // Put the set back as asleep as it was: the segments this call created go back through
         // the owner that created them, so its reservation ends with them.
-        for (name, storage) in segments.names.iter().zip(storages).take(restored) {
-            let config = segmented_config(device, segments, name);
+        for (index, storage) in storages.iter().enumerate().take(restored) {
+            let config = segmented_config(device, segments, index);
+            let indices = segments.parts_of(index, from..count);
             owner
                 .release_segments(&config, storage, &indices)
                 .map_err(|undo| {
@@ -1038,7 +1071,7 @@ pub(super) fn restore_split(
     }
 
     tracing::info!(
-        names = ?segments.names,
+        names = ?segments.storages.iter().map(|(name, _)| name).collect::<Vec<_>>(),
         first = from,
         segments = count - from,
         "created the segments again"
@@ -1046,86 +1079,96 @@ pub(super) fn restore_split(
     Ok(())
 }
 
-/// Checks a pool of `units` units of `layout`: the padding unit and one usable unit at least.
-fn check(layout: &CacheLayout, units: u32) -> Result<()> {
+/// Checks a pool of `units` units of `pool`: the padding unit and one usable unit at least, and
+/// planes of bytes.
+fn check(pool: &PoolLayout, units: u32) -> Result<()> {
     if units < 2 {
         return Err(Error::Invalid(
             "a cache unit pool needs the padding unit and one usable unit".into(),
         ));
     }
-    if layout.columns == 0 || layout.plane_bytes == 0 {
+    if pool.fields.is_empty() || pool.segment_plane() == 0 {
         return Err(Error::Invalid(
-            "a cache unit pool needs columns and planes of bytes".into(),
+            "a cache unit pool needs fields and planes of bytes".into(),
         ));
     }
     Ok(())
 }
 
-/// The runs of the exclusive storage of `config`, cells `[columns, units]` of `cell_bytes`
-/// bytes each: one run of every unit per column, named `{name}/{column}`. Empty for storage
-/// local to the process.
+/// The runs of the exclusive storage of `config`, columns of `units` cells of `cells[c]` bytes
+/// each, back to back: one run of every unit per column, named `{name}/{column}`. Empty for
+/// storage local to the process.
 fn cell_runs(
     owner: &dyn ExclusiveStorage,
     config: &ExclusiveConfig<'_>,
-    columns: u32,
+    cells: &[u64],
     units: u32,
-    cell_bytes: u64,
 ) -> Result<Vec<crate::memory::cache::info::CachePlaneRun>> {
     let Some((key, gpu)) = owner.key(config)? else {
         return Ok(Vec::new());
     };
 
-    Ok((0..columns)
-        .map(|column| crate::memory::cache::info::CachePlaneRun {
-            field: format!("{}/{column}", config.name),
-            key,
-            gpu,
-            first: 0,
-            count: units,
-            offset: u64::from(column) * u64::from(units) * cell_bytes,
-            bytes: cell_bytes,
+    let mut offset = 0;
+    Ok(cells
+        .iter()
+        .enumerate()
+        .map(|(column, &bytes)| {
+            let run = crate::memory::cache::info::CachePlaneRun {
+                field: ::storage::protocol::planes::field(config.name, column as u32),
+                key,
+                gpu,
+                first: 0,
+                count: units,
+                offset,
+                bytes,
+            };
+            offset += u64::from(units) * bytes;
+            run
         })
         .collect())
 }
 
-/// What [`take_split`] takes: the split storages in the order of their names, the segments'
+/// What [`take_split`] takes: the split storages in the order they were named, the segments'
 /// state, and the segments created for this rank.
 type Split = (Vec<Arc<Storage>>, Segments, Vec<u32>);
 
-/// Takes the storages `names` of a split set in `parts` segments on `device`, which `peers`
-/// address, from `owner`, adding their runs to `runs`: each storage holds `columns` columns, the
-/// part of a column of a segment its units at `unit_bytes` each (a value plane's column holds a
-/// plane per unit; the state units are one column of a checkpoint per unit). Returns the
-/// storages, the segments' state and the segments created for this rank.
+/// Takes the split storages `storages` of a set in `parts` segments on `device`, which `peers`
+/// address, from `owner`, adding their runs to `runs`: each storage holds a column per entry of
+/// its bytes, the part of a column of a segment its units at that column's bytes each (a field's
+/// column holds a plane per unit; the state units are one column of a checkpoint per unit).
+/// Returns the storages, the segments' state and the segments created for this rank.
 ///
 /// # Errors
 ///
 /// When `owner` refuses a storage, or the segments given back are not the same ones of every
 /// column of every storage, from one segment on.
 pub(super) fn take_split(
-    names: &[String],
-    (parts, columns, unit_bytes): (&[PlaneSegment], u32, u64),
+    storages: &[SplitStorage],
+    parts: &[PlaneSegment],
     (device, peers): (DeviceId, &[DeviceId]),
     owner: &dyn ExclusiveStorage,
     runs: &mut Vec<crate::memory::cache::info::CachePlaneRun>,
 ) -> Result<Split> {
     let count = parts.len() as u32;
 
-    // Part `c · count + k` holds column `c` of segment `k`: its units at `unit_bytes` each.
-    let segment_parts: Vec<SegmentPart> = (0..columns)
-        .flat_map(|column| {
-            parts.iter().map(move |part| SegmentPart {
-                length: part.segment.units as usize * unit_bytes as usize,
-                column,
-                segment: part.segment,
-                create: part.create,
-            })
-        })
-        .collect();
-
-    let mut storages = Vec::with_capacity(names.len());
+    let mut taken = Vec::with_capacity(storages.len());
+    let mut kept = Vec::with_capacity(storages.len());
     let mut created = vec![false; parts.len()];
-    for name in names {
+    for (name, columns) in storages {
+        // Part `c · count + k` holds column `c` of segment `k`: its units at the column's bytes
+        // each.
+        let segment_parts: Vec<SegmentPart> = columns
+            .iter()
+            .enumerate()
+            .flat_map(|(column, &unit_bytes)| {
+                parts.iter().map(move |part| SegmentPart {
+                    length: part.segment.units as usize * unit_bytes as usize,
+                    column: column as u32,
+                    segment: part.segment,
+                    create: part.create,
+                })
+            })
+            .collect();
         let config = SegmentedConfig {
             name,
             device,
@@ -1143,67 +1186,64 @@ pub(super) fn take_split(
                 && storage.segment_mapped(index)?
             {
                 runs.push(crate::memory::cache::info::CachePlaneRun {
-                    field: format!("{name}/{}", part.column),
+                    field: ::storage::protocol::planes::field(name, part.column),
                     key,
                     gpu,
                     first,
                     count: part.segment.units,
                     offset: 0,
-                    bytes: unit_bytes,
+                    bytes: columns[part.column as usize],
                 });
             }
             first += part.segment.units;
 
             created[index % parts.len()] |= made.get(index).copied().unwrap_or(false);
         }
-        storages.push(storage);
+        taken.push(storage);
+        kept.push((name.clone(), segment_parts));
     }
 
     // Segments given back, which no rank of the region holds, are the same ones of every
     // column of every split storage, from one segment on.
-    let mapped = |segment: u32, column: u32| -> Result<Vec<bool>> {
-        let index = (column * count + segment) as usize;
-        storages
-            .iter()
-            .map(|storage| storage.segment_mapped(index))
-            .collect()
+    let mapped = |segment: u32| -> Result<Vec<bool>> {
+        let mut mapped = Vec::new();
+        for (storage, (_, parts)) in taken.iter().zip(&kept) {
+            let columns = parts.len() as u32 / count.max(1);
+            for column in 0..columns {
+                mapped.push(storage.segment_mapped((column * count + segment) as usize)?);
+            }
+        }
+        Ok(mapped)
     };
     let mut released_from = count;
     for segment in 0..count {
-        let mut all_gone = true;
-        for column in 0..columns {
-            all_gone &= mapped(segment, column)?.iter().all(|mapped| !mapped);
-        }
-        if all_gone {
+        if mapped(segment)?.iter().all(|mapped| !mapped) {
             released_from = segment;
             break;
         }
     }
-    for column in 0..columns {
-        for segment in 0..count {
-            let gone = mapped(segment, column)?.iter().any(|mapped| !mapped);
-            if gone != (segment >= released_from) {
-                return Err(Error::Invalid(format!(
-                    "segment {segment} of column {column} of {names:?} is {} while the set is \
-                     given back from segment {released_from}",
-                    if gone { "unmapped" } else { "mapped" }
-                )));
-            }
+    for segment in 0..count {
+        let gone = mapped(segment)?.iter().any(|mapped| !mapped);
+        if gone != (segment >= released_from) {
+            return Err(Error::Invalid(format!(
+                "segment {segment} of {:?} is {} while the set is given back from segment \
+                 {released_from}",
+                storages.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                if gone { "unmapped" } else { "mapped" }
+            )));
         }
     }
 
     let segments = Segments {
         segments: parts.iter().map(|part| part.segment).collect(),
         released_from,
-        columns,
-        parts: segment_parts,
-        names: names.to_vec(),
+        storages: kept,
     };
     let created = (0..count)
         .filter(|segment| created[*segment as usize])
         .collect();
 
-    Ok((storages, segments, created))
+    Ok((taken, segments, created))
 }
 
 /// Fills `rows` rows of `count` elements of `width` bytes with `value`, `pitch` bytes apart,
@@ -1249,18 +1289,45 @@ unsafe fn fill(
 
 #[cfg(test)]
 mod tests {
-    use nn::family::IndexKeys;
+    use nn::family::{CacheField, FieldOwner, Format, History, INDEX_KEY, KEY, Record, VALUE};
     use proto::request::PrefixCacheDtype;
 
+    use super::super::layout::CacheLayout;
     use super::*;
+
+    /// The keys and values of `layers` layers of one 8-wide head.
+    fn keys_and_values(layers: u32) -> Vec<CacheField> {
+        CacheField::keys_and_values(layers, 1, 8)
+    }
+
+    /// Index keys of six elements per four tokens in BF16 over `layers` layers.
+    fn index_keys(layers: u32) -> CacheField {
+        CacheField {
+            name: INDEX_KEY,
+            owners: (0..layers)
+                .map(|layer| FieldOwner { layer, ratio: 4 })
+                .collect(),
+            readers: Vec::new(),
+            history: History::Full,
+            record: Record {
+                format: Format::Elements(DType::BF16),
+                heads: 1,
+                width: 6,
+            },
+        }
+    }
+
+    /// The KV pool of `fields` over 16-token pages.
+    fn layout(fields: &[CacheField], dtype: PrefixCacheDtype) -> CacheLayout {
+        CacheLayout::of(16, fields, dtype).expect("a layout of the fields")
+    }
 
     /// Planes of two layers of 16-token pages of one 8-wide head, over eight units, with no
     /// device.
-    fn planes(dtype: PrefixCacheDtype) -> Planes {
-        let layout = CacheLayout::dense(16, 2, 1, 8, dtype)
-            .validated()
-            .expect("a dense layout");
-        Planes::meta(Arc::new(layout), 8).expect("planes of eight units")
+    fn planes(dtype: PrefixCacheDtype) -> (CacheLayout, Planes) {
+        let layout = layout(&keys_and_values(2), dtype);
+        let planes = Planes::meta(layout.kv().clone(), 8).expect("planes of eight units");
+        (layout, planes)
     }
 
     #[test]
@@ -1269,25 +1336,45 @@ mod tests {
         assert!(unit_runs(&[]).is_empty());
     }
 
+    /// The storages of the fields of keys and values, and of index keys, are the ones a handoff
+    /// between replicas reads a rank's fields by.
+    #[test]
+    fn the_storages_of_keys_values_and_index_keys_keep_the_names_a_handoff_reads() {
+        use ::storage::protocol::planes::{FLAGS, INDEX_KEYS, SCALES, VALUES};
+
+        for (plane, name) in [KEY, VALUE].into_iter().enumerate() {
+            let [values, flags, scales] = storage_names(name);
+            assert_eq!(
+                (values.as_str(), flags.as_str(), scales.as_str()),
+                (VALUES[plane], FLAGS[plane], SCALES[plane])
+            );
+        }
+        assert_eq!(storage_names(INDEX_KEY)[0], INDEX_KEYS);
+    }
+
     /// A layer's planes are its column's units, and a dense cache states no scale.
     #[test]
     fn a_layer_is_one_column_of_every_unit() -> Result<()> {
-        let dense = planes(PrefixCacheDtype::BFloat16);
-        let group = dense.layout.groups[0].clone();
+        let (layout, dense) = planes(PrefixCacheDtype::BFloat16);
+        let lent = dense.planes(&layout.groups[0])?;
 
-        let layer = dense.layer(&group, 1)?;
-        assert_eq!(layer.key.dims(), [8, 16, 1, 8]);
-        assert_eq!(layer.value.dtype(), DType::BF16);
-        assert_eq!(layer.key_initialized.dims(), [8, 1, 1, 1]);
-        assert_eq!(layer.value_initialized.dtype(), DType::U8);
-        assert!(layer.key_scale.is_none() && layer.value_scale.is_none());
-        assert!(layer.index_keys.is_none());
-        assert!(dense.layer(&group, 2).is_err());
+        // Keys of layers 0 and 1, then their values.
+        let fields: Vec<(&str, u32)> = lent
+            .iter()
+            .map(|plane| (plane.field, plane.layer))
+            .collect();
+        assert_eq!(fields, [(KEY, 0), (KEY, 1), (VALUE, 0), (VALUE, 1)]);
+        let key = &lent[1];
+        assert_eq!(key.entries.dims(), [8, 16, 1, 8]);
+        assert_eq!(lent[3].entries.dtype(), DType::BF16);
+        assert_eq!(key.initialized.dims(), [8, 1, 1, 1]);
+        assert_eq!(key.initialized.dtype(), DType::U8);
+        assert!(lent.iter().all(|plane| plane.scale.is_none()));
 
-        let fp8 = planes(PrefixCacheDtype::Float8E4m3Fn);
-        let layer = fp8.layer(&fp8.layout.groups[0].clone(), 0)?;
-        assert_eq!(layer.key.dtype(), DType::F8E4M3);
-        let scale = layer.key_scale.expect("an FP8 cache states its scales");
+        let (layout, fp8) = planes(PrefixCacheDtype::Float8E4m3Fn);
+        let key = &fp8.planes(&layout.groups[0])?[0];
+        assert_eq!(key.entries.dtype(), DType::F8E4M3);
+        let scale = key.scale.as_ref().expect("an FP8 cache states its scales");
         assert_eq!(
             (scale.dims(), scale.dtype()),
             (&[8, 1, 1, 1][..], DType::F32)
@@ -1296,56 +1383,94 @@ mod tests {
     }
 
     /// A layer of a cache that keeps index keys lends them on its pages: one key of the stated
-    /// width per `ratio` tokens of each unit of its column, in the layers' compute type
-    /// whatever the keys and values are stored in.
+    /// width per `ratio` tokens of each unit of its column, in their own element type whatever
+    /// the keys and values are stored in.
     #[test]
     fn a_layer_lends_the_index_keys_of_its_pages() -> Result<()> {
-        let keys = IndexKeys { width: 6, ratio: 4 };
-
         for dtype in [PrefixCacheDtype::BFloat16, PrefixCacheDtype::Float8E4m3Fn] {
-            let layout = CacheLayout::dense(16, 2, 1, 8, dtype).with_index_keys(keys)?;
-            let group = layout.groups[0].clone();
-            let planes = Planes::meta(Arc::new(layout), 8)?;
+            let mut fields = keys_and_values(2);
+            fields.push(index_keys(2));
+            let layout = layout(&fields, dtype);
+            let planes = Planes::meta(layout.kv().clone(), 8)?.planes(&layout.groups[0])?;
 
-            let layer = planes.layer(&group, 1)?;
-            let index_keys = layer.index_keys.expect("the layer keeps index keys");
+            let index = planes
+                .iter()
+                .find(|plane| plane.field == INDEX_KEY && plane.layer == 1)
+                .expect("the layer keeps index keys");
             assert_eq!(
-                (index_keys.dims(), index_keys.dtype()),
-                (&[8, 4, 6][..], DType::BF16)
+                (index.entries.dims(), index.entries.dtype(), index.ratio),
+                (&[8, 4, 1, 6][..], DType::BF16, 4)
             );
-            assert_eq!(layer.key.dims(), [8, 16, 1, 8]);
+            assert!(index.scale.is_none());
         }
         Ok(())
     }
 
-    /// A draft layer's index keys lie over the columns its pages do: one page per cell.
+    /// A draft layer's planes lie over the columns its pages do, its index keys included: one
+    /// page per cell.
     #[test]
-    fn a_draft_layer_lends_the_index_keys_of_its_span() -> Result<()> {
-        let keys = IndexKeys { width: 6, ratio: 4 };
-        let layout = CacheLayout::dense(16, 4, 1, 8, PrefixCacheDtype::BFloat16)
-            .with_index_keys(keys)?
-            .with_draft(1, 1, 8)?;
+    fn a_draft_layer_lends_the_planes_of_its_span() -> Result<()> {
+        let mut fields = keys_and_values(4);
+        fields.push(index_keys(4));
+        let mut drafter = keys_and_values(1);
+        drafter.push(index_keys(1));
+        let layout = layout(&fields, PrefixCacheDtype::BFloat16).with_draft(&drafter)?;
         let draft = layout.groups[1].clone();
         let span = layout.draft_span().expect("the layout holds a draft group");
         assert_eq!(span, 4);
-        let planes = Planes::meta(Arc::new(layout), 8)?;
 
-        let layer = planes.draft_layer(&draft, 0, span)?;
-        assert_eq!(layer.key.dims(), [32, 16, 1, 8]);
-        assert_eq!(
-            layer
-                .index_keys
-                .expect("the drafter keeps index keys")
-                .dims(),
-            [32, 4, 6]
-        );
+        let planes = Planes::meta(layout.kv().clone(), 8)?.draft_planes(&draft, span)?;
+        let fields: Vec<&str> = planes.iter().map(|plane| plane.field).collect();
+        assert_eq!(fields, [KEY, VALUE, INDEX_KEY]);
+        assert_eq!(planes[0].entries.dims(), [32, 16, 1, 8]);
+        assert_eq!(planes[2].entries.dims(), [32, 4, 1, 6]);
+        assert!(planes.iter().all(|plane| plane.layer == 0));
+        Ok(())
+    }
+
+    /// Owners of one field with other ratios lie in columns of other planes, back to back: a
+    /// plane's offset is every column before it, whole.
+    #[test]
+    fn owners_of_two_ratios_lie_in_columns_of_their_own_planes() -> Result<()> {
+        let latent = CacheField {
+            name: "compressed_latent",
+            owners: vec![
+                FieldOwner { layer: 2, ratio: 2 },
+                FieldOwner {
+                    layer: 20,
+                    ratio: 1,
+                },
+            ],
+            readers: Vec::new(),
+            history: History::Full,
+            record: Record {
+                format: Format::Nvfp4,
+                heads: 1,
+                width: 512,
+            },
+        };
+        let layout = layout(&[latent], PrefixCacheDtype::BFloat16);
+        let pool = layout.kv();
+        let field = &pool.fields[0];
+
+        // Eight entries of 288 bytes, then sixteen: a unit of 6912 bytes of planes.
+        assert_eq!(field.plane_bytes(0, 16), 8 * 288);
+        assert_eq!(field.plane_bytes(1, 16), 16 * 288);
+        assert_eq!(pool.split_bytes(), 24 * 288);
+        assert_eq!(field.column_offset(1, 10, 16), 10 * 8 * 288);
+        assert_eq!(pool.plane_bytes(), 8 * 288);
+
+        let planes = Planes::meta(pool.clone(), 10)?.planes(&layout.groups[0])?;
+        assert_eq!(planes[0].entries.dims(), [10, 8, 1, 288]);
+        assert_eq!(planes[1].entries.dims(), [10, 16, 1, 288]);
+        assert_eq!((planes[1].layer, planes[1].ratio), (20, 1));
         Ok(())
     }
 
     /// A refused copy names the pair and the reason.
     #[test]
     fn a_refused_unit_copy_names_the_pair_and_the_reason() {
-        let planes = planes(PrefixCacheDtype::BFloat16);
+        let (_, planes) = planes(PrefixCacheDtype::BFloat16);
         let refused = |from: u32, to: u32| {
             planes
                 .check_copies(&[(from, to)])
@@ -1364,14 +1489,14 @@ mod tests {
     /// Planes that hold no device map nothing, hold no segment and refuse device work.
     #[test]
     fn planes_with_no_device_have_no_storage() {
-        let mut planes = planes(PrefixCacheDtype::BFloat16);
+        let (_, mut planes) = planes(PrefixCacheDtype::BFloat16);
 
         assert_eq!(planes.mapped_bytes(), 0);
         assert!(planes.segments().is_none());
         assert_eq!(planes.held_segments(), 0);
         assert!(planes.runs().is_empty());
         assert!(planes.plane_address(0, 0, 1).is_err());
-        assert!(planes.index_address(0, 1).is_err());
+        assert!(planes.flag_address(1, 0, 1).is_err());
         assert!(
             planes
                 .release_segments(0, &crate::memory::exclusive::LocalStorage)
@@ -1382,7 +1507,7 @@ mod tests {
     /// A pool needs the padding unit and one unit a page can take.
     #[test]
     fn a_pool_of_one_unit_is_refused() {
-        let layout = CacheLayout::dense(16, 2, 1, 8, PrefixCacheDtype::BFloat16);
-        assert!(Planes::meta(Arc::new(layout), 1).is_err());
+        let layout = layout(&keys_and_values(2), PrefixCacheDtype::BFloat16);
+        assert!(Planes::meta(layout.kv().clone(), 1).is_err());
     }
 }

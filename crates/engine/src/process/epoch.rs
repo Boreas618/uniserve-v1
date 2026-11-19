@@ -450,8 +450,11 @@ fn index_of(opened: &Opened, number: u8) -> Result<usize> {
 }
 
 /// The regions of the session the ranks' KV planes and state units back, by index: the device
-/// regions a class of blocks of a fixed size takes its blocks from. A class sized by each request
-/// (a product, a stored trajectory) takes its blocks from memory of the ranks' own processes.
+/// regions a class of blocks of a fixed size takes its blocks from, whose units the segments the
+/// ranks create back. A class sized by each request (a product, a stored trajectory) takes its
+/// blocks from memory of the ranks' own processes, and so does a sliding window's class, whose
+/// region the session names as a window's pool ([`super::ranks::WINDOW_REGION`]) and opens with
+/// every unit it holds.
 pub(super) fn kv_regions(open: &Open) -> Vec<usize> {
     let mut regions: Vec<usize> = open
         .groups
@@ -460,9 +463,9 @@ pub(super) fn kv_regions(open: &Open) -> Vec<usize> {
         .filter(|(_, class)| class.units > 0)
         .flat_map(|(regions, _)| regions.iter().map(|&region| usize::from(region)))
         .filter(|&index| {
-            open.regions
-                .get(index)
-                .is_some_and(|region| region.tier == Tier::Device)
+            open.regions.get(index).is_some_and(|region| {
+                region.tier == Tier::Device && !region.name.starts_with(super::ranks::WINDOW_REGION)
+            })
         })
         .collect();
 
