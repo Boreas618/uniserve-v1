@@ -7,7 +7,8 @@
 //! (`--launch`, an inherited descriptor of a sealed file holding its
 //! [`proto::config::EngineArgs`]) and its lifeline (`--lifeline`);
 //! the process serves until its daemon commands it down, the epoch fails, or
-//! the daemon is gone ([`follow_lifeline`]). The process states the settings its
+//! the daemon is gone ([`follow_lifeline`]); the error it ends with, a panic's included, is its
+//! exit reason for its daemon (`service::exit_reason`). The process states the settings its
 //! CUDA and NCCL libraries read at initialization itself ([`RUNTIME_SETTINGS`]).
 //!
 //! The engine names no concrete model: the executable loads the families
@@ -18,7 +19,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use service::logging;
+use service::{exit_reason, logging};
 
 // mimalloc is built with `no_thp` (workspace `Cargo.toml`): its arenas carry
 // no transparent-huge-page advice, so khugepaged never collapses the engine's
@@ -69,7 +70,31 @@ struct Cli {
 fn main() -> Result<ExitCode> {
     // Before any thread, CUDA or NCCL exists.
     runtime_settings();
-    let cli = Cli::parse();
+    exit_reason::take();
+    // The error the process ends with is its exit reason, which its daemon's exit report
+    // carries: much of it (the launch, the families) fails before the process dials its daemon
+    // or starts its log.
+    let ended = serve();
+    if let Err(error) = &ended {
+        exit_reason::state(&format!("{error:#}"));
+    }
+    ended
+}
+
+/// The process from its command line on: it reads its launch, follows its lifeline and serves
+/// the epoch until its daemon commands it down.
+fn serve() -> Result<ExitCode> {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // A command line this build does not read (one of a daemon of another build) ends
+            // the process too; help and version requests are no error.
+            if error.use_stderr() {
+                exit_reason::state(&error.to_string());
+            }
+            error.exit()
+        }
+    };
     let lifeline = cli.lifeline.map(take_lifeline);
     let launch = read_launch(cli.launch)?;
     let registry = nn::family::Registry::new(models::FAMILIES.iter().copied())?;
@@ -82,6 +107,8 @@ fn main() -> Result<ExitCode> {
         &logging::Levels::new(cli.log_level),
         logging::Output::Stdout,
     );
+    // After the log's panic report, which it keeps.
+    exit_reason::report_panics();
     engine::run(launch, &registry).map(|()| ExitCode::SUCCESS)
 }
 

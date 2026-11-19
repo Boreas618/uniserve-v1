@@ -1238,14 +1238,21 @@ fn await_exit(reader: &mut Connection, control: &mut Connection) {
 }
 
 /// Fails when the daemon reported the engine process's exit on its control
-/// connection.
+/// connection, with its exit status and the error it stated as it ended (its exit reason).
 fn exited(control: &mut Connection) -> anyhow::Result<()> {
     while let Some(message) = control.try_recv::<process::Downstream>()? {
         if let Some(downstream::Kind::Event(process::Event {
             kind: Some(event::Kind::Exit(exit)),
         })) = message.kind
         {
-            anyhow::bail!("the engine process exited: {}", exit.status);
+            if exit.reason.is_empty() {
+                anyhow::bail!("the engine process exited ({})", exit.status);
+            }
+            anyhow::bail!(
+                "the engine process exited ({}): {}",
+                exit.status,
+                exit.reason
+            );
         }
     }
     Ok(())

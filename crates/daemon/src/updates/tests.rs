@@ -1500,6 +1500,38 @@ fn a_target_lost_while_preparing_abandons_the_update() {
     assert_eq!(deployment.updater.take_retire(), vec![TARGET]);
 }
 
+/// A target that exits as it starts abandons the update with a failure that names the engine's
+/// exit status and the error it stated as it ended (its exit reason): what the `PUT`'s answer, the
+/// revision's reason and the update's `failure` state of why the update did not stand.
+#[test]
+fn a_target_that_exits_as_it_starts_names_its_error_in_the_failure() {
+    let deployment = Deployment::new(Refusals::default());
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+    let error = "reading the launch at descriptor 92: unknown field `boundary_interval`, \
+                 expected one of `max_tokens`, `block_size`";
+    deployment
+        .engines
+        .fail(HOST, SPAWNED, "exit status: 1", error);
+    deployment.updater.advance();
+
+    let status = deployment.status();
+    assert_eq!(status["phase"], "abandoned");
+    assert_eq!(status["failure"]["kind"], "process_exit");
+    let reason = status["failure"]["reason"]
+        .as_str()
+        .expect("the failure states a reason");
+    assert!(
+        reason.contains(&format!("launch generation {SPAWNED}"))
+            && reason.contains("exit status: 1")
+            && reason.ends_with(error),
+        "{reason}"
+    );
+}
+
 /// A rollback asked while the target prepares abandons the update.
 #[test]
 fn a_rollback_before_the_switch_abandons_an_epoch_update() {

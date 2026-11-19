@@ -18,8 +18,11 @@ use service::Connection;
 /// The engine packages the stand-in engine (`tests/bin/stand_in_engine.rs`) stands for, by the
 /// backend a launch's module set names.
 pub(crate) mod package {
-    /// Exits with status 1.
+    /// Exits with status 1, stating [`FAILURE`] as its exit reason.
     pub(crate) const FAILS: &str = "fails";
+    /// The error the [`FAILS`] package ends with.
+    pub(crate) const FAILURE: &str =
+        "reading the launch at descriptor 3: unknown field `boundary_interval`";
     /// Exits with status 0.
     pub(crate) const SUCCEEDS: &str = "succeeds";
     /// Runs until its lifeline ends or it is killed.
