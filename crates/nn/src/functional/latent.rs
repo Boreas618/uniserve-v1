@@ -705,7 +705,12 @@ impl Fused for LatentCompressCall<'_> {
 pub struct Window<'t> {
     /// The window entries' plane, one entry per token.
     pub plane: Plane<'t>,
-    /// Entries a query attends: its own position and the `size − 1` before it.
+    /// `[rows]` U32: the first position whose entry each row of the plane's table holds, the
+    /// position a request resumed from a prefix hit recomputes its window from; zero for a
+    /// request that computed every token.
+    pub starts: &'t Tensor,
+    /// Entries a query attends: its own position and the `size − 1` before it, from the row's
+    /// start on.
     pub size: u32,
 }
 
@@ -764,6 +769,13 @@ pub fn latent_attention(
     if window.size == 0 {
         return Err(Error::shape(OWNER, "a window of no entry".to_owned()));
     }
+    check_column(
+        OWNER,
+        "window starts",
+        window.starts,
+        DType::U32,
+        window.plane.table.dims()[0],
+    )?;
     if let Some(side) = compressed {
         side.plane.check(OWNER, "compressed", head_dim)?;
         let selected = side.selection.dims();
@@ -842,6 +854,7 @@ impl Fused for LatentAttentionCall<'_> {
         } = self;
         let window_latents = window.plane.decoded(head_dim)?;
         let window_table = window.plane.table.to_vec2::<u32>()?;
+        let starts = column::<u32>(window.starts)?;
         let compressed = match compressed {
             Some(side) => Some((
                 side.plane,
@@ -859,18 +872,23 @@ impl Fused for LatentAttentionCall<'_> {
         for token in 0..tokens {
             let row = rows[token] as usize;
 
-            // The window's entries, then the selection's, as latents of their planes; a
-            // padding token's negative position names no window entry.
+            // The window's entries from the row's first held position on, then the
+            // selection's, as latents of their planes; a padding token's negative position
+            // names no window entry.
             let mut latents = Vec::with_capacity(2);
             if let Ok(position) = usize::try_from(positions[token]) {
-                let oldest = (position + 1).saturating_sub(window.size as usize);
+                let oldest = (position + 1)
+                    .saturating_sub(window.size as usize)
+                    .max(starts[row] as usize);
                 let slots: Vec<u32> = (oldest..=position)
                     .map(|entry| window.plane.slot(&window_table, row, entry) as u32)
                     .collect();
-                latents.push(window_latents.index_select(
-                    &Tensor::from_vec(slots.clone(), slots.len(), &Device::Cpu)?,
-                    0,
-                )?);
+                if !slots.is_empty() {
+                    latents.push(window_latents.index_select(
+                        &Tensor::from_vec(slots.clone(), slots.len(), &Device::Cpu)?,
+                        0,
+                    )?);
+                }
             }
             if let Some((plane, decoded, table, selection)) = &compressed {
                 let slots: Vec<u32> = selection[token]
@@ -957,6 +975,7 @@ impl Fused for LatentAttentionCall<'_> {
                 query: ops::operand(query)?,
                 window: ops::operand(window.plane.records)?,
                 window_table: ops::operand(window.plane.table)?,
+                window_starts: ops::operand(window.starts)?,
                 compressed,
                 rows: ops::operand(rows)?,
                 positions: ops::operand(positions)?,

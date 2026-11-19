@@ -264,6 +264,10 @@ fn a_query_attends_its_window_and_its_selection_with_a_sink() {
     let sink = [0.5_f32, -1.0];
     let selection = int(vec![4_i32, -1, 1, 0, -1, -1], (2, 3));
     let scale = 0.25;
+    // The row holds its window from position 2 on, as after a replay from a prefix hit: the
+    // query at position 1 reads no window entry.
+    const START: usize = 2;
+    let starts = int(vec![START as u32], 1);
 
     let out = functional::latent_attention(
         &tensor(&query, (2, HEADS, WIDTH), DType::BF16),
@@ -274,6 +278,7 @@ fn a_query_attends_its_window_and_its_selection_with_a_sink() {
                 format: Format::Bf16,
                 layout: Layout::Entry,
             },
+            starts: &starts,
             size: WINDOW,
         },
         Some(Selected {
@@ -300,8 +305,8 @@ fn a_query_attends_its_window_and_its_selection_with_a_sink() {
     };
     let got = values(&out);
     for (token, position, selected) in [(0_usize, 5_usize, vec![4_usize, 1]), (1, 1, vec![0])] {
-        // The window positions max(0, p - 2) ..= p, then the selected compressed entries.
-        let mut read: Vec<Vec<f32>> = (position.saturating_sub(2)..=position)
+        // The window positions max(start, p - 2) ..= p, then the selected compressed entries.
+        let mut read: Vec<Vec<f32>> = (position.saturating_sub(2).max(START)..=position)
             .map(|entry| latent(&window_latents, &[1, 0], 4, entry))
             .collect();
         read.extend(
@@ -348,6 +353,7 @@ fn a_query_attends_its_window_and_its_selection_with_a_sink() {
                 format: Format::Bf16,
                 layout: Layout::Entry,
             },
+            starts: &int(vec![0_u32], 1),
             size: WINDOW,
         },
         Some(Selected {
@@ -602,6 +608,7 @@ fn a_layer_states_its_kernels_at_the_models_shapes() {
             &query,
             Window {
                 plane: plane(&window, &window_table, Format::Mxfp8, Layout::Entry),
+                starts: &column(DType::U32),
                 size: 128,
             },
             Some(Selected {

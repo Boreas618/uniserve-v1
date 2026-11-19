@@ -44,6 +44,10 @@ pub struct LatentBatch<'t> {
     pub written: &'t Tensor,
     /// `[tokens]` U32: each token's row of the cache fields' tables.
     pub rows: &'t Tensor,
+    /// `[rows]` U32: the first position whose window entry each row holds, the position a
+    /// request resumed from a prefix hit recomputes its window from; zero for one that
+    /// computed every token.
+    pub window_starts: &'t Tensor,
     /// `[tokens, rotated / 2]` F32 each: the rotary factors of the tokens' positions.
     pub cos: &'t Tensor,
     /// See `cos`.
@@ -627,6 +631,7 @@ impl LatentAttention {
             query,
             Window {
                 plane: window,
+                starts: batch.window_starts,
                 size: config.window,
             },
             compressed,

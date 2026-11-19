@@ -25,6 +25,8 @@ The cases, each a property a defect of this family breaks:
   MXFP8, NVFP4 and MXFP4 compressed entries;
 - **a window-only layer**, compiled without the compressed side;
 - **windows that start at zero**: contexts shorter than the window;
+- **windows held from a row's start**, as a request resumed from a prefix hit
+  holds them: entries before the start are never read;
 - **a ring of window pages** narrower than the request, read modulo its width;
 - **negative selection slots** among the named ones, and rows that see no
   compressed entry yet;
@@ -89,6 +91,9 @@ class Case:
     ring: bool = False
     padding: bool = False
     seed: int = 0
+    #: Each request's first held window position, as after a replay from a
+    #: prefix hit; empty for requests that computed every token.
+    starts: tuple[int, ...] = ()
 
 
 #: Small shapes, where every edge a row meets fits a few tiles: a latent of
@@ -125,6 +130,16 @@ CASES = {
         requests=((3, 1), (26, 2), (40, 1)),
         padding=True,
         seed=3,
+        **SMALL,
+    ),
+    "windows held from a replay's start, read from it on": Case(
+        heads=16,
+        block=16,
+        window_format="mxfp8",
+        compressed="nvfp4",
+        requests=((40, 4), (20, 2), (12, 1)),
+        starts=(34, 0, 12),
+        seed=8,
         **SMALL,
     ),
     "MXFP8 entries over 64 heads in blocks of 16": Case(
@@ -290,6 +305,7 @@ class Batch:
 
     query: torch.Tensor
     window: Plane
+    starts: torch.Tensor
     compressed: Plane | None
     selection: torch.Tensor
     rows: torch.Tensor
@@ -371,9 +387,11 @@ def batch(case):
     # Sinks on both sides of the scores, one far above them.
     sink = torch.rand(case.heads, generator=generator) * 6.0 - 3.0
     sink[0] = 8.0
+    starts = case.starts or (0,) * len(case.requests)
     return Batch(
         query=query.to(torch.bfloat16),
         window=window,
+        starts=torch.tensor(starts, dtype=torch.int32),
         compressed=compressed,
         selection=torch.stack(selection),
         rows=torch.tensor(rows, dtype=torch.int32),
@@ -396,7 +414,8 @@ def reference(case, operands):
         position = int(operands.positions[token])
         parts = []
         if position >= 0:
-            first = max(position - case.window + 1, 0)
+            held = int(operands.starts[request])
+            first = max(position - case.window + 1, held)
             parts.append(operands.window.latents[request][first : position + 1])
         if operands.compressed is not None:
             named = operands.selection[token]
@@ -435,6 +454,7 @@ def launch(stated, case, operands, device):
         operands.query.to(device),
         operands.window.pages.to(device),
         operands.window.table.to(device),
+        operands.starts.to(device),
         compressed.to(device),
         table.to(device),
         operands.selection.to(device),

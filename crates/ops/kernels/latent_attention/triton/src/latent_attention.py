@@ -4,8 +4,9 @@ Attention over one shared latent that is both key and value: one program
 attends the queries of ``BLOCK`` heads of one token over the token's entries
 (``ops::attention::LatentAttention``)::
 
-    entries  = the window entries at positions max(0, p - WINDOW + 1) ..= p,
-               then the compressed entries selection[t, :] names (>= 0)
+    entries  = the window entries at positions max(start, p - WINDOW + 1) ..= p,
+               start the row's first held position, then the compressed
+               entries selection[t, :] names (>= 0)
     s        = scale * q . c                      FP32, c the decoded latent
     m        = max(-1e30, max s)
     o        = sum e^(s - m) c / (sum e^(s - m) + e^(sink - m))
@@ -187,6 +188,7 @@ def _latent_attention_kernel(
     query,
     window,
     window_table,
+    window_starts,
     compressed,
     compressed_table,
     selection,
@@ -219,7 +221,9 @@ def _latent_attention_kernel(
     is ``[pages, PAGE, WINDOW_RECORD]`` and ``compressed`` ``[pages, ENTRIES,
     COMPRESSED_RECORD]`` (the unread operand when not ``COMPRESSED``); the
     tables are ``[table rows, window_pages]`` and ``[table rows,
-    compressed_pages]``; ``rows`` and ``positions`` are ``[tokens]``;
+    compressed_pages]``; ``window_starts`` is ``[table rows]``, the first
+    position whose window entry a row holds; ``rows`` and ``positions`` are
+    ``[tokens]``;
     ``selection`` is ``[tokens, COLUMNS]``; ``sink`` is ``[HEADS]`` FP32.
     The head tile ``HEAD_TILE`` covers the block with zero rows past it.
     ``tokens`` is the grid's second extent, which the program reads nowhere.
@@ -244,9 +248,11 @@ def _latent_attention_kernel(
     total = tl.zeros((HEAD_TILE,), tl.float32)
     acc = tl.zeros((HEAD_TILE, HEAD_DIM), tl.float32)
 
-    # ---- The window: positions max(0, p - WINDOW + 1) ..= p. A position below
-    # zero (a padding token's) reads no entry. ----
-    first = tl.maximum(position - WINDOW + 1, 0)
+    # ---- The window: positions max(start, p - WINDOW + 1) ..= p, the row's
+    # window holding nothing before its start (a request resumed from a prefix
+    # hit). A position below zero (a padding token's) reads no entry. ----
+    held = tl.load(window_starts + row)
+    first = tl.maximum(position - WINDOW + 1, held)
     for start in range(0, WINDOW, TILE):
         offset = start + lane
         entry = first + offset

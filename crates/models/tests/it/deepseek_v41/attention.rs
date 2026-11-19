@@ -254,10 +254,12 @@ fn check_layer(layer: usize, ratio: u32, candidates: Candidates) {
     let positions = column((0..tokens as i32).collect(), tokens);
     let (cos, sin) = functional::rotary_factors(&positions, &inv_freq, &[], false).unwrap();
     let rows = column(vec![0_u32; tokens], tokens);
+    let starts = column(vec![0_u32], 1);
     let batch = LatentBatch {
         positions: &positions,
         written: &positions,
         rows: &rows,
+        window_starts: &starts,
         cos: &cos,
         sin: &sin,
         inv_freq: &inv_freq,

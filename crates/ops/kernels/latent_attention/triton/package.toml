@@ -32,6 +32,7 @@ derive = "derive"
 query = { pointer = "dtype" }
 window = { field = "window_format", values = { bf16 = "*bf16", mxfp8 = "*u8", nvfp4 = "*u8", mxfp4 = "*u8" } }
 window_table = "*i32"
+window_starts = "*i32"
 compressed = { field = "compressed", values = { none = "*u8", bf16 = "*bf16", mxfp8 = "*u8", nvfp4 = "*u8", mxfp4 = "*u8" } }
 compressed_table = "*i32"
 selection = "*i32"

@@ -4,8 +4,9 @@
 //!
 //! ```text
 //! entries(t)  = window(t) ∪ selected(t)
-//!             window(t)   = the window entries at positions max(0, p_t − W + 1) ..= p_t,
-//!                           none for a padding token's negative position
+//!             window(t)   = the window entries at positions max(start, p_t − W + 1) ..= p_t,
+//!                           start = starts[row(t)], none for a padding token's negative
+//!                           position
 //!             selected(t) = the compressed entries selection[t, :] names, a negative one none
 //! s[t,h,n]    = scale · q[t,h] · c[n]                         n ∈ entries(t)
 //! m[t,h]      = max(−1e30, max_n s[t,h,n])
@@ -18,7 +19,10 @@
 //! the compressed plane holds one entry per `ratio` tokens, and the selection names compressed
 //! entries by their index in the request's order. Entry `e` of a table lies on page
 //! `table[row, (e / entries) mod max_pages]`, at slot `e mod entries`: a table as wide as the
-//! request addresses every page directly, and a narrower window table is a ring of pages.
+//! request addresses every page directly, and a narrower window table is a ring of pages. A
+//! row's window holds its entries from `starts[row]` on: the position a request resumed from a
+//! prefix hit recomputes its window from (zero for one that computed every token), before
+//! which the window group holds nothing.
 //!
 //! The finite floor of the maximum is the reference's (`inference/kernel.py`, `sparse_attn`):
 //! a query that reads no entry attends the sink alone and receives zeros. The scores, the
@@ -149,6 +153,8 @@ pub struct LatentAttentionArgs {
     pub window: Operand,
     /// `[rows, max_pages]` U32: each row's window pages.
     pub window_table: Operand,
+    /// `[rows]` U32: the first position whose window entry each row holds.
+    pub window_starts: Operand,
     /// The compressed side, exactly when the descriptor has one.
     pub compressed: Option<CompressedArgs>,
     /// `[tokens]` U32: each token's row of the tables.
@@ -315,6 +321,13 @@ impl Op for LatentAttention {
 
         check_column(Self::NAME, "rows", &args.rows, DType::U32, tokens)?;
         check_column(Self::NAME, "positions", &args.positions, DType::I32, tokens)?;
+        check_column(
+            Self::NAME,
+            "window starts",
+            &args.window_starts,
+            DType::U32,
+            table_rows,
+        )?;
         args.sink
             .require_shape(Self::NAME, &[heads])
             .and_then(|()| args.sink.require_row(Self::NAME, DType::F32, heads))
@@ -343,6 +356,7 @@ impl Op for LatentAttention {
             .view("query", &args.query)
             .view("window", &args.window)
             .view("window_table", &args.window_table)
+            .view("window_starts", &args.window_starts)
             .view("compressed", plane)
             .view("compressed_table", table)
             .view("selection", selection)
