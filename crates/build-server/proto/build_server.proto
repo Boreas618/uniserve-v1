@@ -170,6 +170,10 @@ message Cover {
   // stated, the candidates are exactly these packages at these revisions: a
   // package or a revision installed since is none.
   repeated FixedRevision fixed = 5;
+  // The version of the operator's interface the requester launches: only a
+  // revision whose manifest states it is a candidate, and a pinned or fixed
+  // revision of another version is refused. Zero considers every revision.
+  uint32 interface_version = 7;
 }
 
 // One package of an operator at the revision a module set fixed.
@@ -299,6 +303,10 @@ message PackageEntry {
   // revision's, over which the daemon fixes an epoch's kernel packages; empty
   // for every other package.
   repeated string operators = 7;
+  // The version of each of `operators`' interfaces the revision launches, by
+  // operator, at least 1: an entry for every operator listed, among whose
+  // packages the daemon fixes the revisions of that version alone.
+  map<string, uint32> interface_versions = 8;
 }
 
 message ListResponse {

@@ -305,6 +305,7 @@ fn a_listing_names_the_packages_revisions_and_modules() {
                             commit: Some("4c36250e65".into()),
                             clean: false,
                             operators: Vec::new(),
+                            interface_versions: Default::default(),
                             modules: vec![wire::ModuleEntry {
                                 target: arch().to_string(),
                                 descriptor: "dtype_bf16".into(),
@@ -470,6 +471,7 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
                             commit: None,
                             clean: false,
                             operators: Vec::new(),
+                            interface_versions: Default::default(),
                             modules: vec![wire::ModuleEntry {
                                 target: Target::wasm().to_string(),
                                 descriptor: "default".into(),
@@ -504,6 +506,7 @@ fn a_listed_module_of_an_unknown_form_is_refused_rather_than_guessed() {
                             commit: None,
                             clean: false,
                             operators: Vec::new(),
+                            interface_versions: Default::default(),
                             modules: vec![wire::ModuleEntry {
                                 target: arch().to_string(),
                                 descriptor: "dtype_bf16".into(),

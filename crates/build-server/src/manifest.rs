@@ -5,7 +5,8 @@
 //! what is particular to the package:
 //!
 //! - the operator and backend names, and the interface version it implements;
-//! - for the engine, the vocabulary of the operators it launches;
+//! - for the engine, the vocabulary of the operators it launches and of the
+//!   version of each one's interface it launches;
 //! - the kind of source (a Triton kernel with its launch table, CUDA C++ with
 //!   its declared compilation or a build module, CuTe DSL with a build module,
 //!   a vendor cubin, a crate cargo builds, an executable);
@@ -716,22 +717,38 @@ fn admits_bits(bits: u32, text: &str) -> bool {
         && (digits == "0" || !digits.starts_with('0'))
 }
 
-/// The operators the vocabulary at `path` names, in its order ([`Manifest::operators`]).
+/// One operator an engine revision launches, as its vocabulary states it ([`read_operators`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Operator {
+    /// The operator's name, which its kernel packages are filed under.
+    pub name: String,
+    /// The version of the operator's interface the engine revision launches, at least 1: the
+    /// only version of its packages' `interface_version` whose modules the revision loads.
+    pub interface_version: u32,
+}
+
+/// The operators the vocabulary at `path` names, in its order, each with the version of its
+/// interface the vocabulary states ([`Manifest::operators`]).
 ///
-/// The vocabulary is a TOML table of the one key `operators`, an array of names. A name is a
-/// lowercase ASCII letter followed by lowercase letters, digits and `_`, so it is one path
-/// segment of the module store, and each name is listed once. The engine's build compiles the
-/// same file by the same rules (`crates/proto/build.rs`).
+/// The vocabulary is a TOML table of two keys: `operators`, an array of names, and
+/// `interface_versions`, a table of the version of each operator's interface past its first, by
+/// name; an operator it does not name launches version 1. A name is a lowercase ASCII letter
+/// followed by lowercase letters, digits and `_`, so it is one path segment of the module store,
+/// and each name is listed once; a version names a listed operator and is positive. The table is
+/// required, empty or not: a vocabulary without it states no versions, and reading its operators
+/// at version 1 would fix packages of the wrong version for every operator past its first. The
+/// engine's build compiles the same file by the same rules (`crates/proto/build.rs`).
 ///
 /// # Errors
 ///
-/// Fails when the file cannot be read, is no such table, or names an operator by no such name or
-/// twice.
-pub fn read_operators(path: &Path) -> Result<Vec<String>, ManifestError> {
+/// Fails when the file cannot be read, is no such table, states no `interface_versions`, names an
+/// operator by no such name or twice, or states a version of 0 or of an operator it does not list.
+pub fn read_operators(path: &Path) -> Result<Vec<Operator>, ManifestError> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Vocabulary {
         operators: Vec<String>,
+        interface_versions: Option<BTreeMap<String, u32>>,
     }
 
     let text = std::fs::read_to_string(path).map_err(|source| ManifestError::Read {
@@ -763,7 +780,36 @@ pub fn read_operators(path: &Path) -> Result<Vec<String>, ManifestError> {
             )));
         }
     }
-    Ok(vocabulary.operators)
+
+    let versions = vocabulary.interface_versions.ok_or_else(|| {
+        ManifestError::Invalid(format!(
+            "{}: the vocabulary states no `interface_versions`, the version of each operator's \
+             interface past its first that the engine launches",
+            path.display()
+        ))
+    })?;
+    for (name, version) in &versions {
+        if !listed.contains(name.as_str()) {
+            return Err(ManifestError::Invalid(format!(
+                "{}: `interface_versions` states `{name}`, which the vocabulary does not list",
+                path.display()
+            )));
+        }
+        if *version == 0 {
+            return Err(ManifestError::Invalid(format!(
+                "{}: `{name}` states interface version 0; versions start at 1",
+                path.display()
+            )));
+        }
+    }
+    Ok(vocabulary
+        .operators
+        .into_iter()
+        .map(|name| Operator {
+            interface_version: versions.get(&name).copied().unwrap_or(1),
+            name,
+        })
+        .collect())
 }
 
 /// The kernel package a package provides: the architectures it supports and
@@ -802,7 +848,8 @@ pub struct Manifest {
     /// The backend's name, which the configuration field selects.
     pub backend: String,
     /// The vocabulary of the operators whose kernel packages the package launches: a file of the
-    /// package's snapshot that names them ([`read_operators`]), by its path relative to the root
+    /// package's snapshot that names them with the version of each one's interface the package
+    /// launches ([`read_operators`]), by its path relative to the root
     /// of the workspace for a package cargo builds, whose snapshot is its workspace, and to the
     /// package's directory for any other. Every engine package states it, and no other package
     /// does.
@@ -811,7 +858,8 @@ pub struct Manifest {
     /// (`proto::module::operator`), so the vocabulary an installed revision's snapshot holds is
     /// the one the revision launches. The Build Server reads it from the snapshot, lists it with
     /// the revision, and the daemon fixes an epoch's kernel packages over the vocabulary of the
-    /// epoch's engine revision and refuses a `[kernels]` pin of an operator outside it.
+    /// epoch's engine revision, each operator's among the revisions of the interface version the
+    /// vocabulary states, and refuses a `[kernels]` pin of an operator outside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operators: Option<String>,
     /// The version of the interface the package implements: its operator's

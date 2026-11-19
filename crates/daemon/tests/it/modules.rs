@@ -1,7 +1,9 @@
 //! The module set an apply fixes at a real Build Server, over the operators the deployment's
 //! engine revision states: an operator its engine package defines is fixed, pinnable and moved by
 //! a newer installed package however old the daemon's own build is, and an operator the engine
-//! revision does not state is neither, whatever the daemon's build knows.
+//! revision does not state is neither, whatever the daemon's build knows. Each operator's packages
+//! are fixed among the revisions of the interface version the engine revision launches, so a
+//! revision installed for another engine revision's version is fixed for that revision alone.
 
 use std::io::Write as _;
 use std::os::unix::net::UnixStream;
@@ -36,10 +38,12 @@ fn write(root: &Path, files: &[(&str, &str)]) {
 }
 
 /// A source tree of the three packages every apply fixes, as a workspace of three crates: the
-/// engine package, an executable whose vocabulary (`engine/operators.toml`) is [`LATER`] alone,
-/// the default scheduling policy's program package and the default processing program's package.
-/// None is built: fixing a module set selects among installed revisions and builds nothing.
+/// engine package, an executable whose vocabulary (`engine/operators.toml`) is [`LATER`] alone at
+/// version 1 of its interface, the default scheduling policy's program package and the default
+/// processing program's package. None is built: fixing a module set selects among installed
+/// revisions and builds nothing.
 struct Tree {
+    root: PathBuf,
     engine: PathBuf,
     policy: PathBuf,
     processing: PathBuf,
@@ -71,7 +75,7 @@ impl Tree {
                 ("engine/src/main.rs", "fn main() {}\n"),
                 (
                     "engine/operators.toml",
-                    &format!("operators = [\"{LATER}\"]\n"),
+                    &format!("operators = [\"{LATER}\"]\n\n[interface_versions]\n"),
                 ),
                 (
                     "engine/package.toml",
@@ -99,18 +103,34 @@ impl Tree {
             ],
         );
         Self {
+            root: root.to_path_buf(),
             engine: root.join("engine"),
             policy: root.join("policy"),
             processing: root.join("processing"),
         }
     }
+
+    /// States the engine's vocabulary as [`LATER`] alone, launched at version `interface` of its
+    /// interface: installing the engine package after a change of it installs a new revision.
+    fn launch_later_at(&self, interface: u32) {
+        write(
+            &self.root,
+            &[(
+                "engine/operators.toml",
+                &format!(
+                    "operators = [\"{LATER}\"]\n\n[interface_versions]\n{LATER} = {interface}\n"
+                ),
+            )],
+        );
+    }
 }
 
 /// Writes a vendor cubin package of `op`'s backend `vendor` covering [`KEY`] into `directory`,
-/// whose cubin holds `bytes`: two calls with other bytes are two revisions of one package.
-fn kernel_package(directory: &Path, op: &str, bytes: &str) -> PathBuf {
+/// implementing version `interface` of the operator's interface, whose cubin holds `bytes`: two
+/// calls with other bytes are two revisions of one package.
+fn kernel_package(directory: &Path, op: &str, interface: u32, bytes: &str) -> PathBuf {
     let manifest = format!(
-        "op = \"{op}\"\nbackend = \"vendor\"\ninterface_version = 1\n\n\
+        "op = \"{op}\"\nbackend = \"vendor\"\ninterface_version = {interface}\n\n\
          [module]\nmetadata = \"metadata_{{descriptor}}.json\"\n\n\
          [source]\nkind = \"cubin\"\ncubin = \"artifact/module_{{descriptor}}.cubin\"\n\
          metadata = \"artifact/metadata_{{descriptor}}.json\"\n\n\
@@ -238,8 +258,8 @@ fn held(fixed: &proto::module::ModuleSet, slot: &ModuleSlot) -> Option<(String, 
 fn the_module_set_is_fixed_over_the_engine_revision_s_operators() {
     let directory = tempfile::tempdir().unwrap();
     let tree = Tree::write(&directory.path().join("tree"));
-    let later = kernel_package(&directory.path().join("later"), LATER, "first");
-    let unstated = kernel_package(&directory.path().join("unstated"), UNSTATED, "first");
+    let later = kernel_package(&directory.path().join("later"), LATER, 1, "first");
+    let unstated = kernel_package(&directory.path().join("unstated"), UNSTATED, 1, "first");
     let serving = Serving::start(
         &directory.path().join("server"),
         &[
@@ -275,7 +295,7 @@ fn the_module_set_is_fixed_over_the_engine_revision_s_operators() {
 
     // A newer package of the operator is installed: the next apply of the same configuration
     // fixes it, a change of the kernels alone, which the serving engines take as a generation.
-    let newer = kernel_package(&directory.path().join("later"), LATER, "second");
+    let newer = kernel_package(&directory.path().join("later"), LATER, 1, "second");
     let installed = build_server::Client::connect(&serving.socket)
         .unwrap()
         .install(&newer)
@@ -303,6 +323,95 @@ fn the_module_set_is_fixed_over_the_engine_revision_s_operators() {
     let refused = format!("{refused:#}");
     assert!(
         refused.contains(UNSTATED) && refused.contains("engine"),
+        "{refused}"
+    );
+}
+
+/// A deployment that names engine revision `revision` and no kernel package.
+fn running(revision: u32) -> Config {
+    let mut config = Config {
+        model: Some("org/model".to_owned()),
+        ..Config::default()
+    };
+    config.worker_config.engine_revision = Some(revision);
+    config
+}
+
+/// A deployment serves engine revision 1, which launches [`LATER`] at version 2 of its interface,
+/// and a later tree is installed for an epoch update: engine revision 2, which launches the
+/// operator at version 3, and a newer package revision of the operator that implements version 3.
+/// An apply that keeps engine revision 1 fixes the operator's revision of version 2 and changes
+/// nothing the serving engines run; the later engine revision's set fixes the newer revision; and
+/// a pin of the newer revision on engine revision 1 is refused, naming both versions.
+#[test]
+fn an_engine_revision_s_kernels_are_fixed_at_its_interface_versions() {
+    let directory = tempfile::tempdir().unwrap();
+    let tree = Tree::write(&directory.path().join("tree"));
+    tree.launch_later_at(2);
+    let packages = directory.path().join("later");
+    let serving_kernel = kernel_package(&packages, LATER, 2, "first");
+    let serving = Serving::start(
+        &directory.path().join("server"),
+        &[
+            &tree.engine,
+            &tree.policy,
+            &tree.processing,
+            &serving_kernel,
+        ],
+    );
+    let candidate = ModuleSlot {
+        op: LATER.to_owned(),
+        key: None,
+        part: Some("vendor".to_owned()),
+    };
+
+    let config = running(1);
+    let named = daemon::epoch::modules_of(&config);
+    let fixed = with_store_modules(&serving.local(), &named).unwrap();
+    assert_eq!(held(&fixed, &candidate), Some(("vendor".to_owned(), 1)));
+
+    // The later tree's engine and its package of the operator, installed beside the serving ones.
+    tree.launch_later_at(3);
+    let mut client = build_server::Client::connect(&serving.socket).unwrap();
+    assert_eq!(client.install(&tree.engine).unwrap().revision, 2);
+    let later_kernel = kernel_package(&packages, LATER, 3, "second");
+    assert_eq!(client.install(&later_kernel).unwrap().revision, 2);
+
+    // Applied again, the configuration of engine revision 1 fixes the revision that engine
+    // revision loads, and the comparison with what serves starts no generation.
+    let kept = with_store_modules(&serving.local(), &named).unwrap();
+    assert_eq!(kept.engine.revision, 1);
+    assert_eq!(held(&kept, &candidate), Some(("vendor".to_owned(), 1)));
+    assert_eq!(
+        change(
+            &Epoch::with_modules(config.clone(), fixed).unwrap(),
+            &Epoch::with_modules(config, kept).unwrap()
+        ),
+        Change::None
+    );
+
+    // The epoch update to engine revision 2 fixes the operator's revision of version 3.
+    let moved =
+        with_store_modules(&serving.local(), &daemon::epoch::modules_of(&running(2))).unwrap();
+    assert_eq!(moved.engine.revision, 2);
+    assert_eq!(held(&moved, &candidate), Some(("vendor".to_owned(), 2)));
+
+    // On engine revision 1, a pin of the latest revision is the revision of version 2, and a pin
+    // of the revision of version 3 is refused, naming both versions.
+    let mut pinned = pinning(LATER);
+    pinned.worker_config.engine_revision = Some(1);
+    let latest = with_store_modules(&serving.local(), &daemon::epoch::modules_of(&pinned)).unwrap();
+    assert_eq!(
+        held(&latest, &ModuleSlot::key(LATER, KEY)),
+        Some(("vendor".to_owned(), 1))
+    );
+    let kernels = pinned.kernels.get_mut(LATER).unwrap();
+    kernels.get_mut(KEY).unwrap().revision = Some(2);
+    let refused = with_store_modules(&serving.local(), &daemon::epoch::modules_of(&pinned))
+        .expect_err("engine revision 1 launches another version than revision 2 implements");
+    let refused = format!("{refused:#}");
+    assert!(
+        refused.contains("implements version 3") && refused.contains("launches version 2"),
         "{refused}"
     );
 }

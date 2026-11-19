@@ -71,10 +71,10 @@ pub struct Package {
     /// Where the revision's sources came from: the commit of the tree it was
     /// installed from and whether that tree was clean.
     pub origin: Origin,
-    /// The operators whose kernel packages the revision launches, as the vocabulary its
-    /// snapshot holds names them ([`Manifest::operators`]): an engine revision's; empty for
-    /// every other package.
-    pub operators: Vec<String>,
+    /// The operators whose kernel packages the revision launches, with the version of each
+    /// one's interface, as the vocabulary its snapshot holds states them
+    /// ([`Manifest::operators`]): an engine revision's; empty for every other package.
+    pub operators: Vec<crate::manifest::Operator>,
 }
 
 impl Package {
@@ -461,6 +461,8 @@ impl BuildServer {
                     op: cover.op,
                     targets: cover.targets.into_iter().map(Target::new).collect(),
                     keys: cover.keys,
+                    interface_version: (cover.interface_version != 0)
+                        .then_some(cover.interface_version),
                     pins,
                     fixed: cover
                         .fixed
@@ -507,7 +509,16 @@ impl BuildServer {
                             revision: entry.package.revision,
                             commit: entry.origin.commit,
                             clean: entry.origin.clean,
-                            operators: entry.operators,
+                            interface_versions: entry
+                                .operators
+                                .iter()
+                                .map(|operator| (operator.name.clone(), operator.interface_version))
+                                .collect(),
+                            operators: entry
+                                .operators
+                                .into_iter()
+                                .map(|operator| operator.name)
+                                .collect(),
                             modules: entry
                                 .modules
                                 .into_iter()
@@ -1371,7 +1382,12 @@ impl BuildServer {
     /// The candidates are the packages a module set fixed for the operator,
     /// when the request states them, and otherwise each backend's latest
     /// installed revision, or the revision a pin states; of those, the ones
-    /// that build for every requested target. The response lists them in
+    /// that build for every requested target. A request that states the
+    /// version of the operator's interface it launches considers only the
+    /// revisions that implement it (the manifest's `interface_version`): a
+    /// backend's latest revision is its latest of that version, and a backend
+    /// installed at other versions alone is no candidate, since the requester
+    /// refuses the modules of any other version. The response lists them in
     /// selection order, which is what the daemon fixes a module set from: the
     /// manifest's `priority`, highest first, then the backend whose name sorts
     /// first. A key the request pins (the deployment's `[kernels]` table, by the
@@ -1384,8 +1400,9 @@ impl BuildServer {
     /// # Errors
     ///
     /// Fails when the request pins or fixes a revision of a backend that is
-    /// not installed, or pins a key to a backend that is no candidate for the
-    /// targets or does not cover the key.
+    /// not installed, or one of another interface version than it states, pins
+    /// a backend installed at no revision of that version, or pins a key to a
+    /// backend that is no candidate for the targets or does not cover the key.
     pub fn cover(&self, request: &protocol::CoverRequest) -> Result<protocol::Coverage> {
         let packages = self
             .packages
@@ -1409,9 +1426,23 @@ impl BuildServer {
             }
         }
 
+        // Whether the requester loads a package's modules: the package implements the version of
+        // the operator's interface the request launches. A package whose manifest states no
+        // version (the engine, a program) is checked by its loader alone.
+        let loadable = |package: &Package| match (
+            request.interface_version,
+            package.manifest.interface_version,
+        ) {
+            (Some(launched), Some(implemented)) => implemented.get() == launched,
+            _ => true,
+        };
+        // The backends with a revision of another version: a pin of one that has no revision of
+        // the request's version is refused as such, rather than as uninstalled.
+        let mut other_versions: std::collections::BTreeSet<&str> = Default::default();
+
         // Each backend's revision: the one a module set fixed, when the
         // request states them, and otherwise the one a pin states, else the
-        // latest installed.
+        // latest installed of the version the request launches.
         let mut revisions: BTreeMap<&str, (u32, &Arc<Package>)> = BTreeMap::new();
         for ((op, backend, revision), package) in packages.iter() {
             if *op != request.op {
@@ -1427,6 +1458,25 @@ impl BuildServer {
                 }
             };
             if stated.is_some_and(|stated| stated != *revision) {
+                continue;
+            }
+            if !loadable(package) {
+                // A revision the request names is refused, naming both versions; any other one
+                // is no candidate.
+                if let (Some(launched), Some(implemented)) = (
+                    request.interface_version.filter(|_| stated.is_some()),
+                    package.manifest.interface_version,
+                ) {
+                    return Err(Error::Refused {
+                        reason: format!(
+                            "{op} package {backend} revision {revision} implements version \
+                             {implemented} of the operator's interface, and the request launches \
+                             version {launched}"
+                        ),
+                        upstream: None,
+                    });
+                }
+                other_versions.insert(backend.as_str());
                 continue;
             }
             let held = revisions
@@ -1451,12 +1501,26 @@ impl BuildServer {
             }
         }
         for backend in pinned.keys() {
-            if !revisions.contains_key(backend) {
-                return Err(Error::NotInstalled {
-                    op: request.op.clone(),
-                    backend: (*backend).to_owned(),
+            if revisions.contains_key(backend) {
+                continue;
+            }
+            if let Some(launched) = request
+                .interface_version
+                .filter(|_| other_versions.contains(backend))
+            {
+                return Err(Error::Refused {
+                    reason: format!(
+                        "{} package {backend} is installed at no revision that implements version \
+                         {launched} of the operator's interface, the version the request launches",
+                        request.op
+                    ),
+                    upstream: None,
                 });
             }
+            return Err(Error::NotInstalled {
+                op: request.op.clone(),
+                backend: (*backend).to_owned(),
+            });
         }
         let mut candidates: Vec<(&str, u32, &Arc<Package>)> = revisions
             .into_iter()
@@ -2101,7 +2165,7 @@ fn operators(
     manifest: &Manifest,
     package: &Path,
     locate: impl FnOnce(&str) -> Option<PathBuf>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<crate::manifest::Operator>> {
     let Some(name) = manifest.operators_file() else {
         return Ok(Vec::new());
     };

@@ -160,10 +160,11 @@ pub struct PackageEntry {
     /// Where the revision's sources came from: the commit of the tree it was installed from and
     /// whether that tree was clean.
     pub origin: Origin,
-    /// The operators whose kernel packages the revision launches, in its vocabulary's order
-    /// (`Manifest::operators`): an engine revision's, which the daemon fixes an epoch's kernel
-    /// packages over; empty for every other package.
-    pub operators: Vec<String>,
+    /// The operators whose kernel packages the revision launches, in its vocabulary's order,
+    /// each with the version of its interface the revision launches (`Manifest::operators`): an
+    /// engine revision's, which the daemon fixes an epoch's kernel packages over; empty for every
+    /// other package.
+    pub operators: Vec<crate::manifest::Operator>,
     /// The revision's committed modules.
     pub modules: Vec<ModuleEntry>,
 }
@@ -198,6 +199,14 @@ pub struct CoverRequest {
     /// takes each backend's latest installed revision, which is what the
     /// daemon asks when it fixes a module set.
     pub fixed: Vec<(String, u32)>,
+    /// The version of the operator's interface the requester launches: the
+    /// version the engine revision a module set is fixed for states in its
+    /// vocabulary, or the version the engine's own build launches. Only a
+    /// revision that implements it is a candidate, and a revision `pins` or
+    /// `fixed` names of another version is refused. `None` considers every
+    /// revision, for an interface whose packages state no version in their
+    /// manifests (the engine, a program).
+    pub interface_version: Option<u32>,
 }
 
 /// The response to `cover`: each requested key once, either under the package
@@ -657,6 +666,29 @@ impl Client {
                             )?,
                         });
                     }
+                    // A Build Server lists the interface version of every operator it lists.
+                    // One that lists none (a build whose vocabularies state no versions) leaves
+                    // the versions unknown, and none is assumed: reading 1 would select the
+                    // packages of the wrong version for every operator past its first.
+                    let mut operators = Vec::with_capacity(package.operators.len());
+                    for name in package.operators {
+                        let interface_version = package
+                            .interface_versions
+                            .get(&name)
+                            .copied()
+                            .filter(|version| *version != 0)
+                            .ok_or_else(|| {
+                                Error::Protocol(format!(
+                                    "the listing of {} {} revision {} names operator {name} \
+                                     without the version of its interface",
+                                    package.op, package.backend, package.revision
+                                ))
+                            })?;
+                        operators.push(crate::manifest::Operator {
+                            name,
+                            interface_version,
+                        });
+                    }
                     packages.push(PackageEntry {
                         package: Package {
                             op: package.op,
@@ -667,7 +699,7 @@ impl Client {
                             commit: package.commit,
                             clean: package.clean,
                         },
-                        operators: package.operators,
+                        operators,
                         modules,
                     });
                 }
@@ -703,6 +735,7 @@ impl Client {
                         revision: *revision,
                     })
                     .collect(),
+                interface_version: request.interface_version.unwrap_or(0),
             })),
         })?;
         match self.response()? {

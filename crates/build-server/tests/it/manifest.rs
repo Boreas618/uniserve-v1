@@ -962,15 +962,24 @@ fn only_an_engine_package_names_its_operator_vocabulary_inside_its_workspace() {
 
 /// Every engine package of the tree, the engine and the sanitizer suite's `memcheck` package
 /// that runs it, names the vocabulary the tree's engine is compiled with, as a file its snapshot
-/// holds: an installation of either lists exactly the operators the executable launches.
+/// holds: an installation of either lists exactly the operators the executable launches, each at
+/// the version of its interface the executable launches.
 #[test]
 fn the_tree_s_engine_packages_name_the_vocabulary_the_engine_is_compiled_with() {
+    let compiled: Vec<build_server::manifest::Operator> = proto::module::operator::ALL
+        .iter()
+        .map(|name| build_server::manifest::Operator {
+            name: (*name).to_owned(),
+            interface_version: proto::module::operator::version(name),
+        })
+        .collect();
+
     let repository = crate::support::repository();
     let engine = Manifest::load(&repository.join("crates/engine")).unwrap();
     let path = repository.join(engine.operators.as_deref().unwrap());
     assert_eq!(
         build_server::manifest::read_operators(&path).unwrap(),
-        proto::module::operator::ALL
+        compiled
     );
 
     let sanitizer = repository.join("tests/python/sanitizer");
@@ -978,30 +987,65 @@ fn the_tree_s_engine_packages_name_the_vocabulary_the_engine_is_compiled_with() 
     let path = sanitizer.join(memcheck.operators_file().unwrap());
     assert_eq!(
         build_server::manifest::read_operators(&path).unwrap(),
-        proto::module::operator::ALL
+        compiled
     );
 }
 
-/// A vocabulary names each operator once, by a name that is one store path segment, and the
-/// names come back in the order it lists them.
+/// A vocabulary names each operator once, by a name that is one store path segment, with the
+/// version of its interface: the operators come back in the order it lists them, each at the
+/// version `interface_versions` states, else 1. A vocabulary that states no versions is refused
+/// rather than read at version 1, as is a version of 0 or of an operator it does not list.
 #[test]
-fn a_vocabulary_names_each_operator_once_by_a_store_name() {
+fn a_vocabulary_names_each_operator_once_by_a_store_name_and_its_interface_version() {
     let directory = tempfile::tempdir().unwrap();
     let read = |text: &str| {
         let path = directory.path().join("operators.toml");
         fs::write(&path, text).unwrap();
         build_server::manifest::read_operators(&path).map_err(|error| error.to_string())
     };
+    let operator = |name: &str, interface_version: u32| build_server::manifest::Operator {
+        name: name.to_owned(),
+        interface_version,
+    };
 
     assert_eq!(
-        read("operators = [\"rms_norm\", \"gemm\", \"activation1d\"]\n").unwrap(),
-        ["rms_norm", "gemm", "activation1d"]
+        read(
+            "operators = [\"rms_norm\", \"gemm\", \"activation1d\"]\n\n\
+             [interface_versions]\ngemm = 3\n"
+        )
+        .unwrap(),
+        [
+            operator("rms_norm", 1),
+            operator("gemm", 3),
+            operator("activation1d", 1)
+        ]
     );
     for (text, refused) in [
-        ("operators = [\"rms_norm\", \"rms_norm\"]\n", "twice"),
-        ("operators = [\"RmsNorm\"]\n", "no operator name"),
-        ("operators = [\"rms/norm\"]\n", "no operator name"),
-        ("operators = []\nversion = 2\n", "version"),
+        (
+            "operators = [\"rms_norm\", \"rms_norm\"]\n[interface_versions]\n",
+            "twice",
+        ),
+        (
+            "operators = [\"RmsNorm\"]\n[interface_versions]\n",
+            "no operator name",
+        ),
+        (
+            "operators = [\"rms/norm\"]\n[interface_versions]\n",
+            "no operator name",
+        ),
+        (
+            "operators = []\nversion = 2\n[interface_versions]\n",
+            "version",
+        ),
+        ("operators = [\"gemm\"]\n", "no `interface_versions`"),
+        (
+            "operators = [\"gemm\"]\n[interface_versions]\nrms_norm = 2\n",
+            "does not list",
+        ),
+        (
+            "operators = [\"gemm\"]\n[interface_versions]\ngemm = 0\n",
+            "version 0",
+        ),
     ] {
         let error = read(text).unwrap_err();
         assert!(error.contains(refused), "{text}: {error}");

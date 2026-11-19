@@ -52,6 +52,7 @@ fn request(keys: &[&str]) -> CoverRequest {
         keys: keys.iter().map(|key| (*key).to_owned()).collect(),
         pins: Default::default(),
         fixed: Vec::new(),
+        interface_version: None,
     }
 }
 
