@@ -2,9 +2,14 @@
 # snapshot of a cargo package carries with the workspace's manifest and lockfile.
 
 # A wasm32 program reaches nothing but its host functions. The JSON Schema
-# validator the processing program types tool-call values with draws hash seeds
+# validator a processing program types tool-call values with draws hash seeds
 # through `getrandom`, whose default wasm32 backend imports a JavaScript
-# runtime no program host provides; the `custom` backend is the program's own
-# (`crates/processing/src/entropy.rs`).
+# runtime no program host provides; the `custom` backend is the processing
+# library's (`crates/processing/src/entropy.rs`), which every processing
+# program's module links. The setting is the workspace's, not a program
+# crate's, since cargo reads the configuration of the directory it runs in and
+# of its parents: the Build Server builds from its snapshot's workspace root,
+# and a test builds a program's module from its own crate's directory, which
+# need not be the program's.
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg", 'getrandom_backend="custom"']

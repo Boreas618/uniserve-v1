@@ -12,9 +12,8 @@ description = "A processing program of test families, which the daemon's tests s
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# The request-processing machinery the test families are served with, without the release's
-# exports, so this crate's are the module's only ones.
-processing = { path = "..", default-features = false }
+# The request-processing machinery the test families are served with.
+processing.workspace = true
 # The processing interface the families are exported through.
 scheduling.workspace = true
 serde_json.workspace = true

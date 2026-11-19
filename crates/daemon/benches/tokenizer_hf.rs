@@ -5,10 +5,10 @@
 //! The checkpoint is a Hugging Face repository, resolved as the daemon resolves one: through the
 //! Hub the standard Hugging Face environment configures, into its cache (a cold cache needs the
 //! network, an offline host a populated cache). The sample is the conversation of `--turns` user
-//! and assistant turns rendered through the checkpoint's own chat template by the tree's
-//! processing program (`crates/processing`, built for wasm32 by the cargo that runs the bench), as
-//! a chat request's prompt is. Encoding throughput is reported in input bytes and decoding
-//! throughput in token IDs; `FILTER` selects benchmarks by name, as Criterion's does.
+//! and assistant turns rendered through the checkpoint's own chat template by the tree's processing
+//! program (`crates/processing/program`, built for wasm32 by the cargo that runs the bench), as a
+//! chat request's prompt is. Encoding throughput is reported in input bytes and decoding throughput
+//! in token IDs; `FILTER` selects benchmarks by name, as Criterion's does.
 
 use std::error::Error;
 
@@ -52,7 +52,7 @@ impl BenchFixture {
     async fn load(arguments: &Arguments) -> Result<Self, Box<dyn Error>> {
         let hub = Hub::from_env()?;
         let program = Program::load(
-            &program_testing::module!("processing"),
+            &program_testing::module!("processing-program"),
             proto::module::PackageRevision {
                 backend: "processing".to_owned(),
                 revision: 1,
