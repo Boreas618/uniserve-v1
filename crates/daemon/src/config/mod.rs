@@ -29,8 +29,7 @@ pub use proto::request::StandbyStorage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use processing::Family;
-use processing::Serving;
+use scheduling::processing::{Family, Serving};
 
 pub use args::{Stated, parse, printed};
 use proto::admin::{InFlight, PreviousEpoch, RollbackConfig};
@@ -208,9 +207,9 @@ enum Kind {
 impl Kind {
     /// Whether `family` is of this kind.
     fn serves(self, family: &Family) -> bool {
-        match (self, family.serving) {
-            (Self::Chat, Serving::Chat(_)) | (Self::Video, Serving::Video(_)) => true,
-            (Self::Chat, Serving::Video(_)) | (Self::Video, Serving::Chat(_)) => false,
+        match (self, &family.serving) {
+            (Self::Chat, Serving::Chat { .. }) | (Self::Video, Serving::Video(_)) => true,
+            (Self::Chat, Serving::Video(_)) | (Self::Video, Serving::Chat { .. }) => false,
         }
     }
 

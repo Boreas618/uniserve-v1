@@ -1,12 +1,12 @@
 //! Input processing: what turns an API request into the request the engine
 //! serves.
 //!
-//! [`Processor`] renders and tokenizes a request against the loaded model:
-//! chat templates (`chat`), sampling controls (`sampling`), images (`media`),
-//! and the lowering of each model family's requests (`video`). Each request
-//! leaves as its engine request and the lowering its output processing is
-//! built from (`proto::handoff::Lowering`). A request's cache partition is
-//! keyed by `storage::key::isolation`.
+//! [`Processor`] renders and tokenizes a request against the loaded model: its prompt rendered by
+//! the epoch's processing program from the request as `chat` states it, sampling controls
+//! (`sampling`), images (`media`), and the lowering of each model family's requests (`video`).
+//! Each request leaves as its engine request, the lowering its output processing is built from
+//! (`proto::handoff::Lowering`) and its instance of the program, which parses its response. A
+//! request's cache partition is keyed by `storage::key::isolation`.
 
 pub mod chat;
 mod error;
@@ -17,8 +17,8 @@ pub mod video;
 
 pub use error::{ServeError, TokenizeError};
 pub use media::ImageInput;
-pub use processor::{AdapterSelection, ModelResolutionError, Processor, RequestRenderer};
-pub use processor::{LoadedModel, LoadedRenderer};
+pub use processor::{AdapterSelection, ModelResolutionError, Processor};
+pub use processor::{LoadedBinding, LoadedModel};
 
 /// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;

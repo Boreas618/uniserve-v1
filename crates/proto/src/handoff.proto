@@ -196,13 +196,12 @@ message Lowering {
   bool prompt_logprobs = 3;
   // Whether generated-token log-probabilities were requested.
   bool logprobs = 4;
-  // The output parsers the request's model family chose.
-  Parser parser = 5;
   // The response's OpenAI fields.
   ChatResponseOptions response = 6;
-  // The response's clock is its assembly's (`Assembly.started_unix_us`).
-  reserved 7, 8;
-  reserved "compile_us", "started_unix_us";
+  // The response's clock is its assembly's (`Assembly.started_unix_us`). Its
+  // parsers are the processing program's, whose state is `Processor`.
+  reserved 5, 7, 8;
+  reserved "parser", "compile_us", "started_unix_us";
 }
 
 // Incremental detokenization and stop strings of one generation.
@@ -215,33 +214,6 @@ message TextDecode {
   repeated string stop_strings = 3;
   // Generated tokens before stop strings can end the request.
   uint32 min_tokens = 4;
-}
-
-// The output parsers of a request: the formats of its model family's chat
-// profile its output is read with: the delimiters of its reasoning, and its
-// tool-call format by the name the request-processing vocabulary gives it
-// (`processing::ToolCallFormat::name`), which this schema does not
-// enumerate.
-message Parser {
-  reserved 1, 2, 3, 5;
-  reserved "kind", "parse_reasoning", "parse_tools", "reasoning";
-  // The delimiters the output's reasoning is written between
-  // (`processing::ReasoningFormat`); absent when reasoning is not parsed.
-  ReasoningDelimiters reasoning_delimiters = 7;
-  // The tool-call format the output's tool calls are parsed in; empty when
-  // tool calls are not parsed.
-  string tool_calls = 6;
-  // The request's tool definitions, as the JSON array the client stated them
-  // in: a parser that types a call's values by its tool's schema reads them.
-  // Empty when tool calls are not parsed.
-  string tools = 4;
-}
-
-// The text that opens a model's reasoning and the text that closes it, each
-// one token of the model's vocabulary.
-message ReasoningDelimiters {
-  string open = 1;
-  string close = 2;
 }
 
 // The OpenAI fields every chunk and the final body of a chat response carry.
@@ -317,70 +289,18 @@ message IncrementalDecode {
   uint64 min_bytes_to_buffer = 9;
 }
 
-// The reasoning and tool-call parsers of a request.
+// The parsers of a response's reasoning and tool calls, which the epoch's
+// processing program holds: their state as the program saved it, opaque to the
+// daemon, and the program that saved it, which restores it. A successor
+// restores it in the same program, which its epoch's module set fixes, so a
+// new tool-call or reasoning format changes nothing here.
 message Processor {
-  // The reasoning parser, absent when the request parses no reasoning.
-  optional Reasoning reasoning = 1;
-  // The tool-call stage, absent when the request parses no tool calls.
-  optional ToolStage tools = 2;
-}
-
-// The delimited reasoning state machine's state. Its delimiters and region
-// default are configuration: the request's model family restates them when the
-// successor rebuilds the parser.
-message Reasoning {
-  reserved 2;
-  reserved "label_pending";
-  // Whether the text parsed so far is inside a reasoning section.
-  bool in_reasoning = 1;
-  // Text a later delta may still complete into a delimiter.
-  string buffer = 3;
-}
-
-// The tool-call stage of the output processor.
-message ToolStage {
-  reserved 1;
-  reserved "parser_failed";
-  // The parser-local index of the tool call later arguments extend.
-  optional uint64 open_call_index = 2;
-  // The parser behind the stage, with its state.
-  oneof parser {
-    JsonToolCall json = 3;
-    XmlToolCall xml = 4;
-  }
-}
-
-// The function-and-parameter tag tool-call parser's state.
-message XmlToolCall {
-  reserved 5, 6;
-  reserved "active_tool_index", "emitted_tool_count";
-  // Input no complete tag or parameter consumed.
-  string buffer = 1;
-  // Whether the text parsed so far is inside a tool-call region.
-  bool in_tool_call = 2;
-  // The function whose call is open, from its `<function=NAME>` tag until its
-  // `</function>`; the open call is the last one started.
-  optional string function = 3;
-  // Parameters the open call has published.
-  uint64 parameters = 4;
-  // Calls started in the turn; the next call's index.
-  uint64 started = 7;
-}
-
-// The JSON tool-call parser's state.
-message JsonToolCall {
-  reserved 2, 3, 4;
-  reserved "mode", "active_tool_index", "emitted_tool_count";
-  // Input after the emitted text and the open call's body: a partial start
-  // delimiter outside a call, or a prefix of the end delimiter after a call's
-  // object closed.
-  string buffer = 1;
-  // The open call's text after its start delimiter, which a successor's parser
-  // reads again to stand where this one stood; the open call is the last one
-  // started.
-  optional string call = 5;
-  // Calls started in the turn; the next call's index.
-  uint64 started = 6;
+  reserved 1, 2;
+  reserved "reasoning", "tools";
+  // The parsers' state (`scheduling::processing`'s `parse_save`).
+  bytes state = 3;
+  // The SHA-256 of the processing program's module that saved it, in hex.
+  string program = 4;
 }
 
 // The assistant blocks a chat response assembled.

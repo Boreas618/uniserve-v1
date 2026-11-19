@@ -1,37 +1,34 @@
 //! Load-time model resolution and the lowering of requests into engine requests.
 //!
-//! `ModelConfig::load` resolves checkpoint facts, the tokenizer, and what renders requests
-//! at startup, by the family of the executable's registry the checkpoint's root files declare
-//! (`processing::Registry::resolve`): a video family's processor reads the pipeline files the
-//! family s, and a chat family renders with its chat template.
-//! [`Processor::new`] then binds the generation limits the started workers report and the request
-//! renderer they complete ([`RequestRenderer`]), and the result is shared immutably by the
-//! serving runtime.
+//! `ModelConfig::load` resolves the checkpoint's family among the families the epoch's
+//! processing program declares (`crate::api::program::Program::resolve`), reads the files the
+//! family declares and the tokenizer, and binds the family to them in the program: a chat
+//! family's binding states the model's facts; a video family binds once its workers described
+//! the placed denoiser ([`LoadedBinding`]). [`Processor::new`] then binds the generation limits
+//! the started workers report, and the result is shared immutably by the serving runtime.
 //!
 //! [`Processor`] is the deployment's input processing, as vLLM's `Processor` is: it binds the
-//! tokenizer, the chat template, the generation limits and the sampling defaults, and
+//! tokenizer, the program's binding, the generation limits and the sampling defaults, and
 //! [`Processor::process`] turns one parsed chat request into the engine's
-//! [`GenerationRequest`] and the lowering its output processing is built from
-//! (`proto::handoff::Lowering`). A video deployment's `VideoService` produces its
-//! `DiffusionRequest`s.
+//! [`GenerationRequest`], the lowering its output processing is built from
+//! (`proto::handoff::Lowering`), and the request's instance of the program
+//! ([`Session`]), which rendered its prompt and parses its response. A video deployment's
+//! `VideoService` produces its `DiffusionRequest`s through the same program.
 
 use std::sync::Arc;
 
 use crate::api::model::ModelConfig;
-use crate::api::model::assets::{
-    self, ChatFiles, Checkpoint, Hub, PipelineCheckpoint, Source, required_file,
-};
+use crate::api::model::assets::{self, ChatFiles, Checkpoint, Hub, PipelineCheckpoint, Source};
+use crate::api::program::{Binding, Program, Session};
 use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use processing::{ImageFamily, ImageProcessor, Registry, Serving, VideoFamily};
 use proto::handoff;
 use proto::request::{
     CachePolicy, GenerationFeatures, GenerationLimits, GenerationRequest, RequestId,
 };
+use scheduling::processing::{Bind, Bound, ChatOptions, ContentFormat, Open, Segment, Serving};
 use service::span::{self, Stage};
 use thiserror::Error;
 
-use crate::api::input::chat::MultimodalRenderInfo;
-use crate::api::input::chat::{GenerationPromptMode, HfChatRenderer};
 use crate::api::input::sampling::resolve_max_tokens;
 use crate::api::input::video::VideoService;
 use crate::api::input::{Result, ServeError, TokenizeError};
@@ -39,7 +36,7 @@ use crate::api::protocol::{
     ChatCompletionRequest, ChatMessage, ChatModality, ChatToolChoice, ContentPart, MessageContent,
 };
 
-/// The deployment's input processing: the tokenizer and template resources that turn a parsed
+/// The deployment's input processing: the tokenizer and the program binding that turn a parsed
 /// request into the engine's request. Runtime capabilities are fixed at construction, before
 /// this value is shared.
 ///
@@ -48,16 +45,17 @@ use crate::api::protocol::{
 pub struct Processor {
     pub(super) config: ModelConfig,
     pub(super) tokenizer: DynTokenizer,
-    renderer: RequestRenderer,
+    /// The family bound to the checkpoint in the epoch's processing program, whose instances
+    /// requests check out.
+    binding: Arc<Binding>,
+    /// The video service of a video deployment.
+    video: Option<VideoService>,
     // Worker-advertised generation features and resource limits.
     pub(super) limits: GenerationLimits,
     /// The candidates a request may ask for at a position: the workers' `max_logprobs`, which
     /// a kernel generation of other candidates moves while the processor serves
     /// ([`Processor::set_max_logprobs`]).
     max_logprobs: std::sync::atomic::AtomicU32,
-    pub(super) parse_reasoning: bool,
-    // The family's image processor, when the family takes images and the workers encode them.
-    images: Option<Arc<dyn ImageProcessor>>,
 }
 
 /// The LoRA adapter a request computes with.
@@ -73,7 +71,7 @@ pub struct AdapterSelection {
 #[derive(Debug, Error)]
 /// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
-    /// A file a video family's processor reads cannot be read.
+    /// A file the family's binding reads cannot be read.
     #[error("reading {}", path.display())]
     ProcessorFile {
         /// The file.
@@ -83,29 +81,32 @@ pub enum ModelResolutionError {
         source: std::io::Error,
     },
     /// Model files or profile metadata cannot be resolved, or the checkpoint declares no family
-    /// the executable serves.
+    /// the epoch's processing program serves.
     #[error(transparent)]
     Assets(#[from] crate::api::model::assets::Error),
     /// A family that serves video is declared by a checkpoint with no pipeline index.
     #[error("the {family} family serves video, and this checkpoint publishes no pipeline index")]
     NoPipeline {
         /// The declared family.
-        family: &'static str,
+        family: String,
     },
     /// The model tokenizer cannot be loaded.
     #[error(transparent)]
     Tokenizer(#[from] TokenizerError),
-    /// The chat template cannot be read or does not compile.
+    /// The processing program refuses the checkpoint or the options, or fails.
     #[error(transparent)]
-    Template(#[from] crate::api::input::chat::TemplateError),
-    /// The checkpoint's image processor files are not its family's.
-    #[error("binding the image processor: {0}")]
-    ImageProcessor(String),
+    Program(#[from] crate::api::program::Error),
+    /// A binding states facts of another kind than its family serves.
+    #[error("the {family} family's binding states facts of another kind than it serves")]
+    Facts {
+        /// The family.
+        family: String,
+    },
     /// The running worker lacks a feature required by the selected profile.
     #[error("configured model description `{description}` requires worker feature `{feature}`")]
     MissingFeature {
         /// Stable model-profile identifier.
-        description: &'static str,
+        description: String,
         /// Required runtime feature.
         feature: GenerationFeatures,
     },
@@ -117,38 +118,24 @@ pub struct LoadedModel {
     pub config: ModelConfig,
     /// The prompt tokenizer.
     pub tokenizer: DynTokenizer,
-    /// What renders the checkpoint's requests once its engine has started.
-    pub renderer: LoadedRenderer,
+    /// The family bound, or to bind, in the epoch's processing program.
+    pub binding: LoadedBinding,
     /// The checkpoint in the local directories its engines open.
     pub checkpoint: Checkpoint,
 }
 
-/// What renders a loaded checkpoint's requests, fixed by its layout.
-pub enum LoadedRenderer {
-    /// A token model's chat template, and the image processor of a family that takes images.
-    Chat {
-        renderer: Box<HfChatRenderer>,
-        /// The family's image processor, bound to the checkpoint's processor files; `None` for
-        /// a family that serves text alone.
-        images: Option<Arc<dyn ImageProcessor>>,
-    },
-    /// A video family and the contents of the pipeline files its processor
-    /// reads; the processor is bound from the denoiser handshake.
+/// A loaded checkpoint's family in the epoch's processing program.
+pub enum LoadedBinding {
+    /// A chat family, bound to the checkpoint.
+    Chat(Arc<Binding>),
+    /// A video family, with what it binds with beside the description its workers state once
+    /// they started.
     Video {
-        /// The family.
-        family: &'static dyn VideoFamily,
-        /// The files [`VideoFamily::processor_files`] names, in that order.
-        files: Vec<String>,
+        /// The program.
+        program: Arc<Program>,
+        /// The pipeline files and options it binds with.
+        bind: Box<Bind>,
     },
-}
-
-/// What renders the served model's API requests into engine requests.
-pub enum RequestRenderer {
-    /// A token model's chat template.
-    Chat(HfChatRenderer),
-    /// The video service of a video pipeline, bound to what its denoiser
-    /// serves.
-    Video(VideoService),
 }
 
 /// Loads a diffusers pipeline's `tokenizer` stage as the pipeline's own `transformers` tokenizer
@@ -163,26 +150,70 @@ pub fn pipeline_tokenizer(
     Ok(HuggingFaceTokenizer::load(&directory)?)
 }
 
+/// The deployment's chat options as the processing program reads them: the configured template's
+/// source (a file's read exactly as written), its arguments, its content shape, and whether
+/// reasoning is answered apart from content.
+///
+/// # Errors
+///
+/// [`ModelResolutionError::ProcessorFile`] when the configured template file cannot be read.
+fn chat_options(
+    chat: &proto::config::ChatConfig,
+) -> std::result::Result<ChatOptions, ModelResolutionError> {
+    use proto::config::{ChatTemplateContentFormat, ChatTemplateSource, ReasoningParser};
+
+    let template = match &chat.template {
+        Some(ChatTemplateSource::File(path)) => {
+            tracing::info!(path = %path.display(), "rendering with the configured chat template file");
+            Some(std::fs::read_to_string(path).map_err(|source| {
+                ModelResolutionError::ProcessorFile {
+                    path: path.clone(),
+                    source,
+                }
+            })?)
+        }
+        Some(ChatTemplateSource::Inline(source)) => {
+            tracing::info!("rendering with the configured chat template");
+            Some(source.clone())
+        }
+        None => None,
+    };
+    Ok(ChatOptions {
+        template,
+        template_kwargs: chat
+            .template_kwargs
+            .iter()
+            .flatten()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        content_format: chat.template_content_format.map(|format| match format {
+            ChatTemplateContentFormat::String => ContentFormat::String,
+            ChatTemplateContentFormat::OpenAi => ContentFormat::OpenAi,
+            ChatTemplateContentFormat::Preserve => ContentFormat::Preserve,
+        }),
+        reasoning: chat.reasoning_parser == ReasoningParser::Auto,
+    })
+}
+
 impl ModelConfig {
     /// Loads the checkpoint `model` states, with the adapter `adapter` states: its facts, the
-    /// tokenizer and template resources request processing needs, and the local directories its
-    /// engines open, with the family of `registry` that claims it.
+    /// tokenizer, its family bound in the epoch's processing `program`, and the local
+    /// directories its engines open.
     ///
-    /// The checkpoint's root files declare its family, which decides what else is read: a chat
-    /// checkpoint's every file (its engines read it whole) and the files its family declares; a
-    /// diffusers pipeline's stage folders, over the release a layered checkpoint pins, and the
-    /// files its video family's processor reads. A Hugging Face repository is fetched through
-    /// `hub` into its cache's snapshot as each is read. The returned `max_model_len` is the
-    /// configured `max_model_len`, else, for a chat checkpoint, the bound it states where its
-    /// family declares it; a pipeline's deployment must state it. `chat` configures a chat
-    /// checkpoint's template, and `processor_options` (`mm_processor_kwargs`) are a chat
-    /// family's image processor's, which binds with them; a video family's processor binds with
-    /// them once its workers described the placed denoiser.
+    /// The checkpoint's root files declare its family among the program's, which decides what
+    /// else is read: a chat checkpoint's every file (its engines read it whole), its tokenizer
+    /// and the files its family declares, which the family is bound to with the deployment's
+    /// chat options (`chat`) and processor options (`mm_processor_kwargs`); a diffusers
+    /// pipeline's stage folders, over the release a layered checkpoint pins, and the files its
+    /// video family's processor reads, which it binds to once its workers described the placed
+    /// denoiser. A Hugging Face repository is fetched through `hub` into its cache's snapshot as
+    /// each is read. The returned `max_model_len` is the configured `max_model_len`, else, for a
+    /// chat checkpoint, the bound its binding states; a pipeline's deployment must state it.
     ///
     /// # Errors
     ///
-    /// Fails when the checkpoint's files cannot be resolved or read, no family of `registry`
-    /// serves it, or a chat family that binds no image processor is given processor options.
+    /// Fails when the checkpoint's files cannot be resolved or read, no family of `program`
+    /// serves it, or the family refuses the checkpoint or the options.
     pub async fn load(
         hub: &Hub,
         model: &Source,
@@ -190,29 +221,32 @@ impl ModelConfig {
         max_model_len: Option<std::num::NonZeroU32>,
         chat: &proto::config::ChatConfig,
         processor_options: &serde_json::Map<String, serde_json::Value>,
-        registry: &Registry,
+        program: &Arc<Program>,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let max_model_len = max_model_len.map(std::num::NonZeroU32::get);
         let snapshot = model.locate(hub).await?;
         snapshot.fetch(assets::root_file).await?;
         let directory = snapshot.directory();
-        let family = assets::declared_family(directory, registry)?;
+        let family = assets::declared_family(directory, program)?;
         let adapter = match adapter {
             Some(adapter) => Some(adapter.directory(hub).await?),
             None => None,
         };
 
-        let profile = match family.serving {
-            Serving::Chat(profile) => profile,
+        let declared = match &family.serving {
+            Serving::Chat { files } => files.clone(),
             // A diffusers pipeline names its stage folders in its root index, which locates the
             // tokenizer stage before any other asset is read.
             Serving::Video(video) => {
-                let pipeline = PipelineCheckpoint::open(&snapshot, family.root, video, hub)
-                    .await?
-                    .ok_or(ModelResolutionError::NoPipeline { family: family.id })?;
+                let pipeline =
+                    PipelineCheckpoint::open(&snapshot, family.root, video.base_pin.as_ref(), hub)
+                        .await?
+                        .ok_or_else(|| ModelResolutionError::NoPipeline {
+                            family: family.id.clone(),
+                        })?;
                 let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline)?);
-                let mut files = Vec::with_capacity(video.processor_files().len());
-                for (stage, name) in video.processor_files() {
+                let mut files = std::collections::BTreeMap::new();
+                for (stage, name) in &video.processor_files {
                     let path = pipeline.stage_file(stage, name)?;
                     let text = std::fs::read_to_string(&path).map_err(|source| {
                         ModelResolutionError::ProcessorFile {
@@ -220,14 +254,21 @@ impl ModelConfig {
                             source,
                         }
                     })?;
-                    files.push(text);
+                    files.insert(format!("{stage}/{name}"), text);
                 }
+                let bind = Bind {
+                    family: family.id.clone(),
+                    files,
+                    processor_options: processor_options.clone(),
+                    max_model_len,
+                    ..Bind::default()
+                };
                 return Ok(LoadedModel {
                     config: Self::from_pipeline(family, max_model_len)?,
                     tokenizer,
-                    renderer: LoadedRenderer::Video {
-                        family: video,
-                        files,
+                    binding: LoadedBinding::Video {
+                        program: Arc::clone(program),
+                        bind: Box::new(bind),
                     },
                     checkpoint: Checkpoint {
                         directory: directory.to_path_buf(),
@@ -239,35 +280,26 @@ impl ModelConfig {
         };
 
         snapshot.fetch(|_| true).await?;
-        let files = ChatFiles::locate(directory, profile.checkpoint)?;
+        let files = ChatFiles::locate(directory, &declared)?;
         let tokenizer: DynTokenizer =
             Arc::new(HuggingFaceTokenizer::load(files.tokenizer_directory())?);
-        let config = Self::from_files(family, &files, max_model_len, tokenizer.as_ref())?;
-        // A family that takes images binds its processor to the checkpoint's processor files; a
-        // template that reads content parts writes its own image markup, and one that reads
-        // flattened content is given the family's.
-        let images = match profile.images {
-            Some(images) => Some(bind_images(directory, images, processor_options)?),
-            None if processor_options.is_empty() => None,
-            None => {
-                return Err(ModelResolutionError::ImageProcessor(format!(
-                    "the {} family binds no image processor, which `mm_processor_kwargs` \
-                     configures",
-                    config.family.id
-                )));
-            }
+        let bind = Bind {
+            family: family.id.clone(),
+            files: files.texts()?,
+            chat: chat_options(chat)?,
+            processor_options: processor_options.clone(),
+            max_model_len,
+            video: None,
         };
-        let multimodal = images.as_ref().map(|images| MultimodalRenderInfo {
-            placeholder_token: images.markup().to_owned(),
-        });
-        let renderer = HfChatRenderer::load(&files, chat, multimodal)?;
+        let binding = program.bind(bind, Arc::clone(&tokenizer))?;
+        let Bound::Chat(facts) = binding.facts() else {
+            return Err(ModelResolutionError::Facts { family: family.id });
+        };
+        let config = Self::of_chat(family, facts);
         Ok(LoadedModel {
             config,
             tokenizer,
-            renderer: LoadedRenderer::Chat {
-                renderer: Box::new(renderer),
-                images,
-            },
+            binding: LoadedBinding::Chat(binding),
             checkpoint: Checkpoint {
                 directory: directory.to_path_buf(),
                 base: None,
@@ -277,26 +309,6 @@ impl ModelConfig {
     }
 }
 
-/// Binds a chat family's image processor to the processor files of the checkpoint in
-/// `directory`.
-fn bind_images(
-    directory: &std::path::Path,
-    family: &'static dyn ImageFamily,
-    options: &serde_json::Map<String, serde_json::Value>,
-) -> std::result::Result<Arc<dyn ImageProcessor>, ModelResolutionError> {
-    let mut files = Vec::with_capacity(family.processor_files().len());
-    for name in family.processor_files() {
-        let path = required_file(directory, name)?;
-        let text = std::fs::read_to_string(&path)
-            .map_err(|source| ModelResolutionError::ProcessorFile { path, source })?;
-        files.push(text);
-    }
-    family
-        .bind(&files, options)
-        .map(Arc::from)
-        .map_err(ModelResolutionError::ImageProcessor)
-}
-
 impl Processor {
     /// The model's tokenizer, which output processing builds a request's incremental decoder
     /// from.
@@ -304,12 +316,22 @@ impl Processor {
         Arc::clone(&self.tokenizer)
     }
 
+    /// The family's binding in the epoch's processing program, whose instances its requests
+    /// check out.
+    pub fn binding(&self) -> &Arc<Binding> {
+        &self.binding
+    }
+
+    /// The epoch's processing program.
+    pub fn program(&self) -> &Arc<Program> {
+        self.binding.program()
+    }
+
     /// Binds model resources to the generation limits the started workers
     /// report in their handshake, without rebuilding model data.
     ///
-    /// `renderer` is the checkpoint's chat template, or the video service a video pipeline's
-    /// denoiser handshake built. `parse_reasoning` is the deployment's choice
-    /// (`chat_config.reasoning_parser`) to answer reasoning apart from content.
+    /// `binding` is the family bound in the epoch's processing program; `video` the video
+    /// service a video pipeline's denoiser handshake built.
     ///
     /// # Errors
     ///
@@ -318,24 +340,22 @@ impl Processor {
     pub fn new(
         config: ModelConfig,
         tokenizer: DynTokenizer,
-        renderer: RequestRenderer,
+        binding: Arc<Binding>,
+        video: Option<VideoService>,
         limits: GenerationLimits,
-        parse_reasoning: bool,
     ) -> std::result::Result<Self, ModelResolutionError> {
-        let needs = match config.chat() {
+        let needs = match config.chat {
             Some(_) => GenerationFeatures::UNDERSTANDING,
             None => GenerationFeatures::empty(),
         };
         validate_runtime_features(&config, &limits, needs)?;
-
         Ok(Self {
             config,
             tokenizer,
-            renderer,
+            binding,
+            video,
             max_logprobs: std::sync::atomic::AtomicU32::new(limits.max_logprobs),
             limits,
-            parse_reasoning,
-            images: None,
         })
     }
 
@@ -351,38 +371,14 @@ impl Processor {
         self.max_logprobs.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Takes image parts through `images`, the family's bound image processor, when the workers
-    /// encode images ([`GenerationFeatures::VISION_ENCODE`]); a deployment whose workers do not
-    /// keeps refusing them.
-    #[must_use]
-    pub fn with_images(mut self, images: Option<Arc<dyn ImageProcessor>>) -> Self {
-        self.images = images.filter(|_| {
-            self.limits
-                .covers(GenerationFeatures::VISION_ENCODE)
-                .is_ok()
-        });
-        self
-    }
-
     /// Immutable facts of the loaded model.
     pub fn config(&self) -> &ModelConfig {
         &self.config
     }
 
-    /// The chat template of a token model; `None` for a video pipeline.
-    pub(super) fn chat_renderer(&self) -> Option<&HfChatRenderer> {
-        match &self.renderer {
-            RequestRenderer::Chat(renderer) => Some(renderer),
-            RequestRenderer::Video(_) => None,
-        }
-    }
-
     /// The video service of a video deployment; `None` for other models.
     pub fn video_service(&self) -> Option<&VideoService> {
-        match &self.renderer {
-            RequestRenderer::Video(video) => Some(video),
-            RequestRenderer::Chat(_) => None,
-        }
+        self.video.as_ref()
     }
 
     /// What the deployment serves of video, as `GET /v1/capabilities` reports it;
@@ -398,22 +394,21 @@ impl Processor {
     /// Returns whether the model supports image input: its family takes images and its workers
     /// encode them.
     pub fn supports_image_input(&self) -> bool {
-        self.images.is_some()
+        self.config.chat.is_some_and(|chat| chat.images)
+            && self
+                .limits
+                .covers(GenerationFeatures::VISION_ENCODE)
+                .is_ok()
     }
 
-    /// Returns whether the model's tool calls are parsed from its output: whether its
-    /// family's chat profile names the format it writes them in.
+    /// Returns whether the model's tool calls are parsed from its output.
     pub fn supports_tool_calling(&self) -> bool {
-        self.config
-            .chat()
-            .is_some_and(|profile| profile.tool_calls.is_some())
+        self.config.chat.is_some_and(|chat| chat.tools)
     }
 
     /// Returns whether the model produces structured reasoning output.
     pub fn supports_reasoning(&self) -> bool {
-        self.config
-            .chat()
-            .is_some_and(|profile| profile.reasoning.is_some())
+        self.config.chat.is_some_and(|chat| chat.reasoning)
     }
 
     /// Validates the features `request` reaches against the loaded model.
@@ -430,7 +425,7 @@ impl Processor {
             request_id: request_id.to_owned(),
             feature,
         };
-        if self.config.chat().is_none() {
+        if self.config.chat.is_none() {
             return Err(reject("generation_endpoint"));
         }
         if has_input_image && !self.supports_image_input() {
@@ -451,15 +446,15 @@ impl Processor {
             .map_err(|feature| reject(feature.name()))
     }
 
-    /// Lowers one chat completion request into its engine request and the lowering its output
-    /// processing is built from.
+    /// Lowers one chat completion request into its engine request, the lowering its output
+    /// processing is built from, and the request's instance of the processing program.
     ///
     /// The engine request carries the rendered and tokenized prompt, the sampling parameters
     /// (each of the request's controls over the checkpoint's defaults), the generation length,
     /// the stop conditions and the cache partition of `cache_salt` and `adapter`. The lowering
-    /// states what the response needs of the same request: the prompt, the decode options, the
-    /// parsers of the model family's formats and the response's OpenAI fields, named
-    /// `request_id`.
+    /// states what the response needs of the same request: the prompt, the decode options and
+    /// the response's OpenAI fields, named `request_id`. The session rendered the prompt and
+    /// holds the response's parser, opened for the prompt.
     ///
     /// `images` are the fetched `image_url` parts of the request, in
     /// `ChatCompletionRequest::image_urls` order; a text request has none. `adapter` is the
@@ -470,8 +465,8 @@ impl Processor {
     /// # Errors
     ///
     /// Returns `ServeError::UnsupportedFeature` for a feature the deployment does not serve,
-    /// and `ServeError::Tokenize` for every failure of lowering, rendering, tokenization,
-    /// validation and resource sizing.
+    /// `ServeError::Processing` when the program fails, and `ServeError::Tokenize` for every
+    /// failure of lowering, rendering, tokenization, validation and resource sizing.
     pub fn process(
         &self,
         request_id: &str,
@@ -479,48 +474,53 @@ impl Processor {
         adapter: Option<&AdapterSelection>,
         images: Vec<crate::api::input::ImageInput>,
         trace: u64,
-    ) -> Result<(GenerationRequest, handoff::Lowering)> {
+    ) -> Result<(GenerationRequest, handoff::Lowering, Session)> {
         let has_input_image = !images.is_empty() || !request.image_urls().is_empty();
         self.validate_generation_features(request_id, request, has_input_image)?;
+        let tokenize = |source| ServeError::Tokenize {
+            request_id: request_id.to_owned(),
+            source,
+        };
 
-        // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
-        (|| -> std::result::Result<_, TokenizeError> {
-            validate_request(request)?;
-            let mut generation = GenerationRequest {
-                trace,
-                // The daemon's submission stamps the engine's identifier for the request.
-                request_id: RequestId::default(),
-                prompt_token_ids: Vec::new(),
-                multimodal_inputs: Default::default(),
-                sampling: super::sampling::lower(
-                    request,
-                    &self.config.sampling_defaults,
-                    &self.tokenizer,
-                    self.max_logprobs(),
-                )?,
-                max_und_tokens: 0,
-                include_stop_token: request.include_stop_str_in_output,
-                stop_strings: request
-                    .stop
-                    .as_ref()
-                    .map(|stop| stop.as_slice().to_vec())
-                    .unwrap_or_default(),
-                stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
-                priority: request.priority.unwrap_or(0),
-                cache: CachePolicy {
-                    isolation_key: storage::key::isolation(
-                        request.cache_salt.as_deref(),
-                        adapter.map(|adapter| adapter.identity.as_str()),
-                    ),
-                    ..CachePolicy::default()
-                },
-                generated_token_ids: Vec::new(),
-                adapter: adapter.map_or(0, |adapter| adapter.slot),
-                hand_off: false,
-                lend: None,
-            };
+        validate_request(request).map_err(tokenize)?;
+        let mut session = self.binding.checkout()?;
+        let mut generation = GenerationRequest {
+            trace,
+            // The daemon's submission stamps the engine's identifier for the request.
+            request_id: RequestId::default(),
+            prompt_token_ids: Vec::new(),
+            multimodal_inputs: Default::default(),
+            sampling: super::sampling::lower(
+                request,
+                &self.config.sampling_defaults,
+                &self.tokenizer,
+                self.max_logprobs(),
+            )
+            .map_err(tokenize)?,
+            max_und_tokens: 0,
+            include_stop_token: request.include_stop_str_in_output,
+            stop_strings: request
+                .stop
+                .as_ref()
+                .map(|stop| stop.as_slice().to_vec())
+                .unwrap_or_default(),
+            stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
+            priority: request.priority.unwrap_or(0),
+            cache: CachePolicy {
+                isolation_key: storage::key::isolation(
+                    request.cache_salt.as_deref(),
+                    adapter.map(|adapter| adapter.identity.as_str()),
+                ),
+                ..CachePolicy::default()
+            },
+            generated_token_ids: Vec::new(),
+            adapter: adapter.map_or(0, |adapter| adapter.slot),
+            hand_off: false,
+            lend: None,
+        };
 
-            self.tokenize(request, &images, &mut generation)?;
+        self.tokenize(request_id, &mut session, request, &images, &mut generation)?;
+        (|| -> std::result::Result<(), TokenizeError> {
             generation.validate()?;
             // The workers compute a position's candidates in their graphs, as many as they state.
             GenerationLimits {
@@ -528,70 +528,50 @@ impl Processor {
                 ..GenerationLimits::default()
             }
             .covers_logprobs(&generation.sampling)?;
-
-            let lowering = handoff::Lowering {
-                // Detokenization needs the prompt after ownership moves to the engine.
-                prompt_token_ids: generation.prompt_token_ids.clone(),
-                decode_options: Some(handoff::TextDecode {
-                    skip_special_tokens: request.skip_special_tokens,
-                    include_stop_str_in_output: request.include_stop_str_in_output,
-                    stop_strings: generation.stop_strings.clone(),
-                    min_tokens: request.min_tokens.unwrap_or(0),
-                }),
-                prompt_logprobs: generation.sampling.prompt_logprobs_requested(),
-                logprobs: generation.sampling.generated_logprobs_requested(),
-                parser: Some(self.parser(request)?),
-                response: Some(response_options(
-                    request_id,
-                    request,
-                    generation.sampling.n_logprobs,
-                )),
-            };
-            Ok((generation, lowering))
+            Ok(())
         })()
-        .map_err(|source| ServeError::Tokenize {
-            request_id: request_id.to_owned(),
-            source,
-        })
-    }
+        .map_err(tokenize)?;
 
-    /// The parsers `request`'s output is read with: the formats the model family's chat profile
-    /// names, reasoning when the deployment answers it apart from content, tool calls when the
-    /// model may call the request's tools.
-    ///
-    /// # Errors
-    ///
-    /// `TokenizeError::Tools` when the request's tools do not serialize.
-    fn parser(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> std::result::Result<handoff::Parser, TokenizeError> {
-        let Some(profile) = self.config.chat() else {
-            return Ok(handoff::Parser::default());
+        // The response's parser starts where the prompt leaves generation: its tail from its
+        // last special token on decides whether generation starts inside a reasoning section.
+        let open = Open {
+            tools: super::chat::callable_tools(request),
+            prompt: prompt_tail(&self.tokenizer, &generation.prompt_token_ids).to_vec(),
         };
-        let reasoning = profile.reasoning.filter(|_| self.parse_reasoning);
-        let tools = request
-            .callable_tools()
-            .filter(|_| profile.tool_calls.is_some());
+        session
+            .open(&open)?
+            .map_err(|message| tokenize(TokenizeError::Parser(message)))?;
 
-        Ok(handoff::Parser {
-            reasoning_delimiters: reasoning.map(|format| handoff::ReasoningDelimiters {
-                open: format.open.to_owned(),
-                close: format.close.to_owned(),
+        let lowering = handoff::Lowering {
+            // Detokenization needs the prompt after ownership moves to the engine.
+            prompt_token_ids: generation.prompt_token_ids.clone(),
+            decode_options: Some(handoff::TextDecode {
+                skip_special_tokens: request.skip_special_tokens,
+                include_stop_str_in_output: request.include_stop_str_in_output,
+                stop_strings: generation.stop_strings.clone(),
+                min_tokens: request.min_tokens.unwrap_or(0),
             }),
-            tool_calls: profile
-                .tool_calls
-                .filter(|_| tools.is_some())
-                .map(|format| format.name().to_owned())
-                .unwrap_or_default(),
-            // A request's tools serialize as it stated them.
-            tools: tools
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(TokenizeError::Tools)?
-                .unwrap_or_default(),
-        })
+            prompt_logprobs: generation.sampling.prompt_logprobs_requested(),
+            logprobs: generation.sampling.generated_logprobs_requested(),
+            response: Some(response_options(
+                request_id,
+                request,
+                generation.sampling.n_logprobs,
+            )),
+        };
+        Ok((generation, lowering, session))
     }
+}
+
+/// The prompt's ids from its last special token on, the whole prompt when it holds none: what
+/// decides the region a response's generation starts in, as the processing program reads it
+/// (`scheduling::processing::Open::prompt`).
+pub fn prompt_tail<'p>(tokenizer: &HuggingFaceTokenizer, prompt: &'p [u32]) -> &'p [u32] {
+    let start = prompt
+        .iter()
+        .rposition(|id| tokenizer.is_special_id(*id))
+        .unwrap_or(0);
+    &prompt[start..]
 }
 
 /// The OpenAI fields the response to `request` carries, named `request_id`.
@@ -728,39 +708,93 @@ fn validate_runtime_features(
     limits
         .covers(needs)
         .map_err(|feature| ModelResolutionError::MissingFeature {
-            description: config.id(),
+            description: config.id().to_owned(),
             feature,
         })
 }
 
 impl Processor {
-    /// Renders and tokenizes `request`'s prompt into `generation`, with its image blocks, its
-    /// generation length and its stop tokens.
+    /// Renders `request`'s prompt in `session` and tokenizes it into `generation`, with its
+    /// image blocks, its generation length and its stop tokens.
+    ///
+    /// The program states the prompt as text segments, each tokenized here without special
+    /// tokens (the tokenizer splits the added tokens a segment's text names), and the blocks of
+    /// the request's images, each written where its segment stands, in the order the images were
+    /// fetched. An image's digest, which keys its encodings, covers its bytes and the request's
+    /// cache partition, so requests of other partitions share no encoding.
     fn tokenize(
         &self,
+        request_id: &str,
+        session: &mut Session,
         request: &ChatCompletionRequest,
         images: &[crate::api::input::ImageInput],
         generation: &mut GenerationRequest,
-    ) -> std::result::Result<(), TokenizeError> {
+    ) -> Result<()> {
         let trace = generation.trace;
-        let rendered_text = {
+        let tokenize = |source| ServeError::Tokenize {
+            request_id: request_id.to_owned(),
+            source,
+        };
+        let prompt = {
             let _template = span::enter(Stage::Template, trace);
-            self.chat_renderer()
-                .ok_or(TokenizeError::MissingChatTemplate)?
-                .render(request, GenerationPromptMode::StartNewAssistant)?
+            session
+                .render(&super::chat::render(request, images))?
+                .map_err(|refusal| tokenize(TokenizeError::Render(refusal)))?
         };
-        let mut prompt_token_ids = {
-            let _tokenize = span::enter(Stage::Tokenize, trace);
-            self.tokenizer.encode(&rendered_text, false)?
-        };
-        generation.multimodal_inputs.images = {
-            let _preprocess = (!images.is_empty()).then(|| span::enter(Stage::Preprocess, trace));
-            self.lower_images(
-                &mut prompt_token_ids,
-                images,
-                generation.cache.isolation_key,
-            )?
-        };
+
+        let _tokenize = span::enter(Stage::Tokenize, trace);
+        let isolation = generation.cache.isolation_key;
+        let mut prompt_token_ids = Vec::new();
+        let mut inputs = Vec::with_capacity(images.len());
+        let mut next = images.iter();
+        for segment in prompt.segments {
+            match segment {
+                Segment::Text(text) => {
+                    let ids = self
+                        .tokenizer
+                        .encode(&text, false)
+                        .map_err(|error| tokenize(error.into()))?;
+                    prompt_token_ids.extend(ids);
+                }
+                Segment::Image(block) => {
+                    let image = next.next().ok_or_else(|| {
+                        tokenize(TokenizeError::Invalid(
+                            "the prompt places more images than the request fetched".into(),
+                        ))
+                    })?;
+                    let mut digest = storage::key::Digest::new(b"chat-image");
+                    digest.bytes(&image.digest());
+                    match isolation {
+                        Some(key) => {
+                            digest.number(1);
+                            digest.number(key);
+                        }
+                        None => digest.number(0),
+                    }
+                    inputs.push(proto::request::ImageInput {
+                        digest: digest.finish(),
+                        encoded: image.bytes().to_vec(),
+                        position: prompt_token_ids.len() as u32,
+                        num_positions: block.positions,
+                        encoders: vec![proto::request::ImageEncoderInput {
+                            encoder: proto::request::ImageEncoder::Vision,
+                            num_cache_tokens: Some(block.tokens),
+                            max_cache_tokens: None,
+                            height: None,
+                            width: None,
+                        }],
+                    });
+                }
+            }
+        }
+        if next.next().is_some() {
+            return Err(tokenize(TokenizeError::Invalid(format!(
+                "the prompt places {} of the request's {} images",
+                inputs.len(),
+                images.len()
+            ))));
+        }
+        generation.multimodal_inputs.images = inputs;
 
         // The context holds the prompt's tokens and every image block's rows.
         let image_tokens: u32 = generation
@@ -771,8 +805,9 @@ impl Processor {
             .filter_map(|encoder| encoder.num_cache_tokens)
             .sum();
         let prompt_len = prompt_token_ids.len() as u32 + image_tokens;
-        let max_tokens =
-            self.resolve_length(generation, request.max_output_tokens(), prompt_len)?;
+        let max_tokens = self
+            .resolve_length(generation, request.max_output_tokens(), prompt_len)
+            .map_err(tokenize)?;
 
         generation.prompt_token_ids = prompt_token_ids;
         generation.max_und_tokens = max_tokens as usize;
@@ -780,81 +815,6 @@ impl Processor {
         // read would skip.
         generation.cache.read &= !generation.sampling.prompt_logprobs_requested();
         Ok(())
-    }
-
-    /// Lowers the fetched `images` of a rendered prompt into the request's image inputs.
-    ///
-    /// The template wrote the family's placeholder token once per image, in the order the images
-    /// were fetched. Each placeholder is removed from `prompt` and its image becomes a vision block
-    /// written before the token that followed it, of the rows and positions the family's processor
-    /// states for the image's size. An image's digest, which keys its encodings, covers its bytes
-    /// and the request's cache partition `isolation`, so requests of other partitions share no
-    /// encoding.
-    fn lower_images(
-        &self,
-        prompt: &mut Vec<u32>,
-        images: &[crate::api::input::ImageInput],
-        isolation: Option<u64>,
-    ) -> std::result::Result<Vec<proto::request::ImageInput>, TokenizeError> {
-        let Some(processor) = self.images.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let placeholder = self
-            .tokenizer
-            .token_to_id(processor.placeholder())
-            .ok_or_else(|| {
-                TokenizeError::Invalid(format!(
-                    "the vocabulary has no image placeholder `{}`",
-                    processor.placeholder()
-                ))
-            })?;
-        let found = prompt.iter().filter(|id| **id == placeholder).count();
-        if found != images.len() {
-            return Err(TokenizeError::Invalid(format!(
-                "the prompt renders {found} image placeholder(s) for {} image(s)",
-                images.len()
-            )));
-        }
-
-        let mut inputs = Vec::with_capacity(images.len());
-        let mut kept = Vec::with_capacity(prompt.len());
-        let mut next = images.iter();
-        for &id in prompt.iter() {
-            if id != placeholder {
-                kept.push(id);
-                continue;
-            }
-            let image = next.next().ok_or_else(|| {
-                TokenizeError::Invalid("an image placeholder has no image".into())
-            })?;
-            let block = processor
-                .block(image.width(), image.height())
-                .map_err(TokenizeError::Invalid)?;
-            let mut digest = storage::key::Digest::new(b"chat-image");
-            digest.bytes(&image.digest());
-            match isolation {
-                Some(key) => {
-                    digest.number(1);
-                    digest.number(key);
-                }
-                None => digest.number(0),
-            }
-            inputs.push(proto::request::ImageInput {
-                digest: digest.finish(),
-                encoded: image.bytes().to_vec(),
-                position: kept.len() as u32,
-                num_positions: block.positions,
-                encoders: vec![proto::request::ImageEncoderInput {
-                    encoder: proto::request::ImageEncoder::Vision,
-                    num_cache_tokens: Some(block.tokens),
-                    max_cache_tokens: None,
-                    height: None,
-                    width: None,
-                }],
-            });
-        }
-        *prompt = kept;
-        Ok(inputs)
     }
 
     /// Resolves the request's generation length for a prompt of
@@ -950,7 +910,6 @@ mod tests {
         )
         .unwrap();
 
-        let registry = processing::Registry::new([crate::api::test_support::CHAT]).unwrap();
         let cache = tempfile::tempdir().unwrap();
         let hub = Hub::new(assets::HubSettings {
             cache: cache.path().to_path_buf(),
@@ -966,7 +925,7 @@ mod tests {
             None,
             &proto::config::ChatConfig::default(),
             &serde_json::Map::new(),
-            &registry,
+            &crate::api::test_support::program(),
         )
         .await
         .unwrap();
@@ -977,5 +936,17 @@ mod tests {
             .expect("<d> is registered");
         assert_eq!(marker, 7);
         assert_eq!(loaded.tokenizer.encode("a<d>b", false).unwrap(), [1, 7, 2]);
+        assert_eq!(loaded.config.primary_eos_token_id, Some(6));
+    }
+
+    /// The prompt's tail starts at its last special token: a reasoning delimiter before it
+    /// belongs to an earlier turn.
+    #[test]
+    fn the_prompt_tail_starts_at_the_last_special_token() {
+        let tokenizer = crate::api::test_support::configured_tokenizer();
+        // `<think>` is 5, `<|im_end|>` 2 and `<|im_start|>` 1, all special; `a` is 97.
+        assert_eq!(prompt_tail(&tokenizer, &[97, 5, 2, 97, 1, 97]), [1, 97]);
+        assert_eq!(prompt_tail(&tokenizer, &[97, 97]), [97, 97]);
+        assert_eq!(prompt_tail(&tokenizer, &[]), [] as [u32; 0]);
     }
 }

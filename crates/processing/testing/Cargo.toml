@@ -1,0 +1,23 @@
+[package]
+name = "processing-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A processing program of test families, which the daemon's tests serve: a chat family whose output is parsed as <think> reasoning and JSON tool calls, and a video family of one rule and plain inputs."
+
+# A program the daemon's tests build for wasm32 and load as an epoch's processing program, as
+# they load the release's. Never part of a serving build.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The request-processing machinery the test families are served with, without the release's
+# exports, so this crate's are the module's only ones.
+processing = { path = "..", default-features = false }
+# The processing interface the families are exported through.
+scheduling.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

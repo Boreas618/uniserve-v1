@@ -133,6 +133,10 @@ struct Prepare {
     /// hands over speak ([`proto::ENGINE_INTERFACE_VERSION`]): a successor of
     /// another version gives up before anything is handed over.
     interface: u32,
+    /// The processing program the serving epoch processes requests through, which the
+    /// successor loads from the deployment's Build Server: it restores every response's parser
+    /// in it and processes new requests with it.
+    processing: proto::module::PackageRevision,
 }
 
 /// What a daemon hands its successor. The descriptors travel in this
@@ -337,6 +341,9 @@ impl Restarter {
             .and_then(Daemon::address)
             .context("this daemon serves no process socket")?
             .to_owned();
+        // No epoch change runs meanwhile (`quiesce`), so the serving processor's program is the
+        // one every response in flight parses in.
+        let processing = leader.processor().program().revision().clone();
         send(
             &mut channel,
             &Message::Prepare(Box::new(Prepare {
@@ -348,6 +355,7 @@ impl Restarter {
                 deployment: self.deployment.clone(),
                 rebind,
                 interface: proto::ENGINE_INTERFACE_VERSION,
+                processing,
             })),
             &[],
         )?;
@@ -444,6 +452,7 @@ impl Restarter {
                             kernels: record.kernels,
                             policy: record.policy,
                             programs: Default::default(),
+                            processing: record.processing,
                         }
                     }),
                 })),
@@ -671,11 +680,7 @@ impl service::Message for Message {
 /// # Errors
 ///
 /// Fails when the handoff fails or the deployment's serving fails.
-pub async fn take_over(
-    descriptor: i32,
-    families: processing::Registry,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()> {
+pub async fn take_over(descriptor: i32, shutdown: CancellationToken) -> anyhow::Result<()> {
     // SAFETY: the daemon that started this process placed the handoff
     // socket at this descriptor, which nothing else in this process owns.
     let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(descriptor) });
@@ -686,14 +691,7 @@ pub async fn take_over(
     };
     // The successor's whole bring-up is one future, which lives on the heap rather than in the
     // caller's frame.
-    match Box::pin(prepared_successor(
-        &mut channel,
-        *prepare,
-        &families,
-        shutdown,
-    ))
-    .await
-    {
+    match Box::pin(prepared_successor(&mut channel, *prepare, shutdown)).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = send(
@@ -712,7 +710,6 @@ pub async fn take_over(
 async fn prepared_successor(
     channel: &mut Connection,
     prepare: Prepare,
-    families: &processing::Registry,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     // The engines go on serving through this daemon, so an engine interface of another version
@@ -736,7 +733,6 @@ async fn prepared_successor(
     let (mut config, _) = crate::config::parse(&prepare.config)?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);
-    let prepared = Leader::prepare(families, &config, &stated).await?;
     // Another listening address is bound before the handover, so that a
     // refused bind leaves the previous daemon serving; the listener it hands
     // over then closes once the previous daemon stops accepting.
@@ -760,6 +756,15 @@ async fn prepared_successor(
             &config.build_config,
         )?,
     )?;
+    // The successor processes requests through the serving epoch's processing program, which
+    // the deployment's Build Server holds at the revision the predecessor names.
+    let socket = control.build_server().to_owned();
+    let revision = prepare.processing.clone();
+    let program =
+        tokio::task::spawn_blocking(move || crate::api::program::fetch(&socket, &revision))
+            .await
+            .context("loading the processing program did not complete")??;
+    let prepared = Leader::prepare(&program, &config, &stated).await?;
     send(
         channel,
         &Message::Prepared {
@@ -952,7 +957,6 @@ async fn prepared_successor(
     first.start_standby();
     for (index, (handoff, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
-            leader.families.clone(),
             &options,
             Arc::new(client),
             observer,
@@ -1109,7 +1113,6 @@ async fn prepared_successor(
 
     // From here the successor's node serves the adopted deployment as any node serves one.
     let start = crate::http::node::Start {
-        families: families.clone(),
         options: config.clone(),
         deployment: prepare.deployment.clone(),
         revisions,
@@ -1172,6 +1175,7 @@ fn adopted_epoch(
         engine: modules.engine,
         kernels: modules.kernels,
         policy: modules.policy,
+        processing: modules.processing,
         previous: None,
         status: proto::admin::EpochState::Serving,
         generation: None,
