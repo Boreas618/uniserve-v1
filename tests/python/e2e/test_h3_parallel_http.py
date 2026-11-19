@@ -448,12 +448,23 @@ def test_block_bindings_on_two_hosts_release_cancelled_requests(
     workers = _workers(devices, blocks, grouping, place)
     payloads = _payloads(shapes)
 
+    # The reading host's Transfer Server reads each crossing product from
+    # the writing host's memory through NIXL: both hosts' calibrations time
+    # those READs, and without one a Storage Server runs no Transfer Server.
+    calibration = deployments.calibration(reads=True)
     with (
         deployments.serve(
             merged(_options(workers, 2, shapes), two_hosts(peer_host)),
             serving=False,
+            calibration=calibration,
         ) as server,
-        deployments.follower(peer_host, server, repository),
+        deployments.follower(
+            peer_host,
+            server,
+            repository,
+            calibration=calibration,
+            reads=True,
+        ),
     ):
         _exercise(server, payloads, shapes, tmp_path)
 
