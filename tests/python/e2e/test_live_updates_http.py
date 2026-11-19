@@ -1653,12 +1653,16 @@ def test_a_regression_of_the_epoch_on_trial_rolls_it_back(
         assert again.status_code == 400, again.text
 
     # Without the threshold, the same target stands a trial of three windows
-    # under a stream and commits.
+    # under a stream and commits. The deployment's Build Server is its own,
+    # so the target is installed there as it was at the first one's.
     control = f"{name}-unthresholded"
     options = merged(
         OPTIONS, {"update_config": {"trial": f"{3 * TRIAL_WINDOW_S}s"}}
     )
     with _serve(deployments, control, options=options) as server:
+        slower = _slower_target(
+            server.build_server, repository, tmp_path / "control-packages"
+        )
         stream = _start_count(server, control)
         record = _change_epoch(server, slower)
         assert record["trial_s"] >= 2 * TRIAL_WINDOW_S, record
