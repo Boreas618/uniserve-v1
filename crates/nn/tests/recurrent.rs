@@ -13,11 +13,12 @@ use nn::family::{StateField, StateRows, StateShape};
 use nn::functional::{self, WeightOrder};
 use nn::modules::{GatedDeltaNet, GatedDeltaNetConfig};
 use nn::{
-    CpuWeights, DType, Device, MetaWeights, NO_SLOT, Phase, RecurrentState, Tensor, TokenBatch,
-    WeightLoader,
+    Checkpoint, CpuWeights, DType, Device, MetaWeights, NO_SLOT, Phase, RecurrentState, Tensor,
+    TokenBatch, WeightLoader,
 };
 use nn_testing::{
-    Recording, assert_close, checkpoint, meta, operators, record, sequence, tensor, values,
+    Recording, assert_close, checkpoint, meta, operators, record, sequence, stored, tensor, values,
+    write_checkpoint,
 };
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
@@ -905,6 +906,32 @@ fn a_checkpoint_keeps_the_rows_a_field_holds_at_zero_drafts() {
     // A ring of two groups of four keeps one group.
     let ring = field(vec![8, 16], StateRows::Ring { group: 4 });
     assert_eq!(ring.kept_bytes().unwrap(), 4 * 16 * 2);
+}
+
+/// A checkpoint may store the rule's per-head `A_log` and the norm's gain in FP32 beside BF16
+/// projections (Qwen3.5-35B-A3B's): the network reads them in the activations' type, which its
+/// kernels take, and forwards as over a checkpoint of one type.
+#[test]
+fn a_gated_delta_net_reads_its_fp32_constants_in_the_activations_type() {
+    let config = config(4);
+    let (wide, narrow): (Vec<_>, Vec<_>) = weights(&config)
+        .into_iter()
+        .partition(|(name, ..)| matches!(*name, "mixer.A_log" | "mixer.norm.weight"));
+    let shard = [stored(DType::BF16, &narrow), stored(DType::F32, &wide)].concat();
+
+    let directory = tempfile::tempdir().unwrap();
+    write_checkpoint(directory.path(), &[&shard]);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
+    let network = GatedDeltaNet::load(&config, loader.root().pp("mixer")).unwrap();
+
+    let tokens = 8;
+    let hidden = meta((tokens, 16), DType::BF16);
+    let prefill = batch(Phase::Prefill, 64, true);
+    let state = meta_state(&config, tokens, false);
+    let (out, _) = record(&[], || network.forward(&hidden, &prefill, &state, 0));
+    assert_eq!(out.unwrap().dims(), [tokens, 16]);
 }
 
 #[test]

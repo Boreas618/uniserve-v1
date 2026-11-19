@@ -539,11 +539,11 @@ impl SchedulerConfig {
 /// An engine keeps the current values in one snapshot its schedulers share; each step takes the
 /// snapshot once when it begins and uses it for the whole step, and every batch it assembles
 /// names the snapshot's revision and carries the values its ranks read with it (the copy
-/// budget), so all ranks of a batch read one configuration. A change of them replaces the
-/// snapshot (the engine command `Tune`), which the scheduler node relays to every peer, and
-/// takes effect at each scheduler's next step and each process's next turn of its control
-/// loop, without a new policy instance or a new process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// budget, the synthetic acceptance length), so all ranks of a batch read one configuration. A
+/// change of them replaces the snapshot (the engine command `Tune`), which the scheduler node
+/// relays to every peer, and takes effect at each scheduler's next step and each process's next
+/// turn of its control loop, without a new policy instance or a new process.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tuning {
     /// The configuration revision the values are of.
     pub revision: u64,
@@ -566,6 +566,10 @@ pub struct Tuning {
     /// The bytes the copies started with one batch move together over a group's ranks
     /// (`worker_config.copy_budget`).
     pub copy_budget: u64,
+    /// The mean tokens a verification commits under synthetic acceptance, which every batch
+    /// carries to its ranks (`speculative_config.synthetic_acceptance_length`); unstated, a
+    /// verification accepts what the model selects.
+    pub synthetic_acceptance_length: Option<f64>,
     /// How often each process and scheduler reports (`worker_config.report_period`).
     pub report_period: Duration,
     /// How long a job may stay in flight before it is reported stalled
@@ -608,6 +612,7 @@ impl Tuning {
             prefix_caching: config.kv_cache.prefix_caching,
             host_tier: config.kv_cache.host_tier,
             copy_budget: config.worker.copy_budget,
+            synthetic_acceptance_length: config.speculative.synthetic_acceptance_length,
             report_period: config.worker.report_period,
             watchdog_timeout: config.worker.watchdog_timeout,
             compare_timeout: config.worker.compare_timeout,
@@ -636,6 +641,7 @@ impl Tuning {
             prefix_caching: self.prefix_caching,
             host_tier: self.host_tier,
             copy_budget: self.copy_budget,
+            synthetic_acceptance_length: self.synthetic_acceptance_length,
             report_period_ms: millis(self.report_period),
             watchdog_timeout_ms: millis(self.watchdog_timeout),
             compare_timeout_ms: millis(self.compare_timeout),
@@ -671,6 +677,7 @@ impl Tuning {
             prefix_caching: command.prefix_caching,
             host_tier: command.host_tier,
             copy_budget: command.copy_budget,
+            synthetic_acceptance_length: command.synthetic_acceptance_length,
             report_period: Duration::from_millis(command.report_period_ms),
             watchdog_timeout: Duration::from_millis(command.watchdog_timeout_ms),
             compare_timeout: Duration::from_millis(command.compare_timeout_ms),
@@ -721,6 +728,17 @@ pub struct SpeculativeConfig {
     /// negative, measured when unset.
     #[reload(program)]
     pub refill_token_cost: Option<f64>,
+    /// The mean tokens a verification commits under synthetic acceptance,
+    /// from one to one more than `num_draft_tokens`: each verification
+    /// accepts its drafts by their offsets and its request's draws alone,
+    /// whatever the model selects, and commits the model's own selection
+    /// after the last it accepts (vLLM's `rejection_sample_method =
+    /// "synthetic"` with `synthetic_acceptance_length`). Unset, a
+    /// verification accepts the drafts the model's selections agree with.
+    /// Each scheduler reads it at its next step and every batch carries it
+    /// to its ranks; no graph depends on it.
+    #[reload(step)]
+    pub synthetic_acceptance_length: Option<f64>,
 }
 
 /// The kind of device the command line's shorthand places every rank on (`device_config.device`).
@@ -2171,6 +2189,7 @@ impl EngineConfig {
             num_draft_tokens: _,
             expected_speedup: _,
             refill_token_cost: _,
+            synthetic_acceptance_length: _,
         } = speculative;
         let ProfilingConfig {
             fence_probes: _,

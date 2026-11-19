@@ -535,6 +535,7 @@ fn the_drafter_computes_the_references_hidden_states() {
                     &batch(phase, ranges),
                     &lent(cache, ranges),
                     None,
+                    None,
                     &embedded.narrow(0, first, count).expect("the entries"),
                     &hidden.narrow(0, first, count).expect("the entries"),
                 )

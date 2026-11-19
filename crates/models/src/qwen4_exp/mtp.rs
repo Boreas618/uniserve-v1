@@ -41,7 +41,9 @@
 
 use nn::family::{CacheField, StateShape, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, RmsNormConfig, Rotary};
-use nn::{DType, Drafter, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder};
+use nn::{
+    DType, Drafter, ExpertExchange, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder,
+};
 
 use crate::qwen4_exp::ID;
 use crate::qwen4_exp::attention::IndexedAttention;
@@ -180,12 +182,14 @@ impl Drafter for Mtp {
 
     /// The drafter over `batch`: `embedded [tokens, H]` holds the embedding of each entry's
     /// next token and `hidden [tokens, C · H]` the streams each entry reads; returns the
-    /// drafter's streams, `[tokens, C · H]`. `state` holds the layer's ring.
+    /// drafter's streams, `[tokens, C · H]`. `state` holds the layer's ring; the layer's
+    /// experts run through `exchange` when the model's expert group splits them.
     fn forward(
         &self,
         batch: &TokenBatch,
         cache: &KvCache,
         state: Option<&RecurrentState>,
+        exchange: Option<&ExpertExchange>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
@@ -238,7 +242,7 @@ impl Drafter for Mtp {
                 batch,
                 Some(cache),
                 state,
-                None,
+                exchange,
                 0,
                 (0, 0),
             )?;
@@ -246,6 +250,11 @@ impl Drafter for Mtp {
         };
 
         nn::profiler::range(DRAFTER, &self.path, forward)
+    }
+
+    /// The layer's routed block.
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> nn::Result<()> {
+        nn::causal_lm::join_expert_step([self.layer.experts()], exchange)
     }
 
     /// The rows the model's head projects of the drafter's streams: normalized and mixed by

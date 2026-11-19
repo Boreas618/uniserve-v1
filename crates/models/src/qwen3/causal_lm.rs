@@ -166,7 +166,7 @@ impl Qwen3ForCausalLm {
                     config,
                     model.pp("layers").pp(layer),
                     text.linear_layers[layer as usize],
-                    config.routes(layer),
+                    config.moe.as_ref().filter(|_| config.routes(layer)),
                     placement,
                     Some((layer, order)),
                 )

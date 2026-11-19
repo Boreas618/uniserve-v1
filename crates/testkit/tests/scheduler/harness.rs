@@ -816,6 +816,7 @@ impl Deployment {
             prefix_caching: true,
             host_tier: true,
             copy_budget: proto::config::DEFAULT_COPY_BUDGET,
+            synthetic_acceptance_length: None,
             report_period: proto::config::DEFAULT_REPORT_PERIOD,
             watchdog_timeout: proto::config::DEFAULT_WATCHDOG_TIMEOUT,
             compare_timeout: proto::config::DEFAULT_COMPARE_TIMEOUT,

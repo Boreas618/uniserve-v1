@@ -436,6 +436,10 @@ message Tune {
   // The role of each of the engine's schedulers, by its index: which
   // requests it takes from the next submission on (`replicas.<id>.role`).
   repeated Role roles = 19;
+  // The mean tokens a verification commits under synthetic acceptance
+  // (`speculative_config.synthetic_acceptance_length`); unset, a verification
+  // accepts what the model selects.
+  optional double synthetic_acceptance_length = 20;
 }
 
 // The requests a scheduler, a replica of the deployment, takes.

@@ -13,7 +13,7 @@ The plugin's options:
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--kernel-device {interpreter,cuda}` | `interpreter` | Where the kernel checks run |
-| `--e2e-devices` | every GPU NVML reports | The GPUs the end-to-end cases may lease, as comma-separated device indices; a case that needs more is skipped |
+| `--e2e-devices` | every GPU NVML reports | The GPUs the end-to-end cases may lease, as comma-separated device indices; a case that needs more is skipped. The run's Build Server sees these GPUs alone, so a run keeps off the host's other GPUs |
 | `--engine` | the tree's engine package | The engine package every test deployment runs, by its backend name |
 | `--serve-config FILE` | none | A TOML file of options every test deployment's `config.toml` states over its own |
 | `--time-scale` | `1` | The factor every wait of an end-to-end case is stretched by |
@@ -56,6 +56,7 @@ The checkpoints and adapters the cases serve are released Hugging Face repositor
 | --- | --- | --- |
 | `qwen3` | `Qwen/Qwen3-30B-A3B` | every Qwen3 module |
 | `deepseek-v41` | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | `test_deepseek_v41_http.py` (four GPUs of one host; its log-probability case also reads the reference vectors `crates/models/tests/it/deepseek_v41/generate_logprobs.py` writes into `artifacts/deepseek_v41/reference` and, from the AgentX payloads of `semianalysisai/cc-traces-weka-062126` (`--agentx`), into `artifacts/deepseek_v41/reference-agentx`) |
+| `qwen3.5` | `Qwen/Qwen3.5-35B-A3B` | `test_speculation_http.py` |
 | `fasth3` | `FastVideo/FastVideo-FastH3-8-Step-V2` | the FastH3 modules |
 | `minimax-h3` | `MiniMaxAI/MiniMax-H3` | `test_minimax_h3_http.py`, `test_minimax_h3_conditions_http.py` |
 | `fasth3-omniref` | `FastVideo/FastVideo-FastH3-Omni-8-Step-V1` | `test_minimax_h3_conditions_http.py` |

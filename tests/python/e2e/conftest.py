@@ -114,10 +114,13 @@ def build_server(
     uniserve: Path,
     repository: Path,
     e2e_settings: Settings,
+    run_devices: tuple[int, ...],
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[BuildServer]:
     """The run's Build Server, with every package of the tree installed
-    (:func:`uniserve_testing.builds.build_server`).
+    (:func:`uniserve_testing.builds.build_server`), on the GPUs the run may
+    lease alone: a run that ``--e2e-devices`` keeps to some of the host's GPUs
+    touches none of the others.
 
     A deployment's epoch is resolved at its host's Build Server, which the
     run starts itself so that its package root and store are the run's own.
@@ -130,6 +133,7 @@ def build_server(
         uniserve,
         repository,
         tmp_path_factory.mktemp("build-server"),
+        devices=run_devices,
         scale=e2e_settings.time_scale,
     ) as server:
         yield server
