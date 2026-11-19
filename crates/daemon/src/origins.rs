@@ -50,7 +50,13 @@ impl Origins {
             .list()
             .context("listing the Build Server's packages")?
             .into_iter()
-            .map(|(package, origin, _)| ((package.op, package.backend, package.revision), origin))
+            .map(|entry| {
+                let package = entry.package;
+                (
+                    (package.op, package.backend, package.revision),
+                    entry.origin,
+                )
+            })
             .collect();
 
         let mut rows = BTreeSet::new();
