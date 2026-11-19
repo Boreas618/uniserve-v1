@@ -640,12 +640,12 @@ mod tests {
         };
 
         // Thirty-two NVFP4 entries of 288 bytes, then sixty-four.
-        let nvfp4 = shape(Format::Nvfp4, 2)?;
+        let nvfp4 = shape(Format::NVFP4, 2)?;
         assert_eq!(nvfp4.page_bytes, (32 + 64) * 288);
-        let mxfp8 = shape(Format::Mxfp8, 2)?;
+        let mxfp8 = shape(Format::MXFP8, 2)?;
         assert_eq!(mxfp8.page_bytes, (32 + 64) * 528);
         assert_ne!(nvfp4.layout, mxfp8.layout);
-        assert_ne!(nvfp4.layout, shape(Format::Nvfp4, 4)?.layout);
+        assert_ne!(nvfp4.layout, shape(Format::NVFP4, 4)?.layout);
         Ok(())
     }
 }

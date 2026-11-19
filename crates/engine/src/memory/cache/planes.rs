@@ -1439,7 +1439,7 @@ mod tests {
             ],
             readers: Vec::new(),
             history: History::Full,
-            record: Record::rows(Format::Nvfp4, 1, 512),
+            record: Record::rows(Format::NVFP4, 1, 512),
         };
         let layout = layout(&[latent], PrefixCacheDtype::BFloat16);
         let pool = layout.kv();

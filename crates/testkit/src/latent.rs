@@ -8,7 +8,7 @@
 //! | --- | --- | --- | --- | --- |
 //! | [`LATENT`], read as key and value | the 40 target layers and the 3 draft layers (40–42) | the last [`WINDOW`] tokens and the draft block's rollback | 64 | 512 E4M3 + 16 UE8M0, 528 B |
 //! | [`COMPRESSED`] | layers 2, 8, 14 (one entry per two tokens) and 20 (one per token), read by 3–7, 9–13, 15–19 and 21–39 | full | 32 / 64 | NVFP4 (288 B) or MXFP8 (528 B) |
-//! | [`INDEX_KEY`] | the same four, read by 24, 28, 32 and 36 from 20 | full | 32 / 64 | MXFP4 (68 B, a page's values then their scales) or FP8 with a scale (132 B) |
+//! | [`INDEX_KEY`] | the same four, read by 24, 28, 32 and 36 from 20 | full | 32 / 64 | MXFP4 (68 B, a page's values then their scales) or MXFP8 (132 B) |
 //!
 //! and the compressor's remainder, a per-request ring of eight FP32 rows of 1024 on layers 2, 8
 //! and 14 ([`remainder`]), its groups the ratio-2 compressor's pairs.
@@ -46,22 +46,22 @@ const VOCABULARY: usize = 64;
 pub struct Formats {
     /// NVFP4 or MXFP8.
     pub compressed: Format,
-    /// MXFP4 or FP8 with one scale per key.
+    /// MXFP4 or MXFP8.
     pub index: Format,
 }
 
 impl Formats {
     /// The checkpoint's own: an NVFP4 compressed latent and MXFP4 index keys.
     pub const REFERENCE: Self = Self {
-        compressed: Format::Nvfp4,
-        index: Format::Mxfp4,
+        compressed: Format::NVFP4,
+        index: Format::MXFP4,
     };
 
     /// The index keys' record: an MXFP4 page keeps every key's values and then their scales,
-    /// as the paged index logits read it; an FP8 key keeps its scale after its values.
+    /// as the paged index logits read it; an MXFP8 key keeps its scales after its values.
     pub const fn index_record(&self) -> Record {
         let layout = match self.index {
-            Format::Mxfp4 => Layout::Page,
+            Format::MXFP4 => Layout::Page,
             _ => Layout::Entry,
         };
         Record {
@@ -109,7 +109,7 @@ pub fn fields(draft_tokens: u32, formats: Formats) -> Vec<CacheField> {
             history: History::Window {
                 tokens: WINDOW + draft_tokens,
             },
-            record: Record::rows(Format::Mxfp8, 1, LATENT_WIDTH),
+            record: Record::rows(Format::MXFP8, 1, LATENT_WIDTH),
         },
         CacheField {
             name: COMPRESSED,

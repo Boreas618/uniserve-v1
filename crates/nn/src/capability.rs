@@ -1714,7 +1714,7 @@ mod tests {
                     FieldReader { layer: 2, owner: 0 },
                 ],
                 history: History::Full,
-                record: Record::rows(Format::Nvfp4, 1, 512),
+                record: Record::rows(Format::NVFP4, 1, 512),
             },
             CacheField::attention(crate::family::KEY, 2, 2, 8),
         ]
@@ -1783,9 +1783,15 @@ mod tests {
         let mut blocks = fields.clone();
         blocks[0].record.width = 520;
         assert!(CacheField::check(&blocks, 64).is_err());
-        assert_eq!(Format::Mxfp8.row_bytes(512), Some(528));
-        assert_eq!(Format::Mxfp4.row_bytes(128), Some(68));
-        assert_eq!(Format::Fp8Scaled.row_bytes(128), Some(132));
+        assert_eq!(Format::MXFP8.row_bytes(512), Some(528));
+        assert_eq!(Format::MXFP4.row_bytes(128), Some(68));
+        assert_eq!(Format::MXFP8.row_bytes(128), Some(132));
+        // A record of the record operators' BF16 elements keeps no scale: it is an element
+        // format, and refused as a block-scaled one.
+        assert_eq!(
+            Format::Scaled(ops::record::Format::Bf16).row_bytes(128),
+            None
+        );
         let mut window = fields.clone();
         window[0].history = History::Window { tokens: 0 };
         assert!(CacheField::check(&window, 64).is_err());
@@ -1807,13 +1813,19 @@ mod tests {
 
         let keys = Record {
             layout: Layout::Page,
-            ..Record::rows(Format::Mxfp4, 1, 128)
+            ..Record::rows(Format::MXFP4, 1, 128)
         };
         assert_eq!(
             keys.operand().unwrap(),
             (ops::record::Format::Mxfp4, Layout::Page)
         );
-        assert!(Record::rows(Format::Fp8Scaled, 1, 128).operand().is_err());
+        assert_eq!(
+            Record::rows(Format::Elements(DType::BF16), 1, 128)
+                .operand()
+                .unwrap(),
+            (ops::record::Format::Bf16, Layout::Entry)
+        );
+        assert!(Record::rows(Format::Deployment, 1, 128).operand().is_err());
 
         let mut fields = latent_and_keys();
         fields[0].record = keys;

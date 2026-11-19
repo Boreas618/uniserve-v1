@@ -543,9 +543,11 @@ pub struct Record {
 ///
 /// An element format stores each value as one element, and a plane of it is lent as
 /// `[pages, entries, heads, width]` of that type. A block-scaled format packs each row's values
-/// and their block scales into bytes, as the kernels that read it address them, and a plane of
-/// it is lent as `[pages, entries, heads, row bytes]` U8 ([`Format::row_bytes`]): a page holds
-/// `entries · heads` rows' bytes either way, arranged by the record's [`Layout`].
+/// and their block scales into bytes, as the record operators that write and read it address
+/// them, and a plane of it is lent as `[pages, entries, heads, row bytes]` U8
+/// ([`Format::row_bytes`]): a page holds `entries · heads` rows' bytes either way, arranged by
+/// the record's [`Layout`]. The block-scaled formats are the record operators' own
+/// ([`ops::record::Format`]), which state their bytes and their encoding once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     /// The deployment's cache element type (`kv_cache_config.dtype`, else the model's
@@ -555,27 +557,26 @@ pub enum Format {
     /// Elements of a fixed type, whatever the deployment states, such as index keys kept in the
     /// type the model computes in.
     Elements(DType),
-    /// MXFP8: E4M3 values, then one UE8M0 scale byte per 32 values (`width + width / 32` bytes).
-    Mxfp8,
-    /// NVFP4: E2M1 values two to a byte, then one E4M3 scale per 16 values
-    /// (`width / 2 + width / 16` bytes).
-    Nvfp4,
-    /// MXFP4: E2M1 values two to a byte, then one UE8M0 scale per 32 values
-    /// (`width / 2 + width / 32` bytes).
-    Mxfp4,
-    /// E4M3 values, then one F32 scale for the row (`width + 4` bytes).
-    Fp8Scaled,
+    /// A block-scaled byte format of the record operators: MXFP8, NVFP4 or MXFP4 (a format that
+    /// keeps a block scale; BF16 records are [`Format::Elements`]).
+    Scaled(ops::record::Format),
 }
 
 impl Format {
+    /// MXFP8: E4M3 values, then one UE8M0 scale byte per 32 values (`width + width / 32` bytes).
+    pub const MXFP8: Self = Self::Scaled(ops::record::Format::Mxfp8);
+    /// NVFP4: E2M1 values two to a byte, then one E4M3 scale per 16 values
+    /// (`width / 2 + width / 16` bytes).
+    pub const NVFP4: Self = Self::Scaled(ops::record::Format::Nvfp4);
+    /// MXFP4: E2M1 values two to a byte, then one UE8M0 scale per 32 values
+    /// (`width / 2 + width / 32` bytes).
+    pub const MXFP4: Self = Self::Scaled(ops::record::Format::Mxfp4);
+
     /// The values of a row one block scale of the format covers; `None` for an element format.
     pub fn block(self) -> Option<u32> {
         match self {
             Self::Deployment | Self::Elements(_) => None,
-            Self::Mxfp8 | Self::Mxfp4 => Some(32),
-            Self::Nvfp4 => Some(16),
-            // One scale covers the whole row, whatever its width.
-            Self::Fp8Scaled => Some(1),
+            Self::Scaled(format) => format.block().map(|block| block as u32),
         }
     }
 
@@ -586,29 +587,21 @@ impl Format {
         if width == 0 || !width.is_multiple_of(block) {
             return None;
         }
-
-        Some(match self {
-            Self::Mxfp8 => width + width / 32,
-            Self::Nvfp4 => width / 2 + width / 16,
-            Self::Mxfp4 => width / 2 + width / 32,
-            Self::Fp8Scaled => width + 4,
-            Self::Deployment | Self::Elements(_) => return None,
-        })
+        match self {
+            Self::Scaled(format) => u32::try_from(format.record_bytes(u64::from(width))).ok(),
+            Self::Deployment | Self::Elements(_) => None,
+        }
     }
-}
 
-impl Format {
     /// The record format of the operators that write and read paged records
     /// ([`ops::record::Format`]): BF16 elements or a block-scaled format they encode; `None`
-    /// for the deployment's element type, another element type and [`Format::Fp8Scaled`],
-    /// which no record operator reads.
+    /// for the deployment's element type and another element type, which no record operator
+    /// reads.
     pub fn record(self) -> Option<ops::record::Format> {
         match self {
             Self::Elements(DType::BF16) => Some(ops::record::Format::Bf16),
-            Self::Mxfp8 => Some(ops::record::Format::Mxfp8),
-            Self::Nvfp4 => Some(ops::record::Format::Nvfp4),
-            Self::Mxfp4 => Some(ops::record::Format::Mxfp4),
-            Self::Deployment | Self::Elements(_) | Self::Fp8Scaled => None,
+            Self::Scaled(format) => Some(format),
+            Self::Deployment | Self::Elements(_) => None,
         }
     }
 }
@@ -648,7 +641,7 @@ impl Record {
         match self.format {
             Format::Deployment => deployment,
             Format::Elements(dtype) => dtype,
-            Format::Mxfp8 | Format::Nvfp4 | Format::Mxfp4 | Format::Fp8Scaled => DType::U8,
+            Format::Scaled(_) => DType::U8,
         }
     }
 
@@ -672,7 +665,8 @@ impl Record {
                 let packed = self.format.block().is_some();
                 if self.layout == Layout::Page && (self.heads != 1 || !packed) {
                     return Err(crate::Error::Unsupported(format!(
-                        "a cache record of {} rows in {:?} keeps no scales after its page's                          values: a page layout holds one block-scaled row an entry",
+                        "a cache record of {} rows in {:?} keeps no scales after its page's \
+                         values: a page layout holds one block-scaled row an entry",
                         self.heads, self.format
                     )));
                 }
