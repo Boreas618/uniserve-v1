@@ -100,7 +100,9 @@ pub use recurrent::{StateAxes, causal_conv1d, gated_delta_rule};
 pub use residual_norm::{
     modulated_rms_norm, modulated_rms_norm_, scaled_residual_layer_norm, scaled_residual_rms_norm_,
 };
-pub use rotary::{grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors};
+pub use rotary::{
+    grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors, rotary_trailing_,
+};
 pub use rows::place_rows_;
 pub use sampling::{
     argmax, log_softmax, logits_shape, logprob_gather, sampling_from_logits, softmax, top_k,
