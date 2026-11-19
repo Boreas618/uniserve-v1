@@ -33,6 +33,7 @@ import dataclasses
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -468,6 +469,7 @@ class Deployments:
         devices: Sequence[int] | None = None,
         calibration: Path | None = None,
         reads: bool = False,
+        killed: bool = False,
         name: str = "follower",
     ) -> Iterator[Follower]:
         """The daemon of a deployment's second host, serving the package of
@@ -495,7 +497,11 @@ class Deployments:
         path there first, with NIXL's READs when `reads`, and its directory
         there is removed with the block. On exit the leader stops first;
         the daemon ends when the leader's connection closes, which this
-        waits for, and a daemon that outlives its leader fails the case.
+        waits for, and a daemon that outlives its leader fails the case, as
+        does a process of it that did not exit with status 0, such as a main
+        process that ended by a signal in its close; a case that kills a
+        process of the second host itself states it (`killed`), and the kills
+        (``SIGKILL``) are not counted then.
         Its log is ``<name>.log`` in the case's directory.
         """  # noqa: D205
         assert leader.package is not None, "the leader serves no package"
@@ -533,9 +539,10 @@ class Deployments:
                     timeout_s=CALIBRATION_S,
                 )
                 owned.callback(host.run, "rm", "-rf", str(calibration.parent))
+            log = self.directory / f"{name}.log"
             member = host.start(
                 ["uniserve", "serve", package],
-                self.directory / f"{name}.log",
+                log,
                 environment=declared,
             )
             owned.callback(
@@ -555,6 +562,39 @@ class Deployments:
                     raise AssertionError(
                         "the second host's daemon outlived its leader"
                     ) from None
+            failed = [
+                status
+                for status in failed_exits(log)
+                if not (killed and status.startswith(KILLED_STATUS))
+            ]
+            assert not failed, (
+                f"a process of the second host's daemon failed: {failed}"
+            )
+
+
+# A daemon's report of a supervised process that exited otherwise than with
+# status 0: its supervisor states the status only then
+# (`crates/daemon/src/supervision/supervisor.rs`), on one line of its log.
+FAILED_EXIT = re.compile(r"a process exited .*\bstatus=(?P<status>.*)$")
+
+# How the daemon states the status of a process a kill ended (Rust's
+# `ExitStatus` display).
+KILLED_STATUS = "signal: 9 (SIGKILL)"
+
+# The terminal colours of a log line, which the pattern reads past.
+COLOURS = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def failed_exits(log: Path) -> list[str]:
+    """The statuses the daemon whose log is `log` reported for processes
+    it supervised that did not exit with status 0, in the log's order.
+    """  # noqa: D205
+    text = log.read_text(encoding="utf-8", errors="replace")
+    return [
+        found["status"]
+        for line in text.splitlines()
+        if (found := FAILED_EXIT.search(COLOURS.sub("", line)))
+    ]
 
 
 def stop_remote_servers(
