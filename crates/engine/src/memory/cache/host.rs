@@ -1,17 +1,19 @@
 //! The host tier of the rank's KV cache: the host regions its pages are copied through.
 //!
-//! Each cache group copies its pages through a host region of the buffer pool, the
+//! Each cache group of the KV pool copies its pages through a host region of the buffer pool, the
 //! deployment's on the host: the Storage Server keeps one memfd per rank index, the rank's part
 //! of every unit, which every epoch that names the region maps. The rank maps its part of each
 //! group's region writable and registers it for device copies ([`HostPart`]). The buffer pool
 //! names a host copy of a block as a run of the group's host region, whose unit `u` is page `u`
 //! of the group on every rank, at unit `u` of the rank's part; the copies a completion queues
-//! ([`HostPage`]) run on the rank's copy stream with the batch that takes them.
+//! ([`HostPage`]) run on the rank's copy stream with the batch that takes them. A sliding
+//! window's pages are never cached, so its group has no host region.
 //!
-//! A host page is one page of one group on this rank, plane by plane: the key planes of every
-//! unit and column of the page, in unit then column order, the value planes in the same order,
-//! and for an FP8 cache the scales `[2, planes]` as F32. One layer of one attention page fills
-//! exactly one plane, so an attention page is layer-major:
+//! A host page is one page of one group on this rank, plane by plane: each field's planes of
+//! every unit and column of the page, in unit then column order, the fields in the pool's order,
+//! and directly after the last field that keeps page scales, the scales of those fields
+//! `[scaled fields, planes]` as F32. One owner of one page fills exactly one plane, so a page of
+//! keys and values (and index keys) is layer-major:
 //!
 //! 1. keys `[layers, block_size, kv_heads, head_dim]`;
 //! 2. values, in the same shape;
@@ -30,7 +32,7 @@ use ::storage::protocol::PageShape;
 use platform::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
 use tensor::DType;
 
-use super::layout::{CacheLayout, GroupLayout};
+use super::layout::{CacheLayout, FieldLayout, GroupLayout, PoolLayout};
 use super::planes::Planes;
 use super::states::StateUnits;
 use crate::memory::client::StorageClient;
@@ -39,19 +41,49 @@ use crate::worker::{Error, Result};
 
 /// The page encoding above, as the layout and content digests describe it beside the group's
 /// shape: pages encoded otherwise are described otherwise, and so are another layout and
-/// another content.
+/// another content. The spelling names the encoding of a page of keys and values, the one every
+/// encoding of the rule above reduces to for them, and stays as it is: it names host regions
+/// every build of a deployment shares.
 const PAGE_ENCODING: &str = "keys, then values, each field's planes in unit then column order; \
                              then scales [2, planes] float32; then index keys";
 
-/// The bytes of one host page of `group` of a cache of `layout`.
-fn page_bytes(layout: &CacheLayout, group: &GroupLayout) -> u64 {
-    if group.state() {
-        return layout.state_bytes();
-    }
-    let planes = layout.page_planes(group);
+/// The fields of a page of `group`: its pool's, which a draft page shares with the full
+/// history's. `None` for the state group.
+fn pool_of<'a>(layout: &'a CacheLayout, group: &GroupLayout) -> Option<&'a PoolLayout> {
+    (!group.state()).then(|| &layout.pools[group.pool])
+}
 
-    let scales = if layout.quantized { 2 * planes * 4 } else { 0 };
-    2 * planes * layout.plane_bytes + scales + planes * layout.index_bytes()
+/// The planes one page of `group` spans of `field`: every column of every unit of the page.
+fn field_planes(group: &GroupLayout, field: &FieldLayout) -> u64 {
+    u64::from(group.units_per_page) * u64::from(field.columns())
+}
+
+/// The index of the last field of `pool` that keeps page scales, after whose planes a page holds
+/// the scales of every such field; `None` for a pool that keeps none.
+fn scales_after(pool: &PoolLayout) -> Option<usize> {
+    pool.fields.iter().rposition(|field| field.scaled)
+}
+
+/// The bytes of one host page of `group` of a cache of `layout`: every plane of every field of
+/// the page, and a scale per plane of a scaled field.
+fn page_bytes(layout: &CacheLayout, group: &GroupLayout) -> u64 {
+    let Some(pool) = pool_of(layout, group) else {
+        return layout.state_bytes();
+    };
+    let tokens = pool.block_size;
+
+    pool.fields
+        .iter()
+        .map(|field| {
+            let planes = field_planes(group, field) / u64::from(field.columns().max(1));
+            let scales = if field.scaled {
+                field_planes(group, field) * 4
+            } else {
+                0
+            };
+            planes * field.unit_bytes(tokens) + scales
+        })
+        .sum()
 }
 
 /// The spelling of a stored element type inside a page layout digest. The digest names the
@@ -69,8 +101,10 @@ fn stored_name(dtype: DType) -> &'static str {
 }
 
 /// Adds what the logical content of `group`'s pages is to `digest`: the group's window, block
-/// size, layers and heads, and the shape of the index keys its layers keep.
-fn content_of(digest: &mut ::storage::key::Digest, group: &GroupLayout) {
+/// size, layers and heads, and each field beside keys and values: the shape of the index keys a
+/// key/value cache keeps beside them, and any other field by its name, its record and its
+/// owners.
+fn content_of(digest: &mut ::storage::key::Digest, layout: &CacheLayout, group: &GroupLayout) {
     digest.number(u64::from(group.kind.window().unwrap_or(0)));
     digest.number(u64::from(group.block_size));
 
@@ -83,11 +117,32 @@ fn content_of(digest: &mut ::storage::key::Digest, group: &GroupLayout) {
     digest.number(u64::from(group.total_kv_heads));
     digest.number(u64::from(group.head_dim));
 
-    // A group that keeps none adds nothing, so its pages keep the digest they had.
-    if let Some(keys) = group.index_keys {
-        digest.text("index_keys");
-        digest.number(u64::from(keys.width));
-        digest.number(u64::from(keys.ratio));
+    // Keys and values are the group's heads above; a group that keeps nothing else adds nothing,
+    // so its pages keep the digest a cache of keys and values has.
+    let Some(pool) = pool_of(layout, group) else {
+        return;
+    };
+    for field in &pool.fields {
+        if [nn::family::KEY, nn::family::VALUE].contains(&field.name) {
+            continue;
+        }
+        let ratio = field.owners.first().map_or(0, |owner| owner.ratio);
+        let uniform = field.owners.iter().all(|owner| owner.ratio == ratio);
+        if field.name == nn::family::INDEX_KEY && field.dims[0] == 1 && uniform {
+            digest.text("index_keys");
+            digest.number(u64::from(field.dims[1]));
+            digest.number(u64::from(ratio));
+            continue;
+        }
+
+        digest.text(field.name);
+        digest.numbers(&[u64::from(field.dims[0]), u64::from(field.dims[1])]);
+        let owners: Vec<u64> = field
+            .owners
+            .iter()
+            .flat_map(|owner| [u64::from(owner.layer), u64::from(owner.ratio)])
+            .collect();
+        digest.numbers(&owners);
     }
 }
 
@@ -106,16 +161,21 @@ fn state_of(digest: &mut ::storage::key::Digest, layout: &CacheLayout, group: &G
 fn layout_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
     let mut digest = ::storage::key::Digest::new(b"uniserve-page-layout");
     digest.text(PAGE_ENCODING);
-    digest.number(u64::from(layout.quantized));
-    digest.number(layout.plane_bytes);
-    digest.number(u64::from(layout.columns));
-    content_of(&mut digest, group);
+    digest.number(u64::from(layout.kv().quantized()));
+    digest.number(layout.plane_bytes());
+    digest.number(u64::from(layout.columns()));
+    content_of(&mut digest, layout, group);
     digest.text(stored_name(group.dtype));
 
-    // The index keys are stored in the layers' compute type, whatever the planes store; a
-    // group that keeps none adds nothing.
-    if group.index_keys.is_some() {
-        digest.text(stored_name(group.compute_dtype));
+    // Every field beside keys and values is stored in its own type (index keys in the layers'
+    // compute type, a block-scaled record in bytes), whatever the planes of keys and values
+    // store; a group that keeps none adds nothing.
+    if let Some(pool) = pool_of(layout, group) {
+        for field in &pool.fields {
+            if ![nn::family::KEY, nn::family::VALUE].contains(&field.name) {
+                digest.text(stored_name(field.dtype));
+            }
+        }
     }
     state_of(&mut digest, layout, group);
     digest.finish()
@@ -127,7 +187,7 @@ fn layout_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
 fn content_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
     let mut digest = ::storage::key::Digest::new(b"uniserve-page-content-layout");
     digest.text(PAGE_ENCODING);
-    content_of(&mut digest, group);
+    content_of(&mut digest, layout, group);
     state_of(&mut digest, layout, group);
     digest.finish()
 }
@@ -237,9 +297,14 @@ impl HostTier {
                 continue;
             };
 
+            if group.window() {
+                return Err(Error::Invalid(format!(
+                    "cache group {index} keeps a sliding window, whose pages have no host copy"
+                )));
+            }
             let shape = page_shape(layout, index)?;
             let held = HostPart::map(client, device, region, part, shape.page_bytes, numa_node)?;
-            parts.insert(index as u32, (held, layout.page_planes(group) as u32));
+            parts.insert(index as u32, (held, group.units_per_page));
         }
 
         Ok(Self { parts, stream })
@@ -314,8 +379,8 @@ impl HostTier {
     }
 
     /// One page's copies between its host page and its units, as `(device, host, bytes)`: every
-    /// field and plane, then every scale, then every index-key plane; for the state group, the
-    /// one state unit whole.
+    /// plane of every field in the page's encoding (module documentation), the scales after the
+    /// last scaled field; for the state group, the one state unit whole.
     fn runs(
         &self,
         layout: &CacheLayout,
@@ -323,17 +388,16 @@ impl HostTier {
         copy: &HostPage,
     ) -> Result<Vec<(u64, u64, usize)>> {
         let (group, page, units) = copy;
-        let (part, page_planes) = self
+        let (part, units_per_page) = self
             .parts
             .get(group)
             .ok_or_else(|| Error::Invalid(format!("cache group {group} has no host region")))?;
-        let page_planes = *page_planes;
 
-        let state = layout
+        let laid = layout
             .groups
             .get(*group as usize)
-            .is_some_and(GroupLayout::state);
-        if state {
+            .ok_or_else(|| Error::Invalid(format!("the cache holds no group {group}")))?;
+        let Some(pool) = pool_of(layout, laid) else {
             // A state page is one unit of the state region, its planes back to back on both
             // sides.
             let states =
@@ -350,57 +414,53 @@ impl HostTier {
                 part.address(*page)?,
                 bytes as usize,
             )]);
-        }
-
-        let columns = layout.columns;
-        if units.len() as u32 * columns != page_planes {
+        };
+        if units.len() as u32 != *units_per_page {
             return Err(Error::Invalid(format!(
-                "a page of {page_planes} planes spans {} units of {columns} columns, not {}",
-                page_planes.div_ceil(columns),
-                units.len()
+                "a page of group {group} spans {units_per_page} units, not units {}..{}",
+                units.start, units.end
             )));
         }
 
-        let plane = layout.plane_bytes;
-        let host = part.address(*page)?;
-        let count = u64::from(page_planes);
-        let unit = |index: u32| units.start + index / columns;
-
-        let mut runs = Vec::with_capacity(4 * page_planes as usize);
-        for field in 0..2 {
-            for index in 0..page_planes {
-                let device = planes.plane_address(field, index % columns, unit(index))?;
-                let host = host + (field as u64 * count + u64::from(index)) * plane;
-                runs.push((device, host, plane as usize));
-            }
-        }
-        if layout.quantized {
-            for field in 0..2 {
-                for index in 0..page_planes {
-                    let device = planes.scale_address(field, index % columns, unit(index))?;
-                    let host =
-                        host + 2 * count * plane + (field as u64 * count + u64::from(index)) * 4;
-                    runs.push((device, host, 4));
+        // Each field's planes in unit then column order, and after the last scaled field the
+        // scales of every scaled field in the same order.
+        let mut host = part.address(*page)?;
+        let block = pool.block_size;
+        let scaled = scales_after(pool);
+        let mut runs = Vec::new();
+        for (index, field) in pool.fields.iter().enumerate() {
+            for unit in units.clone() {
+                for column in 0..field.columns() {
+                    let bytes = field.plane_bytes(column as usize, block);
+                    runs.push((
+                        planes.plane_address(index, column, unit)?,
+                        host,
+                        bytes as usize,
+                    ));
+                    host += bytes;
                 }
             }
-        }
 
-        let index_bytes = layout.index_bytes();
-        if index_bytes > 0 {
-            let scales = if layout.quantized { 2 * count * 4 } else { 0 };
-
-            for index in 0..page_planes {
-                let device = planes.index_address(index % columns, unit(index))?;
-                let host = host + 2 * count * plane + scales + u64::from(index) * index_bytes;
-                runs.push((device, host, index_bytes as usize));
+            if Some(index) == scaled {
+                for (index, field) in pool.fields.iter().enumerate() {
+                    if !field.scaled {
+                        continue;
+                    }
+                    for unit in units.clone() {
+                        for column in 0..field.columns() {
+                            runs.push((planes.scale_address(index, column, unit)?, host, 4));
+                            host += 4;
+                        }
+                    }
+                }
             }
         }
         Ok(runs)
     }
 
     /// Loads the units of `loads` from their host pages in `stream` order. The copies overwrite
-    /// every column of both fields, an FP8 cache's scales and the index keys of a cache that
-    /// keeps them; an FP8 cache then raises the units' initialization flags.
+    /// every column of every field and the scales of a scaled field; a pool that keeps scales
+    /// then raises the units' initialization flags, which its writer reads a page's scale by.
     pub(crate) fn load(
         &self,
         layout: &CacheLayout,
@@ -430,7 +490,7 @@ impl HostTier {
         unsafe { batch.submit(stream) }?;
 
         // The flags are the pool's: a state unit has none.
-        if layout.quantized {
+        if layout.kv().quantized() {
             let state = layout
                 .state_group()
                 .and_then(|group| u32::try_from(group).ok());
@@ -478,15 +538,31 @@ impl HostTier {
 
 #[cfg(test)]
 mod tests {
+    use nn::family::{CacheField, FieldOwner, Format, History, INDEX_KEY, Record};
     use proto::request::PrefixCacheDtype;
 
     use super::*;
 
+    /// Four layers of two 128-wide heads, over `block`-token pages.
+    fn layout_of(block: u32, dtype: PrefixCacheDtype) -> CacheLayout {
+        CacheLayout::of(block, &CacheField::keys_and_values(4, 2, 128), dtype)
+            .expect("a dense layout")
+    }
+
     /// 64-token pages of four layers of two 128-wide heads.
     fn layout(dtype: PrefixCacheDtype) -> CacheLayout {
-        CacheLayout::dense(64, 4, 2, 128, dtype)
-            .validated()
-            .expect("a dense layout")
+        layout_of(64, dtype)
+    }
+
+    /// Index keys of 128 BF16 elements per four tokens over the four layers.
+    fn index_keys() -> CacheField {
+        CacheField {
+            name: INDEX_KEY,
+            owners: (0..4).map(|layer| FieldOwner { layer, ratio: 4 }).collect(),
+            readers: Vec::new(),
+            history: History::Full,
+            record: Record::rows(Format::Elements(DType::BF16), 1, 128),
+        }
     }
 
     /// A dense page is both fields of every layer; an FP8 page stores a byte per element and one
@@ -512,10 +588,9 @@ mod tests {
     #[test]
     fn a_host_page_holds_the_index_keys_of_every_layer() -> Result<()> {
         let plain = layout(PrefixCacheDtype::BFloat16);
-        let keyed = plain.clone().with_index_keys(nn::family::IndexKeys {
-            width: 128,
-            ratio: 4,
-        })?;
+        let mut fields = CacheField::keys_and_values(4, 2, 128);
+        fields.push(index_keys());
+        let keyed = CacheLayout::of(64, &fields, PrefixCacheDtype::BFloat16)?;
 
         let (plain, keyed) = (page_shape(&plain, 0)?, page_shape(&keyed, 0)?);
         assert_eq!(keyed.page_bytes, plain.page_bytes + 4 * (16 * 128 * 2));
@@ -537,7 +612,40 @@ mod tests {
         let other_weights = page_identities(&layout(PrefixCacheDtype::BFloat16), "weights-b");
         assert_ne!(bf16, other_weights);
 
-        let wider = CacheLayout::dense(128, 4, 2, 128, PrefixCacheDtype::BFloat16);
+        let wider = layout_of(128, PrefixCacheDtype::BFloat16);
         assert_ne!(bf16, page_identities(&wider, "weights-a"));
+    }
+
+    /// A page of a field that is neither keys nor values is its owners' planes, each of its own
+    /// ratio's entries, and its record and owners are part of its content: another format or
+    /// another owner is another page.
+    #[test]
+    fn a_page_of_a_block_scaled_field_holds_each_owners_entries() -> Result<()> {
+        let latent = |format, ratio| CacheField {
+            name: "compressed_latent",
+            owners: vec![
+                FieldOwner { layer: 2, ratio },
+                FieldOwner {
+                    layer: 20,
+                    ratio: 1,
+                },
+            ],
+            readers: Vec::new(),
+            history: History::Full,
+            record: Record::rows(format, 1, 512),
+        };
+        let shape = |format, ratio| {
+            let layout = CacheLayout::of(64, &[latent(format, ratio)], PrefixCacheDtype::BFloat16)?;
+            page_shape(&layout, 0)
+        };
+
+        // Thirty-two NVFP4 entries of 288 bytes, then sixty-four.
+        let nvfp4 = shape(Format::NVFP4, 2)?;
+        assert_eq!(nvfp4.page_bytes, (32 + 64) * 288);
+        let mxfp8 = shape(Format::MXFP8, 2)?;
+        assert_eq!(mxfp8.page_bytes, (32 + 64) * 528);
+        assert_ne!(nvfp4.layout, mxfp8.layout);
+        assert_ne!(nvfp4.layout, shape(Format::NVFP4, 4)?.layout);
+        Ok(())
     }
 }

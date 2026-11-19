@@ -67,6 +67,17 @@
 //! | [`norm::LayerNorm`] | `layer_norm` | [`norm`] |
 //! | [`norm::Softmax`] | `softmax` | [`norm`] |
 //! | [`embedding::Embedding`] | `embedding` | [`embedding`] |
+//! | [`embedding::EmbeddingMxfp8`] | `embedding_mxfp8` | [`embedding`] |
+//!
+//! Residuals of several streams and hashed n-gram memories:
+//!
+//! | Operator | `NAME` | Module |
+//! | --- | --- | --- |
+//! | [`mhc::MhcBoundary`] | `mhc_boundary` | [`mhc`] |
+//! | [`mhc::MhcPost`] | `mhc_post` | [`mhc`] |
+//! | [`mhc::MhcPre`] | `mhc_pre` | [`mhc`] |
+//! | [`ngram::NgramHash`] | `ngram_hash` | [`ngram`] |
+//! | [`ngram::NgramGate`] | `ngram_gate` | [`ngram`] |
 //!
 //! Encoded products and their factors:
 //!
@@ -86,6 +97,8 @@
 //! | [`rope::QkNormRope`] | `qk_norm_rope` | [`rope`] |
 //! | [`kv::KvWrite`] | `kv_write` | [`kv`] |
 //! | [`kv::KvWriteScaled`] | `kv_write_scaled` | [`kv`] |
+//! | [`record::RecordWrite`] | `record_write` | [`record`] |
+//! | [`compress::LatentCompress`] | `latent_compress` | [`compress`] |
 //!
 //! Logits and sampling:
 //!
@@ -148,6 +161,7 @@ pub mod cast;
 pub mod channel_affine;
 pub mod collective;
 pub mod commit;
+pub mod compress;
 pub mod context;
 pub mod conv;
 pub mod copy_block;
@@ -172,8 +186,11 @@ pub mod kernel;
 pub mod kv;
 mod launch;
 pub mod logits;
+pub mod mhc;
 pub mod modulation;
 pub mod moe;
+pub mod mx;
+pub mod ngram;
 pub mod noise;
 pub mod norm;
 pub mod op;
@@ -184,6 +201,7 @@ pub mod position;
 pub mod posterior;
 mod primitives;
 pub mod profiler;
+pub mod record;
 pub mod recurrent;
 pub mod reduce;
 pub mod residual;

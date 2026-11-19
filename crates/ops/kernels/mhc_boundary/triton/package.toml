@@ -1,0 +1,70 @@
+# The mhc_boundary operator's Triton backend: design 5.2's package.
+#
+# One program holds a block of tokens of an mHC residual and walks the
+# columns of every stream once: it writes a pending sub-layer output back
+# (`post`), accumulates the next sub-layer's mixes (a three-pass TF32 product
+# of the FP32 projection), and stores the next input collapsed with the
+# carried pre-mix; then it runs the Sinkhorn iterations and normalizes the
+# input. Few tokens split their columns across the grid's second axis, the
+# last split of a block finishing it. The key is the one
+# `BoundaryDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_streams_4_hidden_5120_iterations_20_post_true_tokens_16_block_64`.
+
+op = "mhc_boundary"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+# A block of 64 tokens takes eight warps for its tiles, one of 16 four. The
+# derivation gives the connection's mixes, the lanes of its mix tile and the
+# epilogue's tiles. Every product of the fold and the collapse rounds before
+# its sum, as the reference's separate operations round them (no contraction
+# into fused multiply-adds), and two stages of the column walk are in flight.
+[launch]
+kernel = "_mhc_boundary_kernel"
+warps = { field = "tokens", steps = [[64, 8]], otherwise = 4 }
+derive = "derive"
+options = { enable_fp_fusion = false, num_stages = 2 }
+
+[launch.types]
+streams_ptr = { pointer = "dtype" }
+output_ptr = { pointer = "dtype" }
+post_ptr = "*fp32"
+comb_ptr = "*fp32"
+written_ptr = { pointer = "dtype" }
+weight_ptr = "*fp32"
+scale_ptr = "*fp32"
+base_ptr = "*fp32"
+pre_ptr = "*fp32"
+norm_ptr = { pointer = "dtype" }
+input_ptr = { pointer = "dtype" }
+next_pre_ptr = "*fp32"
+next_post_ptr = "*fp32"
+next_comb_ptr = "*fp32"
+partials_ptr = "*fp32"
+counters_ptr = "*i32"
+tokens = "i64"
+splits = "i32"
+rms_eps = "fp32"
+eps = "fp32"
+norm_eps = "fp32"
+
+[launch.constants]
+STREAMS = { field = "streams" }
+HIDDEN = { field = "hidden" }
+ITERATIONS = { field = "iterations" }
+POST = { field = "post" }
+BLOCK_T = { field = "tokens" }
+BLOCK_D = { field = "block" }
+MIXES = { field = "mixes" }
+MIX_TILE = { field = "mix_tile" }
+NORM = { field = "norm" }
+CHUNK = { field = "chunk" }
+
+# The streams are a power of two (the kernel's tiles are `[streams, …]`); the
+# token block and the column step are `tl.arange` extents, the token block a
+# `tl.dot` operand's rows.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], streams = { power_of_two = true, max = 8 }, hidden = { min = 1 }, iterations = { min = 1 }, post = ["true", "false"], tokens = { power_of_two = true, min = 16 }, block = { power_of_two = true, min = 16 } }

@@ -1,4 +1,5 @@
-//! The gated MLP of a transformer block: `down(act(gate(x)) · up(x))`.
+//! The gated MLP of a transformer block: `down(act(gate(x)) · up(x))`, its halves clamped first
+//! when the model states a limit (`down(act(min(gate(x), L)) · clamp(up(x), ±L))`).
 //!
 //! The gate and up projections are column parallel and the down projection is row parallel over
 //! the config's split, so a tensor-parallel block reduces once, in its down projection. A
@@ -39,6 +40,9 @@ pub struct MlpConfig {
     pub activation: Activation,
     /// Where the gated product rounds; a model keeps its reference's.
     pub rounding: Rounding,
+    /// The clamp of the gated product's halves, when the model states one: the gate from above
+    /// and the up half on both sides, before the activation.
+    pub limit: Option<f32>,
     /// The input projections' module names.
     pub gate_up: GateUp,
     /// The output projection's module name.
@@ -60,6 +64,7 @@ pub struct Mlp {
     inputs: Inputs,
     activation: Activation,
     rounding: Rounding,
+    limit: Option<f32>,
     down: Linear,
 }
 
@@ -70,8 +75,16 @@ impl Mlp {
     /// # Errors
     ///
     /// A projection the loader refuses, a split that does not divide the gated width, or the
-    /// value-product rounding with an activation other than SiLU, which has no kernel.
+    /// value-product rounding with an activation other than SiLU or with a clamp, which have no
+    /// kernel.
     pub fn load(config: &MlpConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
+        if config.rounding == Rounding::ValueProduct && config.limit.is_some() {
+            return Err(Error::shape(
+                "Mlp",
+                "the value-product order has no clamp; a clamped MLP rounds fused or stepwise"
+                    .to_owned(),
+            ));
+        }
         if config.rounding == Rounding::ValueProduct && config.activation != Activation::Silu {
             return Err(Error::shape(
                 "Mlp",
@@ -144,6 +157,7 @@ impl Mlp {
             inputs,
             activation: config.activation,
             rounding: config.rounding,
+            limit: config.limit,
             down,
         })
     }
@@ -176,6 +190,7 @@ impl Mlp {
                 &up.forward(x)?,
                 self.activation,
                 stepwise,
+                self.limit,
             )?,
 
             // The halves of one packed projection, as two strided views of its rows: the value
@@ -186,7 +201,7 @@ impl Mlp {
                 let value = packed.narrow(D::Minus1, 0, width)?;
                 let gate = packed.narrow(D::Minus1, width, width)?;
 
-                functional::act_and_mul(&gate, &value, self.activation, stepwise)?
+                functional::act_and_mul(&gate, &value, self.activation, stepwise, self.limit)?
             }
         };
         self.down.forward(&gated)

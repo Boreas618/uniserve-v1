@@ -1,0 +1,34 @@
+# The mhc_post operator's Triton backend: design 5.2's package.
+#
+# One program writes a column block of every stream of one token: the
+# sub-layer's output under the token's post-mix plus the streams combined by
+# its combination matrix, in FP32, rounded once. The key is the one
+# `PostDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_streams_4_hidden_5120_block_1024`.
+
+op = "mhc_post"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+[launch]
+kernel = "_mhc_post_kernel"
+options = { enable_fp_fusion = false }
+warps = 4
+
+[launch.types]
+streams_ptr = { pointer = "dtype" }
+output_ptr = { pointer = "dtype" }
+post_ptr = "*fp32"
+comb_ptr = "*fp32"
+out_ptr = { pointer = "dtype" }
+
+[launch.constants]
+STREAMS = { field = "streams" }
+HIDDEN = { field = "hidden" }
+BLOCK = { field = "block" }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], streams = { power_of_two = true, max = 8 }, hidden = { min = 1 }, block = { power_of_two = true } }

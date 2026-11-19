@@ -378,7 +378,7 @@ impl Deployment {
         let ids: Vec<GroupId> = (0..self.groups.len()).map(group_id).collect();
 
         let (inbox, messages) = unbounded();
-        let fake = FakeExecutor::new(&ids, self.written(), inbox);
+        let fake = FakeExecutor::new(&ids, self.written(), inbox).with_windows(self.windows());
         let fake = match self.class_of(|kind| kind.is_draft()) {
             Some(class) => fake.with_draft(class, BLOCK),
             None => fake,
@@ -592,6 +592,13 @@ impl Deployment {
         let classes = (0..).zip(&self.cache);
         let written = classes.filter(|(_, (kind, _))| !kind.is_state() && !kind.is_draft());
         written.map(|(class, (_, block))| (class, *block)).collect()
+    }
+
+    /// The classes of the sliding windows among the cache groups.
+    fn windows(&self) -> Vec<u8> {
+        let classes = (0u8..).zip(&self.cache);
+        let windows = classes.filter(|(_, (kind, _))| kind.window().is_some());
+        windows.map(|(class, _)| class).collect()
     }
 
     /// The class of the first cache group of a kind.

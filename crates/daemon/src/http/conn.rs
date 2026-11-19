@@ -2928,13 +2928,13 @@ mod tests {
                 skip_special_tokens: true,
                 ..Default::default()
             }),
-            parser: Some(proto::handoff::Parser::default()),
             response: Some(response.clone()),
             ..Default::default()
         };
         let output = crate::api::output::OutputProcessor::new(
             configured_tokenizer(),
             lowering,
+            crate::api::test_support::session(),
             0,
             Box::new(Unrecorded(std::time::Instant::now())),
         )

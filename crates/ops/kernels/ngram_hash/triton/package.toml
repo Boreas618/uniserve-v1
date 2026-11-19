@@ -1,0 +1,38 @@
+# The ngram_hash operator's Triton backend: design 5.2's package.
+#
+# One program hashes a block of tokens: each token's context of vocabulary
+# ids is normalized, folded into a rolling 64-bit hash, and each n-gram length
+# names one row in each of its heads' ranges of the table. The key is the one
+# `HashDescriptor`'s `Display` prints, e.g. `ids_u32_order_4_heads_8_block_64`.
+
+op = "ngram_hash"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+# The derivation gives the lanes of a program's heads.
+[launch]
+kernel = "_ngram_hash_kernel"
+warps = 4
+derive = "derive"
+
+[launch.types]
+context_ptr = { pointer = "ids" }
+normalize_ptr = "*i32"
+multipliers_ptr = "*i64"
+moduli_ptr = "*i64"
+offsets_ptr = "*i64"
+out_ptr = "*i64"
+tokens = "i64"
+vocabulary = "i64"
+
+[launch.constants]
+ORDER = { field = "order" }
+HEADS = { field = "heads" }
+HEAD_TILE = { field = "head_tile" }
+BLOCK = { field = "block" }
+
+[[kernel.descriptors]]
+dimensions = { ids = ["u32", "i32", "i64"], order = { min = 2 }, heads = { min = 1 }, block = { power_of_two = true } }

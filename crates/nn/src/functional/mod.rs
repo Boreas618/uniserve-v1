@@ -53,9 +53,13 @@ mod conv;
 mod embedding;
 mod frame;
 mod indexed;
+mod latent;
 mod linear;
 mod logits;
+mod mhc;
 mod moe;
+mod mx;
+mod ngram;
 mod noise;
 mod norm;
 mod nvfp4;
@@ -81,26 +85,39 @@ pub use attention::{
 };
 pub use commit::slot_commit_;
 pub use conv::{Padding, ProductPrecision, causal_pad, conv_transpose1d, conv1d, conv3d};
-pub use embedding::{embedding, vocabulary_shard};
+pub use embedding::{embedding, embedding_mxfp8, vocabulary_shard};
 pub use frame::frame_norm_pad;
-pub use indexed::{index_scores, indexed_attention};
+pub use indexed::{IndexScoring, index_scores, index_select, indexed_attention};
+pub use latent::{
+    Compression, Plane, RecordRow, Ring, Selected, Window, latent_attention, latent_compress,
+    record_write_,
+};
 pub use linear::{WeightOrder, dynamic_scales, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
+pub use mhc::{MhcMixes, MhcMixing, mhc_boundary, mhc_post, mhc_pre};
 pub use moe::{
-    EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN,
+    EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN, Routing,
     SORT_MAPS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, expert_combine, expert_dispatch,
-    expert_exchange_fused, gather_gemm, gather_gemm_nvfp4, moe_sort, moe_unpermute, route_gemm,
-    route_gemm_nvfp4, sigmoid_gated_add_, topk_softmax,
+    expert_exchange_fused, gather_gemm, gather_gemm_mxfp4, gather_gemm_nvfp4, moe_sort,
+    moe_unpermute, route_gemm, route_gemm_mxfp4, route_gemm_nvfp4, sigmoid_gated_add_,
+    topk_softmax,
 };
+pub use mx::{linear_mxfp8, mxfp8_quantize};
+pub use ngram::{ngram_gate, ngram_hash};
 pub use noise::{philox_normal, philox_normal_like, philox_normal_rows};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
 pub use nvfp4::nvfp4_quantize;
+pub use ops::moe::routing::Scoring;
+/// The formats of a cache plane's records and where a page keeps their scales ([`Plane`]).
+pub use ops::record::{Format, Layout};
 pub use pool::adaptive_avg_pool2d;
 pub use recurrent::{StateAxes, causal_conv1d, gated_delta_rule};
 pub use residual_norm::{
     modulated_rms_norm, modulated_rms_norm_, scaled_residual_layer_norm, scaled_residual_rms_norm_,
 };
-pub use rotary::{grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors};
+pub use rotary::{
+    grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors, rotary_trailing_,
+};
 pub use rows::place_rows_;
 pub use sampling::{
     argmax, log_softmax, logits_shape, logprob_gather, sampling_from_logits, softmax, top_k,

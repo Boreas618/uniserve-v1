@@ -39,8 +39,8 @@ pub enum Error {
         model: String,
     },
     #[error(transparent)]
-    /// The checkpoint declares no family the executable serves.
-    Family(#[from] processing::ResolveError),
+    /// The checkpoint declares no family the epoch's processing program serves.
+    Family(#[from] scheduling::processing::ResolveError),
     #[error("unsupported diffusers pipeline {class_name}")]
     /// A family that has no pipeline form is resolved as a pipeline.
     UnsupportedPipeline {

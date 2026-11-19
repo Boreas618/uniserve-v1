@@ -1,0 +1,42 @@
+# The index_select operator's Triton backend: design 5.2's package.
+#
+# One program per row keeps the row's `kept` best pooled scores by four radix
+# passes over the row and one compaction pass in column order, and writes the
+# entry each names, -1 for a score of -inf: a column, a block of `pool`
+# columns (the row's newest visible block pinned), or the group of a candidate
+# block a column scored. The row is read in chunks of `tile` scores, so one
+# module serves rows of any length; the column count and the kept count are
+# launch values.
+
+op = "index_select"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+# The derivation gives the pooled entries one chunk holds, `tile / pool`.
+[launch]
+kernel = "_index_select_kernel"
+warps = 8
+derive = "derive"
+
+[launch.types]
+scores = "*fp32"
+visible = "*i32"
+candidates = "*i32"
+out = "*i32"
+columns = "i64"
+kept = "i64"
+
+[launch.constants]
+POOL = { field = "pool" }
+CANDIDATES = { field = "candidates" }
+LANES = { field = "lanes" }
+
+# `pool_8_candidates_0_tile_4096`.
+#
+# `tile / pool` is a `tl.arange` extent, so a power of two the derivation
+# checks; `candidates` is zero for scores of the request's own groups.
+[[kernel.descriptors]]
+dimensions = { pool = { power_of_two = true }, candidates = { min = 0 }, tile = { power_of_two = true } }

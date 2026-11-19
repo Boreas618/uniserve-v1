@@ -651,7 +651,7 @@ pub(crate) mod tests {
 
     use crate::batch::{MediaRow, Variant};
     use nn::capability::{CausalLm, PatchFormat, PixelNorm, Vision};
-    use nn::family::{CacheShape, ExpertShape, StateShape, TextModel, TokenHistory};
+    use nn::family::{CacheField, ExpertShape, StateShape, TextModel, TokenHistory};
     use nn::{Drafter, ExpertExchange, KvCache, RecurrentState, TokenBatch};
     use ops::Generation;
     use proto::request::RequestId as CallRequest;
@@ -716,13 +716,8 @@ pub(crate) mod tests {
             DType::BF16
         }
 
-        fn cache(&self) -> CacheShape {
-            CacheShape {
-                layers: 1,
-                kv_heads: 1,
-                head_dim: 8,
-                index_keys: None,
-            }
+        fn cache(&self) -> Vec<CacheField> {
+            CacheField::keys_and_values(1, 1, 8)
         }
 
         fn state_layers(&self) -> Vec<StateShape> {

@@ -7,6 +7,7 @@ The model families in Rust, one module each, on the tensor library (`tensor`) an
 | `qwen3` | The Qwen3 decoder, `Qwen3MoeForCausalLM`, the language model of `Qwen3_5MoeForConditionalGeneration` with its MTP drafter, and Qwen3-VL as an encoder with its vision tower |
 | `qwen4_exp` | Qwen3.8 Flash Next (`Qwen4ExpForConditionalGeneration`), on the vision tower and configuration readers of `qwen3` |
 | `minimax_h3` | MiniMax-H3 and FastH3, whose text encoder is the Qwen3-VL model of `qwen3` |
+| `deepseek_v41` | What DeepSeek-V4.1 (`DeepseekV41ForCausalLM`) reads for its hyper-connected residual and its n-gram memories; the family is not registered yet |
 
 Every type is a configuration read from the checkpoint, a module with a `forward`, a family value or a family's error.
 
@@ -30,6 +31,10 @@ The Qwen-VL processor rules that size media to the tower's patch grid (`smart_re
 ## `qwen4_exp`
 
 The configuration (`Config`), the hyper-connections around each block (`HyperConnection`), the hashed n-gram embedding and its PLE layer (`NgramEmbedding`, `PleLayer`), indexed attention (`IndexedAttention`), the decoder layer (`DecoderLayer`), the causal language model (`Qwen4ExpForCausalLm`, an `nn::CausalLm`), the drafter over streams (`Mtp`, an `nn::Drafter`) and the family value `FAMILY`, following vLLM's implementation of the family. The vision tower and the M-RoPE coordinates of a prompt are `qwen3`'s.
+
+## `deepseek_v41`
+
+The fields of the checkpoint's `text_config` its residual and its n-gram memories read (`Config`, `EngramConfig`, with the `nn::modules::MhcConfig` and `nn::modules::NgramConfig` they state), and the n-gram hashing the reference builds at load (`Hashing`): the normalized vocabulary from the checkpoint's `tokenizer.json` with the tokenizer library's normalizers, each layer's multipliers as numpy's `default_rng(10007 · layer)` draws them (its `SeedSequence`, PCG64 and bounded draws, ported), and the prime ranges of every head. The residual and the memory themselves are `nn`'s (`MhcResidual`, `MhcConnection`, `NgramMemory`); layer `l`'s connections are `layers.<l>.hc_{attn,ffn}_{fn,scale,base}` with `layers.<l>.{attn,ffn}_norm`.
 
 ## `minimax_h3`
 

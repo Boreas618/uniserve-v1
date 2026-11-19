@@ -6,8 +6,10 @@
 //! ([`Embedding`](crate::modules::Embedding) reduces it). The operator is therefore a gather with
 //! a mask, and two implementations of it agree bit for bit.
 
-use ops::embedding::{Args, Descriptor, Embedding};
-use tensor::{Device, Tensor};
+use ops::embedding::{
+    Args, Descriptor, Embedding, EmbeddingMxfp8, MXFP8_GROUP, Mxfp8Args, Mxfp8Descriptor,
+};
+use tensor::{DType, Device, Tensor};
 
 use super::{Fused, columns, compute};
 use crate::collective::Split;
@@ -136,6 +138,181 @@ impl Fused for EmbeddingCall<'_> {
                 ids: ops::operand(ids)?,
                 weight: ops::operand(weight)?,
                 out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
+}
+
+/// The rows of `ids` from an MXFP8 table's shard, dequantized: `[ids, hidden]` of `output`
+/// elements, each E4M3 value of `values` times its group's UE8M0 scale of `scales`, the product
+/// in FP32 rounded once, and zeros for an id outside the shard.
+///
+/// `ids` is one column of I64 ids of the whole table; `values` is the shard's `[rows, hidden]`
+/// E4M3 rows, whose first is row `first` of the table, and `scales` its `[rows, hidden / 32]`
+/// U8 exponent bytes, `e` meaning `2^(e − 127)`.
+///
+/// # Errors
+///
+/// When an operand has other extents or types, or the operator refuses its arguments.
+pub fn embedding_mxfp8(
+    ids: &Tensor,
+    values: &Tensor,
+    scales: &Tensor,
+    first: u64,
+    output: DType,
+) -> Result<Tensor> {
+    const OWNER: &str = Mxfp8Call::OWNER;
+
+    let group = MXFP8_GROUP as usize;
+    let (&[_], &[rows, hidden]) = (ids.dims(), values.dims()) else {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "ids of {:?} and rows of {:?}: a column of ids and a [rows, hidden] table",
+                ids.dims(),
+                values.dims()
+            ),
+        ));
+    };
+    if ids.dtype() != DType::I64
+        || values.dtype() != DType::F8E4M3
+        || scales.dtype() != DType::U8
+        || hidden == 0
+        || !hidden.is_multiple_of(group)
+        || scales.dims() != [rows, hidden / group]
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "ids {} {:?}, values {} {:?} and scales {} {:?}: I64 ids, E4M3 rows of whole \
+                 groups of {group} and one U8 scale per group",
+                ops::abi::name(ids.dtype()),
+                ids.dims(),
+                ops::abi::name(values.dtype()),
+                values.dims(),
+                ops::abi::name(scales.dtype()),
+                scales.dims()
+            ),
+        ));
+    }
+
+    compute(Mxfp8Call {
+        ids,
+        values,
+        scales,
+        first,
+        output,
+    })
+}
+
+/// A checked call of [`embedding_mxfp8`].
+struct Mxfp8Call<'t> {
+    ids: &'t Tensor,
+    values: &'t Tensor,
+    scales: &'t Tensor,
+    first: u64,
+    output: DType,
+}
+
+impl Mxfp8Call<'_> {
+    const OWNER: &'static str = "embedding_mxfp8";
+}
+
+/// The FP32 value of a UE8M0 exponent byte: `2^(e − 127)`, the subnormal `2^-127` for 0 and not a
+/// number for 255.
+fn ue8m0(byte: u8) -> f32 {
+    match byte {
+        0 => f32::from_bits(0x0040_0000),
+        u8::MAX => f32::NAN,
+        exponent => f32::from_bits(u32::from(exponent) << 23),
+    }
+}
+
+impl Fused for Mxfp8Call<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.ids.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            ids,
+            values,
+            scales,
+            first,
+            output,
+        } = self;
+        let (rows, hidden) = values.dims2()?;
+        let count = ids.elem_count();
+        let groups = hidden / MXFP8_GROUP as usize;
+        if rows == 0 {
+            return Ok(Tensor::zeros((count, hidden), output, ids.device())?);
+        }
+
+        // An id outside the shard reads its nearest row, and the mask writes zeros in its place.
+        // The ids are below 2^53, where the scalar comparisons' floating point is exact.
+        let (low, high) = (first as f64, (first + rows as u64 - 1) as f64);
+        let opening = Tensor::new(first as i64, ids.device())?;
+        let local = ids
+            .maximum(low)?
+            .minimum(high)?
+            .broadcast_sub(&opening)?
+            .to_dtype(DType::U32)?;
+
+        let exponents = Tensor::from_vec(
+            (0..=u8::MAX).map(ue8m0).collect::<Vec<f32>>(),
+            256,
+            ids.device(),
+        )?;
+        let factors = exponents
+            .index_select(
+                &scales
+                    .index_select(&local, 0)?
+                    .to_dtype(DType::U32)?
+                    .flatten_all()?,
+                0,
+            )?
+            .reshape((count, groups, 1))?;
+        let dequantized = values
+            .index_select(&local, 0)?
+            .to_dtype(DType::F32)?
+            .reshape((count, groups, MXFP8_GROUP as usize))?
+            .broadcast_mul(&factors)?
+            .reshape((count, hidden))?
+            .to_dtype(output)?;
+
+        let outside = (ids.lt(low)? + ids.gt(high)?)?
+            .unsqueeze(1)?
+            .broadcast_as(dequantized.shape())?;
+        Ok(outside.where_cond(&dequantized.zeros_like()?, &dequantized)?)
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            ids,
+            values,
+            scales,
+            first,
+            output,
+        } = self;
+        let hidden = values.dim(1)?;
+        let out = ops::empty((ids.elem_count(), hidden), output)?;
+        if ids.elem_count() == 0 {
+            return Ok(out);
+        }
+
+        let width = u32::try_from(hidden)
+            .map_err(|_| Error::shape(Self::OWNER, format!("rows of {hidden} elements")))?;
+        ops::launch::<EmbeddingMxfp8>(
+            &Mxfp8Descriptor::new(output, ids.dtype(), width),
+            Mxfp8Args {
+                ids: ops::operand(&ids.contiguous()?)?,
+                values: ops::operand(values)?,
+                scales: ops::operand(scales)?,
+                out: ops::operand(&out)?,
+                first,
             },
         )?;
         Ok(out)

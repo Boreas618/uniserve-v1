@@ -5,49 +5,14 @@
 //! reads the [`Registry`] of these values, execution the registry of numerical families built
 //! from the same list. A family declares the one root file its checkpoints name their class in
 //! ([`RootFile`]) and the classes it claims there; a checkpoint resolves by what those files
-//! declare ([`Registry::resolve`]). The daemon and the engine read the root files the registry
-//! names ([`Registry::root_files`]) where the checkpoint is and resolve them by this one rule.
+//! declare ([`Registry::resolve`]). The engine reads the root files the registry names
+//! ([`Registry::root_files`]) where the checkpoint is and resolves them by the processing
+//! interface's one rule (`scheduling::processing::resolve`), by which the daemon resolves a
+//! checkpoint among the families the processing program declares.
 
-use serde_json::Value;
+pub use scheduling::processing::{ResolveError, RootFile};
 
 use crate::serving::Serving;
-
-/// A file at a checkpoint's root that names the checkpoint's class.
-///
-/// Each checkpoint format declares its class in one file under one key, and a family names the
-/// format its checkpoints are published in: no file is read in place of another, and no second
-/// key stands in for the class.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RootFile {
-    /// A transformers checkpoint's `config.json`, whose `architectures[0]` names the model
-    /// class.
-    Config,
-    /// A diffusers modular pipeline's `modular_model_index.json`, whose `_class_name` names the
-    /// pipeline class.
-    ModularIndex,
-}
-
-impl RootFile {
-    /// The file's name at the checkpoint's root.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Config => "config.json",
-            Self::ModularIndex => "modular_model_index.json",
-        }
-    }
-
-    /// The class the file's JSON object names, if it names one.
-    fn class(self, object: &serde_json::Map<String, Value>) -> Option<&str> {
-        match self {
-            Self::Config => object
-                .get("architectures")
-                .and_then(Value::as_array)
-                .and_then(|architectures| architectures.first())
-                .and_then(Value::as_str),
-            Self::ModularIndex => object.get("_class_name").and_then(Value::as_str),
-        }
-    }
-}
 
 /// One model family, as its checkpoints declare it and request processing serves it.
 #[derive(Clone, Copy)]
@@ -82,60 +47,22 @@ impl PartialEq for Family {
 
 impl Eq for Family {}
 
-/// The request-processing side of every model family this tree serves: what a daemon registers,
-/// without linking a model. The engine executable registers the numerical side of the same
-/// families, each of which holds its value of this list.
-pub const FAMILIES: [Family; 4] = [
+/// The request-processing side of every model family this tree serves: what the tree's processing
+/// program serves (`crate::program::Release`), which the leader daemon loads without linking a
+/// model. The engine executable registers the numerical side of the same families, each of which
+/// holds its value of this list.
+pub const FAMILIES: [Family; 5] = [
     crate::qwen::QWEN3,
     crate::qwen::QWEN3_5_MOE,
     crate::qwen::QWEN4_EXP,
     crate::minimax_h3::FAMILY,
+    crate::deepseek_v41::FAMILY,
 ];
 
 /// Two families claim one class: a checkpoint of it would resolve to either.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("two model families claim the class {0}")]
 pub struct RegistryError(pub &'static str);
-
-/// Why a checkpoint resolves to no family of a [`Registry`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ResolveError {
-    /// A root file the checkpoint publishes is not a JSON object.
-    #[error("the checkpoint's {} is not a JSON object: {message}", file.name())]
-    Malformed {
-        /// The file.
-        file: RootFile,
-        /// What is wrong with it.
-        message: String,
-    },
-    /// No root file the registry's families declare in names a class.
-    #[error(
-        "the checkpoint declares no model class: none of {files} it publishes names one",
-        files = files.join(", ")
-    )]
-    Undeclared {
-        /// The root files the registry's families declare their classes in.
-        files: Vec<&'static str>,
-    },
-    /// No family claims what the checkpoint declares.
-    #[error(
-        "the checkpoint declares {declared}, which this build cannot serve: it serves {served}"
-    )]
-    Unserved {
-        /// Each class the checkpoint declares, with the file that declares it.
-        declared: String,
-        /// Every class the registry's families claim.
-        served: String,
-    },
-    /// Two root files declare classes of two families.
-    #[error("the checkpoint declares {first} and {second}, two families' classes")]
-    Ambiguous {
-        /// The first family's class, with the file that declares it.
-        first: String,
-        /// The second family's class, with the file that declares it.
-        second: String,
-    },
-}
 
 /// The families an executable serves, each claiming the classes its checkpoints declare in its
 /// root file.
@@ -182,20 +109,12 @@ impl Registry {
     /// The root files the families declare their classes in, each once, in registration order:
     /// the files a checkpoint is resolved from.
     pub fn root_files(&self) -> Vec<RootFile> {
-        let mut files = Vec::new();
-        for family in &self.families {
-            if !files.contains(&family.root) {
-                files.push(family.root);
-            }
-        }
-        files
+        scheduling::processing::root_files(&self.families)
     }
 
     /// The family a checkpoint declares in its root files: `files` holds the text of each of
-    /// [`Self::root_files`] the checkpoint publishes.
-    ///
-    /// Every published file is read under its own key, and a family claims the checkpoint when
-    /// the file it declares in names one of its classes. Exactly one family must claim it.
+    /// [`Self::root_files`] the checkpoint publishes, resolved by the processing interface's
+    /// one rule ([`scheduling::processing::resolve`]).
     ///
     /// # Errors
     ///
@@ -207,59 +126,21 @@ impl Registry {
         &self,
         files: impl IntoIterator<Item = (RootFile, &'a str)>,
     ) -> Result<Family, ResolveError> {
-        let mut declared = Vec::new();
-        let mut claimed: Option<(Family, String)> = None;
-        for (file, text) in files {
-            let object = object(file, text)?;
-            let Some(class) = file.class(&object) else {
-                continue;
-            };
-            let stated = format!("class {class} ({})", file.name());
-            let family = self
-                .families
-                .iter()
-                .copied()
-                .find(|family| family.root == file && family.classes.contains(&class));
-            match (family, &claimed) {
-                (None, _) => declared.push(stated),
-                (Some(family), None) => claimed = Some((family, stated)),
-                (Some(family), Some((first, _))) if family == *first => {}
-                (Some(_), Some((_, first))) => {
-                    return Err(ResolveError::Ambiguous {
-                        first: first.clone(),
-                        second: stated,
-                    });
-                }
-            }
-        }
-
-        if let Some((family, _)) = claimed {
-            return Ok(family);
-        }
-        if declared.is_empty() {
-            return Err(ResolveError::Undeclared {
-                files: self.root_files().into_iter().map(RootFile::name).collect(),
-            });
-        }
-        Err(ResolveError::Unserved {
-            declared: declared.join(" and "),
-            served: self
-                .families
-                .iter()
-                .flat_map(|family| family.classes.iter().copied())
-                .collect::<Vec<_>>()
-                .join(", "),
-        })
+        scheduling::processing::resolve(&self.families, files).copied()
     }
 }
 
-/// `text`, the content of the checkpoint's `file`, as a JSON object.
-fn object(file: RootFile, text: &str) -> Result<serde_json::Map<String, Value>, ResolveError> {
-    let malformed = |message: String| ResolveError::Malformed { file, message };
-    match serde_json::from_str(text) {
-        Ok(Value::Object(object)) => Ok(object),
-        Ok(_) => Err(malformed("it is not an object".to_owned())),
-        Err(error) => Err(malformed(error.to_string())),
+impl scheduling::processing::Claim for Family {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn root(&self) -> RootFile {
+        self.root
+    }
+
+    fn classes(&self) -> Vec<&str> {
+        self.classes.to_vec()
     }
 }
 

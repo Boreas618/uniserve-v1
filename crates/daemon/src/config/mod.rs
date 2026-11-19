@@ -29,8 +29,7 @@ pub use proto::request::StandbyStorage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use processing::Family;
-use processing::Serving;
+use scheduling::processing::{Family, Serving};
 
 pub use args::{Stated, parse, printed};
 use proto::admin::{InFlight, PreviousEpoch, RollbackConfig};
@@ -208,9 +207,9 @@ enum Kind {
 impl Kind {
     /// Whether `family` is of this kind.
     fn serves(self, family: &Family) -> bool {
-        match (self, family.serving) {
-            (Self::Chat, Serving::Chat(_)) | (Self::Video, Serving::Video(_)) => true,
-            (Self::Chat, Serving::Video(_)) | (Self::Video, Serving::Chat(_)) => false,
+        match (self, &family.serving) {
+            (Self::Chat, Serving::Chat { .. }) | (Self::Video, Serving::Video(_)) => true,
+            (Self::Chat, Serving::Video(_)) | (Self::Video, Serving::Chat { .. }) => false,
         }
     }
 
@@ -873,8 +872,9 @@ impl Config {
     /// server host or Unix socket path is blank, or
     /// `video_config.max_seconds` lies outside the durations the video API
     /// admits, a program's name is not one plain name or its period is zero, or the `[kernels]`
-    /// table names an operator this build lacks or pins one backend of an operator at two
-    /// revisions.
+    /// table pins an empty key or one backend of an operator at two revisions. Whether the
+    /// table's operators are ones the deployment's engine launches is the engine revision's to
+    /// state, which the apply fixes (`engine::control::with_store_modules`), not this build's.
     pub fn validate(&self, stated: &Stated) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.states_model(),
@@ -906,10 +906,6 @@ impl Config {
         // One backend serves an operator at one revision (`BuildServer::cover`), so the keys of
         // an operator pin each backend at one revision.
         for (op, pins) in &self.kernels {
-            anyhow::ensure!(
-                proto::module::operator::named(op).is_some(),
-                "`kernels.{op}` names no operator of this build"
-            );
             let mut revisions: std::collections::BTreeMap<&str, (&str, Option<u32>)> =
                 std::collections::BTreeMap::new();
             for (key, pin) in pins {

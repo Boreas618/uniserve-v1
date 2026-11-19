@@ -180,6 +180,8 @@ pub mod speculation;
 pub(crate) mod wiring;
 
 #[cfg(test)]
+mod latent_tests;
+#[cfg(test)]
 mod tests;
 
 use std::cell::Cell;
@@ -190,7 +192,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::batch::{Batch, BatchOutput, Phase, Shape as BatchShape, TimingCounters, Variant};
-use nn::family::{StateField, StateShape, TextModel};
+use nn::family::{History, StateField, StateShape, TextModel};
 use nn::{KvCache, RecurrentState, TokenBatch, VerifySlots};
 use platform::{Event, Stream};
 use proto::module::commit::COMMIT_FIELDS;
@@ -968,7 +970,7 @@ impl CausalLmRunner {
             && scratch
                 .iter()
                 .zip(&self.cache)
-                .all(|(lent, group)| lent.layers.len() == group.layers.len());
+                .all(|(lent, group)| lent.planes.len() == group.planes.len());
 
         let tabled = scratch.iter().zip(&self.cache).all(|(lent, group)| {
             let table = &lent.block_tables;
@@ -1471,22 +1473,24 @@ impl CausalLmRunner {
             })
     }
 
-    /// The cache slot each token of `batch` writes through `tables`, and the calls refused for
-    /// a token whose entry may not be written (`columns::slot_mapping`). A call writes the
-    /// attention group it names: the model's attention groups come first among the cache
-    /// groups, in the order the runner is lent them.
+    /// The cache slot each token of `batch` writes through `tables` in each of the model's
+    /// attention groups, and the calls refused for a token whose entry may not be written
+    /// (`columns::slot_mapping`). The model's attention groups come first among the cache
+    /// groups, in the order the runner is lent them, a sliding window's lent with its rows'
+    /// starts.
     fn slot_mapping(
         &self,
         batch: &Batch,
         tables: &BlockTables,
-    ) -> Result<(Vec<u32>, Vec<Refusal>)> {
-        columns::slot_mapping(
-            &batch.columns.rows,
-            tables,
-            self.config.page_size,
-            self.cache.len() as u32,
-        )
-        .map_err(|error| Error::Invalid(format!("batch {}: {error}", batch.id.0)))
+    ) -> Result<(Vec<Vec<u32>>, Vec<Refusal>)> {
+        let windows: Vec<bool> = self
+            .cache
+            .iter()
+            .map(|group| group.starts.is_some())
+            .collect();
+
+        columns::slot_mapping(&batch.columns.rows, tables, self.config.page_size, &windows)
+            .map_err(|error| Error::Invalid(format!("batch {}: {error}", batch.id.0)))
     }
 
     /// The draft pages of each row of `batch`, in row order, from its slot's entries of the
@@ -1516,7 +1520,7 @@ impl CausalLmRunner {
         batch: &Batch,
         bucket: &Bucket,
         tables: &BlockTables,
-        mapping: &[u32],
+        mapping: &[Vec<u32>],
         scratch: Option<&[Range<u32>]>,
     ) -> Result<()> {
         self.stage(batch, bucket, tables, mapping, scratch)?;
@@ -1535,7 +1539,7 @@ impl CausalLmRunner {
         batch: &Batch,
         bucket: &Bucket,
         tables: &BlockTables,
-        mapping: &[u32],
+        mapping: &[Vec<u32>],
         scratch: Option<&[Range<u32>]>,
     ) -> Result<Vec<u32>> {
         self.staged.resize(self.layout.bytes() as usize, 0);
@@ -1883,21 +1887,35 @@ impl CausalLmRunner {
         })
     }
 
-    /// The attention groups of a forward: each group's page-table rows gathered by
-    /// `table_rows`, from the pooled table of the serving cache or, in a paired forward, from
-    /// the scratch set's table.
-    fn gathered_cache(&self, table_rows: &Tensor) -> Result<Vec<KvCache>> {
+    /// The attention groups of a forward of `rows` rows and `tokens` tokens: each group's
+    /// page-table rows gathered by `table_rows`, from the pooled table of the serving cache or,
+    /// in a paired forward, from the scratch set's table; its row of the slot mapping column, a
+    /// bucket's tokens per group; and for a sliding window's group the rows' starts.
+    fn gathered_cache(
+        &self,
+        table_rows: &Tensor,
+        (rows, tokens): (usize, usize),
+    ) -> Result<Vec<KvCache>> {
         let groups = if self.paired.get() {
             &self.scratch
         } else {
             &self.cache
         };
+        let slots = self
+            .column(Column::SlotMapping, groups.len().max(1) * tokens)?
+            .reshape((groups.len().max(1), tokens))?;
 
         groups
             .iter()
-            .map(|group| {
+            .enumerate()
+            .map(|(index, group)| {
                 Ok(KvCache {
                     block_tables: group.block_tables.index_select(table_rows, 0)?,
+                    slot_mapping: slots.get(index)?,
+                    starts: match &group.starts {
+                        Some(_) => Some(self.column(Column::Starts, rows)?),
+                        None => None,
+                    },
                     ..group.clone()
                 })
             })
@@ -2008,7 +2026,7 @@ impl Forward for CausalLmRunner {
 
         let slots = self.column(Column::Slots, rows)?;
         let slot_rows = self.column(Column::SlotRows, rows)?;
-        let cache = self.gathered_cache(&self.column(Column::TableRows, rows)?)?;
+        let cache = self.gathered_cache(&self.column(Column::TableRows, rows)?, (rows, tokens))?;
 
         // A decode row's input token is the one the step before it committed into its slot.
         let ids = if decode {
@@ -2041,7 +2059,6 @@ impl Forward for CausalLmRunner {
                 None => None,
             },
             positions,
-            slot_mapping: self.column(Column::SlotMapping, tokens)?,
             seq_lens: self.column(Column::SeqLens, rows)?,
             query_offsets: self.column(Column::QueryOffsets, rows + 1)?,
             logits_rows: self.column(Column::LogitsRows, rows)?,
@@ -2057,6 +2074,9 @@ impl Forward for CausalLmRunner {
             live_tokens: Some(self.column(Column::LiveTokens, 1)?),
         };
         batch.check()?;
+        for group in &cache {
+            group.check(&batch)?;
+        }
 
         // A batch's state rows are its attention rows.
         let state = match &self.state {
@@ -2610,6 +2630,8 @@ impl Runner for CausalLmRunner {
             return Ok(bucket);
         }
 
+        // Every attention group of a cache that keeps scratch pages is the KV pool's, and they
+        // share the set's numbering.
         let mapping = columns::scratch_column(
             &rows.cache_positions,
             &rows.query_offsets,
@@ -2617,6 +2639,7 @@ impl Runner for CausalLmRunner {
             &spans,
             self.config.page_size,
         )?;
+        let mapping = vec![mapping; self.scratch.len()];
         self.fill(batch, &bucket, tables, &mapping, Some(&spans))?;
         // No row an earlier batch's image marked stays marked.
         self.place_images(batch, &[])?;
@@ -2785,7 +2808,9 @@ fn stated(config: &CausalLmConfig, model: &dyn TextModel) -> Result<(Buckets, La
             ));
         }
     };
-    let layout = Layout::of(buckets.iter(), config.drafts, pages, history)?;
+    // Every token has a slot of each attention group of the model's fields.
+    let groups = histories(model).len() as u32;
+    let layout = Layout::of(buckets.iter(), groups, config.drafts, pages, history)?;
 
     Ok((buckets, layout))
 }
@@ -2850,18 +2875,55 @@ fn refuse_drawn_rows(variant: Variant, parameters: &[f32]) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a cache that is not `model`'s layers over `config`'s page size and slots.
-fn check_cache(model: &dyn TextModel, config: &CausalLmConfig, cache: &[KvCache]) -> Result<()> {
-    let shape = model.cache();
+/// The histories of `model`'s cache fields, in the order a forward is lent their groups: the
+/// full history's, then each sliding window's, shortest first (`nn::CausalLm::forward`).
+pub(crate) fn histories(model: &dyn TextModel) -> Vec<History> {
+    let mut histories: Vec<History> = Vec::new();
+    for field in model.cache() {
+        if !histories.contains(&field.history) {
+            histories.push(field.history);
+        }
+    }
+    histories.sort_by_key(|history| match history {
+        History::Full => 0,
+        History::Window { tokens } => u64::from(*tokens) + 1,
+    });
+    histories
+}
 
-    let layers: usize = cache.iter().map(|group| group.layers.len()).sum();
-    if layers != shape.layers as usize {
+/// Refuses a cache that is not `model`'s fields over `config`'s page size and slots: a group
+/// per history of the fields, in order, each holding a plane per owner of every field of its
+/// history, a sliding window's lent with its rows' starts.
+fn check_cache(model: &dyn TextModel, config: &CausalLmConfig, cache: &[KvCache]) -> Result<()> {
+    let fields = model.cache();
+    let histories = histories(model);
+    if histories.len() != cache.len() {
         return Err(Error::Invalid(format!(
-            "the cache lends {layers} layers in {} groups, and the model's layers store keys \
-             and values in {}",
+            "the cache lends {} groups, and the model's fields keep {} histories",
             cache.len(),
-            shape.layers
+            histories.len()
         )));
+    }
+
+    for (index, (group, history)) in cache.iter().zip(&histories).enumerate() {
+        let planes: usize = fields
+            .iter()
+            .filter(|field| field.history == *history)
+            .map(|field| field.owners.len())
+            .sum();
+        let windowed = matches!(history, History::Window { .. });
+        if group.planes.len() != planes || group.starts.is_some() != windowed {
+            return Err(Error::Invalid(format!(
+                "group {index} of the cache lends {} planes{}, and the model's fields of {history:?} \
+                 keep {planes}",
+                group.planes.len(),
+                if group.starts.is_some() {
+                    " with starts"
+                } else {
+                    ""
+                },
+            )));
+        }
     }
 
     for (index, group) in cache.iter().enumerate() {
@@ -2950,13 +3012,19 @@ fn check_state(
 }
 
 /// Refuses `draft`, a draft cache a runner of `model` verifies over, when it is not the
-/// drafter's layers: a model that loaded no drafter reads none.
+/// drafter's fields' planes: a model that loaded no drafter reads none.
 fn check_draft_cache(model: &dyn TextModel, draft: &KvCache) -> Result<()> {
-    let layers = model.drafter().map(|drafter| drafter.cache().layers);
-    if Some(draft.layers.len() as u32) != layers {
+    let planes = model.drafter().map(|drafter| {
+        drafter
+            .cache()
+            .iter()
+            .map(|field| field.owners.len())
+            .sum::<usize>()
+    });
+    if Some(draft.planes.len()) != planes {
         return Err(Error::Invalid(format!(
-            "a draft cache of {} layers, and the drafter's {layers:?} layers read it",
-            draft.layers.len()
+            "a draft cache of {} planes, and the drafter's fields keep {planes:?}",
+            draft.planes.len()
         )));
     }
     Ok(())

@@ -133,7 +133,11 @@ fn memory<H>(caller: &mut Caller<'_, Context<H>>) -> wasmtime::Result<wasmtime::
 }
 
 /// The `len` bytes at `ptr` of the module's memory, a fault when they lie outside it.
-fn read<H>(caller: &mut Caller<'_, Context<H>>, ptr: u32, len: u32) -> wasmtime::Result<Vec<u8>> {
+pub(crate) fn read<H>(
+    caller: &mut Caller<'_, Context<H>>,
+    ptr: u32,
+    len: u32,
+) -> wasmtime::Result<Vec<u8>> {
     let memory = memory(caller)?;
     let mut bytes = vec![0; len as usize];
     memory
@@ -143,7 +147,7 @@ fn read<H>(caller: &mut Caller<'_, Context<H>>, ptr: u32, len: u32) -> wasmtime:
 }
 
 /// The message at `ptr`, decoded; a fault when it is not a `T`.
-fn message<H, T: serde::de::DeserializeOwned>(
+pub(crate) fn message<H, T: serde::de::DeserializeOwned>(
     caller: &mut Caller<'_, Context<H>>,
     ptr: u32,
     len: u32,
@@ -155,7 +159,7 @@ fn message<H, T: serde::de::DeserializeOwned>(
 
 /// Writes `value` into a buffer of the module's own `alloc` export and packs it, giving the call
 /// the fuel the module spends decoding it: the budget's fuel per byte of a message.
-fn reply<H>(
+pub(crate) fn reply<H>(
     caller: &mut Caller<'_, Context<H>>,
     value: &impl serde::Serialize,
 ) -> wasmtime::Result<u64> {

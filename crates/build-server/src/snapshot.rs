@@ -6,8 +6,8 @@
 //! **whole workspace**: `package.toml` at the revision's root and, under
 //! [`WORKSPACE`], every file cargo packages of every workspace member
 //! (`cargo package --list`, which honours each crate's `include` and `exclude`
-//! and the repository's ignore rules) with the workspace's manifest, lockfile
-//! and toolchain file, exactly as they are. The revision is then the workspace
+//! and the repository's ignore rules) with the workspace's manifest, lockfile,
+//! toolchain file and cargo configuration, exactly as they are. The revision is then the workspace
 //! cargo builds offline with its own lockfile, wherever the tree it was
 //! installed from is, and any change to the workspace is a change of the
 //! package's digest. Nothing is rewritten: no generated manifest, no reduced
@@ -35,8 +35,15 @@ use crate::{Error, Result};
 /// snapshot of its workspace.
 pub const WORKSPACE: &str = "workspace";
 
-/// The files of a workspace root a snapshot always holds, beside its members'.
-const WORKSPACE_FILES: [&str; 3] = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"];
+/// The files of a workspace root a snapshot holds, beside its members', when the workspace has
+/// them: its manifest, lockfile and toolchain file, and the cargo configuration every build of it
+/// reads (a target's flags).
+const WORKSPACE_FILES: [&str; 4] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+];
 
 /// The directory of a lockfile's vendored sources inside its provisioning.
 const VENDOR_SOURCES: &str = "sources";

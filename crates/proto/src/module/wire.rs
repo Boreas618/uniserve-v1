@@ -117,6 +117,7 @@ impl TryFrom<wire::ModuleSet> for ModuleSet {
             policy: policy.try_into()?,
             kernels,
             programs: BTreeMap::new(),
+            processing: None,
         })
     }
 }
@@ -219,6 +220,7 @@ mod tests {
                 ),
             ]),
             programs: Default::default(),
+            processing: None,
         };
 
         let wire = wire::ModuleSet::from(&modules);

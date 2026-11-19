@@ -189,11 +189,11 @@ impl Arrival {
         if !kind.writes_prefix_cache() {
             return work_tokens(kind, 0, view.next_tokens);
         }
-        // The view already states the further of the two cursors: the prompt
-        // tokens the runtime computed, or the prefix the cache held when the
-        // request was admitted. Adding them counts the cached prefix twice,
-        // which pushes the start past the end of a prompt that reused one — the
-        // chunk is then zero for ever and the request is never named.
+        // The view already states where the chunk starts: the prompt tokens
+        // the runtime computed, or for a waiting request the prefix the cache
+        // holds for it. Adding the cached prefix counts it twice, which pushes
+        // the start past the end of a prompt that reused one — the chunk is
+        // then zero for ever and the request is never named.
         let start = view.prefilled_tokens;
         let share = shares.tokens().min(shares.prefill());
         let chunk = prefill_chunk(

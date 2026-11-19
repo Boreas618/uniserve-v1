@@ -7,8 +7,10 @@
 //! representation from the checkpoint's quantization declaration: a dense weight is one `gemm`;
 //! a calibrated NVFP4 weight is an activation encoder and a packed product whose `alpha` is the
 //! weight's tensor scale times the activation's; a per-tensor FP8 weight is an activation
-//! encoder at its static scale and an `fp8_gemm` over the codes; a weight-only NVFP4 weight
-//! is the dense matrix its fields state, decoded at load. A dense weight the declaration
+//! encoder at its static scale and an `fp8_gemm` over the codes; a block-scaled FP8 weight is an
+//! MXFP8 matrix, its activation encoded per 32 elements on every call and multiplied by
+//! `mxfp8_gemm` ([`functional::linear_mxfp8`]); a weight-only NVFP4 weight is the dense matrix
+//! its fields state, decoded at load. A dense weight the declaration
 //! converts ([`Scheme::DynamicFp8`], [`Scheme::DynamicNvfp4`]) is encoded at load into the
 //! same FP8 or NVFP4 product, and its activation's factors are measured on every call
 //! ([`functional::dynamic_scales`]) instead of published. The caller names the module, its
@@ -38,12 +40,13 @@
 
 use ops::dynamic_scale::{FP8_RANGE, NVFP4_RANGE};
 use ops::fp4::{BLOCK_ELEMENTS, GemmDescriptor, PRODUCT_TILE, ScaleLayout};
+use ops::mx::GemmDescriptor as MxGemmDescriptor;
 use tensor::{DType, Module, Shape, Tensor};
 
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
 use crate::functional::{self, WeightOrder};
-use crate::quantization::{Nvfp4Weight, Scheme};
+use crate::quantization::{Mxfp8Part, Mxfp8Weight, Nvfp4Weight, Scheme};
 use crate::var_builder::VarBuilder;
 use crate::weights::{WeightLayout, WeightSource, extents};
 
@@ -98,6 +101,9 @@ enum Weight {
     },
     /// A per-tensor FP8 matrix, `[n, k]` E4M3, and how its activation is scaled.
     Fp8 { weight: Tensor, scaling: Scaling },
+    /// An MXFP8 matrix, `[n, k]` E4M3 with its scales in the product's layout; its activation
+    /// is encoded per call.
+    Mxfp8(Mxfp8Weight),
 }
 
 /// Where an encoded projection's two factors come from: the encoder's multiplier of the
@@ -272,6 +278,39 @@ impl Linear {
                 Ok(linear)
             }
 
+            Scheme::Mxfp8 => {
+                // This rank's rows (a column share) or columns (a row share) of the matrix.
+                let (rows, columns) = match parallel {
+                    Parallel::None => (0..outputs, 0..inputs),
+                    Parallel::Column(split) => {
+                        let first = u64::from(split.rank()) * local_out;
+                        (first..first + local_out, 0..inputs)
+                    }
+                    Parallel::Row(split) => {
+                        let first = u64::from(split.rank()) * local_in;
+                        (0..outputs, first..first + local_in)
+                    }
+                };
+                let weight = vb.loader().mxfp8(
+                    &name,
+                    &[Mxfp8Part {
+                        weight: name.clone(),
+                        rows,
+                        columns,
+                    }],
+                    MxGemmDescriptor::SCALE_LAYOUT,
+                )?;
+                let bias = load_bias(&vb, config.bias, local_out, parallel)?;
+
+                Self::build(Weight::Mxfp8(weight), bias, local_in, local_out, reduce)
+            }
+
+            Scheme::Mxfp4 => Err(Error::weight(
+                &name,
+                "is an MXFP4 matrix, which the routed experts' products read; a projection \
+                 multiplies dense, FP8, MXFP8 and NVFP4 weights",
+            )),
+
             Scheme::Nvfp4 => {
                 let mut linear = Self::load_nvfp4(&vb, inputs, local_in, local_out, parallel)?;
 
@@ -317,6 +356,32 @@ impl Linear {
                 .collect()
         };
         let merged = vb.name(&modules.join("+"));
+
+        // Block-scaled weights merge as one MXFP8 matrix: codes and scales stacked alike.
+        if vb.pp(modules[0]).scheme("weight") == Scheme::Mxfp8 {
+            if bias {
+                return Err(Error::weight(
+                    &merged,
+                    "a merged MXFP8 projection adds no bias: no block-scaled export states one"
+                        .to_owned(),
+                ));
+            }
+            let stacked: Vec<Mxfp8Part> = parts("weight")
+                .into_iter()
+                .zip(outputs)
+                .map(|(weight, rows)| Mxfp8Part {
+                    weight,
+                    rows: 0..u64::from(*rows),
+                    columns: 0..u64::from(inputs),
+                })
+                .collect();
+            let weight = vb.loader().mxfp8(
+                &format!("{merged}.weight"),
+                &stacked,
+                MxGemmDescriptor::SCALE_LAYOUT,
+            )?;
+            return Self::build(Weight::Mxfp8(weight), None, u64::from(inputs), total, 1);
+        }
 
         let shape = extents(&[total, u64::from(inputs)]);
         let weight = vb.load(
@@ -596,6 +661,8 @@ impl Linear {
 
         let activation = match &weight {
             Weight::Dense { weight, .. } => Some(weight.dtype()),
+            // The MXFP8 product reads and writes BF16 rows whatever the builder pins.
+            Weight::Mxfp8(_) => Some(DType::BF16),
             Weight::Nvfp4 { .. } | Weight::Fp8 { .. } => None,
         };
 
@@ -626,6 +693,7 @@ impl Linear {
         match &self.weight {
             Weight::Dense { weight, .. } | Weight::Fp8 { weight, .. } => weight,
             Weight::Nvfp4 { values, .. } => values,
+            Weight::Mxfp8(weight) => &weight.codes,
         }
     }
 
@@ -666,6 +734,7 @@ impl Linear {
                 let (encode, alpha) = scaling.factors(x)?;
                 functional::linear_fp8(x, weight, bias, &encode, &alpha)?
             }
+            Weight::Mxfp8(weight) => functional::linear_mxfp8(x, weight, bias)?,
         };
 
         if self.reduce > 1 {

@@ -21,7 +21,7 @@
 //! `step mod layers` of a speculation's steps (`qwen3_5_mtp.py:172-173`). A forward here is
 //! not told its step, so a checkpoint of more than one layer is refused at load.
 
-use nn::family::{CacheShape, SequenceSplit, StateShape, TextPlacement};
+use nn::family::{CacheField, SequenceSplit, StateShape, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, Rotary};
 use nn::{D, Drafter, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder, functional};
 
@@ -45,7 +45,8 @@ pub struct Mtp {
     hidden: usize,
     /// The query heads of this rank's attention, whose decode counters a forward clears.
     q_heads: u32,
-    cache: CacheShape,
+    /// The draft cache's keys and values of the one layer.
+    cache: Vec<CacheField>,
     /// The module's path in the checkpoint, which names its profiler range.
     path: String,
 }
@@ -112,20 +113,19 @@ impl Mtp {
             norm: RmsNorm::load(&norm, vb.pp("norm"))?,
             hidden: text.hidden_size as usize,
             q_heads: text.local_heads(placement.tensor)?.0,
-            cache: CacheShape {
-                layers: 1,
-                kv_heads: text.local_heads(placement.tensor)?.1,
-                head_dim: text.head_dim,
-                index_keys: None,
-            },
+            cache: CacheField::keys_and_values(
+                1,
+                text.local_heads(placement.tensor)?.1,
+                text.head_dim,
+            ),
             path: vb.path().to_owned(),
         })
     }
 }
 
 impl Drafter for Mtp {
-    fn cache(&self) -> CacheShape {
-        self.cache
+    fn cache(&self) -> Vec<CacheField> {
+        self.cache.clone()
     }
 
     /// The layers attend over the draft cache alone and keep no state.

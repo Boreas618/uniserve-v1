@@ -81,7 +81,13 @@ fn values_key(layout: ValueLayout) -> WeightLayout {
 /// `bytes` holds `experts` matrices of `rows` rows by `row_bytes` bytes, one after another, and
 /// the caller holds `rows` to whole blocks of the arrangement; a plain arrangement is the bytes
 /// unchanged.
-fn arrange(layout: ValueLayout, bytes: &[u8], experts: u64, rows: u64, row_bytes: u64) -> Vec<u8> {
+pub(super) fn arrange(
+    layout: ValueLayout,
+    bytes: &[u8],
+    experts: u64,
+    rows: u64,
+    row_bytes: u64,
+) -> Vec<u8> {
     if layout == ValueLayout::Plain {
         return bytes.to_vec();
     }

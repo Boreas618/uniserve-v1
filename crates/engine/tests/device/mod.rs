@@ -84,10 +84,21 @@ pub(crate) fn weight(
         .iter()
         .flat_map(|value| value.to_ne_bytes())
         .collect();
+    tensor(stream, &bytes, dims, DType::F32)
+}
+
+/// Device memory holding `bytes`, and the retained tensor of `dims` and `dtype` over it. The
+/// allocation is the tensor's storage: the caller keeps it for as long as the tensor is used.
+pub(crate) fn tensor(
+    stream: &Stream,
+    bytes: &[u8],
+    dims: &[usize],
+    dtype: DType,
+) -> Outcome<(DeviceAllocation, Tensor)> {
     let allocation = DeviceAllocation::linear(DEVICE, bytes.len())?;
 
     // SAFETY: the destination is the allocation just made for exactly these bytes, the source
-    // is this vector, and the stream is waited for before the vector goes.
+    // is the caller's slice, and the stream is waited for before the slice can go.
     unsafe {
         platform::memcpy_async(
             allocation.address(),
@@ -101,7 +112,7 @@ pub(crate) fn weight(
     let tensor = ops::retained(
         allocation.address(),
         dims,
-        DType::F32,
+        dtype,
         &ops::cuda(DEVICE.0 as usize),
     )?;
     Ok((allocation, tensor))

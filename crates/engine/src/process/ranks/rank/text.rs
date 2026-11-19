@@ -56,8 +56,9 @@ impl ModelRunner {
     /// The scratch page set is one set the rows of a paired forward share,
     /// `ceil(T / page) + R` pages for the `T` tokens and `R` rows of the largest bucket
     /// (`CausalLmRunner::scratch_pages`); a batch whose rows' contexts need more is not
-    /// compared. A model that keeps a recurrent state has no scratch state to advance and
-    /// computes no paired forward.
+    /// compared. A model that keeps a recurrent state has no scratch state to advance, and one
+    /// whose cache keeps a sliding window no scratch pages of the window's pool, so neither
+    /// computes a paired forward.
     ///
     /// # Errors
     ///
@@ -69,7 +70,8 @@ impl ModelRunner {
         units: u32,
     ) -> Result<CausalLmConfig> {
         let drafts = self.engine_config().speculative.num_draft_tokens;
-        let scratch_pages = if model.state_layers().is_empty() {
+        let scratch_pages = if model.state_layers().is_empty() && layout.window_groups().is_empty()
+        {
             CausalLmRunner::scratch_pages(&self.buckets, self.page_tokens())
         } else {
             0
@@ -123,6 +125,7 @@ impl ModelRunner {
         member: Option<Member>,
         kernels: &Generation,
     ) -> Result<CausalLmRunner> {
+        let collects = model.expert_collectives();
         let mut runner = {
             let cache = service::lock(cache);
             let state = state.map(|state| service::lock(state));
@@ -147,10 +150,15 @@ impl ModelRunner {
         }
 
         // The group's one axis is its whole width: a rank's split is its position among the
-        // group's ranks. The meta contexts take the split alone: a profile run issues no
-        // collective.
+        // group's ranks. A member of an expert union whose model collects along the union states
+        // the union's axis after it (`nn::family::EXPERT_AXIS`). The meta contexts take the
+        // splits alone: a profile run issues no collective.
         let (rank, ranks) = super::split(self.mapping.position as usize, self.world_size);
-        crate::runner::Forward::graphs(&runner).set_group(group, rank, ranks)?;
+        let mut axes = vec![(group, rank, ranks)];
+        if let Some(member) = member.as_ref().filter(|_| collects) {
+            axes.push(member.axis());
+        }
+        crate::runner::Forward::graphs(&runner).set_axes(axes)?;
 
         // A serving runner counts the tokens each routed layer's experts take. The ranks of a
         // tensor group route the same tokens, so its first rank counts them for the group;

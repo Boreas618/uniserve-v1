@@ -1,8 +1,8 @@
 //! The Qwen chat families, as request processing serves them.
 //!
-//! The daemon serves a family by what is stated here and links no model: how the family's
-//! checkpoints declare it, the output formats they write and, for a family that takes images,
-//! the processor that sizes their blocks ([`crate::qwen_vl`]). The model crate (`qwen3`) holds
+//! The processing program serves a family by what is stated here: how the family's checkpoints
+//! declare it, the output formats they write and, for a family that takes images, the processor
+//! that sizes their blocks ([`crate::qwen_vl`]). The model crate (`qwen3`) holds
 //! the numerical side of the families it loads and refers to these values.
 //!
 //! Every Qwen chat model since Qwen3 delimits its reasoning with `<think>` and `</think>`.

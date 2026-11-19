@@ -40,13 +40,14 @@
 
 use std::collections::HashMap;
 
-use models::qwen4_exp::causal_lm::{coordinates, ngram_context, token_columns};
+use models::qwen4_exp::causal_lm::{coordinates, token_columns};
 use models::qwen4_exp::{Config, DecoderLayer, HyperConnection, NgramEmbedding, PleLayer};
-use nn::family::{Family, TextModel, TextPlacement};
+use nn::family::{Family, INDEX_KEY, KEY, TextModel, TextPlacement, VALUE};
 use nn::modules::Rotary;
+use nn::modules::ngram_context;
 use nn::quantization::Declaration;
 use nn::{
-    CpuWeights, DType, Device, KvCache, KvPlanes, Phase, RecurrentState, Shape, Split, Tensor,
+    CpuWeights, DType, Device, KvCache, KvPlane, Phase, RecurrentState, Shape, Split, Tensor,
     TokenBatch, VarBuilder, WeightLoader, functional,
 };
 use nn_testing::text::{self, WORKSPACE_BYTES};
@@ -245,7 +246,6 @@ fn request_batch(requests: usize, seen: u32, ngram: Option<(Tensor, Tensor)>) ->
         Phase::Decode,
         [
             Tensor::new(positions.as_slice(), &Device::Cpu).expect("positions"),
-            column(&vec![0; tokens]),
             column(&vec![seen; requests]),
             column(&offsets),
             column(&offsets[1..].iter().map(|end| end - 1).collect::<Vec<_>>()),
@@ -324,15 +324,7 @@ fn the_ngram_ids_are_the_references() {
                     before.to_dtype(DType::U32).unwrap(),
                 )),
             );
-            let slots = Tensor::zeros((requests, STEP), DType::U32, &Device::Cpu).unwrap();
-            let state = request_state(
-                &vec![54; requests],
-                &slots,
-                &column(&vec![1; requests]),
-                Vec::new(),
-            );
-            let columns = token_columns(&batch, &state).expect("the token columns");
-            let context = ngram_context(&batch, &columns).expect("the n-gram context");
+            let context = ngram_context(&batch).expect("the n-gram context");
 
             let rows: Vec<Vec<i64>> = embedding.ids(&context).unwrap().to_vec2().unwrap();
             let expected: Vec<Vec<i64>> = vector(&vectors, &name("ids")).to_vec2().unwrap();
@@ -404,8 +396,7 @@ fn the_ple_layer_is_the_references() {
                 &vector(&vectors, &name("num_accepted")),
                 vec![vec![window.clone()]],
             );
-            let columns = token_columns(&batch, &state).expect("the token columns");
-            let context = ngram_context(&batch, &columns).expect("the n-gram context");
+            let context = ngram_context(&batch).expect("the n-gram context");
 
             let added = layer
                 .forward(&folded, &context, &batch, &state, 0)
@@ -574,7 +565,6 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
         Phase::Decode,
         [
             Tensor::new(signed.as_slice(), &Device::Cpu).unwrap(),
-            column(&slots),
             column(
                 &positions
                     .iter()
@@ -597,16 +587,24 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
         block_tables: column(&row_tables)
             .reshape((tokens, table[0].len()))
             .unwrap(),
+        slot_mapping: column(&slots),
+        starts: None,
         page_size: PAGE_TOKENS,
-        layers: vec![KvPlanes {
-            key,
-            value: vector(vectors, &name("value")).copy().unwrap(),
-            key_initialized: flags.clone(),
-            value_initialized: flags,
-            key_scale: None,
-            value_scale: None,
-            index_keys: Some(vector(vectors, &name("index_keys")).copy().unwrap()),
-        }],
+        planes: vec![
+            plane(KEY, 1, key, &flags),
+            plane(
+                VALUE,
+                1,
+                vector(vectors, &name("value")).copy().unwrap(),
+                &flags,
+            ),
+            plane(
+                INDEX_KEY,
+                4,
+                index_keys(vector(vectors, &name("index_keys")).copy().unwrap()),
+                &flags,
+            ),
+        ],
         workspace: zeros(Shape::from(1 << 10), DType::U8),
     };
 
@@ -648,6 +646,28 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
     }
 }
 
+/// Layer 0's plane of `field`, one entry per `ratio` tokens, over `entries`, with the flags
+/// `flags`: the one attention layer of a reference step, which owns its entries.
+fn plane(field: &'static str, ratio: u32, entries: Tensor, flags: &Tensor) -> KvPlane {
+    KvPlane {
+        field,
+        layer: 0,
+        readers: Vec::new(),
+        ratio,
+        entries,
+        initialized: flags.clone(),
+        scale: None,
+    }
+}
+
+/// The reference's index keys, `[pages, groups, width]`, as a plane of the [`INDEX_KEY`] field
+/// holds them: one key of one row an entry, `[pages, groups, 1, width]`.
+fn index_keys(keys: Tensor) -> Tensor {
+    let (pages, groups, width) = keys.dims3().expect("[pages, groups, width] index keys");
+    keys.reshape((pages, groups, 1, width))
+        .expect("the index keys as a plane")
+}
+
 /// Asserts the caches and the ring a step of an attention layer left against the reference's
 /// under `prefix`: the keys and values of the step's tokens, the compressed keys of the groups
 /// it completed and the raw keys of its rows.
@@ -660,13 +680,13 @@ fn assert_attention_caches(vectors: &HashMap<String, Tensor>, prefix: &str, step
         );
         rows_of(&plane.reshape((leading, width)).unwrap(), rows)
     };
-    let planes = &step.cache.layers[0];
+    let entries = |field| &step.cache.plane(field, 0).unwrap().entries;
 
     // `qsa_moe_layer/TASK.md`: new K/V rows 10%. The reference's caches are E4M3 where these
     // are BF16, and so are its compressed keys (module documentation).
     for (what, plane, reference) in [
-        ("new keys", &planes.key, expected("key")),
-        ("new values", &planes.value, expected("value")),
+        ("new keys", entries(KEY), expected("key")),
+        ("new values", entries(VALUE), expected("value")),
     ] {
         assert_within(
             what,
@@ -676,10 +696,9 @@ fn assert_attention_caches(vectors: &HashMap<String, Tensor>, prefix: &str, step
         );
     }
     if !step.completed.is_empty() {
-        let index_keys = planes.index_keys.as_ref().expect("index keys");
         assert_within(
             "compressed keys",
-            &rows(index_keys, &step.completed),
+            &rows(entries(INDEX_KEY), &step.completed),
             &rows(&expected("index_keys"), &step.completed),
             0.1,
         );
@@ -920,7 +939,6 @@ fn the_drafter_over_two_rounds_is_the_references() {
             Phase::Decode,
             [
                 pick(&step.batch.positions),
-                pick(&step.batch.slot_mapping),
                 pick(&step.batch.seq_lens),
                 column(&offsets),
                 column(&offsets[..picked.len()]),
@@ -931,6 +949,7 @@ fn the_drafter_over_two_rounds_is_the_references() {
         );
         let cache = KvCache {
             block_tables: pick(&step.cache.block_tables),
+            slot_mapping: pick(&step.cache.slot_mapping),
             ..step.cache.clone()
         };
 
@@ -1000,29 +1019,25 @@ fn the_indexed_functions_are_vllms_references() {
     let named = |tensor: &str| vector(&vectors, &format!("vllm.{tensor}"));
     let table = named("page_table").to_dtype(DType::U32).unwrap();
     let rows = named("rows").to_dtype(DType::U32).unwrap();
-    let plane = |tensor: Tensor, index_keys: Option<Tensor>| KvPlanes {
-        key: tensor.clone(),
-        value: tensor,
-        key_initialized: zeros(Shape::from(1), DType::U8),
-        value_initialized: zeros(Shape::from(1), DType::U8),
-        key_scale: None,
-        value_scale: None,
-        index_keys,
-    };
+    let unflagged = zeros(Shape::from(1), DType::U8);
 
     // Scores: two heads of sixteen elements against each visible key.
-    let scores_cache = KvCache {
-        block_tables: table.clone(),
-        page_size: 64,
-        layers: vec![plane(
-            zeros(Shape::from(1), DType::F32),
-            Some(named("index_keys")),
-        )],
-        workspace: zeros(Shape::from(1), DType::U8),
+    let index_keys = named("index_keys");
+    let keys = functional::Plane {
+        records: &index_keys,
+        table: &table,
+        format: functional::Format::Bf16,
+        layout: functional::Layout::Page,
     };
     let visible = named("visible").to_dtype(DType::U32).unwrap();
-    let scores = functional::index_scores(&named("index_query"), &scores_cache, 0, &rows, &visible)
-        .expect("the scores");
+    let scores = functional::index_scores(
+        &named("index_query"),
+        keys,
+        &rows,
+        &visible,
+        functional::IndexScoring::default(),
+    )
+    .expect("the scores");
     assert_close(
         "index scores",
         &scores,
@@ -1048,12 +1063,15 @@ fn the_indexed_functions_are_vllms_references() {
 
     // Attention over a selection: a softmax over at most eleven scores of eight terms each
     // and the weighted sum of the values.
-    let mut attention_plane = plane(named("key"), None);
-    attention_plane.value = named("value");
     let attention_cache = KvCache {
         block_tables: table,
+        slot_mapping: column(&[]),
+        starts: None,
         page_size: 16,
-        layers: vec![attention_plane],
+        planes: vec![
+            plane(KEY, 1, named("key"), &unflagged),
+            plane(VALUE, 1, named("value"), &unflagged),
+        ],
         workspace: zeros(Shape::from(1), DType::U8),
     };
     let attended = functional::indexed_attention(
@@ -1174,13 +1192,15 @@ impl Memory {
         };
 
         Self {
-            cache: KvCache::allocate(
-                model.cache(),
+            cache: text::cache(
+                &model.cache(),
                 model.dtype(),
-                PAGES,
-                PAGE_TOKENS,
-                zeros(Shape::from((1, 1)), DType::U32),
-                zeros(Shape::from(WORKSPACE_BYTES), DType::U8),
+                (PAGES, PAGE_TOKENS),
+                (
+                    zeros(Shape::from((1, 1)), DType::U32),
+                    column(&[]),
+                    zeros(Shape::from(WORKSPACE_BYTES), DType::U8),
+                ),
                 |shape, dtype| Ok(zeros(shape, dtype)),
             )
             .expect("a cache group"),
@@ -1258,7 +1278,6 @@ fn forward(
         phase,
         [
             Tensor::new(positions.as_slice(), &Device::Cpu).unwrap(),
-            column(&slots),
             column(&seq_lens),
             column(&offsets),
             column(&last),
@@ -1269,6 +1288,7 @@ fn forward(
     );
     let cache = KvCache {
         block_tables: column(&tables).reshape((rows, row_pages)).unwrap(),
+        slot_mapping: column(&slots),
         ..memory.cache.clone()
     };
     let state = text::state(
@@ -1453,24 +1473,18 @@ fn a_prefill_and_verify_steps_compute_what_one_prefill_does() {
             .collect();
 
         for layer in 0..config.attention_layers() as usize {
-            let (ours, theirs) = (&stepped.cache.layers[layer], &whole.cache.layers[layer]);
             let planes = [
-                ("keys", &ours.key, &theirs.key, &token_rows),
-                ("values", &ours.value, &theirs.value, &token_rows),
-                (
-                    "index keys",
-                    ours.index_keys.as_ref().unwrap(),
-                    theirs.index_keys.as_ref().unwrap(),
-                    &group_rows,
-                ),
+                ("keys", KEY, &token_rows),
+                ("values", VALUE, &token_rows),
+                ("index keys", INDEX_KEY, &group_rows),
             ];
-            for (what, ours, theirs, rows) in planes {
-                assert_close(
-                    what,
-                    &rows_of(&flat(ours), rows),
-                    &rows_of(&flat(theirs), rows),
-                    bound,
-                );
+            for (what, field, rows) in planes {
+                let entries = |memory: &Memory| {
+                    let plane = memory.cache.plane(field, layer as u32).unwrap();
+                    flat(&plane.entries)
+                };
+                let (ours, theirs) = (entries(&stepped), entries(&whole));
+                assert_close(what, &rows_of(&ours, rows), &rows_of(&theirs, rows), bound);
             }
 
             let ring = linear_layers + ple_layers + layer;

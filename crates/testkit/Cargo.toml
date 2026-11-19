@@ -23,6 +23,9 @@ engine.workspace = true
 nn-testing.workspace = true
 # The tiny checkpoints the engine's tests serve (`models::fixtures`).
 models = { workspace = true, features = ["fixtures"] }
+# The cache fields a fake engine's model states (`pools::cache`), and the stub family the
+# engine's cache tests serve (`fields`).
+nn.workspace = true
 # The FFmpeg libraries the engine links through the media crate; `build.rs` reads their
 # directories from its `links` metadata for the test executables' run path.
 media.workspace = true
@@ -54,7 +57,6 @@ arc-swap.workspace = true
 # The media pipeline a video deployment's groups state: MiniMax-H3's, as its family declares it
 # (`nn::pipeline`).
 models.workspace = true
-nn.workspace = true
 # The policy modules the scheduler's suite states as WebAssembly text.
 wasmtime = { workspace = true, features = ["wat"] }
 

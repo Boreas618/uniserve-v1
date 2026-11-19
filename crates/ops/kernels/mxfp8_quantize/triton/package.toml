@@ -1,0 +1,35 @@
+# The mxfp8_quantize operator's Triton backend.
+#
+# One program encodes a run of whole 128-element words of one row into E4M3 codes
+# and their UE8M0 scales (`ops::mx`); the row count comes from the grid, so one
+# module serves every row count. The scales are written as the row's own byte
+# table (`linear`, what a routed product that gathers its tokens reads) or as
+# DeepGEMM's MN-major packed words (`packed_mn_major`, what `mxfp8_gemm` reads),
+# whose column stride is the row count padded to four.
+
+op = "mxfp8_quantize"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+[launch]
+kernel = "_mxfp8_quantize_kernel"
+warps = 4
+
+[launch.types]
+input_ptr = { pointer = "input" }
+codes_ptr = "*fp8e4nv"
+scales_ptr = { field = "layout", values = { linear = "*u8", packed_mn_major = "*u32" } }
+rows = "i64"
+input_row_stride = "i64"
+
+[launch.constants]
+COLUMNS = { field = "columns" }
+BLOCK = { field = "block" }
+PACKED = { field = "layout", values = { linear = false, packed_mn_major = true } }
+
+# `input_bf16_columns_5120_layout_packed_mn_major_block_1024_pdl_false`.
+[[kernel.descriptors]]
+dimensions = { input = ["bf16", "f16"], columns = { multiple = 128 }, layout = ["linear", "packed_mn_major"], block = { min = 128, power_of_two = true }, pdl = ["true", "false"] }

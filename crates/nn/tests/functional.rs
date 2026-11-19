@@ -250,7 +250,7 @@ fn act_and_mul_multiplies_the_activation_of_the_gate_by_the_value() {
         }),
     ] {
         let product =
-            functional::act_and_mul(&gate_tensor, &value_tensor, activation, false).unwrap();
+            functional::act_and_mul(&gate_tensor, &value_tensor, activation, false, None).unwrap();
         assert_close(&values(&product), &reference(formula), F32_TOLERANCE);
     }
 }
@@ -280,7 +280,7 @@ fn the_stepwise_product_rounds_the_activation_first() {
     );
 
     let product = |stepwise| {
-        values(&functional::act_and_mul(&gate, &value, Activation::Silu, stepwise).unwrap())
+        values(&functional::act_and_mul(&gate, &value, Activation::Silu, stepwise, None).unwrap())
     };
     assert_eq!(product(false), bf16(&fused));
     assert_eq!(product(true), bf16(&stepwise));
@@ -752,13 +752,14 @@ fn the_gated_activations_state_their_kernels_and_their_row_strides() {
         let value = meta((3, 16), DType::BF16);
         let packed = meta((3, 32), DType::BF16);
 
-        let fused = functional::act_and_mul(&gate, &value, Activation::Silu, false)?;
+        let fused = functional::act_and_mul(&gate, &value, Activation::Silu, false, None)?;
         // The halves of one packed projection stride over the packed row.
         let halves = functional::act_and_mul(
             &packed.narrow(1, 16, 16)?,
             &packed.narrow(1, 0, 16)?,
             Activation::GeluTanh,
             true,
+            None,
         )?;
         let swiglu = functional::swiglu(&value, &gate, None, None)?;
         let value_first = functional::value_first_swiglu(&packed, None)?;
@@ -787,12 +788,12 @@ fn the_gated_activations_state_their_kernels_and_their_row_strides() {
             (
                 "act_and_mul",
                 "dtype_bf16_width_16_block_4096_activation_silu_gate_stride_16_value_stride_16_\
-                 wide_false_pdl_false_stepwise_false"
+                 wide_false_pdl_false_stepwise_false_clamp_false"
             ),
             (
                 "act_and_mul",
                 "dtype_bf16_width_16_block_4096_activation_gelu_tanh_gate_stride_32_\
-                 value_stride_32_wide_false_pdl_false_stepwise_true"
+                 value_stride_32_wide_false_pdl_false_stepwise_true_clamp_false"
             ),
             (
                 "swiglu",
@@ -823,6 +824,7 @@ fn a_packed_projection_goes_wide_on_its_input_span() {
                 &packed.narrow(1, 0, width)?,
                 Activation::Silu,
                 true,
+                None,
             )
         });
         output.unwrap();

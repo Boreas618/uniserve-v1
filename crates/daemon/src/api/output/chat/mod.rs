@@ -2,19 +2,18 @@
 //! into the blocks an assistant message consists of
 //! (`proto::handoff::assistant_block::Block`).
 //!
-//! A request's [`ChatParser`] holds the reasoning and tool-call parsers of the
-//! formats its model family's chat profile names. The request's
-//! `OutputProcessor` feeds decoded text through it and frames the resulting
-//! assistant events as response deltas (`structured`).
+//! A request's [`ChatParser`] is its instance of the epoch's processing program,
+//! which holds the reasoning and tool-call parsers of the formats its model
+//! family writes. The request's `OutputProcessor` feeds decoded text through it
+//! and frames the resulting assistant events as response deltas (`structured`).
 //!
-//! The daemon's `chat_config.reasoning_parser` setting decides whether
-//! reasoning sections become reasoning blocks.
+//! The daemon's `chat_config.reasoning_parser` setting, which the program's
+//! binding reads, decides whether reasoning sections become reasoning blocks.
 
 pub use parser::{AssistantEvent, ChatParser};
 
 mod parser;
 pub mod structured;
-mod tool;
 
 use serde::{Deserialize, Serialize};
 

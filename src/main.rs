@@ -95,13 +95,6 @@ fn host_targets() -> std::result::Result<Vec<build_server::Target>, String> {
         .collect()
 }
 
-/// What the daemon serves: the request-processing side of every model family
-/// (`processing::FAMILIES`), which is all the daemon reads of a model. The
-/// engine executable registers the numerical side of the same families.
-pub(crate) fn served() -> Result<processing::Registry> {
-    Ok(processing::Registry::new(processing::FAMILIES)?)
-}
-
 /// The daemon's Tokio runtime: one worker per CPU this process may run on (Tokio's default,
 /// the available parallelism, which follows the process's CPU affinity and cgroup quota), at
 /// Tokio's default thread stack.

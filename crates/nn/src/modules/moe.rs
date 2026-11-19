@@ -1,10 +1,16 @@
 //! The mixture-of-experts block of a transformer layer, and the shared expert beside it.
 //!
 //! ```text
-//! scores  = router(x)                                  one score per expert, replicated
-//! routes  = topk_softmax(scores)                       each token's `top` experts and weights
+//! logits  = router(x)                                  one logit per expert, replicated
+//! routes  = topk_softmax(logits)                       each token's `top` experts and weights
 //! out[t]  = Σ_routes weight · down_e(act(gate_e(x[t])) · up_e(x[t]))
 //! ```
+//!
+//! The router's scores are a softmax over the experts or each expert's `sqrt(softplus(logit))`
+//! ([`MoEConfig::scoring`]); a selection bias, when the checkpoint states one, decides which
+//! experts a token takes without entering their weights, and a routed scaling factor multiplies
+//! every weight ([`functional::Routing`]). The experts' gated activation may be clamped
+//! ([`MoEConfig::limit`]: `act(min(gate, L)) · clamp(up, ±L)`).
 //!
 //! [`MoE`] is one module because its parts only make sense together: the routing decides which
 //! expert's rows a token's routes go to, the sort turns that into the tiles the grouped products
@@ -22,6 +28,9 @@
 //! are read as packed stacks, which the representation the model's loader resolved decides
 //! from the first held expert's weight; a calibrated export stores every packed expert as its
 //! own module (ModelOpt's unified export), which is the one layout packed experts are read in.
+//! A block-scaled export's MXFP4 experts are read the same way, into the stacks the MXFP4
+//! products read ([`functional::gather_gemm_mxfp4`]); a rank holds whole MXFP4 experts, every
+//! slot or its window of a tensor group that holds whole experts or of an expert group.
 //!
 //! ## Where the experts sit
 //!
@@ -64,15 +73,16 @@ use ops::moe::exchange;
 use ops::moe::grouped::{
     GatherGemmNvfp4Descriptor, RouteGemmNvfp4Descriptor, WEIGHT_SCALE_LAYOUT, packed_width,
 };
+use ops::moe::mxfp4::{self, GatherGemmMxfp4Descriptor, RouteGemmMxfp4Descriptor};
 use tensor::{DType, Device, Shape, Tensor};
 
 use crate::capability::ExpertExchange;
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
-use crate::functional::{self, Activation, WeightOrder};
+use crate::functional::{self, Activation, Routing, Scoring, WeightOrder};
 use crate::modules::linear::{Linear, LinearConfig, Parallel};
 use crate::modules::mlp::{Mlp, MlpConfig};
-use crate::quantization::{Nvfp4Share, Nvfp4Stack, Scheme};
+use crate::quantization::{Mxfp4Stack, Nvfp4Share, Nvfp4Stack, Scheme};
 use crate::var_builder::VarBuilder;
 use crate::weights::{PartBlock, WeightLayout, WeightSource, extents};
 
@@ -96,8 +106,23 @@ pub struct MoEConfig {
     pub activation: Activation,
     /// Whether the selected experts' weights are renormalized to sum to one.
     pub renormalize: bool,
+    /// How the router's logits become the scores it selects experts by and weighs them with.
+    pub scoring: Scoring,
+    /// The name of the router module's `[experts]` FP32 selection bias, added to the scores the
+    /// selection is made by and to no weight, when the checkpoint states one.
+    pub selection_bias: Option<&'static str>,
+    /// The factor every route's weight is multiplied by after the renormalization, when the
+    /// model states one (a routed scaling factor).
+    pub routed_scale: Option<f32>,
+    /// The clamp of the experts' gated activation, `act(min(gate, L)) · clamp(up, ±L)`, when the
+    /// model states one.
+    pub limit: Option<f32>,
     /// The router's module name.
     pub router: &'static str,
+    /// The element type the router's product reads its weight and the rows in and states its
+    /// logits in: the activations' when `None`, or a wider one (F32) for a model whose reference
+    /// routes in it, so near ties select as the reference's do.
+    pub router_dtype: Option<DType>,
     /// The name of the module list that holds the experts: expert `e`'s projections are
     /// `<list>.<e>.<up|gate|down>`.
     pub list: &'static str,
@@ -157,6 +182,13 @@ enum Experts {
         up_gate: Nvfp4Stack,
         down: Nvfp4Stack,
     },
+    /// MXFP4 stacks in the arrangement the MXFP4 routed products read, with each held expert's
+    /// `[local]` F32 clamp of the gated activation.
+    Mxfp4 {
+        up_gate: Mxfp4Stack,
+        down: Mxfp4Stack,
+        limit: Tensor,
+    },
     /// Calibrated NVFP4 stacks in the arrangement an expert group's fused exchange reads (each
     /// gate block before its up block), with the three `[local]` FP32 tables its kernel
     /// multiplies in.
@@ -186,6 +218,12 @@ pub struct MoE {
     intermediate: u32,
     activation: Activation,
     renormalize: bool,
+    scoring: Scoring,
+    /// `[experts]` F32: the router's selection bias, when the checkpoint states one.
+    selection_bias: Option<Tensor>,
+    /// `[experts]` F32: each expert's weight factor, the routed scaling factor, when the model
+    /// states one.
+    routed_scale: Option<Tensor>,
     /// The slots this rank holds; every slot when no group divides them.
     local: Range<u32>,
     /// Whether an expert group divides the slots, so the forward runs through its exchange.
@@ -276,12 +314,40 @@ impl MoE {
         let window = &config.order[local.start as usize..local.end as usize];
         let intermediate = config.intermediate / split.size();
 
+        let router_vb = match config.router_dtype {
+            Some(dtype) => vb.pp(config.router).to_dtype(dtype),
+            None => vb.pp(config.router),
+        };
         let router = Linear::new(
-            vb.pp(config.router)
-                .get((experts as usize, config.hidden as usize), "weight")?,
+            router_vb.get((experts as usize, config.hidden as usize), "weight")?,
             None,
             WeightOrder::NxK,
         )?;
+
+        // The router's selection bias and its routed scaling factor, one F32 per expert.
+        let selection_bias = config
+            .selection_bias
+            .map(|name| {
+                vb.pp(config.router)
+                    .to_dtype(DType::F32)
+                    .get(experts as usize, name)
+            })
+            .transpose()?;
+        let routed_scale = config
+            .routed_scale
+            .map(|factor| -> Result<Tensor> {
+                let bytes: Vec<u8> = std::iter::repeat_n(factor.to_le_bytes(), experts as usize)
+                    .flatten()
+                    .collect();
+                vb.loader().constant(
+                    &vb.name("routed_scale"),
+                    DType::F32,
+                    &Shape::from(experts as usize),
+                    &bytes,
+                    PRODUCER,
+                )
+            })
+            .transpose()?;
 
         // The slot of each expert: the inverse of the order, as the top-k reads it.
         let slots = Tensor::arange(0_u32, experts, &Device::Cpu)?;
@@ -292,8 +358,28 @@ impl MoE {
         )?;
 
         let list = vb.pp(config.list);
-        let packed = list.pp(window[0]).pp(config.up).scheme("weight") == Scheme::Nvfp4;
-        let (stacks, intermediate) = if packed {
+        let scheme = list.pp(window[0]).pp(config.up).scheme("weight");
+        if config.limit.is_some() && scheme != Scheme::Mxfp4 {
+            return Err(refuse(
+                "a clamped gated activation is fused into the MXFP4 products alone, and these \
+                 experts are not MXFP4"
+                    .to_owned(),
+            ));
+        }
+        let packed = scheme == Scheme::Nvfp4;
+        let (stacks, intermediate) = if scheme == Scheme::Mxfp4 {
+            // A rank holds whole MXFP4 experts: its window of the slots, over a tensor group that
+            // holds whole experts or over an expert group, whose exchange carries BF16 rows.
+            if split.size() > 1 || config.activation != Activation::Silu {
+                return Err(refuse(format!(
+                    "MXFP4 experts are held whole and gated by SiLU: a tensor group of {} \
+                     splitting each expert's width, or {} gating, has no MXFP4 product",
+                    split.size(),
+                    config.activation
+                )));
+            }
+            (Self::load_mxfp4(config, &vb, window)?, intermediate)
+        } else if packed {
             // A rank's block of packed experts: whole bytes and block scales of every row,
             // padded to the width the products compute over.
             let padded = packed_width(intermediate);
@@ -333,6 +419,9 @@ impl MoE {
             intermediate,
             activation: config.activation,
             renormalize: config.renormalize,
+            scoring: config.scoring,
+            selection_bias,
+            routed_scale,
             local,
             exchanges: exchange.size() > 1,
             // The tensor group sums its ranks' outputs whether it divides each expert's width
@@ -569,6 +658,70 @@ impl MoE {
         })
     }
 
+    /// The MXFP4 stacks of the experts `window` names, whole, in the arrangement the MXFP4
+    /// routed products read, with the `[held]` F32 table of the gated activation's clamp: the
+    /// block's limit, or none (an infinite one) without it.
+    fn load_mxfp4(config: &MoEConfig, vb: &VarBuilder<'_, '_>, window: &[u32]) -> Result<Experts> {
+        let loader = vb.loader();
+        let list = vb.pp(config.list);
+        let up_gate = loader.mxfp4_stack(
+            &vb.name("experts.up_gate"),
+            list.path(),
+            &[config.up, config.gate],
+            window,
+            (
+                GatherGemmMxfp4Descriptor::WEIGHT_VALUES,
+                mxfp4::WEIGHT_SCALE_LAYOUT,
+            ),
+        )?;
+        let down = loader.mxfp4_stack(
+            &vb.name("experts.down"),
+            list.path(),
+            &[config.down],
+            window,
+            (
+                RouteGemmMxfp4Descriptor::WEIGHT_VALUES,
+                mxfp4::WEIGHT_SCALE_LAYOUT,
+            ),
+        )?;
+
+        let (hidden, intermediate) = (config.hidden as usize, config.intermediate as usize);
+        let held = window.len();
+        if up_gate.codes.dims() != [held, 2 * intermediate, hidden / 2]
+            || down.codes.dims() != [held, hidden, intermediate / 2]
+        {
+            return Err(Error::weight(
+                vb.path(),
+                format!(
+                    "the MXFP4 stacks are {:?} and {:?}, [{held}, {}, {}] and [{held}, {hidden}, \
+                     {}] expected",
+                    up_gate.codes.dims(),
+                    down.codes.dims(),
+                    2 * intermediate,
+                    hidden / 2,
+                    intermediate / 2
+                ),
+            ));
+        }
+
+        let limit = config.limit.unwrap_or(f32::INFINITY);
+        let bytes: Vec<u8> = std::iter::repeat_n(limit.to_le_bytes(), held)
+            .flatten()
+            .collect();
+        let limit = loader.constant(
+            &vb.name("experts.limit"),
+            DType::F32,
+            &Shape::from(held),
+            &bytes,
+            PRODUCER,
+        )?;
+        Ok(Experts::Mxfp4 {
+            up_gate,
+            down,
+            limit,
+        })
+    }
+
     /// Checks that packed stacks of `held` experts of `intermediate` columns are the extents
     /// and types the block's config states and its products read.
     fn check_packed(
@@ -659,11 +812,21 @@ impl MoE {
         live_tokens: Option<&Tensor>,
         load: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
+        let routing = Routing {
+            top: self.top,
+            scoring: self.scoring,
+            renormalize: self.renormalize,
+            bias: self.selection_bias.as_ref(),
+            scale: self.routed_scale.as_ref(),
+        };
+        // A router held in a wider type than the rows reads them widened.
+        let rows = match self.router.weight().dtype() {
+            dtype if dtype != x.dtype() => x.to_dtype(dtype)?,
+            _ => x.clone(),
+        };
         functional::topk_softmax(
-            &self.router.forward(x)?,
-            self.top,
-            self.renormalize,
-            None,
+            &self.router.forward(&rows)?,
+            &routing,
             Some(&self.map),
             live_tokens,
             load,
@@ -784,6 +947,16 @@ impl MoE {
                 functional::route_gemm_nvfp4(&gated, down, &maps, self.top)?
             }
 
+            Experts::Mxfp4 {
+                up_gate,
+                down,
+                limit,
+            } => {
+                let (codes, scales) =
+                    functional::gather_gemm_mxfp4(x, up_gate, limit, &maps, self.top)?;
+                functional::route_gemm_mxfp4(&codes, &scales, down, &maps, self.top)?
+            }
+
             Experts::Fused { .. } => {
                 return Err(Error::Unsupported(
                     "MoE: experts loaded for an expert group's fused exchange run through it"
@@ -875,7 +1048,7 @@ impl MoE {
         live_tokens: Option<&Tensor>,
         exchange: &ExpertExchange,
     ) -> Result<Tensor> {
-        let (up_gate, down) = match &self.experts {
+        let stacks = match &self.experts {
             Experts::Fused {
                 up_gate,
                 down,
@@ -896,12 +1069,12 @@ impl MoE {
                 );
             }
 
-            Experts::Dense { up_gate, down } if !exchange.fused => (up_gate, down),
+            stacks @ (Experts::Dense { .. } | Experts::Mxfp4 { .. }) if !exchange.fused => stacks,
 
             _ => {
                 return Err(Error::Unsupported(
-                    "MoE: a fused exchange runs packed experts and an exchange of two launches \
-                     dense ones, and this block holds the other"
+                    "MoE: a fused exchange runs packed NVFP4 experts and an exchange of two \
+                     launches dense or MXFP4 ones, and this block holds the other"
                         .to_owned(),
                 ));
             }
@@ -936,10 +1109,35 @@ impl MoE {
             )?;
 
             // 3. Both products over this rank's stacks, and each received row's sum left where
-            //    the combine returns it from.
-            let gated =
-                functional::gather_gemm(&states, up_gate, &received_ids, &maps, self.activation)?;
-            let products = functional::route_gemm(&gated, down, &received_ids, &maps)?;
+            //    the combine returns it from. The rows arrive in the activation type; MXFP4
+            //    products encode them as their first product reads them.
+            let products = match stacks {
+                Experts::Dense { up_gate, down } => {
+                    let gated = functional::gather_gemm(
+                        &states,
+                        up_gate,
+                        &received_ids,
+                        &maps,
+                        self.activation,
+                    )?;
+                    functional::route_gemm(&gated, down, &received_ids, &maps)?
+                }
+                Experts::Mxfp4 {
+                    up_gate,
+                    down,
+                    limit,
+                } => {
+                    let (codes, scales) =
+                        functional::gather_gemm_mxfp4(&states, up_gate, limit, &maps, self.top)?;
+                    functional::route_gemm_mxfp4(&codes, &scales, down, &maps, self.top)?
+                }
+                // Matched out before the dispatch: a fused exchange returned above.
+                Experts::Packed { .. } | Experts::Fused { .. } => {
+                    return Err(Error::Unsupported(
+                        "MoE: packed NVFP4 experts run through a fused exchange".to_owned(),
+                    ));
+                }
+            };
             functional::moe_unpermute(
                 &products,
                 &maps,
@@ -961,54 +1159,63 @@ pub struct SharedExpertConfig {
     pub mlp: MlpConfig,
     /// The name of the module that holds the MLP.
     pub module: &'static str,
-    /// The name of the `[1, hidden]` gate projection beside it.
-    pub gate: &'static str,
+    /// The name of the `[1, hidden]` gate projection beside it, when the expert is gated; an
+    /// ungated expert's output is added whole.
+    pub gate: Option<&'static str>,
 }
 
 /// A shared expert beside a routed block: a gated MLP every token passes through, its output
-/// scaled by the sigmoid of a per-token gate and added into the routed output (Qwen2-MoE,
-/// Qwen3-Next, Qwen3.5):
+/// added into the routed output, scaled by the sigmoid of a per-token gate when the checkpoint
+/// states one (Qwen2-MoE, Qwen3-Next, Qwen3.5) and whole when it does not (DeepSeek):
 ///
 /// ```text
-/// routed ← routed + sigmoid(gate · x) · mlp(x)
+/// routed ← routed + sigmoid(gate · x) · mlp(x)        gated
+/// routed ← routed + mlp(x)                            ungated
 /// ```
 pub struct SharedExpert {
     mlp: Mlp,
-    gate: Linear,
+    gate: Option<Linear>,
 }
 
 impl SharedExpert {
-    /// The shared expert the modules under `vb` state, at the MLP's split. The gate is
-    /// replicated: one logit per token on every rank.
+    /// The shared expert the modules under `vb` state, at the MLP's split. The gate, when there
+    /// is one, is replicated: one logit per token on every rank.
     ///
     /// # Errors
     ///
     /// A module the loader refuses or a split the MLP refuses.
     pub fn load(config: &SharedExpertConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
         let mlp = Mlp::load(&config.mlp, vb.pp(config.module))?;
-        let gate = Linear::load(
-            &LinearConfig {
-                inputs: config.mlp.hidden,
-                outputs: 1,
-                bias: false,
-                parallel: Parallel::None,
-            },
-            vb.pp(config.gate),
-        )?;
+        let gate = config
+            .gate
+            .map(|gate| {
+                Linear::load(
+                    &LinearConfig {
+                        inputs: config.mlp.hidden,
+                        outputs: 1,
+                        bias: false,
+                        parallel: Parallel::None,
+                    },
+                    vb.pp(gate),
+                )
+            })
+            .transpose()?;
 
         Ok(Self { mlp, gate })
     }
 
-    /// Adds the shared expert's gated output of `x [..., hidden]` into `routed`, the routed
-    /// block's output of the same rows, in place, and returns it.
+    /// Adds the shared expert's output of `x [..., hidden]`, gated when it has a gate, into
+    /// `routed`, the routed block's output of the same rows, and returns the sum: in place for a
+    /// gated expert, a new tensor for an ungated one.
     ///
     /// # Errors
     ///
     /// Rows a projection refuses, or an operator's refusal.
     pub fn forward(&self, x: &Tensor, routed: Tensor) -> Result<Tensor> {
         let update = self.mlp.forward(x)?;
-        let gate = self.gate.forward(x)?;
-
-        functional::sigmoid_gated_add_(routed, &update, &gate)
+        match &self.gate {
+            Some(gate) => functional::sigmoid_gated_add_(routed, &update, &gate.forward(x)?),
+            None => Ok((routed + update)?),
+        }
     }
 }
