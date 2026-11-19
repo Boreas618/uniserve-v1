@@ -13,10 +13,12 @@
 //! Build Server and its clients of one release speak it.
 //!
 //! [`Client`] is the half the daemon and the main process use: the daemon
-//! calls [`Client::prepare`] before a deployment starts and before an update,
-//! and the main process calls [`Client::resolve`] when it starts and when a
-//! package revision changes, and [`Client::cover`] to learn which installed package
-//! builds each descriptor key of an operator the deployment does not name.
+//! reads the operators of the engine revision it fixes a module set over from
+//! [`Client::list`] and calls [`Client::prepare`] before a deployment starts
+//! and before an update, and the main process calls [`Client::resolve`] when it
+//! starts and when a package revision changes, and [`Client::cover`] to learn
+//! which installed package builds each descriptor key of an operator the
+//! deployment does not name.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -149,6 +151,21 @@ pub struct Module {
     /// Where the module's package revision came from: the commit of the tree
     /// it was installed from and whether that tree was clean.
     pub origin: Origin,
+}
+
+/// One installed package revision, as `list` names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageEntry {
+    pub package: Package,
+    /// Where the revision's sources came from: the commit of the tree it was installed from and
+    /// whether that tree was clean.
+    pub origin: Origin,
+    /// The operators whose kernel packages the revision launches, in its vocabulary's order
+    /// (`Manifest::operators`): an engine revision's, which the daemon fixes an epoch's kernel
+    /// packages over; empty for every other package.
+    pub operators: Vec<String>,
+    /// The revision's committed modules.
+    pub modules: Vec<ModuleEntry>,
 }
 
 /// One module of an installed package, as `list` names it.
@@ -610,8 +627,9 @@ impl Client {
         }
     }
 
-    /// Lists every installed package revision with its origin and its modules.
-    pub fn list(&mut self) -> Result<Vec<(Package, Origin, Vec<ModuleEntry>)>> {
+    /// Lists every installed package revision with its origin, the operators it launches and its
+    /// modules.
+    pub fn list(&mut self) -> Result<Vec<PackageEntry>> {
         self.connection.deliver(&wire::Request {
             request: Some(wire::request::Request::List(wire::List {})),
         })?;
@@ -639,18 +657,19 @@ impl Client {
                             )?,
                         });
                     }
-                    packages.push((
-                        Package {
+                    packages.push(PackageEntry {
+                        package: Package {
                             op: package.op,
                             backend: package.backend,
                             revision: package.revision,
                         },
-                        Origin {
+                        origin: Origin {
                             commit: package.commit,
                             clean: package.clean,
                         },
+                        operators: package.operators,
                         modules,
-                    ));
+                    });
                 }
                 Ok(packages)
             }

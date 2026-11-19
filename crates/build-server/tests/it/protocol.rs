@@ -304,6 +304,7 @@ fn a_listing_names_the_packages_revisions_and_modules() {
                             revision: 2,
                             commit: Some("4c36250e65".into()),
                             clean: false,
+                            operators: Vec::new(),
                             modules: vec![wire::ModuleEntry {
                                 target: arch().to_string(),
                                 descriptor: "dtype_bf16".into(),
@@ -321,7 +322,8 @@ fn a_listing_names_the_packages_revisions_and_modules() {
 
     let listing = client.list().unwrap();
     assert_eq!(listing.len(), 1);
-    let (package, origin, modules) = &listing[0];
+    let entry = &listing[0];
+    let (package, origin, modules) = (&entry.package, &entry.origin, &entry.modules);
     assert_eq!(package.revision, 2);
     assert_eq!(origin.commit.as_deref(), Some("4c36250e65"));
     assert!(!origin.clean);
@@ -467,6 +469,7 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
                             revision: 1,
                             commit: None,
                             clean: false,
+                            operators: Vec::new(),
                             modules: vec![wire::ModuleEntry {
                                 target: Target::wasm().to_string(),
                                 descriptor: "default".into(),
@@ -483,7 +486,7 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
     });
 
     let listing = client.list().unwrap();
-    assert_eq!(listing[0].2[0].form, ModuleForm::Wasm);
+    assert_eq!(listing[0].modules[0].form, ModuleForm::Wasm);
 }
 
 #[test]
@@ -500,6 +503,7 @@ fn a_listed_module_of_an_unknown_form_is_refused_rather_than_guessed() {
                             revision: 1,
                             commit: None,
                             clean: false,
+                            operators: Vec::new(),
                             modules: vec![wire::ModuleEntry {
                                 target: arch().to_string(),
                                 descriptor: "dtype_bf16".into(),

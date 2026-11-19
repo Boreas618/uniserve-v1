@@ -44,7 +44,10 @@ fn listed(server: &BuildServer) -> Vec<String> {
         .list()
         .unwrap()
         .into_iter()
-        .map(|(package, _, _)| format!("{} {} {}", package.op, package.backend, package.revision))
+        .map(|entry| {
+            let package = entry.package;
+            format!("{} {} {}", package.op, package.backend, package.revision)
+        })
         .collect()
 }
 
@@ -70,7 +73,7 @@ fn the_server_opens_over_the_packages_installed_before_it_started() {
     let server = BuildServer::open(&config).unwrap();
     let listing = server.list().unwrap();
     assert_eq!(listed(&server), ["rms_norm vendor 1", "rms_norm vendor 2"]);
-    assert!(listing.iter().all(|(_, _, modules)| modules.is_empty()));
+    assert!(listing.iter().all(|entry| entry.modules.is_empty()));
 }
 
 #[test]
@@ -139,7 +142,13 @@ fn a_revision_records_the_commit_it_was_installed_from() {
             .list()
             .unwrap()
             .into_iter()
-            .map(|(package, origin, _)| (package.revision, origin.commit, origin.clean))
+            .map(|entry| {
+                (
+                    entry.package.revision,
+                    entry.origin.commit,
+                    entry.origin.clean,
+                )
+            })
             .collect::<Vec<_>>()
     };
 
@@ -512,7 +521,7 @@ fn an_installed_policy_holds_its_workspace_and_lists_its_one_wasm_module() {
 
     let listing = server.list().unwrap();
     assert_eq!(listing.len(), 1);
-    let (package, _, modules) = &listing[0];
+    let (package, modules) = (&listing[0].package, &listing[0].modules);
     assert_eq!(package.op, "program");
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0].target, Target::wasm());

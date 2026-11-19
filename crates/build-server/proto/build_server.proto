@@ -294,6 +294,11 @@ message PackageEntry {
   // The revision's origin, as `ResolveResponse` states it.
   optional string commit = 5;
   bool clean = 6;
+  // The operators whose kernel packages the revision launches, in the order of
+  // the vocabulary its snapshot holds (`operators` of its manifest): an engine
+  // revision's, over which the daemon fixes an epoch's kernel packages; empty
+  // for every other package.
+  repeated string operators = 7;
 }
 
 message ListResponse {

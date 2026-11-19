@@ -96,9 +96,9 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     );
 
     let listing = client.list().unwrap();
-    assert_eq!(listing[0].2.len(), 1);
-    assert_eq!(listing[0].2[0].descriptor, PAGE_64);
-    assert_eq!(listing[0].2[0].form, ModuleForm::Cubin);
+    assert_eq!(listing[0].modules.len(), 1);
+    assert_eq!(listing[0].modules[0].descriptor, PAGE_64);
+    assert_eq!(listing[0].modules[0].form, ModuleForm::Cubin);
 
     drop(client);
     serving.stop().unwrap();
@@ -277,12 +277,13 @@ fn served(store: &Path, cache: &Path) -> Vec<(u32, Vec<String>)> {
         .list()
         .unwrap()
         .into_iter()
-        .map(|(package, _, modules)| {
-            let keys = modules
+        .map(|entry| {
+            let keys = entry
+                .modules
                 .into_iter()
                 .map(|module| module.descriptor)
                 .collect();
-            (package.revision, keys)
+            (entry.package.revision, keys)
         })
         .collect()
 }

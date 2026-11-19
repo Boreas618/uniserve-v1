@@ -30,8 +30,8 @@ fn a_server_serves_an_installation_and_a_listing_over_its_socket() {
 
     let listing = client.list().unwrap();
     assert_eq!(listing.len(), 1);
-    assert_eq!(listing[0].0, installed);
-    assert!(listing[0].2.is_empty(), "installing builds nothing");
+    assert_eq!(listing[0].package, installed);
+    assert!(listing[0].modules.is_empty(), "installing builds nothing");
 
     drop(client);
     serving.stop().unwrap();

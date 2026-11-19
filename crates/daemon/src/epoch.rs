@@ -1019,8 +1019,9 @@ mod tests {
         );
     }
 
-    /// A table that names an operator this build lacks, an empty key, or one backend of an
-    /// operator at two revisions is refused before anything is selected.
+    /// A table that pins an empty key or one backend of an operator at two revisions is refused
+    /// before anything is selected. Which operators it may name is the engine revision's to state
+    /// when the apply fixes the set (`tests/it/modules.rs`).
     #[test]
     fn a_table_the_build_server_could_not_select_by_is_refused() {
         let stated = crate::config::Stated::from_paths(Vec::new());
@@ -1045,7 +1046,6 @@ mod tests {
             None
         );
         for (op, pins, named) in [
-            ("no_such_operator", vec![("a", "trtllm@7")], "no operator"),
             ("paged_attention", vec![("", "trtllm@7")], "empty"),
             (
                 "paged_attention",
