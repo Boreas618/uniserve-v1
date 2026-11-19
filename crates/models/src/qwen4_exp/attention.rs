@@ -261,6 +261,7 @@ impl IndexedAttention {
             &attended.reshape((tokens * heads, head_dim))?,
             Activation::Sigmoid,
             false,
+            None,
         )?;
         self.o_proj
             .forward(&gated.reshape((tokens, heads * head_dim))?)

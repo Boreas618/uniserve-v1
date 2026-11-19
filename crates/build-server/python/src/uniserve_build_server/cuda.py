@@ -101,6 +101,12 @@ class Unit:
     extended_lambda: bool = False
     register_usage_level: int | None = None
     suppressed: Sequence[int] = ()
+    #: Whether the unit's device code is the target's architecture-specific
+    #: instruction set alone (``tcgen05`` behind a guard of the architecture
+    #: number only, as DeepGEMM's kernels are): it is compiled into the target's
+    #: own code, and the portable PTX nvcc's ``-arch`` also embeds and verifies,
+    #: which cannot hold that code, is not generated.
+    specific: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,12 +199,20 @@ def compile_command(
     """The nvcc command compiling ``unit`` into ``output``: an object, or a
     cubin when ``cubin`` is set.
     """  # noqa: D205
+    # The target's own code and no portable PTX: `sm_100a` is compiled from
+    # `compute_100a` into `sm_100a` alone.
+    virtual = str(request.target).replace("sm_", "compute_")
+    architecture = (
+        f"--generate-code=arch={virtual},code={request.target}"
+        if unit.specific
+        else f"-arch={request.target}"
+    )
     command = [
         request.toolchain.require_cuda().nvcc,
         "-cubin" if cubin else "-c",
         OPTIMIZATION,
         f"-std={unit.standard}",
-        f"-arch={request.target}",
+        architecture,
     ]
     if unit.cuda:
         command += ["-x", "cu"]

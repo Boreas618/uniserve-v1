@@ -174,6 +174,7 @@ mod launch;
 pub mod logits;
 pub mod modulation;
 pub mod moe;
+pub mod mx;
 pub mod noise;
 pub mod norm;
 pub mod op;

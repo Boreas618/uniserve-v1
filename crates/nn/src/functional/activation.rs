@@ -86,28 +86,45 @@ pub(super) fn activate(x: &Tensor, activation: Activation) -> Result<Tensor> {
 /// `gate` and `value` are `[rows, width]` of one element type, each with unit stride along its
 /// rows: two tensors, or the two halves of one packed projection as strided views of its rows.
 /// With `stepwise` the activation is rounded into the element type before the product, the
-/// eager expression's rounding; without it the product rounds once. The result is a contiguous
-/// `[rows, width]` tensor of the same element type.
+/// eager expression's rounding; without it the product rounds once. With a `limit` `L` the
+/// halves are clamped first, as DeepSeek's SwiGLU clamps them:
+///
+/// ```text
+/// out = act(min(gate, L)) · clamp(value, −L, L)
+/// ```
+///
+/// The result is a contiguous `[rows, width]` tensor of the same element type.
 ///
 /// # Errors
 ///
-/// When the halves differ in shape or element type, or the operator refuses its arguments.
+/// When the halves differ in shape or element type, the limit is not a positive number, or the
+/// operator refuses its arguments.
 pub fn act_and_mul(
     gate: &Tensor,
     value: &Tensor,
     activation: Activation,
     stepwise: bool,
+    limit: Option<f32>,
 ) -> Result<Tensor> {
     const OWNER: &str = ActAndMulCall::OWNER;
 
     columns(OWNER, gate)?;
     same_rows(OWNER, "value half", value, gate)?;
+    if let Some(limit) = limit
+        && !(limit.is_finite() && limit > 0.0)
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!("a clamp limit of {limit} is not a positive number"),
+        ));
+    }
 
     compute(ActAndMulCall {
         gate,
         value,
         activation,
         stepwise,
+        limit,
     })
 }
 
@@ -117,6 +134,7 @@ struct ActAndMulCall<'t> {
     value: &'t Tensor,
     activation: Activation,
     stepwise: bool,
+    limit: Option<f32>,
 }
 
 impl ActAndMulCall<'_> {
@@ -132,11 +150,18 @@ impl Fused for ActAndMulCall<'_> {
 
     fn cpu(self) -> Result<Tensor> {
         let Self { gate, value, .. } = self;
-        let mut activated = activate(&gate.to_dtype(DType::F32)?, self.activation)?;
+        let (mut wide_gate, mut wide_value) =
+            (gate.to_dtype(DType::F32)?, value.to_dtype(DType::F32)?);
+        if let Some(limit) = self.limit {
+            let limit = f64::from(limit);
+            wide_gate = wide_gate.minimum(limit)?;
+            wide_value = wide_value.clamp(-limit, limit)?;
+        }
+        let mut activated = activate(&wide_gate, self.activation)?;
         if self.stepwise {
             activated = activated.to_dtype(gate.dtype())?.to_dtype(DType::F32)?;
         }
-        let product = (activated * value.to_dtype(DType::F32)?)?;
+        let product = (activated * wide_value)?;
 
         Ok(product.to_dtype(gate.dtype())?)
     }
@@ -149,10 +174,12 @@ impl Fused for ActAndMulCall<'_> {
             gate: ops::operand(&gate_rows)?,
             value: ops::operand(&value_rows)?,
             out: ops::operand(&out)?,
+            // An unclamped module reads no limit.
+            limit: self.limit.unwrap_or(0.0),
         };
 
         ops::launch::<ActAndMul>(
-            &ActAndMulDescriptor::of(&args, self.activation, self.stepwise)?,
+            &ActAndMulDescriptor::of(&args, self.activation, self.stepwise, self.limit.is_some())?,
             args,
         )?;
         like_rows(out, gate)

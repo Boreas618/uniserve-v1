@@ -60,6 +60,13 @@ struct FirstMatrix {
   // The first matrix's tactics are sized by the tokens it gathers.
   static int32_t rows(Call const* call) { return static_cast<int32_t>(call->tokens); }
 
+  // The module's activations and output are BF16 rows.
+  static char const* refused_types(Call const* call) {
+    return call->dtype == UNISERVE_DTYPE_BF16
+               ? nullptr
+               : "the product's output is compiled as bf16 and this module is the bf16 one";
+  }
+
   // Every token gathers its `top` routes.
   static bool counts(Call const* call) {
     return call->tokens > 0 && call->routes >= call->tokens * call->top;

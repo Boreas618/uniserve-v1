@@ -282,10 +282,14 @@ pub mod operator {
     pub const GATHER_GEMM_NVFP4: &str = "gather_gemm_nvfp4";
     pub const ROUTE_GEMM: &str = "route_gemm";
     pub const ROUTE_GEMM_NVFP4: &str = "route_gemm_nvfp4";
+    pub const GATHER_GEMM_MXFP4: &str = "gather_gemm_mxfp4";
+    pub const ROUTE_GEMM_MXFP4: &str = "route_gemm_mxfp4";
     pub const TOPK_SOFTMAX: &str = "topk_softmax";
     pub const MOE_SORT: &str = "moe_sort";
     pub const NVFP4_QUANTIZE: &str = "nvfp4_quantize";
     pub const NVFP4_GEMM: &str = "nvfp4_gemm";
+    pub const MXFP8_QUANTIZE: &str = "mxfp8_quantize";
+    pub const MXFP8_GEMM: &str = "mxfp8_gemm";
     pub const FP8_GEMM: &str = "fp8_gemm";
     pub const FP8_QUANTIZE: &str = "fp8_quantize";
     pub const DYNAMIC_SCALE: &str = "dynamic_scale";
@@ -381,10 +385,14 @@ pub mod operator {
         GATHER_GEMM_NVFP4,
         ROUTE_GEMM,
         ROUTE_GEMM_NVFP4,
+        GATHER_GEMM_MXFP4,
+        ROUTE_GEMM_MXFP4,
         TOPK_SOFTMAX,
         MOE_SORT,
         NVFP4_QUANTIZE,
         NVFP4_GEMM,
+        MXFP8_QUANTIZE,
+        MXFP8_GEMM,
         FP8_GEMM,
         FP8_QUANTIZE,
         DYNAMIC_SCALE,
@@ -432,9 +440,13 @@ pub mod operator {
         // The product reads an activation `fp8_quantize` encoded, and its factor from device
         // memory, where a measured scale is written by a launch before it.
         (FP8_GEMM, 2),
+        // The gated activation clamps its halves at a limit the call passes, after the value's
+        // row stride.
+        (ACT_AND_MUL, 2),
         // The router reads the batch's live count and adds each live route into the expert
-        // load, two pointers after the map.
-        (TOPK_SOFTMAX, 2),
+        // load, two pointers after the map; its descriptor states its scoring and whether it reads
+        // a selection bias, a pointer after the scale's kind.
+        (TOPK_SOFTMAX, 3),
     ];
 
     /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.

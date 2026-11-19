@@ -4,11 +4,11 @@ The module of the descriptor below (``module.cubin`` and its
 ``metadata.json``, resolved at the session's Build Server for the session's
 device) is held to its own build: the compile constants the metadata records
 (``definitions``: the expert count and the top-k the kernel derives its
-iterations and its butterfly from) are the descriptor's, and the twelve words
-of its signature are the operator's, in order and by kind; the fourth pointer
-is the scale, which a ``scale_none`` module still declares as one, and the
-last three the expert map, the live count and the expert load, which the
-operator passes null without them. A module
+iterations and its butterfly from) are the descriptor's, and the fifteen words
+of its signature are the operator's, in order and by kind; the second pointer
+is the scale, which a ``scale_none`` module still declares as one, the third
+the selection bias, and the last three the expert map, the live count and the
+expert load, which the operator passes null without them. A module
 built for another descriptor fails here, the observable form of the kernel's
 `__trap()`.
 
@@ -36,6 +36,13 @@ reversed and a live count below the rows, the counters must hold, per logical
 expert, twice the picks of the live rows: the count is by the expert's own id,
 whatever slot the map names, and a row past the live count adds nothing.
 
+**The sqrt-softplus router** (DeepSeek-V4.1-Flash's: 384 experts, top 6, a
+selection bias and a routed scaling factor of 1.5 as the per-expert scale) is
+held to the reference router: each score ``sqrt(softplus(logit))``, the picks
+the top of ``score + bias`` with ties in ascending id, the weights the picks'
+unbiased scores over their sum plus ``1e-20``, times the scale. Its bound is
+the operator's, over a reduction of the picks.
+
 The module half and the launch need a module built for a device; the pinned
 reference's own tie rule is checked on the host.
 """
@@ -53,13 +60,34 @@ DESCRIPTOR = {
     "scores": "bf16",
     "experts": 128,
     "top": 8,
+    "scoring": "softmax",
     "renormalize": True,
+    "bias": False,
     "scale": "none",
 }
-KEY = "_".join(
-    f"{field}_{str(value).lower()}" for field, value in DESCRIPTOR.items()
-)
+
+
+def key_of(descriptor):
+    """A descriptor's key, its fields in the package's dimension order."""
+    return "_".join(
+        f"{field}_{str(value).lower()}" for field, value in descriptor.items()
+    )
+
+
+KEY = key_of(DESCRIPTOR)
 EXPERTS, TOP = DESCRIPTOR["experts"], DESCRIPTOR["top"]
+
+#: DeepSeek-V4.1-Flash's router.
+SQRT_SOFTPLUS = {
+    "scores": "bf16",
+    "experts": 384,
+    "top": 6,
+    "scoring": "sqrtsoftplus",
+    "renormalize": True,
+    "bias": True,
+    "scale": "f32",
+}
+ROUTED_SCALE = 1.5
 
 #: The fixed input's rows, and the elements between them: the vocabulary.
 ROWS, ROW_STRIDE = 4, DESCRIPTOR["experts"]
@@ -75,6 +103,7 @@ SIGNATURE = (
     ("renormalize", "i32"),
     ("scale", "pointer"),
     ("scale_kind", "i32"),
+    ("bias", "pointer"),
     ("ids", "pointer"),
     ("weights", "pointer"),
     ("map", "pointer"),
@@ -220,7 +249,16 @@ def test_the_modules_signature_is_the_operators(metadata):
 
 
 def launch(
-    module, metadata, device, scores, mapping=None, live=None, load=None
+    module,
+    metadata,
+    device,
+    scores,
+    mapping=None,
+    live=None,
+    load=None,
+    descriptor=DESCRIPTOR,
+    scale=None,
+    bias=None,
 ):
     """Launch the module's cubin on `scores`; answers the ids and the weights
     it wrote, on the host.
@@ -229,8 +267,9 @@ def launch(
     torch's current stream, one token per warp of the block the metadata
     states. `mapping`, when given, is the device's logical-to-physical expert
     map; `live` the count of leading live rows; `load` the device's int64
-    counters the live routes add into. The operator passes a null pointer for
-    each it is not given.
+    counters the live routes add into; `scale` and `bias` the per-expert FP32
+    factors and selection bias of a descriptor that reads them. The operator
+    passes a null pointer for each it is not given.
     """  # noqa: D205
     from cuda.bindings import driver
 
@@ -242,11 +281,16 @@ def launch(
         return values[0] if len(values) == 1 else values
 
     rows, row_stride = scores.shape
-    dtype = DESCRIPTOR["scores"]
+    dtype, top = descriptor["scores"], descriptor["top"]
     device_scores = scores.to(TORCH_TYPES[dtype]).contiguous().to(device)
-    ids = torch.full((rows, TOP), -1, dtype=torch.int32, device=device)
-    weights = torch.zeros((rows, TOP), dtype=torch.float32, device=device)
-    scale = torch.zeros(16, dtype=torch.float32, device=device)
+    ids = torch.full((rows, top), -1, dtype=torch.int32, device=device)
+    weights = torch.zeros((rows, top), dtype=torch.float32, device=device)
+    scale = (
+        torch.zeros(16, dtype=torch.float32, device=device)
+        if scale is None
+        else scale.to(device)
+    )
+    device_bias = None if bias is None else bias.to(device)
     device_map = None if mapping is None else mapping.to(device)
     device_live = (
         None
@@ -267,11 +311,12 @@ def launch(
             KINDS[dtype],
             row_stride,
             rows,
-            EXPERTS,
-            TOP,
-            int(DESCRIPTOR["renormalize"]),
+            descriptor["experts"],
+            top,
+            int(descriptor["renormalize"]),
             scale.data_ptr(),
-            KINDS[DESCRIPTOR["scale"]],
+            KINDS[descriptor["scale"]],
+            0 if device_bias is None else device_bias.data_ptr(),
             ids.data_ptr(),
             weights.data_ptr(),
             0 if device_map is None else device_map.data_ptr(),
@@ -288,6 +333,7 @@ def launch(
             ctypes.c_int32,
             ctypes.c_void_p,
             ctypes.c_int32,
+            ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
@@ -411,4 +457,83 @@ def test_the_load_counts_each_live_route_by_its_logical_expert(
             f"{expected[expert].item()}"
             for expert in wrong
         )
+    )
+
+
+def sqrt_softplus_case(rows):
+    """Logits of a router's spread, a selection bias that moves picks, and the
+    reference's routing of them, in FP64: ids by `score + bias` with ties in
+    ascending id, weights the unbiased scores renormalized and scaled.
+    """  # noqa: D205
+    experts, top = SQRT_SOFTPLUS["experts"], SQRT_SOFTPLUS["top"]
+    generator = torch.Generator().manual_seed(4101)
+    logits = (torch.randn(rows, experts, generator=generator) * 2.0).to(
+        torch.bfloat16
+    )
+    bias = (torch.randn(experts, generator=generator) * 0.05).float()
+    exact = logits.double()
+    # PyTorch's softplus: the logit itself above its threshold of 20.
+    softplus = torch.where(exact > 20.0, exact, torch.log1p(torch.exp(exact)))
+    scores = softplus.sqrt()
+    keys = scores + bias.double()
+    ids = torch.empty(rows, top, dtype=torch.int64)
+    weights = torch.empty(rows, top, dtype=torch.float64)
+    for row in range(rows):
+        order = sorted(range(experts), key=lambda e: (-keys[row, e].item(), e))[
+            :top
+        ]
+        ids[row] = torch.tensor(order)
+        picked = scores[row][order]
+        weights[row] = picked / (picked.sum() + 1e-20) * ROUTED_SCALE
+    return logits, bias, ids, weights
+
+
+@pytest.mark.gpu
+def test_a_sqrt_softplus_router_selects_by_the_bias_and_weighs_without_it(
+    kernel_module, torch_device
+):
+    directory = kernel_module("topk_softmax", "nvcc", key_of(SQRT_SOFTPLUS))
+    metadata = json.loads((directory / "metadata.json").read_text())
+    assert metadata["definitions"]["UNISERVE_SQRTSOFTPLUS"] == 1
+    rows = 64
+    logits, bias, ids, weights = sqrt_softplus_case(rows)
+    scale = torch.full((SQRT_SOFTPLUS["experts"],), ROUTED_SCALE)
+
+    got_ids, got_weights = launch(
+        directory,
+        metadata,
+        torch_device,
+        logits,
+        descriptor=SQRT_SOFTPLUS,
+        scale=scale,
+        bias=bias,
+    )
+
+    wrong = got_ids.long() != ids
+    assert not bool(wrong.any()), (
+        f"{int(wrong.sum())} of {ids.numel()} picks are not the reference's; "
+        f"first at {wrong.nonzero()[0].tolist()}"
+    )
+    # A score is its own expert's, so the reduction is the picks' sum; the
+    # softplus, the root and the scale cost one rounding each.
+    terms = SQRT_SOFTPLUS["top"] * UNIT_ROUNDOFF
+    bound = terms / (1.0 - terms) + 4.0 * UNIT_ROUNDOFF
+    outside = ~((got_weights.double() - weights).abs() <= bound * weights.abs())
+    assert not bool(outside.any()), (
+        f"{int(outside.sum())} of {weights.numel()} weights outside "
+        f"{bound:.3e} relative; first at {outside.nonzero()[0].tolist()}"
+    )
+    # The bias moved picks: without it some token takes another expert.
+    unbiased = (
+        torch.where(
+            logits.double() > 20.0,
+            logits.double(),
+            torch.log1p(torch.exp(logits.double())),
+        )
+        .topk(SQRT_SOFTPLUS["top"])
+        .indices.sort()
+        .values
+    )
+    assert not torch.equal(unbiased, ids.sort().values), (
+        "the case's bias changes no pick, so it does not test the selection"
     )

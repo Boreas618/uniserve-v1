@@ -572,6 +572,7 @@ impl Attention {
                 &attended.reshape((rows * heads, head_dim))?,
                 Activation::Sigmoid,
                 false,
+                None,
             )?,
             None => attended,
         };

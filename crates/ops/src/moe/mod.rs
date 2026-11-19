@@ -36,6 +36,7 @@ pub mod combine;
 pub mod exchange;
 pub mod grouped;
 pub mod load;
+pub mod mxfp4;
 pub mod routing;
 pub mod sort;
 

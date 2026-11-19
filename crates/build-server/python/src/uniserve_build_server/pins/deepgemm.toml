@@ -1,0 +1,23 @@
+# DeepGEMM's kernel headers, at vllm-project/DeepGEMM commit 727f847082d2 (the
+# DeepGEMM vLLM vendors, version 2.8.1), each file from the commit's raw tree. The
+# manifest is `deepgemm.sha256` beside this file. The kernels are built against the
+# CUTLASS the `flashinfer-python` distribution installs.
+sha256 = "a375dfeca5f92fb81a06f84c755d7d3255d94b17ab56f64368beb79d2611b5b2"
+
+# The kernels' headers include one another as `<deep_gemm/...>` from this root.
+include = ["deep_gemm/include"]
+
+[origin]
+files = "https://raw.githubusercontent.com/vllm-project/DeepGEMM/727f847082d2e7946f70dc02b94949db206310d3/"
+
+# How DeepGEMM compiles these kernels: the flags its run-time compiler gives every
+# kernel at this commit, the defaults of its `deep_jit` compiler (`-std=c++20`,
+# `--expt-relaxed-constexpr`, `--expt-extended-lambda`,
+# `--ptxas-options=--register-usage-level=10`) and the suppressions
+# `csrc/runtime/jit.hpp` adds (`--diag-suppress=39,161,174,177,186,940`).
+[compile]
+standard = "c++20"
+relaxed_constexpr = true
+extended_lambda = true
+register_usage_level = 10
+suppressed = [39, 161, 174, 177, 186, 940]
