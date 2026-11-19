@@ -5,7 +5,8 @@
 //! Build Server holding the tree's `arrival` policy package. It starts the built `uniserve-engine`
 //! with a launch of the Qwen3-MoE fixture on one rank of one group, `device = "meta"`: the
 //! engine says hello and `Starting`, claims the node's Storage Server, starts its rank, opens
-//! its session, resolves its policy and serves; it takes a request, states its metrics, and
+//! its session, resolves its policy and serves; it states its metrics, takes a request while
+//! asleep, which it holds (a meta engine computes nothing, so no request may run on it), and
 //! exits with status 0 once shut down, its session closed. The others start an epoch of two
 //! processes of this host standing for two hosts, each with a Storage Server of its own: a text
 //! group with a rank on each; and released media checkpoints (which the repository does not
@@ -420,7 +421,20 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
         }))
     );
 
-    // One request is accepted by the one scheduler.
+    // The metrics, once a second.
+    until(&mut requests, LONG, |kind| match kind {
+        from_engine::Kind::Metrics(metrics) => Some(metrics),
+        _ => None,
+    });
+
+    // A meta engine computes nothing, so the request is sent to it asleep: its scheduler takes
+    // the request and holds it, forming no batch until a wake, and the shutdown ends it.
+    let sleep = wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+        id: 21,
+        change: wire::CacheChange::Sleep as i32,
+        ..Default::default()
+    });
+    assert_eq!(operated(&mut requests, 21, sleep), "");
     let request =
         proto::request::Request::Generation(Box::new(proto::request::GenerationRequest {
             trace: 0,
@@ -453,12 +467,6 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     // The request keeps the identity this connection gave it, and the engine states its own.
     assert_eq!((accepted.request, accepted.scheduler), (11, 0));
     assert_ne!(accepted.engine_request, 0);
-
-    // The metrics, once a second.
-    until(&mut requests, LONG, |kind| match kind {
-        from_engine::Kind::Metrics(metrics) => Some(metrics),
-        _ => None,
-    });
 
     // A shutdown ends the process in order: it exits with status 0, its session closed.
     requests
@@ -766,7 +774,24 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
     assert!(holds_session(&storage_a, head.epoch, head.engine));
     assert!(holds_session(&storage_b, peer.epoch, peer.engine));
 
-    // One request is accepted by the one scheduler, whose group's batches reach both ranks.
+    // A sleep and a wake reach the peer's ranks as well as the scheduler node's.
+    let resize = |id, change: wire::CacheChange| {
+        wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+            id,
+            change: change as i32,
+            ..Default::default()
+        })
+    };
+    let slept = operated(&mut a.requests, 21, resize(21, wire::CacheChange::Sleep));
+    assert_eq!(slept, "");
+    let woken = operated(&mut a.requests, 22, resize(22, wire::CacheChange::Wake));
+    assert_eq!(woken, "");
+
+    // One request is accepted by the one scheduler, sent while the epoch sleeps again: a meta
+    // epoch computes nothing, so no request may run on it, and a sleeping scheduler holds what
+    // it takes and forms no batch until a wake.
+    let slept = operated(&mut a.requests, 23, resize(23, wire::CacheChange::Sleep));
+    assert_eq!(slept, "");
     let request =
         proto::request::Request::Generation(Box::new(proto::request::GenerationRequest {
             trace: 0,
@@ -797,19 +822,6 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
         _ => None,
     });
     assert_eq!(accepted.scheduler, 0);
-
-    // A sleep and a wake reach the peer's ranks as well as the scheduler node's.
-    let resize = |id, change: wire::CacheChange| {
-        wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
-            id,
-            change: change as i32,
-            ..Default::default()
-        })
-    };
-    let slept = operated(&mut a.requests, 21, resize(21, wire::CacheChange::Sleep));
-    assert_eq!(slept, "");
-    let woken = operated(&mut a.requests, 22, resize(22, wire::CacheChange::Wake));
-    assert_eq!(woken, "");
 
     // A shutdown of the scheduler node ends the epoch in order.
     let storage = [(&storage_a, head.engine), (&storage_b, peer.engine)];
