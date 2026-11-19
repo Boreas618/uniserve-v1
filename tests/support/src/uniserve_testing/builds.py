@@ -1,26 +1,26 @@
 """The Build Servers of a test session, through their command-line interface.
 
-A deployment's epoch is resolved at its own Build Server on its node before
-its main processes serve: the deployment's daemon starts it, and it compiles
-and keeps its modules apart from every other deployment's. A run starts one
-Build Server of its own (:func:`build_server`) over a fresh store under its
-work directory (``store/packages`` and ``store/modules``, the layout of a
+A deployment's epoch is resolved at its own Build Server on its node before its
+main processes serve: the deployment's daemon starts it, and it compiles and
+keeps its modules apart from every other deployment's. A run starts one Build
+Server of its own (:func:`build_server`) over a fresh store under its work
+directory (``store/packages`` and ``store/modules``, the layout of a
 ``build-server build --store`` store), with the repository as its source tree
 (``--source``): its Build Server environment compiles, and the server installs
 the tree's serving packages (every kernel package of the operator tree, the
-scheduling policy and the engine) before it serves, as a kernel check that
-loads a built module needs. Every deployment of the run reads that store as a
-read-only store (``build_config.read_only_stores``, :func:`deployment_config`),
-so its own Build Server finds the tree's packages installed and installs none
-of them again, and keeps what it compiles in the run's data directory for
-deployments (:attr:`BuildServer.data`, which holds the ``XDG_DATA_HOME``
-and ``XDG_CACHE_HOME`` of the run's daemons), under the deployment's name: the
-cases of a run that serve a deployment of one name compile its modules once,
-and deployments of other names never read them. A deployment's packages are
-its case's own (``build_config.package_root``), so a revision one case
-installs is selected by no other case. :class:`BuildServer` installs further
-packages and resolves modules with the ``--json`` forms of ``uniserve
-build-server install`` and ``resolve``, at the run's server or at a
+scheduling policy, the processing program and the engine) before it serves, as
+a kernel check that loads a built module needs. Every deployment of the run
+reads that store as a read-only store (``build_config.read_only_stores``,
+:func:`deployment_config`), so its own Build Server finds the tree's packages
+installed and installs none of them again, and keeps what it compiles in the
+run's data directory for deployments (:attr:`BuildServer.data`, which holds the
+``XDG_DATA_HOME`` and ``XDG_CACHE_HOME`` of the run's daemons), under the
+deployment's name: the cases of a run that serve a deployment of one name
+compile its modules once, and deployments of other names never read them. A
+deployment's packages are its case's own (``build_config.package_root``), so a
+revision one case installs is selected by no other case. :class:`BuildServer`
+installs further packages and resolves modules with the ``--json`` forms of
+``uniserve build-server install`` and ``resolve``, at the run's server or at a
 deployment's (:meth:`BuildServer.of`).
 """
 

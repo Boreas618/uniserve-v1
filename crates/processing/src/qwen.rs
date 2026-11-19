@@ -1,8 +1,8 @@
 //! The Qwen chat families, as request processing serves them.
 //!
-//! The daemon serves a family by what is stated here and links no model: how the family's
-//! checkpoints declare it, the output formats they write and, for a family that takes images,
-//! the processor that sizes their blocks ([`crate::qwen_vl`]). The model crate (`qwen3`) holds
+//! The processing program serves a family by what is stated here: how the family's checkpoints
+//! declare it, the output formats they write and, for a family that takes images, the processor
+//! that sizes their blocks ([`crate::qwen_vl`]). The model crate (`qwen3`) holds
 //! the numerical side of the families it loads and refers to these values.
 //!
 //! Every Qwen chat model since Qwen3 delimits its reasoning with `<think>` and `</think>`.
@@ -46,11 +46,13 @@ pub const QWEN3: Family = Family {
         reasoning: Some(THINK),
         tool_calls: Some(ToolCallFormat::Json),
         images: None,
-        // A Qwen3 checkpoint states its context bound at the root of its configuration and its
-        // template in its tokenizer configuration.
+        // A Qwen3 checkpoint states its context bound at the root of its configuration. Qwen's
+        // releases keep the template in their tokenizer configuration, and exports saved since
+        // `transformers` writes templates as files keep it in `chat_template.jinja` alone, as
+        // NVIDIA's ModelOpt NVFP4 export of Qwen3-30B-A3B does.
         checkpoint: ChatCheckpoint {
             context_length: &["max_position_embeddings"],
-            chat_template: ChatTemplate::TokenizerConfig,
+            chat_template: ChatTemplate::FileOrTokenizerConfig("chat_template.jinja"),
         },
     }),
 };
@@ -84,7 +86,9 @@ pub const QWEN4_EXP: Family = Family {
 };
 
 /// Where a Qwen checkpoint with a vision tower states what request processing reads: its language
-/// model is the `text_config` section of its configuration, and its template a file of its own.
+/// model is the `text_config` section of its configuration, and its template a file of its own,
+/// which every checkpoint of these families publishes (some also copy it into their tokenizer
+/// configuration), as they were all saved since `transformers` writes templates as files.
 const VISION_CHAT_CHECKPOINT: ChatCheckpoint = ChatCheckpoint {
     context_length: &["text_config", "max_position_embeddings"],
     chat_template: ChatTemplate::File("chat_template.jinja"),

@@ -18,6 +18,8 @@ members = [
     "crates/ops",
     "crates/ops/derive",
     "crates/processing",
+    "crates/processing/program",
+    "crates/processing/testing",
     "crates/program",
     "crates/program/testing",
     "crates/program/tests/programs/chunk",
@@ -60,8 +62,6 @@ libc.workspace = true
 # directories from its `links` metadata for the executable's run path.
 media.workspace = true
 mimalloc.workspace = true
-# The request-processing side of the families, which the daemon serves.
-processing.workspace = true
 # The host's devices, whose architectures a Build Server this executable runs builds for.
 platform.workspace = true
 build-server.workspace = true
@@ -104,6 +104,7 @@ ops = { path = "crates/ops" }
 ops-derive = { path = "crates/ops/derive" }
 models = { path = "crates/models" }
 processing = { path = "crates/processing" }
+processing-testing = { path = "crates/processing/testing" }
 program = { path = "crates/program" }
 program-testing = { path = "crates/program/testing" }
 build-server = { path = "crates/build-server" }
@@ -163,6 +164,9 @@ educe = "0.6.0"
 expect-test = "1.5.1"
 fastokens = "0.3.2"
 futures = "0.3.31"
+# The randomness interface the JSON Schema validator seeds its hash maps through, whose `custom`
+# backend a processing program's wasm32 module links from `crates/processing/src/entropy.rs`.
+getrandom = "0.3.4"
 hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 http-body = "1.0.1"
 http-body-util = "0.1.3"
@@ -186,9 +190,10 @@ nvtx = { version = "2.0.0", default-features = false, features = ["std"] }
 llm-multimodal = { git = "https://github.com/vllm-project/llm-multimodal", rev = "5b558989844d1c7af3e43d0f604069ffd9c06320" }
 # Keep scheduler heap mappings out of transparent-huge-page collapse.
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
-# `stacker` grows a rendering thread's stack as a template recurses, so a deeply nested chat
-# template renders on any thread at minijinja's own recursion bound.
-minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order", "stacker"] }
+# The chat templates' engine, which the processing program (`crates/processing/program`) renders
+# with in its wasm32 module: its recursion is bounded by minijinja's own limit, within the
+# module's stack (`crates/processing/program/build.rs`).
+minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 # Mooncake Store's C API, loaded at run time (`libmooncake_store.so`, built
 # with `WITH_STORE_C_SHARED`), so nothing links Mooncake.
@@ -263,12 +268,14 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 url = "2.5.8"
 uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
-# The runtime of the scheduling policy modules: the engine's policy host
-# (`engine::scheduler::policy`) configures it, compiles the wasm32 modules the Build Server
-# builds, instantiates them and calls them. Only the JIT, the runtime and `std`: no WASI, no
-# async.
+# The runtime of the program modules: the program host (`crates/program`) configures it,
+# compiles the wasm32 modules the Build Server builds, instantiates them and calls them. Only the
+# JIT, the runtime, `std` and parallel compilation: no WASI, no async. A module's functions
+# compile in parallel, since a hot restart's successor and an epoch's target compile the
+# processing program, several megabytes of code, before they serve.
 wasmtime = { version = "50.0.1", default-features = false, features = [
     "cranelift",
+    "parallel-compilation",
     "runtime",
     "std",
 ] }

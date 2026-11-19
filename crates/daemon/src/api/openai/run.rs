@@ -32,30 +32,32 @@ use tracing::{error, trace};
 
 use crate::api::body::{Session, Step};
 use crate::api::events::{Events, Next as EventStep, Stats};
+use crate::api::input::Processor;
 use crate::api::openai::chat_completions::{ChatCollector, ChatStreamEmitter, chat_response};
 use crate::api::openai::error::ApiError;
 use crate::api::output::{OutputProcessor, RequestOutput};
 use crate::api::protocol::ChatCompletionStreamResponse;
-use crate::api::tokenizer::DynTokenizer;
 
 impl GenerationRun<ChatStreamEmitter> {
     /// Continues the streamed response `state` describes, whose engine events
     /// arrive on `events`, taken over from the connection that consumed them:
     /// the successor rebuilds the output processor the state states from its
-    /// own tokenizer, then resumes every stage where the predecessor stopped.
+    /// own `processor` (its tokenizer, and its binding in the same processing
+    /// program, where the response's parser is restored), then resumes every
+    /// stage where the predecessor stopped.
     ///
     /// # Errors
     ///
     /// Fails when the state names no lowering or no prompt, or when the
-    /// family's parsers cannot be built.
+    /// family's parser cannot be restored.
     pub fn resume_stream(
         state: &handoff::ChatStream,
-        tokenizer: DynTokenizer,
+        processor: &Processor,
         events: Box<dyn Events>,
         stats: Box<dyn Stats>,
     ) -> anyhow::Result<Self> {
         let output = resumed_output(
-            tokenizer,
+            processor,
             state.lowering.as_ref(),
             state.decode.as_ref(),
             state.processor.as_ref(),
@@ -80,12 +82,12 @@ impl GenerationRun<ChatBodySink> {
     /// Fails as [`GenerationRun::resume_stream`] does.
     pub fn resume_collection(
         state: &handoff::ChatResponse,
-        tokenizer: DynTokenizer,
+        processor: &Processor,
         events: Box<dyn Events>,
         stats: Box<dyn Stats>,
     ) -> anyhow::Result<Self> {
         let output = resumed_output(
-            tokenizer,
+            processor,
             state.lowering.as_ref(),
             state.decode.as_ref(),
             state.processor.as_ref(),
@@ -104,7 +106,7 @@ impl GenerationRun<ChatBodySink> {
 /// The output processor of a handed-over response, rebuilt from the parts of its state every
 /// chat response shares, each of which the state must state.
 fn resumed_output(
-    tokenizer: DynTokenizer,
+    processor: &Processor,
     lowering: Option<&handoff::Lowering>,
     decode: Option<&handoff::Decode>,
     parsers: Option<&handoff::Processor>,
@@ -116,8 +118,16 @@ fn resumed_output(
     let parsers = parsers.context("a handed response states no parser state")?;
     let assembly = assembly.context("a handed response states no assembly")?;
 
-    OutputProcessor::resume(tokenizer, lowering, decode, parsers, assembly, stats)
-        .context("resuming the output processor")
+    OutputProcessor::resume(
+        processor.tokenizer(),
+        processor.binding(),
+        lowering,
+        decode,
+        parsers,
+        assembly,
+        stats,
+    )
+    .context("resuming the output processor")
 }
 
 /// What a response body's outputs become: the frames it writes.
@@ -135,7 +145,7 @@ pub trait ResponseSink: Send + 'static {
     /// The response's application state for a successor: the sink's own
     /// state with `output`'s and the position `events` reached; `None` when
     /// the sink or a parser cannot be handed over at this boundary.
-    fn freeze(&self, output: &OutputProcessor, events: &dyn Events) -> Option<Application>;
+    fn freeze(&self, output: &mut OutputProcessor, events: &dyn Events) -> Option<Application>;
 
     /// The frames this response writes when it fails, in the sink's own shape:
     /// server-sent events for a streamed response, the one document a
@@ -161,8 +171,8 @@ impl ResponseSink for ChatStreamEmitter {
         ChatStreamEmitter::done(self)
     }
 
-    fn freeze(&self, output: &OutputProcessor, events: &dyn Events) -> Option<Application> {
-        let processor = output.parser_state();
+    fn freeze(&self, output: &mut OutputProcessor, events: &dyn Events) -> Option<Application> {
+        let processor = output.parser_state()?;
         let chunks = ChatStreamEmitter::state(self)?;
         let (consumed_events, consumed_tokens) = events.progress();
         let usage_owed = output.response().include_usage && !ChatStreamEmitter::done(self);
@@ -237,8 +247,8 @@ impl ResponseSink for ChatBodySink {
         self.written
     }
 
-    fn freeze(&self, output: &OutputProcessor, events: &dyn Events) -> Option<Application> {
-        let processor = output.parser_state();
+    fn freeze(&self, output: &mut OutputProcessor, events: &dyn Events) -> Option<Application> {
+        let processor = output.parser_state()?;
         let (consumed_events, consumed_tokens) = events.progress();
 
         Some(Application::ChatResponse(handoff::ChatResponse {
@@ -419,7 +429,7 @@ impl<S: ResponseSink> Session for GenerationRun<S> {
     }
 
     fn freeze(&mut self) -> Option<Application> {
-        self.sink.freeze(&self.output, self.events.as_ref())
+        self.sink.freeze(&mut self.output, self.events.as_ref())
     }
 
     fn abort(&mut self) {
@@ -552,6 +562,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::api::program::Session as Instance;
     use crate::api::test_support::{ChannelEvents, Unrecorded};
 
     /// Drives a body to its end as its connection does and answers what it
@@ -590,10 +601,10 @@ mod tests {
     }
 
     /// The body of a request whose prompt is `p`, decoded as `decode` states
-    /// and parsed as `parser` states, over the engine events `events`,
-    /// written by `sink`.
+    /// and parsed in `parser`, its instance of the processing program, over the
+    /// engine events `events`, written by `sink`.
     fn run<S: ResponseSink>(
-        parser: handoff::Parser,
+        parser: Instance,
         decode: handoff::TextDecode,
         logprobs: bool,
         events: Box<dyn Events>,
@@ -604,12 +615,12 @@ mod tests {
             decode_options: Some(decode),
             prompt_logprobs: false,
             logprobs,
-            parser: Some(parser),
             response: Some(response(logprobs)),
         };
         let output = OutputProcessor::new(
             crate::api::test_support::configured_tokenizer(),
             lowering,
+            parser,
             7,
             Box::new(Unrecorded(std::time::Instant::now())),
         )
@@ -620,7 +631,7 @@ mod tests {
     /// The one JSON document a non-streamed request over `events` answers
     /// with, or the failure its held head states.
     async fn document(
-        parser: handoff::Parser,
+        parser: Instance,
         decode: handoff::TextDecode,
         logprobs: bool,
         events: Box<dyn Events>,
@@ -694,9 +705,7 @@ mod tests {
             },
             finished(proto::request::FinishReason::MaxTokens, 1),
         ]);
-        let document = document(handoff::Parser::default(), decode(), true, events)
-            .await
-            .unwrap();
+        let document = document(plain(), decode(), true, events).await.unwrap();
 
         assert_eq!(content(&document), "a");
         let token = &document["choices"][0]["logprobs"]["content"][0];
@@ -727,9 +736,7 @@ mod tests {
                 ],
             )
         };
-        let document = document(handoff::Parser::default(), decode(), false, events())
-            .await
-            .unwrap();
+        let document = document(plain(), decode(), false, events()).await.unwrap();
         assert_eq!(document["usage"]["prompt_tokens"], 1);
         assert_eq!(
             document["usage"]["prompt_tokens_details"]["cached_tokens"],
@@ -739,7 +746,7 @@ mod tests {
         let mut options = response(false);
         options.include_usage = true;
         let sink = ChatStreamEmitter::new(&options);
-        let mut body = run(handoff::Parser::default(), decode(), false, events(), sink);
+        let mut body = run(plain(), decode(), false, events(), sink);
         let (bytes, failed) = responded(&mut body).await;
         assert!(failed.is_none());
         let text = String::from_utf8(bytes).unwrap();
@@ -763,9 +770,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_without_generated_tokens_has_no_text() {
         let events = engine_events([finished(proto::request::FinishReason::Eos, 1)]);
-        let document = document(handoff::Parser::default(), decode(), false, events)
-            .await
-            .unwrap();
+        let document = document(plain(), decode(), false, events).await.unwrap();
 
         assert_eq!(content(&document), "");
         assert_eq!(document["choices"][0]["finish_reason"], "stop");
@@ -789,7 +794,7 @@ mod tests {
         };
         for failure in failures() {
             let error = document(
-                handoff::Parser::default(),
+                plain(),
                 decode(),
                 false,
                 engine_events([text_token(b'a'), failure]),
@@ -804,7 +809,7 @@ mod tests {
         for failure in failures() {
             let sink = ChatStreamEmitter::new(&response(false));
             let mut body = run(
-                handoff::Parser::default(),
+                plain(),
                 decode(),
                 false,
                 engine_events([text_token(b'a'), failure]),
@@ -828,30 +833,32 @@ mod tests {
             kind: proto::request::RejectionKind::Invalid,
             message: "the prompt does not fit".to_owned(),
         }]);
-        let error = document(handoff::Parser::default(), decode(), false, events)
+        let error = document(plain(), decode(), false, events)
             .await
             .unwrap_err();
         assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
     }
 
-    /// The parsers of a request that may call the tool `lookup`, written as
+    /// The parser of a request whose text passes as content.
+    fn plain() -> Instance {
+        crate::api::test_support::session()
+    }
+
+    /// The parser of a request that may call the tool `lookup`, written as
     /// function and parameter tags.
-    fn lookup_parser() -> handoff::Parser {
-        handoff::Parser {
-            reasoning_delimiters: None,
-            tool_calls: "xml".to_owned(),
-            tools: serde_json::json!([{
-                "type": "function",
-                "function": {
-                    "name": "lookup",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"q": {"type": "string"}, "limit": {"type": "integer"}},
-                    },
-                },
-            }])
-            .to_string(),
-        }
+    fn lookup_parser() -> Instance {
+        let lookup = scheduling::processing::Tool::Function {
+            function: scheduling::processing::Function {
+                name: "lookup".to_owned(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}, "limit": {"type": "integer"}},
+                }),
+                strict: None,
+            },
+        };
+        crate::api::test_support::session_of(crate::api::test_support::TAGS, Some(vec![lookup]))
     }
 
     /// The engine events of a model that writes `text` one token a character

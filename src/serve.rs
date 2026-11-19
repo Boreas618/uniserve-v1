@@ -24,7 +24,7 @@ pub(crate) fn run(args: ServeArgs, log: &LogLevels) -> Result<ExitCode> {
     let runtime = crate::runtime()?;
     if let Some(descriptor) = args.predecessor {
         runtime.block_on(async move {
-            daemon::restart::take_over(descriptor, crate::served()?, crate::shutdown_signal()).await
+            daemon::restart::take_over(descriptor, crate::shutdown_signal()).await
         })?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -40,14 +40,7 @@ pub(crate) fn run(args: ServeArgs, log: &LogLevels) -> Result<ExitCode> {
         .context("`serve` takes the policy package's directory")?;
     let (package, deployment) = read(&directory)?;
     runtime.block_on(async move {
-        daemon::serve(
-            package,
-            deployment,
-            crate::served()?,
-            ready,
-            crate::shutdown_signal(),
-        )
-        .await
+        daemon::serve(package, deployment, ready, crate::shutdown_signal()).await
     })?;
     Ok(ExitCode::SUCCESS)
 }

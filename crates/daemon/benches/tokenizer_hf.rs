@@ -4,19 +4,23 @@
 //!
 //! The checkpoint is a Hugging Face repository, resolved as the daemon resolves one: through the
 //! Hub the standard Hugging Face environment configures, into its cache (a cold cache needs the
-//! network, an offline host a populated cache), and only its root files are fetched. The sample
-//! is the conversation of `--turns` user and assistant turns rendered through the checkpoint's own
-//! chat template, as a chat request's prompt is. Encoding throughput is reported in input bytes
-//! and decoding throughput in token IDs; `FILTER` selects benchmarks by name, as Criterion's does.
+//! network, an offline host a populated cache). The sample is the conversation of `--turns` user
+//! and assistant turns rendered through the checkpoint's own chat template by the tree's processing
+//! program (`crates/processing/program`, built for wasm32 by the cargo that runs the bench), as a
+//! chat request's prompt is. Encoding throughput is reported in input bytes and decoding throughput
+//! in token IDs; `FILTER` selects benchmarks by name, as Criterion's does.
 
 use std::error::Error;
 
 use clap::Parser;
 use criterion::{Criterion, Throughput, black_box};
-use daemon::api::input::chat::{GenerationPromptMode, HfChatRenderer};
-use daemon::api::model::assets::{ChatFiles, Hub, HubAsset, declared_family, root_file};
+use daemon::api::input::LoadedBinding;
+use daemon::api::model::ModelConfig;
+use daemon::api::model::assets::{Hub, HubAsset, Source};
+use daemon::api::program::Program;
 use daemon::api::protocol::ChatCompletionRequest;
-use daemon::api::tokenizer::HuggingFaceTokenizer;
+use daemon::api::tokenizer::DynTokenizer;
+use scheduling::processing::Segment;
 
 /// The bench's protocol.
 #[derive(Debug, Parser)]
@@ -37,7 +41,7 @@ struct Arguments {
 
 /// Loaded tokenizer plus a sample text and its encoding.
 struct BenchFixture {
-    tokenizer: HuggingFaceTokenizer,
+    tokenizer: DynTokenizer,
     text: String,
     token_ids: Vec<u32>,
 }
@@ -47,18 +51,28 @@ impl BenchFixture {
     /// so the measured calls repeat calls known to succeed.
     async fn load(arguments: &Arguments) -> Result<Self, Box<dyn Error>> {
         let hub = Hub::from_env()?;
-        let snapshot = hub
-            .snapshot(&HubAsset::parse(&arguments.checkpoint)?)
-            .await?;
-        snapshot.fetch(root_file).await?;
-        let directory = snapshot.directory();
-        let family = declared_family(directory, &processing::Registry::new(processing::FAMILIES)?)?;
-        let processing::Serving::Chat(profile) = family.serving else {
+        let program = Program::load(
+            &program_testing::module!("processing-program"),
+            proto::module::PackageRevision {
+                backend: "processing".to_owned(),
+                revision: 1,
+                arguments: toml::Table::new(),
+            },
+        )?;
+        let loaded = ModelConfig::load(
+            &hub,
+            &Source::Hub(HubAsset::parse(&arguments.checkpoint)?),
+            None,
+            None,
+            &Default::default(),
+            &serde_json::Map::new(),
+            &program,
+        )
+        .await?;
+        let LoadedBinding::Chat(binding) = loaded.binding else {
             return Err(format!("{} is not a chat checkpoint", arguments.checkpoint).into());
         };
-        let files = ChatFiles::locate(directory, profile.checkpoint)?;
-        let tokenizer = HuggingFaceTokenizer::load(files.tokenizer_directory())?;
-        let renderer = HfChatRenderer::load(&files, &Default::default(), None)?;
+        let tokenizer = loaded.tokenizer;
 
         let messages = (0..arguments.turns)
             .flat_map(|turn| {
@@ -72,7 +86,18 @@ impl BenchFixture {
             "model": arguments.checkpoint,
             "messages": messages,
         }))?;
-        let text = renderer.render(&request, GenerationPromptMode::StartNewAssistant)?;
+        let mut session = binding.checkout()?;
+        let prompt = session
+            .render(&daemon::api::input::chat::render(&request, &[]))?
+            .map_err(|refusal| refusal.message)?;
+        let text: String = prompt
+            .segments
+            .into_iter()
+            .map(|segment| match segment {
+                Segment::Text(text) => text,
+                Segment::Image(_) => String::new(),
+            })
+            .collect();
         let token_ids = tokenizer.encode(&text, false)?;
         tokenizer.decode(&token_ids, false)?;
         Ok(Self {

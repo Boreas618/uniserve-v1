@@ -1314,8 +1314,12 @@ pub fn prepare_epoch(
     });
     let pinned = pinned?;
     for (host, prepared) in remote {
-        let prepared =
+        let mut prepared =
             prepared.map_err(|_| anyhow::anyhow!("the preparation at {host} panicked"))??;
+        // The engines' wire form of the set leaves out what the leader daemon runs itself (its
+        // programs and its processing program), which no other host prepares.
+        prepared.programs.clone_from(&pinned.programs);
+        prepared.processing.clone_from(&pinned.processing);
         anyhow::ensure!(
             prepared == pinned,
             "the Build Server of {host} prepared other modules than the Build Server of {}",
@@ -1402,6 +1406,9 @@ pub fn with_store_modules(
     let mut complete = filled.clone();
     fix_revision(&mut client, proto::module::ENGINE, &mut complete.engine)?;
     fix_revision(&mut client, proto::module::PROGRAM, &mut complete.policy)?;
+    if let Some(processing) = complete.processing.as_mut() {
+        fix_revision(&mut client, proto::module::PROGRAM, processing)?;
+    }
     for (slot, package) in &mut complete.kernels {
         fix_revision(&mut client, &slot.op, package)?;
     }
@@ -1598,8 +1605,10 @@ fn prepare_at(
         engine,
         kernels,
         policy,
-        // The programs were fixed before the set: the Build Servers prepare the engines' modules.
+        // The programs were fixed before the set: the Build Servers prepare the engines' modules,
+        // and the leader daemon resolves the processing program itself.
         programs: filled.programs.clone(),
+        processing: filled.processing.clone(),
     })
 }
 

@@ -32,7 +32,7 @@ use media::probe::readable;
 use proto::config::{MediaDefaults, MediaSources};
 use tokio::sync::Semaphore;
 
-use processing::{
+use scheduling::processing::video::{
     AudioMetadata, FrameRate, ImageMetadata, InputError, MediaMetadata, ReferenceKind,
     VideoMetadata,
 };
