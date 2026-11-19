@@ -274,10 +274,15 @@ impl GatedDeltaNet {
             gathered("conv1d", width)?
         };
 
+        // The delta rule reads `A_log` and `dt_bias`, and the output norm its gain, in the
+        // activations' element type, which the convolution's taps are held in. A checkpoint
+        // may store them in FP32 beside BF16 projections (Qwen3.5-35B-A3B), so they are read
+        // at that type, as vLLM's parameters of the model's type load them.
+        let activations = vb.to_dtype(conv1d.dtype());
         let heads = (config.value_heads / split.size()) as usize;
         let first = split.rank() as usize * heads;
-        let a_log = vb.get_rows(heads, "A_log", first)?;
-        let dt_bias = vb.get_rows(heads, "dt_bias", first)?;
+        let a_log = activations.get_rows(heads, "A_log", first)?;
+        let dt_bias = activations.get_rows(heads, "dt_bias", first)?;
 
         let norm = GatedRmsNorm::load(
             &GatedRmsNormConfig {
@@ -285,7 +290,7 @@ impl GatedDeltaNet {
                 eps: config.eps,
                 sigmoid: config.sigmoid_gate,
             },
-            vb.pp("norm"),
+            activations.pp("norm"),
         )?;
 
         Ok(Self {
