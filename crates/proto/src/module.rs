@@ -276,6 +276,10 @@ pub mod operator {
     pub const SPARSE_ATTENTION: &str = "sparse_attention";
     pub const INDEXED_ATTENTION: &str = "indexed_attention";
     pub const INDEX_SCORES: &str = "index_scores";
+    pub const INDEX_SELECT: &str = "index_select";
+    pub const LATENT_ATTENTION: &str = "latent_attention";
+    pub const LATENT_COMPRESS: &str = "latent_compress";
+    pub const RECORD_WRITE: &str = "record_write";
     pub const MOE_UNPERMUTE: &str = "moe_unpermute";
     pub const EXPERT_EXCHANGE: &str = "expert_exchange";
     pub const GATHER_GEMM: &str = "gather_gemm";
@@ -375,6 +379,10 @@ pub mod operator {
         SPARSE_ATTENTION,
         INDEXED_ATTENTION,
         INDEX_SCORES,
+        INDEX_SELECT,
+        LATENT_ATTENTION,
+        LATENT_COMPRESS,
+        RECORD_WRITE,
         MOE_UNPERMUTE,
         EXPERT_EXCHANGE,
         GATHER_GEMM,

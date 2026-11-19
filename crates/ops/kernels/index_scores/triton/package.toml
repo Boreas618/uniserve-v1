@@ -1,0 +1,58 @@
+# The index_scores operator's Triton backend: design 5.2's package.
+#
+# One program scores `block` columns of one token's score row: the rectified
+# products of the token's index heads with the keys of the groups the columns
+# name, weighted per head and summed in FP32, and -inf for a column of no
+# visible group. The keys are BF16 rows or MXFP4 records in the page layout
+# (`crates/ops/src/record.rs`); a query is read as it is or rounded to MXFP4
+# blocks; the columns are the request's groups or the groups of its candidate
+# blocks.
+
+op = "index_scores"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+# The derivation gives the variants a key prints only when they are set (an
+# unweighted, unrounded, dense scoring names none of them) and the heads' tile
+# of the products, padded to at least sixteen rows.
+[launch]
+kernel = "_index_scores_kernel"
+warps = 8
+derive = "derive"
+
+# A BF16 key plane is read in its elements, a packed one in bytes. The weights
+# and the candidates are read only by the variants that state them; the others
+# are passed the unread operand.
+[launch.types]
+query = { pointer = "dtype" }
+weights = "*fp32"
+keys = { field = "keys", values = { bf16 = "*bf16", mxfp4 = "*u8" } }
+page_table = "*i32"
+rows = "*i32"
+visible = "*i32"
+candidates = "*i32"
+out = "*fp32"
+tokens = "i64"
+max_pages = "i64"
+blocks = "i64"
+
+[launch.constants]
+HEADS = { field = "heads" }
+HEADS_TILE = { field = "heads_tile" }
+WIDTH = { field = "width" }
+GROUPS = { field = "groups" }
+BLOCK = { field = "block" }
+KEYS_MXFP4 = { field = "keys", values = { bf16 = false, mxfp4 = true } }
+WEIGHTED = { field = "weighted" }
+QUERY_MXFP4 = { field = "query", values = { bf16 = false, mxfp4 = true } }
+CANDIDATES = { field = "candidates" }
+
+# `dtype_bf16_keys_mxfp4_heads_32_width_128_groups_64_block_256_weighted_true_query_mxfp4_candidates_8`.
+#
+# `width` and `block` are `tl.arange` extents; the products need a width of at
+# least sixteen. `weighted`, `query` and `candidates` appear only when set.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], keys = ["bf16", "mxfp4"], heads = { min = 1 }, width = { power_of_two = true, min = 16 }, groups = { min = 1 }, block = { power_of_two = true, min = 16 }, weighted = ["true", "false"], query = ["bf16", "mxfp4"], candidates = { min = 1 } }
