@@ -16,9 +16,11 @@ mod embedding;
 mod frame;
 mod gated_delta_net;
 mod head;
+mod hyper;
 mod linear;
 mod mlp;
 mod moe;
+mod ngram;
 mod norm;
 mod rotary;
 
@@ -34,9 +36,11 @@ pub use codec::{DacEncoder, DacEncoderConfig};
 pub use conv::{Conv1d, Conv3d, ConvConfig, ConvTranspose1d};
 pub use frame::{FrameNorm, FrameNormConfig, ResnetBlock3d, ResnetBlock3dConfig};
 pub use head::{LmHead, LmHeadConfig};
+pub use hyper::{MhcConfig, MhcConnection, MhcResidual};
 pub use linear::{Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearConfig, QkvNames};
 pub use mlp::{GateUp, Mlp, MlpConfig};
 pub use moe::{ExpertLayout, MoE, MoEConfig, SharedExpert, SharedExpertConfig};
+pub use ngram::{NgramConfig, NgramHashing, NgramMemory, NgramTable, TableShard};
 pub use norm::{
     GatedRmsNorm, GatedRmsNormConfig, LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig,
 };
