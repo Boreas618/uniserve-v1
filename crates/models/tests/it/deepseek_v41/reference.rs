@@ -2,7 +2,7 @@
 //!
 //! | Test | Reference | What is compared |
 //! | --- | --- | --- |
-//! | n-gram hashing | `inference/engram.py`, run as it is (`generate_reference.py`, `data/engram.json`) | the normalized vocabulary, the multipliers, the primes, every table row of a fixed token sequence, exactly |
+//! | n-gram hashing | `inference/engram.py`, run as it is (`generate_engram.py`, `data/engram.json`) | the normalized vocabulary, the multipliers, the primes, every table row of a fixed token sequence, exactly |
 //! | layer 1's residual | `Block.hc_mixes`, `hc_split_sinkhorn`, `hc_pre`, `hc_post`, `RMSNorm` (`inference/model.py:909-996`, `kernel.py:407-474`), ported ([`nn_testing::reference`]) | the residual of the fixed tokens' embeddings through layer 1's two connections and the output norm |
 //! | layer 1's n-gram memory | `ParallelEngramEmbedding`, `Engram.forward` (`inference/model.py:296-365`), ported | the streams the memory gates, over the release's table rows, projection and gate |
 //!
@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use super::shards::Shards;
 use crate::releases::DEEPSEEK_V41_FLASH;
 
-/// What the reference code computed (`generate_reference.py`).
+/// What the reference code computed (`generate_engram.py`).
 fn fixture() -> serde_json::Value {
     serde_json::from_str(include_str!("data/engram.json")).expect("the fixture is JSON")
 }

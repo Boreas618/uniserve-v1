@@ -815,7 +815,8 @@ pub struct RopeApplyDescriptor {
     pub heads: u32,
     /// How the rotation pairs the elements of a head.
     pub rotation: Rotation,
-    /// The channels of each head that rotate: the first `rotated`, the rest pass through.
+    /// The channels of each head that rotate: `rotated` from channel `first` on, the rest pass
+    /// through.
     ///
     /// `rotated == head_dim` is the whole head and keeps the key it always had; a narrower rotation
     /// names its width.
@@ -826,6 +827,15 @@ pub struct RopeApplyDescriptor {
     pub block: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+    /// The first channel of each head that rotates: zero for the leading channels, `head_dim −
+    /// rotated` for the trailing ones a latent attention rotates.
+    pub first: u32,
+    /// Whether the rotation turns by the negated angles of its factors: the inverse of the
+    /// rotation by the same tables, which takes a rotation back out of an attended value.
+    pub inverse: bool,
+    /// Whether the output is the input, so the channels outside the rotation stay where they are
+    /// and are not copied.
+    pub inplace: bool,
 }
 
 /// The tokens one `rope_apply` program rotates.
@@ -836,8 +846,9 @@ const APPLY_BLOCK: u32 = 128;
 
 impl RopeApplyDescriptor {
     /// The compilation of the call `args` makes, rotating by `rotation`: the element types,
-    /// heads and widths are the operands', and the rotated channels twice the factor tables'
-    /// columns.
+    /// heads and widths are the operands', the rotated channels twice the factor tables'
+    /// columns from the head's first channel on, forward, in place when the output is the
+    /// input.
     ///
     /// # Errors
     ///
@@ -853,7 +864,20 @@ impl RopeApplyDescriptor {
             rows: APPLY_TOKENS,
             block: APPLY_BLOCK,
             pdl: PDL,
+            first: 0,
+            inverse: false,
+            inplace: args.x.ptr == args.out.ptr,
         })
+    }
+
+    /// The same compilation rotating the head's trailing channels, by the inverse rotation
+    /// when `inverse`.
+    pub const fn trailing(self, inverse: bool) -> Self {
+        Self {
+            first: self.head_dim - self.rotated,
+            inverse,
+            ..self
+        }
     }
 }
 
@@ -873,6 +897,23 @@ impl fmt::Display for RopeApplyDescriptor {
             key
         } else {
             key.field("rotated", self.rotated)
+        };
+        // The placement, the direction and the in-place form follow, each only when it is not
+        // the forward rotation of the leading channels into another tensor.
+        let key = if self.first == 0 {
+            key
+        } else {
+            key.field("first", self.first)
+        };
+        let key = if self.inverse {
+            key.field("inverse", true)
+        } else {
+            key
+        };
+        let key = if self.inplace {
+            key.field("inplace", true)
+        } else {
+            key
         };
         key.finish(formatter)
     }
@@ -910,17 +951,25 @@ impl Op for RopeApply {
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let head_dim = u64::from(descriptor.head_dim);
         if descriptor.rotated == 0
-            || descriptor.rotated > descriptor.head_dim
+            || descriptor.first + descriptor.rotated > descriptor.head_dim
             || !descriptor.rotated.is_multiple_of(2)
         {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "a rotation of {} channels of a {} channel head: expected an even count in \
-                     1..=head_dim",
-                    descriptor.rotated, descriptor.head_dim
+                    "a rotation of {} channels from channel {} of a {} channel head: expected an \
+                     even count within the head",
+                    descriptor.rotated, descriptor.first, descriptor.head_dim
                 ),
             ));
+        }
+        if descriptor.inplace != (args.x.ptr == args.out.ptr) {
+            let refusal = if descriptor.inplace {
+                "a compilation in place called with an output that is not its input"
+            } else {
+                "a compilation into another tensor called with its input as the output"
+            };
+            return Err(Error::argument(Self::NAME, refusal.to_owned()));
         }
         let pairs = u64::from(descriptor.rotated) / 2;
         let heads = u64::from(descriptor.heads);
@@ -975,6 +1024,16 @@ impl Op for RopeApply {
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
+        // A rotation in place modifies its input: its twin starts as a copy of it and is both
+        // the shadow's input and output.
+        if args.x.ptr == args.out.ptr {
+            let twin = twins.in_place(args.x);
+            return RopeApplyArgs {
+                x: twin.clone(),
+                out: twin,
+                ..args
+            };
+        }
         RopeApplyArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -1068,6 +1127,9 @@ mod tests {
             rows: 1,
             block: 128,
             pdl: false,
+            first: 0,
+            inverse: false,
+            inplace: false,
         }
     }
 
@@ -1080,6 +1142,20 @@ mod tests {
         assert_eq!(
             apply(96).to_string(),
             "dtype_bf16_output_bf16_head_dim_128_heads_16_rotation_interleaved_rows_1_block_128_pdl_false_rotated_96"
+        );
+    }
+
+    #[test]
+    fn a_trailing_inverse_rotation_in_place_names_its_placement() {
+        let trailing = RopeApplyDescriptor {
+            inplace: true,
+            ..apply(64).trailing(true)
+        };
+        assert_eq!(trailing.first, 64);
+        assert_eq!(
+            trailing.to_string(),
+            "dtype_bf16_output_bf16_head_dim_128_heads_16_rotation_interleaved_rows_1_block_128_\
+             pdl_false_rotated_64_first_64_inverse_true_inplace_true"
         );
     }
 

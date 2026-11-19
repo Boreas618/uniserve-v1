@@ -1,0 +1,57 @@
+# The record_write operator's Triton backend: design 5.2's package.
+#
+# One program writes one token's record into its paged plane: the row, normalized when the key
+# says so, its trailing channels rotated by the entry's group position, then encoded in the
+# record's format (`ops::record::RecordWrite`). The token count, the rows' stride, the table's
+# width and the epsilon are launch values; the key fixes the row's width and type, the
+# normalization, the rotation, the format, the layout of a page and its record count.
+
+op = "record_write"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+# Every product and sum rounds once (`enable_fp_fusion = false`), as the operator's formula
+# states them. The derivation gives the format's scale block and a record's value and scale
+# bytes.
+[launch]
+kernel = "_record_write_kernel"
+warps = 4
+derive = "derive"
+options = { enable_fp_fusion = false }
+
+# The gain is read in the rows' element type. The plane is BF16 elements for BF16 records and
+# bytes for the packed ones. The table and the rows are U32 columns whose values fit an I32.
+[launch.types]
+x = { pointer = "dtype" }
+weight = { pointer = "dtype" }
+inv_freq = "*fp32"
+entries = "*i32"
+rows = "*i32"
+table = "*i32"
+plane = { field = "format", values = { bf16 = "*bf16", mxfp8 = "*u8", nvfp4 = "*u8", mxfp4 = "*u8" } }
+tokens = "i64"
+x_stride = "i64"
+max_pages = "i32"
+eps = "fp32"
+
+[launch.constants]
+WIDTH = { field = "width" }
+NORM = { field = "norm" }
+ROTATED = { field = "rotated" }
+RATIO = { field = "ratio" }
+FORMAT = { field = "format", values = { bf16 = 0, mxfp8 = 1, nvfp4 = 2, mxfp4 = 3 } }
+PAGED = { field = "layout", values = { entry = false, page = true } }
+ENTRIES = { field = "entries" }
+BLOCK = { field = "block" }
+VALUE_BYTES = { field = "value_bytes" }
+SCALE_BYTES = { field = "scale_bytes" }
+
+# `dtype_bf16_width_512_norm_true_rotated_64_ratio_1_format_mxfp8_layout_entry_entries_64`.
+#
+# `width` is a `tl.arange` extent and so a power of two, at least one scale block of every
+# format; the derivation refuses a rotation wider than the row.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f32"], width = { power_of_two = true, min = 32 }, norm = ["true", "false"], rotated = { min = 0, multiple = 2 }, ratio = { min = 1 }, format = ["bf16", "mxfp8", "nvfp4", "mxfp4"], layout = ["entry", "page"], entries = { min = 1 } }

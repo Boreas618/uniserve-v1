@@ -21,6 +21,13 @@ a cancelling sum, and stronger than the operator's where the element does not
 cancel. A channel past the rotation is held to its input at the same factor,
 on an output pre-filled with NaN. The store is checked apart from the
 arithmetic (:mod:`uniserve_testing.kernels.rope.rounding`).
+
+A rotation may turn a span from channel ``first`` on (a latent attention turns
+its heads' trailing channels), by the negated angles (the inverse rotation,
+``sin -> -sin``), and in place, where the channels outside the span are left
+as they are rather than copied: the placed cases hold the span to the same
+bound, and the rotation in place to the one into another tensor of the input's
+type, bit for bit, with every other channel untouched.
 """
 
 import math
@@ -101,47 +108,68 @@ def factor(output):
 
 
 def launch(
-    kernels, x, cosine, sine, out, rotated, rows, heads_tile, interleaved
+    kernels,
+    x,
+    cosine,
+    sine,
+    out,
+    rotated,
+    rows,
+    heads_tile,
+    interleaved,
+    placement=(0, False),
 ):
     """One launch of the program the descriptor selects: the narrowed one,
     which takes the turned width as a word, when the rotation is partial.
+
+    ``placement`` is the first turned channel and whether the rotation is the
+    inverse one. A launch whose output is its input is in place: the narrowed
+    program then leaves the channels it does not turn alone, and copies them
+    otherwise, as the package's derivation compiles it.
     """  # noqa: D205
     tokens, heads, head_dim = x.shape
+    first, inverse = placement
     narrowed = rotated != head_dim
     words = [x, cosine, sine, out, tokens] + ([rotated] if narrowed else [])
-    kernel = (
-        kernels._rope_apply_narrowed_kernel
-        if narrowed
-        else kernels._rope_apply_full_kernel
-    )
-    kernel[((tokens + rows - 1) // rows, 1, 1)](
-        *words,
-        ROTATED=rotated,
-        PAIRS=rotated // 2,
-        PAIRS_TILE=1 << (rotated // 2 - 1).bit_length(),
-        HEAD_DIM=head_dim,
-        HEADS=heads,
-        ROWS=rows,
-        HEADS_TILE=heads_tile,
-        INTERLEAVED=interleaved,
-        PDL=False,
-    )
+    constants = {
+        "ROTATED": rotated,
+        "PAIRS": rotated // 2,
+        "PAIRS_TILE": 1 << (rotated // 2 - 1).bit_length(),
+        "HEAD_DIM": head_dim,
+        "HEADS": heads,
+        "ROWS": rows,
+        "HEADS_TILE": heads_tile,
+        "INTERLEAVED": interleaved,
+        "INVERSE": inverse,
+        "PDL": False,
+    }
+    if narrowed:
+        kernel = kernels._rope_apply_narrowed_kernel
+        constants["FIRST"] = first
+        constants["COPY"] = x.data_ptr() != out.data_ptr()
+    else:
+        kernel = kernels._rope_apply_full_kernel
+    kernel[((tokens + rows - 1) // rows, 1, 1)](*words, **constants)
 
 
-def reference(x, cosine, sine, rotated, interleaved):
+def reference(x, cosine, sine, rotated, interleaved, placement=(0, False)):
     """The expected output, and the terms each element's error is measured
-    against.
+    against: the rotation of the channels from ``placement``'s first on, by
+    the negated angles for the inverse rotation.
     """  # noqa: D205
+    first, inverse = placement
     x = x.to(torch.float64)
     half = rotated // 2
     if interleaved:
-        low_column = 2 * torch.arange(half)
+        low_column = first + 2 * torch.arange(half)
         high_column = low_column + 1
     else:
-        low_column = torch.arange(half)
+        low_column = first + torch.arange(half)
         high_column = low_column + half
     cos = cosine.to(torch.float64).unsqueeze(1)
     sin = sine.to(torch.float64).unsqueeze(1)
+    if inverse:
+        sin = -sin
     expected = x.clone()
     scale = x.abs().clone()
     low, high = x[..., low_column], x[..., high_column]
@@ -209,3 +237,187 @@ def test_the_rotation_and_its_store_match_the_reference(
 
     if output != "f32":
         stored_copy(where, results[TORCH_TYPES[output]], wide)
+
+
+#: The rotations of a span that does not start at a head's first channel, or
+#: turn backwards, each named for the mistake it catches: the element type,
+#: the pairing, the head width, the heads, the turned channels, the rows one
+#: program covers, the heads' tile, the tokens, the first turned channel and
+#: whether the rotation is the inverse one.
+PLACED = {
+    "a latent's trailing 64 of 512 channels, adjacent pairs": (
+        "bf16",
+        True,
+        512,
+        16,
+        64,
+        8,
+        16,
+        5,
+        448,
+        False,
+    ),
+    "the inverse rotation of the same span, which a forward one fails": (
+        "bf16",
+        True,
+        512,
+        16,
+        64,
+        8,
+        16,
+        5,
+        448,
+        True,
+    ),
+    "an index query's trailing 64 of 128 channels": (
+        "f32",
+        True,
+        128,
+        32,
+        64,
+        4,
+        32,
+        3,
+        64,
+        False,
+    ),
+    "a span inside the head in the half pairing, inverted": (
+        "f32",
+        False,
+        64,
+        4,
+        16,
+        2,
+        4,
+        7,
+        24,
+        True,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", PLACED)
+def test_a_placed_rotation_turns_its_span_and_in_place_leaves_the_rest(
+    case, torch_device, kernel_source
+):
+    (
+        dtype,
+        interleaved,
+        head_dim,
+        heads,
+        rotated,
+        rows,
+        tile,
+        tokens,
+        first,
+        inverse,
+    ) = PLACED[case]
+    torch.manual_seed(SEED)
+    element = TORCH_TYPES[dtype]
+    x = torch.randn(tokens, heads, head_dim).to(element)
+    angle = torch.rand(tokens, rotated // 2) * 2.0 * math.pi
+    cosine = torch.cos(angle).to(torch_device)
+    sine = torch.sin(angle).to(torch_device)
+    kernels = kernel_source("rope_apply")
+    placement = (first, inverse)
+    where = (
+        f"{case}: {dtype}, {tokens} tokens, {heads} heads of {head_dim}, "
+        f"{rotated} turned from channel {first}"
+        f"{', inverse' if inverse else ''}"
+    )
+
+    def into(out, source):
+        launch(
+            kernels,
+            source,
+            cosine,
+            sine,
+            out,
+            rotated,
+            rows,
+            tile,
+            interleaved,
+            placement,
+        )
+        return out
+
+    # Into another tensor: the span turned within the operator's bound, every
+    # other channel copied, on an output that starts as NaN.
+    source = x.to(torch_device)
+    wide = into(
+        torch.full(x.shape, float("nan"), device=torch_device), source
+    ).cpu()
+    expected, scale = reference(
+        x, cosine.cpu(), sine.cpu(), rotated, interleaved, placement
+    )
+    relative = factor(torch.float32)
+    missed = outside(
+        (wide.to(torch.float64) - expected).abs(), relative * scale
+    )
+    assert not missed.any(), (
+        f"{where}: {int(missed.sum())} of {wide.numel()} elements outside the "
+        f"bound, first at {int(missed.reshape(-1).nonzero()[0])}"
+    )
+
+    # In place: the span is what the same rotation stores into another tensor
+    # of the input's type, bit for bit, and every other channel keeps its
+    # input's bits, untouched.
+    narrow = into(
+        torch.full(x.shape, float("nan"), dtype=element, device=torch_device),
+        source,
+    ).cpu()
+    in_place = source.clone()
+    into(in_place, in_place)
+    in_place = in_place.cpu()
+    span = torch.zeros(head_dim, dtype=torch.bool)
+    span[first : first + rotated] = True
+    assert torch.equal(in_place[..., span], narrow[..., span]), (
+        f"{where}: the span rotated in place differs from the rotation into "
+        f"another tensor"
+    )
+    assert torch.equal(in_place[..., ~span], x[..., ~span]), (
+        f"{where}: a channel outside the span changed in place"
+    )
+
+
+def test_the_key_of_a_latent_output_inverse_in_place_turns_its_tail(
+    torch_device, stated_launch, launch_target
+):
+    """The key `RopeApplyDescriptor::trailing(true)` prints for a latent
+    attention's output, rotated back in place: the compilation it states
+    turns the trailing 64 of 512 channels backwards and leaves the rest.
+    """  # noqa: D205
+    tokens, heads, head_dim, rotated = 3, 16, 512, 64
+    stated = stated_launch(
+        "rope_apply",
+        f"dtype_f32_output_f32_head_dim_{head_dim}_heads_{heads}_rotation_"
+        f"interleaved_rows_8_block_128_pdl_false_rotated_{rotated}_first_"
+        f"{head_dim - rotated}_inverse_true_inplace_true",
+        launch_target,
+    )
+    assert stated.words == ["x", "cosine", "sine", "out", "tokens", "rotated"]
+
+    torch.manual_seed(SEED)
+    x = torch.randn(tokens, heads, head_dim)
+    angle = torch.rand(tokens, rotated // 2) * 2.0 * math.pi
+    cosine, sine = torch.cos(angle), torch.sin(angle)
+    in_place = x.clone().to(torch_device)
+    stated.kernel[(1, 1, 1)](
+        in_place,
+        cosine.to(torch_device),
+        sine.to(torch_device),
+        in_place,
+        tokens,
+        rotated,
+        **stated.constexprs,
+    )
+
+    got = in_place.cpu()
+    placement = (head_dim - rotated, True)
+    expected, scale = reference(x, cosine, sine, rotated, True, placement)
+    missed = outside(
+        (got.to(torch.float64) - expected).abs(),
+        factor(torch.float32) * scale,
+    )
+    assert not missed.any(), f"{int(missed.sum())} elements outside the bound"
+    assert torch.equal(got[..., : head_dim - rotated], x[..., :-rotated])

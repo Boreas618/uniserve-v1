@@ -19,7 +19,7 @@ Run with an interpreter that has torch, numpy, sympy and transformers, from
 the repository root:
 
     cd crates/models/tests/it/deepseek_v41
-    python generate_reference.py <snapshot of the release> data/engram.json
+    python generate_engram.py <snapshot of the release> data/engram.json
 """
 
 import hashlib

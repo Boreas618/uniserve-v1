@@ -458,12 +458,18 @@ impl IndexedAttention {
         functional::place_rows_(&ring_positions, &ring_row, &own)?;
 
         // The scores of the groups complete before each row, and the best of them.
+        let keys = functional::Plane {
+            records: plane,
+            table: &cache.block_tables,
+            format: functional::Format::Bf16,
+            layout: functional::Layout::Page,
+        };
         let scores = functional::index_scores(
             &index_query,
-            cache,
-            layer,
+            keys,
             &columns[ROW],
             &visible.to_dtype(DType::U32)?,
+            functional::Scoring::default(),
         )?;
         let block_topk = self.indexer.block_topk() as usize;
         let kept_groups = block_topk.min(scores.dims()[1]);

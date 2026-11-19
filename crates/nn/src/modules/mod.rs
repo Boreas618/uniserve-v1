@@ -17,6 +17,7 @@ mod frame;
 mod gated_delta_net;
 mod head;
 mod hyper;
+mod latent;
 mod linear;
 mod mlp;
 mod moe;
@@ -27,6 +28,10 @@ mod rotary;
 pub use attention::{Attention, AttentionConfig, QkNorm};
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use gated_delta_net::{GatedDeltaNet, GatedDeltaNetConfig};
+pub use latent::{
+    Candidates, Compressed, Compressor, CompressorConfig, Indexer, IndexerConfig, LatentAttention,
+    LatentAttentionConfig, LatentBatch, Selection,
+};
 mod timestep;
 pub mod ulysses;
 mod vocoder;

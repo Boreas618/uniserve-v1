@@ -1011,18 +1011,22 @@ fn the_indexed_functions_are_vllms_references() {
     };
 
     // Scores: two heads of sixteen elements against each visible key.
-    let scores_cache = KvCache {
-        block_tables: table.clone(),
-        page_size: 64,
-        layers: vec![plane(
-            zeros(Shape::from(1), DType::F32),
-            Some(named("index_keys")),
-        )],
-        workspace: zeros(Shape::from(1), DType::U8),
+    let index_keys = named("index_keys");
+    let keys = functional::Plane {
+        records: &index_keys,
+        table: &table,
+        format: functional::Format::Bf16,
+        layout: functional::Layout::Page,
     };
     let visible = named("visible").to_dtype(DType::U32).unwrap();
-    let scores = functional::index_scores(&named("index_query"), &scores_cache, 0, &rows, &visible)
-        .expect("the scores");
+    let scores = functional::index_scores(
+        &named("index_query"),
+        keys,
+        &rows,
+        &visible,
+        functional::Scoring::default(),
+    )
+    .expect("the scores");
     assert_close(
         "index scores",
         &scores,

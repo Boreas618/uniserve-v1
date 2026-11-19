@@ -97,6 +97,8 @@
 //! | [`rope::QkNormRope`] | `qk_norm_rope` | [`rope`] |
 //! | [`kv::KvWrite`] | `kv_write` | [`kv`] |
 //! | [`kv::KvWriteScaled`] | `kv_write_scaled` | [`kv`] |
+//! | [`record::RecordWrite`] | `record_write` | [`record`] |
+//! | [`compress::LatentCompress`] | `latent_compress` | [`compress`] |
 //!
 //! Logits and sampling:
 //!
@@ -159,6 +161,7 @@ pub mod cast;
 pub mod channel_affine;
 pub mod collective;
 pub mod commit;
+pub mod compress;
 pub mod context;
 pub mod conv;
 pub mod copy_block;
@@ -197,6 +200,7 @@ pub mod position;
 pub mod posterior;
 mod primitives;
 pub mod profiler;
+pub mod record;
 pub mod recurrent;
 pub mod reduce;
 pub mod residual;
