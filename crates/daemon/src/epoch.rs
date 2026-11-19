@@ -868,6 +868,29 @@ mod tests {
         };
         assert_eq!(change(&drafting(2), &drafting(4)), Change::Generation);
         assert_eq!(change(&drafting(2), &base), Change::Generation);
+        // The synthetic acceptance length shapes no graph: every batch carries it to its ranks
+        // from each scheduler's next step on, switched on, between two lengths and off.
+        let synthetic = |length: Option<f64>| {
+            let mut config = Config::default();
+            config.speculative_config.num_draft_tokens = 3;
+            config.speculative_config.synthetic_acceptance_length = length;
+            Epoch::of(config).expect("the configuration resolves")
+        };
+        for (from, to) in [(None, Some(2.5)), (Some(2.5), Some(3.0)), (Some(3.0), None)] {
+            let (from, to) = (synthetic(from), synthetic(to));
+            assert_eq!(
+                change(&from, &to),
+                Change::None,
+                "a synthetic length moves no update"
+            );
+
+            let changes = proto::reload::changes(Some(&from.config), &to.config);
+            assert_eq!(
+                proto::reload::Effects::of(&changes).heaviest(),
+                Some(proto::reload::Effect::Step),
+                "a synthetic length takes effect at the next step"
+            );
+        }
         // Switched on, the capability needs the storage a new epoch lays out.
         let mut uncached = Config::default();
         uncached.kv_cache_config.prefix_caching = false;

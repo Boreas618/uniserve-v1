@@ -27,8 +27,10 @@
 //!   processor_stage, draw_index]`, where the token index is the sampled
 //!   token's logical position in the request's sequence (the position its
 //!   token takes: prompt and generated tokens before it), which a migration
-//!   keeps, and the stage and draw index are zero for the one draw of target
-//!   sampling;
+//!   keeps; the stage is zero, the draw index zero for the token's own draw
+//!   of target sampling and one for synthetic acceptance's draw of the draft
+//!   at that position ([`DrawAddress::acceptance_word`]), so the two are
+//!   independent;
 //! - uniform = `(word0 >> 8) * 2^-24`, a 24-bit dyadic value in `[0, 1)`.
 
 const PHILOX_M0: u32 = 0xD251_1F53;
@@ -39,6 +41,13 @@ const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// The draw space of target sampling, folded as a key's last coordinate.
 const TARGET_DRAW_SPACE: u64 = 0;
+
+/// The draw index of synthetic acceptance's draw at a position, beside the token's own draw
+/// (index zero).
+const ACCEPTANCE_DRAW: u64 = 1;
+
+/// The words of a uniform's resolution: a draw is `word · 2^-24` for a 24-bit `word`.
+pub(crate) const UNIFORM_WORDS: u32 = 1 << 24;
 
 /// Folds one semantic coordinate into an evolving key with SplitMix64 avalanche.
 fn splitmix_coordinate(seed: u64, coordinate: u64) -> u64 {
@@ -138,20 +147,26 @@ impl DrawAddress {
     pub fn uniform(self) -> f32 {
         sampling_uniform(self.key, self.position, 0, 0)
     }
+
+    /// Synthetic acceptance's draw at the address as its 24-bit word `w`, in
+    /// `[0, UNIFORM_WORDS)`: the uniform `w · 2^-24` of draw index one, which a
+    /// verification compares with the rate of the draft at the position
+    /// (`crate::runner::causal_lm::speculation`). It is independent of the
+    /// position's own draw, so the token a rejected position samples is
+    /// distributed as without the acceptance.
+    pub fn acceptance_word(self) -> u32 {
+        sampling_word(self.key, self.position, 0, ACCEPTANCE_DRAW)
+    }
 }
 
-/// Maps one Philox word to an exactly representable 24-bit uniform value.
-fn uniform_from_word(word: u32) -> f32 {
-    ((word >> 8) as f32) * (1.0f32 / 16_777_216.0f32)
-}
-
-/// Returns one uniform draw in `[0, 1)` for a semantic coordinate and request key.
-pub(crate) fn sampling_uniform(
+/// Returns one draw's 24-bit word in `[0, UNIFORM_WORDS)` for a semantic
+/// coordinate and request key: the uniform is the word times `2^-24`.
+fn sampling_word(
     key: u64,
     semantic_token_index: u64,
     processor_stage: u64,
     draw_index: u64,
-) -> f32 {
+) -> u32 {
     // The counter layout gives each token, processor stage, and draw index an
     // independent address without relying on mutable generator state. The
     // token index keeps all 64 bits across two words; the stage and draw
@@ -163,7 +178,19 @@ pub(crate) fn sampling_uniform(
         draw_index as u32,
     ];
     let words = philox4x32_10(counter, [key as u32, (key >> 32) as u32]);
-    uniform_from_word(words[0])
+    words[0] >> 8
+}
+
+/// Returns one uniform draw in `[0, 1)` for a semantic coordinate and request
+/// key: an exactly representable 24-bit dyadic value.
+pub(crate) fn sampling_uniform(
+    key: u64,
+    semantic_token_index: u64,
+    processor_stage: u64,
+    draw_index: u64,
+) -> f32 {
+    let word = sampling_word(key, semantic_token_index, processor_stage, draw_index);
+    (word as f32) * (1.0f32 / UNIFORM_WORDS as f32)
 }
 
 #[cfg(test)]

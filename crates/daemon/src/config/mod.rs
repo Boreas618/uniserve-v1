@@ -1076,6 +1076,16 @@ impl Config {
                 "invalid `speculative_config.refill_token_cost`: {cost} must not be negative"
             );
         }
+        // A verification commits its own token and at most every draft it carries.
+        if let Some(length) = speculation.synthetic_acceptance_length {
+            let most = f64::from(speculation.num_draft_tokens) + 1.0;
+            anyhow::ensure!(
+                speculation.num_draft_tokens > 0 && (1.0..=most).contains(&length),
+                "invalid `speculative_config.synthetic_acceptance_length`: {length} must lie \
+                 between 1 and one more than `num_draft_tokens`, {most}, in a deployment that \
+                 speculates"
+            );
+        }
         if let Some(slowdown) = self.update_config.transfer_slowdown {
             anyhow::ensure!(
                 slowdown.is_finite() && slowdown > 0.0,

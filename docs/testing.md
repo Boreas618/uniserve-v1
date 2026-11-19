@@ -55,6 +55,7 @@ The checkpoints and adapters the cases serve are released Hugging Face repositor
 | Asset | Repository | Cases |
 | --- | --- | --- |
 | `qwen3` | `Qwen/Qwen3-30B-A3B` | every Qwen3 module |
+| `qwen3.5` | `Qwen/Qwen3.5-35B-A3B` | `test_speculation_http.py` |
 | `fasth3` | `FastVideo/FastVideo-FastH3-8-Step-V2` | the FastH3 modules |
 | `minimax-h3` | `MiniMaxAI/MiniMax-H3` | `test_minimax_h3_http.py`, `test_minimax_h3_conditions_http.py` |
 | `fasth3-omniref` | `FastVideo/FastVideo-FastH3-Omni-8-Step-V1` | `test_minimax_h3_conditions_http.py` |

@@ -3848,10 +3848,13 @@ fn a_verification_agrees_the_drafts_its_samples_equal_up_to_the_first_that_diffe
     let drafts = [7_u32, 8, 9, none, 7, 8, none, 7, 8, none, none];
     let windows = [0_u32, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10, 10, 10, 10];
     let firsts = [0_u32, 4, 7, 10];
+    // The synthetic law's draws, which windows into the model's law's agreements never read.
+    let unread = Tensor::zeros(11, DType::U32, &cpu).unwrap();
 
     let (agreed, last) = speculation::accept(
         &Tensor::from_slice(&chosen, 11, &cpu).unwrap(),
         &Tensor::from_slice(&drafts, 11, &cpu).unwrap(),
+        (&unread, &unread),
         &Tensor::from_slice(&windows, (4, 4), &cpu).unwrap(),
         &Tensor::from_slice(&firsts, 4, &cpu).unwrap(),
     )
@@ -3863,15 +3866,229 @@ fn a_verification_agrees_the_drafts_its_samples_equal_up_to_the_first_that_diffe
     assert_eq!(last.to_vec1::<u32>().unwrap(), [2, 6, 7, 10]);
 
     // A row the batch does not hold agrees nothing.
+    let unread = Tensor::zeros(2, DType::U32, &cpu).unwrap();
     let (agreed, last) = speculation::accept(
         &Tensor::from_slice(&[0_u32, 0], 2, &cpu).unwrap(),
         &Tensor::from_slice(&[none, none], 2, &cpu).unwrap(),
+        (&unread, &unread),
         &Tensor::from_slice(&[none; 4], (2, 2), &cpu).unwrap(),
         &Tensor::from_slice(&[0_u32, 0], 2, &cpu).unwrap(),
     )
     .unwrap();
     assert_eq!(agreed.to_vec1::<u32>().unwrap(), [0, 0]);
     assert_eq!(last.to_vec1::<u32>().unwrap(), [0, 0]);
+}
+
+// ---- Synthetic acceptance ---------------------------------------------------------------------
+
+/// A greedy verification batch of one call per entry of `requests`, on the slots from one on:
+/// each `(key, position)` a committed token and two drafts in the request stream `key` from
+/// `position` on, the drafts never zero, under synthetic acceptance of mean length `length`.
+fn synthetic_verification(requests: &[(u64, u64)], length: Option<f64>) -> Batch {
+    let calls = requests.len();
+    let width = DRAFTS as usize + 1;
+    let call = |index: usize| Row {
+        slot: index as u32 + 1,
+        kind: Phase::Verify,
+        cache_group: 0,
+        rows: index as u32..index as u32 + 1,
+    };
+    let positions: Vec<i32> = requests
+        .iter()
+        .flat_map(|(_, position)| (0..width).map(move |ahead| (*position as usize + ahead) as i32))
+        .collect();
+    let tasks: Vec<(i64, i64, i64)> = (0..calls)
+        .map(|index| (index as i64 + 1, mode::VERIFY, index as i64))
+        .collect();
+
+    let columns = Columns {
+        rows: Rows {
+            calls: (0..calls).map(call).collect(),
+            cache_positions: positions.clone(),
+            seq_lens: positions
+                .chunks(width)
+                .map(|row| row[width - 1] + 1)
+                .collect(),
+            query_offsets: (0..=calls).map(|index| (index * width) as i32).collect(),
+            logits_rows: (0..calls as i32).collect(),
+            positions,
+        },
+        input_ids: (0..calls * width)
+            .map(|token| (token % 5) as i32 + 1)
+            .collect(),
+        slots: (1..=calls as i32).collect(),
+        parameters: request(0.0).repeat(calls),
+        draws: requests
+            .iter()
+            .map(|(key, position)| DrawAddress {
+                key: *key,
+                position: position + width as u64,
+            })
+            .collect(),
+        commit: commit(&tasks),
+        page_size: PAGE,
+        max_kv_len: MAX_KV_LEN,
+        synthetic_acceptance_length: length,
+        ..Columns::default()
+    };
+    batch(
+        BatchShape::prefill(calls as u32, (calls * width) as u32, Variant::DecodeGreedy),
+        columns,
+    )
+}
+
+/// The tokens each call of `batch`, a verification of at most four calls, commits when the
+/// model selects `chosen` at its tokens (zero past them): the verification bucket's columns
+/// and its acceptance on the device, over the host's tensors.
+fn committed(batch: &Batch, chosen: &[u32]) -> Vec<u32> {
+    let bucket = Bucket::verify(4, DRAFTS, Variant::VerifyGreedy);
+    let (layout, mut block) = speculating_block();
+    speculation::fill_verification(
+        &layout,
+        SLOTS,
+        VOCABULARY as u32,
+        &batch.columns,
+        &speculation::token_rows(&batch.columns),
+        &bucket,
+        &[],
+        &mut block,
+    )
+    .unwrap();
+
+    let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+    let width = DRAFTS as usize + 1;
+    let column = |column, elements| u32_column(&read::<u32>(&layout, &block, column, elements));
+    let mut selected = chosen.to_vec();
+    selected.resize(tokens, 0);
+
+    let (agreed, _) = speculation::accept(
+        &u32_column(&selected),
+        &column(Column::Drafts, tokens),
+        (
+            &column(Column::AcceptDraws, tokens),
+            &column(Column::AcceptBounds, tokens),
+        ),
+        &column(Column::Windows, rows * width)
+            .reshape((rows, width))
+            .unwrap(),
+        &column(Column::Firsts, rows),
+    )
+    .unwrap();
+
+    let agreed = agreed.to_vec1::<u32>().unwrap();
+    agreed[..batch.columns.calls()]
+        .iter()
+        .map(|agreed| agreed + 1)
+        .collect()
+}
+
+#[test]
+fn synthetic_acceptance_rates_are_vllm_s_least_variance_schedule() {
+    // vLLM's rates for a length over five drafts, unconditional and then conditional: 3.5
+    // accepts two drafts and the third half the time, 2.25 the first and a quarter of the
+    // second.
+    let rates = |length: f64| -> Vec<f64> {
+        (0..5)
+            .map(|draft| speculation::acceptance_rate(length, draft))
+            .collect()
+    };
+    assert_eq!(rates(3.5), [1.0, 1.0, 0.5, 0.0, 0.0]);
+    assert_eq!(rates(2.25), [1.0, 0.25, 0.0, 0.0, 0.0]);
+    assert_eq!(rates(1.0), [0.0; 5]);
+    assert_eq!(rates(6.0), [1.0; 5]);
+
+    // Their products, the unconditional rates, sum to one fewer than the length.
+    for length in [1.0, 1.4, 2.5, 3.0, 4.75, 6.0] {
+        let mut reached = 1.0;
+        let accepted: f64 = (0..5)
+            .map(|draft| {
+                reached *= speculation::acceptance_rate(length, draft);
+                reached
+            })
+            .sum();
+        assert!((1.0 + accepted - length).abs() < 1e-12, "{length}");
+    }
+}
+
+#[test]
+fn synthetic_acceptance_commits_its_mean_length_whatever_the_model_selects() {
+    use crate::batch::philox::request_sampling_key;
+
+    // Requests of fixed seeds, four a batch, each verifying two drafts at a position of its
+    // own.
+    let requests: Vec<(u64, u64)> = (0..4000_u64)
+        .map(|seed| (request_sampling_key(Some(seed), 0, 0, 0), 10 + seed % 37))
+        .collect();
+    let drafts_of = |batch: &Batch| -> Vec<u32> {
+        batch
+            .columns
+            .input_ids
+            .iter()
+            .map(|id| *id as u32)
+            .collect()
+    };
+
+    for length in [1.0, 1.5, 2.0, 2.25, 2.6, 3.0] {
+        let mut tokens = 0;
+        for batch in requests.chunks(4) {
+            let batch = synthetic_verification(batch, Some(length));
+
+            // A model that selects no draft and one whose every selection is the next draft
+            // commit the same tokens: the law reads neither.
+            let unselected = committed(&batch, &[]);
+            let mut shifted = drafts_of(&batch);
+            shifted.remove(0);
+            assert_eq!(committed(&batch, &shifted), unselected, "{length}");
+
+            tokens += unselected.iter().sum::<u32>();
+        }
+        let mean = f64::from(tokens) / requests.len() as f64;
+
+        // At most one draft's rate lies strictly between zero and one, so a verification's
+        // committed tokens vary as one Bernoulli draw does, by at most a half: five standard
+        // errors of the mean of the requests' verifications.
+        let bound = 5.0 * 0.5 / (requests.len() as f64).sqrt();
+        assert!(
+            (mean - length).abs() <= bound,
+            "{mean} tokens a verification under a synthetic length of {length}"
+        );
+    }
+
+    // Without a synthetic length the model's own law accepts what it selects: none of the
+    // drafts a model that selects zero.
+    let batch = synthetic_verification(&requests[..4], None);
+    assert_eq!(committed(&batch, &[]), [1; 4]);
+}
+
+#[test]
+fn synthetic_acceptance_of_a_request_follows_its_seed_and_positions_alone() {
+    use crate::batch::philox::request_sampling_key;
+
+    let length = Some(2.5);
+    let request = request_sampling_key(Some(7), 0, 0, 0);
+    let alone =
+        |position: u64| committed(&synthetic_verification(&[(request, position)], length), &[])[0];
+
+    // Run again, the request's verification at position 40 accepts the same drafts.
+    let accepted = alone(40);
+    assert_eq!(alone(40), accepted);
+
+    // Beside other requests and in another row, as another batch or another engine after a
+    // migration places it, it accepts them too.
+    for row in 0..4 {
+        let mut beside: Vec<(u64, u64)> = (0..3)
+            .map(|other| (request_sampling_key(Some(100 + other), 0, 0, 0), 17 + other))
+            .collect();
+        beside.insert(row, (request, 40));
+
+        let batch = synthetic_verification(&beside, length);
+        assert_eq!(committed(&batch, &[])[row], accepted, "row {row}");
+    }
+
+    // The draws are its positions': over its verifications at other positions, its second
+    // draft is accepted at some and rejected at others.
+    let outcomes: std::collections::BTreeSet<u32> = (0..64).map(alone).collect();
+    assert_eq!(outcomes, [2, 3].into());
 }
 
 #[test]
@@ -4601,6 +4818,10 @@ fn a_verification_continues_each_slot_from_the_token_its_acceptance_ends_on() {
     let (agreed, last) = speculation::accept(
         &u32_column(&chosen),
         &column(Column::Drafts, tokens),
+        (
+            &column(Column::AcceptDraws, tokens),
+            &column(Column::AcceptBounds, tokens),
+        ),
         &column(Column::Windows, rows * (DRAFTS as usize + 1))
             .reshape((rows, DRAFTS as usize + 1))
             .unwrap(),
