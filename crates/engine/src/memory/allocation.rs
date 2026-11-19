@@ -166,13 +166,19 @@ impl Storage {
         }))
     }
 
-    /// Every other visible device that can address `device`'s storage: the devices an exportable
-    /// allocation grants access to, so readers on those devices in this process copy from it.
-    pub(crate) fn peers(device: DeviceId) -> Result<Vec<DeviceId>> {
+    /// The devices of `served`, the CUDA devices this process serves (`EngineArgs::devices`),
+    /// other than `device` that can address `device`'s storage: the devices a rank's storage
+    /// grants access to, so readers on those devices in this process copy from it.
+    ///
+    /// A grant costs the driver state of every mapping on the device it is given to, which a
+    /// mapping of a GPU's whole KV cache makes a share of that device's storage that no quota
+    /// counts. A device the process does not serve reads nothing of its ranks, and may serve
+    /// another deployment, so it is granted nothing whether the process can see it or not.
+    pub(crate) fn peers(device: DeviceId, served: &[DeviceId]) -> Result<Vec<DeviceId>> {
         let mut peers = Vec::new();
 
-        for peer in (0..DeviceId::count()?).map(DeviceId) {
-            if peer != device && peer.can_access_peer(device)? {
+        for &peer in served {
+            if peer != device && !peers.contains(&peer) && peer.can_access_peer(device)? {
                 peers.push(peer);
             }
         }

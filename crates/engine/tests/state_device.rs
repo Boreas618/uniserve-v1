@@ -94,7 +94,7 @@ fn config(trail: u32) -> StateConfig {
 /// The device's allocator with room for the state's buffers and its snapshot.
 fn allocator() -> Outcome<platform::Allocator> {
     let mut allocator =
-        platform::Allocator::new(&platform::Device::new(DEVICE)?, Arc::new(Unbounded))?;
+        platform::Allocator::new(&platform::Device::new(DEVICE)?, &[], Arc::new(Unbounded))?;
     allocator.reserve(PoolKind::Resident, 64 << 20)?;
     allocator.reserve(PoolKind::Scratch, 64 << 20)?;
     Ok(allocator)
@@ -147,7 +147,7 @@ fn write_row(stream: &Stream, buffer: &Tensor, row: usize, values: &[f32]) -> Ou
 fn a_keep_and_a_restore_move_a_checkpoint_through_a_state_unit() -> Outcome {
     let stream = Stream::new(DEVICE)?;
     let cache_config = cache()?;
-    let cache = KvCacheMemory::open(cache_config.clone(), DEVICE, &LocalStorage, &stream)?;
+    let cache = KvCacheMemory::open(cache_config.clone(), (DEVICE, &[]), &LocalStorage, &stream)?;
 
     // The generation holds the kernels the state's own profile states.
     let keys = StateMemory::meta(config(0), &cache_config)?.keys()?;
@@ -307,7 +307,7 @@ fn counting(from: usize, count: usize) -> Vec<f32> {
 fn a_keep_and_a_restore_move_a_windows_history_and_leave_its_draft_rows() -> Outcome {
     let stream = Stream::new(DEVICE)?;
     let cache_config = drafting_cache()?;
-    let cache = KvCacheMemory::open(cache_config.clone(), DEVICE, &LocalStorage, &stream)?;
+    let cache = KvCacheMemory::open(cache_config.clone(), (DEVICE, &[]), &LocalStorage, &stream)?;
 
     let keys = StateMemory::meta(drafting_config(2), &cache_config)?.keys()?;
     let kernels = Kernels::open()?.generation(1, &keys)?;

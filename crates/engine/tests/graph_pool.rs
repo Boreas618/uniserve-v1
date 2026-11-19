@@ -85,8 +85,15 @@ fn the_runners_regions_are_mapped_apart_and_reserved_in_the_quota() {
     let (_head, client) = rank(&server);
 
     let sizes = [(RunnerId(0), 5 * MIB), (RunnerId(1), 3 * MIB)];
-    let mut pool =
-        GraphPool::open(Arc::clone(&client), device, 0.5, &sizes, 4 * MIB, 4 * MIB).unwrap();
+    let mut pool = GraphPool::open(
+        Arc::clone(&client),
+        (device, &[]),
+        0.5,
+        &sizes,
+        4 * MIB,
+        4 * MIB,
+    )
+    .unwrap();
 
     let first = pool.region(RunnerId(0)).unwrap();
     let second = pool.region(RunnerId(1)).unwrap();
@@ -144,7 +151,7 @@ fn regions_past_the_quota_are_refused_and_reserve_nothing() {
     // A hundredth of the device is the limit; the second region alone is a fiftieth.
     let total = device.memory_info().unwrap().total;
     let sizes = [(RunnerId(0), 2 * MIB), (RunnerId(1), total / 50)];
-    let refused = GraphPool::open(Arc::clone(&client), device, 0.01, &sizes, 0, 0);
+    let refused = GraphPool::open(Arc::clone(&client), (device, &[]), 0.01, &sizes, 0, 0);
     assert!(refused.is_err());
 
     // The first region was mapped and reserved before the second was refused; its storage
@@ -164,7 +171,7 @@ fn a_suspended_pool_is_restored_at_the_same_addresses_with_its_bytes() {
     let (_head, client) = rank(&server);
 
     let sizes = [(RunnerId(0), 4 * MIB)];
-    let mut pool = GraphPool::open(Arc::clone(&client), device, 0.5, &sizes, 0, 0).unwrap();
+    let mut pool = GraphPool::open(Arc::clone(&client), (device, &[]), 0.5, &sizes, 0, 0).unwrap();
     let region = pool.region(RunnerId(0)).unwrap();
     let mapped = pool.mapped();
 

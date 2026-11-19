@@ -144,7 +144,9 @@ impl GraphPool {
     /// reserves none, for a rank that never shadows and keeps no state snapshot. `resident` is
     /// the bytes of the recurrent state's live buffers (`StateConfig::bytes`), and zero reserves
     /// no resident pool, for a model that keeps no state. `fraction` is the deployment's
-    /// `mem_fraction_static`, whose limit the pools' reservation restates.
+    /// `mem_fraction_static`, whose limit the pools' reservation restates. Every block the pools
+    /// map is addressed by `device` and each of `peers`, the other devices of the process that
+    /// read it (`Storage::peers`).
     ///
     /// # Errors
     ///
@@ -153,7 +155,7 @@ impl GraphPool {
     /// regions do not fit the GPU's quota. Nothing stays mapped after an error.
     pub fn open(
         client: Arc<StorageClient>,
-        device: DeviceId,
+        (device, peers): (DeviceId, &[DeviceId]),
         fraction: f64,
         regions: &[(RunnerId, u64)],
         scratch: u64,
@@ -174,7 +176,8 @@ impl GraphPool {
             mapped: Mutex::new([0; PoolKind::ALL.len()]),
             usage: Arc::clone(&usage),
         };
-        let mut allocator = Allocator::new(&platform::Device::new(device)?, Arc::new(reservation))?;
+        let device_handle = platform::Device::new(device)?;
+        let mut allocator = Allocator::new(&device_handle, peers, Arc::new(reservation))?;
 
         // Addresses cost nothing, so each pool reserves as many as the quota could ever let
         // it map: whatever granules the driver rounds a region up to, its address range holds

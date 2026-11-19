@@ -35,6 +35,7 @@
 
 use std::sync::Arc;
 
+use crate::memory::allocation::Storage;
 use crate::memory::cache::segments::{self, PlaneSegment};
 use crate::memory::cache::{ATTENTION_WORKSPACE_BYTES, CacheLayout, KvCacheConfig};
 use crate::memory::client::{StorageClient, quota_limit};
@@ -79,6 +80,27 @@ impl ModelRunner {
     /// (`specs/buffer-pool.md` §6).
     pub(crate) fn page_tokens(&self) -> u32 {
         self.engine_config().kv_cache.block_tokens()
+    }
+
+    /// The other devices of this process that address the storage the rank maps on `device`
+    /// (its KV cache, its state units, its graph pools, its product buffer): among the CUDA
+    /// devices the process serves (`EngineArgs::devices`), those that can access `device`'s
+    /// storage (`Storage::peers`). A device the process can see but does not serve is granted
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the driver cannot tell a device's peer access.
+    pub(crate) fn peers(&self, device: DeviceId) -> Result<Vec<DeviceId>> {
+        let served: Vec<DeviceId> = self
+            .launch()
+            .devices
+            .iter()
+            .filter_map(|&ordinal| i32::try_from(ordinal).ok())
+            .map(DeviceId)
+            .collect();
+
+        Storage::peers(device, &served).context("reading which served devices reach the rank's")
     }
 
     /// The layout of the rank's cache for `model` (step 5): one attention group of the model's

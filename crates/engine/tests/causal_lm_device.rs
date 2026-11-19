@@ -674,7 +674,7 @@ fn state_cache(runs: &[StateShape]) -> Outcome<KvCacheConfig> {
 /// The device's allocator with room for the states' buffers and their snapshot.
 fn allocator() -> Outcome<platform::Allocator> {
     let mut allocator =
-        platform::Allocator::new(&platform::Device::new(DEVICE)?, Arc::new(Unbounded))?;
+        platform::Allocator::new(&platform::Device::new(DEVICE)?, &[], Arc::new(Unbounded))?;
     allocator.reserve(PoolKind::Resident, 64 << 20)?;
     allocator.reserve(PoolKind::Scratch, 64 << 20)?;
     Ok(allocator)

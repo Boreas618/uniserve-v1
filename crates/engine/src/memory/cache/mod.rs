@@ -249,9 +249,10 @@ impl KvCacheMemory {
     }
 
     /// Opens the cache of `config` on `device`: takes its planes and its state units from
-    /// `owner` (the rank's Storage Server client, or storage local to the process), allocates its
-    /// page tables and workspace, and resets what was created of the planes for this rank on
-    /// `stream`, which is synchronized before returning.
+    /// `owner` (the rank's Storage Server client, or storage local to the process), addressed by
+    /// `device` and each of `peers` (`Storage::peers`), allocates its page tables and workspace,
+    /// and resets what was created of the planes for this rank on `stream`, which is synchronized
+    /// before returning.
     ///
     /// # Errors
     ///
@@ -259,7 +260,7 @@ impl KvCacheMemory {
     /// config's units, or a storage `owner` or the device refuses.
     pub fn open(
         config: KvCacheConfig,
-        device: DeviceId,
+        (device, peers): (DeviceId, &[DeviceId]),
         owner: &dyn ExclusiveStorage,
         stream: &Stream,
     ) -> Result<Self> {
@@ -269,7 +270,7 @@ impl KvCacheMemory {
             Arc::clone(&config.layout),
             config.units,
             config.segments.as_deref(),
-            device,
+            (device, peers),
             owner,
             stream,
         )?;
@@ -287,7 +288,7 @@ impl KvCacheMemory {
                 &config.layout,
                 config.states.0,
                 config.states.1.as_deref(),
-                device,
+                (device, peers),
                 owner,
             )?),
             None => None,
@@ -1528,7 +1529,7 @@ mod tests {
         let stream = Stream::new(device)?;
         let mut cache = KvCacheMemory::open(
             two_groups(),
-            device,
+            (device, &[]),
             &crate::memory::exclusive::LocalStorage,
             &stream,
         )?;
@@ -1627,7 +1628,7 @@ mod tests {
             workspace_bytes: 1 << 20,
             states: (0, None),
         };
-        let mut cache = KvCacheMemory::open(config, device, &local, &stream)?;
+        let mut cache = KvCacheMemory::open(config, (device, &[]), &local, &stream)?;
         cache.set_regions(CacheRegions {
             units: UNITS,
             states: None,

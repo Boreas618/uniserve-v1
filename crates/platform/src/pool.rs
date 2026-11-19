@@ -61,7 +61,7 @@ pub struct VirtualPool {
     context: PrimaryContext,
     device: DeviceId,
     /// The ordinals granted access to the chunks: the device's, then each
-    /// peer's that can access its storage.
+    /// peer's the pool was reserved for.
     access: Vec<i32>,
     address: u64,
     reserved: usize,
@@ -80,27 +80,37 @@ pub struct VirtualPool {
 
 impl VirtualPool {
     /// Reserves `bytes` of virtual addresses on `device`, rounded up to the
-    /// allocation granularity; no physical storage is mapped yet.
+    /// allocation granularity, whose chunks every visible device that can
+    /// access `device`'s storage addresses; no physical storage is mapped yet.
     ///
     /// # Errors
     ///
     /// Fails when the driver cannot reserve the range.
     pub fn reserve(device: DeviceId, bytes: usize) -> Result<Self> {
         let handle_type = HandleType::probe(device)?;
-        Self::with_handle_type(device, bytes, handle_type, None)
+        let mut peers = Vec::new();
+        for peer in (0..DeviceId::count()?).map(DeviceId) {
+            if peer != device && peer.can_access_peer(device)? {
+                peers.push(peer);
+            }
+        }
+        Self::with_handle_type(device, bytes, handle_type, &peers, None)
     }
 
     /// Reserves `bytes` of virtual addresses on `device` for one of an
-    /// allocator's pools: every block it maps uses `handle_type` handles and is
-    /// booked against `budget` as `kind` before its storage is created.
+    /// allocator's pools: every block it maps uses `handle_type` handles, is
+    /// booked against `budget` as `kind` before its storage is created, and is
+    /// addressed by `device` and each of `peers`.
     pub(crate) fn with_budget(
         device: DeviceId,
         bytes: usize,
         handle_type: HandleType,
+        peers: &[DeviceId],
         kind: PoolKind,
         budget: Arc<dyn Budget>,
     ) -> Result<Self> {
-        Self::with_handle_type(device, bytes, handle_type, Some(Booking { kind, budget }))
+        let booking = Some(Booking { kind, budget });
+        Self::with_handle_type(device, bytes, handle_type, peers, booking)
     }
 
     /// The extent in which a pool of `handle_type` blocks on `device` maps each block: the
@@ -127,19 +137,20 @@ impl VirtualPool {
         })
     }
 
+    /// Reserves the range of a pool whose blocks `device` and each of `peers`
+    /// address.
     fn with_handle_type(
         device: DeviceId,
         bytes: usize,
         handle_type: HandleType,
+        peers: &[DeviceId],
         booking: Option<Booking>,
     ) -> Result<Self> {
         let context = PrimaryContext::retain(device)?;
         let ordinal = device.handle()?;
         let mut access = vec![ordinal];
-        for peer in (0..DeviceId::count()?).map(DeviceId) {
-            if peer != device && peer.can_access_peer(device)? {
-                access.push(peer.handle()?);
-            }
+        for peer in peers.iter().filter(|&&peer| peer != device) {
+            access.push(peer.handle()?);
         }
         let granularity = Self::granularity(device, handle_type)?;
         let (address, reserved) = in_context(context.raw(), |driver| {

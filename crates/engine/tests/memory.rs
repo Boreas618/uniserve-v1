@@ -401,7 +401,7 @@ fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
     // segment table the buffer pool keeps of it.
     let made = segments::own(EPOCH, units, layout.plane_bytes, granularity);
     assert!(made.is_some(), "the planes split");
-    let first = KvCacheMemory::open(config(made), device, &*serving, &stream).unwrap();
+    let first = KvCacheMemory::open(config(made), (device, &[]), &*serving, &stream).unwrap();
     let mut unit = 0;
     let table: storage::runtime::Segments = first
         .segments()
@@ -421,7 +421,8 @@ fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
         })
         .collect();
     let mapped = segments::of_table(&table).unwrap();
-    let mut second = KvCacheMemory::open(config(Some(mapped)), device, &*target, &stream).unwrap();
+    let mut second =
+        KvCacheMemory::open(config(Some(mapped)), (device, &[]), &*target, &stream).unwrap();
 
     // Both state the same storage and offset for every field of every unit.
     let (runs, theirs) = (first.info().plane_runs, second.info().plane_runs);

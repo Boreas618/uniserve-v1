@@ -77,7 +77,7 @@ impl Budget for RecordingBudget {
 fn with_budget(device: &platform::Device, budget: &Arc<RecordingBudget>) -> Allocator {
     let recording: Arc<RecordingBudget> = Arc::clone(budget);
     let ledger: Arc<dyn Budget> = recording;
-    Allocator::new(device, ledger).unwrap()
+    Allocator::new(device, &[], ledger).unwrap()
 }
 
 #[test]
@@ -603,7 +603,7 @@ fn with_adapter(device: &platform::Device, ledger: &Arc<SharedLedger>) -> Alloca
         last: Mutex::new(0),
     });
     let booking: Arc<dyn Budget> = adapter;
-    Allocator::new(device, booking).unwrap()
+    Allocator::new(device, &[], booking).unwrap()
 }
 
 #[test]

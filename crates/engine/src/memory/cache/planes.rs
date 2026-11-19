@@ -210,7 +210,8 @@ impl Planes {
     }
 
     /// Takes the planes of `units` units (the padding unit included) on `device` from `owner`,
-    /// the value planes in `parts` segments when the cache splits, and resets what was created
+    /// addressed by `device` and each of `peers`, the value planes in `parts` segments when the
+    /// cache splits, and resets what was created
     /// for this rank on `stream`, which is synchronized before returning: values, flags and index
     /// keys zero, scales one.
     ///
@@ -229,7 +230,7 @@ impl Planes {
         layout: Arc<CacheLayout>,
         units: u32,
         parts: Option<&[PlaneSegment]>,
-        device: DeviceId,
+        (device, peers): (DeviceId, &[DeviceId]),
         owner: &dyn ExclusiveStorage,
         stream: &Stream,
     ) -> Result<Self> {
@@ -240,7 +241,7 @@ impl Planes {
             ));
         }
 
-        let peers = Storage::peers(device)?;
+        let peers = peers.to_vec();
         let cells = layout.columns as usize * units as usize;
         let plane_bytes = cells * layout.plane_bytes as usize;
         let index_bytes = cells * layout.index_bytes() as usize;

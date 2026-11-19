@@ -65,7 +65,6 @@ use crate::batch::Capacity;
 use crate::batch::{Batch, Phase};
 use crate::executor::Route;
 use crate::executor::peers::Remote;
-use crate::memory::allocation::Storage;
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::cache::{CacheLayout, CacheRegions, GroupLayout, KvCacheMemory, host};
 use crate::memory::client::{StorageClient, unit_runs};
@@ -2881,9 +2880,10 @@ fn open_rank(
         .map(|(id, peaks)| (RunnerId(id), peaks.graph))
         .collect();
     let (_, fraction) = model_runner.fractions()?;
+    let peers = model_runner.peers(device)?;
     let mut pool = GraphPool::open(
         Arc::clone(&client),
-        device,
+        (device, &peers),
         fraction,
         &regions,
         scratch,
@@ -2893,7 +2893,7 @@ fn open_rank(
     // Step 18: the cache, whose segments the rank maps or creates at the Storage Server.
     let stream =
         Stream::new(device).with_context(|| format!("creating device {}'s stream", device.0))?;
-    let mut cache = KvCacheMemory::open(cache_config, device, &*client, &stream)
+    let mut cache = KvCacheMemory::open(cache_config, (device, &peers), &*client, &stream)
         .context("opening the rank's KV cache")?;
 
     // Step 19: the recurrent state, from the resident pool.
@@ -3310,9 +3310,10 @@ fn open_media_memory(
         .map(|(id, peaks)| (*id, peaks.graph))
         .collect();
     let (_, fraction) = model_runner.fractions()?;
+    let peers = model_runner.peers(device)?;
     let mut graph_pool = GraphPool::open(
         Arc::clone(client),
-        device,
+        (device, &peers),
         fraction,
         &regions,
         pools.1,
@@ -3321,19 +3322,18 @@ fn open_media_memory(
 
     // The product buffer, which the Storage Server retains so that a crossing reaches it: a part
     // per slot of whole granules, or for a rank that holds no product kind one unit in a part
-    // of one granule; addressed by every device of the process by peer access.
+    // of one granule; addressed by every device the process serves by peer access.
     let parts = video.product_parts(slots);
     let part_units = products.1 / parts.max(1);
     let length = (u64::from(part_units) * UNIT_BYTES).next_multiple_of(granularity.max(1));
     let length =
         usize::try_from(length).context("a product buffer's part past the address space")?;
-    let access = Storage::peers(device)?;
     let retained = client
         .region_storage(
             &name,
             device,
             (parts, part_units, UNIT_BYTES, length),
-            &access,
+            &peers,
         )
         .context("taking the rank's product buffer")?;
 

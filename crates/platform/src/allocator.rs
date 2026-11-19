@@ -340,6 +340,8 @@ impl fmt::Debug for Buffer {
 /// One device's allocator; see the module documentation.
 pub struct Allocator {
     device: Device,
+    /// The other devices of the process that address the pools' blocks, each by peer access.
+    peers: Vec<DeviceId>,
     budget: Arc<dyn Budget>,
     /// One reserved range per pool kind, indexed by [`PoolKind::index`];
     /// `None` until the pool is reserved.
@@ -347,11 +349,18 @@ pub struct Allocator {
 }
 
 impl Allocator {
-    /// An allocator for `device` that books every mapping against `budget`. No
-    /// pool is reserved yet; [`Self::reserve`] sets each one's range.
-    pub fn new(device: &Device, budget: Arc<dyn Budget>) -> Result<Self> {
+    /// An allocator for `device` that books every mapping against `budget`
+    /// and grants each of `peers`, other devices that can address `device`'s
+    /// storage, access to every block it maps. No pool is reserved yet;
+    /// [`Self::reserve`] sets each one's range.
+    ///
+    /// A grant costs the driver state of every mapping on the device it is
+    /// given to, so `peers` names the devices whose work in this process reads
+    /// the blocks, not every device the process can see.
+    pub fn new(device: &Device, peers: &[DeviceId], budget: Arc<dyn Budget>) -> Result<Self> {
         Ok(Self {
             device: device.clone(),
+            peers: peers.to_vec(),
             budget,
             pools: [None, None, None],
         })
@@ -392,6 +401,7 @@ impl Allocator {
             self.device.id(),
             bytes,
             HandleType::Descriptor,
+            &self.peers,
             pool,
             Arc::clone(&self.budget),
         )?;

@@ -747,7 +747,7 @@ fn a_shadow_of_one_implementation_loaded_twice_compares_every_element() -> Outco
 
     // The shadow region is what the profile run states: the most one paired call carves.
     let device = platform::Device::new(DEVICE)?;
-    let mut allocator = platform::Allocator::new(&device, Arc::new(Unbounded::default()))?;
+    let mut allocator = platform::Allocator::new(&device, &[], Arc::new(Unbounded::default()))?;
     allocator.reserve(PoolKind::Scratch, 1 << 26)?;
     let region = bench.runner.graphs.shadow_peak(0);
     bench

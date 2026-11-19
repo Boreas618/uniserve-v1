@@ -86,7 +86,7 @@ impl StateUnits {
     }
 
     /// Takes the units of a state region of `units` units for a cache of `layout` on `device`
-    /// from `owner`, in `parts` segments when the region splits, and one storage otherwise (a
+    /// from `owner`, addressed by `device` and each of `peers`, in `parts` segments when the region splits, and one storage otherwise (a
     /// rank of no region's, or local storage). What exists keeps its contents; what is created
     /// holds unspecified bytes, which no restore reads before a keep wrote them. The storage is
     /// keyed by the region's memory: the epoch of the first of `parts`, or the rank's own when
@@ -99,7 +99,7 @@ impl StateUnits {
         layout: &CacheLayout,
         units: u32,
         parts: Option<&[PlaneSegment]>,
-        device: DeviceId,
+        (device, peers): (DeviceId, &[DeviceId]),
         owner: &dyn ExclusiveStorage,
     ) -> Result<Self> {
         let mut states = Self::meta(layout, units)?;
@@ -108,7 +108,7 @@ impl StateUnits {
                 "a state region's segments do not hold its units".into(),
             ));
         }
-        let peers = Storage::peers(device)?;
+        let peers = peers.to_vec();
         let mut runs = Vec::new();
 
         let (storage, split) = match parts {
