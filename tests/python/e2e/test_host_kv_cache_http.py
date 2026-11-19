@@ -21,9 +21,13 @@ restarted engine loads its blocks from the host all the same: it reuses as
 many tokens as the same prompt asked again on it, once its own answer put
 every block on the device.
 
-Both deployments of a case share one runtime directory, so the restarted
-daemon finds the Storage Server the first one started there, which the case
-stops at its end.
+Each case starts one deployment twice under one runtime directory: a
+deployment is its policy package's name, and one that comes down without
+``retire`` keeps its Storage Server and the storage it holds there, so the
+restarted daemon finds the Storage Server the first start left, which the
+case stops at its end. A second deployment on the same GPU would instead
+start a Storage Server of its own, which holds no block of the first, beside
+the storage the first one retains on the GPU.
 """
 
 from __future__ import annotations
@@ -34,10 +38,15 @@ import pytest
 from uniserve_testing import chat
 from uniserve_testing.assets import CHECKPOINTS
 from uniserve_testing.caching import cached_tokens
-from uniserve_testing.deployments import Deployments, runtime_directory
+from uniserve_testing.deployments import (
+    Deployments,
+    runtime_directory,
+    storage_status,
+)
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
+#: The deployment each case starts twice, and the model name it serves.
 SERVED_MODEL = "qwen3-host-kv-cache"
 MAX_TOKENS = 32
 # About five thousand tokens of records, then a question about them.
@@ -61,6 +70,15 @@ def _ask(base_url: str, prompt: str, max_tokens: int) -> dict:
     )
 
 
+def _storage_server(uniserve: Path, runtime: Path) -> int:
+    """The process of the deployment's Storage Server under `runtime`, as its
+    readiness record states it.
+    """  # noqa: D205
+    record = storage_status(uniserve, runtime, SERVED_MODEL)
+    assert record is not None, "the deployment's Storage Server does not serve"
+    return int(record["pid"])
+
+
 def test_a_restarted_engine_loads_a_prompts_blocks_from_the_host_tier(
     uniserve: Path, deployments: Deployments, tmp_path: Path
 ):
@@ -69,12 +87,18 @@ def test_a_restarted_engine_loads_a_prompts_blocks_from_the_host_tier(
         "served_model_name": SERVED_MODEL,
     }
     with runtime_directory(uniserve, tmp_path / "storage") as runtime:
-        with deployments.serve(config, name="first", runtime=runtime) as server:
+        with deployments.serve(
+            config, name=SERVED_MODEL, log="first", runtime=runtime
+        ) as server:
             cold = _ask(server.base_url, PROMPT, MAX_TOKENS)
             warm = _ask(server.base_url, PROMPT, MAX_TOKENS)
+            storage = _storage_server(uniserve, runtime)
         with deployments.serve(
-            config, name="restarted", runtime=runtime
+            config, name=SERVED_MODEL, log="restarted", runtime=runtime
         ) as server:
+            # The restart is served beside the Storage Server the first
+            # start left, which holds the blocks it stored.
+            assert _storage_server(uniserve, runtime) == storage
             loaded = _ask(server.base_url, PROMPT, MAX_TOKENS)
 
     # Cold, nothing is cached; warm, every reusable block is pinned on the
@@ -95,11 +119,17 @@ def test_a_stopping_engine_stores_its_last_blocks_to_the_host_tier(
         "served_model_name": SERVED_MODEL,
     }
     with runtime_directory(uniserve, tmp_path / "storage") as runtime:
-        with deployments.serve(config, name="first", runtime=runtime) as server:
-            first = _ask(server.base_url, PROMPT, 1)
         with deployments.serve(
-            config, name="restarted", runtime=runtime
+            config, name=SERVED_MODEL, log="first", runtime=runtime
         ) as server:
+            first = _ask(server.base_url, PROMPT, 1)
+            storage = _storage_server(uniserve, runtime)
+        with deployments.serve(
+            config, name=SERVED_MODEL, log="restarted", runtime=runtime
+        ) as server:
+            # The restart is served beside the Storage Server the first
+            # start left, which holds the blocks it stored.
+            assert _storage_server(uniserve, runtime) == storage
             loaded = _ask(server.base_url, PROMPT, 1)
             # The prompt asked again finds every block on the device, which
             # the loaded answer either loaded or computed: its cached tokens

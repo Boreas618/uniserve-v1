@@ -325,6 +325,7 @@ class Deployments:
         *,
         timeout_s: float | None = None,
         name: str = "server",
+        log: str | None = None,
         serving: bool = True,
         host_gib: int | None = HOST_CACHE_GIB,
         runtime: Path | None = None,
@@ -340,13 +341,21 @@ class Deployments:
             timeout_s: A bound on its start, in seconds (scaled); none by
                 default: the server states its record or ends.
             name: The deployment's name: its package's directory in the
-                case's directory, and its log's (``<name>.log``).
+                case's directory, and its log's (``<name>.log``) unless
+                `log` names it. A case that starts the same deployment
+                again under one runtime directory names it alike each
+                time, so that the start finds the deployment's Storage
+                Server and Build Server, with the storage it retained.
+            log: The name of this start's log in the case's directory
+                (``<log>.log``), for a case that starts one deployment more
+                than once and keeps each start's log.
             serving: Whether to wait for its serving record.
             host_gib: Its host tier in GiB (:data:`HOST_CACHE_GIB`); ``None``
                 for a case whose `config` sizes it.
             runtime: A runtime directory the caller owns
-                (:func:`runtime_directory`), for a case whose deployments
-                share their Storage Server; a fresh one by default.
+                (:func:`runtime_directory`), for a case that reads a
+                deployment's Storage Server or starts the deployment again
+                beside the one it left; a fresh one by default.
             calibration: The transfer calibration its Storage Server copies
                 by (:meth:`calibration`), for a deployment that transfers;
                 without one its Storage Server runs no Transfer Server.
@@ -373,7 +382,7 @@ class Deployments:
                 )
             server = launch(
                 [str(self.uniserve), "serve", str(package)],
-                self.directory / f"{name}.log",
+                self.directory / f"{log or name}.log",
                 self.environment(runtime),
                 scale=self.settings.time_scale,
             )
