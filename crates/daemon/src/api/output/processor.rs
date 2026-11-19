@@ -3,13 +3,15 @@
 //! [`OutputProcessor`] is what a request's response is produced through, as vLLM's
 //! `OutputProcessor` holds a request's state: it checks the engine's event order and
 //! detokenizes incrementally with the stop strings (`text`), parses reasoning and tool calls
-//! in the formats the request's model family writes (`chat`), assembles the content blocks
-//! (`chat::structured`), keeps the timings the terminal usage reports, and records the
-//! request's statistics. A route's response body pushes one engine event at a time and
-//! writes the [`RequestOutput`]s it gets back.
+//! in the formats the request's model family writes through the request's instance of the
+//! epoch's processing program (`chat`), assembles the content blocks (`chat::structured`),
+//! keeps the timings the terminal usage reports, and records the request's statistics. A
+//! route's response body pushes one engine event at a time and writes the [`RequestOutput`]s it
+//! gets back.
 //!
 //! Everything it is built from is the lowering input processing stated for the request
-//! (`proto::handoff::Lowering`), so a successor daemon rebuilds the same processor from a
+//! (`proto::handoff::Lowering`) and the parser the program opened for it, whose state is the
+//! program's opaque bytes, so a successor daemon rebuilds the same processor from a
 //! handed-over response's state and resumes every stage where its predecessor stopped
 //! ([`OutputProcessor::resume`]).
 
@@ -26,14 +28,13 @@ use crate::api::output::chat::ChatParser;
 use crate::api::output::chat::structured::StructuredEventState;
 use crate::api::output::text::{DecodeStream, DecodedTextEvent};
 use crate::api::output::{OutputError, RequestOutput, RequestUsage};
+use crate::api::program::{Binding, Session};
 use crate::api::tokenizer::DynTokenizer;
 
 /// The output processing of one token request.
 pub struct OutputProcessor {
     /// The response's OpenAI fields, which also name the request in errors.
     response: handoff::ChatResponseOptions,
-    /// The parsers the request's model family chose, restated to a successor.
-    parser: handoff::Parser,
     prompt_logprobs: bool,
     logprobs: bool,
     decode: DecodeStream,
@@ -51,7 +52,6 @@ pub struct OutputProcessor {
 /// The parts of a lowering every token response is built from, each checked present once.
 struct Parts {
     response: handoff::ChatResponseOptions,
-    parser: handoff::Parser,
     decode: handoff::TextDecode,
 }
 
@@ -68,10 +68,6 @@ impl Parts {
                 .response
                 .clone()
                 .ok_or_else(|| missing("response fields"))?,
-            parser: lowering
-                .parser
-                .clone()
-                .ok_or_else(|| missing("output parsers"))?,
             decode: lowering
                 .decode_options
                 .clone()
@@ -81,7 +77,8 @@ impl Parts {
 }
 
 impl OutputProcessor {
-    /// The output processor of the request `lowering` describes, before any engine event.
+    /// The output processor of the request `lowering` describes, before any engine event, whose
+    /// text is parsed in `session`, the request's instance of the processing program.
     ///
     /// `compile_us` is how long the request took to reach the engine, in microseconds, and `stats`
     /// records the request's statistics; the instant it started at is the origin of the timings
@@ -89,11 +86,11 @@ impl OutputProcessor {
     ///
     /// # Errors
     ///
-    /// Fails when the lowering leaves out a part every response states, the prompt is empty, or
-    /// the request's parsers cannot be built.
+    /// Fails when the lowering leaves out a part every response states or the prompt is empty.
     pub fn new(
         tokenizer: DynTokenizer,
         lowering: handoff::Lowering,
+        session: Session,
         compile_us: u64,
         stats: Box<dyn Stats>,
     ) -> Result<Self, OutputError> {
@@ -106,13 +103,9 @@ impl OutputProcessor {
             request_id: request_id.clone(),
             source,
         };
-        let Parts {
-            response,
-            parser,
-            decode,
-        } = Parts::of(&lowering).map_err(failed)?;
+        let Parts { response, decode } = Parts::of(&lowering).map_err(failed)?;
 
-        let parsers = ChatParser::new(&parser, Arc::clone(&tokenizer)).map_err(failed)?;
+        let parsers = ChatParser::new(session);
         let decode = DecodeStream::new(
             response.request_id.clone(),
             tokenizer,
@@ -126,7 +119,6 @@ impl OutputProcessor {
 
         Ok(Self {
             response,
-            parser,
             prompt_logprobs: lowering.prompt_logprobs,
             logprobs: lowering.logprobs,
             decode,
@@ -140,15 +132,18 @@ impl OutputProcessor {
     }
 
     /// Continues the output processing a handed-over response states: the processor is
-    /// rebuilt from `lowering` on this process's `tokenizer`, and its decoder, parsers and
-    /// block assembly resume from `decode`, `parsers` and `assembly`.
+    /// rebuilt from `lowering` on this process's `tokenizer`, its parser is restored in an
+    /// instance of `binding` (the family this process binds the request's checkpoint to in the
+    /// same processing program), and its decoder, parser and block assembly resume from
+    /// `decode`, `parsers` and `assembly`.
     ///
     /// # Errors
     ///
     /// Fails as [`Self::new`] does, and when a state does not fit the processor the lowering
-    /// builds.
+    /// builds or the program `binding` is of.
     pub fn resume(
         tokenizer: DynTokenizer,
+        binding: &Arc<Binding>,
         lowering: &handoff::Lowering,
         decode: &handoff::Decode,
         parsers: &handoff::Processor,
@@ -166,12 +161,10 @@ impl OutputProcessor {
         };
         let Parts {
             response,
-            parser,
             decode: options,
         } = Parts::of(lowering).map_err(failed)?;
 
-        let mut chat = ChatParser::new(&parser, Arc::clone(&tokenizer)).map_err(failed)?;
-        chat.resume(parsers).map_err(failed)?;
+        let chat = ChatParser::resume(binding, parsers).map_err(failed)?;
         let decode = DecodeStream::resume(
             response.request_id.clone(),
             tokenizer,
@@ -187,7 +180,6 @@ impl OutputProcessor {
 
         Ok(Self {
             response,
-            parser,
             prompt_logprobs: lowering.prompt_logprobs,
             logprobs: lowering.logprobs,
             decode,
@@ -255,7 +247,6 @@ impl OutputProcessor {
                     queued_at,
                     scheduled_at,
                 } => {
-                    self.parsers.initialize(&prompt.token_ids);
                     self.clock.scheduled(queued_at, scheduled_at);
                     outputs.push(RequestOutput::Accepted(prompt));
                     outputs.push(RequestOutput::Scheduled {
@@ -268,7 +259,7 @@ impl OutputProcessor {
                     token_ids,
                     logprobs,
                 } => {
-                    for event in self.parsers.push(delta).map_err(failed)? {
+                    for event in self.parsers.push(&delta).map_err(failed)? {
                         outputs.extend(self.blocks.push(event).map_err(failed)?);
                     }
                     self.visible(&outputs);
@@ -347,7 +338,6 @@ impl OutputProcessor {
             decode_options: Some(self.decode.options().clone()),
             prompt_logprobs: self.prompt_logprobs,
             logprobs: self.logprobs,
-            parser: Some(self.parser.clone()),
             response: Some(self.response.clone()),
         }
     }
@@ -369,9 +359,10 @@ impl OutputProcessor {
         self.decode.state()
     }
 
-    /// The reasoning and tool-call parsers' state.
-    pub fn parser_state(&self) -> handoff::Processor {
-        self.parsers.state()
+    /// The parser's state, as the processing program saves it; `None` when the program's
+    /// instance ended, so the response cannot be handed over.
+    pub fn parser_state(&mut self) -> Option<handoff::Processor> {
+        self.parsers.state().ok()
     }
 
     /// The assembled blocks and the timings recorded so far.

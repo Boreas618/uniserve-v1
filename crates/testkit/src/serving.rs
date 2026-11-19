@@ -181,6 +181,7 @@ pub fn launch() -> EngineArgs {
         policy: policy_revision(""),
         kernels: Default::default(),
         programs: Default::default(),
+        processing: None,
     };
     let sizes = |sizes: &[u32]| {
         Some(

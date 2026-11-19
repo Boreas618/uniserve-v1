@@ -12,24 +12,13 @@ pub enum TokenizeError {
     /// The model tokenizer cannot encode request content.
     #[error(transparent)]
     Tokenizer(#[from] crate::api::tokenizer::TokenizerError),
-    /// The chat request contains no message to render.
-    #[error("chat request must contain at least one message")]
-    EmptyMessages,
-    /// The prompt continues the final message of a history whose last message is not the
-    /// assistant's.
-    #[error("cannot continue the final message when the last message is not from the assistant")]
-    ContinueWithoutAssistant,
-    /// The served model has no chat template: neither the deployment nor the checkpoint states
-    /// one.
-    #[error("chat template is required but none was configured")]
-    MissingChatTemplate,
-    /// The chat template fails to render the request.
-    #[error(transparent)]
-    Template(#[from] crate::api::input::chat::TemplateError),
-    /// The request carries content the renderer does not take: an image part for a model that
-    /// takes none, or in an assistant message.
-    #[error("unsupported multimodal content: {0}")]
-    UnsupportedMultimodalContent(&'static str),
+    /// The epoch's processing program refuses to render the request: its family's prompt
+    /// cannot be made of it.
+    #[error("{0}")]
+    Render(scheduling::processing::Refusal),
+    /// The epoch's processing program cannot open the response's parser for the request.
+    #[error("{0}")]
+    Parser(String),
     /// The tokenized prompt fills or exceeds the model context window, leaving
     /// no room for a generated token.
     #[error(
@@ -73,9 +62,6 @@ pub enum TokenizeError {
     /// The request contains an invalid combination of serving controls.
     #[error("{0}")]
     Invalid(String),
-    /// The request's tools, which its output's tool calls are parsed against, do not serialize.
-    #[error("serializing the request's tools")]
-    Tools(#[source] serde_json::Error),
     /// The blocking tokenization task cannot complete.
     #[error("tokenization task failed")]
     Task(#[source] tokio::task::JoinError),
@@ -108,7 +94,10 @@ pub enum ServeError {
     },
     /// The video model refuses a video request, or its processing fails.
     #[error(transparent)]
-    Video(#[from] processing::InputError),
+    Video(#[from] scheduling::processing::video::InputError),
+    /// The epoch's processing program failed processing the request: its instance ended.
+    #[error(transparent)]
+    Processing(#[from] crate::api::program::Error),
     /// Request tokenization fails before engine submission.
     #[error("request `{request_id}` cannot be tokenized")]
     Tokenize {

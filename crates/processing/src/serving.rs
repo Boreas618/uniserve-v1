@@ -2,6 +2,8 @@
 //! or video through the processor a video family binds. A family states it in its
 //! request-processing description ([`crate::Family::serving`]).
 
+use crate::chat::ChatEncoder;
+use crate::deepseek_v41::encoding::{CALLS_END, CALLS_SEPARATOR, CALLS_START};
 use crate::image::ImageFamily;
 use crate::video::VideoFamily;
 
@@ -47,15 +49,43 @@ pub struct ChatCheckpoint {
     pub chat_template: ChatTemplate,
 }
 
-/// Where a chat family's checkpoints keep their chat template.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a chat family's checkpoints keep their chat template, or the family's encoder for
+/// checkpoints that publish none.
+#[derive(Clone, Copy)]
 pub enum ChatTemplate {
     /// The `chat_template` field of `tokenizer_config.json`, where `transformers` stored a
     /// template before it saved templates as files of their own.
     TokenizerConfig,
     /// A file of Jinja source at the checkpoint's root, such as `chat_template.jinja`.
     File(&'static str),
+    /// No template: the checkpoints state their prompt format as a reference encoder, which the
+    /// family ports. A deployment's own template still replaces it.
+    Encoder(&'static dyn ChatEncoder),
 }
+
+impl std::fmt::Debug for ChatTemplate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TokenizerConfig => formatter.write_str("TokenizerConfig"),
+            Self::File(name) => formatter.debug_tuple("File").field(name).finish(),
+            Self::Encoder(_) => formatter.write_str("Encoder"),
+        }
+    }
+}
+
+impl PartialEq for ChatTemplate {
+    /// The same place, or the same encoder.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::TokenizerConfig, Self::TokenizerConfig) => true,
+            (Self::File(left), Self::File(right)) => left == right,
+            (Self::Encoder(left), Self::Encoder(right)) => std::ptr::addr_eq(*left, *right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ChatTemplate {}
 
 impl std::fmt::Debug for ChatProfile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,7 +119,7 @@ impl Eq for ChatProfile {}
 /// of the vocabulary.
 ///
 /// The delimiters are the family's data, and request processing reads every family's reasoning
-/// with one parser parameterized by them; a response's handoff carries them as they are.
+/// with one parser parameterized by them (`crate::output::reasoning`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReasoningFormat {
     /// The text that opens a reasoning section.
@@ -123,23 +153,55 @@ pub enum ToolCallFormat {
     /// </tool_call>
     /// ```
     Xml,
+    /// DeepSeek's DSML markup: one `calls` block at the end of the turn, after a blank line, of
+    /// one `invoke` per call and one `parameter` per argument, whose `string` attribute states
+    /// whether the value is the text itself (`true`) or JSON (`false`):
+    ///
+    /// ```text
+    /// <｜DSML｜ calls>
+    /// <｜DSML｜ invoke name="NAME">
+    /// <｜DSML｜ parameter name="ARG" string="true">TEXT</｜DSML｜ parameter>
+    /// <｜DSML｜ parameter name="ARG" string="false">JSON</｜DSML｜ parameter>
+    /// </｜DSML｜ invoke>
+    /// </｜DSML｜ calls>
+    /// ```
+    ///
+    /// The block ends the turn: what follows it is no part of the response. Its opening also
+    /// ends reasoning the model did not close ([`Self::final_region`]).
+    Dsml,
+}
+
+/// The opening of a format's final tool-call region: the region that ends the turn, whose
+/// opening also ends reasoning, so that no reasoning delimiter is read after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Opening {
+    /// The region's start delimiter.
+    pub delimiter: &'static str,
+    /// What the format writes before the delimiter, which belongs neither to the text before it
+    /// nor to the region.
+    pub separator: &'static str,
 }
 
 impl ToolCallFormat {
-    /// Every tool-call format.
-    pub const ALL: [Self; 2] = [Self::Json, Self::Xml];
-
-    /// The format's name, which a response's handoff states it by.
+    /// The format's name, which a malformed call's failure states it by.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Json => "json",
             Self::Xml => "xml",
+            Self::Dsml => "dsml",
         }
     }
 
-    /// The format named `name` ([`Self::name`]); `None` for no format's name.
-    pub fn named(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|format| format.name() == name)
+    /// The opening of the format's final region, for a format whose calls end the turn; `None`
+    /// for a format whose regions text may follow.
+    pub const fn final_region(self) -> Option<Opening> {
+        match self {
+            Self::Json | Self::Xml => None,
+            Self::Dsml => Some(Opening {
+                delimiter: CALLS_START,
+                separator: CALLS_SEPARATOR,
+            }),
+        }
     }
 
     /// The text that opens one tool-call region and the text that closes it.
@@ -147,11 +209,14 @@ impl ToolCallFormat {
     /// The JSON format's newlines belong to its delimiters, as its families' chat templates
     /// instruct them, so a bare `<tool_call>` mentioned in prose stays text. The tag format
     /// writes its tags on lines of their own, and whitespace between its tags carries no
-    /// meaning, so its delimiters are the tags alone.
+    /// meaning, so its delimiters are the tags alone. DSML's are its block's tags; the blank line
+    /// before the block is the separator of its [`Self::final_region`], which a block written
+    /// without it also opens.
     pub const fn delimiters(self) -> (&'static str, &'static str) {
         match self {
             Self::Json => ("<tool_call>\n", "\n</tool_call>"),
             Self::Xml => ("<tool_call>", "</tool_call>"),
+            Self::Dsml => (CALLS_START, CALLS_END),
         }
     }
 }

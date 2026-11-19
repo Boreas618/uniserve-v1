@@ -158,9 +158,9 @@ pub type Packages = BTreeMap<ModuleSlot, PackageRevision>;
 pub const ENGINE: &str = "engine";
 
 /// The interface every program package implements, as its packages are filed: a wasm32 program
-/// module of any kind (control, routing, KV, scheduling), which states its kind in its own
-/// section (`scheduling::program::SECTION`). The release's programs are installed under their
-/// names; a policy package's own program crates under `programs.<dir>`.
+/// module of any kind (control, routing, KV, scheduling, processing), which states its kind in
+/// its own section (`scheduling::program::SECTION`). The release's programs are installed under
+/// their names; a policy package's own program crates under `programs.<dir>`.
 pub const PROGRAM: &str = "program";
 
 /// The key of the one module a package of the engine or a program builds: each fills a whole
@@ -196,6 +196,12 @@ pub struct ModuleSet {
     /// daemon and the Storage Servers, so the engines' wire form of the set leaves them out.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub programs: BTreeMap<String, Program>,
+    /// The processing program the leader daemon serves the epoch's requests through
+    /// (`worker_config.processing`): the request side of the model families, fixed beside the
+    /// engine so an epoch's request side is built from the same tree as its engine. The engines'
+    /// wire form of the set leaves it out, so theirs states none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing: Option<PackageRevision>,
 }
 
 /// One program of a module set: where it came from, the program package revision its apply

@@ -1,0 +1,30 @@
+# The processing program's package: the request side of the tree's model
+# families (which classes they claim, how a chat request becomes a prompt, how
+# a completion is parsed into reasoning, content and tool calls, and a video
+# family's request rules), as the leader daemon loads it per epoch. An epoch's
+# module set fixes its revision beside the engine's (`worker_config.processing`
+# and `worker_config.processing_revision`), so installing a tree installs both
+# and the request side an epoch serves is built from the same tree as its
+# engine.
+
+# A program package: its module states its kind (a processing program) and the
+# processing interface version it implements in its own `uniserve.program`
+# section, which the Build Server records with the module and the daemon
+# checks before it links it.
+op = "program"
+backend = "processing"
+
+# Built with the workspace's pinned Rust toolchain.
+[toolchain]
+kind = "cargo"
+
+[module]
+form = "wasm"
+
+# The package is this crate: the Build Server snapshots its whole workspace when
+# it is installed and builds the crate for wasm32 from that snapshot; the daemon
+# compiles the module when it loads it. The crate's files are the ones cargo
+# packages, so none is listed here.
+[source]
+kind = "wasm"
+files = []

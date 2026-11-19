@@ -1,25 +1,21 @@
 //! Assistant output processing for chat generation.
 //!
-//! [`ChatParser`] parses one request's decoded text, as vLLM's chat serving
-//! does with its reasoning and tool parsers: an optional reasoning parser
-//! splits reasoning from visible text, and an optional tool parser extracts
-//! tool calls from the visible text (`tool`). Which parsers a request has is
-//! stated by its lowering (`handoff::Parser`): the formats its model family's
-//! chat profile names. The request's `OutputProcessor` feeds the parser and
-//! frames its [`AssistantEvent`]s as content blocks and tool calls
-//! (`structured`).
+//! [`ChatParser`] parses one request's decoded text through the request's instance of the
+//! epoch's processing program, which holds the parsers of the formats its family writes: the
+//! program splits reasoning from visible text and extracts tool calls from the visible text, and
+//! states each update as events (`scheduling::processing::Event`). The parser frames them as the
+//! [`AssistantEvent`]s the request's `OutputProcessor` assembles into content blocks and tool
+//! calls (`structured`), naming each call as it opens.
+
+use std::sync::Arc;
 
 use proto::handoff;
+use scheduling::processing::Event;
 use uuid::Uuid;
 
 use crate::api::error::{Error, Result};
 use crate::api::output::chat::AssistantBlockKind;
-use crate::api::output::reasoning::{DelimitedReasoningParser, ReasoningDelta};
-use crate::api::output::tools;
-use crate::api::tokenizer::DynTokenizer;
-use processing::ToolCallFormat;
-
-use super::tool::ToolStage;
+use crate::api::program::{Binding, Session};
 
 /// Parsed assistant output of one decoded update.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,169 +41,93 @@ pub enum AssistantEvent {
     },
 }
 
-/// The parsers of one chat request's decoded text: its reasoning and
-/// tool-call parsers, either of which may be absent.
-///
-/// Without a reasoning parser all text is visible; without a tool parser
-/// visible text passes unchanged. Text a parser holds back as a possible
-/// partial delimiter is released by a later push or by [`Self::finish`].
-#[derive(Default)]
+/// The parser of one chat request's decoded text: the request's instance of the processing
+/// program, whose parser `Processor::process` opened for the request's prompt.
 pub struct ChatParser {
-    reasoning: Option<DelimitedReasoningParser>,
-    tools: Option<ToolStage>,
+    session: Session,
 }
 
 impl ChatParser {
-    /// The parsers `parser` states for a request: the reasoning parser over its delimiters when
-    /// reasoning is parsed, and the parser of its tool-call format ([`tools::parser`]) when tool
-    /// calls are.
+    /// The parser of the request whose instance is `session`.
+    pub fn new(session: Session) -> Self {
+        Self { session }
+    }
+
+    /// The parser a handed-over response's `state` states, restored in an instance of
+    /// `binding`, the family the successor binds the request's checkpoint to.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Parser`] when a tool-call format's name is no format's, the tokenizer
-    /// lacks a reasoning delimiter as one token, or the request's tools are not the JSON array a
-    /// request states.
-    pub fn new(parser: &handoff::Parser, tokenizer: DynTokenizer) -> Result<Self> {
-        let unknown = |kind: &'static str, name: &str| Error::Parser {
-            kind,
-            name: name.to_owned(),
-            source: format!("no {kind} format is named {name:?}").into(),
-        };
-
-        let reasoning = match &parser.reasoning_delimiters {
-            None => None,
-            Some(delimiters) => {
-                let reasoning = DelimitedReasoningParser::new(
-                    tokenizer,
-                    &delimiters.open,
-                    &delimiters.close,
-                    false,
-                )
-                .map_err(|error| Error::Parser {
-                    kind: "reasoning",
-                    name: format!("{} {}", delimiters.open, delimiters.close),
-                    source: Box::new(error),
-                })?;
-                Some(reasoning)
-            }
-        };
-
-        let tools = match parser.tool_calls.as_str() {
-            "" => None,
-            name => {
-                let format = ToolCallFormat::named(name).ok_or_else(|| unknown("tool", name))?;
-                Some(ToolStage::new(tools::parser(format, &parser.tools)?))
-            }
-        };
-
-        Ok(Self { reasoning, tools })
-    }
-
-    /// The parsers' state, for the process that goes on writing the response after a handoff.
-    pub fn state(&self) -> handoff::Processor {
-        handoff::Processor {
-            reasoning: self.reasoning.as_ref().map(DelimitedReasoningParser::state),
-            tools: self.tools.as_ref().map(ToolStage::state),
+    /// Fails with [`Error::Lowering`] when the state names another program than `binding`'s or
+    /// states none, and with [`Error::Output`] when the program does not restore it.
+    pub fn resume(binding: &Arc<Binding>, state: &handoff::Processor) -> Result<Self> {
+        if state.program != binding.program().digest() {
+            return Err(Error::Lowering {
+                part: "parser state of this deployment's processing program",
+            });
         }
+        let mut session = binding.checkout()?;
+        session.restore(&state.state)?.map_err(Error::output)?;
+        Ok(Self { session })
     }
 
-    /// Puts the parsers back where `state` left them: the successor builds the same parsers for
-    /// the request (its family and its tools) and resumes them from the state the predecessor
-    /// handed over.
+    /// The parser's state, for the process that goes on writing the response after a handoff:
+    /// the program's opaque bytes and the program that saved them.
     ///
     /// # Errors
     ///
-    /// Fails with [`Error::Lowering`] when `state` does not state each of this request's
-    /// parsers, or states one of another format.
-    pub fn resume(&mut self, state: &handoff::Processor) -> Result<()> {
-        if let Some(reasoning) = self.reasoning.as_mut() {
-            let reasoning_state = state.reasoning.as_ref().ok_or(Error::Lowering {
-                part: "reasoning parser state",
-            })?;
-            reasoning.resume(reasoning_state);
-        }
-        if let Some(tools) = self.tools.as_mut() {
-            let tools_state = state.tools.as_ref().ok_or(Error::Lowering {
-                part: "tool stage state",
-            })?;
-            tools.resume(tools_state)?;
-        }
-        Ok(())
+    /// Fails when the program's instance ended.
+    pub fn state(&mut self) -> Result<handoff::Processor> {
+        Ok(handoff::Processor {
+            state: self.session.save()?,
+            program: self.session.binding().program().digest().to_owned(),
+        })
     }
 
-    /// Chooses the region generation starts in from the prompt.
-    ///
-    /// A reasoning delimiter in the prompt suffix after the last other
-    /// special token decides whether generation starts inside a reasoning
-    /// section; without one, generation starts outside it.
-    pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
-        if let Some(reasoning) = self.reasoning.as_mut() {
-            reasoning.initialize(prompt_token_ids);
-        }
-    }
-
-    /// Parses one decoded text delta into assistant events.
-    ///
-    /// One delta may span several delimiters, as when several tokens decode
-    /// into one update; its reasoning text precedes its visible text.
+    /// Parses one decoded text delta into assistant events; its reasoning text precedes its
+    /// visible text.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ToolCall`] for a malformed tool call and
-    /// [`Error::ToolCallStream`] when the tool parser's output is out of order.
-    pub fn push(&mut self, delta: String) -> Result<Vec<AssistantEvent>> {
-        let parsed = match self.reasoning.as_mut() {
-            Some(reasoning) => reasoning.push(&delta),
-            None => ReasoningDelta {
-                reasoning: None,
-                content: Some(delta),
-            },
-        };
-        self.split(parsed)
+    /// Fails with [`Error::Output`] for output the family's parsers refuse, such as a malformed
+    /// tool call, and with [`Error::Processing`] when the program's instance ended.
+    pub fn push(&mut self, delta: &str) -> Result<Vec<AssistantEvent>> {
+        let events = self.session.push(delta)?.map_err(Error::output)?;
+        Ok(events.into_iter().map(assistant_event).collect())
     }
 
-    /// Releases the text held back at the end of generation: the reasoning
-    /// parser's partial delimiter as text of its current region, then the
-    /// tool parser's buffered input.
+    /// Releases the text the parsers hold back at the end of generation.
     ///
     /// # Errors
     ///
-    /// As [`Self::push`].
+    /// As [`Self::push`], and [`Error::Output`] when the text ended inside a tool call.
     pub fn finish(&mut self) -> Result<Vec<AssistantEvent>> {
-        let parsed = self
-            .reasoning
-            .as_mut()
-            .map(|reasoning| reasoning.finish())
-            .unwrap_or_default();
-        let mut events = self.split(parsed)?;
-        if let Some(tools) = self.tools.as_mut() {
-            events.extend(tools.finish()?);
-        }
-        Ok(events)
+        let events = self.session.finish()?.map_err(Error::output)?;
+        Ok(events.into_iter().map(assistant_event).collect())
     }
+}
 
-    /// Emits the reasoning part of `parsed`, then its visible part through
-    /// the tool stage.
-    fn split(&mut self, parsed: ReasoningDelta) -> Result<Vec<AssistantEvent>> {
-        let mut events = Vec::new();
-        for (kind, text) in [
-            (AssistantBlockKind::Reasoning, parsed.reasoning),
-            (AssistantBlockKind::Text, parsed.content),
-        ] {
-            let Some(text) = text.filter(|text| !text.is_empty()) else {
-                continue;
-            };
-            match self.tools.as_mut() {
-                Some(tools) => events.extend(tools.push(kind, text)?),
-                None => events.push(AssistantEvent::TextDelta { kind, delta: text }),
-            }
-        }
-        Ok(events)
+/// The assistant event of one parsed event; a call that opens is given its identifier.
+fn assistant_event(event: Event) -> AssistantEvent {
+    match event {
+        Event::Reasoning(delta) => AssistantEvent::TextDelta {
+            kind: AssistantBlockKind::Reasoning,
+            delta,
+        },
+        Event::Content(delta) => AssistantEvent::TextDelta {
+            kind: AssistantBlockKind::Text,
+            delta,
+        },
+        Event::ToolCall { name } => AssistantEvent::ToolCallStart {
+            id: generate_tool_call_id(),
+            name,
+        },
+        Event::Arguments(delta) => AssistantEvent::ToolCallArgumentsDelta { delta },
     }
 }
 
 /// Generates an OpenAI-compatible tool-call identifier: `call_` followed by
 /// 24 hex digits of a random UUID.
-pub(super) fn generate_tool_call_id() -> String {
+fn generate_tool_call_id() -> String {
     format!("call_{}", &Uuid::new_v4().simple().to_string()[..24])
 }

@@ -11,6 +11,7 @@
 //! | routing | leader daemon | [`crate::routing::Routing`] | [`crate::routing::Route`] | every request |
 //! | KV | every Storage Server | [`crate::kv::Hook`] | [`crate::kv::Action`] | every handoff; every `period` on the leader |
 //! | scheduling | every scheduler | the scheduling policy interface ([`crate::policy::Policy`]) | | every step |
+//! | processing | leader daemon | the processing interface ([`crate::processing::Processing`]) | | every request |
 //!
 //! # The module
 //!
@@ -89,11 +90,21 @@ pub enum Kind {
     Kv,
     /// Every scheduler's scheduling policy ([`crate::policy::Policy`]).
     Scheduling,
+    /// An epoch's request processing on the leader daemon ([`crate::processing::Processing`]),
+    /// which the epoch's module set fixes beside its engine rather than a package's
+    /// `[programs]`.
+    Processing,
 }
 
 impl Kind {
     /// Every kind.
-    pub const ALL: [Kind; 4] = [Kind::Control, Kind::Routing, Kind::Kv, Kind::Scheduling];
+    pub const ALL: [Kind; 5] = [
+        Kind::Control,
+        Kind::Routing,
+        Kind::Kv,
+        Kind::Scheduling,
+        Kind::Processing,
+    ];
 
     /// The kind's name, as `events` and the configuration's reports name it.
     pub fn name(self) -> &'static str {
@@ -102,6 +113,7 @@ impl Kind {
             Kind::Routing => "routing",
             Kind::Kv => "kv",
             Kind::Scheduling => "scheduling",
+            Kind::Processing => "processing",
         }
     }
 
@@ -112,6 +124,7 @@ impl Kind {
             Kind::Routing => 2,
             Kind::Kv => 3,
             Kind::Scheduling => 4,
+            Kind::Processing => 5,
         }
     }
 
@@ -120,12 +133,14 @@ impl Kind {
         Kind::ALL.into_iter().find(|kind| kind.code() == code)
     }
 
-    /// The version of the interface a program of this kind speaks: [`INTERFACE_VERSION`], or the
-    /// scheduling policy interface's own ([`crate::INTERFACE_VERSION`]).
+    /// The version of the interface a program of this kind speaks: [`INTERFACE_VERSION`], the
+    /// scheduling policy interface's own ([`crate::INTERFACE_VERSION`]), or the processing
+    /// interface's ([`crate::processing::INTERFACE_VERSION`]).
     pub fn interface_version(self) -> u32 {
         match self {
             Kind::Control | Kind::Routing | Kind::Kv => INTERFACE_VERSION,
             Kind::Scheduling => crate::INTERFACE_VERSION,
+            Kind::Processing => crate::processing::INTERFACE_VERSION,
         }
     }
 }
@@ -343,7 +358,7 @@ pub mod guest {
 
     /// Installs, once per module, the panic hook that hands the host a panic's text before the
     /// module traps, and the logger that forwards the `log` crate's records to `uniserve.log`.
-    fn install() {
+    pub(crate) fn install() {
         static INSTALL: Once = Once::new();
 
         INSTALL.call_once(|| {
@@ -463,7 +478,7 @@ pub mod guest {
     /// Calls the host function `function` with `request` encoded and decodes the buffer it
     /// replies; a trap when either does not code, since host and program are built from the
     /// same types.
-    fn exchange<T: DeserializeOwned>(
+    pub(crate) fn exchange<T: DeserializeOwned>(
         function: fn(u32, u32) -> u64,
         request: &impl Serialize,
         what: &str,

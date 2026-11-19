@@ -526,7 +526,7 @@ mod tests {
         assert_eq!(left.seed, Some(7));
         assert_eq!(
             left.spec().unwrap().length,
-            Some(processing::Length::Seconds(5.5))
+            Some(scheduling::processing::video::Length::Seconds(5.5))
         );
     }
 

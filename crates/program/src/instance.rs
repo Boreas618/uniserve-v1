@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use scheduling::program::{EXPORTS, name};
+use scheduling::program::name;
 use scheduling::wire::{decode, encode, unpack};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -46,23 +46,48 @@ impl Budget {
     };
 }
 
-/// One call into a program, by the export it enters.
+/// One call into a program, by the export it enters: a program kind's (`new`, `step`, `save`,
+/// `restore`) or a processing program's (`scheduling::processing::name`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Call {
     New,
     Step,
     Save,
     Restore,
+    Inbox,
+    Families,
+    Bind,
+    Render,
+    ParseOpen,
+    ParsePush,
+    ParseFinish,
+    ParseSave,
+    ParseRestore,
+    VideoCheck,
+    VideoProcess,
 }
 
 impl Call {
     /// The export the call enters.
     pub fn name(self) -> &'static str {
+        use scheduling::processing::name as processing;
+
         match self {
             Call::New => name::NEW,
             Call::Step => name::STEP,
             Call::Save => name::SAVE,
             Call::Restore => name::RESTORE,
+            Call::Inbox => processing::INBOX,
+            Call::Families => processing::FAMILIES,
+            Call::Bind => processing::BIND,
+            Call::Render => processing::RENDER,
+            Call::ParseOpen => processing::PARSE_OPEN,
+            Call::ParsePush => processing::PARSE_PUSH,
+            Call::ParseFinish => processing::PARSE_FINISH,
+            Call::ParseSave => processing::PARSE_SAVE,
+            Call::ParseRestore => processing::PARSE_RESTORE,
+            Call::VideoCheck => processing::VIDEO_CHECK,
+            Call::VideoProcess => processing::VIDEO_PROCESS,
         }
     }
 }
@@ -205,13 +230,13 @@ impl<H: Send> ResourceLimiter for Context<H> {
     }
 }
 
-/// Checks that `module` has the memory and every export of the program interface; their
-/// signatures are checked when an instance binds them.
-pub(crate) fn check(module: &wasmtime::Module) -> Result<(), crate::Error> {
+/// Checks that `module` has the memory and every one of `exports`, the functions of its kind's
+/// interface; their signatures are checked when an instance binds them.
+pub(crate) fn check(module: &wasmtime::Module, exports: &[&str]) -> Result<(), crate::Error> {
     if !matches!(module.get_export(name::MEMORY), Some(ExternType::Memory(_))) {
         return Err(Error::Load("the module exports no memory".into()));
     }
-    for export in EXPORTS {
+    for export in exports {
         if !matches!(module.get_export(export), Some(ExternType::Func(_))) {
             return Err(Error::Load(format!(
                 "the module exports no function `{export}`"
@@ -221,135 +246,42 @@ pub(crate) fn check(module: &wasmtime::Module) -> Result<(), crate::Error> {
     Ok(())
 }
 
-/// A program's instance: one program, its own linear memory, called one call at a time.
+/// What every instance of a module is: its store, its memory and buffer exports, and how a
+/// call into it ends. A program's [`Instance`] and a processing program's
+/// [`crate::Processor`] add the exports of their interface.
 ///
 /// Once a call ends it ([`Error::Ended`]), every later call returns the same reason.
-pub struct Instance<H: 'static> {
-    store: Store<Context<H>>,
+pub(crate) struct Core<H: 'static> {
+    pub(crate) store: Store<Context<H>>,
     memory: Memory,
     alloc: TypedFunc<u32, u32>,
     free: TypedFunc<(u32, u32), ()>,
-    new: TypedFunc<(u32, u32), u64>,
-    step: TypedFunc<(u32, u32), u64>,
-    save: TypedFunc<(), u64>,
-    restore: TypedFunc<(u32, u32), u64>,
-    budget: Budget,
     ended: Option<(Call, Reason)>,
     usage: Usage,
 }
 
-impl<H: Host> Instance<H> {
-    /// Instantiates `module` with `host` answering its host functions and creates the program
-    /// from the package's `args` table (the `new` export).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Load`] when the module does not instantiate, [`Error::Args`] when `args` is not
-    /// the program's `Args`, [`Error::Ended`] when `new` fails.
-    pub fn new(
+impl<H: Host> Core<H> {
+    /// Instantiates `module` in a store of its own, whose memory may grow to `memory` bytes and
+    /// whose host functions' replies add `per_byte` fuel per byte, and binds the buffer exports.
+    /// The module's own start code runs under `fuel`.
+    pub(crate) fn start(
         module: &Module<H>,
         host: H,
-        budget: &Budget,
-        args: &impl Serialize,
-    ) -> Result<Self, Error> {
-        let mut instance = Self::start(module, host, budget)?;
-
-        let args = encode(args).map_err(|error| Error::Message(error.to_string()))?;
-        match instance.exchange(Call::New, &args)? {
-            None => Ok(instance),
-            Some(text) => Err(Error::Args(String::from_utf8_lossy(&text).into_owned())),
-        }
-    }
-
-    /// Instantiates `module` with `host` answering its host functions and restores the program
-    /// from `state`, which [`Instance::save`] returned, perhaps for an earlier version of the
-    /// program (the `restore` export).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::State`] when `state` is not the program's current type, so the embedder creates
-    /// it anew; otherwise as [`Instance::new`].
-    pub fn restore(
-        module: &Module<H>,
-        host: H,
-        budget: &Budget,
-        state: &[u8],
-    ) -> Result<Self, Error> {
-        let mut instance = Self::start(module, host, budget)?;
-
-        match instance.exchange(Call::Restore, state)? {
-            None => Ok(instance),
-            Some(text) => Err(Error::State(String::from_utf8_lossy(&text).into_owned())),
-        }
-    }
-
-    /// One step: `input` in, the program's output out. `I` encodes as the program's `Input`
-    /// and `O` is its `Output`, as the SDK's types for the program's kind give them.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Ended`] when the step fails, its reply missing or not an `O` included;
-    /// [`Error::Message`] when `input` does not encode.
-    pub fn step<I: Serialize, O: DeserializeOwned>(&mut self, input: &I) -> Result<O, Error> {
-        let input = encode(input).map_err(|error| Error::Message(error.to_string()))?;
-        let reply = self.exchange(Call::Step, &input)?;
-        self.decode(Call::Step, reply)
-    }
-
-    /// The program's state, which [`Instance::restore`] takes back.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Ended`] when `save` fails.
-    pub fn save(&mut self) -> Result<Vec<u8>, Error> {
-        self.alive()?;
-
-        let save = self.save.clone();
-        let packed = self.enter(Call::Save, save, (), self.budget.fuel)?;
-        self.take(Call::Save, packed)?
-            .ok_or_else(|| self.end(Call::Save, malformed("it replied no state")))
-    }
-
-    /// Ends the instance: every later call returns [`Reason::Disabled`].
-    pub fn disable(&mut self) {
-        if self.ended.is_none() {
-            self.ended = Some((Call::Step, Reason::Disabled));
-        }
-    }
-
-    /// The call that ended the instance and why; `None` while it runs.
-    pub fn ended(&self) -> Option<&(Call, Reason)> {
-        self.ended.as_ref()
-    }
-
-    /// The calls made into the instance and the fuel they consumed.
-    pub fn usage(&self) -> Usage {
-        self.usage
-    }
-
-    /// The embedder.
-    pub fn host(&self) -> &H {
-        &self.store.data().host
-    }
-
-    /// The embedder, to change between calls.
-    pub fn host_mut(&mut self) -> &mut H {
-        &mut self.store.data_mut().host
-    }
-
-    /// Instantiates `module` in a store of its own and binds the exports.
-    fn start(module: &Module<H>, host: H, budget: &Budget) -> Result<Self, Error> {
+        fuel: u64,
+        per_byte: u64,
+        memory: usize,
+    ) -> Result<(Self, wasmtime::Instance), Error> {
         let context = Context {
             host,
             panic: None,
-            per_byte: budget.per_byte,
-            memory: budget.memory,
+            per_byte,
+            memory,
             exceeded: false,
         };
         let mut store = Store::new(module.pre.module().engine(), context);
         store.limiter(|context| context as &mut dyn ResourceLimiter);
         store
-            .set_fuel(budget.fuel)
+            .set_fuel(fuel)
             .map_err(|error| Error::Load(format!("the engine meters no fuel: {error}")))?;
 
         let instance = module
@@ -360,23 +292,28 @@ impl<H: Host> Instance<H> {
             .get_memory(&mut store, name::MEMORY)
             .ok_or_else(|| Error::Load("the module exports no memory".into()))?;
 
-        Ok(Self {
+        let core = Self {
             alloc: bind(&mut store, &instance, name::ALLOC)?,
             free: bind(&mut store, &instance, name::FREE)?,
-            new: bind(&mut store, &instance, name::NEW)?,
-            step: bind(&mut store, &instance, name::STEP)?,
-            save: bind(&mut store, &instance, name::SAVE)?,
-            restore: bind(&mut store, &instance, name::RESTORE)?,
             store,
             memory,
-            budget: *budget,
             ended: None,
             usage: Usage::default(),
-        })
+        };
+        Ok((core, instance))
+    }
+
+    /// The export `name` of `instance`, with the signature the interface gives it.
+    pub(crate) fn export<P: WasmParams, R: WasmResults>(
+        &mut self,
+        instance: &wasmtime::Instance,
+        name: &str,
+    ) -> Result<TypedFunc<P, R>, Error> {
+        bind(&mut self.store, instance, name)
     }
 
     /// Fails with the call that ended the instance and why, if one did.
-    fn alive(&self) -> Result<(), Error> {
+    pub(crate) fn alive(&self) -> Result<(), Error> {
         match &self.ended {
             Some((call, reason)) => Err(Error::Ended {
                 call: *call,
@@ -386,19 +323,24 @@ impl<H: Host> Instance<H> {
         }
     }
 
-    /// Writes `message` into a buffer of the module's memory, enters the export of `call` with
-    /// it, frees it, and returns the reply's bytes (`None` for the empty reply).
-    fn exchange(&mut self, call: Call, message: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    /// Writes `message` into a buffer of the module's memory, enters `export` with it under
+    /// `fuel` plus `per_byte` fuel for each of its bytes, frees it, and returns the reply's bytes
+    /// (`None` for the empty reply).
+    pub(crate) fn exchange(
+        &mut self,
+        call: Call,
+        export: TypedFunc<(u32, u32), u64>,
+        message: &[u8],
+        fuel: u64,
+        per_byte: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
         self.alive()?;
 
         let len = u32::try_from(message.len())
             .map_err(|_| Error::Message("the message is larger than wasm32 addresses".into()))?;
         // A call decodes its message, so its budget, and the budget of the allocation that holds
         // the message, grow with it.
-        let fuel = self
-            .budget
-            .fuel
-            .saturating_add(self.budget.per_byte.saturating_mul(u64::from(len)));
+        let fuel = fuel.saturating_add(per_byte.saturating_mul(u64::from(len)));
 
         let alloc = self.alloc.clone();
         let ptr = self.enter(call, alloc, len, fuel)?;
@@ -416,21 +358,20 @@ impl<H: Host> Instance<H> {
             ));
         }
 
-        let export = match call {
-            Call::New => self.new.clone(),
-            Call::Step => self.step.clone(),
-            Call::Restore => self.restore.clone(),
-            Call::Save => return Err(Error::Message("`save` takes no message".into())),
-        };
         let packed = self.enter(call, export, (ptr, len), fuel)?;
 
         let free = self.free.clone();
-        self.enter(call, free, (ptr, len), self.budget.fuel)?;
-        self.take(call, packed)
+        self.enter(call, free, (ptr, len), fuel)?;
+        self.take(call, packed, fuel)
     }
 
-    /// Copies the packed reply out of the module's memory and frees it.
-    fn take(&mut self, call: Call, packed: u64) -> Result<Option<Vec<u8>>, Error> {
+    /// Copies the packed reply out of the module's memory and frees it under `fuel`.
+    pub(crate) fn take(
+        &mut self,
+        call: Call,
+        packed: u64,
+        fuel: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
         let Some((ptr, len)) = unpack(packed) else {
             return Ok(None);
         };
@@ -445,12 +386,110 @@ impl<H: Host> Instance<H> {
             return Err(self.end(call, malformed(text)));
         }
         let free = self.free.clone();
-        self.enter(call, free, (ptr, len), self.budget.fuel)?;
+        self.enter(call, free, (ptr, len), fuel)?;
         Ok(Some(reply))
     }
 
+    /// Writes `message` into a buffer of the module's memory and enters `export` with it, under
+    /// `fuel` plus `per_byte` fuel for each of its bytes, in the processing interface's call
+    /// convention: the export frees its message, and its reply stays in the module's own buffer
+    /// until the module's next call, which this decodes in place as an `O`.
+    pub(crate) fn consume<O: DeserializeOwned>(
+        &mut self,
+        call: Call,
+        export: TypedFunc<(u32, u32), u64>,
+        message: &[u8],
+        inbox: (u32, u32),
+        fuel: u64,
+        per_byte: u64,
+    ) -> Result<O, Error> {
+        self.alive()?;
+
+        let len = u32::try_from(message.len())
+            .map_err(|_| Error::Message("the message is larger than wasm32 addresses".into()))?;
+        let fuel = fuel.saturating_add(per_byte.saturating_mul(u64::from(len)));
+
+        // A message the module's message buffer holds is written there; a longer one into a
+        // buffer of `alloc`, which the export frees.
+        let (place, capacity) = inbox;
+        let ptr = if len <= capacity {
+            place
+        } else {
+            let alloc = self.alloc.clone();
+            self.enter(call, alloc, len, fuel)?
+        };
+        if ptr == 0 && len != 0 {
+            return Err(self.end(call, malformed("it could not hold the message")));
+        }
+        if self
+            .memory
+            .write(&mut self.store, ptr as usize, message)
+            .is_err()
+        {
+            return Err(self.end(
+                call,
+                malformed("its message buffer lies outside its memory"),
+            ));
+        }
+        let packed = self.enter(call, export, (ptr, len), fuel)?;
+        self.read_reply(call, packed)
+    }
+
+    /// Enters `export`, which takes no message, under `fuel`, in the processing interface's call
+    /// convention ([`Self::consume`]).
+    pub(crate) fn consume_empty<O: DeserializeOwned>(
+        &mut self,
+        call: Call,
+        export: TypedFunc<(), u64>,
+        fuel: u64,
+    ) -> Result<O, Error> {
+        self.alive()?;
+        let packed = self.enter(call, export, (), fuel)?;
+        self.read_reply(call, packed)
+    }
+
+    /// The place and length of a buffer of the module that `export` replies, packed, as a
+    /// processing module's `inbox` states its message buffer; `(0, 0)`, which holds no message,
+    /// for a reply outside the module's memory.
+    pub(crate) fn buffer(
+        &mut self,
+        call: Call,
+        export: TypedFunc<(), u64>,
+        fuel: u64,
+    ) -> Result<(u32, u32), Error> {
+        let packed = self.enter(call, export, (), fuel)?;
+        let Some((ptr, len)) = unpack(packed) else {
+            return Ok((0, 0));
+        };
+        let end = ptr as usize + len as usize;
+        if end > self.memory.data_size(&self.store) {
+            return Err(self.end(
+                call,
+                malformed("its message buffer lies outside its memory"),
+            ));
+        }
+        Ok((ptr, len))
+    }
+
+    /// The reply `packed` names in the module's own buffer, decoded in place as an `O`; the
+    /// module keeps the buffer.
+    fn read_reply<O: DeserializeOwned>(&mut self, call: Call, packed: u64) -> Result<O, Error> {
+        let Some((ptr, len)) = unpack(packed) else {
+            return Err(self.end(call, malformed("it replied nothing")));
+        };
+        let (start, end) = (ptr as usize, ptr as usize + len as usize);
+        let decoded = match self.memory.data(&self.store).get(start..end) {
+            Some(reply) => decode(reply)
+                .map_err(|error| malformed(format!("its reply does not decode: {error}"))),
+            None => Err(malformed(format!(
+                "its reply {ptr}+{len} lies outside its memory"
+            ))),
+        };
+        decoded.map_err(|reason| self.end(call, reason))
+    }
+
     /// The reply of `call` decoded as an `O`, ending the instance when it is missing or not one.
-    fn decode<O: DeserializeOwned>(
+    pub(crate) fn decode<O: DeserializeOwned>(
         &mut self,
         call: Call,
         reply: Option<Vec<u8>>,
@@ -468,7 +507,7 @@ impl<H: Host> Instance<H> {
 
     /// Enters one export with a fresh fuel budget of `fuel` and adds what it consumed to the
     /// usage; a failure ends the instance with its reason.
-    fn enter<P: WasmParams, R: WasmResults>(
+    pub(crate) fn enter<P: WasmParams, R: WasmResults>(
         &mut self,
         call: Call,
         export: TypedFunc<P, R>,
@@ -512,13 +551,179 @@ impl<H: Host> Instance<H> {
     }
 
     /// Ends the instance in `call` for `reason`, and the error that reports it.
-    fn end(&mut self, call: Call, reason: Reason) -> Error {
+    pub(crate) fn end(&mut self, call: Call, reason: Reason) -> Error {
         self.ended = Some((call, reason.clone()));
         Error::Ended { call, reason }
     }
+
+    /// Ends the instance: every later call returns [`Reason::Disabled`].
+    pub(crate) fn disable(&mut self) {
+        if self.ended.is_none() {
+            self.ended = Some((Call::Step, Reason::Disabled));
+        }
+    }
+
+    /// The call that ended the instance and why; `None` while it runs.
+    pub(crate) fn ended(&self) -> Option<&(Call, Reason)> {
+        self.ended.as_ref()
+    }
+
+    /// The calls made into the instance and the fuel they consumed.
+    pub(crate) fn usage(&self) -> Usage {
+        self.usage
+    }
+
+    /// The bytes the instance's linear memory holds now.
+    pub(crate) fn memory_size(&self) -> usize {
+        self.memory.data_size(&self.store)
+    }
 }
 
-fn malformed(text: impl Into<String>) -> Reason {
+/// A program's instance: one program, its own linear memory, called one call at a time.
+///
+/// Once a call ends it ([`Error::Ended`]), every later call returns the same reason.
+pub struct Instance<H: 'static> {
+    core: Core<H>,
+    new: TypedFunc<(u32, u32), u64>,
+    step: TypedFunc<(u32, u32), u64>,
+    save: TypedFunc<(), u64>,
+    restore: TypedFunc<(u32, u32), u64>,
+    budget: Budget,
+}
+
+impl<H: Host> Instance<H> {
+    /// Instantiates `module` with `host` answering its host functions and creates the program
+    /// from the package's `args` table (the `new` export).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Load`] when the module does not instantiate, [`Error::Args`] when `args` is not
+    /// the program's `Args`, [`Error::Ended`] when `new` fails.
+    pub fn new(
+        module: &Module<H>,
+        host: H,
+        budget: &Budget,
+        args: &impl Serialize,
+    ) -> Result<Self, Error> {
+        let mut instance = Self::start(module, host, budget)?;
+
+        let args = encode(args).map_err(|error| Error::Message(error.to_string()))?;
+        let new = instance.new.clone();
+        match instance.exchange(Call::New, new, &args)? {
+            None => Ok(instance),
+            Some(text) => Err(Error::Args(String::from_utf8_lossy(&text).into_owned())),
+        }
+    }
+
+    /// Instantiates `module` with `host` answering its host functions and restores the program
+    /// from `state`, which [`Instance::save`] returned, perhaps for an earlier version of the
+    /// program (the `restore` export).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] when `state` is not the program's current type, so the embedder creates
+    /// it anew; otherwise as [`Instance::new`].
+    pub fn restore(
+        module: &Module<H>,
+        host: H,
+        budget: &Budget,
+        state: &[u8],
+    ) -> Result<Self, Error> {
+        let mut instance = Self::start(module, host, budget)?;
+
+        let restore = instance.restore.clone();
+        match instance.exchange(Call::Restore, restore, state)? {
+            None => Ok(instance),
+            Some(text) => Err(Error::State(String::from_utf8_lossy(&text).into_owned())),
+        }
+    }
+
+    /// One step: `input` in, the program's output out. `I` encodes as the program's `Input`
+    /// and `O` is its `Output`, as the SDK's types for the program's kind give them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Ended`] when the step fails, its reply missing or not an `O` included;
+    /// [`Error::Message`] when `input` does not encode.
+    pub fn step<I: Serialize, O: DeserializeOwned>(&mut self, input: &I) -> Result<O, Error> {
+        let input = encode(input).map_err(|error| Error::Message(error.to_string()))?;
+        let step = self.step.clone();
+        let reply = self.exchange(Call::Step, step, &input)?;
+        self.core.decode(Call::Step, reply)
+    }
+
+    /// The program's state, which [`Instance::restore`] takes back.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Ended`] when `save` fails.
+    pub fn save(&mut self) -> Result<Vec<u8>, Error> {
+        self.core.alive()?;
+
+        let save = self.save.clone();
+        let packed = self.core.enter(Call::Save, save, (), self.budget.fuel)?;
+        self.core
+            .take(Call::Save, packed, self.budget.fuel)?
+            .ok_or_else(|| self.core.end(Call::Save, malformed("it replied no state")))
+    }
+
+    /// Ends the instance: every later call returns [`Reason::Disabled`].
+    pub fn disable(&mut self) {
+        self.core.disable();
+    }
+
+    /// The call that ended the instance and why; `None` while it runs.
+    pub fn ended(&self) -> Option<&(Call, Reason)> {
+        self.core.ended()
+    }
+
+    /// The calls made into the instance and the fuel they consumed.
+    pub fn usage(&self) -> Usage {
+        self.core.usage()
+    }
+
+    /// The embedder.
+    pub fn host(&self) -> &H {
+        &self.core.store.data().host
+    }
+
+    /// The embedder, to change between calls.
+    pub fn host_mut(&mut self) -> &mut H {
+        &mut self.core.store.data_mut().host
+    }
+
+    /// Instantiates `module` in a store of its own and binds the exports.
+    fn start(module: &Module<H>, host: H, budget: &Budget) -> Result<Self, Error> {
+        let (mut core, instance) =
+            Core::start(module, host, budget.fuel, budget.per_byte, budget.memory)?;
+        Ok(Self {
+            new: core.export(&instance, name::NEW)?,
+            step: core.export(&instance, name::STEP)?,
+            save: core.export(&instance, name::SAVE)?,
+            restore: core.export(&instance, name::RESTORE)?,
+            core,
+            budget: *budget,
+        })
+    }
+
+    /// Exchanges `message` with `export` under the budget's fuel.
+    fn exchange(
+        &mut self,
+        call: Call,
+        export: TypedFunc<(u32, u32), u64>,
+        message: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        self.core.exchange(
+            call,
+            export,
+            message,
+            self.budget.fuel,
+            self.budget.per_byte,
+        )
+    }
+}
+
+pub(crate) fn malformed(text: impl Into<String>) -> Reason {
     Reason::Malformed(text.into())
 }
 

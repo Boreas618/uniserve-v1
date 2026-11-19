@@ -18,11 +18,11 @@
 pub mod processor;
 pub mod prompt;
 pub mod rules;
+pub mod wire;
 
 use std::num::NonZeroU32;
 
-use proto::request::wire;
-use proto::video::Canvas;
+use scheduling::processing::video::Canvas;
 use serde::{Deserialize, Serialize};
 
 use crate::canvas::{CanvasError, CanvasRule};
