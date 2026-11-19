@@ -111,6 +111,7 @@ impl DecoderLayer {
                 // `act(gate) · up` is one FP32 expression rounded once, as vLLM's
                 // `act_and_mul` evaluates it.
                 rounding: Rounding::Fused,
+                limit: None,
                 gate_up: GateUp::Split {
                     gate: "gate_proj",
                     up: "up_proj",
@@ -120,7 +121,7 @@ impl DecoderLayer {
                 split: tensor,
             },
             module: "shared_expert",
-            gate: "shared_expert_gate",
+            gate: Some("shared_expert_gate"),
         };
 
         Ok(Self {

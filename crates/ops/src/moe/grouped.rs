@@ -644,7 +644,12 @@ const ENTRY_PREAMBLE: u64 = 16;
 ///
 /// The size follows from a bucket's worst-case route count, so every replay of a captured bucket
 /// takes the same bytes.
-fn packed_workspace(routes: u64, width: u64, tile: (u32, u32), cluster: (u32, u32)) -> u64 {
+pub(super) fn packed_workspace(
+    routes: u64,
+    width: u64,
+    tile: (u32, u32),
+    cluster: (u32, u32),
+) -> u64 {
     let kibibytes = |bytes: u64| bytes.div_ceil(1024) * 1024;
     let token_tile = u64::from(tile.0) * u64::from(cluster.0);
     let padded = routes.max(1).div_ceil(token_tile) * token_tile;
@@ -784,7 +789,7 @@ pub struct GatherGemmNvfp4Args {
 /// the point of use by the entry, where a short buffer is a named refusal; it is never grown, because
 /// the step runs inside a captured graph and an allocation there lands at an address the pool did not
 /// bake into the capture.
-fn check_workspace(operator: &'static str, workspace: &Operand) -> Result<()> {
+pub(super) fn check_workspace(operator: &'static str, workspace: &Operand) -> Result<()> {
     workspace.require_rank(operator, 1)?;
     if workspace.dtype != DType::U8 {
         return Err(Error::argument(

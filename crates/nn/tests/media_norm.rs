@@ -683,6 +683,7 @@ const ADALN: AdaLnBlockConfig = AdaLnBlockConfig {
         intermediate: INTERMEDIATE as u32,
         activation: Activation::GeluTanh,
         rounding: Rounding::Stepwise,
+        limit: None,
         gate_up: GateUp::ValueFirst("ff.proj"),
         down: "ff.down_proj",
         bias: false,
@@ -787,6 +788,7 @@ fn an_adaln_block_modulates_both_inputs_and_gates_both_updates() {
         &packed.narrow(1, 0, INTERMEDIATE).unwrap(),
         Activation::GeluTanh,
         true,
+        None,
     )
     .unwrap();
     let projected = functional::linear(

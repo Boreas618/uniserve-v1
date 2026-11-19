@@ -1024,7 +1024,7 @@ fn the_indexed_functions_are_vllms_references() {
         keys,
         &rows,
         &visible,
-        functional::Scoring::default(),
+        functional::IndexScoring::default(),
     )
     .expect("the scores");
     assert_close(

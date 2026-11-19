@@ -1044,6 +1044,7 @@ fn mlp_config(rounding: Rounding, gate_up: GateUp) -> MlpConfig {
         intermediate: INTERMEDIATE as u32,
         activation: Activation::Silu,
         rounding,
+        limit: None,
         gate_up,
         down: "down_proj",
         bias: false,

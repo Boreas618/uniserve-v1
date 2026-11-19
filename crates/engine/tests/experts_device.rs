@@ -170,9 +170,7 @@ impl Forward for RouterRunner {
         let load = ops::moe::layer_load(LAYER);
         let (slots, _) = functional::topk_softmax(
             &scores,
-            TOP as u32,
-            true,
-            None,
+            &functional::Routing::softmax(TOP as u32, true),
             Some(&self.router.map),
             Some(&live),
             load.as_ref(),

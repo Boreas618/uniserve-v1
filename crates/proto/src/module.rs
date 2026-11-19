@@ -250,9 +250,13 @@ pub mod operator {
         // The product reads an activation `fp8_quantize` encoded, and its factor from device
         // memory, where a measured scale is written by a launch before it.
         (FP8_GEMM, 2),
+        // The gated activation clamps its halves at a limit the call passes, after the value's
+        // row stride.
+        (ACT_AND_MUL, 2),
         // The router reads the batch's live count and adds each live route into the expert
-        // load, two pointers after the map.
-        (TOPK_SOFTMAX, 2),
+        // load, two pointers after the map; its descriptor states its scoring and whether it reads
+        // a selection bias, a pointer after the scale's kind.
+        (TOPK_SOFTMAX, 3),
     ];
 
     /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.

@@ -1,0 +1,44 @@
+# The mxfp8_gemm operator's DeepGEMM backend.
+#
+# DeepGEMM's SM100 block-scaled product (`sm100_fp8_fp4_gemm_1d1d`, the `deepgemm`
+# pin of `uniserve_build_server.fetch`) over MXFP8 operands, compiled ahead of time:
+# the build chooses the tile for the descriptor's row class as DeepGEMM's run-time
+# heuristic chooses it, instantiates the kernel template with it, and compiles it
+# with the package's entry `src/gemm.cu`, which encodes the five tensor maps the
+# kernel reads and launches it, into one native module per descriptor. A serving
+# host compiles nothing.
+#
+# The kernel is persistent and computes any row count (`SHAPE_M = 0`). The pin's
+# scheduler strides its blocks by its compiled multiprocessor count; the build
+# compiles a staged copy with `patches/launched-grid.patch`, which strides by the
+# launched grid instead, so one module serves every multiprocessor count of its
+# target and the entry launches one block per multiprocessor of the device it runs
+# on. The CUTLASS the kernel includes is the one the `flashinfer-python`
+# distribution installs.
+
+op = "mxfp8_gemm"
+backend = "deepgemm"
+interface_version = 1
+
+[toolchain]
+packages = ["flashinfer-python"]
+
+[source]
+kind = "cuda"
+
+[kernel]
+requires = ["tensor_memory"]
+
+[parameters]
+# The multiprocessors the tile choice plans its waves for, and the kernel's L2
+# grouping is sized by: the fewest an SM100 part has (148), so a choice never
+# counts on more than a device holds.
+multiprocessors = 148
+
+# `output_bf16_n_1792_k_5120_rows_128`.
+#
+# The contraction is whole 128-element steps (one packed scale word of each row)
+# and the output channels whole 16-element vectors; the row class is the tile
+# choice's, a power of two.
+[[kernel.descriptors]]
+dimensions = { output = ["bf16"], n = { multiple = 16 }, k = { multiple = 128 }, rows = { min = 16, max = 16384, power_of_two = true } }

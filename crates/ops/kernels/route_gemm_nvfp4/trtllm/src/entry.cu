@@ -40,6 +40,13 @@ struct SecondMatrix {
   // The second matrix's tactics are sized by the routes it reads.
   static int32_t rows(Call const* call) { return static_cast<int32_t>(call->routes); }
 
+  // The module's activations and output are BF16 rows.
+  static char const* refused_types(Call const* call) {
+    return call->dtype == UNISERVE_DTYPE_BF16
+               ? nullptr
+               : "the product's output is compiled as bf16 and this module is the bf16 one";
+  }
+
   // A call reads at least one token's routes.
   static bool counts(Call const* call) { return call->routes >= call->top; }
 

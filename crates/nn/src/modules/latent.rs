@@ -29,7 +29,7 @@ use tensor::{DType, Device, Tensor};
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
 use crate::functional::{
-    self, Compression, Format, Plane, RecordRow, Ring, Scoring, Selected, Window,
+    self, Compression, Format, IndexScoring, Plane, RecordRow, Ring, Selected, Window,
 };
 use crate::modules::{Linear, LinearConfig, Parallel};
 use crate::var_builder::VarBuilder;
@@ -475,7 +475,7 @@ impl Indexer {
             keys,
             batch.rows,
             &visible,
-            Scoring {
+            IndexScoring {
                 weights: Some(&weights),
                 query: Format::Mxfp4,
                 candidates: restriction,

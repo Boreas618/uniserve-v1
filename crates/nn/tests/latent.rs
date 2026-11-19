@@ -9,7 +9,9 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-use nn::functional::{self, Format, Layout, Plane, RecordRow, Ring, Scoring, Selected, Window};
+use nn::functional::{
+    self, Format, IndexScoring, Layout, Plane, RecordRow, Ring, Selected, Window,
+};
 use nn::{DType, Device, Tensor};
 use nn_testing::{Recording, assert_close, meta, record, sequence, tensor, values};
 use ops::record as codec;
@@ -407,7 +409,7 @@ fn the_index_scores_weight_their_heads_and_keep_to_the_candidates() {
                 plane,
                 &int(vec![0_u32], 1),
                 &int(vec![9_u32], 1),
-                Scoring {
+                IndexScoring {
                     weights: Some(&tensor(&weights, (1, HEADS), DType::F32)),
                     query: Format::Bf16,
                     candidates,
@@ -594,7 +596,7 @@ fn a_layer_states_its_kernels_at_the_models_shapes() {
             plane(&keys, &compressed_table, Format::Mxfp4, Layout::Page),
             &rows,
             &column(DType::U32),
-            Scoring {
+            IndexScoring {
                 weights: Some(&meta((TOKENS, 32), DType::F32)),
                 query: Format::Mxfp4,
                 candidates: None,

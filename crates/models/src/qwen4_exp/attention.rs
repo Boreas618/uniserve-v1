@@ -261,6 +261,7 @@ impl IndexedAttention {
             &attended.reshape((tokens * heads, head_dim))?,
             Activation::Sigmoid,
             false,
+            None,
         )?;
         self.o_proj
             .forward(&gated.reshape((tokens, heads * head_dim))?)
@@ -469,7 +470,7 @@ impl IndexedAttention {
             keys,
             &columns[ROW],
             &visible.to_dtype(DType::U32)?,
-            functional::Scoring::default(),
+            functional::IndexScoring::default(),
         )?;
         let block_topk = self.indexer.block_topk() as usize;
         let kept_groups = block_topk.min(scores.dims()[1]);

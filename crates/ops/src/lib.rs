@@ -189,6 +189,7 @@ pub mod logits;
 pub mod mhc;
 pub mod modulation;
 pub mod moe;
+pub mod mx;
 pub mod ngram;
 pub mod noise;
 pub mod norm;

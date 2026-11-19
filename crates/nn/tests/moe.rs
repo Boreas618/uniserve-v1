@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use nn::collective::Split;
-use nn::functional::{self, Activation, Rounding};
+use nn::functional::{self, Activation, Rounding, Routing, Scoring};
 use nn::modules::{
     ExpertLayout, GateUp, MlpConfig, MoE, MoEConfig, SharedExpert, SharedExpertConfig,
 };
@@ -104,9 +104,7 @@ fn topk_softmax_keeps_the_most_probable_experts_and_renormalizes_them() {
 
     let (ids, weights) = functional::topk_softmax(
         &tensor(&scores, (tokens, experts), DType::F32),
-        top as u32,
-        true,
-        None,
+        &Routing::softmax(top as u32, true),
         None,
         None,
         None,
@@ -119,9 +117,7 @@ fn topk_softmax_keeps_the_most_probable_experts_and_renormalizes_them() {
     // Without the renormalization the weights are the softmax's own probabilities.
     let (_, raw) = functional::topk_softmax(
         &tensor(&scores, (tokens, experts), DType::F32),
-        top as u32,
-        false,
-        None,
+        &Routing::softmax(top as u32, false),
         None,
         None,
         None,
@@ -148,9 +144,7 @@ fn topk_softmax_routes_ten_of_five_hundred_and_twelve_experts() {
     let (expected_ids, expected_weights) = route_by_hand(&scores, experts, top);
     let (ids, weights) = functional::topk_softmax(
         &tensor(&scores, (tokens, experts), DType::F32),
-        top as u32,
-        true,
-        None,
+        &Routing::softmax(top as u32, true),
         None,
         None,
         None,
@@ -162,9 +156,7 @@ fn topk_softmax_routes_ten_of_five_hundred_and_twelve_experts() {
     let (routed, Recording { launches, .. }) = record(&[], || {
         functional::topk_softmax(
             &meta((tokens, experts), DType::BF16),
-            top as u32,
-            true,
-            None,
+            &Routing::softmax(top as u32, true),
             None,
             None,
             None,
@@ -175,7 +167,8 @@ fn topk_softmax_routes_ten_of_five_hundred_and_twelve_experts() {
         launches,
         [(
             "topk_softmax",
-            "scores_bf16_experts_512_top_10_renormalize_true_scale_none".to_owned()
+            "scores_bf16_experts_512_top_10_scoring_softmax_renormalize_true_bias_false_scale_none"
+                .to_owned()
         )]
     );
 }
@@ -190,9 +183,10 @@ fn topk_softmax_scales_by_the_expert_and_writes_each_route_s_slot() {
 
     let (ids, weights) = functional::topk_softmax(
         &tensor(&scores, (tokens, experts), DType::F32),
-        top as u32,
-        true,
-        Some(&tensor(&scale, experts, DType::F32)),
+        &Routing {
+            scale: Some(&tensor(&scale, experts, DType::F32)),
+            ..Routing::softmax(top as u32, true)
+        },
         Some(&indices(&map, experts)),
         None,
         None,
@@ -211,9 +205,20 @@ fn topk_softmax_scales_by_the_expert_and_writes_each_route_s_slot() {
 
     // A top beyond the experts, and a map of another length, are refused.
     let scores = tensor(&scores, (tokens, experts), DType::F32);
-    assert!(functional::topk_softmax(&scores, 6, true, None, None, None, None).is_err());
+    assert!(
+        functional::topk_softmax(&scores, &Routing::softmax(6, true), None, None, None,).is_err()
+    );
     let short = indices(&[0, 1], 2);
-    assert!(functional::topk_softmax(&scores, 2, true, None, Some(&short), None, None).is_err());
+    assert!(
+        functional::topk_softmax(
+            &scores,
+            &Routing::softmax(2, true),
+            Some(&short),
+            None,
+            None,
+        )
+        .is_err()
+    );
 }
 
 // ---- The sort ---------------------------------------------------------------------------------
@@ -977,6 +982,10 @@ fn dense_config() -> MoEConfig {
         top: 2,
         activation: Activation::Silu,
         renormalize: true,
+        scoring: Scoring::Softmax,
+        selection_bias: None,
+        routed_scale: None,
+        limit: None,
         router: "gate",
         list: "experts",
         up: "up_proj",
@@ -1428,7 +1437,7 @@ fn a_dense_block_states_its_routing_its_products_and_its_combine() {
     );
     assert_eq!(
         launches[1].1,
-        "scores_bf16_experts_4_top_2_renormalize_true_scale_none"
+        "scores_bf16_experts_4_top_2_scoring_softmax_renormalize_true_bias_false_scale_none"
     );
     assert_eq!(
         launches[2].1,
@@ -1691,7 +1700,7 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
         [
             (
                 "topk_softmax",
-                "scores_bf16_experts_4_top_2_renormalize_true_scale_none".to_owned()
+                "scores_bf16_experts_4_top_2_scoring_softmax_renormalize_true_bias_false_scale_none".to_owned()
             ),
             ("expert_exchange", exchange_key("dispatch")),
             (
@@ -1968,6 +1977,7 @@ fn a_shared_expert_adds_its_gated_mlp_into_the_routed_output() {
             intermediate: intermediate as u32,
             activation: Activation::Silu,
             rounding: Rounding::Fused,
+            limit: None,
             gate_up: GateUp::Split {
                 gate: "gate_proj",
                 up: "up_proj",
@@ -1977,7 +1987,7 @@ fn a_shared_expert_adds_its_gated_mlp_into_the_routed_output() {
             split: Split::WHOLE,
         },
         module: "shared_expert",
-        gate: "shared_expert_gate",
+        gate: Some("shared_expert_gate"),
     };
 
     let store = CpuWeights::new();

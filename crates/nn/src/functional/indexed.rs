@@ -52,7 +52,7 @@ fn check_rows(owner: &'static str, rows: &Tensor, tokens: usize) -> Result<()> {
 
 /// How [`index_scores`] scores beyond the plain sum of rectified products.
 #[derive(Clone, Copy)]
-pub struct Scoring<'t> {
+pub struct IndexScoring<'t> {
     /// `[tokens, heads]` F32: each row's head weights, when the heads are weighted.
     pub weights: Option<&'t Tensor>,
     /// How a query is read: as it is ([`Format::Bf16`]), or rounded to [`Format::Mxfp4`] blocks
@@ -64,7 +64,7 @@ pub struct Scoring<'t> {
     pub candidates: Option<(&'t Tensor, u32)>,
 }
 
-impl Default for Scoring<'_> {
+impl Default for IndexScoring<'_> {
     /// The unweighted sum over every visible group, each query read as it is.
     fn default() -> Self {
         Self {
@@ -107,7 +107,7 @@ pub fn index_scores(
     keys: Plane<'_>,
     rows: &Tensor,
     visible: &Tensor,
-    scoring: Scoring<'_>,
+    scoring: IndexScoring<'_>,
 ) -> Result<Tensor> {
     const OWNER: &str = IndexScoresCall::OWNER;
 
@@ -213,7 +213,7 @@ struct IndexScoresCall<'t> {
     keys: Plane<'t>,
     rows: &'t Tensor,
     visible: &'t Tensor,
-    scoring: Scoring<'t>,
+    scoring: IndexScoring<'t>,
     tokens: usize,
     heads: usize,
     width: usize,
