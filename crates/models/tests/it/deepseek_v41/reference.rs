@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use models::deepseek_v41::{Config, Hashing};
 use nn::config::Fields;
 use nn::functional::WeightOrder;
-use nn::modules::{Linear, MhcConnection, MhcResidual, NgramMemory, NgramTable, TableShard};
+use nn::modules::{
+    Linear, MhcConnection, MhcResidual, NgramMemory, NgramTable, TableShard, Tokens,
+};
 use nn::{DType, Device, Tensor};
 use nn_testing::reference::{self, Mixing, assert_within};
 use nn_testing::{tensor, values};
@@ -355,7 +357,9 @@ fn the_layer_one_ngram_memory_is_the_reference_formulas() {
     let h = shards.bf16_rows("embed.weight", &embedded);
     let streams = tensor(&h, (TOKENS, n, d), DType::BF16);
 
-    let recalled = memory.lookup(&local_rows, DType::BF16).unwrap();
+    let recalled = memory
+        .lookup(&local_rows, DType::BF16, Tokens::Shared)
+        .unwrap();
     let gated = memory.gate(&streams, &recalled).unwrap();
 
     // The reference: the rows' values, the projection stored in BF16, the gate.

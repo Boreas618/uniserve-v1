@@ -18,6 +18,13 @@
 //! heads, whose rows are contiguous ranges of it. Where the rows live (device memory or memory
 //! of the host the device reads) is the loader's placement: the lookup reads the shard's rows
 //! wherever its tensor is.
+//!
+//! The ranks of the group either look the same tokens up (a tensor-parallel group) or each its
+//! own ([`Tokens`]): ranks that serve batches of their own, as the data-parallel ranks that share
+//! their routed experts do, gather every rank's row ids, each reads its heads' rows for all of
+//! them, and an all-to-all hands each rank its own tokens' columns back. Every rank of such a
+//! group takes part in every lookup of a step, a rank with no tokens of its own included
+//! ([`NgramMemory::join`]).
 
 use tensor::{DType, Tensor};
 
@@ -154,6 +161,21 @@ pub enum TableShard {
     Heads(Split),
 }
 
+/// Whose tokens the ranks of a split table's group look up, which decides how the group completes
+/// a lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tokens {
+    /// Every rank looks the same tokens up: a tensor-parallel group.
+    Shared,
+    /// Each rank looks tokens of its own up, at most `block` of them: the ranks of a group that
+    /// serve batches of their own and shaped the step for `block` rows each. Every rank's rows
+    /// travel padded to `block`, so the group's collectives move equal blocks.
+    Own {
+        /// Rows per rank of the step.
+        block: usize,
+    },
+}
+
 /// An MXFP8 table of n-gram rows, or this rank's shard of it.
 pub struct NgramTable {
     /// `[rows, r]` E4M3: the rows held.
@@ -208,18 +230,30 @@ impl NgramTable {
     }
 
     /// The rows `rows` names, `[tokens, columns]` I64, dequantized into `dtype`:
-    /// `[tokens, columns · r]`, every token's rows side by side.
+    /// `[tokens, columns · r]`, every token's rows side by side. `tokens` states whose tokens the
+    /// group's other ranks look up in the same lookup; a whole table reads every row itself.
     ///
     /// # Errors
     ///
-    /// Rows of another shape, a shard of heads that does not divide the columns, a split table in
-    /// a forward without its group, or what the lookup refuses.
-    pub fn lookup(&self, rows: &Tensor, dtype: DType) -> Result<Tensor> {
-        let (tokens, columns) = rows.dims2()?;
+    /// Rows of another shape, a shard of heads that does not divide the columns, more tokens than
+    /// a rank's block, a table split by rows over ranks of their own tokens, a split table in a
+    /// forward without its group, or what the lookup refuses.
+    pub fn lookup(&self, rows: &Tensor, dtype: DType, tokens: Tokens) -> Result<Tensor> {
         let width = self.values.dim(1)?;
         let read = |ids: &Tensor| -> Result<Tensor> {
             functional::embedding_mxfp8(ids, &self.values, &self.scales, self.first, dtype)
         };
+        if let (TableShard::Heads(split), Tokens::Own { block }) = (self.shard, tokens) {
+            return self.served(rows, split, block, &read);
+        }
+        if let (TableShard::Rows(_), Tokens::Own { .. }) = (self.shard, tokens) {
+            return Err(Error::Unsupported(
+                "NgramTable: a table split by rows sums every rank's rows of the same tokens; \
+                 ranks of their own tokens split it by hash heads"
+                    .to_owned(),
+            ));
+        }
+        let (tokens, columns) = rows.dims2()?;
 
         match self.shard {
             TableShard::Whole => {
@@ -255,6 +289,66 @@ impl NgramTable {
                     .reshape((tokens, columns * width))?)
             }
         }
+    }
+}
+
+impl NgramTable {
+    /// A lookup of a table split by hash heads over `split`, whose ranks look tokens of their own
+    /// up, at most `block` each (module documentation): `[tokens, columns · r]`.
+    ///
+    /// ```text
+    /// ids      = gather(pad(rows, block))              [ranks · block, columns], rank-major
+    /// held     = read(ids[:, own heads' columns])      [ranks, block, share, r]
+    /// returned = all_to_all(held)                      block j: rank j's columns of these tokens
+    /// out      = returned, columns in rank order       [block, columns · r], then the tokens'
+    /// ```
+    fn served(
+        &self,
+        rows: &Tensor,
+        split: Split,
+        block: usize,
+        read: &dyn Fn(&Tensor) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let (tokens, columns) = rows.dims2()?;
+        let (size, width) = (split.size() as usize, self.values.dim(1)?);
+        if !columns.is_multiple_of(size) || tokens > block || block == 0 {
+            return Err(Error::shape(
+                "NgramTable",
+                format!(
+                    "{tokens} tokens of {columns} row columns over {size} ranks of their own \
+                     tokens, {block} rows a rank"
+                ),
+            ));
+        }
+        grouped("a table split by heads gathers every rank's row ids over its group")?;
+
+        // Every rank's ids in rank order, each padded to the block: a padding id reads row 0,
+        // whose values no rank keeps.
+        let share = columns / size;
+        let padded = if tokens < block {
+            let padding = Tensor::zeros((block - tokens, columns), rows.dtype(), rows.device())?;
+            Tensor::cat(&[rows, &padding], 0)?
+        } else {
+            rows.clone()
+        };
+        let ids = collective::gathered(&padded.contiguous()?)?;
+
+        // This rank's heads' rows of every rank's tokens, laid out by the rank they go back to.
+        let held = ids
+            .narrow(1, split.rank() as usize * share, share)?
+            .contiguous()?;
+        let sent = read(&held.flatten_all()?)?.contiguous()?;
+        let returned = ops::empty(sent.dims().to_vec(), sent.dtype())?;
+        collective::all_to_all(&sent, &returned)?;
+
+        // Block j holds rank j's columns of this rank's tokens: ranks in order are columns in
+        // order.
+        Ok(returned
+            .reshape((size, block, share, width))?
+            .transpose(0, 1)?
+            .contiguous()?
+            .reshape((block, columns * width))?
+            .narrow(0, 0, tokens)?)
     }
 }
 
@@ -342,8 +436,8 @@ impl NgramMemory {
     /// # Errors
     ///
     /// As [`NgramTable::lookup`].
-    pub fn lookup(&self, rows: &Tensor, dtype: DType) -> Result<Tensor> {
-        self.table.lookup(rows, dtype)
+    pub fn lookup(&self, rows: &Tensor, dtype: DType, tokens: Tokens) -> Result<Tensor> {
+        self.table.lookup(rows, dtype, tokens)
     }
 
     /// `streams`, `[tokens, n, d]`, each plus the value `recalled` projects to, under the gate of
@@ -359,13 +453,30 @@ impl NgramMemory {
 
     /// The memory added into `streams`, `[tokens, n, d]`, for the tokens of `context`
     /// (`[tokens, N]` vocabulary ids): [`Self::rows`], [`Self::lookup`] and [`Self::gate`].
+    /// `tokens` states whose tokens the table's other ranks look up ([`Tokens`]).
     ///
     /// # Errors
     ///
     /// What one of them refuses.
-    pub fn forward(&self, streams: &Tensor, context: &Tensor) -> Result<Tensor> {
-        let recalled = self.lookup(&self.rows(context)?, streams.dtype())?;
+    pub fn forward(&self, streams: &Tensor, context: &Tensor, tokens: Tokens) -> Result<Tensor> {
+        let recalled = self.lookup(&self.rows(context)?, streams.dtype(), tokens)?;
         self.gate(streams, &recalled)
+    }
+
+    /// Takes part in a step's lookup with no token of this rank's own, `block` rows a rank, as a
+    /// rank of a group whose ranks look up tokens of their own must ([`Tokens::Own`]): its heads'
+    /// rows serve the other ranks' tokens. A table this rank holds whole looks nothing up.
+    ///
+    /// # Errors
+    ///
+    /// What the lookup refuses.
+    pub fn join(&self, block: usize, dtype: DType) -> Result<()> {
+        if let TableShard::Heads(_) = self.table.shard {
+            let columns = self.config.columns() as usize;
+            let none = ops::empty(vec![0, columns], DType::I64)?;
+            self.table.lookup(&none, dtype, Tokens::Own { block })?;
+        }
+        Ok(())
     }
 }
 

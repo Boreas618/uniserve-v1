@@ -10,7 +10,7 @@
 use nn::functional::{self, MhcMixes, MhcMixing, WeightOrder};
 use nn::modules::{
     Linear, MhcConfig, MhcConnection, MhcResidual, NgramConfig, NgramHashing, NgramMemory,
-    NgramTable, TableShard,
+    NgramTable, TableShard, Tokens,
 };
 use nn::{CpuWeights, DType, Device, Tensor, WeightLoader};
 use nn_testing::reference::{self, Mixes, Mixing, assert_within, narrow};
@@ -480,6 +480,7 @@ fn the_memory_gates_its_recalled_rows_into_every_stream_as_the_reference_does() 
         .forward(
             &streams,
             &Tensor::from_vec(context.clone(), (5, 4), &Device::Cpu).unwrap(),
+            Tokens::Shared,
         )
         .unwrap();
 
@@ -580,4 +581,56 @@ fn a_profile_run_states_the_block_a_call_of_its_tokens_launches() {
         // A split call clears its arrival counters first.
         assert_eq!(recording.launches[0].0, "fill", "{tokens} tokens");
     }
+}
+
+/// A table split by hash heads over ranks that serve tokens of their own: a rank gathers every
+/// rank's row ids, reads its heads' rows of all of them and hands each rank its own tokens'
+/// columns back, so its lookup answers its own tokens' every column; it reads only its heads'
+/// rows, and a rank with no token of its own takes part with none. A block narrower than the
+/// rank's tokens, and a table split by rows, are refused for such ranks.
+#[test]
+fn a_table_split_by_heads_serves_ranks_that_look_up_their_own_tokens() {
+    let rank = nn::Split::new(4, 1).unwrap();
+    let (columns, width) = (24, 256);
+    let shard = |shard| {
+        NgramTable::new(
+            nn_testing::meta(&[1000, width], DType::F8E4M3),
+            nn_testing::meta(&[1000, width / 32], DType::U8),
+            6000,
+            shard,
+        )
+        .unwrap()
+    };
+    let table = shard(TableShard::Heads(rank));
+
+    let (looked_up, recording) = nn_testing::record(&[rank], || {
+        let rows = nn_testing::meta(&[3, columns], DType::I64);
+        table.lookup(&rows, DType::BF16, Tokens::Own { block: 8 })
+    });
+    assert_eq!(looked_up.unwrap().dims(), [3, columns * width]);
+    // One read of this rank's 6 heads' rows of 4 ranks' blocks of 8 tokens.
+    let reads: Vec<_> = recording
+        .launches
+        .iter()
+        .filter(|(operator, _)| *operator == "embedding_mxfp8")
+        .collect();
+    assert_eq!(reads.len(), 1, "{:?}", recording.launches);
+
+    let (joined, _) = nn_testing::record(&[rank], || {
+        let none = nn_testing::meta(&[0, columns], DType::I64);
+        table.lookup(&none, DType::BF16, Tokens::Own { block: 8 })
+    });
+    assert_eq!(joined.unwrap().dims(), [0, columns * width]);
+
+    let (crowded, _) = nn_testing::record(&[rank], || {
+        let rows = nn_testing::meta(&[9, columns], DType::I64);
+        table.lookup(&rows, DType::BF16, Tokens::Own { block: 8 })
+    });
+    assert!(crowded.is_err());
+    let (summed, _) = nn_testing::record(&[rank], || {
+        let rows = nn_testing::meta(&[3, columns], DType::I64);
+        shard(TableShard::Rows(rank)).lookup(&rows, DType::BF16, Tokens::Own { block: 8 })
+    });
+    let message = summed.err().unwrap().to_string();
+    assert!(message.contains("hash heads"), "{message}");
 }
