@@ -2,15 +2,15 @@
 
 Qwen3 is served by two data-parallel schedulers whose ranks share their
 experts (``data_parallel_size = 2`` with expert parallelism): one main
-process, one scheduler per replica, each on its own GPU. The control thread
-asks the epoch's scheduling policy where each request goes (its ``route``),
-and the policy the deployment serves names the live replica with the fewest
-requests in flight, rotating among equally loaded ones
-(``docs/architecture.md``, The request interface). Each replica's scheduler
+process, one scheduler per replica, each on its own GPU. The leader routes
+each request and names the scheduler that serves it; with no routing program
+its own rule names the replica with the fewest requests in flight, equally
+loaded replicas in turn (``docs/configuration.md``, Replicas;
+``docs/architecture.md``, The request interface). Each replica's scheduler
 reports its admissions under its own ``scheduler`` label
 (``uniserve_scheduler_admitted_requests_total``).
 
-Requests sent one at a time find both replicas idle, so the policy alternates
+Requests sent one at a time find both replicas idle, so the leader alternates
 between them and each admits half. While one replica holds a long request,
 every request sent meanwhile finds the other replica with fewer in flight, so
 the other replica admits all of them.
@@ -148,7 +148,7 @@ def test_requests_are_served_by_the_replicas_the_policy_routes_them_to(
         }
     ) as server:
         base_url = server.base_url
-        # Idle replicas: the policy rotates, and each admits half.
+        # Idle replicas: the leader takes them in turn, and each admits half.
         before = _quiet(server)
         for index in range(SEQUENTIAL):
             _ask(base_url, f"Say the number {index}.", 4)

@@ -110,6 +110,8 @@ pub(crate) struct Replicas {
     /// it to its end, and an epoch switch to model files that process requests otherwise
     /// replaces it ([`Replicas::process_with`]).
     processor: std::sync::Mutex<Arc<Processor>>,
+    /// Where the deployment's own route breaks its next tie among equally loaded schedulers.
+    rotation: Rotation,
 }
 
 impl Replicas {
@@ -146,7 +148,7 @@ impl crate::migration::Reroute for Replicas {
     fn reroute(&self, request: &Request) -> Option<Target> {
         let serving = self.serving_now();
         let candidates = candidates(&serving);
-        let route = pair(&loads(&candidates), request)?;
+        let route = self.rotation.route(&loads(&candidates), request)?;
         Some(target(&candidates, route).1)
     }
 }
@@ -290,16 +292,20 @@ fn routing(
 
 /// The deployment's own route of `request` among `candidates`, each scheduler's role and requests
 /// in flight, as indices into them: the least loaded scheduler whose role takes the request
-/// first, by requests in flight, the first of them on a tie. A continuation
-/// (it names a lend or tokens it generated) goes to one that generates tokens; any other token
-/// request to one that computes prompts, generated there too when that one is mixed and handed
-/// off to the least loaded that generates tokens otherwise; a video request to a mixed one.
-/// `None` when no candidate's role takes it.
-fn pair(candidates: &[(Role, u32)], request: &Request) -> Option<(usize, usize)> {
+/// first, by requests in flight, and on a tie the first of the equally loaded at or after index
+/// `start`, wrapping around. A continuation (it names a lend or tokens it generated) goes to one
+/// that generates tokens; any other token request to one that computes prompts, generated there
+/// too when that one is mixed and handed off to the least loaded that generates tokens
+/// otherwise; a video request to a mixed one. `None` when no candidate's role takes it.
+fn pair(candidates: &[(Role, u32)], request: &Request, start: usize) -> Option<(usize, usize)> {
+    let count = candidates.len();
+    let start = start % count.max(1);
+    // A candidate's distance from `start` in the deployment's order, wrapping around, orders the
+    // equally loaded ones.
     let least = |takes: &dyn Fn(Role) -> bool| {
-        (0..candidates.len())
+        (0..count)
             .filter(|&index| takes(candidates[index].0))
-            .min_by_key(|&index| candidates[index].1)
+            .min_by_key(|&index| (candidates[index].1, (index + count - start) % count))
     };
     let generation = match request {
         Request::Generation(generation) => generation,
@@ -318,6 +324,27 @@ fn pair(candidates: &[(Role, u32)], request: &Request) -> Option<(usize, usize)>
     }
     let decode = least(&Role::decodes)?;
     Some((prefill, decode))
+}
+
+/// The deployment's own rule of routing ([`pair`]), which takes equally loaded schedulers in
+/// turn: each route breaks its ties from the candidate after the one the previous route gave its
+/// request to first, so requests that find the schedulers equally loaded, such as requests sent
+/// one at a time to idle replicas, rotate over them rather than all landing on the first.
+#[derive(Debug, Default)]
+struct Rotation {
+    /// The index of the candidate the next route's tie starts from.
+    next: AtomicUsize,
+}
+
+impl Rotation {
+    /// The route of `request` among `candidates` ([`pair`]), ties broken from this rotation's
+    /// turn, which then passes to the candidate after the route's first. Two routes at once may
+    /// start from the same turn; each still goes to a least loaded scheduler.
+    fn route(&self, candidates: &[(Role, u32)], request: &Request) -> Option<(usize, usize)> {
+        let route = pair(candidates, request, self.next.load(Ordering::Relaxed))?;
+        self.next.store(route.0 + 1, Ordering::Relaxed);
+        Some(route)
+    }
 }
 
 /// The target `route`, indices into `candidates`, names, with the replica that takes the request
@@ -665,9 +692,11 @@ impl Leader {
 
     /// Where a new request goes ([`Target`]): the routing program's choice among every serving
     /// replica's schedulers while one runs (`crate::programs::Router`), and otherwise, or when
-    /// its route is refused, the deployment's own rule ([`pair`]). A deployment whose schedulers
-    /// are all mixed and runs no program gives the request to the least loaded replica, whose
-    /// engine gives it to its least loaded scheduler.
+    /// its route is refused, the deployment's own rule ([`Rotation`]): the least loaded
+    /// scheduler whose role takes the request, equally loaded ones in turn. The route names the
+    /// scheduler, so an engine of several schedulers makes no choice of its own. Only while no
+    /// serving engine states its schedulers does the request go to the least loaded ready
+    /// replica, whose engine gives it to its least loaded scheduler.
     ///
     /// A route that names two replicas computes the prompt on the first, which hands the KV off
     /// once the first token is sampled, and generates the tokens on the second
@@ -680,19 +709,6 @@ impl Leader {
         let least = self.replica_for_request().await?;
         let serving = self.replicas.serving_now();
         let candidates = candidates(&serving);
-        let mixed = candidates
-            .iter()
-            .all(|candidate| candidate.role == Role::Mixed);
-        if mixed && !self.router.routes() {
-            let target = Target {
-                first: Next {
-                    hold: Arc::clone(&least.hold),
-                    scheduler: None,
-                },
-                decode: None,
-            };
-            return Ok((least, target));
-        }
 
         let route = if self.router.routes() {
             // The directory answers over a socket: the question waits off the runtime's threads.
@@ -720,7 +736,7 @@ impl Leader {
         };
         let route = route
             .map(|route| (route.prefill, route.decode))
-            .or_else(|| pair(&loads(&candidates), request));
+            .or_else(|| self.replicas.rotation.route(&loads(&candidates), request));
         Ok(match route {
             Some(route) => target(&candidates, route),
             None => {
@@ -1456,6 +1472,7 @@ impl Leader {
             held: AtomicUsize::new(0),
             profile_sessions: std::sync::atomic::AtomicU64::new(0),
             processor: std::sync::Mutex::new(Arc::new(processor)),
+            rotation: Rotation::default(),
         });
         for replica in replicas.serving.borrow().iter() {
             replica.monitor();
@@ -4675,16 +4692,46 @@ mod tests {
             (Role::Prefill, 1),
             (Role::Decode, 2),
         ];
-        assert_eq!(super::pair(&split, &fresh), Some((2, 3)));
-        assert_eq!(super::pair(&split, &continued), Some((3, 3)));
-        assert_eq!(super::pair(&split, &video), None);
+        assert_eq!(super::pair(&split, &fresh, 0), Some((2, 3)));
+        assert_eq!(super::pair(&split, &continued, 0), Some((3, 3)));
+        assert_eq!(super::pair(&split, &video, 0), None);
 
         let mixed = [(Role::Prefill, 4), (Role::Mixed, 1), (Role::Decode, 0)];
-        assert_eq!(super::pair(&mixed, &fresh), Some((1, 1)));
-        assert_eq!(super::pair(&mixed, &continued), Some((2, 2)));
-        assert_eq!(super::pair(&mixed, &video), Some((1, 1)));
+        assert_eq!(super::pair(&mixed, &fresh, 0), Some((1, 1)));
+        assert_eq!(super::pair(&mixed, &continued, 0), Some((2, 2)));
+        assert_eq!(super::pair(&mixed, &video, 0), Some((1, 1)));
 
-        assert_eq!(super::pair(&[(Role::Decode, 0)], &fresh), None);
+        assert_eq!(super::pair(&[(Role::Decode, 0)], &fresh, 0), None);
+    }
+
+    /// Requests that find the schedulers equally loaded take them in turn: requests sent one at
+    /// a time to idle replicas alternate between them, and a scheduler with fewer requests in
+    /// flight takes the request whatever the turn.
+    #[test]
+    fn equally_loaded_schedulers_take_requests_in_turn() {
+        use scheduling::routing::Role;
+
+        let request = text_request();
+        let rotation = super::Rotation::default();
+        let idle = [(Role::Mixed, 0), (Role::Mixed, 0)];
+        let routed: Vec<_> = (0..6)
+            .map(|_| rotation.route(&idle, &request).map(|(first, _)| first))
+            .collect();
+        assert_eq!(routed, [0, 1, 0, 1, 0, 1].map(Some));
+
+        // The busy scheduler between two idle ones is skipped; the idle ones alternate.
+        let rotation = super::Rotation::default();
+        let busy = [(Role::Mixed, 0), (Role::Mixed, 2), (Role::Mixed, 0)];
+        let routed: Vec<_> = (0..4)
+            .map(|_| rotation.route(&busy, &request).map(|(first, _)| first))
+            .collect();
+        assert_eq!(routed, [0, 2, 0, 2].map(Some));
+
+        // The least loaded takes the request, from any turn.
+        let lighter = [(Role::Mixed, 1), (Role::Mixed, 0)];
+        for _ in 0..3 {
+            assert_eq!(rotation.route(&lighter, &request), Some((1, 1)));
+        }
     }
 
     /// Replicas spread over a second host run their engines where their ranks are: each one's

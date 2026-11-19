@@ -4,7 +4,7 @@
 //! request and the state of every replica ([`Routing`]) and chooses the replica that computes
 //! the prompt and the replica that generates the tokens ([`Route`]). The leader checks every
 //! route: an index outside `replicas` or a replica of the wrong role is refused, and the request
-//! goes to the replica with the fewest requests in flight.
+//! goes to the replica with the fewest requests in flight, equally loaded replicas in turn.
 
 use serde::{Deserialize, Serialize};
 

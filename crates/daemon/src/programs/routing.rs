@@ -4,8 +4,8 @@
 //! The leader checks every route it is given: an index outside the replicas, a prefill replica
 //! that computes no prompts or a decode replica that generates no tokens is refused, recorded as
 //! a `log` event of the program, and the request goes where the leader's own rule sends it, the
-//! replica with the fewest requests in flight. So does every request while no routing program
-//! runs, or after the one that ran ended.
+//! replica with the fewest requests in flight, equally loaded replicas in turn. So does every
+//! request while no routing program runs, or after the one that ran ended.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
