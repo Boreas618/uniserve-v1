@@ -498,16 +498,27 @@ def test_a_sqrt_softplus_router_selects_by_the_bias_and_weighs_without_it(
     rows = 64
     logits, bias, ids, weights = sqrt_softplus_case(rows)
     scale = torch.full((SQRT_SOFTPLUS["experts"],), ROUTED_SCALE)
+    # A padding row of a captured bucket: NaN logits pick no expert, and its
+    # routes read no expert's scale.
+    padded = torch.cat([logits, torch.full_like(logits[:1], float("nan"))])
 
     got_ids, got_weights = launch(
         directory,
         metadata,
         torch_device,
-        logits,
+        padded,
         descriptor=SQRT_SOFTPLUS,
         scale=scale,
         bias=bias,
     )
+    padding = got_ids[-1].long()
+    assert not bool(
+        ((padding >= 0) & (padding < SQRT_SOFTPLUS["experts"])).any()
+    ), f"the padding row names an expert: {padding.tolist()}"
+    assert torch.equal(got_weights[-1], torch.zeros_like(got_weights[-1])), (
+        f"the padding row's routes weigh {got_weights[-1].tolist()}"
+    )
+    got_ids, got_weights = got_ids[:-1], got_weights[:-1]
 
     wrong = got_ids.long() != ids
     assert not bool(wrong.any()), (
