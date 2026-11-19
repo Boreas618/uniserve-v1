@@ -18,6 +18,7 @@ and each carries every token it asked for.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import threading
@@ -48,14 +49,13 @@ PROCESSING_PACKAGE = Path("crates", "processing")
 #: The release's family list in the processing program's source, and the
 #: list of the earlier tree, which omits Qwen3.5-MoE.
 FAMILIES_SOURCE = Path("crates", "processing", "src", "family.rs")
-FAMILIES = (
-    "pub const FAMILIES: [Family; 4] = [\n"
-    "    crate::qwen::QWEN3,\n"
-    "    crate::qwen::QWEN3_5_MOE,\n"
+#: The release's family list, whatever families it holds: its declared length
+#: and its entries.
+FAMILIES = re.compile(
+    r"pub const FAMILIES: \[Family; (\d+)\] = \[\n((?:    .*\n)*?)\];"
 )
-EARLIER_FAMILIES = (
-    "pub const FAMILIES: [Family; 3] = [\n    crate::qwen::QWEN3,\n"
-)
+#: The entry the earlier tree's program lacks: a family a later revision adds.
+LATER_FAMILY = "    crate::qwen::QWEN3_5_MOE,\n"
 
 #: The options every revision of the deployment states: a small KV cache, few
 #: captured graphs and most of the GPU as the deployment's quota, which both
@@ -123,8 +123,17 @@ def _earlier_tree(repository: Path, root: Path) -> Path:
         shutil.copy2(source, target)
     families = tree / FAMILIES_SOURCE
     text = families.read_text()
-    assert FAMILIES in text, "the release's family list moved"
-    families.write_text(text.replace(FAMILIES, EARLIER_FAMILIES))
+    listed = FAMILIES.search(text)
+    assert listed and LATER_FAMILY in listed.group(2), (
+        "the release's family list moved"
+    )
+    # The earlier tree is the release without that family: its entry removed and
+    # the list's declared length one shorter, however many families it holds.
+    earlier = (
+        f"pub const FAMILIES: [Family; {int(listed.group(1)) - 1}] = [\n"
+        f"{listed.group(2).replace(LATER_FAMILY, '')}];"
+    )
+    families.write_text(text[: listed.start()] + earlier + text[listed.end() :])
     return tree
 
 
