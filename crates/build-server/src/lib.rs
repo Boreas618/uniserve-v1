@@ -72,8 +72,8 @@ pub mod tree;
 pub use builder::{BuildState, Limits, Urgency};
 pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, ToolchainKind};
 pub use protocol::{
-    Client, CoverRequest, Coverage, Descriptors, Module, ModuleEntry, ModuleFile, PackageRequest,
-    PrepareRequest, Progress, Selector,
+    Client, CoverRequest, Coverage, Descriptors, Module, ModuleEntry, ModuleFile, PackageEntry,
+    PackageRequest, PrepareRequest, Progress, Selector,
 };
 pub use server::{BuildServer, ServerConfig};
 pub use store::{ModulePath, Root, Store};
