@@ -21,7 +21,7 @@ use tensor::{DType, Shape, Tensor};
 
 use crate::error::{Error, Result};
 use crate::quantization::Scheme;
-use crate::weights::{WeightLayout, WeightLoader, WeightSource, host_bytes, numel, source_names};
+use crate::weights::{WeightLayout, WeightLoader, WeightSource, host_bytes, source_names};
 
 /// The class the constants a module computes are filed under: the producer of their retained
 /// keys. Its text is part of every stored key of such a constant, so it does not follow the
@@ -199,30 +199,20 @@ impl<'l, 'a> VarBuilder<'l, 'a> {
     }
 
     /// A table of zeros of `dtype` this module's launches write once after the load
-    /// ([`WeightLoader::writable_constant`]): it stays writable on the device and is this
+    /// ([`WeightLoader::writable_zeros`]): it stays writable on the device and is this
     /// process's own.
     ///
     /// # Errors
     ///
-    /// When `dtype` has no whole-byte element size.
+    /// As [`WeightLoader::writable_zeros`].
     pub fn writable_zeros(
         &self,
         name: &str,
         dtype: DType,
         shape: impl Into<Shape>,
     ) -> Result<Tensor> {
-        let (tensor, shape) = (self.name(name), shape.into());
-        let element = ops::abi::bytes(dtype).ok_or_else(|| {
-            Error::weight(
-                &tensor,
-                format!("{} has no whole-byte element", ops::abi::name(dtype)),
-            )
-        })?;
-
-        // Every supported type's zero is the all-zero pattern.
-        let bytes = vec![0; (numel(&shape) * element) as usize];
         self.loader
-            .writable_constant(&tensor, dtype, &shape, &bytes, PRODUCER)
+            .writable_zeros(&self.name(name), dtype, &shape.into())
     }
 
     /// How the checkpoint stores this module's `name`, by the declaration the model's loader

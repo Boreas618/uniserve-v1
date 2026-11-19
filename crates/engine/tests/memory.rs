@@ -109,13 +109,7 @@ fn a_load_over_the_meta_store_states_its_weights_in_order_and_holds_no_data() {
     let store = MetaWeights::new();
     let (norm, embed) = load(&checkpoint, &store, ROWS);
     let table = WeightLoader::new(&checkpoint, &store, None)
-        .writable_constant(
-            "frequencies",
-            DType::F32,
-            &Shape::from(2),
-            &[0_u8; 8],
-            "engine::tests",
-        )
+        .writable_zeros("frequencies", DType::F32, &Shape::from(2))
         .unwrap();
 
     assert_eq!(
@@ -296,6 +290,52 @@ fn a_loader_publishes_a_checkpoint_and_a_second_load_maps_what_was_published() {
     );
     assert_eq!(device_bytes(&norm, device), norm_bytes(1.0));
     assert_eq!(device_bytes(&embed, device), embed_bytes(DEVICE_ROWS, 1.0));
+}
+
+/// A table the model writes after its load lies on the rank's device, all zero until the model
+/// writes it, and the store publishes nothing for it: it is the rank's own, and the store's
+/// order states it as a table beside the weights the load published.
+#[test]
+#[ignore = "requires a GPU"]
+fn a_writable_table_is_zeros_on_the_device_and_published_nowhere() {
+    let device = DeviceId(0);
+    let cuda = DeviceLocation::Backend {
+        kind: "cuda",
+        ordinal: 0,
+    };
+    let server = StorageServer::start();
+    let (_head, client) = rank(&server);
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(directory.path(), DEVICE_ROWS, 1.0);
+
+    // A table larger than an allocation granularity, so its storage is not one page of a pack.
+    let store = WeightStore::new(Arc::clone(&client), device).unwrap();
+    load(&checkpoint, &store, DEVICE_ROWS);
+    let table = WeightLoader::new(&checkpoint, &store, None)
+        .writable_zeros(
+            "frequencies",
+            DType::BF16,
+            &Shape::from((DEVICE_ROWS, COLUMNS)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        (table.dims(), table.dtype()),
+        ([DEVICE_ROWS, COLUMNS].as_slice(), DType::BF16)
+    );
+    assert_eq!(table.device().location(), cuda);
+    assert!(device_bytes(&table, device).iter().all(|byte| *byte == 0));
+
+    let order = store.finish().unwrap();
+    assert_eq!(
+        names(&order),
+        ["norm.weight", "embed.weight", "frequencies"]
+    );
+    assert_eq!(
+        order.iter().map(|(_, table)| *table).collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    assert_eq!(store.published(), 2);
 }
 
 /// A second load beside the weights that serve publishes each weight whose key changed, and a

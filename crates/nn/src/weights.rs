@@ -251,10 +251,11 @@ pub struct WeightKey {
     pub stride: Option<u64>,
     /// What produced the bytes, for a weight no checkpoint file names.
     ///
-    /// `None` for a weight read from a checkpoint, whose files and region are its provenance; a
-    /// computed weight states the class that computed it and a digest of the numbers it
-    /// produced, so two producers that compute different tables under one name cannot share
-    /// retained bytes.
+    /// `None` for a weight read from a checkpoint, whose files and region are its provenance,
+    /// and for a table of zeros the model writes after the load, which no store retains under
+    /// its key ([`WeightLoader::writable_zeros`]); a computed weight states the class that
+    /// computed it and a digest of the numbers it produced, so two producers that compute
+    /// different tables under one name cannot share retained bytes.
     pub provenance: Option<Provenance>,
 }
 
@@ -345,18 +346,18 @@ pub trait RetainedWeights {
     /// When the store cannot keep the bytes.
     fn publish(&self, key: &WeightKey, shape: &Shape, bytes: &[u8]) -> Result<Tensor>;
 
-    /// A tensor the model writes after the load, holding `bytes` until it does.
+    /// A tensor of `shape` elements of `key.dtype` that the model writes after the load, all
+    /// zero until it does, and never returned for a later key.
     ///
     /// Published storage is read-only on the device, so a table a model derives from its weights
-    /// cannot live in it: the first launch that writes it faults. A store whose storage a kernel
-    /// may write returns that, which is what this default does.
+    /// cannot live in it: the first launch that writes it faults. The store zeroes the storage
+    /// itself, so no load produces or reads host bytes for the table, which may span gigabytes
+    /// (a diffusion stack's modulation at every level of its schedule).
     ///
     /// # Errors
     ///
-    /// As [`RetainedWeights::publish`].
-    fn writable(&self, key: &WeightKey, shape: &Shape, bytes: &[u8]) -> Result<Tensor> {
-        self.publish(key, shape, bytes)
-    }
+    /// When the store cannot hold the table.
+    fn writable(&self, key: &WeightKey, shape: &Shape) -> Result<Tensor>;
 }
 
 /// Retained storage on the CPU device: every published weight is a CPU tensor holding its bytes.
@@ -397,14 +398,9 @@ impl RetainedWeights for CpuWeights {
         Ok(tensor)
     }
 
-    fn writable(&self, key: &WeightKey, shape: &Shape, bytes: &[u8]) -> Result<Tensor> {
+    fn writable(&self, key: &WeightKey, shape: &Shape) -> Result<Tensor> {
         // A writable table is one load's own: it is never returned for a later key.
-        Ok(Tensor::from_raw_buffer(
-            bytes,
-            key.dtype,
-            shape.dims(),
-            &Device::Cpu,
-        )?)
+        Ok(Tensor::zeros(shape.dims(), key.dtype, &Device::Cpu)?)
     }
 }
 
@@ -465,7 +461,7 @@ impl RetainedWeights for MetaWeights {
             .ok_or_else(|| Error::weight(&key.region(), "a meta store holds every key"))
     }
 
-    fn writable(&self, key: &WeightKey, shape: &Shape, _bytes: &[u8]) -> Result<Tensor> {
+    fn writable(&self, key: &WeightKey, shape: &Shape) -> Result<Tensor> {
         // A writable table is one load's own: it is never returned for a later key.
         Ok(ops::meta_tensor(shape.clone(), key.dtype)?)
     }
@@ -602,21 +598,15 @@ impl<'a> WeightLoader<'a> {
     ///
     /// `bytes` produces the converted bytes from the checkpoint's payload; it runs only for a
     /// key the store does not hold, so everything a load decides from the shard headers happens
-    /// before this call, and a refusal that depends on the bytes happens in it. A `writable`
-    /// table goes to the store's writable storage and is never returned for a later key.
+    /// before this call, and a refusal that depends on the bytes happens in it.
     pub(crate) fn publish_with<'c>(
         &self,
         key: &WeightKey,
         shape: &Shape,
-        writable: bool,
         bytes: impl FnOnce(&Self) -> Result<Cow<'c, [u8]>>,
     ) -> Result<Tensor> {
         let produced = bytes(self)?;
-        let tensor = if writable {
-            self.store.writable(key, shape, &produced)?
-        } else {
-            self.store.publish(key, shape, &produced)?
-        };
+        let tensor = self.store.publish(key, shape, &produced)?;
         held(key, shape, tensor)
     }
 
@@ -721,7 +711,7 @@ impl<'a> WeightLoader<'a> {
         if let Some(weight) = self.retained(&key, shape)? {
             return Ok(weight);
         }
-        self.publish_with(&key, shape, false, |loader| {
+        self.publish_with(&key, shape, |loader| {
             let bytes = loader.gather(&spans)?;
 
             // The region's own bytes, before any conversion: one read, which this load was
@@ -825,7 +815,7 @@ impl<'a> WeightLoader<'a> {
 
         let (value_dtype, gain_dtype) = (value.dtype, gain.dtype);
         let elements = numel(&value.shape);
-        self.publish_with(&key, &value.shape, false, |loader| {
+        self.publish_with(&key, &value.shape, |loader| {
             let values = to_f32(value_dtype, &loader.checkpoint.read(v)?, v)?;
             let gains = to_f32(gain_dtype, &loader.checkpoint.read(g)?, g)?;
             let per_channel = usize::try_from(elements / channels.max(1))
@@ -940,7 +930,7 @@ impl<'a> WeightLoader<'a> {
         if let Some(weight) = self.retained(key, shape)? {
             return Ok(weight);
         }
-        self.publish_with(key, shape, false, bytes)
+        self.publish_with(key, shape, bytes)
     }
 
     /// Publishes host-computed bytes as a weight, without a checkpoint tensor behind them.
@@ -963,46 +953,7 @@ impl<'a> WeightLoader<'a> {
         bytes: &[u8],
         producer: &'static str,
     ) -> Result<Tensor> {
-        self.computed(name, dtype, shape, bytes, producer, false)
-    }
-
-    /// A table the model writes once after the load, holding `bytes` until then.
-    ///
-    /// It is a [`Self::constant`] that stays writable on the device, and it is this process's
-    /// own: no later load reads it back, because the launch that fills it runs in every load.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::constant`].
-    pub fn writable_constant(
-        &self,
-        name: &str,
-        dtype: DType,
-        shape: &Shape,
-        bytes: &[u8],
-        producer: &'static str,
-    ) -> Result<Tensor> {
-        self.computed(name, dtype, shape, bytes, producer, true)
-    }
-
-    fn computed(
-        &self,
-        name: &str,
-        dtype: DType,
-        shape: &Shape,
-        bytes: &[u8],
-        producer: &'static str,
-        writable: bool,
-    ) -> Result<Tensor> {
-        let element = ops::abi::bytes(dtype).ok_or_else(|| {
-            Error::weight(
-                name,
-                format!("{} has no whole-byte element size", ops::abi::name(dtype)),
-            )
-        })?;
-        let expected = numel(shape)
-            .checked_mul(element)
-            .ok_or_else(|| Error::weight(name, "the constant's bytes overflow"))?;
+        let expected = constant_bytes(name, dtype, shape)?;
         if bytes.len() as u64 != expected {
             return Err(Error::weight(
                 name,
@@ -1016,20 +967,31 @@ impl<'a> WeightLoader<'a> {
         }
 
         let key = WeightKey {
-            files: Vec::new(),
-            dtype,
-            layout: WeightLayout::ROW_MAJOR,
-            tensors: vec![name.to_owned()],
-            start: 0,
-            shape: shape.clone(),
-            stride: None,
             provenance: Some(Provenance::computed(producer, bytes)),
+            ..computed_key(name, dtype, shape)
         };
-        if writable {
-            self.publish_with(&key, shape, true, |_| Ok(Cow::Borrowed(bytes)))
-        } else {
-            self.publish_computed(&key, shape, |_| Ok(Cow::Borrowed(bytes)))
-        }
+        self.publish_computed(&key, shape, |_| Ok(Cow::Borrowed(bytes)))
+    }
+
+    /// A table of `shape` elements of `dtype`, all zero, that the model writes once after the
+    /// load ([`RetainedWeights::writable`]).
+    ///
+    /// It stays writable on the device, and it is this process's own: no later load reads it
+    /// back, because the launch that fills it runs in every load. So its key is `name` in
+    /// `shape` with no provenance: there is no retained weight for a digest of its bytes to
+    /// tell apart, and the store zeroes the table itself, so no load produces its bytes on the
+    /// host.
+    ///
+    /// # Errors
+    ///
+    /// When `dtype` has no whole-byte element size, the table's bytes overflow, or the store
+    /// cannot hold it.
+    pub fn writable_zeros(&self, name: &str, dtype: DType, shape: &Shape) -> Result<Tensor> {
+        constant_bytes(name, dtype, shape)?;
+
+        let key = computed_key(name, dtype, shape);
+        let tensor = self.store.writable(&key, shape)?;
+        held(&key, shape, tensor)
     }
 
     /// The identity of each of `names`' files, in order.
@@ -1132,6 +1094,38 @@ impl<'a> WeightLoader<'a> {
             at += run;
         }
         Ok(gathered)
+    }
+}
+
+/// The bytes `shape` elements of `dtype` take, as the table `name` a model computes.
+///
+/// # Errors
+///
+/// When `dtype` has no whole-byte element size, or the count overflows.
+fn constant_bytes(name: &str, dtype: DType, shape: &Shape) -> Result<u64> {
+    let element = ops::abi::bytes(dtype).ok_or_else(|| {
+        Error::weight(
+            name,
+            format!("{} has no whole-byte element size", ops::abi::name(dtype)),
+        )
+    })?;
+    numel(shape)
+        .checked_mul(element)
+        .ok_or_else(|| Error::weight(name, "the constant's bytes overflow"))
+}
+
+/// The key of the table `name` a model computes, `shape` elements of `dtype` in row-major
+/// order, read from no file and of no stated provenance.
+fn computed_key(name: &str, dtype: DType, shape: &Shape) -> WeightKey {
+    WeightKey {
+        files: Vec::new(),
+        dtype,
+        layout: WeightLayout::ROW_MAJOR,
+        tensors: vec![name.to_owned()],
+        start: 0,
+        shape: shape.clone(),
+        stride: None,
+        provenance: None,
     }
 }
 

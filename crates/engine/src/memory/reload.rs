@@ -115,7 +115,7 @@ impl RetainedWeights for MetaWeights {
         self.tensor(key, shape, false)
     }
 
-    fn writable(&self, key: &WeightKey, shape: &Shape, _bytes: &[u8]) -> nn::Result<Tensor> {
+    fn writable(&self, key: &WeightKey, shape: &Shape) -> nn::Result<Tensor> {
         self.tensor(key, shape, true)
     }
 }
@@ -378,7 +378,7 @@ impl RetainedWeights for Reload<'_> {
     /// The serving table stays: its address is what the captured graphs read, and the model
     /// writes it again once the changed weights are in place, so this load allocates none and
     /// states the table as a tensor with no data.
-    fn writable(&self, key: &WeightKey, shape: &Shape, _bytes: &[u8]) -> nn::Result<Tensor> {
+    fn writable(&self, key: &WeightKey, shape: &Shape) -> nn::Result<Tensor> {
         self.store.note_table(key);
 
         Ok(ops::retained(

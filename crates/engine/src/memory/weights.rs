@@ -859,29 +859,18 @@ impl WeightStore {
         Ok(Some(tensor))
     }
 
-    /// A table of `shape` elements holding `bytes`, in device storage of this process that
-    /// kernels may write.
-    fn table(&self, key: &WeightKey, shape: &Shape, bytes: &[u8]) -> Result<Tensor> {
-        let expected = byte_length(key, shape)?;
-        if bytes.len() as u64 != expected {
-            return Err(Error::Invalid(format!(
-                "{:?} of {} is {expected} bytes, not {}",
-                shape.dims(),
-                ops::abi::name(key.dtype),
-                bytes.len()
-            )));
-        }
+    /// A table of `shape` elements, all zero, in device storage of this process that kernels
+    /// may write: the device zeroes it, so no host bytes are produced or copied for it.
+    fn table(&self, key: &WeightKey, shape: &Shape) -> Result<Tensor> {
+        let length = usize::try_from(byte_length(key, shape)?).map_err(|_| {
+            Error::Invalid(format!("{:?} elements overflow a length", shape.dims()))
+        })?;
 
-        let storage = Storage::retainable(self.device, bytes.len())?;
-        // SAFETY: the storage holds at least `bytes.len()` writable device bytes, and the
-        // pageable source is read before the call returns.
+        let storage = Storage::retainable(self.device, length)?;
+        // SAFETY: the storage holds at least `length` writable device bytes and outlives the
+        // fill, which completes before the synchronization returns.
         unsafe {
-            platform::memcpy_async(
-                storage.address(),
-                bytes.as_ptr() as u64,
-                bytes.len(),
-                &self.stream,
-            )?;
+            platform::memset_d8(storage.address(), 0, length, &self.stream)?;
         }
         self.stream.synchronize()?;
 
@@ -935,9 +924,8 @@ impl RetainedWeights for WeightStore {
 
     /// The table lives in this process alone and is not retained: the launch that fills it
     /// runs in every load.
-    fn writable(&self, key: &WeightKey, shape: &Shape, bytes: &[u8]) -> nn::Result<Tensor> {
-        self.table(key, shape, bytes)
-            .map_err(|error| refusal(key, error))
+    fn writable(&self, key: &WeightKey, shape: &Shape) -> nn::Result<Tensor> {
+        self.table(key, shape).map_err(|error| refusal(key, error))
     }
 }
 
