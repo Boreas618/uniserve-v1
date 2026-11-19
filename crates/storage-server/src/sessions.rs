@@ -8,7 +8,7 @@
 //! - **Sessions.** An engine's main process, a head of its epoch, opens the
 //!   epoch's session ([`Request::Open`]) and gets one queue pair per
 //!   scheduler. The session speaks the server's version of the interface
-//!   (`storage::runtime::VERSION`), which its `Open` states; the pool
+//!   (`storage::runtime::VERSIONS`), whose window its `Open` states; the pool
 //!   refuses any other. The engine closes it ([`Request::Close`]) once its
 //!   workers stopped.
 //!   When its connection closes first, the session closes only once the
@@ -172,6 +172,10 @@ pub(crate) struct Sessions {
     /// theirs was open: the pool rolls each back once its last session
     /// closes.
     rolled: BTreeSet<(String, u64)>,
+    /// The version of the buffer pool's runtime interface each session agreed on when it
+    /// opened, by its number in the pool, while it is open or waits for its engine's processes:
+    /// its queue pair's records are of that version, and a restart's successor must speak it.
+    versions: BTreeMap<PoolSession, u32>,
     /// How long a transfer between worker groups may take. A helper that
     /// runs one on another host cancels it after that long too, and then
     /// waits that long again for its end.
@@ -231,10 +235,11 @@ impl Running {
 }
 
 /// What the sessions are as a restart in place hands them over: the
-/// pools' image in this build's format ([`crate::buffer_pool::FORMAT`],
-/// which the successor agreed to before the takeover), the number of queue
-/// pairs, whose descriptors travel apart, and what the main loop keeps. No
-/// task runs then.
+/// pools' image in this build's newest format ([`crate::buffer_pool::FORMATS`],
+/// which the successor agreed to read before the takeover), the number of
+/// queue pairs, whose descriptors travel apart, and what the main loop keeps,
+/// with the version of the runtime interface each session agreed on. No task
+/// runs then.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionsHandoff {
     #[serde(with = "serde_bytes")]
@@ -252,6 +257,7 @@ pub(crate) struct SessionsHandoff {
     remote: Vec<(Engine, BTreeSet<(u32, String)>)>,
     next: u64,
     rolled: Vec<(String, u64)>,
+    versions: Vec<(PoolSession, u32)>,
 }
 
 impl Sessions {
@@ -294,6 +300,7 @@ impl Sessions {
             next: 1,
             lost: Vec::new(),
             rolled: BTreeSet::new(),
+            versions: BTreeMap::new(),
             transfer_deadline: settings.transfer_deadline(),
             put_deadline: settings.put_deadline(),
         })
@@ -334,8 +341,15 @@ impl Sessions {
             remote: std::mem::take(&mut self.remote).into_iter().collect(),
             next: self.next,
             rolled: std::mem::take(&mut self.rolled).into_iter().collect(),
+            versions: std::mem::take(&mut self.versions).into_iter().collect(),
         };
         Ok((handoff, descriptors))
+    }
+
+    /// The versions of the runtime interface the sessions agreed on: each one a restart's
+    /// successor must speak to go on with them.
+    pub(crate) fn versions(&self) -> BTreeSet<u32> {
+        self.versions.values().copied().collect()
     }
 
     /// The sessions a predecessor handed over, the buffer pool's thread
@@ -371,6 +385,7 @@ impl Sessions {
         sessions.remote = handoff.remote.into_iter().collect();
         sessions.next = handoff.next;
         sessions.rolled = handoff.rolled.into_iter().collect();
+        sessions.versions = handoff.versions.into_iter().collect();
         Ok(sessions)
     }
 }
@@ -530,6 +545,10 @@ impl Server {
             .call(move |pools| pools.open(&named, &layout))
             .map_err(resource)?;
         let (pool, opened, descriptors) = opened.map_err(|refusal| invalid(&refusal))?;
+        // The pool states the version it opened the session in, from the window both speak.
+        if let Some(version) = opened.version {
+            self.sessions.versions.insert(pool, version);
+        }
         for region in new {
             self.sessions.hosts.insert(
                 (deployment.to_owned(), region.name.clone()),
@@ -661,6 +680,7 @@ impl Server {
                 "no session of engine {generation} of epoch {epoch} of {deployment} is open"
             )));
         };
+        self.sessions.versions.remove(&pool);
         self.sessions.remote.remove(&engine);
         let rolled = self.epoch_ends(&engine);
         let named = deployment.to_owned();
@@ -1241,6 +1261,7 @@ impl Server {
             let Some((pool, _)) = self.sessions.gone.remove(&engine) else {
                 continue;
             };
+            self.sessions.versions.remove(&pool);
             self.sessions.remote.remove(&engine);
             let rolled = self.epoch_ends(&engine);
             let (deployment, epoch, generation) = engine;

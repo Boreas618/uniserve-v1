@@ -39,9 +39,10 @@ static InitializeInjectionNvtx2_fnptr: unsafe extern "C" fn(
     *const std::ffi::c_void,
 ) -> std::ffi::c_int = platform::cupti::initialize_nvtx_injection;
 
-// The engine interface this executable implements, stated in the executable for the Build Server,
-// which records it with the engine package's module and hands it to the daemon that starts it.
-build_server::interface_section!(proto::ENGINE_INTERFACE_VERSION);
+// The versions of the engine interface this executable speaks, stated in the executable for the
+// Build Server, which records them with the engine package's module and hands them to the daemon
+// that starts it.
+build_server::interface_section!(proto::ENGINE_INTERFACE);
 
 /// The engine's command line: a main process with `--launch`.
 #[derive(Debug, Parser)]

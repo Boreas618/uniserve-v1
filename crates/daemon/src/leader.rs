@@ -1190,13 +1190,13 @@ impl Leader {
         // The process table names every engine this daemon manages, and the
         // serving one is the first: an update addresses the engine it drains
         // by this launch generation, and its `process` events name it.
-        if let Some(engine) = leader
+        if let Some((engine, interface)) = leader
             .replicas
             .serving
             .borrow()
             .first()
             .and_then(|replica| replica.hold().client())
-            .and_then(|client| client.engine())
+            .and_then(|client| Some((client.engine()?, client.interface())))
         {
             let mut processes = leader.epochs().processes();
             processes.retain(|process| process.generation != engine);
@@ -1208,6 +1208,7 @@ impl Leader {
                 build: deployment.engine.executable.clone(),
                 generation: engine,
                 state: proto::admin::ProcessState::Serving,
+                interface,
             });
             leader.epochs().set_processes(processes);
         }

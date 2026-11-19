@@ -92,9 +92,9 @@ impl<H: Vocabulary> Module<H> {
     ///
     /// # Errors
     ///
-    /// [`Error::Load`] when the bytes are not a module, it states another kind or another
-    /// version of the processing interface, it imports anything else, or it lacks the memory
-    /// or an export of the processing interface.
+    /// [`Error::Load`] when the bytes are not a module, it states another kind or a version of
+    /// the processing interface this host does not run ([`crate::PROCESSING`]), it imports
+    /// anything else, or it lacks the memory or an export of the processing interface.
     pub fn processing(bytes: &[u8]) -> Result<Self, Error> {
         let mut linker = Linker::new(crate::engine()?);
         crate::host::log(&mut linker)?;
@@ -354,5 +354,72 @@ impl<H: Vocabulary> Processor<H> {
 impl<H> std::fmt::Debug for Processor<H> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Processor").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host of no vocabulary: what a module refused before it runs never asks one.
+    struct Nothing;
+
+    impl crate::Host for Nothing {
+        fn log(&mut self, _level: crate::Level, _text: &str) {}
+    }
+
+    impl Vocabulary for Nothing {
+        fn token(&mut self, _text: &str) -> Option<u32> {
+            None
+        }
+
+        fn encode(&mut self, _text: &str) -> Result<Vec<u32>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The bytes of a module that holds nothing but the section stating it a processing program
+    /// of interface version `version`.
+    fn stating(version: u32) -> Vec<u8> {
+        let name = scheduling::program::SECTION.as_bytes();
+        let payload = scheduling::program::section(Kind::Processing, version);
+        let mut section = vec![u8::try_from(name.len()).unwrap()];
+        section.extend_from_slice(name);
+        section.extend_from_slice(&payload);
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        module.push(0);
+        module.push(u8::try_from(section.len()).unwrap());
+        module.extend(section);
+        module
+    }
+
+    /// The host runs a processing program of any version of its window and refuses one of a
+    /// version outside it, naming the version and the window, before it links anything.
+    #[test]
+    fn a_processing_program_outside_the_window_is_refused() {
+        assert_eq!(crate::versions(Kind::Processing), crate::PROCESSING);
+        assert!(crate::PROCESSING.speaks(scheduling::processing::INTERFACE_VERSION));
+
+        let later = crate::PROCESSING.newest() + 1;
+        let Err(Error::Load(refusal)) = Module::<Nothing>::processing(&stating(later)) else {
+            panic!("a processing program of version {later} is run");
+        };
+        assert!(
+            refusal.contains(&format!("version {later}"))
+                && refusal.contains(&format!("versions {}", crate::PROCESSING)),
+            "{refusal}"
+        );
+
+        // A module of a version of the window passes the version and is refused for what it
+        // lacks: it is no program module.
+        let Err(Error::Load(refusal)) =
+            Module::<Nothing>::processing(&stating(crate::PROCESSING.oldest()))
+        else {
+            panic!("an empty module is run");
+        };
+        assert!(
+            !refusal.contains("program interface and this host"),
+            "{refusal}"
+        );
     }
 }

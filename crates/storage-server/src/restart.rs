@@ -5,13 +5,17 @@
 //! operator's command) as a descriptor, with the arguments that select its `storage-server`
 //! command. The server starts the successor from that image (`storage-server serve --predecessor
 //! FD`) with one end of a socket pair at that descriptor, responds with its process id, and
-//! states at once the versions it speaks: its protocol version, which every connection speaks,
-//! its version of the buffer pool's runtime interface, which every session speaks, and the
-//! format of the buffer pools' image. A successor of a build that speaks another of them says so
-//! and ends: the protocol has one version per release, so a successor of another release could
-//! serve none of the connections. The restart is then given up, as it is when the successor ends
-//! before it answers, and the server goes on with everything it holds. The server waits for the
-//! answer on the handoff socket and the successor's pidfd in its loop, serving meanwhile.
+//! states at once the versions in use: the version of the protocol each client's connection
+//! agreed on, the version of the buffer pool's runtime interface each session agreed on, and the
+//! format of the buffer pools' image it writes. The successor may be of another build: it takes
+//! the server over when its windows hold every one of them (`storage::protocol::VERSIONS`,
+//! `storage::runtime::VERSIONS`, [`FORMATS`]), and answers with its windows; a successor that
+//! does not speak one of them says which and ends. The restart is then given up, as it is when
+//! the successor ends before it answers, and the server goes on with everything it holds. The
+//! server waits for the answer on the handoff socket and the successor's pidfd in its loop,
+//! serving meanwhile; a connection or a session that agrees meanwhile on a version outside the
+//! successor's windows gives the restart up before the handover, since the successor could not
+//! go on with it.
 //!
 //! From the restart's start the buffer pools' thread takes no request and reads no `completed`
 //! word, so no work starts there while the tasks end; an engine's requests wait in its queue
@@ -36,13 +40,13 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::storage::protocol::{Access, Claim, Key, Location, Role, Scope, StorageRecord, VERSION};
+use ::storage::protocol::{Access, Claim, Key, Location, Role, Scope, StorageRecord, VERSIONS};
 use ::storage::runtime;
 use rustix::event::{PollFd, PollFlags, poll};
 use serde::{Deserialize, Serialize};
 use service::{Connection, Handed};
 
-use crate::buffer_pool::FORMAT;
+use crate::buffer_pool::FORMATS;
 use crate::child::Program;
 use crate::kv_storage::KvStorage;
 use crate::quota::Quotas;
@@ -57,9 +61,18 @@ pub struct Pending {
     channel: Connection,
     /// The settings the successor serves with: the operator's, or this server's.
     settings: ::storage::Settings,
-    /// Whether the successor said it speaks this server's versions: the server passes itself
-    /// on once nothing is in flight from then on.
-    agreed: bool,
+    /// The windows of the protocol and of the runtime interface the successor speaks, once it
+    /// said it speaks every version in use: the server passes itself on once nothing is in
+    /// flight from then on and every version in use then lies in them.
+    agreed: Option<Windows>,
+}
+
+/// The windows of versions a successor speaks: the Storage Server protocol's and the buffer pool's
+/// runtime interface's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Windows {
+    protocol: service::Versions,
+    runtime: service::Versions,
 }
 
 /// A restart's successor process, by its pidfd: readable once the process ended, and the handle
@@ -91,8 +104,8 @@ impl Successor {
 pub(crate) enum Answer {
     /// The successor has not answered yet.
     Waiting,
-    /// It speaks the server's versions.
-    Agreed,
+    /// It speaks the server's versions in use, in these windows.
+    Agreed(Windows),
     /// It does not, ended, or answered out of protocol: the restart is given up.
     Refused(String),
 }
@@ -107,17 +120,17 @@ enum Message {
     Serving,
     /// The successor gives up, and why.
     Failed { reason: String },
-    /// Before the takeover: the protocol version the connections speak, the
-    /// runtime version the sessions speak, and the format of the buffer
-    /// pools' image.
+    /// Before the takeover: the protocol versions the connections agreed on,
+    /// the runtime versions the sessions agreed on, and the format of the
+    /// buffer pools' image.
     Versions {
-        protocol: u32,
-        runtime: u32,
+        protocol: Vec<u32>,
+        runtime: Vec<u32>,
         image: u32,
     },
-    /// The successor speaks the versions and reads the image: the takeover
-    /// follows.
-    Speaks,
+    /// The successor speaks the versions and reads the image, in the windows
+    /// it states: the takeover follows.
+    Speaks { windows: Windows },
 }
 
 /// The handoff socket's messages are the Storage Server protocol's: MessagePack with named fields
@@ -183,31 +196,57 @@ struct ClientHandoff {
     pid: i32,
     pidfd: Option<usize>,
     role: Option<Role>,
+    /// The version of the protocol the connection agreed on at its hello, which the successor
+    /// goes on speaking on it.
+    version: u32,
     /// Bytes received and not yet taken as frames.
     received: Vec<u8>,
 }
 
-/// Whether this build speaks the predecessor's protocol and runtime versions
-/// and reads its image's format; the reason it does not otherwise.
-fn speaks(protocol: u32, sessions: u32, image: u32) -> Result<(), String> {
-    if protocol != VERSION {
+/// Whether a build of the windows `windows` speaks every protocol version `protocol` the
+/// connections agreed on and every runtime version `sessions` the sessions agreed on; the reason
+/// it does not otherwise.
+fn holds(windows: Windows, protocol: &[u32], sessions: &[u32]) -> Result<(), String> {
+    if let Some(version) = protocol
+        .iter()
+        .find(|version| !windows.protocol.speaks(**version))
+    {
         return Err(format!(
-            "connections speak protocol {protocol}; the successor speaks {VERSION}"
+            "a connection speaks protocol {version}; the successor speaks protocol versions {}",
+            windows.protocol
         ));
     }
-    if sessions != runtime::VERSION {
+    if let Some(version) = sessions
+        .iter()
+        .find(|version| !windows.runtime.speaks(**version))
+    {
         return Err(format!(
-            "sessions speak version {sessions} of the buffer pool's interface; the successor \
-             speaks {}",
-            runtime::VERSION
-        ));
-    }
-    if image != FORMAT {
-        return Err(format!(
-            "the buffer pools' image is of format {image}; the successor reads {FORMAT}"
+            "a session speaks version {version} of the buffer pool's interface; the successor \
+             speaks versions {}",
+            windows.runtime
         ));
     }
     Ok(())
+}
+
+/// Whether this build speaks the predecessor's versions in use and reads its image's format;
+/// the reason it does not otherwise.
+fn speaks(protocol: &[u32], sessions: &[u32], image: u32) -> Result<(), String> {
+    holds(own_windows(), protocol, sessions)?;
+    if !FORMATS.speaks(image) {
+        return Err(format!(
+            "the buffer pools' image is of format {image}; the successor reads formats {FORMATS}"
+        ));
+    }
+    Ok(())
+}
+
+/// The windows this build speaks.
+fn own_windows() -> Windows {
+    Windows {
+        protocol: VERSIONS,
+        runtime: runtime::VERSIONS,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -303,6 +342,7 @@ impl Server {
             )
         })?;
         let program = Program::of_image(image, arguments.to_vec());
+        let versions = self.versions_in_use();
         let (ours, theirs) = UnixStream::pair()?;
         let (process, pidfd) = program.spawn(
             &crate::command::successor_entry(theirs.as_raw_fd()),
@@ -315,7 +355,12 @@ impl Server {
             .map_err(|_| io::Error::other("the successor's pidfd is shared"))?;
         tracing::info!(pid, "started the successor server");
         let settings = settings.unwrap_or_else(|| self.settings.clone());
-        let pending = Pending::new(Successor { pid, pidfd }, Connection::new(ours)?, settings);
+        let pending = Pending::new(
+            Successor { pid, pidfd },
+            Connection::new(ours)?,
+            settings,
+            versions,
+        );
         // The buffer pools start no work from now on, and their tasks end.
         self.sessions.thread.send(|pools| pools.freeze());
         self.restart = Some(pending);
@@ -331,31 +376,62 @@ impl Server {
         };
         match pending.answer() {
             Answer::Waiting => {}
-            Answer::Agreed => pending.agreed = true,
-            Answer::Refused(reason) => {
-                tracing::error!(
-                    pid = pending.successor.pid,
-                    %reason,
-                    "the restart in place is given up: the successor does not take the server \
-                     over, which goes on"
-                );
-                if let Some(pending) = self.restart.take() {
-                    pending.successor.end();
-                }
-                self.sessions.thread.send(|pools| pools.thaw());
-            }
+            Answer::Agreed(windows) => pending.agreed = Some(windows),
+            Answer::Refused(reason) => self.give_up(&reason),
         }
     }
 
+    /// Gives the restart under way up for `reason`: its successor ends, the buffer pools take
+    /// requests again and the server goes on.
+    fn give_up(&mut self, reason: &str) {
+        if let Some(pending) = self.restart.take() {
+            tracing::error!(
+                pid = pending.successor.pid,
+                %reason,
+                "the restart in place is given up: the successor does not take the server \
+                 over, which goes on"
+            );
+            pending.successor.end();
+        }
+        self.sessions.thread.send(|pools| pools.thaw());
+    }
+
+    /// The protocol versions the clients' connections agreed on, except the server's children's,
+    /// which end with the handover, and the runtime versions the sessions agreed on.
+    fn versions_in_use(&self) -> (Vec<u32>, Vec<u32>) {
+        let protocol: BTreeSet<u32> = self
+            .clients
+            .values()
+            .filter(|client| client.child.is_none() && client.role.is_some())
+            .map(|client| client.version)
+            .collect();
+        let sessions = self.sessions.versions();
+        (
+            protocol.into_iter().collect(),
+            sessions.into_iter().collect(),
+        )
+    }
+
     /// Whether the restart under way may pass the server on now: its successor speaks the
-    /// server's versions, and nothing is in flight.
+    /// server's versions, and nothing is in flight. A restart whose successor does not speak a
+    /// version a connection or a session agreed on since it answered is given up.
     ///
     /// # Errors
     ///
     /// The buffer pools' thread ended ([`Self::quiescent`]).
-    pub(crate) fn ready_to_hand_over(&self) -> io::Result<bool> {
-        let agreed = self.restart.as_ref().is_some_and(|pending| pending.agreed);
-        Ok(agreed && self.quiescent()?)
+    pub(crate) fn ready_to_hand_over(&mut self) -> io::Result<bool> {
+        let Some(windows) = self.restart.as_ref().and_then(|pending| pending.agreed) else {
+            return Ok(false);
+        };
+        if !self.quiescent()? {
+            return Ok(false);
+        }
+        let (protocol, sessions) = self.versions_in_use();
+        if let Err(reason) = holds(windows, &protocol, &sessions) {
+            self.give_up(&reason);
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// The descriptors the loop waits on for the restart under way: its handoff socket and its
@@ -424,6 +500,7 @@ impl Server {
                 pid: client.pid,
                 pidfd,
                 role: client.role,
+                version: client.version,
                 received,
             });
         }
@@ -579,7 +656,7 @@ impl Server {
     /// handed its state over, exits all the same, and its clients see their connections close.
     pub fn resume(handoff: OwnedFd, program: Option<Program>) -> io::Result<Resumed> {
         let mut connection = Connection::new(UnixStream::from(handoff))?;
-        // The predecessor states the versions it speaks first.
+        // The predecessor states the versions in use first.
         let Message::Versions {
             protocol,
             runtime: sessions,
@@ -590,14 +667,16 @@ impl Server {
                 "the predecessor stated no versions before its takeover",
             ));
         };
-        if let Err(reason) = speaks(protocol, sessions, image) {
+        if let Err(reason) = speaks(&protocol, &sessions, image) {
             let _ = connection.send(&Message::Failed {
                 reason: reason.clone(),
             });
             let _ = connection.flush();
             return Err(io::Error::other(reason));
         }
-        connection.send(&Message::Speaks)?;
+        connection.send(&Message::Speaks {
+            windows: own_windows(),
+        })?;
         connection.flush()?;
         let (message, descriptors) = receive(&mut connection)?;
         let Message::Takeover(handoff) = message else {
@@ -675,6 +754,7 @@ impl Server {
                     pid: client.pid,
                     pidfd: client.pidfd.map(pidfd).transpose()?,
                     role: client.role,
+                    version: client.version,
                     child: None,
                     queue: VecDeque::new(),
                     held: false,
@@ -811,13 +891,20 @@ impl Server {
 }
 
 impl Pending {
-    /// A restart of `successor`, to which this server states the versions it speaks on its end
-    /// of the handoff socket, `channel`.
-    fn new(successor: Successor, mut channel: Connection, settings: ::storage::Settings) -> Self {
+    /// A restart of `successor`, to which this server states the versions in use on its end of
+    /// the handoff socket, `channel`: `(protocol, runtime)`, the protocol versions its clients'
+    /// connections agreed on and the runtime versions its sessions agreed on, with the format of
+    /// the image it writes.
+    fn new(
+        successor: Successor,
+        mut channel: Connection,
+        settings: ::storage::Settings,
+        (protocol, runtime): (Vec<u32>, Vec<u32>),
+    ) -> Self {
         let versions = Message::Versions {
-            protocol: VERSION,
-            runtime: runtime::VERSION,
-            image: FORMAT,
+            protocol,
+            runtime,
+            image: FORMATS.newest(),
         };
         // A successor that ended already (one that refuses its command line ends at once) fails
         // the send; the restart then stands until the loop reads that end as its answer.
@@ -828,7 +915,7 @@ impl Pending {
             successor,
             channel,
             settings,
-            agreed: false,
+            agreed: None,
         }
     }
 
@@ -840,7 +927,7 @@ impl Pending {
             return failed(error);
         }
         match self.channel.try_recv::<Message>() {
-            Ok(Some(Message::Speaks)) => Answer::Agreed,
+            Ok(Some(Message::Speaks { windows })) => Answer::Agreed(windows),
             Ok(Some(Message::Failed { reason })) => Answer::Refused(reason),
             Ok(Some(_)) => Answer::Refused("the successor answered out of protocol".into()),
             Ok(None) if self.successor.ended() => {
@@ -923,15 +1010,17 @@ mod tests {
             pid: pid.as_raw_nonzero().get().unsigned_abs(),
             pidfd: rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).unwrap(),
         };
+        let versions = server.versions_in_use();
         server.restart = Some(Pending::new(
             this_process,
             Connection::new(ours).unwrap(),
             server.settings.clone(),
+            versions,
         ));
         while server
             .restart
             .as_ref()
-            .is_some_and(|pending| !pending.agreed)
+            .is_some_and(|pending| pending.agreed.is_none())
         {
             let pending = server.restart.as_mut().unwrap();
             pending.channel.wait(Duration::MAX).unwrap();
@@ -1154,7 +1243,7 @@ mod tests {
     fn a_session_survives_a_restart_with_a_request_deferred_across_it() {
         use ::storage::runtime::{
             Class, Completion, Group, GroupId, Open, OwnerId, Region, Request, RequestId, Tier,
-            VERSION,
+            VERSIONS,
         };
 
         let directory = tempfile::tempdir().unwrap();
@@ -1187,7 +1276,8 @@ mod tests {
             memory: String::new(),
         };
         let open = Open {
-            version: VERSION,
+            oldest: VERSIONS.oldest(),
+            newest: Some(VERSIONS.newest()),
             epoch: 0,
             trial: false,
             regions: vec![region("units", 4), region("rows", 2)],
@@ -1309,32 +1399,88 @@ mod tests {
         drop(thread.join().unwrap());
     }
 
-    /// A successor of a build that speaks another version of the protocol
-    /// refuses the takeover before anything is handed over: it says why and
-    /// ends, and the predecessor's restart is given up.
-    #[test]
-    fn a_successor_refuses_a_predecessor_of_another_protocol_version() {
+    /// The successor's answer to the versions a predecessor states, on the predecessor's end
+    /// of the handoff socket: [`Server::resume`] runs on a thread of this process.
+    fn answer_to(protocol: Vec<u32>, runtime: Vec<u32>, image: u32) -> (Message, bool) {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let successor =
             std::thread::spawn(move || Server::resume(OwnedFd::from(theirs), None).map(drop));
         let mut predecessor = Connection::new(ours).unwrap();
         predecessor
             .send(&Message::Versions {
-                protocol: VERSION + 1,
-                runtime: runtime::VERSION,
-                image: FORMAT,
+                protocol,
+                runtime,
+                image,
             })
             .unwrap();
         predecessor.flush().unwrap();
+        let answer = receive(&mut predecessor).unwrap().0;
+        // A successor that speaks the versions waits for the takeover, which never comes: the
+        // predecessor's end closes and the successor gives up.
+        drop(predecessor);
+        let refused = successor.join().unwrap().is_err();
+        (answer, refused)
+    }
 
-        let Message::Failed { reason } = receive(&mut predecessor).unwrap().0 else {
-            panic!("the successor did not refuse the versions");
+    /// A successor of a build whose windows hold every version the predecessor's connections
+    /// and sessions agreed on answers with its windows; one whose windows miss one, or whose
+    /// image format it does not read, refuses the takeover before anything is handed over,
+    /// naming the version, and ends.
+    #[test]
+    fn a_successor_takes_over_the_versions_its_windows_hold() {
+        let protocol = VERSIONS.newest();
+        let sessions = runtime::VERSIONS.newest();
+
+        let (answer, _) = answer_to(vec![protocol], vec![sessions], FORMATS.newest());
+        let Message::Speaks { windows } = answer else {
+            panic!("the successor did not speak the versions: {answer:?}");
+        };
+        assert_eq!(windows, own_windows());
+
+        for (versions, named) in [
+            (
+                (vec![protocol, VERSIONS.newest() + 1], vec![sessions]),
+                format!("protocol {}", VERSIONS.newest() + 1),
+            ),
+            (
+                (vec![protocol], vec![runtime::VERSIONS.oldest() - 1]),
+                format!("version {}", runtime::VERSIONS.oldest() - 1),
+            ),
+        ] {
+            let (answer, refused) = answer_to(versions.0, versions.1, FORMATS.newest());
+            let Message::Failed { reason } = answer else {
+                panic!("the successor did not refuse the versions: {answer:?}");
+            };
+            assert!(reason.contains(&named), "{reason}");
+            assert!(reason.contains("the successor speaks"), "{reason}");
+            assert!(refused);
+        }
+
+        let (answer, refused) = answer_to(vec![protocol], vec![sessions], FORMATS.newest() + 1);
+        let Message::Failed { reason } = answer else {
+            panic!("the successor did not refuse the image: {answer:?}");
         };
         assert!(
-            reason.contains(&format!("protocol {}", VERSION + 1))
-                && reason.contains(&format!("speaks {VERSION}")),
+            reason.contains(&format!("format {}", FORMATS.newest() + 1)),
             "{reason}"
         );
-        assert!(successor.join().unwrap().is_err());
+        assert!(refused);
+    }
+
+    /// A successor's windows hold the versions in use, or the predecessor gives the restart up
+    /// before it hands anything over: a connection that agreed on a version outside them since
+    /// the successor answered is one the successor could not go on with.
+    #[test]
+    fn versions_outside_the_successors_windows_give_the_restart_up() {
+        let windows = Windows {
+            protocol: service::Versions::new(33, 34),
+            runtime: service::Versions::one(12),
+        };
+        assert_eq!(holds(windows, &[33, 34], &[12]), Ok(()));
+        let reason = holds(windows, &[32], &[12]).unwrap_err();
+        assert!(reason.contains("protocol 32"), "{reason}");
+        assert!(reason.contains("33 to 34"), "{reason}");
+        let reason = holds(windows, &[33], &[13]).unwrap_err();
+        assert!(reason.contains("version 13"), "{reason}");
     }
 }

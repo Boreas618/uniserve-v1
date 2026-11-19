@@ -123,6 +123,7 @@ impl Config {
             mm_processor_kwargs: Every,
             kernels: Every,
             build_config: Every,
+            executable: Every,
             max_running_requests: Every,
             max_num_batched_tokens: Of(Kind::Chat),
             max_logprobs: Every,
@@ -315,6 +316,14 @@ pub struct Config {
     /// whose successor replaces a Build Server that serves with other settings.
     #[reload(daemon)]
     pub build_config: build_server::command::Settings,
+    /// The base executable (`uniserve`) the daemon's hot restart starts its successor from, as
+    /// an absolute path; unset, the running daemon's own image. A change restarts the daemon
+    /// into it: the successor takes the deployment over when it speaks the versions of the
+    /// engine interface its engines and connections agreed on and the Storage Server protocol
+    /// version of its claim, and refuses with the reason otherwise while this daemon serves on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[reload(daemon)]
+    pub executable: Option<PathBuf>,
     /// Concurrently resident requests, clamped to what the workers hold.
     #[reload(epoch)]
     pub max_running_requests: NonZeroUsize,
@@ -481,6 +490,7 @@ impl Default for Config {
             mm_processor_kwargs: serde_json::Map::new(),
             kernels: std::collections::BTreeMap::new(),
             build_config: build_server::command::Settings::default(),
+            executable: None,
             max_running_requests: positive(128),
             max_num_batched_tokens: None,
             // The most the OpenAI API admits per position (`top_logprobs` lies in 0..=20), so
@@ -1143,6 +1153,14 @@ impl Config {
             anyhow::bail!(
                 "`{option}` places ranks without a deployment layout; the stated `worker_groups` \
                  place their own ranks"
+            );
+        }
+        // A successor's image is started by its path from whatever directory the daemon runs in.
+        if let Some(executable) = &self.executable {
+            anyhow::ensure!(
+                executable.is_absolute(),
+                "`executable` {} is no absolute path of a `uniserve` executable",
+                executable.display()
             );
         }
         // A stated key is the token itself: an empty one would admit an empty bearer token.

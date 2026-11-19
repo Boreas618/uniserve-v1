@@ -168,6 +168,10 @@ pub struct ManagedProcess {
     /// Where it is (`state`, and `reason` for a failed one).
     #[serde(flatten)]
     pub state: ProcessState,
+    /// The version of the engine interface an engine's links agreed on with the leader
+    /// (`ENGINE_INTERFACE`), once its process link greeted it; none for another process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<u32>,
 }
 
 /// The state of a process a node's daemon manages.
@@ -232,6 +236,7 @@ mod tests {
                 build: String::new(),
                 generation: 3,
                 state,
+                interface: None,
             };
             let encoded = serde_json::to_value(&process).unwrap();
             assert_eq!(

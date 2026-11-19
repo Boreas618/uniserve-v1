@@ -2623,7 +2623,8 @@ fn processes_layout(groups: Vec<storage::runtime::Group>) -> storage::runtime::O
     };
     let schedulers = vec![groups.iter().map(|group| group.id).collect()];
     Open {
-        version: storage::runtime::VERSION,
+        oldest: storage::runtime::VERSIONS.oldest(),
+        newest: Some(storage::runtime::VERSIONS.newest()),
         epoch: 1,
         trial: false,
         regions: vec![

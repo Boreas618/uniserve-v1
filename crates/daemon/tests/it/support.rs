@@ -64,15 +64,15 @@ pub(crate) struct Engine {
 impl Engine {
     /// Connects to the leader at `address` as an engine of this build.
     pub(crate) fn connect(address: &str) -> Self {
-        let (engine, welcome) = Self::hello(address, proto::ENGINE_INTERFACE_VERSION);
+        let (engine, welcome) = Self::hello(address, proto::ENGINE_INTERFACE);
         assert_eq!(welcome.refusal, None, "the leader refused this engine");
         engine
     }
 
     /// Connects to the leader at `address`, saying hello as an engine whose
-    /// build speaks `major`, and returns the leader's welcome.
-    pub(crate) fn hello(address: &str, major: u32) -> (Self, Welcome) {
-        let mut engine = Self::dial(address, major);
+    /// build speaks the window `versions`, and returns the leader's welcome.
+    pub(crate) fn hello(address: &str, versions: service::Versions) -> (Self, Welcome) {
+        let mut engine = Self::dial(address, versions);
         let welcome = engine.welcome();
         (engine, welcome)
     }
@@ -81,7 +81,7 @@ impl Engine {
     /// sends its first request, `kind`, right behind its hello rather than
     /// after the welcome, and returns the request's answer.
     pub(crate) fn connect_asking(address: &str, kind: request::Kind) -> (Self, Reply) {
-        let mut engine = Self::dial(address, proto::ENGINE_INTERFACE_VERSION);
+        let mut engine = Self::dial(address, proto::ENGINE_INTERFACE);
         let id = engine.send(kind);
         assert_eq!(
             engine.welcome().refusal,
@@ -93,13 +93,14 @@ impl Engine {
     }
 
     /// Connects to the leader at `address`, which is bound once its daemon's start returned, and
-    /// says hello as an engine whose build speaks `major`.
-    fn dial(address: &str, major: u32) -> Self {
+    /// says hello as an engine whose build speaks the window `versions`.
+    fn dial(address: &str, versions: service::Versions) -> Self {
         let mut connection = Connection::connect(&address.parse().unwrap())
             .unwrap_or_else(|error| panic!("the leader is not reachable at {address}: {error}"));
         connection
             .deliver(&Hello {
-                major,
+                oldest: versions.oldest(),
+                newest: versions.newest(),
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(EnginePeer {
                     deployment: "deployment".into(),
@@ -483,7 +484,8 @@ fn answer(
                         }],
                         entries: std::collections::HashMap::new(),
                         metadata: String::new(),
-                        interface_version: proto::ENGINE_INTERFACE_VERSION,
+                        interface_version: proto::ENGINE_INTERFACE.newest(),
+                        interface_oldest: proto::ENGINE_INTERFACE.oldest(),
                         executable: name,
                         // The stand-in is no revision of a repository.
                         commit: None,

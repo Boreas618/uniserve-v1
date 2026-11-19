@@ -11,6 +11,8 @@ description = "The program host: runs a policy package's wasm32 programs in wasm
 scheduling.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The window of versions of each program interface the host runs (`service::Versions`).
+service.workspace = true
 # The runtime of the program modules: compiles them, meters each call's fuel, links the host
 # functions. No WASI: a program reaches nothing but its host functions.
 wasmtime.workspace = true

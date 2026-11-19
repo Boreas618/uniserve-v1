@@ -65,8 +65,9 @@ pub use chat::{
 };
 
 /// The version of the processing interface: the exports, the host functions and the messages of
-/// this module. Every change that is not an addition raises it, and a daemon loads only a
-/// program of its own version.
+/// this module, which a program module states. Every change a host must act on raises it, and a
+/// daemon loads a program of any version of the window its host runs (`program::PROCESSING`),
+/// whose newest is this version.
 pub const INTERFACE_VERSION: u32 = 1;
 
 /// The names of the exports and of the host functions only a processing program has.

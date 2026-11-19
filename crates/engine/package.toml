@@ -17,11 +17,11 @@ backend = "uniserve"
 # revision, so the daemon fixes an epoch's kernel packages, and validates its
 # `[kernels]` pins, over the operators of the epoch's own engine revision.
 operators = "crates/proto/src/module/operators.toml"
-# The engine interface the executable implements, its messages with the daemon
-# (`proto::ENGINE_INTERFACE_VERSION`), is stated by the executable itself
-# (`build_server::interface_section!` in `src/main.rs`), and the Build Server
-# records the version it reads there; the Storage Server's protocol and the
-# buffer pool's runtime interface have versions of their own, checked at their
+# The versions of the engine interface the executable speaks, its messages with
+# the daemon (`proto::ENGINE_INTERFACE`), are stated by the executable itself as
+# a window (`build_server::interface_section!` in `src/main.rs`), and the Build
+# Server records the window it reads there; the Storage Server's protocol and
+# the buffer pool's runtime interface have windows of their own, agreed at their
 # own hellos.
 
 # cargo at the release the workspace's `rust-toolchain.toml` selects.

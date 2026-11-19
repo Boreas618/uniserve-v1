@@ -195,9 +195,10 @@ pub(crate) struct Supervisor {
 ///
 /// Every host of the epoch prepared the module set before any of its processes was spawned
 /// (`Request::PrepareModules`), so this is a read of the node's store, within the reply time of a spawn;
-/// a store that lost the module builds it again first. A module of another version of the
-/// engine interface than this daemon's ([`proto::ENGINE_INTERFACE_VERSION`]) is refused here,
-/// before a process starts.
+/// a store that lost the module builds it again first. A module whose versions of the engine
+/// interface (its executable's window, as the Build Server recorded it) share none with this
+/// daemon's ([`proto::ENGINE_INTERFACE`]) is refused here, before a process starts: its process
+/// would be refused at its hello.
 fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
     let engine = &launch.modules.engine;
     let named = format!(
@@ -227,12 +228,12 @@ fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, Stri
             },
         )
         .map_err(|error| format!("resolving {named}: {error}"))?;
-    if module.interface_version != proto::ENGINE_INTERFACE_VERSION {
+    if module.interface.agree(proto::ENGINE_INTERFACE).is_none() {
         return Err(format!(
-            "{named} implements version {} of the engine interface and this daemon speaks \
-             version {}",
-            module.interface_version,
-            proto::ENGINE_INTERFACE_VERSION
+            "{named} implements versions {} of the engine interface and this daemon speaks \
+             versions {}, which share none",
+            module.interface,
+            proto::ENGINE_INTERFACE
         ));
     }
 

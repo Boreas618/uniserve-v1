@@ -98,14 +98,15 @@ fn stamped() -> Vec<storage::runtime::Request> {
 
 /// A session of one device region with one segment, as the scheduler node opened it.
 fn session() -> (storage::runtime::Open, storage::runtime::Opened) {
-    use storage::runtime::{Open, Opened, Region, Tier, VERSION};
+    use storage::runtime::{Open, Opened, Region, Tier, VERSIONS};
 
     let segment = storage::Segment {
         epoch: 1,
         ordinal: 0,
     };
     let open = Open {
-        version: VERSION,
+        oldest: VERSIONS.oldest(),
+        newest: Some(VERSIONS.newest()),
         epoch: 1,
         trial: false,
         regions: vec![Region {
@@ -134,6 +135,7 @@ fn session() -> (storage::runtime::Open, storage::runtime::Opened) {
             capacity: vec![(0, 1)],
         }],
         session: 0,
+        version: None,
     };
     (open, opened)
 }

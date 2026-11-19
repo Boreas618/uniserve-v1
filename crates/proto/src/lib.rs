@@ -17,10 +17,12 @@
 //! - [`admin`]: the fields of the observation rows a node's admin API answers, JSON, which
 //!   the daemon writes and its clients (`uniserve-manager`, a harness) read.
 //!
-//! Each connection opens with a hello exchange in which the daemon refuses a
-//! peer of any other version of the engine interface than its own
-//! ([`ENGINE_INTERFACE_VERSION`]) with a typed refusal. The workspace's one
-//! connection (`service::Connection`) carries the messages,
+//! Each connection opens with a hello exchange in which the peer states the
+//! window of versions of the engine interface it speaks, the daemon agrees on
+//! the newest version both speak ([`ENGINE_INTERFACE`], [`agree`]) and states
+//! it in its welcome, and a peer whose window shares no version with the
+//! daemon's is refused with a typed refusal that names both windows. The
+//! workspace's one connection (`service::Connection`) carries the messages,
 //! one frame each, over a Unix socket on one node or TCP
 //! between nodes: every envelope of the interfaces implements
 //! `service::Message` here.
@@ -59,30 +61,127 @@ pub mod handoff {
     include!(concat!(env!("OUT_DIR"), "/uniserve.handoff.rs"));
 }
 
-/// The version of the engine interface: the process, request and handoff
-/// messages an engine exchanges with its daemon (this crate's schemas). The
-/// interface has one version per release, raised by every change of its
-/// messages. The engine package's manifest states it, a peer sends it in its
-/// hello, and a daemon serves a peer of this version alone, refusing any other
-/// in its welcome with a typed refusal (`process::refusal::Reason::Version`,
-/// `request::wire::refusal::Reason::Version`).
+/// The versions of the engine interface this build speaks: the process, request and handoff
+/// messages an engine exchanges with its daemon, and a daemon with its members and with the
+/// successor of its hot restart (this crate's schemas).
 ///
-/// The engine's other interfaces have versions of their own, each checked at
-/// that interface's hello: the Storage Server's protocol
-/// (`storage::protocol::VERSION`) at the Storage Server, the buffer pool's
-/// runtime interface (`storage::runtime::VERSION`) when a session opens.
-pub const ENGINE_INTERFACE_VERSION: u32 = 14;
+/// A peer states the window in its hello and the daemon serves it in the newest version both
+/// speak ([`agree`]), refusing a peer whose window shares none with a typed refusal that names
+/// both windows (`process::refusal::Reason::Version`, `request::wire::refusal::Reason::Version`).
+/// An engine process speaks the version its first hello agreed on every link for its whole life
+/// ([`Agreed`]), so a hot restart's successor that speaks it serves on with the same processes.
+/// The engine package's executable states the window (`build_server::interface_section!`), and a
+/// daemon starts only an engine whose window shares a version with its own.
+///
+/// The window's versions are one schema: every version changes the messages only by additions,
+/// as Protobuf's rules for compatible changes state them (a new field number, oneof member or
+/// enum value; never a renumbered, retyped or reused one). The newest version is raised by each
+/// change of the messages a receiver must act on; a sender uses what a version added only on a
+/// connection whose agreed version has it. The window holds at least the previous release's
+/// version and the current one: raising the newest keeps the oldest, and a later change raises
+/// the oldest past a version once no release that serves needs it, removing every handling of
+/// the versions it passes (a version check `agreed >= V` whose `V` is the new oldest, a handler
+/// of a message the window no longer holds).
+///
+/// The engine's other interfaces have windows of their own, each agreed at that interface's
+/// hello: the Storage Server's protocol (`storage::protocol::VERSIONS`) at the Storage Server,
+/// the buffer pool's runtime interface (`storage::runtime::VERSIONS`) when a session opens.
+pub const ENGINE_INTERFACE: service::Versions = service::Versions::one(14);
+
+/// The version of the engine interface a peer of the window `spoken` agrees on with a peer
+/// whose hello states `oldest` and `newest` ([`process::Hello`], [`request::wire::Hello`]): the
+/// newest both speak.
+///
+/// # Errors
+///
+/// [`Disagreement`] when the windows share no version (a hello that states no version at all
+/// shares none).
+pub fn agree(oldest: u32, newest: u32, spoken: service::Versions) -> Result<u32, Disagreement> {
+    service::Versions::stated(oldest, newest)
+        .and_then(|offered| offered.agree(spoken))
+        .ok_or(Disagreement {
+            oldest,
+            newest,
+            spoken,
+        })
+}
+
+/// A hello whose window shares no version of the engine interface with the window a daemon
+/// speaks: the hello's versions as it stated them, and the daemon's window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Disagreement {
+    oldest: u32,
+    newest: u32,
+    spoken: service::Versions,
+}
+
+/// The version of the engine interface a peer that offered `offered` in its hello speaks with
+/// the daemon whose welcome states `version` ([`process::Welcome::version`],
+/// [`request::wire::Welcome::version`]): that version, or the offer's oldest when the welcome
+/// states none, as a daemon of one version accepts it.
+///
+/// # Errors
+///
+/// When the welcome states a version the offer does not hold: the daemon broke the agreement.
+pub fn agreed(offered: service::Versions, version: u32) -> Result<u32, String> {
+    match version {
+        0 => Ok(offered.oldest()),
+        version if offered.speaks(version) => Ok(version),
+        version => Err(format!(
+            "the daemon welcomed versions {offered} of the engine interface in version {version}"
+        )),
+    }
+}
+
+/// The one version of the engine interface an engine process speaks once its first hello agreed
+/// on it: every later hello of the process (its process link, an attachment to a hot restart's
+/// successor) offers it alone, so the process speaks one version on all its links, whichever
+/// daemon serves them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Agreed(pub u32);
+
+impl Agreed {
+    /// The window a later hello of the process offers: its agreed version alone.
+    pub fn offer(self) -> service::Versions {
+        service::Versions::one(self.0)
+    }
+}
+
+/// The windows a version refusal states, as text: the peer's (`offered` to `offered_newest`)
+/// and the refuser's (`spoken_oldest` to `spoken`), each a single version where its second field
+/// is unset (a refuser or a peer of one version).
+fn refused_windows(
+    offered: u32,
+    offered_newest: u32,
+    spoken: u32,
+    spoken_oldest: u32,
+) -> (String, String) {
+    let window = |oldest: u32, newest: u32| match service::Versions::stated(oldest, newest) {
+        Some(window) => window.to_string(),
+        None => format!("{oldest} to {newest}"),
+    };
+    let spoken_oldest = if spoken_oldest == 0 {
+        spoken
+    } else {
+        spoken_oldest
+    };
+    (
+        window(offered, offered_newest),
+        window(spoken_oldest, spoken),
+    )
+}
 
 impl process::Refusal {
-    /// The refusal of a peer whose hello states version `offered` of the engine
-    /// interface, when that is not this build's; `None` for this build's.
-    pub fn of_version(offered: u32) -> Option<Self> {
-        (offered != ENGINE_INTERFACE_VERSION).then_some(Self {
+    /// The refusal of a peer whose hello's window shares no version with the daemon's.
+    pub fn of_versions(disagreement: Disagreement) -> Self {
+        Self {
             reason: Some(process::refusal::Reason::Version(process::VersionRefusal {
-                offered,
-                spoken: ENGINE_INTERFACE_VERSION,
+                offered: disagreement.oldest,
+                spoken: disagreement.spoken.newest(),
+                offered_newest: disagreement.newest,
+                spoken_oldest: disagreement.spoken.oldest(),
             })),
-        })
+        }
     }
 
     /// A refusal for `reason`.
@@ -113,11 +212,19 @@ impl std::fmt::Display for process::Refusal {
         use process::refusal::Reason;
 
         match &self.reason {
-            Some(Reason::Version(version)) => write!(
-                formatter,
-                "the peer speaks version {} of the engine interface and the daemon {}",
-                version.offered, version.spoken
-            ),
+            Some(Reason::Version(version)) => {
+                let (offered, spoken) = refused_windows(
+                    version.offered,
+                    version.offered_newest,
+                    version.spoken,
+                    version.spoken_oldest,
+                );
+                write!(
+                    formatter,
+                    "the peer speaks versions {offered} of the engine interface and the daemon \
+                     {spoken}, which share none"
+                )
+            }
             Some(Reason::Unserved(_)) => {
                 formatter.write_str("the peer is not one this socket serves")
             }
@@ -137,18 +244,18 @@ impl std::fmt::Display for process::Refusal {
 impl std::error::Error for process::Refusal {}
 
 impl request::wire::Refusal {
-    /// The refusal of an engine whose hello states version `offered` of the
-    /// engine interface, when that is not this build's; `None` for this
-    /// build's.
-    pub fn of_version(offered: u32) -> Option<Self> {
-        (offered != ENGINE_INTERFACE_VERSION).then_some(Self {
+    /// The refusal of an engine whose hello's window shares no version with the daemon's.
+    pub fn of_versions(disagreement: Disagreement) -> Self {
+        Self {
             reason: Some(request::wire::refusal::Reason::Version(
                 request::wire::VersionRefusal {
-                    offered,
-                    spoken: ENGINE_INTERFACE_VERSION,
+                    offered: disagreement.oldest,
+                    spoken: disagreement.spoken.newest(),
+                    offered_newest: disagreement.newest,
+                    spoken_oldest: disagreement.spoken.oldest(),
                 },
             )),
-        })
+        }
     }
 }
 
@@ -157,11 +264,19 @@ impl std::fmt::Display for request::wire::Refusal {
         use request::wire::refusal::Reason;
 
         match &self.reason {
-            Some(Reason::Version(version)) => write!(
-                formatter,
-                "the engine speaks version {} of the engine interface and the daemon {}",
-                version.offered, version.spoken
-            ),
+            Some(Reason::Version(version)) => {
+                let (offered, spoken) = refused_windows(
+                    version.offered,
+                    version.offered_newest,
+                    version.spoken,
+                    version.spoken_oldest,
+                );
+                write!(
+                    formatter,
+                    "the engine speaks versions {offered} of the engine interface and the daemon \
+                     {spoken}, which share none"
+                )
+            }
             Some(Reason::Engine(engine)) => write!(
                 formatter,
                 "engine {} connected on the link of engine {}",

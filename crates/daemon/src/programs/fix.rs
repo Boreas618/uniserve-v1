@@ -90,12 +90,12 @@ pub(crate) fn fix(
             .with_context(|| format!("resolving `programs.{name}` ({source})"))?;
         let (kind, version) = program::kind(&bytes)
             .map_err(|error| anyhow::anyhow!("`programs.{name}` ({source}): {error}"))?;
+        let runs = program::versions(kind);
         ensure!(
-            version == kind.interface_version(),
+            runs.speaks(version),
             "`programs.{name}` ({source}) is a {} program of interface version {version}, and \
-             this release runs version {}",
+             this release runs versions {runs}",
             kind.name(),
-            kind.interface_version()
         );
         let digest = format!("{:x}", Sha256::digest(&bytes));
         fixed.programs.insert(

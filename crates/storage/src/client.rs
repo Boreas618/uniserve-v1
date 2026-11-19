@@ -28,7 +28,7 @@ use crate::protocol::{
     ANSWER, Claim, Claimant, ClientMessage, Event, Hello, Item, Key, KvProgram, Lent, Link,
     Listing, Location, Mode, Priority, ProgramRecord, ProgramStart, Quota, Refusal, Region,
     Registration, Request, Response, Role, Scope, Segment, ServerMessage, Span, StorageRecord,
-    TaskStatus, TensorRecord, Tensors, Throttle, UnitLayout, UnitRun, Usage, VERSION, Welcome,
+    TaskStatus, TensorRecord, Tensors, Throttle, UnitLayout, UnitRun, Usage, VERSIONS, Welcome,
 };
 use crate::queue::QueueDescriptors;
 use crate::runtime::{Open, Opened};
@@ -37,6 +37,8 @@ use service::Connection;
 /// A connection to a Storage Server.
 pub struct Client {
     connection: Connection,
+    /// The version of the protocol the connection agreed on at its hello.
+    version: u32,
     /// Whether the server is another host's, whose answers the protocol bounds
     /// ([`Request::remote_deadline`]); a server of this host closes the connection when it ends.
     remote: bool,
@@ -94,39 +96,53 @@ impl Client {
         })))
     }
 
-    /// Says hello as `role` in this build's [`VERSION`] and reads the
-    /// server's welcome, within the protocol's answer bound for another host's server.
+    /// Says hello as `role` in this build's window of versions ([`VERSIONS`])
+    /// and reads the server's welcome, within the protocol's answer bound for
+    /// another host's server: the connection speaks the version the welcome
+    /// agrees on.
     ///
     /// # Errors
     ///
-    /// [`Error::Version`] when the server speaks another version,
-    /// [`Error::Refused`] when it refuses the hello otherwise.
+    /// [`Error::Version`] when the server speaks no version of this client's
+    /// window, [`Error::Refused`] when it refuses the hello otherwise.
     fn open(mut connection: Connection, role: Role, remote: bool) -> Result<Self> {
-        connection.send(&ClientMessage::Hello(Hello {
-            version: VERSION,
-            role,
-        }))?;
+        connection.send(&ClientMessage::Hello(Hello::new(VERSIONS, role)))?;
         let deadline = remote.then(|| Instant::now() + ANSWER);
-        match receive(&mut connection, deadline)?.0 {
-            ServerMessage::Welcome(Welcome::Accepted) => Ok(Self {
-                connection,
-                remote,
-                deadlines: HashMap::new(),
-                next: 1,
-                responses: HashMap::new(),
-                events: VecDeque::new(),
-            }),
+        let welcome = match receive(&mut connection, deadline)?.0 {
             ServerMessage::Welcome(Welcome::Refused {
-                refusal: Refusal::Version { offered, spoken },
-            }) => Err(Error::Version { offered, spoken }),
-            ServerMessage::Welcome(Welcome::Refused { refusal }) => Err(Error::Refused(refusal)),
-            other => Err(Error::Protocol(format!("{other:?} before a welcome"))),
-        }
+                refusal: Refusal::Version(refusal),
+            }) => return Err(Error::Version(refusal)),
+            ServerMessage::Welcome(Welcome::Refused { refusal }) => {
+                return Err(Error::Refused(refusal));
+            }
+            ServerMessage::Welcome(welcome) => welcome,
+            other => return Err(Error::Protocol(format!("{other:?} before a welcome"))),
+        };
+        let version = welcome
+            .version(VERSIONS)
+            .map_err(Error::Protocol)?
+            .ok_or_else(|| Error::Protocol("the server refused the hello unstated".into()))?;
+        Ok(Self {
+            connection,
+            version,
+            remote,
+            deadlines: HashMap::new(),
+            next: 1,
+            responses: HashMap::new(),
+            events: VecDeque::new(),
+        })
+    }
+
+    /// The version of the protocol this connection agreed on at its hello, which every message
+    /// on it is of.
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     /// The connection's socket and the next request identity, for another
-    /// process to go on with ([`Client::resume`]): the server knows the
-    /// connection under the role it said hello as.
+    /// process to go on with ([`Client::resume`]) in the connection's agreed
+    /// version: the server knows the connection under the role it said hello
+    /// as.
     fn handoff(self) -> Result<(OwnedFd, u64)> {
         if !self.responses.is_empty() || !self.events.is_empty() {
             return Err(Error::Protocol(
@@ -144,10 +160,11 @@ impl Client {
     }
 
     /// Goes on with a Unix connection on this host another process passed
-    /// on.
-    fn resume(descriptor: OwnedFd, next: u64) -> Result<Self> {
+    /// on, which agreed on `version` at its hello.
+    fn resume(descriptor: OwnedFd, next: u64, version: u32) -> Result<Self> {
         Ok(Self {
             connection: Connection::new(UnixStream::from(descriptor))?,
+            version,
             remote: false,
             deadlines: HashMap::new(),
             next,
@@ -708,13 +725,18 @@ impl Client {
     }
 
     /// See [`Request::Open`]: open the epoch's session with the buffer
-    /// pool. Returns the answer and one queue pair's descriptors per
-    /// scheduler, in the order the layout lists them, each for
-    /// [`QueuePair::open`](crate::QueuePair::open) as the engine's end.
+    /// pool, in the newest version of its interface both speak. Returns the
+    /// answer and one queue pair's descriptors per scheduler, in the order the
+    /// layout lists them, each for [`QueuePair::open`](crate::QueuePair::open)
+    /// as the engine's end.
     pub fn open_pool(&mut self, open: Open) -> Result<(Opened, Vec<QueueDescriptors>)> {
         let schedulers = open.schedulers.len();
+        let offered = open.versions();
         match self.request(&Request::Open(open), &[])? {
             (Response::Opened(opened), descriptors) => {
+                if let Some(offered) = offered {
+                    opened.agreed(offered).map_err(Error::Protocol)?;
+                }
                 let count = descriptors.len();
                 if count != schedulers * QueueDescriptors::COUNT
                     || opened.registers.len() != schedulers
@@ -1018,6 +1040,9 @@ pub struct ClaimHandoff {
     pub claimed: Vec<((u64, Claimant), Vec<Scope>)>,
     /// The connection's next request identity.
     pub next: u64,
+    /// The version of the protocol the connection agreed on at its hello, which the process
+    /// that goes on with it must speak.
+    pub version: u32,
 }
 
 impl ClaimClient {
@@ -1162,6 +1187,12 @@ impl ClaimClient {
         self.client.spans(since)
     }
 
+    /// The version of the protocol the claiming connection agreed on at its hello, which a
+    /// process that goes on with the claim must speak.
+    pub fn version(&self) -> u32 {
+        self.client.version()
+    }
+
     /// Passes the claim to another process ([`ClaimClient::resume`]): its
     /// state and the claiming connection's descriptor.
     ///
@@ -1169,12 +1200,14 @@ impl ClaimClient {
     ///
     /// Fails when the connection has unread messages.
     pub fn handoff(self) -> Result<(ClaimHandoff, OwnedFd)> {
+        let version = self.client.version();
         let (descriptor, next) = self.client.handoff()?;
         let handoff = ClaimHandoff {
             deployment: self.deployment,
             claim: self.claim,
             claimed: self.claimed.into_iter().collect(),
             next,
+            version,
         };
         Ok((handoff, descriptor))
     }
@@ -1187,7 +1220,7 @@ impl ClaimClient {
     /// Fails when the connection cannot be configured.
     pub fn resume(handoff: ClaimHandoff, descriptor: OwnedFd) -> Result<Self> {
         Ok(Self {
-            client: Client::resume(descriptor, handoff.next)?,
+            client: Client::resume(descriptor, handoff.next, handoff.version)?,
             deployment: handoff.deployment,
             claim: handoff.claim,
             claimed: handoff.claimed.into_iter().collect(),

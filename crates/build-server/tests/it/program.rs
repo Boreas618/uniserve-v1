@@ -82,8 +82,8 @@ fn a_program_crate_is_installed_and_built_in_the_sdk() {
         (Kind::Routing, scheduling::program::INTERFACE_VERSION)
     );
     assert_eq!(
-        module.interface_version,
-        scheduling::program::INTERFACE_VERSION
+        module.interface,
+        service::Versions::one(scheduling::program::INTERFACE_VERSION)
     );
     assert_eq!(module.origin.commit, None);
     assert!(!module.origin.clean);

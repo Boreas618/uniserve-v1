@@ -276,30 +276,52 @@ fn a_stopped_daemon_takes_its_processes_with_it() {
     assert!(!process.runs(), "a process outlived its daemon's stop");
 }
 
-/// A daemon serves an engine of its own version of the engine interface alone, and refuses one
-/// of any other version at its hello with the typed refusal naming both versions.
+/// A daemon serves an engine in the newest version of the engine interface both windows hold,
+/// which its welcome states, whether the engine's build is this one, a later one whose window
+/// holds this build's newest or an earlier one of one version this build speaks; it refuses an
+/// engine whose window shares no version with its own at its hello, with the typed refusal naming
+/// both windows.
 #[test]
-fn a_daemon_serves_engines_of_its_own_version_alone() {
+fn a_daemon_serves_engines_in_the_newest_version_both_speak() {
     use proto::process::refusal::Reason;
     use proto::process::{Refusal, VersionRefusal};
+    use service::Versions;
 
     let directory = tempfile::tempdir().unwrap();
     let node = Node::start(&directory, "node");
 
-    let ours = proto::ENGINE_INTERFACE_VERSION;
-    let (_, welcome) = Engine::hello(node.address(), ours);
-    assert_eq!(welcome.refusal, None, "an engine of this build is refused");
-    for offered in [ours - 1, ours + 1] {
+    let ours = proto::ENGINE_INTERFACE;
+    for (offered, agreed) in [
+        (ours, ours.newest()),
+        (
+            Versions::new(ours.newest(), ours.newest() + 1),
+            ours.newest(),
+        ),
+        (Versions::one(ours.oldest()), ours.oldest()),
+    ] {
+        let (_, welcome) = Engine::hello(node.address(), offered);
+        assert_eq!(
+            welcome.refusal, None,
+            "an engine of versions {offered} is refused"
+        );
+        assert_eq!(welcome.version, agreed, "an engine of versions {offered}");
+    }
+    for offered in [
+        Versions::one(ours.oldest() - 1),
+        Versions::new(ours.newest() + 1, ours.newest() + 2),
+    ] {
         let (_, welcome) = Engine::hello(node.address(), offered);
         assert_eq!(
             welcome.refusal,
             Some(Refusal {
                 reason: Some(Reason::Version(VersionRefusal {
-                    offered,
-                    spoken: ours,
+                    offered: offered.oldest(),
+                    spoken: ours.newest(),
+                    offered_newest: offered.newest(),
+                    spoken_oldest: ours.oldest(),
                 })),
             }),
-            "an engine of version {offered}"
+            "an engine of versions {offered}"
         );
     }
 }
