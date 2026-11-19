@@ -1512,7 +1512,8 @@ mod tests {
         let ids: Vec<GroupId> = served.iter().map(|&(id, _)| id).collect();
 
         let layout = runtime::Open {
-            version: runtime::VERSION,
+            oldest: runtime::VERSIONS.oldest(),
+            newest: Some(runtime::VERSIONS.newest()),
             epoch: 1,
             trial: false,
             regions: vec![
@@ -1534,6 +1535,7 @@ mod tests {
                 capacity: vec![(4, 4), (5, 7), (6, 10)],
             }],
             session: 0,
+            version: None,
         };
         let configs = served
             .iter()
@@ -2222,7 +2224,8 @@ mod tests {
         };
 
         let layout = runtime::Open {
-            version: runtime::VERSION,
+            oldest: runtime::VERSIONS.oldest(),
+            newest: Some(runtime::VERSIONS.newest()),
             epoch: 1,
             trial: false,
             regions: vec![
@@ -2253,6 +2256,7 @@ mod tests {
                     .collect(),
             }],
             session: 0,
+            version: None,
         };
 
         let rank = |host: &str| WorkerRank {

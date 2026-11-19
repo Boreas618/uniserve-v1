@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use storage::protocol::Segment;
-use storage::runtime::{GROUPS, GroupId, Open, Segments, Tier, VERSION};
+use storage::runtime::{GROUPS, GroupId, Open, Segments, Tier, VERSIONS};
 
 use super::{
     BufferPool, Class, ClientId, Deferred, Group, Memories, Region, Validity, disowned,
@@ -294,8 +294,9 @@ impl BufferPool {
     ///
     /// # Errors
     ///
-    /// Refuses, changing nothing, a layout that does not fit: another version
-    /// of the interface than this build's [`VERSION`], a name stated
+    /// Refuses, changing nothing, a layout that does not fit: a window of the
+    /// interface's versions that shares none with this build's ([`VERSIONS`]),
+    /// naming both windows, a name stated
     /// twice, a region stated again with another tier, space, unit size or
     /// reserved units, a segment that cannot join its space's table, an index
     /// that names no region of the right tier, a group of no scheduler's or
@@ -558,12 +559,7 @@ impl BufferPool {
 
     /// Whether a layout fits the pool; see [`Self::admit`].
     fn fits(&self, open: &Open) -> Result<(), String> {
-        if open.version != VERSION {
-            return Err(format!(
-                "the buffer pool serves version {VERSION} of its interface, not {}",
-                open.version
-            ));
-        }
+        open.agree(VERSIONS)?;
         self.segments_fit(open)?;
         let mut names = HashSet::new();
         for region in &open.regions {

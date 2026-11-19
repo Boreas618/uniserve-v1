@@ -177,8 +177,7 @@ pub fn install(
                     );
                 })
                 .with_context(|| format!("resolving {} for {key}", slot.op))?;
-            interface_agrees(operator, package, module.interface_version)
-                .map_err(anyhow::Error::msg)?;
+            interface_agrees(operator, package, module.interface).map_err(anyhow::Error::msg)?;
             let module =
                 Resolved::of(module).with_context(|| format!("reading {} for {key}", slot.op))?;
 
@@ -249,11 +248,11 @@ pub(crate) fn policy(
 
     // A module built for another version of the policy interface would be asked decisions
     // through calls whose messages mean something else to it.
-    if module.interface_version != scheduling::INTERFACE_VERSION {
+    if !module.interface.speaks(scheduling::INTERFACE_VERSION) {
         bail!(
-            "{named} implements version {} of the scheduling policy interface and this engine \
+            "{named} implements versions {} of the scheduling policy interface and this engine \
              instantiates version {}",
-            module.interface_version,
+            module.interface,
             scheduling::INTERFACE_VERSION
         );
     }
@@ -459,7 +458,7 @@ mod tests {
                 build_server::manifest::LAUNCH_ENTRY.to_owned(),
                 "launch_attention".to_owned(),
             )]),
-            interface_version: 1,
+            interface: service::Versions::one(1),
             executable: None,
             origin: build_server::protocol::Origin::default(),
         };
@@ -491,7 +490,7 @@ mod tests {
             ],
             metadata: Some("launch.json".to_owned()),
             entries: BTreeMap::new(),
-            interface_version: 1,
+            interface: service::Versions::one(1),
             executable: None,
             origin: build_server::protocol::Origin::default(),
         };
@@ -517,7 +516,7 @@ mod tests {
                 build_server::manifest::LAUNCH_ENTRY.to_owned(),
                 "launch".to_owned(),
             )]),
-            interface_version: 1,
+            interface: service::Versions::one(1),
             executable: None,
             origin: build_server::protocol::Origin::default(),
         };

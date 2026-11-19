@@ -306,6 +306,9 @@ pub struct EngineClient {
     /// other hosts: one client per peer, which this client holds so that they
     /// end with it.
     peers: Vec<EngineClient>,
+    /// The version of the engine interface the engine's request link agreed on, which the
+    /// engine speaks on every link; `None` for a client made without a hello.
+    interface: Option<u32>,
 }
 
 impl EngineClient {
@@ -354,6 +357,7 @@ impl EngineClient {
             engine: None,
             host: None,
             peers: Vec::new(),
+            interface: None,
         })
     }
 
@@ -370,6 +374,27 @@ impl EngineClient {
     pub fn on_host(mut self, host: &str) -> Self {
         self.host = Some(host.to_owned());
         self
+    }
+
+    /// The client of an engine whose request link agreed on version `version` of the engine
+    /// interface.
+    #[must_use]
+    pub fn speaking(mut self, version: u32) -> Self {
+        self.interface = Some(version);
+        self
+    }
+
+    /// The version of the engine interface the engine speaks, when its hello was answered here.
+    pub fn interface(&self) -> Option<u32> {
+        self.interface
+    }
+
+    /// The versions of the engine interface this engine and its peers speak: what a hot
+    /// restart's successor must speak to go on with them.
+    pub fn interfaces(&self) -> impl Iterator<Item = u32> + '_ {
+        std::iter::once(self)
+            .chain(&self.peers)
+            .filter_map(|client| client.interface)
     }
 
     /// The scheduler node's client of a deployment whose other engines `peers` are: they end

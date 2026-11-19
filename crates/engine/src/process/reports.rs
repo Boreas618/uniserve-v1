@@ -356,6 +356,7 @@ mod tests {
         let mut main = MainProcess::new(
             Connection::new(engine_requests).unwrap(),
             std::num::NonZeroU32::MIN,
+            proto::Agreed(proto::ENGINE_INTERFACE.newest()),
             Connection::new(engine_process).unwrap(),
             testkit::serving::launch(),
         )

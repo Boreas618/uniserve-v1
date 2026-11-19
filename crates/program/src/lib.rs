@@ -53,6 +53,29 @@ pub use scheduling::control::{
 };
 pub use scheduling::program::{Kind, Level};
 
+/// The versions of the processing interface (`scheduling::processing`) this host runs a
+/// processing program of. A module states the one version its SDK was compiled for
+/// (`scheduling::processing::INTERFACE_VERSION`, in its section), and the host runs a module of
+/// any version of the window: its newest is this build's SDK's, and its oldest the previous
+/// release's. A version changes the exports and their JSON messages only by additions (a field
+/// with a default, an export the host calls only of a module that states a version with it), so
+/// the host reads a module's replies of every version of the window with its own types; a
+/// change that is not an addition keeps the previous version's handling beside its own, selected
+/// by the module's version ([`Module::version`]), until the window's oldest passes it.
+pub const PROCESSING: service::Versions =
+    service::Versions::new(1, scheduling::processing::INTERFACE_VERSION);
+
+/// The versions of the interface of programs of `kind` this host runs: [`PROCESSING`] for a
+/// processing program, and the one version of this build's SDK for every other kind.
+pub fn versions(kind: Kind) -> service::Versions {
+    match kind {
+        Kind::Processing => PROCESSING,
+        Kind::Control | Kind::Routing | Kind::Kv | Kind::Scheduling => {
+            service::Versions::one(kind.interface_version())
+        }
+    }
+}
+
 /// The process's one wasmtime engine, which compiles and runs every program module.
 ///
 /// Fuel metering is on (every call into a program has a budget), the compiler optimizes for
@@ -124,6 +147,7 @@ pub fn kind(bytes: &[u8]) -> Result<(Kind, u32), Error> {
 pub struct Module<H: 'static> {
     pre: wasmtime::InstancePre<instance::Context<H>>,
     kind: Kind,
+    version: u32,
 }
 
 impl<H: 'static> Clone for Module<H> {
@@ -131,6 +155,7 @@ impl<H: 'static> Clone for Module<H> {
         Self {
             pre: self.pre.clone(),
             kind: self.kind,
+            version: self.version,
         }
     }
 }
@@ -140,6 +165,12 @@ impl<H: 'static> Module<H> {
     pub fn kind(&self) -> Kind {
         self.kind
     }
+
+    /// The version of its kind's interface the module states it was compiled against, one of
+    /// the window this host runs ([`versions`]): the version its calls are made in.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
 }
 
 impl<H: Host> Module<H> {
@@ -148,9 +179,10 @@ impl<H: Host> Module<H> {
     ///
     /// # Errors
     ///
-    /// [`Error::Load`] when the bytes are not a module, it states another kind ([`kind`]) or
-    /// another version of the program interface, it imports anything else, or it lacks the
-    /// memory or an export of the program interface, or has one of another signature.
+    /// [`Error::Load`] when the bytes are not a module, it states another kind ([`kind`]) or a
+    /// version of the program interface this host does not run ([`versions`]), it imports
+    /// anything else, or it lacks the memory or an export of the program interface, or has one
+    /// of another signature.
     pub fn new(bytes: &[u8]) -> Result<Self, Error> {
         let mut linker = wasmtime::Linker::new(engine()?);
         host::log(&mut linker)?;
@@ -169,12 +201,12 @@ impl<H: Host> Module<H> {
                 kind.name()
             )));
         }
-        if version != kind.interface_version() {
+        let runs = versions(kind);
+        if !runs.speaks(version) {
             return Err(Error::Load(format!(
                 "the module speaks version {version} of the {} program interface and this host \
-                 version {}",
+                 versions {runs}",
                 kind.name(),
-                kind.interface_version()
             )));
         }
 
@@ -190,7 +222,7 @@ impl<H: Host> Module<H> {
         let pre = linker
             .instantiate_pre(&module)
             .map_err(|error| Error::Load(format!("the module does not link: {error}")))?;
-        Ok(Self { pre, kind })
+        Ok(Self { pre, kind, version })
     }
 }
 

@@ -13,11 +13,15 @@
 // `Artifact` event passes the shared memory holding the bytes as a file
 // descriptor beside its frame.
 //
-// The interface has one version per release (`proto::ENGINE_INTERFACE_VERSION`,
-// shared with the process interface): the daemon serves an engine of its own
-// version alone, refusing any other in its welcome with a typed `Refusal`.
-// The `Hello` and the `Welcome` are the one part of the interface that no
-// release changes, so that an engine of any version reads its refusal.
+// The interface is versioned (`proto::ENGINE_INTERFACE`, shared with the
+// process interface): the engine states the window of versions it speaks in
+// its hello, the daemon agrees on the newest version both speak and states it
+// in its welcome, and an engine whose window shares no version with the
+// daemon's is refused in the welcome with a typed `Refusal` that names both
+// windows. The `Hello` and the `Welcome` change only by additions, so that an
+// engine of any version reads its refusal: a hello that states no `newest`
+// speaks its `oldest` alone, and a welcome that states no `version` agreed on
+// the hello's `oldest`.
 
 syntax = "proto3";
 
@@ -25,7 +29,12 @@ package uniserve.request;
 
 // The first message on a connection, from the engine process.
 message Hello {
-  uint32 major = 1;
+  // The oldest version of the engine interface the engine speaks: its build's oldest at its
+  // first hello, and the version that hello agreed at every later one (an attachment to a
+  // hot restart's successor), so the engine speaks one version on every link for its life.
+  uint32 oldest = 1;
+  // The newest version the engine speaks; unset, it speaks `oldest` alone.
+  uint32 newest = 6;
   string build = 3;
   // The identity the daemon started the engine process under.
   uint64 engine = 4;
@@ -45,12 +54,15 @@ message Welcome {
   // reports: the engine sends a request's events no further beyond the
   // position the daemon last reported. Positive.
   uint32 event_window = 6;
+  // The version of the engine interface the daemon serves the engine in: the newest both speak.
+  // Unset, it is the hello's `oldest`, as a daemon of one version accepts it.
+  uint32 version = 7;
 }
 
 // Why the daemon refuses an engine's hello on its request link.
 message Refusal {
   oneof reason {
-    // The engine speaks another version of the engine interface than the daemon.
+    // The engine speaks no version of the engine interface the daemon speaks.
     VersionRefusal version = 1;
     // The engine states another engine number than the one the link was made
     // for.
@@ -58,12 +70,17 @@ message Refusal {
   }
 }
 
-// The versions of a refusal for the engine interface's version.
+// The windows of a refusal for the engine interface's version: the engine's and the daemon's,
+// which share no version.
 message VersionRefusal {
-  // The version the engine's hello states.
+  // The oldest version the engine's hello states.
   uint32 offered = 1;
-  // The daemon's version, the one it serves.
+  // The newest version the daemon speaks.
   uint32 spoken = 2;
+  // The newest version the engine's hello states; unset, `offered` alone.
+  uint32 offered_newest = 3;
+  // The oldest version the daemon speaks; unset, `spoken` alone.
+  uint32 spoken_oldest = 4;
 }
 
 // The engine numbers of a refusal for a link made for another engine.

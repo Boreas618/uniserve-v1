@@ -92,7 +92,7 @@ use platform::{DeviceId, Stream};
 use proto::config::{EngineArgs, WorkerGroupConfig};
 use storage::QueuePair;
 use storage::protocol::UnitRun;
-use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Tier, VERSION};
+use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Tier, VERSIONS};
 
 use self::rank::{Collective, ModelRunner, RankModel, parallel_order};
 use crate::process::binding::{self, Served};
@@ -1754,7 +1754,8 @@ pub fn text_layout(
         u8::try_from(classes.len() - 1).context("more classes than a session numbers")?;
 
     Ok(Open {
-        version: VERSION,
+        oldest: VERSIONS.oldest(),
+        newest: Some(VERSIONS.newest()),
         epoch: launch.epoch,
         trial: false,
         regions,
@@ -2064,7 +2065,8 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     }
 
     Ok(Open {
-        version: VERSION,
+        oldest: VERSIONS.oldest(),
+        newest: Some(VERSIONS.newest()),
         epoch: launch.epoch,
         trial: false,
         regions,

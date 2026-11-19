@@ -431,7 +431,8 @@ impl BuildServer {
                             files,
                             entries: module.entries.into_iter().collect(),
                             metadata: module.metadata.unwrap_or_default(),
-                            interface_version: module.interface_version,
+                            interface_version: module.interface.newest(),
+                            interface_oldest: module.interface.oldest(),
                             executable: module.executable.unwrap_or_default(),
                             commit: module.origin.commit,
                             clean: module.origin.clean,
@@ -514,7 +515,8 @@ impl BuildServer {
                                     target: module.target.to_string(),
                                     descriptor: module.descriptor,
                                     form: wire::ModuleForm::from(module.form) as i32,
-                                    interface_version: module.interface_version,
+                                    interface_version: module.interface.newest(),
+                                    interface_oldest: module.interface.oldest(),
                                 })
                                 .collect(),
                         })
@@ -1293,18 +1295,15 @@ impl BuildServer {
             entries,
             executable: package.manifest.executable().map(str::to_owned),
             // The record written with the module when it was built: every
-            // committed module states the interface version it was built for.
-            interface_version: self
-                .store
-                .interface_version(&path)
-                .ok_or_else(|| Error::Build {
-                    op: path.op.clone(),
-                    backend: path.backend.clone(),
-                    revision: path.revision,
-                    target: path.target.clone(),
-                    descriptor: path.descriptor.clone(),
-                    message: "the module's record states no interface version".into(),
-                })?,
+            // committed module states the interface versions it was built for.
+            interface: self.store.interface(&path).ok_or_else(|| Error::Build {
+                op: path.op.clone(),
+                backend: path.backend.clone(),
+                revision: path.revision,
+                target: path.target.clone(),
+                descriptor: path.descriptor.clone(),
+                message: "the module's record states no interface version".into(),
+            })?,
         })
     }
 
@@ -1333,15 +1332,15 @@ impl BuildServer {
             let Some(modules) = listed.get_mut(&key) else {
                 continue;
             };
-            // A listed module is committed, and its mark states its version.
-            let Some(interface_version) = self.store.interface_version(&path) else {
+            // A listed module is committed, and its mark states its versions.
+            let Some(interface) = self.store.interface(&path) else {
                 continue;
             };
             modules.push(protocol::ModuleEntry {
                 target: Target::new(path.target),
                 descriptor: path.descriptor,
                 form,
-                interface_version,
+                interface,
             });
         }
         Ok(listed
@@ -1932,19 +1931,17 @@ impl Queue {
                 message: "the build wrote no file".into(),
             });
         }
-        let interface_version =
-            crate::source::stated_interface(&package.manifest, workspace.path()).map_err(
-                |message| Error::Build {
-                    op: path.op.clone(),
-                    backend: path.backend.clone(),
-                    revision: path.revision,
-                    target: path.target.clone(),
-                    descriptor: path.descriptor.clone(),
-                    message,
-                },
-            )?;
+        let interface = crate::source::stated_interface(&package.manifest, workspace.path())
+            .map_err(|message| Error::Build {
+                op: path.op.clone(),
+                backend: path.backend.clone(),
+                revision: path.revision,
+                target: path.target.clone(),
+                descriptor: path.descriptor.clone(),
+                message,
+            })?;
         self.store
-            .publish(path, workspace.path(), &built, interface_version)?;
+            .publish(path, workspace.path(), &built, interface)?;
         Ok(())
     }
 

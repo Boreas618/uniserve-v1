@@ -67,7 +67,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
         .resolve(OP, &prepared[0].1, &arch(), PAGE_64, &mut |_| {})
         .unwrap();
     assert_eq!(resolved.form, ModuleForm::Cubin);
-    assert_eq!(resolved.interface_version, 1);
+    assert_eq!(resolved.interface, service::Versions::one(1));
     let names: Vec<&str> = resolved
         .files
         .iter()
@@ -155,7 +155,8 @@ fn an_executable_revision_is_installed_stored_and_resolved_as_it_is() {
     assert!(resolved.metadata.is_none());
     assert!(resolved.entries.is_empty());
     assert_eq!(
-        resolved.interface_version, 3,
+        resolved.interface,
+        service::Versions::one(3),
         "the module carries the interface version its package's manifest states"
     );
     assert_eq!(support::file_of(&resolved, "bin/sampler"), executable);

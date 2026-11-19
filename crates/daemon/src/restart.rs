@@ -1,22 +1,27 @@
-//! Hot restart of a leader daemon: a successor process of the running build takes the
-//! deployment over while the daemon it replaces finishes the requests it took, as Envoy's hot
-//! restart does.
+//! Hot restart of a leader daemon: a successor process takes the deployment over while the
+//! daemon it replaces finishes the requests it took, as Envoy's hot restart does. The successor
+//! may run another build than the daemon it replaces.
 //!
 //! A change of the daemon's own options (`proto::reload::Effect::Daemon`) starts the successor
-//! by re-executing the daemon's own image
-//! (`/proc/self/exe serve --predecessor FD`), which inherits one end of a socket pair at the
-//! descriptor the argument names. They talk over it:
+//! from the base executable the deployment names (`executable`), or by re-executing the daemon's
+//! own image when it names none (`IMAGE serve --predecessor FD`), which inherits one end of a
+//! socket pair at the descriptor the argument names. They talk over it:
 //!
-//! 1. The daemon sends its options and the version of the engine interface
-//!    its engines speak (`Prepare`); a successor of another version gives
-//!    up, as one does whose protocol the host's Storage Server does not
-//!    speak. The successor loads the model's files and binds a request
-//!    socket of its own, which it responds with (`Prepared`).
+//! 1. The daemon sends its options, the window of versions of the engine interface it speaks,
+//!    the versions of the engine interface its connections agreed on (its engines' links,
+//!    their workers', its members' and its own clients') and the Storage Server protocol
+//!    version of its claim (`Prepare`). The successor goes on with those connections as they
+//!    are, so it gives up unless its windows hold every one of those versions
+//!    (`proto::ENGINE_INTERFACE`, `storage::protocol::VERSIONS`) and the host's Storage Server
+//!    serves it; it also agrees with the daemon on the version the handoff's messages are
+//!    written in, the newest both speak. The successor loads the model's files and binds a
+//!    request socket of its own, which it responds with, with the agreed version (`Prepared`).
 //! 2. The daemon stops its service thread between two rounds and sends what
 //!    the thread served, its HTTP listener and the connection its engine's
 //!    process lives under, with the arguments the engine serves with and the video jobs
 //!    (`Takeover`), and commands the engine to attach to
-//!    the successor's request socket (`EngineCommand::Attach`).
+//!    the successor's request socket (`EngineCommand::Attach`). The engine says hello there in
+//!    the one version it speaks.
 //! 3. The successor goes on with the service, adopts the engine once it
 //!    attaches, and accepts on the HTTP listener (`Serving`).
 //! 4. The daemon stops accepting and finishes the requests and video jobs
@@ -28,14 +33,15 @@
 //!
 //! No connection closes: the listener, the processes' connections and the
 //! claim cross as descriptors, and each request ends on the daemon that took
-//! it. The engines are the same processes throughout, so a successor speaks
-//! the same version of the engine interface as the daemon it replaces, and
-//! the same Storage Server protocol: each interface has one version per
-//! release, and a deployment moves to another release by an epoch change
-//! after a full restart, not in place. A connection that arrives meanwhile
-//! waits in the listener's queue until one of the two accepts it. Until the successor serves, a failure leaves the daemon serving
-//! as before, except after the service thread stopped, which then fails the
-//! restart and the daemon with it.
+//! it. The engines are the same processes throughout and speak the version they agreed on with
+//! the daemon that started them; an epoch update the successor runs afterwards starts engines of
+//! its own build, which agree on the newest version both speak. The handoff's messages are part
+//! of the engine interface: they change only by additions (a field with a default, a variant),
+//! so a successor of another build within the window reads them. A connection that arrives
+//! meanwhile waits in the listener's queue until one of the two accepts it. Until the successor
+//! serves, a failure leaves the daemon serving as before, except after the service thread
+//! stopped, which then fails the restart and the daemon with it: every check a successor of
+//! another build may fail runs before it.
 
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -65,8 +71,9 @@ enum Message {
     /// Daemon to successor: the options it serves with.
     Prepare(Box<Prepare>),
     /// Successor to daemon: its request socket, which the engine attaches
-    /// to.
-    Prepared { requests: String },
+    /// to, and the version of the engine interface the handoff's messages are written in, the
+    /// newest both daemons speak.
+    Prepared { requests: String, version: u32 },
     /// Daemon to successor: everything it serves, with the descriptors of
     /// [`Takeover`].
     Takeover(Box<Takeover>),
@@ -129,10 +136,17 @@ struct Prepare {
     /// Whether the configuration listens on another address than the
     /// daemon's listener: the successor binds it before the handover.
     rebind: bool,
-    /// The version of the engine interface the daemon and every engine it
-    /// hands over speak ([`proto::ENGINE_INTERFACE_VERSION`]): a successor of
-    /// another version gives up before anything is handed over.
-    interface: u32,
+    /// The window of versions of the engine interface the daemon speaks
+    /// ([`proto::ENGINE_INTERFACE`]), over which the two agree on the version of the handoff's
+    /// messages.
+    versions: service::Versions,
+    /// The versions of the engine interface the connections the daemon hands over agreed on:
+    /// its engines' links, their workers', its members' and its own clients'. A successor whose
+    /// window misses one gives up before anything is handed over.
+    spoken: Vec<u32>,
+    /// The version of the Storage Server protocol the daemon's claim agreed on, once an engine
+    /// claimed the node: the claim's connection crosses as it is.
+    storage: Option<u32>,
     /// The processing program the serving epoch processes requests through, which the
     /// successor loads from the deployment's Build Server: it restores every response's parser
     /// in it and processes new requests with it.
@@ -262,9 +276,10 @@ impl Restarter {
         service::lock(&self.handoff).clone()
     }
 
-    /// Restarts the daemon as a successor of the running build, as the module describes, up to
-    /// the successor serving; returns its process id. Video job changes go on to the successor until this
-    /// daemon exits.
+    /// Restarts the daemon as a successor, as the module describes, up to the successor serving;
+    /// returns its process id. The successor runs the base executable `config` names
+    /// (`executable`), or this daemon's own image. Video job changes go on to the successor until
+    /// this daemon exits.
     ///
     /// # Errors
     ///
@@ -317,17 +332,21 @@ impl Restarter {
         // handover instead of leaving the old daemon's copies parked behind it.
         leader.end_standbys().await;
         let handoff = leader.engine_handoff()?;
+        // The successor serves with the daemon's options the change
+        // states, over the configuration the engine serves.
+        let options = config.unwrap_or_else(|| handoff[0].config.clone());
+        let image = options
+            .executable
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(RUNNING_IMAGE));
         let (ours, theirs) = UnixStream::pair().context("creating the handoff socket")?;
         // The persistent reply reader must yield to the continuations it
         // wakes, including when the handoff channel has no further traffic.
         ours.set_nonblocking(true)?;
-        let successor = spawn(theirs)?;
-        info!(pid = successor, "started the successor daemon");
+        let successor = spawn(theirs, &image)?;
+        info!(pid = successor, image = %image.display(), "started the successor daemon");
         let mut channel = Connection::new(ours)?;
 
-        // The successor serves with the daemon's options the change
-        // states, over the configuration the engine serves.
-        let options = config.unwrap_or_else(|| handoff[0].config.clone());
         // The listener binds the daemon's own address (`admin_config`): a
         // change of it is the rebind this successor makes before the
         // handover, and the previous daemon keeps serving if the bind fails.
@@ -344,6 +363,17 @@ impl Restarter {
         // No epoch change runs meanwhile (`quiesce`), so the serving processor's program is the
         // one every response in flight parses in.
         let processing = leader.processor().program().revision().clone();
+        // The versions of what crosses: no epoch change, relaunch or standby starts an engine
+        // meanwhile, so they hold until the handover.
+        let spoken = ::service::lock(&self.daemon)
+            .as_ref()
+            .map(Daemon::spoken)
+            .unwrap_or_default();
+        let engines = handoff
+            .iter()
+            .flat_map(|replica| replica.client.interfaces().collect::<Vec<_>>());
+        let versions: std::collections::BTreeSet<u32> =
+            spoken.engine.iter().copied().chain(engines).collect();
         send(
             &mut channel,
             &Message::Prepare(Box::new(Prepare {
@@ -354,13 +384,26 @@ impl Restarter {
                 instance: self.instance.clone(),
                 deployment: self.deployment.clone(),
                 rebind,
-                interface: proto::ENGINE_INTERFACE_VERSION,
+                versions: proto::ENGINE_INTERFACE,
+                spoken: versions.into_iter().collect(),
+                storage: spoken.storage,
                 processing,
             })),
             &[],
         )?;
         let requests = match recv(&mut channel).await? {
-            (Message::Prepared { requests }, _) => requests,
+            (Message::Prepared { requests, version }, _) => {
+                // The successor agreed on the newest version both windows hold, which this
+                // daemon writes the handoff in.
+                anyhow::ensure!(
+                    proto::ENGINE_INTERFACE.speaks(version),
+                    "the successor agreed on version {version} of the engine interface, which \
+                     this daemon (versions {}) does not speak",
+                    proto::ENGINE_INTERFACE
+                );
+                info!(version, "the successor agreed on the handoff's version");
+                requests
+            }
             (Message::Failed { reason }, _) => anyhow::bail!("the successor gave up: {reason}"),
             (other, _) => anyhow::bail!("the successor responded {other:?}"),
         };
@@ -547,16 +590,16 @@ impl Restarter {
 }
 
 /// The running process's own executable image, as the kernel holds it: what the successor of a
-/// hot restart executes, so it is the running build even when the file it was started from was
-/// replaced since.
+/// hot restart executes when the deployment names no `executable`, so it is the running build
+/// even when the file it was started from was replaced since.
 const RUNNING_IMAGE: &str = "/proc/self/exe";
 
-/// Starts the successor, `serve --predecessor FD` of the running image, inheriting `socket` at
-/// the descriptor `FD` names; returns its process id. The successor is not this daemon's to
-/// stop: it outlives it.
-fn spawn(socket: UnixStream) -> anyhow::Result<u32> {
+/// Starts the successor, `serve --predecessor FD` of the base executable `image`, inheriting
+/// `socket` at the descriptor `FD` names; returns its process id. The successor is not this
+/// daemon's to stop: it outlives it.
+fn spawn(socket: UnixStream, image: &std::path::Path) -> anyhow::Result<u32> {
     let descriptor = socket.as_raw_fd();
-    let mut command = std::process::Command::new(RUNNING_IMAGE);
+    let mut command = std::process::Command::new(image);
     command.args(["serve", "--predecessor", &descriptor.to_string()]);
     // SAFETY: the closure runs in the forked child before exec and calls only `fcntl`, which is
     // async-signal-safe; `socket` stays open in the parent until the spawn returned. Only the
@@ -569,7 +612,9 @@ fn spawn(socket: UnixStream) -> anyhow::Result<u32> {
             Ok(())
         });
     }
-    let child = command.spawn().context("starting the successor daemon")?;
+    let child = command
+        .spawn()
+        .with_context(|| format!("starting the successor daemon from {}", image.display()))?;
     drop(socket);
     Ok(child.id())
 }
@@ -712,14 +757,20 @@ async fn prepared_successor(
     prepare: Prepare,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    // The engines go on serving through this daemon, so an engine interface of another version
-    // ends the restart here, while the predecessor serves as it was; so does a Storage Server
-    // whose protocol this build does not speak, since the claims cross on its connections.
-    anyhow::ensure!(
-        prepare.interface == proto::ENGINE_INTERFACE_VERSION,
-        "the deployment's engines speak version {} of the engine interface, and this daemon {}",
-        prepare.interface,
-        proto::ENGINE_INTERFACE_VERSION
+    // The engines and every other connection go on through this daemon in the versions they
+    // agreed on, so a version this build does not speak ends the restart here, while the
+    // predecessor serves as it was; so does a Storage Server this build cannot speak to, since
+    // the claims cross on its connections.
+    let version = takes_over(
+        &prepare,
+        proto::ENGINE_INTERFACE,
+        ::storage::protocol::VERSIONS,
+    )?;
+    info!(
+        version,
+        engines = ?prepare.spoken,
+        storage = ?prepare.storage,
+        "this daemon speaks every version the deployment's connections agreed on"
     );
     let deployment = prepare.deployment.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -769,6 +820,7 @@ async fn prepared_successor(
         channel,
         &Message::Prepared {
             requests: control.request_address().to_owned(),
+            version,
         },
         &[],
     )?;
@@ -909,6 +961,7 @@ async fn prepared_successor(
     let (handoff, options, served, observer, client) =
         adopted.next().context("the takeover names no replicas")?;
     let served_epoch = served.epoch;
+    let interface = client.interface();
     let leader = Arc::new(
         Leader::finish(
             &config,
@@ -926,7 +979,7 @@ async fn prepared_successor(
     {
         let (record, process) = adopted_epoch(
             served_epoch,
-            handoff.engine,
+            (handoff.engine, interface),
             adopted_pids.get(&handoff.engine).copied(),
             &options,
             modules.clone(),
@@ -956,6 +1009,7 @@ async fn prepared_successor(
     // or the deployment would serve without one until the next restart.
     first.start_standby();
     for (index, (handoff, options, served, observer, client)) in adopted.enumerate() {
+        let interface = client.interface();
         let replica = crate::leader::Replica::new(
             &options,
             Arc::new(client),
@@ -970,7 +1024,7 @@ async fn prepared_successor(
         if epoch_records.recorded(served.epoch).is_none() {
             let (record, process) = adopted_epoch(
                 served.epoch,
-                handoff.engine,
+                (handoff.engine, interface),
                 adopted_pids.get(&handoff.engine).copied(),
                 &options,
                 modules.clone(),
@@ -1152,8 +1206,9 @@ async fn prepared_successor(
 /// The epoch record and the process row of an epoch a restarting daemon
 /// adopts: the build config and the modules the adopted configuration
 /// fills, serving, at the launch generation the engine reported (which is the
-/// identity it runs under), with the process id `pid` the service handed over
-/// for that launch on this node. The record's own generation stays `None`:
+/// identity it runs under) with the version of the engine interface it attached in, `(engine,
+/// interface)`, with the process id `pid` the service handed over for that launch on this
+/// node. The record's own generation stays `None`:
 /// that field is the MODEL generation the adopted engine numbers for its
 /// modules, and a daemon that adopted it never saw that number — the launch
 /// generation belongs to the process row alone.
@@ -1163,7 +1218,7 @@ async fn prepared_successor(
 /// under a live engine's generation.
 fn adopted_epoch(
     epoch: u64,
-    engine: u64,
+    (engine, interface): (u64, Option<u32>),
     pid: Option<u32>,
     options: &crate::config::Config,
     modules: Option<proto::module::ModuleSet>,
@@ -1188,19 +1243,61 @@ fn adopted_epoch(
         build: deployment.engine.executable.clone(),
         generation: engine,
         state: proto::admin::ProcessState::Serving,
+        interface,
     };
     Ok((record, process))
 }
 
-/// Whether the host's Storage Server at `socket` serves this build's protocol
-/// ([`storage::protocol::VERSION`]), which the claim connections a successor
-/// takes over must speak: the server serves one version, and refuses this
-/// build's hello with the typed version refusal when it is another. A host
-/// where no server listens has none to speak to yet.
+/// The version of the engine interface a successor of the windows `engine` and `storage` agrees
+/// on with the predecessor that sent `prepare`, the newest both speak, when the successor speaks
+/// every version the predecessor's connections agreed on: those of the engine interface on its
+/// engines', members' and clients' connections, and the Storage Server protocol's on its claim.
 ///
 /// # Errors
 ///
-/// [`storage::Error::Version`] when the server speaks another version, and
+/// Why the successor cannot take the deployment over: the windows of the engine interface share
+/// no version, or a connection's version lies outside the successor's windows.
+fn takes_over(
+    prepare: &Prepare,
+    engine: service::Versions,
+    storage: service::Versions,
+) -> anyhow::Result<u32> {
+    let version = engine.agree(prepare.versions).with_context(|| {
+        format!(
+            "the daemon speaks versions {} of the engine interface and this successor {engine}, \
+             which share none",
+            prepare.versions
+        )
+    })?;
+    if let Some(unspoken) = prepare
+        .spoken
+        .iter()
+        .find(|version| !engine.speaks(**version))
+    {
+        anyhow::bail!(
+            "the deployment's connections speak version {unspoken} of the engine interface, which \
+             this successor (versions {engine}) does not speak"
+        );
+    }
+    if let Some(claim) = prepare.storage
+        && !storage.speaks(claim)
+    {
+        anyhow::bail!(
+            "the claim at the host's Storage Server speaks version {claim} of its protocol, which \
+             this successor (versions {storage}) does not speak"
+        );
+    }
+    Ok(version)
+}
+
+/// Whether the host's Storage Server at `socket` serves this build: the successor's own
+/// connections to it agree on a version of its protocol ([`storage::protocol::VERSIONS`]),
+/// and a server whose window shares none refuses this build's hello with the typed version
+/// refusal, which names both windows. A host where no server listens has none to speak to yet.
+///
+/// # Errors
+///
+/// [`storage::Error::Version`] when the server speaks no version of this build's window, and
 /// any other failure to reach a server that listens.
 fn storage_server_speaks(socket: &std::path::Path) -> anyhow::Result<()> {
     match storage::Client::connect(socket, storage::Role::Operator) {
@@ -1222,7 +1319,9 @@ fn storage_server_speaks(socket: &std::path::Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use storage::protocol::{ClientMessage, Refusal, ServerMessage, VERSION, Welcome};
+    use storage::protocol::{
+        ClientMessage, Refusal, ServerMessage, VERSIONS, VersionRefusal, Welcome,
+    };
 
     use super::*;
 
@@ -1263,8 +1362,8 @@ mod tests {
     #[test]
     fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
         let options = crate::config::Config::default();
-        let (record, process) =
-            adopted_epoch(7, 12, Some(4321), &options, None).expect("the configuration resolves");
+        let (record, process) = adopted_epoch(7, (12, Some(14)), Some(4321), &options, None)
+            .expect("the configuration resolves");
         assert_eq!(record.status, proto::admin::EpochState::Serving);
         assert_eq!(
             record.generation, None,
@@ -1275,14 +1374,15 @@ mod tests {
             options.engine_config().expect("the configuration resolves")
         );
         assert_eq!(process.generation, 12);
+        assert_eq!(process.interface, Some(14));
         assert_eq!(process.pid, Some(4321));
         assert_eq!(process.epoch, Some(7));
         assert_eq!(process.state, proto::admin::ProcessState::Serving);
     }
 
-    /// A host's Storage Server of another release, as a successor daemon reaches it at its
-    /// socket: it refuses every hello with the typed version refusal, naming the version it
-    /// speaks.
+    /// A host's Storage Server of versions no later than `spoken`, which this build does not
+    /// speak, as a successor daemon reaches it at its socket: it refuses every hello with the
+    /// typed version refusal, naming both windows.
     fn storage_server_of_version(spoken: u32) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
@@ -1297,10 +1397,12 @@ mod tests {
                     connection.recv::<ClientMessage>(std::time::Duration::from_secs(30))
                 {
                     let refused = ServerMessage::Welcome(Welcome::Refused {
-                        refusal: Refusal::Version {
-                            offered: hello.version,
+                        refusal: Refusal::Version(VersionRefusal {
+                            offered: hello.oldest,
                             spoken,
-                        },
+                            offered_newest: hello.newest,
+                            spoken_oldest: Some(spoken),
+                        }),
                     });
                     let _ = connection.deliver(&refused);
                 }
@@ -1310,22 +1412,103 @@ mod tests {
     }
 
     /// A successor daemon does not take a deployment over when the host's Storage Server
-    /// speaks another protocol version than its build: the claims cross on that server's
+    /// speaks no protocol version of its build's window: the claims cross on that server's
     /// connections. A host with no server listening has none to speak to.
     #[test]
     fn a_successor_needs_the_storage_server_to_speak_its_protocol() {
-        let (_directory, socket) = storage_server_of_version(VERSION + 1);
+        let (_directory, socket) = storage_server_of_version(VERSIONS.oldest() - 1);
         let error = storage_server_speaks(&socket).unwrap_err();
         assert!(
             matches!(
                 error.downcast_ref::<storage::Error>(),
-                Some(storage::Error::Version { offered, spoken })
-                    if *offered == VERSION && *spoken == VERSION + 1
+                Some(storage::Error::Version(refusal))
+                    if refusal.offered == VERSIONS.oldest()
+                        && refusal.spoken == VERSIONS.oldest() - 1
             ),
             "{error:#}"
         );
 
         let absent = tempfile::tempdir().unwrap();
         storage_server_speaks(&absent.path().join("storage.sock")).unwrap();
+    }
+
+    /// The options a predecessor of the window `versions` sends, whose connections agreed on
+    /// `spoken` and whose claim on `storage`.
+    fn prepare(versions: service::Versions, spoken: &[u32], storage: Option<u32>) -> Prepare {
+        Prepare {
+            config: String::new(),
+            stated: Vec::new(),
+            api_key: None,
+            processes: String::new(),
+            instance: std::path::PathBuf::new(),
+            deployment: "model".to_owned(),
+            rebind: false,
+            versions,
+            spoken: spoken.to_vec(),
+            storage,
+            processing: proto::module::PackageRevision {
+                backend: "uniserve".to_owned(),
+                revision: 1,
+                arguments: Default::default(),
+            },
+        }
+    }
+
+    /// A successor of another build takes the deployment over when its windows hold every
+    /// version the predecessor's connections agreed on, and writes the handoff in the newest
+    /// version both daemons speak; it gives up, naming the version, when a connection's version
+    /// or the claim's lies outside its windows, or when the daemons' windows share none.
+    #[test]
+    fn a_successor_takes_over_the_versions_its_windows_hold() {
+        let engine = service::Versions::new(14, 15);
+        let storage = service::Versions::one(33);
+
+        let earlier = prepare(service::Versions::one(14), &[14], Some(33));
+        assert_eq!(takes_over(&earlier, engine, storage).unwrap(), 14);
+        let later = prepare(service::Versions::new(15, 16), &[15], Some(33));
+        assert_eq!(takes_over(&later, engine, storage).unwrap(), 15);
+
+        let error = takes_over(
+            &prepare(service::Versions::new(14, 16), &[14, 16], Some(33)),
+            engine,
+            storage,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("version 16"), "{error:#}");
+
+        let error = takes_over(
+            &prepare(service::Versions::one(14), &[14], Some(32)),
+            engine,
+            storage,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("version 32"), "{error:#}");
+
+        let error = takes_over(
+            &prepare(service::Versions::new(16, 17), &[16], None),
+            engine,
+            storage,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("share none"), "{error:#}");
+    }
+
+    /// The options a predecessor sends cross the handoff socket's encoding whole, with the
+    /// versions a successor checks.
+    #[test]
+    fn the_options_cross_the_handoff_with_their_versions() {
+        let sent = Message::Prepare(Box::new(prepare(
+            service::Versions::new(14, 15),
+            &[14],
+            Some(33),
+        )));
+        let encoded = service::Message::encode(&sent).unwrap();
+        let Message::Prepare(received) = <Message as service::Message>::decode(&encoded).unwrap()
+        else {
+            panic!("the options decode as another message");
+        };
+        assert_eq!(received.versions, service::Versions::new(14, 15));
+        assert_eq!(received.spoken, [14]);
+        assert_eq!(received.storage, Some(33));
     }
 }

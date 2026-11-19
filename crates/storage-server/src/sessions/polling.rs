@@ -960,6 +960,8 @@ impl Pools {
                 limits,
                 registers,
                 session: client,
+                // `admit` refused a layout of no common version, so this is the agreement.
+                version: open.agree(storage::runtime::VERSIONS).ok(),
             },
             descriptors,
         ))

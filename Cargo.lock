@@ -4902,6 +4902,7 @@ dependencies = [
  "scheduling",
  "serde",
  "serde_json",
+ "service",
  "wasmparser 0.261.0",
  "wasmtime",
 ]

@@ -11,9 +11,9 @@
 //! of the pool the image was taken of. The pool an image was taken of is
 //! not used afterwards, save that the enumeration goes on from both.
 //!
-//! An image is in the format of the build that wrote it ([`FORMAT`]), which
-//! a restart in place states beside it: a successor takes over an image of
-//! its own format alone.
+//! An image is in the newest format of the build that wrote it ([`FORMATS`]),
+//! which a restart in place states beside it: a successor takes over an image
+//! of a format it reads alone.
 
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -29,11 +29,13 @@ use super::{
     Block, BufferPool, Class, ClientId, Copy, Deferred, Entry, Group, Held, Owner, QueueId, Region,
 };
 
-/// The format of the images this build writes, whose completions not yet
-/// written are records of this build's runtime interface
-/// (`storage::runtime::VERSION`). A change of the image or of those records
-/// is a new format.
-pub(crate) const FORMAT: u32 = 10;
+/// The formats of the images this build reads, of which it writes the newest.
+/// A pool's completions not yet written are records of each session's agreed
+/// version of the runtime interface (`storage::runtime::VERSIONS`). A change
+/// of the image is a new format: one that adds a field with a default keeps the
+/// previous format readable, and the window then holds both until its oldest
+/// passes the previous one.
+pub(crate) const FORMATS: service::Versions = service::Versions::one(10);
 
 /// The image of a pool, over the regions `R` and the blocks `B`: borrowed
 /// from a pool to write it, owned to make a pool of it. Maps keyed by more

@@ -577,7 +577,7 @@ pub(crate) struct Engines {
     /// The reports the engines send up, by launch generation.
     reports: std::sync::mpsc::Sender<(u64, proto::process::Report)>,
     exits: std::sync::mpsc::Sender<proto::process::Exit>,
-    greetings: std::sync::mpsc::Sender<(u64, String)>,
+    greetings: std::sync::mpsc::Sender<crate::supervision::Greeting>,
     /// The engines the leader's service started for the daemon's engine control.
     controlled: std::sync::mpsc::Sender<crate::supervision::processes::Started>,
     /// The fake engines by launch generation.
@@ -660,7 +660,11 @@ impl Engines {
                 pid: testkit::process::pid(generation),
             });
         let engine = testkit::process::Engine::serving(generation);
-        let _ = self.greetings.send((generation, build.to_owned()));
+        let _ = self.greetings.send(crate::supervision::Greeting {
+            engine: generation,
+            build: build.to_owned(),
+            version: proto::ENGINE_INTERFACE.newest(),
+        });
         let _ = self.reports.send((generation, engine.started()));
         self.engines.insert(generation, engine);
     }
@@ -679,7 +683,11 @@ impl Engines {
             } else {
                 testkit::process::Engine::serving(spawn.generation)
             };
-            let _ = self.greetings.send((spawn.generation, build.to_owned()));
+            let _ = self.greetings.send(crate::supervision::Greeting {
+                engine: spawn.generation,
+                build: build.to_owned(),
+                version: proto::ENGINE_INTERFACE.newest(),
+            });
             let _ = self.reports.send((spawn.generation, engine.started()));
             self.engines.insert(spawn.generation, engine);
         }

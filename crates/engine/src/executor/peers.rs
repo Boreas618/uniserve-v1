@@ -1026,7 +1026,7 @@ mod tests {
     use crate::batch::{Batch, BatchId, BatchOutput, Capacity, Columns, Phase, Shape, Variant};
     use crate::executor::tests::host_batch;
     use storage::protocol::{Location, Segment, UnitRun};
-    use storage::runtime::{Region, RequestId, Tier, VERSION};
+    use storage::runtime::{Region, RequestId, Tier, VERSIONS};
 
     use testkit::LONG;
 
@@ -1206,7 +1206,8 @@ mod tests {
     #[test]
     fn a_relayed_session_is_answered_with_what_the_peer_s_ranks_hold() {
         let open = Open {
-            version: VERSION,
+            oldest: VERSIONS.oldest(),
+            newest: Some(VERSIONS.newest()),
             epoch: 3,
             trial: false,
             regions: vec![Region {
@@ -1239,6 +1240,7 @@ mod tests {
             limits: vec![65],
             registers: Vec::new(),
             session: 0,
+            version: None,
         };
         let created = vec![(
             "kv 0 ab".to_owned(),

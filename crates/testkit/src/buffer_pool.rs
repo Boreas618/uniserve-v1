@@ -165,6 +165,7 @@ impl InProcessPool {
                 limits,
                 registers,
                 session: client,
+                version: None,
             },
             ends,
         ))
@@ -515,7 +516,7 @@ mod tests {
     use engine::batch::{Batch, BatchId, Columns, Phase, Row, Rows, Shape, Variant};
     use engine::executor::Executor;
     use engine::scheduler::Message;
-    use storage::runtime::{Class, Group, OwnerId, Region, Tier, VERSION};
+    use storage::runtime::{Class, Group, OwnerId, Region, Tier, VERSIONS};
 
     use super::*;
 
@@ -554,7 +555,8 @@ mod tests {
             parts: Vec::new(),
         };
         Open {
-            version: VERSION,
+            oldest: VERSIONS.oldest(),
+            newest: Some(VERSIONS.newest()),
             epoch: 1,
             trial: false,
             regions: vec![

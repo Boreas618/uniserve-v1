@@ -485,7 +485,12 @@ fn installed_policy(temporary: &Path) -> (BuildServer, build_server::ServerConfi
     write(&built, &[("module.wasm", b"\0asm a policy")]);
     Store::open(config.store_roots.clone())
         .unwrap()
-        .publish(&path, &built, &["module.wasm".to_owned()], 1)
+        .publish(
+            &path,
+            &built,
+            &["module.wasm".to_owned()],
+            service::Versions::one(1),
+        )
         .unwrap();
     (server, config, path)
 }

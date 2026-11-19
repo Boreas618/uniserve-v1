@@ -239,6 +239,7 @@ impl Epochs {
                 row.epoch = adopted.epoch;
                 row.build = adopted.build;
                 row.state = adopted.state;
+                row.interface = adopted.interface;
             }
             None => processes.push(adopted),
         }
@@ -560,6 +561,7 @@ mod tests {
             build: "uniserve".to_owned(),
             generation: 4,
             state: proto::admin::ProcessState::Serving,
+            interface: None,
         }];
         assert_eq!(epochs.processes(), *service::lock(&table));
         service::lock(&table).clear();
@@ -579,6 +581,7 @@ mod tests {
             build: "uniserve".to_owned(),
             generation: 1,
             state: proto::admin::ProcessState::Serving,
+            interface: None,
         }]));
         let epochs = Epochs::new(std::sync::Arc::clone(&table));
 
@@ -590,6 +593,7 @@ mod tests {
             build: "engine".to_owned(),
             generation: 1,
             state: proto::admin::ProcessState::Serving,
+            interface: None,
         });
         let processes = epochs.processes();
         assert_eq!(processes.len(), 1, "{processes:?}");

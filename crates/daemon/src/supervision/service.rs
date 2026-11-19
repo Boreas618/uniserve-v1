@@ -370,6 +370,8 @@ pub(crate) struct Membership {
     pub(crate) host: String,
     /// The address the member declared in its join (`proto::process::Join::address`).
     pub(crate) address: String,
+    /// The version of the engine interface the member's connection agreed on at its join.
+    pub(crate) version: u32,
     pub(crate) connection: Connection,
     /// The requests forwarded to the member that it has not replied to, by asker and request id:
     /// a member that is lost replies to none of them, so the leader fails each with the node's
@@ -407,7 +409,8 @@ impl Joins {
 
     /// Accepts the connections waiting and replies to every hello that
     /// arrived: a member of a node rank other than the leader's and every
-    /// member's in `members` joins, any other hello is refused. Returns the
+    /// member's in `members` joins, in the newest version of the engine
+    /// interface both speak, and any other hello is refused. Returns the
     /// members that joined.
     ///
     /// # Errors
@@ -436,28 +439,37 @@ impl Joins {
                 Some(hello::Peer::Join(join)) => Some(join.clone()),
                 _ => None,
             };
-            let refusal =
-                refusal(&hello, |peer| matches!(peer, hello::Peer::Join(_))).or_else(|| {
-                    let member = member.as_ref()?;
-                    (member.node_rank == 0
-                        || members
-                            .iter()
-                            .chain(&joined)
-                            .any(|known| known.node_rank == member.node_rank))
-                    .then(|| Refusal::because(Reason::RankTaken(member.node_rank)))
-                });
+            let agreed = agreement(&hello, |peer| matches!(peer, hello::Peer::Join(_))).and_then(
+                |version| {
+                    let taken = member.as_ref().is_some_and(|member| {
+                        member.node_rank == 0
+                            || members
+                                .iter()
+                                .chain(&joined)
+                                .any(|known| known.node_rank == member.node_rank)
+                    });
+                    match &member {
+                        Some(member) if taken => {
+                            Err(Refusal::because(Reason::RankTaken(member.node_rank)))
+                        }
+                        _ => Ok(version),
+                    }
+                },
+            );
             let welcome = Welcome {
                 build: proto::BUILD.to_owned(),
-                refusal,
+                refusal: agreed.err(),
                 nodes: Vec::new(),
+                version: agreed.unwrap_or_default(),
             };
             let sent = connection.deliver(&welcome).is_ok();
-            if let (None, Some(member), true) = (refusal, member, sent) {
-                tracing::info!(node_rank = member.node_rank, host = %member.host, address = %member.address, "a node joined");
+            if let (Ok(version), Some(member), true) = (agreed, member, sent) {
+                tracing::info!(node_rank = member.node_rank, host = %member.host, address = %member.address, version, "a node joined");
                 joined.push(Membership {
                     node_rank: member.node_rank,
                     host: member.host,
                     address: member.address,
+                    version,
                     connection,
                     forwarded: Vec::new(),
                 });
@@ -504,13 +516,12 @@ impl Role {
         }
     }
 
-    /// The role the hello `hello` states, or why it is refused: another version of the engine
-    /// interface, a peer the process socket does not serve, a process link that states no engine
-    /// number, or a link of an engine that holds that link already (`links`).
-    fn of_hello(hello: &Hello, links: &Links) -> Result<Self, Refusal> {
-        if let Some(refusal) = refusal(hello, |peer| matches!(peer, hello::Peer::Engine(_))) {
-            return Err(refusal);
-        }
+    /// The role the hello `hello` states and the version of the engine interface it is served
+    /// in, or why it is refused: no version in common with this daemon, a peer the process socket
+    /// does not serve, a process link that states no engine number, or a link of an engine that
+    /// holds that link already (`links`).
+    fn of_hello(hello: &Hello, links: &Links) -> Result<(Self, u32), Refusal> {
+        let version = agreement(hello, |peer| matches!(peer, hello::Peer::Engine(_)))?;
         let (stated, interface) = match &hello.peer {
             Some(hello::Peer::Engine(engine)) => (
                 Some(engine.engine).filter(|number| *number != 0),
@@ -518,24 +529,27 @@ impl Role {
             ),
             _ => (None, Interface::Unspecified),
         };
-        match (interface, stated) {
+        let role = match (interface, stated) {
             // A link that receives commands must say which engine's commands it receives.
-            (Interface::Process, None) => Err(Refusal::because(Reason::Unnumbered(Unnumbered {}))),
+            (Interface::Process, None) => {
+                return Err(Refusal::because(Reason::Unnumbered(Unnumbered {})));
+            }
             // A process has one command link. A second one is a deployment fault, and the first
             // keeps the commands it is serving.
             (Interface::Process, Some(engine)) if links.process.contains_key(&engine) => {
-                Err(Refusal::because(Reason::Linked(engine)))
+                return Err(Refusal::because(Reason::Linked(engine)));
             }
-            (Interface::Process, Some(engine)) => Ok(Self::Process(engine)),
+            (Interface::Process, Some(engine)) => Self::Process(engine),
             // A process has one request link.
             (Interface::Requests, Some(engine)) if links.requests.contains_key(&engine) => {
-                Err(Refusal::because(Reason::Linked(engine)))
+                return Err(Refusal::because(Reason::Linked(engine)));
             }
-            (Interface::Requests, Some(engine)) => Ok(Self::Requests(engine)),
+            (Interface::Requests, Some(engine)) => Self::Requests(engine),
             // Everything else - a worker's client, the daemon's own client, a request link that
             // states no number - is served and never numbered.
-            _ => Ok(Self::Client),
-        }
+            _ => Self::Client,
+        };
+        Ok((role, version))
     }
 }
 
@@ -543,6 +557,9 @@ impl Role {
 struct Peer {
     connection: Connection,
     role: Role,
+    /// The version of the engine interface the connection agreed on at its hello; 0 while it
+    /// greets.
+    version: u32,
 }
 
 /// The connection each engine's links are on, by engine number.
@@ -630,6 +647,7 @@ fn publish(local: &Local, table: &ProcessTable) {
             // or failed is what the process itself reports, which the
             // updater records against this row.
             state: proto::admin::ProcessState::Serving,
+            interface: None,
         });
     }
 }
@@ -657,9 +675,10 @@ pub(crate) struct Updater {
     /// The updater's requests, each with where its reply goes: a request for this node gets its
     /// reply at once, one for another node when that node's daemon's reply arrives.
     pub(crate) requests: Receiver<(Request, Sender<Reply>)>,
-    /// Every engine whose process link greeted the leader, with the build its hello states: the
-    /// updater checks the build of every engine it starts.
-    pub(crate) greetings: Sender<(u64, String)>,
+    /// Every engine whose process link greeted the leader, with the build its hello states and
+    /// the version of the engine interface it agreed on: the updater checks the build of every
+    /// engine it starts and records the version in its process row.
+    pub(crate) greetings: Sender<Greeting>,
     /// Every supervised process that exited, for the updater's switch.
     pub(crate) exits: Sender<Exit>,
     /// Every engine a node started for another asker than the updater (the daemon's engine
@@ -670,7 +689,34 @@ pub(crate) struct Updater {
     pub(crate) wake: Sender<()>,
     /// The daemon's process table, which this service keeps current as processes start and end.
     pub(crate) processes: ProcessTable,
+    /// The versions the service's connections agreed on, which this service keeps current as
+    /// connections greet and close: a hot restart's successor must speak each to go on with
+    /// them.
+    pub(crate) spoken: SpokenTable,
 }
+
+/// The process link of an engine that greeted the leader: its engine number, the build its hello
+/// states and the version of the engine interface it agreed on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Greeting {
+    pub(crate) engine: u64,
+    pub(crate) build: String,
+    pub(crate) version: u32,
+}
+
+/// The versions a node's connections agreed on, which the service publishes every round: a hot
+/// restart's successor goes on with the connections it is handed only when it speaks each.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Spoken {
+    /// The engine interface's, on the connections of the process socket (the engines' links,
+    /// their workers' and the daemon's own clients) and the members' links.
+    pub(crate) engine: std::collections::BTreeSet<u32>,
+    /// The Storage Server protocol's, on the node's claim, once an engine claimed the node.
+    pub(crate) storage: Option<u32>,
+}
+
+/// The versions the leader's service last published ([`Spoken`]), which the daemon reads.
+pub(crate) type SpokenTable = std::sync::Arc<std::sync::Mutex<Spoken>>;
 
 /// Runs the leader's service until `stop`: engines connect on `listener`, `members` joined
 /// before, and other nodes may join at `joins`. Returns what it served when `stop` asks for a hot
@@ -752,6 +798,16 @@ pub(crate) fn run_leader(
         // loop turns on events, so a reader of the table sees the processes
         // that started and ended.
         publish(&service.local, &service.updater.processes);
+        *::service::lock(&service.updater.spoken) = Spoken {
+            engine: service
+                .peers
+                .values()
+                .map(|peer| peer.version)
+                .chain(service.members.iter().map(|member| member.version))
+                .filter(|version| *version != 0)
+                .collect(),
+            storage: service.local.claims.version(),
+        };
         if stop.handoff() {
             return service.hand_over().map(Some);
         }
@@ -773,6 +829,7 @@ impl LeaderService {
                 Peer {
                     connection,
                     role: Role::Greeting,
+                    version: 0,
                 },
             );
             self.next_connection += 1;
@@ -914,16 +971,17 @@ impl LeaderService {
     /// Answers connection `connection`'s hello: it takes the role the hello states, or is
     /// refused. Returns whether it stays.
     fn greet(&mut self, connection: u64, hello: &Hello) -> bool {
-        let role = Role::of_hello(hello, &self.links);
+        let agreed = Role::of_hello(hello, &self.links);
         let welcome = Welcome {
             build: proto::BUILD.to_owned(),
-            refusal: role.err(),
+            refusal: agreed.as_ref().err().cloned(),
             nodes: self.nodes.clone(),
+            version: agreed.as_ref().map_or(0, |(_, version)| *version),
         };
         let Some(peer) = self.peers.get_mut(&connection) else {
             return false;
         };
-        let Ok(role) = role else {
+        let Ok((role, version)) = agreed else {
             let _ = peer.connection.deliver(&welcome);
             return false;
         };
@@ -931,10 +989,15 @@ impl LeaderService {
             return false;
         }
         peer.role = role;
+        peer.version = version;
         self.links.insert(role, connection);
-        tracing::info!(connection, ?role, build = %hello.build, "a process connected");
+        tracing::info!(connection, ?role, build = %hello.build, version, "a process connected");
         if let Role::Process(engine) = role {
-            let _ = self.updater.greetings.send((engine, hello.build.clone()));
+            let _ = self.updater.greetings.send(Greeting {
+                engine,
+                build: hello.build.clone(),
+                version,
+            });
             let _ = self.updater.wake.send(());
         }
         true
@@ -1310,6 +1373,7 @@ struct PendingStop {
 pub(crate) fn serve_member(
     mut local: Local,
     mut leader: Connection,
+    version: u32,
     stop: &mut Stop,
 ) -> anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>> {
     loop {
@@ -1320,6 +1384,7 @@ pub(crate) fn serve_member(
             let handoff = ServiceHandoff::Member {
                 local,
                 leader: ConnectionHandoff::of(&leader),
+                version,
             };
             let mut ordered = vec![leader.descriptor];
             ordered.extend(descriptors);
@@ -1422,6 +1487,8 @@ pub(crate) enum ServiceHandoff {
     Member {
         /// The leader's connection, whose descriptor comes first.
         leader: ConnectionHandoff,
+        /// The version of the engine interface the leader's connection agreed on at the join.
+        version: u32,
         local: LocalHandoff,
     },
 }
@@ -1473,6 +1540,9 @@ impl ConnectionHandoff {
 pub(crate) struct PeerHandoff {
     id: u64,
     role: Role,
+    /// The version of the engine interface the connection agreed on, which the successor goes
+    /// on speaking on it.
+    version: u32,
     connection: ConnectionHandoff,
 }
 
@@ -1482,6 +1552,8 @@ pub(crate) struct MemberHandoff {
     node_rank: u32,
     host: String,
     address: String,
+    /// The version of the engine interface the member's join agreed on.
+    version: u32,
     connection: ConnectionHandoff,
 }
 
@@ -1531,6 +1603,7 @@ impl LeaderService {
             peer_handoffs.push(PeerHandoff {
                 id,
                 role: peer.role,
+                version: peer.version,
                 connection: ConnectionHandoff::of(&connection),
             });
             descriptors.push(connection.descriptor);
@@ -1542,6 +1615,7 @@ impl LeaderService {
                 node_rank: member.node_rank,
                 host: member.host,
                 address: member.address,
+                version: member.version,
                 connection: ConnectionHandoff::of(&connection),
             });
             descriptors.push(connection.descriptor);
@@ -1614,6 +1688,7 @@ pub(crate) fn resume(
                     Peer {
                         connection: handed.connection.resume(next()?)?,
                         role: handed.role,
+                        version: handed.version,
                     },
                 );
             }
@@ -1623,6 +1698,7 @@ pub(crate) fn resume(
                     node_rank: member.node_rank,
                     host: member.host,
                     address: member.address,
+                    version: member.version,
                     connection: member.connection.resume(next()?)?,
                     forwarded: Vec::new(),
                 });
@@ -1669,24 +1745,33 @@ pub(crate) fn resume(
                 stop,
             )
         }
-        ServiceHandoff::Member { leader, local } => {
+        ServiceHandoff::Member {
+            leader,
+            version,
+            local,
+        } => {
             let leader = leader.resume(next()?)?;
             let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();
             let local = Local::adopt(host, local, &mut rest, stop.waker.wake())?;
             tracing::info!("the service goes on from the previous daemon");
-            serve_member(local, leader, stop)
+            serve_member(local, leader, version, stop)
         }
     }
 }
 
-/// Why a hello is refused, when it is: another version of the engine
-/// interface than this daemon's ([`proto::ENGINE_INTERFACE_VERSION`]), or a
-/// peer of the wrong kind for the socket it reached.
-pub(crate) fn refusal(hello: &Hello, accepts: impl Fn(&hello::Peer) -> bool) -> Option<Refusal> {
-    Refusal::of_version(hello.major).or_else(|| match &hello.peer {
-        Some(peer) if accepts(peer) => None,
-        _ => Some(Refusal::because(Reason::Unserved(Unserved {}))),
-    })
+/// The version of the engine interface this daemon serves the hello `hello` in, the newest both
+/// windows hold ([`proto::ENGINE_INTERFACE`]), or why it is refused: the windows share no
+/// version, or the peer is of the wrong kind for the socket it reached.
+pub(crate) fn agreement(
+    hello: &Hello,
+    accepts: impl Fn(&hello::Peer) -> bool,
+) -> Result<u32, Refusal> {
+    let version = proto::agree(hello.oldest, hello.newest, proto::ENGINE_INTERFACE)
+        .map_err(Refusal::of_versions)?;
+    match &hello.peer {
+        Some(peer) if accepts(peer) => Ok(version),
+        _ => Err(Refusal::because(Reason::Unserved(Unserved {}))),
+    }
 }
 
 fn failed(request: &Request, error: String) -> Reply {

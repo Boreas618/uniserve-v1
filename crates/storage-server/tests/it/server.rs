@@ -1130,20 +1130,22 @@ fn a_running_server_takes_the_settings_it_reads_when_it_acts() {
     assert_eq!(operator.status().unwrap().settings.server, lowered);
 }
 
-/// A server serves a client of its own protocol version alone: such a client
-/// is welcomed and served, and a client of any other version is refused at its
-/// hello with the typed refusal naming both versions.
+/// A server serves a client in the newest protocol version both windows hold: a client of the
+/// server's window, or of a later one that holds its newest, is welcomed and served, and a client
+/// whose window shares no version is refused at its hello with the typed refusal naming both
+/// windows.
 #[test]
-fn a_server_serves_its_own_protocol_version_alone() {
-    use ::storage::protocol::{Refusal, Request, Response, VERSION};
+fn a_server_serves_the_newest_protocol_version_both_speak() {
+    use ::storage::protocol::{Refusal, Request, Response, VERSIONS, VersionRefusal};
 
     let server = Running::start();
     let timeout = crate::PATIENCE;
-    let connect = |version: u32| {
+    let connect = |oldest: u32, newest: u32| {
         let stream = std::os::unix::net::UnixStream::connect(&server.socket).unwrap();
         let mut connection = service::Connection::new(stream).unwrap();
         let hello = Hello {
-            version,
+            oldest,
+            newest: Some(newest),
             role: Role::Operator,
         };
         connection.send(&ClientMessage::Hello(hello)).unwrap();
@@ -1151,8 +1153,23 @@ fn a_server_serves_its_own_protocol_version_alone() {
         (connection, welcome)
     };
 
-    let (mut connection, welcome) = connect(VERSION);
+    let newest = VERSIONS.newest();
+    let (_, welcome) = connect(newest, newest + 1);
     assert_eq!(welcome, ServerMessage::Welcome(Welcome::Accepted));
+    let (_, welcome) = connect(VERSIONS.oldest() - 1, newest + 1);
+    assert_eq!(
+        welcome,
+        ServerMessage::Welcome(Welcome::Agreed { version: newest })
+    );
+
+    let (mut connection, welcome) = connect(VERSIONS.oldest(), newest);
+    assert_eq!(
+        welcome,
+        ServerMessage::Welcome(Welcome::of_version(
+            &Hello::new(VERSIONS, Role::Operator),
+            newest
+        ))
+    );
     let listed = ClientMessage::Request {
         id: 7,
         request: Request::List,
@@ -1170,15 +1187,17 @@ fn a_server_serves_its_own_protocol_version_alone() {
         "{response:?}"
     );
 
-    for offered in [VERSION - 1, VERSION + 1] {
-        let (_, welcome) = connect(offered);
+    for offered in [VERSIONS.oldest() - 1, newest + 1] {
+        let (_, welcome) = connect(offered, offered);
         assert_eq!(
             welcome,
             ServerMessage::Welcome(Welcome::Refused {
-                refusal: Refusal::Version {
+                refusal: Refusal::Version(VersionRefusal {
                     offered,
-                    spoken: VERSION,
-                },
+                    spoken: newest,
+                    offered_newest: Some(offered),
+                    spoken_oldest: Some(VERSIONS.oldest()),
+                }),
             }),
             "a client of protocol {offered}"
         );

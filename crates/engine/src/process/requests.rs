@@ -681,6 +681,7 @@ mod tests {
         let mut main = MainProcess::new(
             Connection::new(front).unwrap(),
             std::num::NonZeroU32::new(WINDOW).unwrap(),
+            proto::Agreed(proto::ENGINE_INTERFACE.newest()),
             Connection::new(process).unwrap(),
             launch.clone(),
         )

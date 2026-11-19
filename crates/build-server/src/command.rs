@@ -540,7 +540,8 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
                                 target: module.target.to_string(),
                                 descriptor: &module.descriptor,
                                 form: module.form,
-                                interface_version: module.interface_version,
+                                interface_version: module.interface.newest(),
+                                interface_oldest: module.interface.oldest(),
                             })
                             .collect(),
                     })
@@ -862,13 +863,15 @@ pub struct ListedPackage<'a> {
 }
 
 /// One module of a [`ListedPackage`]: the target it was built for, its descriptor key, its form
-/// and the interface version it was built for.
+/// and the interface versions it was built for, from its oldest to its newest (equal for a
+/// package of one version).
 #[derive(Serialize)]
 pub struct ListedModule<'a> {
     pub target: String,
     pub descriptor: &'a str,
     pub form: ModuleForm,
     pub interface_version: u32,
+    pub interface_oldest: u32,
 }
 
 /// What `resolve --json` prints: the module's form, the path of each of its files in the store,

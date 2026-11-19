@@ -21,6 +21,8 @@ pub(crate) mod gpus;
 
 pub(crate) mod processes;
 mod service;
+
+pub(crate) use service::{Greeting, Spoken};
 mod supervisor;
 
 pub(crate) use service::{ServiceHandoff, readable};
@@ -184,6 +186,9 @@ pub struct Daemon {
     /// The processes this node supervises, which the service keeps current:
     /// the updater and the deployment's status rows read them.
     table: Option<service::ProcessTable>,
+    /// The versions the leader's connections agreed on, which the service keeps current; `None`
+    /// on a member.
+    spoken: Option<service::SpokenTable>,
     /// One token per thing the updater has to read, so the thread that
     /// advances the update waits instead of polling.
     awake: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
@@ -205,6 +210,7 @@ struct LeaderEnds {
     link: processes::ProcessLink,
     awake: std::sync::mpsc::Receiver<()>,
     table: service::ProcessTable,
+    spoken: service::SpokenTable,
 }
 
 impl LeaderEnds {
@@ -214,6 +220,7 @@ impl LeaderEnds {
         let (reports, reports_rx) = std::sync::mpsc::channel();
         let (requests, requests_rx) = std::sync::mpsc::channel();
         let (greetings, greetings_rx) = std::sync::mpsc::channel();
+        let spoken: service::SpokenTable = Default::default();
         let (exits, exits_rx) = std::sync::mpsc::channel();
         let (started, started_rx) = std::sync::mpsc::channel();
         let (activity, awake) = std::sync::mpsc::channel();
@@ -228,6 +235,7 @@ impl LeaderEnds {
                 started,
                 wake: activity,
                 processes: Arc::clone(&table),
+                spoken: Arc::clone(&spoken),
             },
             link: processes::ProcessLink {
                 requests: ToService::new(requests, wake.clone()),
@@ -241,6 +249,7 @@ impl LeaderEnds {
             },
             awake,
             table,
+            spoken,
         }
     }
 }
@@ -332,6 +341,7 @@ impl Daemon {
                 link,
                 awake,
                 table,
+                spoken,
             } = LeaderEnds::new(&wake);
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
@@ -341,14 +351,14 @@ impl Daemon {
                     )
                 })
                 .context("starting the daemon's service")?;
-            (Some(address), thread, Some((link, awake, table)))
+            (Some(address), thread, Some((link, awake, table, spoken)))
         } else {
-            let leader = join_leader(&options)?;
+            let (leader, version) = join_leader(&options)?;
             let address = leader.local_addr().map(|address| address.ip());
             let local = local(&options, address, true, wake.clone())?;
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
-                .spawn(move || service::serve_member(local, leader, &mut stop))
+                .spawn(move || service::serve_member(local, leader, version, &mut stop))
                 .context("starting the daemon's service")?;
             (None, thread, None)
         };
@@ -369,14 +379,18 @@ impl Daemon {
             processes::ProcessLink,
             std::sync::mpsc::Receiver<()>,
             service::ProcessTable,
+            service::SpokenTable,
         )>,
     ) -> Self {
-        let (link, awake, table) = match ends {
-            Some((link, awake, table)) => (Some(link), Some(awake), Some(table)),
-            None => (None, None, None),
+        let (link, awake, table, spoken) = match ends {
+            Some((link, awake, table, spoken)) => {
+                (Some(link), Some(awake), Some(table), Some(spoken))
+            }
+            None => (None, None, None, None),
         };
         Self {
             table,
+            spoken,
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(awake),
             address,
@@ -415,6 +429,7 @@ impl Daemon {
             link,
             awake,
             table,
+            spoken,
         } = LeaderEnds::new(&wake);
         let thread = std::thread::Builder::new()
             .name("daemon".into())
@@ -426,7 +441,7 @@ impl Daemon {
             handoff,
             wake,
             thread,
-            leader.then_some((link, awake, table)),
+            leader.then_some((link, awake, table, spoken)),
         ))
     }
 
@@ -449,6 +464,16 @@ impl Daemon {
             .join()
             .map_err(|_| anyhow::anyhow!("the daemon's service panicked"))??
             .context("the daemon's service stopped before it handed over")
+    }
+
+    /// The versions the connections of the leader's service agreed on, as the service last
+    /// published them (every round): the engine interface's on its engines' links, its members'
+    /// and its clients', and the Storage Server protocol's on its claim. None on a member.
+    pub(crate) fn spoken(&self) -> Spoken {
+        self.spoken
+            .as_ref()
+            .map(|spoken| ::service::lock(spoken).clone())
+            .unwrap_or_default()
     }
 
     /// The updater's ends of this node's service: `None` on a member daemon,
@@ -672,9 +697,10 @@ fn leader_address(options: &DaemonOptions) -> anyhow::Result<Option<IpAddr>> {
 }
 
 /// A member's join: connects to the leader at the join endpoint the leader reported bound
-/// (`dist_init_addr`, from the leader's readiness record), states this node and the address its
-/// connection reaches the leader from, and reads the leader's welcome.
-fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
+/// (`dist_init_addr`, from the leader's readiness record), states this node, the address its
+/// connection reaches the leader from and the versions of the engine interface it speaks, and
+/// reads the leader's welcome. Returns the connection and the version the leader agreed on.
+fn join_leader(options: &DaemonOptions) -> anyhow::Result<(Connection, u32)> {
     let address = options
         .dist_init_addr
         .as_ref()
@@ -689,7 +715,8 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
         .context("a member reaches the leader over TCP")?
         .ip();
     connection.deliver(&Hello {
-        major: proto::ENGINE_INTERFACE_VERSION,
+        oldest: proto::ENGINE_INTERFACE.oldest(),
+        newest: proto::ENGINE_INTERFACE.newest(),
         build: proto::BUILD.to_owned(),
         peer: Some(hello::Peer::Join(Join {
             node_rank: options.node_rank,
@@ -703,8 +730,10 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
     if let Some(refusal) = welcome.refusal {
         return Err(anyhow::Error::new(refusal).context("the leader refused this node"));
     }
-    tracing::info!(leader = %address, node_rank = options.node_rank, "joined the leader");
-    Ok(connection)
+    let version =
+        proto::agreed(proto::ENGINE_INTERFACE, welcome.version).map_err(anyhow::Error::msg)?;
+    tracing::info!(leader = %address, node_rank = options.node_rank, version, "joined the leader");
+    Ok((connection, version))
 }
 
 #[cfg(test)]
@@ -770,7 +799,8 @@ mod tests {
         let mut client = Connection::connect(&address.parse().unwrap()).unwrap();
         client
             .deliver(&Hello {
-                major: proto::ENGINE_INTERFACE_VERSION,
+                oldest: proto::ENGINE_INTERFACE.oldest(),
+                newest: proto::ENGINE_INTERFACE.newest(),
                 build: proto::BUILD.to_owned(),
                 // A client of the socket: no engine number, no interface.
                 peer: Some(hello::Peer::Engine(Engine {
@@ -782,6 +812,7 @@ mod tests {
             .unwrap();
         let welcome: Welcome = client.recv_next().unwrap();
         assert_eq!(welcome.refusal, None);
+        assert_eq!(welcome.version, proto::ENGINE_INTERFACE.newest());
         let reserved = ask(
             &mut client,
             1,
