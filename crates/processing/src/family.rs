@@ -51,11 +51,12 @@ impl Eq for Family {}
 /// program serves (`crate::program::Release`), which the leader daemon loads without linking a
 /// model. The engine executable registers the numerical side of the same families, each of which
 /// holds its value of this list.
-pub const FAMILIES: [Family; 4] = [
+pub const FAMILIES: [Family; 5] = [
     crate::qwen::QWEN3,
     crate::qwen::QWEN3_5_MOE,
     crate::qwen::QWEN4_EXP,
     crate::minimax_h3::FAMILY,
+    crate::deepseek_v41::FAMILY,
 ];
 
 /// Two families claim one class: a checkpoint of it would resolve to either.

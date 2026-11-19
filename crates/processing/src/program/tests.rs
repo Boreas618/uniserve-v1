@@ -106,7 +106,16 @@ fn chat_facts(bound: Bound) -> ChatFacts {
 fn every_family_is_declared_with_its_claims_and_files() {
     let declared = Release::families();
     let ids: Vec<&str> = declared.iter().map(|family| family.id.as_str()).collect();
-    assert_eq!(ids, ["qwen3", "qwen3_5_moe", "qwen4_exp", "minimax_h3"]);
+    assert_eq!(
+        ids,
+        [
+            "qwen3",
+            "qwen3_5_moe",
+            "qwen4_exp",
+            "minimax_h3",
+            "deepseek_v41"
+        ]
+    );
 
     let names = |family: &interface::Family| match &family.serving {
         interface::Serving::Chat { files } => files
@@ -140,9 +149,176 @@ fn every_family_is_declared_with_its_claims_and_files() {
     assert!(pipeline.base_pin.is_some());
     assert!(pipeline.processing_parts.contains(&"tokenizer".to_owned()));
 
+    // DeepSeek-V4.1 encodes its prompts itself: its binding reads no template file.
+    assert_eq!(names(&declared[4]), names(&declared[0]));
+
     let config = r#"{"architectures": ["Qwen3_5MoeForConditionalGeneration"]}"#;
     let resolved = interface::resolve(&declared, [(RootFile::Config, config)]).unwrap();
     assert_eq!(resolved.id, "qwen3_5_moe");
+    let config = r#"{"architectures": ["DeepseekV41ForCausalLM"]}"#;
+    let resolved = interface::resolve(&declared, [(RootFile::Config, config)]).unwrap();
+    assert_eq!(resolved.id, "deepseek_v41");
+}
+
+/// The files of a DeepSeek-V4.1 checkpoint, as it publishes them: its language model a section of
+/// its configuration, its tokenizer configuration's tokens `AddedToken` objects, and no chat
+/// template or generation defaults.
+fn deepseek_v41_files() -> BTreeMap<String, String> {
+    let token = |content: &str| {
+        json!({"__type": "AddedToken", "content": content, "lstrip": false,
+            "normalized": true, "rstrip": false, "single_word": false})
+    };
+    BTreeMap::from([
+        (
+            "config.json".to_owned(),
+            json!({"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41",
+                "text_config": {"max_position_embeddings": 1048576}})
+            .to_string(),
+        ),
+        (
+            "tokenizer_config.json".to_owned(),
+            json!({"add_bos_token": false, "bos_token": token("<｜begin▁of▁sentence｜>"),
+                "eos_token": token("<｜end▁of▁sentence｜>"),
+                "tokenizer_class": "PreTrainedTokenizerFast"})
+            .to_string(),
+        ),
+    ])
+}
+
+/// The id of DeepSeek-V4.1's `<｜end▁of▁sentence｜>` in [`deepseek_v41_vocabulary`].
+const SENTENCE_END: u32 = 7;
+
+/// [`Characters::chat`] with DeepSeek-V4.1's end of sentence.
+fn deepseek_v41_vocabulary() -> Characters {
+    let mut vocabulary = Characters::chat();
+    vocabulary
+        .controls
+        .push(("<｜end▁of▁sentence｜>", SENTENCE_END));
+    vocabulary
+}
+
+/// The DeepSeek-V4.1 instance `bind` binds, and its facts.
+fn deepseek_v41(bind: Bind) -> (Release, Bound) {
+    Release::bind_with(bind, &deepseek_v41_vocabulary()).unwrap()
+}
+
+/// A DeepSeek-V4.1 checkpoint binds to the facts its files state and encodes requests with the
+/// family's encoder, in thinking mode unless the deployment's or the request's template
+/// arguments choose chat mode; a deployment's template replaces the encoder, and image parts
+/// are refused.
+#[test]
+fn a_deepseek_v41_checkpoint_encodes_its_requests() {
+    let (mut program, facts) = deepseek_v41(binding("deepseek_v41", deepseek_v41_files()));
+    let facts = chat_facts(facts);
+    assert_eq!(facts.max_model_len, 1_048_576);
+    assert_eq!(facts.primary_eos, Some(SENTENCE_END));
+    assert_eq!(facts.eos, [SENTENCE_END]);
+    assert!(facts.tools && facts.reasoning && !facts.images);
+
+    let prompt = program
+        .render(chat::request(vec![chat::user("hello")]))
+        .unwrap();
+    assert_eq!(
+        prompt.segments,
+        [Segment::Text(
+            "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the \
+             value, the more thorough the reasoning)\n\n<｜User｜>hello<｜Assistant｜><think>"
+                .to_owned()
+        )]
+    );
+
+    let chat_mode = Bind {
+        chat: ChatOptions {
+            template_kwargs: Map::from_iter([("thinking".to_owned(), false.into())]),
+            reasoning: true,
+            ..ChatOptions::default()
+        },
+        ..binding("deepseek_v41", deepseek_v41_files())
+    };
+    let (mut program, _) = deepseek_v41(chat_mode);
+    let request = chat::request(vec![chat::user("hello")]);
+    let prompt = program.render(request.clone()).unwrap();
+    let chat_prompt = "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>";
+    assert_eq!(prompt.segments, [Segment::Text(chat_prompt.to_owned())]);
+    let thinking = Render {
+        reasoning_effort: Some("max".to_owned()),
+        ..request
+    };
+    let prompt = program.render(thinking).unwrap();
+    let Segment::Text(text) = &prompt.segments[0] else {
+        panic!("a text prompt");
+    };
+    assert!(
+        text.contains("Reasoning Effort: 100") && text.ends_with("<think>"),
+        "{text}"
+    );
+
+    let templated = Bind {
+        chat: ChatOptions {
+            template: Some("{{ messages[0].content }}!".to_owned()),
+            ..ChatOptions::default()
+        },
+        ..binding("deepseek_v41", deepseek_v41_files())
+    };
+    let (mut program, _) = deepseek_v41(templated);
+    let prompt = program
+        .render(chat::request(vec![chat::user("hello")]))
+        .unwrap();
+    assert_eq!(prompt.segments, [Segment::Text("hello!".to_owned())]);
+
+    let (mut program, _) = deepseek_v41(binding("deepseek_v41", deepseek_v41_files()));
+    let refusal = program
+        .render(chat::request(vec![chat::user_parts(vec![
+            chat::image_part("https://example.com/a.png"),
+        ])]))
+        .unwrap_err();
+    assert!(refusal.message.contains("image_url"), "{refusal}");
+}
+
+/// A DeepSeek-V4.1 response parses into its reasoning, its text and its DSML calls, and a
+/// parser restored in another instance from the bytes one saved inside a call goes on where it
+/// stood.
+#[test]
+fn a_deepseek_v41_response_parses_and_hands_off() {
+    let deltas = [
+        "look</think>On it.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n",
+        "<｜DSML｜ parameter name=\"q\" string=\"true\">rust tr",
+        "aits</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">3",
+        "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    ];
+    let expected = [
+        Event::Reasoning("look".to_owned()),
+        Event::Content("On it.".to_owned()),
+        Event::ToolCall {
+            name: "lookup".to_owned(),
+        },
+        Event::Arguments(r#"{"q": "rust traits", "limit": 3}"#.to_owned()),
+    ];
+    let (mut program, _) = deepseek_v41(binding("deepseek_v41", deepseek_v41_files()));
+    assert_eq!(parse(&mut program, Some(Vec::new()), &deltas), expected);
+
+    for cut in 1..deltas.len() {
+        let (mut first, _) = deepseek_v41(binding("deepseek_v41", deepseek_v41_files()));
+        first
+            .open(Open {
+                tools: Some(Vec::new()),
+                prompt: vec![THINK],
+            })
+            .unwrap();
+        let mut events = Vec::new();
+        for delta in &deltas[..cut] {
+            events.extend(first.push(delta).unwrap());
+        }
+        let state = first.save();
+
+        let (mut second, _) = deepseek_v41(binding("deepseek_v41", deepseek_v41_files()));
+        second.restore(&state).unwrap();
+        for delta in &deltas[cut..] {
+            events.extend(second.push(delta).unwrap());
+        }
+        events.extend(second.finish().unwrap());
+        assert_eq!(merged(events), expected, "cut after delta {cut}");
+    }
 }
 
 /// A Qwen3 checkpoint binds to the facts its files state: its context bound, the EOS ids of its

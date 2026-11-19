@@ -3,23 +3,29 @@
 //! The output's tool stage (`output::tool`) feeds visible assistant text chunk by chunk to the
 //! [`ToolParser`] of the format the request's model family declares
 //! ([`ToolCallFormat`]), which [`parser`] builds: [`JsonToolParser`] for one JSON
-//! object per call, [`XmlToolParser`] for function and parameter tags. A parser is named for its
-//! format, never for a model, and reads the format's region delimiters from its declaration
-//! (`ToolCallFormat::delimiters`). It turns each chunk into an ordered sequence of plain text and
-//! [`ToolCallDelta`] updates, holding back the bytes it cannot classify yet, such as a partial
-//! delimiter or a parameter whose value has not ended.
+//! object per call, [`XmlToolParser`] for function and parameter tags, [`DsmlToolParser`] for
+//! DeepSeek's DSML markup. A parser is named for its format, never for a model, and reads the
+//! format's region delimiters from its declaration (`ToolCallFormat::delimiters`). It turns each
+//! chunk into an ordered sequence of plain text and [`ToolCallDelta`] updates, holding back the
+//! bytes it cannot classify yet, such as a partial delimiter or a parameter whose value has not
+//! ended.
 //!
-//! A parser is strict: text inside a call that breaks the format's grammar, and a call the text
-//! leaves open, fail with [`Error::ToolCall`], which fails the request's response. A parser
-//! repairs nothing and guesses nothing. What it holds is bounded by the text the model wrote,
-//! which the request's token budget bounds.
+//! The JSON and tag parsers are strict: text inside a call that breaks the format's grammar, and
+//! a call the text leaves open, fail with [`Error::ToolCall`], which fails the request's response.
+//! They repair nothing and guess nothing. The DSML parser is lenient, as vLLM's DeepSeek parsers
+//! are: its format types each value in its tags and ends the turn with its block, so it reads a
+//! cut or stray text as far as the tags reach and never fails the response (its module states
+//! the rules). What a parser holds is bounded by the text the model wrote, which the request's
+//! token budget bounds.
 
+mod dsml;
 mod json;
 mod xml;
 
 use scheduling::processing::Tool;
 use serde::{Deserialize, Serialize};
 
+pub use dsml::DsmlToolParser;
 pub use json::JsonToolParser;
 pub use xml::XmlToolParser;
 
@@ -34,6 +40,8 @@ pub enum State {
     Json(json::State),
     /// The tag format's parser.
     Xml(xml::State),
+    /// The DSML format's parser.
+    Dsml(dsml::State),
 }
 
 /// Incremental extraction of tool calls from one assistant turn's visible text.
@@ -83,6 +91,8 @@ pub fn parser(format: ToolCallFormat, tools: &[Tool]) -> Result<Box<dyn ToolPars
                 message: error.to_string(),
             })?)
         }
+        // The DSML format types each value in its tags, so its parser needs no schema.
+        ToolCallFormat::Dsml => Box::new(DsmlToolParser::new()),
     })
 }
 
