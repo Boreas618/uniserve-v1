@@ -1,0 +1,37 @@
+# The embedding_mxfp8 operator's Triton backend: design 5.2's package.
+#
+# One program dequantizes the MXFP8 rows of a block of ids from this shard of
+# the table (E4M3 values, a UE8M0 scale per group of 32), or writes zeros for
+# an id another shard holds; the id count and the shard's rows are launch
+# values. The key is the one `Mxfp8Descriptor`'s `Display` prints, e.g.
+# `dtype_bf16_ids_i64_hidden_256_group_32_block_16`.
+
+op = "embedding_mxfp8"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+[launch]
+kernel = "_embedding_mxfp8_kernel"
+warps = 4
+derive = "derive"
+
+[launch.types]
+ids_ptr = { pointer = "ids" }
+values_ptr = "*fp8e4nv"
+scales_ptr = "*u8"
+out_ptr = { pointer = "dtype" }
+count = "i64"
+first = "i64"
+rows = "i64"
+
+[launch.constants]
+HIDDEN = { field = "hidden" }
+GROUP = { field = "group" }
+TILE = { field = "tile" }
+BLOCK = { field = "block" }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], ids = ["i64", "i32", "u32"], hidden = { min = 1 }, group = { power_of_two = true }, block = { power_of_two = true } }

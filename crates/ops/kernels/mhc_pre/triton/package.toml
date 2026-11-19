@@ -1,0 +1,33 @@
+# The mhc_pre operator's Triton backend: design 5.2's package.
+#
+# One program reads one token's streams into one row under its pre-mix,
+# rounds the collapse into the streams' type and RMS-normalizes it with the
+# gain. The key is the one `PreDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_streams_4_hidden_5120_tile_8192`.
+
+op = "mhc_pre"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+[launch]
+kernel = "_mhc_pre_kernel"
+options = { enable_fp_fusion = false }
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+
+[launch.types]
+streams_ptr = { pointer = "dtype" }
+pre_ptr = "*fp32"
+norm_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+eps = "fp32"
+
+[launch.constants]
+STREAMS = { field = "streams" }
+HIDDEN = { field = "hidden" }
+TILE = { field = "tile" }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], streams = { power_of_two = true, max = 8 }, hidden = { min = 1 }, tile = { power_of_two = true } }

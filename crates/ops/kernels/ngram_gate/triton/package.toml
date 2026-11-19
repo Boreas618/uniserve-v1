@@ -1,0 +1,36 @@
+# The ngram_gate operator's Triton backend: design 5.2's package.
+#
+# One program gates one stream of one token: the agreement of the stream with
+# its key, both RMS-scaled, through a signed square root and a sigmoid, adds
+# the value into the stream. The key is the one `GateDescriptor`'s `Display`
+# prints, e.g. `dtype_bf16_streams_4_hidden_5120_tile_8192`.
+
+op = "ngram_gate"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+[launch]
+kernel = "_ngram_gate_kernel"
+options = { enable_fp_fusion = false }
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+
+[launch.types]
+streams_ptr = { pointer = "dtype" }
+projected_ptr = { pointer = "dtype" }
+query_ptr = { pointer = "dtype" }
+key_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+projected_stride = "i64"
+eps = "fp32"
+scale = "fp32"
+
+[launch.constants]
+STREAMS = { field = "streams" }
+HIDDEN = { field = "hidden" }
+TILE = { field = "tile" }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], streams = { min = 1 }, hidden = { min = 1 }, tile = { power_of_two = true } }

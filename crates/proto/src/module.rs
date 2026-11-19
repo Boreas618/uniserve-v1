@@ -232,6 +232,7 @@ pub mod operator {
     pub const VSA_SCORES: &str = "vsa_scores";
     pub const CONV: &str = "conv";
     pub const EMBEDDING: &str = "embedding";
+    pub const EMBEDDING_MXFP8: &str = "embedding_mxfp8";
     pub const FRAME_PAD: &str = "frame_pad";
     pub const FRAME_MOMENTS: &str = "frame_moments";
     pub const FRAME_NORM_PAD: &str = "frame_norm_pad";
@@ -246,6 +247,11 @@ pub mod operator {
     pub const RMS_NORM: &str = "rms_norm";
     pub const ADD_RMS_NORM: &str = "add_rms_norm";
     pub const SIGMOID_GATED_ADD: &str = "sigmoid_gated_add";
+    pub const MHC_BOUNDARY: &str = "mhc_boundary";
+    pub const MHC_POST: &str = "mhc_post";
+    pub const MHC_PRE: &str = "mhc_pre";
+    pub const NGRAM_HASH: &str = "ngram_hash";
+    pub const NGRAM_GATE: &str = "ngram_gate";
     pub const GATED_DELTA_RULE: &str = "gated_delta_rule";
     pub const CAUSAL_CONV1D: &str = "causal_conv1d";
     pub const GATED_RMS_NORM: &str = "gated_rms_norm";
@@ -331,6 +337,7 @@ pub mod operator {
         VSA_SCORES,
         CONV,
         EMBEDDING,
+        EMBEDDING_MXFP8,
         FRAME_PAD,
         FRAME_MOMENTS,
         FRAME_NORM_PAD,
@@ -345,6 +352,11 @@ pub mod operator {
         RMS_NORM,
         ADD_RMS_NORM,
         SIGMOID_GATED_ADD,
+        MHC_BOUNDARY,
+        MHC_POST,
+        MHC_PRE,
+        NGRAM_HASH,
+        NGRAM_GATE,
         GATED_DELTA_RULE,
         CAUSAL_CONV1D,
         GATED_RMS_NORM,
