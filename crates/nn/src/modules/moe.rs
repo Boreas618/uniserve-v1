@@ -119,6 +119,10 @@ pub struct MoEConfig {
     pub limit: Option<f32>,
     /// The router's module name.
     pub router: &'static str,
+    /// The element type the router's product reads its weight and the rows in and states its
+    /// logits in: the activations' when `None`, or a wider one (F32) for a model whose reference
+    /// routes in it, so near ties select as the reference's do.
+    pub router_dtype: Option<DType>,
     /// The name of the module list that holds the experts: expert `e`'s projections are
     /// `<list>.<e>.<up|gate|down>`.
     pub list: &'static str,
@@ -310,9 +314,12 @@ impl MoE {
         let window = &config.order[local.start as usize..local.end as usize];
         let intermediate = config.intermediate / split.size();
 
+        let router_vb = match config.router_dtype {
+            Some(dtype) => vb.pp(config.router).to_dtype(dtype),
+            None => vb.pp(config.router),
+        };
         let router = Linear::new(
-            vb.pp(config.router)
-                .get((experts as usize, config.hidden as usize), "weight")?,
+            router_vb.get((experts as usize, config.hidden as usize), "weight")?,
             None,
             WeightOrder::NxK,
         )?;
@@ -812,8 +819,13 @@ impl MoE {
             bias: self.selection_bias.as_ref(),
             scale: self.routed_scale.as_ref(),
         };
+        // A router held in a wider type than the rows reads them widened.
+        let rows = match self.router.weight().dtype() {
+            dtype if dtype != x.dtype() => x.to_dtype(dtype)?,
+            _ => x.clone(),
+        };
         functional::topk_softmax(
-            &self.router.forward(x)?,
+            &self.router.forward(&rows)?,
             &routing,
             Some(&self.map),
             live_tokens,
