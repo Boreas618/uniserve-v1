@@ -17,7 +17,9 @@
 //! | multi-token-prediction layers | [`Config::mtp_num_hidden_layers`] | Qwen3.5 |
 //!
 //! [`Config::open`] also reads what the checkpoint's other sidecars state of the same modules:
-//! the quantization its export declares and the processor rules its images are sized by.
+//! the quantization its export declares and the processor rules its images are sized by; and
+//! what its tensors alone state, the layout of its drafter's routed experts
+//! ([`Config::mtp_experts`]).
 //!
 //! Every rotary spectrum is computed in FP32, as the references compute `inv_freq`
 //! (`torch.arange(..., dtype=torch.float)` in vLLM's and transformers' rotary embeddings).
@@ -164,6 +166,13 @@ pub struct Config {
     /// The multi-token-prediction layers the checkpoint carries (Qwen3.5's `mtp.*`), zero for
     /// none. They embed with the model's own table.
     pub mtp_num_hidden_layers: u32,
+    /// How the checkpoint stores the routed experts of its multi-token-prediction layers, for
+    /// a model with routed experts: the class's layout ([`MoeConfig::layout`]) as `config.json`
+    /// states it, and what the checkpoint's tensors hold once [`Config::open`] read them. A
+    /// Qwen3.5-MoE checkpoint stores its model's experts fused and its drafter's either fused
+    /// (Qwen3.6-35B-A3B) or one module per expert (Qwen3.5-35B-A3B), which only its tensors
+    /// state.
+    pub mtp_experts: Option<ExpertLayout>,
     /// What the checkpoint's export declares about its packed weights; dense for a
     /// configuration read from `config.json` alone ([`Config::parse`]).
     pub quantization: Declaration,
@@ -198,6 +207,9 @@ impl Config {
         })?;
         let mut config = Self::parse(&Fields::of("config.json", &value)?)?;
         config.quantization = Declaration::read(checkpoint)?;
+        config.mtp_experts = config
+            .mtp_experts
+            .map(|stated| mtp_experts(stated, |name| checkpoint.tensor(name).is_some()));
         Ok(config)
     }
 
@@ -357,6 +369,7 @@ impl Config {
         Self {
             class: class.to_owned(),
             text,
+            mtp_experts: moe.as_ref().map(|moe| moe.layout),
             moe,
             vision,
             mtp_num_hidden_layers,
@@ -778,6 +791,24 @@ fn routed_experts(fields: &Fields<'_>) -> Result<(u32, u32)> {
     ))
 }
 
+/// The layout a checkpoint stores its multi-token-prediction layer's routed experts in, where
+/// `holds` states which tensors it holds and `stated` is the layout of the class's own layers
+/// ([`Config::mtp_experts`]): the stacked layout when the drafter's stacked tensors are held,
+/// one module per expert when its first expert's module is held instead, and `stated` when
+/// the tensors hold neither, which the drafter's load then refuses by the missing name.
+fn mtp_experts(stated: ExpertLayout, holds: impl Fn(&str) -> bool) -> ExpertLayout {
+    const EXPERTS: &str = "mtp.layers.0.mlp.experts";
+
+    let stacked = match stated {
+        ExpertLayout::Stacked { gate_up, .. } => holds(&format!("{EXPERTS}.{gate_up}")),
+        ExpertLayout::Modules => false,
+    };
+    if !stacked && holds(&format!("{EXPERTS}.0.gate_proj.weight")) {
+        return ExpertLayout::Modules;
+    }
+    stated
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -848,6 +879,26 @@ mod tests {
 
         assert_eq!(layout(moe()), ExpertLayout::Modules);
         assert_eq!(layout(hybrid()), FUSED_EXPERTS);
+    }
+
+    /// A Qwen3.5-MoE checkpoint stores its drafter's routed experts fused or one module per
+    /// expert, whatever its model's are: the layout is the one its tensors hold.
+    #[test]
+    fn a_drafter_s_experts_are_read_in_the_layout_its_checkpoint_holds() {
+        let holding = |names: &'static [&'static str]| move |name: &str| names.contains(&name);
+
+        // As `config.json` states it, the class's layout.
+        let config = parse(&hybrid()).expect("parsed");
+        assert_eq!(config.mtp_experts, Some(FUSED_EXPERTS));
+
+        // Qwen3.6-35B-A3B's stacked tensors, and Qwen3.5-35B-A3B's modules.
+        let stacked = holding(&["mtp.layers.0.mlp.experts.gate_up_proj"]);
+        assert_eq!(mtp_experts(FUSED_EXPERTS, stacked), FUSED_EXPERTS);
+        let modules = holding(&["mtp.layers.0.mlp.experts.0.gate_proj.weight"]);
+        assert_eq!(mtp_experts(FUSED_EXPERTS, modules), ExpertLayout::Modules);
+
+        // Neither: the class's layout, whose load names the tensor it misses.
+        assert_eq!(mtp_experts(FUSED_EXPERTS, holding(&[])), FUSED_EXPERTS);
     }
 
     #[test]

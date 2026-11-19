@@ -22,6 +22,7 @@
 //! `step mod layers` of a speculation's steps (`qwen3_5_mtp.py:172-173`). A forward here is
 //! not told its step, so a checkpoint of more than one layer is refused at load.
 
+use nn::causal_lm::MoeConfig;
 use nn::family::{CacheShape, SequenceSplit, StateShape, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, Rotary};
 use nn::{
@@ -87,6 +88,16 @@ impl Mtp {
         let text = &config.text;
         let norm = decoder::stream_norm(text);
 
+        // The drafter's routed experts are the model's, stored in the layout the checkpoint
+        // holds the drafter's in.
+        let experts = match (&config.moe, config.mtp_experts) {
+            (Some(moe), Some(layout)) => Some(MoeConfig {
+                layout,
+                ..moe.clone()
+            }),
+            _ => None,
+        };
+
         Ok(Self {
             pre_fc_norm_embedding: RmsNorm::load(&norm, vb.pp("pre_fc_norm_embedding"))?,
             pre_fc_norm_hidden: RmsNorm::load(&norm, vb.pp("pre_fc_norm_hidden"))?,
@@ -106,7 +117,7 @@ impl Mtp {
                 config,
                 vb.pp("layers").pp(0),
                 false,
-                config.moe.is_some(),
+                experts.as_ref(),
                 &TextPlacement {
                     sequence: SequenceSplit::WHOLE,
                     ..*placement
