@@ -25,8 +25,9 @@ const IM_END: u32 = 2;
 const VISION_PROCESSOR: &str = r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
     "size": {"shortest_edge": 4096, "longest_edge": 16777216}}"#;
 
-/// The files of a Qwen3 checkpoint: its template in its tokenizer configuration, its context
-/// bound at the root of its configuration, and generation defaults that end at two ids.
+/// The files of a Qwen3 checkpoint as Qwen releases it: its template in its tokenizer
+/// configuration, its context bound at the root of its configuration, and generation defaults
+/// that end at two ids.
 fn qwen3_files() -> BTreeMap<String, String> {
     let tokenizer = json!({"eos_token": "<|im_end|>", "chat_template": CHATML_TEMPLATE});
     BTreeMap::from([
@@ -41,6 +42,20 @@ fn qwen3_files() -> BTreeMap<String, String> {
             r#"{"eos_token_id": [151645, 151643], "temperature": 0.6, "top_k": 20}"#.to_owned(),
         ),
     ])
+}
+
+/// The files of a Qwen3 checkpoint exported since `transformers` writes templates as files of
+/// their own, as NVIDIA's ModelOpt NVFP4 export of Qwen3-30B-A3B publishes them: [`qwen3_files`]
+/// with the template in `chat_template.jinja` alone and a tokenizer configuration that states
+/// none.
+fn qwen3_export_files() -> BTreeMap<String, String> {
+    let mut files = qwen3_files();
+    files.insert(
+        "tokenizer_config.json".to_owned(),
+        r#"{"eos_token": "<|im_end|>"}"#.to_owned(),
+    );
+    files.insert("chat_template.jinja".to_owned(), CHATML_TEMPLATE.to_owned());
+    files
 }
 
 /// The files of a Qwen checkpoint with a vision tower: its language model a section of its
@@ -99,6 +114,15 @@ fn chat_facts(bound: Bound) -> ChatFacts {
     facts
 }
 
+/// The prompt of one user message `hello` that `bind` renders.
+fn hello(bind: Bind) -> Vec<Segment> {
+    let (mut program, _) = bound(bind);
+    let prompt = program
+        .render(chat::request(vec![chat::user("hello")]))
+        .unwrap();
+    prompt.segments
+}
+
 /// Every family of the release is declared with the classes it claims and what its binding
 /// reads of a checkpoint, and a checkpoint resolves by the declarations as the daemon resolves
 /// it.
@@ -115,12 +139,15 @@ fn every_family_is_declared_with_its_claims_and_files() {
             .collect::<Vec<_>>(),
         interface::Serving::Video(_) => panic!("{} serves chat", family.id),
     };
+    // A Qwen3 checkpoint may keep its template in a file of its own or in its tokenizer
+    // configuration, so the file is read when published and required of none.
     assert_eq!(
         names(&declared[0]),
         [
             ("config.json".to_owned(), true),
             ("tokenizer_config.json".to_owned(), true),
             ("generation_config.json".to_owned(), false),
+            ("chat_template.jinja".to_owned(), false),
         ]
     );
     let vision = names(&declared[1]);
@@ -205,7 +232,7 @@ fn a_checkpoint_without_what_its_family_reads_is_refused() {
 }
 
 /// A chat request renders into the prompt its template writes, one text segment the daemon
-/// tokenizes; the deployment's template takes the checkpoint's place.
+/// tokenizes, and a request without messages is refused.
 #[test]
 fn a_request_renders_into_the_prompt_its_template_writes() {
     let (mut program, _) = bound(binding("qwen3", qwen3_files()));
@@ -219,25 +246,62 @@ fn a_request_renders_into_the_prompt_its_template_writes() {
         )]
     );
 
-    let configured = Bind {
-        chat: ChatOptions {
-            template: Some("{{ messages[0].content }}!".to_owned()),
-            ..ChatOptions::default()
-        },
-        ..binding("qwen3", qwen3_files())
-    };
-    let (mut program, _) = bound(configured);
-    let prompt = program
-        .render(chat::request(vec![chat::user("hello")]))
-        .unwrap();
-    assert_eq!(prompt.segments, [Segment::Text("hello!".to_owned())]);
-
     let refusal = program.render(chat::request(Vec::new())).unwrap_err();
     assert_eq!(refusal.param, None);
     assert!(
         refusal.message.contains("at least one message"),
         "{refusal}"
     );
+}
+
+/// A checkpoint's template renders from where the checkpoint keeps it, as `transformers` loads
+/// it: a Qwen3 release's from its tokenizer configuration, a later Qwen3 export's from its
+/// `chat_template.jinja` alone, and the file before the field in a Qwen3 or Qwen3.6 checkpoint
+/// that publishes both. A Qwen3 checkpoint with neither is refused, naming both places, and a
+/// deployment's template replaces the checkpoint's in every layout.
+#[test]
+fn a_template_renders_from_where_its_checkpoint_keeps_it() {
+    let chatml = [Segment::Text(
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n".to_owned(),
+    )];
+    assert_eq!(hello(binding("qwen3", qwen3_files())), chatml);
+    assert_eq!(hello(binding("qwen3", qwen3_export_files())), chatml);
+
+    // Released checkpoints that publish both hold one template in the two places; a file that
+    // differs from the field shows which one renders.
+    let file = "{{ messages[0].content }} from the file";
+    let vision = vision_files("Qwen3_5MoeForConditionalGeneration");
+    let field = json!({"eos_token": "<|im_end|>", "chat_template": CHATML_TEMPLATE});
+    for (family, mut files) in [("qwen3", qwen3_files()), ("qwen3_5_moe", vision)] {
+        files.insert("tokenizer_config.json".to_owned(), field.to_string());
+        files.insert("chat_template.jinja".to_owned(), file.to_owned());
+        assert_eq!(
+            hello(binding(family, files)),
+            [Segment::Text("hello from the file".to_owned())],
+            "{family}"
+        );
+    }
+
+    let mut neither = qwen3_export_files();
+    neither.remove("chat_template.jinja");
+    let Err(error) = Release::bind_with(binding("qwen3", neither), &Characters::chat()) else {
+        panic!("a checkpoint without a template is refused");
+    };
+    assert!(
+        error.contains("chat_template.jinja") && error.contains("tokenizer_config.json"),
+        "{error}"
+    );
+
+    for files in [qwen3_files(), qwen3_export_files()] {
+        let configured = Bind {
+            chat: ChatOptions {
+                template: Some("{{ messages[0].content }}!".to_owned()),
+                ..ChatOptions::default()
+            },
+            ..binding("qwen3", files)
+        };
+        assert_eq!(hello(configured), [Segment::Text("hello!".to_owned())]);
+    }
 }
 
 /// A family that takes images places each image's block where its template writes the

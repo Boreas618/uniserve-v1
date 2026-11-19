@@ -910,7 +910,9 @@ mod tests {
                 images: None,
                 checkpoint: processing::ChatCheckpoint {
                     context_length: &["max_position_embeddings"],
-                    chat_template: processing::ChatTemplate::TokenizerConfig,
+                    chat_template: processing::ChatTemplate::FileOrTokenizerConfig(
+                        "chat_template.jinja",
+                    ),
                 },
             }),
         },
