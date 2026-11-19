@@ -33,7 +33,9 @@ use super::{Request, RequestStatus, Scheduler, WorkerGroup, monotonic_nanos};
 /// - Token counts: `prompt_tokens` is the prompt the request was submitted with, which its usage
 ///   charges; `prefill_tokens` the prompt it computes (a resumed request's generated tokens
 ///   included); `generated_tokens` every token it generated, on this engine and before;
-///   `prefilled_tokens` where its next prompt chunk starts; `cached_pages` the blocks its cache
+///   `prefilled_tokens` where its next prompt chunk starts (a running request's computed tokens,
+///   before the end of its hit while a bounded replay recomputes its windows; a waiting request's
+///   hit); `cached_pages` the blocks its cache
 ///   groups' tables hold; `refill_tokens` the draft cache's gap a refill can close, when one
 ///   is ready and can be given its blocks ([`refill_writable`]), which a step of `tokens`
 ///   tokens at most sizes its next chunk by; with `tokens` `None` no refill is offered.
@@ -110,10 +112,16 @@ pub(super) fn view(request: &Request, groups: &[WorkerGroup], tokens: Option<u32
         },
         generated_tokens: generated,
         cached_prefix_tokens: request.num_cached_tokens,
-        prefilled_tokens: request
-            .num_computed_tokens
-            .min(request.num_prompt_tokens)
-            .max(request.num_cached_tokens),
+        prefilled_tokens: if request.status == RequestStatus::Running {
+            // A running request computes on from its computed tokens, which a bounded replay
+            // (SD §4.4) sets before the end of its hit to recompute its sliding windows.
+            request.num_computed_tokens.min(request.num_prompt_tokens)
+        } else {
+            request
+                .num_computed_tokens
+                .min(request.num_prompt_tokens)
+                .max(request.num_cached_tokens)
+        },
         cached_pages,
         last_emitted_at: None,
         class,
@@ -469,8 +477,8 @@ pub(super) mod tests {
     }
 
     /// An admission under way still waits; a transfer and a run are running, and only the
-    /// transfer waits for one. Its next prompt chunk starts past its hit and what is scheduled,
-    /// and it holds the blocks of its cache groups' tables.
+    /// transfer waits for one. Its next prompt chunk starts past what is scheduled, before the
+    /// end of its hit while it replays, and it holds the blocks of its cache groups' tables.
     #[test]
     fn a_running_request_states_its_progress() {
         let mut request = waiting(1, 0, &[1; 100]);
@@ -508,6 +516,16 @@ pub(super) mod tests {
         assert_eq!(view.cached_prefix_tokens, 64);
         assert_eq!(view.prefilled_tokens, 80);
         assert_eq!(view.cached_pages, 4);
+
+        // A bounded replay computes on from before the end of its hit, where its next chunk
+        // starts: a policy that sized it from the hit's end would ask a chunk that stops short of
+        // the recurrent-state checkpoint the request holds for its next call.
+        request.num_cached_tokens = 96;
+        request.num_computed_tokens = 70;
+        request.replay = 32..96;
+        let view = view_of(&request, &[]);
+        assert_eq!(view.cached_prefix_tokens, 96);
+        assert_eq!(view.prefilled_tokens, 70);
 
         request.status = RequestStatus::Finished;
         let view = view_of(&request, &[]);
