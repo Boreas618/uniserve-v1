@@ -378,7 +378,10 @@ impl Request {
     /// - a refill of its draft cache in such a deployment, once the context is computed, with
     ///   nothing in flight, while the draft cache ends before [`Request::refill_end`];
     /// - under stop strings, no token call while the outputs of as many calls as the group's call
-    ///   window are unacknowledged (`:486`).
+    ///   window are unacknowledged (`:486`);
+    /// - for a request that hands off ([`GenerationRequest::hand_off`]), no decode or
+    ///   verification: its prompt's last chunk samples its first token, and then, with nothing of
+    ///   it in flight, it lends its KV and continues on the decode replica its route named.
     pub(crate) fn ready(&self, phase: Phase, groups: &[WorkerGroup]) -> bool {
         if self.status != RequestStatus::Running {
             return false;
@@ -398,14 +401,18 @@ impl Request {
         let speculates = groups.iter().any(|group| group.serves(Phase::Verify));
         let window = group.capacity.call_window.max(1);
         let acknowledged = request.stop_strings.is_empty() || self.unacknowledged() < window;
+        // A request that hands off generates nothing past the first token its prompt samples: a
+        // decode pipelined behind that chunk would keep a call of it in flight at every step, and
+        // it would never be idle to lend.
+        let generates = computed && !request.hand_off;
         match phase {
             Phase::Prefill => acknowledged && !computed && self.idle() && !self.awaits_encoding(),
             Phase::VisionEncode => self.idle() && self.encodes_next(ImageEncoder::Vision, groups),
             Phase::LatentEncode => self.idle() && self.encodes_next(ImageEncoder::Latent, groups),
             Phase::Decode => {
-                acknowledged && computed && !speculates && self.pipelines(request, window)
+                acknowledged && generates && !speculates && self.pipelines(request, window)
             }
-            Phase::Verify => acknowledged && computed && speculates && self.idle(),
+            Phase::Verify => acknowledged && generates && speculates && self.idle(),
             Phase::Refill => {
                 acknowledged
                     && computed
@@ -1286,6 +1293,36 @@ mod tests {
         assert!(request.ready(Phase::Decode, &groups));
         request.status = RequestStatus::WaitingForRemoteKvs;
         assert!(!request.ready(Phase::Decode, &groups));
+    }
+
+    /// A request that hands off computes its prompt and is given no decode or verification
+    /// after it, behind its prompt's last chunk or once that chunk's output arrived, so that it
+    /// becomes idle and lends its KV; one that does not hand off pipelines its decode.
+    #[test]
+    fn a_request_that_hands_off_decodes_nothing() {
+        for phases in [
+            &[Phase::Prefill, Phase::Decode][..],
+            &[Phase::Prefill, Phase::Decode, Phase::Verify, Phase::Refill],
+        ] {
+            let groups = [group(0, phases, 2, 64)];
+            let mut input = tokens(&[1, 2, 3], 8);
+            input.hand_off = true;
+            let mut request = running(input);
+            assert!(request.ready(Phase::Prefill, &groups));
+
+            schedule(&mut request, Phase::Prefill, 1, 3);
+            assert!(!request.ready(Phase::Decode, &groups));
+            request.completed[Phase::Prefill.index()] = 1;
+            request.token_ids.push(5);
+            assert!(request.idle());
+            assert!(!request.ready(Phase::Decode, &groups));
+            assert!(!request.ready(Phase::Verify, &groups));
+        }
+
+        let groups = [group(0, &[Phase::Prefill, Phase::Decode], 2, 64)];
+        let mut request = running(tokens(&[1, 2, 3], 8));
+        schedule(&mut request, Phase::Prefill, 1, 3);
+        assert!(request.ready(Phase::Decode, &groups));
     }
 
     /// A speculating deployment verifies instead of decoding, never behind another call, and
