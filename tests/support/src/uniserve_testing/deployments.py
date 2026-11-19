@@ -265,6 +265,10 @@ class Deployments:
         self.settings = settings
         self.lease = lease
         self.directory = directory
+        #: The case's directory on this host's own storage, which holds its
+        #: transfer calibration (:meth:`calibration`); made once one is
+        #: measured.
+        self.local: Path | None = None
 
     def run_config(self) -> dict[str, Any]:
         """The options every deployment of the run states over its own: its
@@ -414,9 +418,19 @@ class Deployments:
         """The transfer calibration of the case's GPUs and this host's
         storage, which ``uniserve storage-server calibrate`` measures on the
         leased GPUs (and with `reads` NIXL's READs through the host's RDMA
-        ports), written into the case's directory once per case.
+        ports), once per case.
+
+        It lies in a directory of the case's own in the system's temporary
+        directory, which is the host's own, rather than in the case's
+        directory: a deployment over two hosts names one calibration path,
+        which each host's Storage Server reads its own calibration from
+        (:meth:`follower` measures the second host's there), and the case's
+        directory may lie on storage both hosts mount. :meth:`close` removes
+        it.
         """  # noqa: D205
-        calibration = self.directory / "transfer-calibration.json"
+        if self.local is None:
+            self.local = Path(tempfile.mkdtemp(prefix="uniserve-calibration-"))
+        calibration = self.local / "transfer-calibration.json"
         if not calibration.exists():
             declared = {}
             if self.lease is not None:
@@ -434,6 +448,14 @@ class Deployments:
                 check=True,
             )
         return calibration
+
+    def close(self) -> None:
+        """Remove what the case's deployments keep on this host outside the
+        case's directory: the transfer calibration (:meth:`calibration`).
+        """  # noqa: D205
+        if self.local is not None:
+            shutil.rmtree(self.local, ignore_errors=True)
+            self.local = None
 
     @contextmanager
     def follower(
@@ -468,12 +490,13 @@ class Deployments:
         GPUs without them) under a runtime directory of its own there,
         which also holds its state directory. A deployment that names a
         transfer calibration names it on every host it serves on, so with
-        `calibration` (the path the leader's package names) the host's own
-        is measured at that path there first, with NIXL's READs when
-        `reads`. On exit the leader stops first; the daemon ends when the
-        leader's connection closes, which this waits for, and a daemon that
-        outlives its leader fails the case. Its log is ``<name>.log`` in
-        the case's directory.
+        `calibration` (the path the leader's package names, on this host's
+        own storage: :meth:`calibration`) the host's own is measured at that
+        path there first, with NIXL's READs when `reads`, and its directory
+        there is removed with the block. On exit the leader stops first;
+        the daemon ends when the leader's connection closes, which this
+        waits for, and a daemon that outlives its leader fails the case.
+        Its log is ``<name>.log`` in the case's directory.
         """  # noqa: D205
         assert leader.package is not None, "the leader serves no package"
         with ExitStack() as owned:
@@ -509,7 +532,7 @@ class Deployments:
                     *(["--reads"] if reads else []),
                     timeout_s=CALIBRATION_S,
                 )
-                owned.callback(host.run, "rm", "-f", str(calibration))
+                owned.callback(host.run, "rm", "-rf", str(calibration.parent))
             member = host.start(
                 ["uniserve", "serve", package],
                 self.directory / f"{name}.log",

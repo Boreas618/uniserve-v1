@@ -142,9 +142,13 @@ def deployments(
     e2e_settings: Settings,
     lease: Lease | None,
     tmp_path: Path,
-) -> Deployments:
+) -> Iterator[Deployments]:
     """The case's deployments, on its lease at the run's Build Server."""
-    return Deployments(uniserve, build_server, e2e_settings, lease, tmp_path)
+    deployments = Deployments(
+        uniserve, build_server, e2e_settings, lease, tmp_path
+    )
+    yield deployments
+    deployments.close()
 
 
 @pytest.fixture(scope="module")
@@ -154,14 +158,16 @@ def module_deployments(
     e2e_settings: Settings,
     module_lease: Lease | None,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Deployments:
+) -> Iterator[Deployments]:
     """The deployments of a module that serves one deployment for all its
     cases, on the module's lease.
     """  # noqa: D205
-    return Deployments(
+    deployments = Deployments(
         uniserve,
         build_server,
         e2e_settings,
         module_lease,
         tmp_path_factory.mktemp("deployments"),
     )
+    yield deployments
+    deployments.close()
