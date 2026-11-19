@@ -67,6 +67,24 @@ pub struct MultimodalRenderInfo {
     pub placeholder_token: String,
 }
 
+/// How a chat family whose checkpoints publish no chat template encodes a request into its
+/// prompt: in the format the checkpoint's reference encoder states, which the family ports
+/// (`crate::ChatTemplate::Encoder`).
+pub trait ChatEncoder: Sync {
+    /// Encodes `request` into the prompt text the daemon tokenizes, the deployment's template
+    /// arguments `defaults` under the request's own.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of a request the format cannot encode, naming the request field at fault
+    /// where one is.
+    fn encode(
+        &self,
+        request: &Render,
+        defaults: &Map<String, JsonValue>,
+    ) -> Result<String, Refusal>;
+}
+
 /// Hugging Face chat-template renderer for one served model.
 ///
 /// Holds at most one compiled template together with the default template

@@ -620,8 +620,8 @@ The leader pushes the deployment's observation store to an OpenTelemetry Collect
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `template` | The checkpoint's | The chat template, read exactly as written: `{ file = "/path/chat.jinja" }` names a file of Jinja source, `{ inline = "..." }` states the source itself. Unset, the checkpoint's own template renders: its standalone template file, else the `chat_template` of its `tokenizer_config.json` |
-| `template_kwargs` | Unset | Keyword arguments bound into every chat-template render |
+| `template` | The checkpoint's | The chat template, read exactly as written: `{ file = "/path/chat.jinja" }` names a file of Jinja source, `{ inline = "..." }` states the source itself. Unset, the checkpoint's own template renders: its standalone template file, else the `chat_template` of its `tokenizer_config.json`; a family whose checkpoints publish no template (DeepSeek-V4.1) encodes with its own encoder instead |
+| `template_kwargs` | Unset | Keyword arguments bound into every chat-template render, or read by a family's encoder (DeepSeek-V4.1 reads `thinking`, `enable_thinking`, `reasoning_effort` and `drop_thinking`); a request's `chat_template_kwargs` replace them by name |
 | `template_content_format` | `"auto"` | How message content renders: `string` or `openai`; `auto` detects it from the template, keeping each message's own shape for a template that reads both |
 | `reasoning_parser` | `"auto"` | `auto` splits `reasoning` from `content`; `none` streams reasoning delimiters as content |
 

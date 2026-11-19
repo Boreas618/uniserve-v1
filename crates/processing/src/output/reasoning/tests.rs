@@ -2,7 +2,7 @@
 
 use super::DelimitedReasoningParser;
 use crate::output::Delimiters;
-use crate::serving::ReasoningFormat;
+use crate::serving::{ReasoningFormat, ToolCallFormat};
 
 /// The id of `<think>` in the tests' vocabulary.
 const START: u32 = 5;
@@ -16,15 +16,18 @@ const PROMPT_END: u32 = 2;
 /// The parser of `<think>` reasoning, which waits for an explicit start delimiter when the
 /// prompt states no reasoning boundary.
 fn think_parser() -> DelimitedReasoningParser {
-    DelimitedReasoningParser::new(Delimiters {
-        format: ReasoningFormat {
-            open: "<think>",
-            close: "</think>",
-        },
-        open: START,
-        close: END,
-    })
+    DelimitedReasoningParser::new(THINK, None)
 }
+
+/// `<think>` reasoning with the ids of the tests' vocabulary.
+const THINK: Delimiters = Delimiters {
+    format: ReasoningFormat {
+        open: "<think>",
+        close: "</think>",
+    },
+    open: START,
+    close: END,
+};
 
 #[test]
 fn delimited_parser_splits_reasoning_across_chunk_boundaries() {
@@ -82,4 +85,41 @@ fn a_tail_without_a_delimiter_starts_in_content() {
     let delta = parser.push("answer");
     assert_eq!(delta.reasoning, None);
     assert_eq!(delta.content.as_deref(), Some("answer"));
+}
+
+/// The parser of `<think>` reasoning for a family whose DSML calls end the turn.
+fn dsml_parser() -> DelimitedReasoningParser {
+    DelimitedReasoningParser::new(THINK, ToolCallFormat::Dsml.final_region())
+}
+
+/// The final region's opening ends unclosed reasoning, the separator before it going to the
+/// content with it, and no delimiter is read after it, at every split of the text.
+#[test]
+fn the_final_region_ends_reasoning_and_its_delimiters() {
+    let text = "reason\n\n<｜DSML｜ calls><think>arg</think>";
+    for (at, _) in text.char_indices().skip(1) {
+        let mut parser = dsml_parser();
+        parser.initialize(&[START]);
+        let mut delta = parser.push(&text[..at]);
+        for part in [parser.push(&text[at..]), parser.finish()] {
+            delta.push_reasoning(part.reasoning.as_deref().unwrap_or_default());
+            delta.push_content(part.content.as_deref().unwrap_or_default());
+        }
+        assert_eq!(delta.reasoning.as_deref(), Some("reason"), "split at {at}");
+        assert_eq!(
+            delta.content.as_deref(),
+            Some("\n\n<｜DSML｜ calls><think>arg</think>"),
+            "split at {at}"
+        );
+    }
+
+    // Opened in the text, the region keeps its thinking tags as text too.
+    let mut parser = dsml_parser();
+    parser.initialize(&[END]);
+    let delta = parser.push("answer<｜DSML｜ calls><think>x");
+    assert_eq!(delta.reasoning, None);
+    assert_eq!(
+        delta.content.as_deref(),
+        Some("answer<｜DSML｜ calls><think>x")
+    );
 }

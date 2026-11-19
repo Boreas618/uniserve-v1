@@ -20,9 +20,10 @@
 //! (`scheduling::processing`), and the leader daemon loads the module its epoch's module set
 //! fixes, so an epoch's request side is built from the same tree as its engine and nothing in the
 //! daemon names a model ([`program`]). The request side of chat lives here with the families:
-//! the Jinja chat template a request renders with ([`chat`]) and the parsers of a response's
-//! reasoning and tool calls ([`output`]). The engine links the crate natively for the numerical
-//! facts its models read, and registers the numerical side of the same families.
+//! the Jinja chat template a request renders with, or the encoder of a family whose checkpoints
+//! state their prompt format as a reference encoder instead ([`chat`]), and the parsers of a
+//! response's reasoning and tool calls ([`output`]). The engine links the crate natively for the
+//! numerical facts its models read, and registers the numerical side of the same families.
 //!
 //! The family-neutral rules a video request is processed with are stated here once, each
 //! parameterized by values the family states: the frame rule ([`FrameClips`]), the canvas rule
@@ -32,11 +33,13 @@
 //! As in the reference serving systems, a family's own request preprocessing is a stage beside its
 //! model's numerics rather than part of them, and lives here with the request facts it states once:
 //! [`qwen`] (the Qwen families' chat profiles), [`qwen_vl`] (the Qwen-VL image and video processor
-//! rules) and [`minimax_h3`] (MiniMax-H3's request rules, conditioner prompt and processor). The
-//! model crates read those facts from here.
+//! rules), [`deepseek_v41`] (DeepSeek-V4.1's chat profile and prompt encoder) and [`minimax_h3`]
+//! (MiniMax-H3's request rules, conditioner prompt and processor). The model crates read those
+//! facts from here.
 
 mod canvas;
 pub mod chat;
+pub mod deepseek_v41;
 #[cfg(target_arch = "wasm32")]
 mod entropy;
 mod family;
@@ -46,6 +49,7 @@ mod media;
 pub mod minimax_h3;
 pub mod output;
 pub mod program;
+mod python_json;
 pub mod qwen;
 pub mod qwen_vl;
 mod serving;
@@ -62,7 +66,7 @@ pub use media::{
     AudioMetadata, FrameRate, ImageMetadata, MediaMetadata, VideoMetadata, resampled_len,
 };
 pub use serving::{
-    ChatCheckpoint, ChatProfile, ChatTemplate, ReasoningFormat, Serving, ToolCallFormat,
+    ChatCheckpoint, ChatProfile, ChatTemplate, Opening, ReasoningFormat, Serving, ToolCallFormat,
 };
 pub use video::{
     BasePin, ConditionInput, InputError, Length, Reference, ReferenceKind, VideoBinding,

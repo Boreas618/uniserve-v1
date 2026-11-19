@@ -324,3 +324,122 @@ fn a_missing_delimiter_fails_the_responses_that_parse_reasoning() {
     let served = Parser::new(Options::default(), missing(), None, &[]);
     assert!(served.is_ok());
 }
+
+/// A DeepSeek-V4.1 completion in thinking mode: reasoning, the turn's text, and a DSML block
+/// whose text argument holds thinking tags, after which the model ran on (as a request that
+/// ignores the end-of-sequence token lets it).
+const DSML_COMPLETION: &str = concat!(
+    "I should read it.</think>Reading.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n",
+    "<｜DSML｜ parameter name=\"path\" string=\"true\">a <think>b</think> c</｜DSML｜ parameter>\n",
+    "<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n",
+    "</｜DSML｜ invoke>\n</｜DSML｜ calls><｜User｜>next<｜Assistant｜><think>more</think>text",
+);
+
+/// The output of [`DSML_COMPLETION`]: its reasoning, its text without the blank line before the
+/// block, and its call, whose argument keeps the thinking tags; what followed the block is
+/// dropped.
+fn dsml_output() -> Vec<Ordered> {
+    vec![
+        Ordered::Reasoning("I should read it.".to_owned()),
+        text("Reading."),
+        Ordered::Call {
+            name: "read".to_owned(),
+            arguments: r#"{"path": "a <think>b</think> c", "limit": 2}"#.to_owned(),
+        },
+    ]
+}
+
+/// A thinking-mode prompt's tail, which ends with `<think>`: generation starts inside reasoning.
+const THINKING_TAIL: [u32; 1] = [5];
+
+/// A DSML completion parses into its reasoning, text and calls at every split of its text, and
+/// a parser handed off at any point goes on where it stood.
+#[test]
+fn a_dsml_completion_parses_alike_at_every_split_and_handoff() {
+    let parse_split = |at: usize| {
+        let parser = parser(ToolCallFormat::Dsml, true, Some(Vec::new()), &THINKING_TAIL);
+        ordered(parse(parser, &[&DSML_COMPLETION[..at], &DSML_COMPLETION[at..]]).unwrap())
+    };
+    assert_eq!(parse_split(DSML_COMPLETION.len()), dsml_output());
+
+    for (at, _) in DSML_COMPLETION.char_indices().skip(1) {
+        assert_eq!(parse_split(at), dsml_output(), "split at {at}");
+
+        let mut first = parser(ToolCallFormat::Dsml, true, Some(Vec::new()), &THINKING_TAIL);
+        let mut events = first.push(&DSML_COMPLETION[..at]).unwrap();
+        // The state crosses as the bytes a handoff carries.
+        let bytes = serde_json::to_vec(&first.save()).unwrap();
+        let mut second = Parser::restore(
+            serde_json::from_slice(&bytes).unwrap(),
+            Ok(Some(think())),
+            Some(ToolCallFormat::Dsml),
+        )
+        .unwrap();
+        events.extend(second.push(&DSML_COMPLETION[at..]).unwrap());
+        events.extend(second.finish().unwrap());
+        assert_eq!(ordered(events), dsml_output(), "handed off at {at}");
+    }
+}
+
+/// A DSML block opened inside reasoning ends the reasoning, the blank line before it belonging
+/// to neither; without callable tools the block is text, and reasoning still ends at it.
+#[test]
+fn a_dsml_block_ends_unclosed_reasoning() {
+    let completion = concat!(
+        "thinking\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"list\">\n",
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    );
+    let called = parse(
+        parser(ToolCallFormat::Dsml, true, Some(Vec::new()), &THINKING_TAIL),
+        &[completion],
+    )
+    .unwrap();
+    assert_eq!(
+        ordered(called),
+        [
+            Ordered::Reasoning("thinking".to_owned()),
+            Ordered::Call {
+                name: "list".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        ]
+    );
+
+    let uncalled = parse(
+        parser(ToolCallFormat::Dsml, true, None, &THINKING_TAIL),
+        &[completion],
+    )
+    .unwrap();
+    assert_eq!(
+        ordered(uncalled),
+        [
+            Ordered::Reasoning("thinking".to_owned()),
+            text(&completion["thinking".len()..]),
+        ]
+    );
+}
+
+/// A DSML call cut by the end of generation reaches the response closed, never as a failure.
+/// In chat mode, whose prompt ends with `</think>`, generation starts in the text.
+#[test]
+fn a_cut_dsml_call_does_not_fail_the_response() {
+    let cut = concat!(
+        "Writing.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write\">\n",
+        "<｜DSML｜ parameter name=\"content\" string=\"true\">first line\nsecond",
+    );
+    let events = parse(
+        parser(ToolCallFormat::Dsml, true, Some(Vec::new()), &[6]),
+        &[cut],
+    )
+    .unwrap();
+    assert_eq!(
+        ordered(events),
+        [
+            text("Writing."),
+            Ordered::Call {
+                name: "write".to_owned(),
+                arguments: r#"{"content": "first line\nsecond"}"#.to_owned(),
+            },
+        ]
+    );
+}
