@@ -284,6 +284,31 @@ pub struct KvPlane {
     pub scale: Option<Tensor>,
 }
 
+impl KvPlane {
+    /// The plane's entries as the record operators read them (`crate::functional::Plane`):
+    /// `[pages, entries, heads · row]`, one record of an entry's rows a slot. A page of a
+    /// page-laid record ([`crate::family::Layout::Page`]) holds the same bytes, its entries'
+    /// values first and their scales after them, which the operators address by the layout.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Shape`] for entries that are not `[pages, entries, heads, row]`.
+    pub fn records(&self) -> Result<Tensor> {
+        let &[pages, entries, heads, row] = self.entries.dims() else {
+            return Err(Error::shape(
+                "KvPlane",
+                format!(
+                    "the {} plane of layer {} is {:?}, not [pages, entries, heads, row]",
+                    self.field,
+                    self.layer,
+                    self.entries.dims()
+                ),
+            ));
+        };
+        Ok(self.entries.reshape((pages, entries, heads * row))?)
+    }
+}
+
 /// The paged cache of one cache group, as execution lends it for one forward: how rows address
 /// pages, where each token writes, and where each owner's entries are.
 ///
@@ -1689,11 +1714,7 @@ mod tests {
                     FieldReader { layer: 2, owner: 0 },
                 ],
                 history: History::Full,
-                record: Record {
-                    format: Format::Nvfp4,
-                    heads: 1,
-                    width: 512,
-                },
+                record: Record::rows(Format::Nvfp4, 1, 512),
             },
             CacheField::attention(crate::family::KEY, 2, 2, 8),
         ]
@@ -1765,8 +1786,46 @@ mod tests {
         assert_eq!(Format::Mxfp8.row_bytes(512), Some(528));
         assert_eq!(Format::Mxfp4.row_bytes(128), Some(68));
         assert_eq!(Format::Fp8Scaled.row_bytes(128), Some(132));
-        let mut window = fields;
+        let mut window = fields.clone();
         window[0].history = History::Window { tokens: 0 };
         assert!(CacheField::check(&window, 64).is_err());
+
+        // A page keeps one section of scales: its entries are one block-scaled row each.
+        let mut paged = fields;
+        paged[0].record.layout = crate::family::Layout::Page;
+        CacheField::check(&paged, 64).unwrap();
+        paged[1].record.layout = crate::family::Layout::Page;
+        let error = CacheField::check(&paged, 64).unwrap_err().to_string();
+        assert!(error.contains("page layout"), "{error}");
+    }
+
+    /// A page-laid record is lent in its page's extents and bound to the record operators in
+    /// the format and the layout its declaration states: what its writer and its reader read.
+    #[test]
+    fn a_plane_binds_in_the_layout_its_record_states() {
+        use crate::family::{Format, Layout, Record};
+
+        let keys = Record {
+            layout: Layout::Page,
+            ..Record::rows(Format::Mxfp4, 1, 128)
+        };
+        assert_eq!(
+            keys.operand().unwrap(),
+            (ops::record::Format::Mxfp4, Layout::Page)
+        );
+        assert!(Record::rows(Format::Fp8Scaled, 1, 128).operand().is_err());
+
+        let mut fields = latent_and_keys();
+        fields[0].record = keys;
+        let planes = KvCache::planes_of(&fields, DType::BF16, 2, 64, |shape, dtype| {
+            Ok(Tensor::zeros(shape, dtype, &Device::Cpu)?)
+        })
+        .unwrap();
+
+        // 32 keys of 64 + 4 bytes a page, whichever section holds their scales.
+        assert_eq!(planes[0].entries.dims(), [2, 32, 1, 68]);
+        assert_eq!(planes[0].records().unwrap().dims(), [2, 32, 68]);
+        // A key field of two heads of eight is two heads' elements a slot.
+        assert_eq!(planes[1].records().unwrap().dims(), [2, 64, 16]);
     }
 }

@@ -534,11 +534,7 @@ pub(crate) fn cache_fields(
             .collect(),
         readers: Vec::new(),
         history: History::Full,
-        record: Record {
-            format: Format::Elements(dtype),
-            heads: 1,
-            width: indexer.head_dim,
-        },
+        record: Record::rows(Format::Elements(dtype), 1, indexer.head_dim),
     });
     fields
 }
@@ -598,11 +594,7 @@ mod tests {
         );
         assert_eq!(
             keys.record,
-            Record {
-                format: Format::Elements(DType::BF16),
-                heads: 1,
-                width: 128
-            }
+            Record::rows(Format::Elements(DType::BF16), 1, 128)
         );
 
         let rank = cache_fields(&config, Split::new(4, 3).unwrap(), 2, DType::BF16);

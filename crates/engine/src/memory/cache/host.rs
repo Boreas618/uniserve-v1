@@ -561,11 +561,7 @@ mod tests {
             owners: (0..4).map(|layer| FieldOwner { layer, ratio: 4 }).collect(),
             readers: Vec::new(),
             history: History::Full,
-            record: Record {
-                format: Format::Elements(DType::BF16),
-                heads: 1,
-                width: 128,
-            },
+            record: Record::rows(Format::Elements(DType::BF16), 1, 128),
         }
     }
 
@@ -636,11 +632,7 @@ mod tests {
             ],
             readers: Vec::new(),
             history: History::Full,
-            record: Record {
-                format,
-                heads: 1,
-                width: 512,
-            },
+            record: Record::rows(format, 1, 512),
         };
         let shape = |format, ratio| {
             let layout = CacheLayout::of(64, &[latent(format, ratio)], PrefixCacheDtype::BFloat16)?;

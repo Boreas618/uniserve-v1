@@ -8,7 +8,7 @@
 //! | --- | --- | --- | --- | --- |
 //! | [`LATENT`], read as key and value | the 40 target layers and the 3 draft layers (40–42) | the last [`WINDOW`] tokens and the draft block's rollback | 64 | 512 E4M3 + 16 UE8M0, 528 B |
 //! | [`COMPRESSED`] | layers 2, 8, 14 (one entry per two tokens) and 20 (one per token), read by 3–7, 9–13, 15–19 and 21–39 | full | 32 / 64 | NVFP4 (288 B) or MXFP8 (528 B) |
-//! | [`INDEX_KEY`] | the same four, read by 24, 28, 32 and 36 from 20 | full | 32 / 64 | MXFP4 (68 B) or FP8 with a scale (132 B) |
+//! | [`INDEX_KEY`] | the same four, read by 24, 28, 32 and 36 from 20 | full | 32 / 64 | MXFP4 (68 B, a page's values then their scales) or FP8 with a scale (132 B) |
 //!
 //! and the compressor's remainder, a per-request ring of eight FP32 rows of 1024 on layers 2, 8
 //! and 14 ([`remainder`]), its groups the ratio-2 compressor's pairs.
@@ -16,7 +16,7 @@
 use std::sync::Mutex;
 
 use nn::family::{
-    CacheField, ExpertShape, FieldOwner, FieldReader, Format, History, INDEX_KEY, Record,
+    CacheField, ExpertShape, FieldOwner, FieldReader, Format, History, INDEX_KEY, Layout, Record,
     StateField, StateRows, StateShape, TextModel, TokenHistory,
 };
 use nn::functional::{WeightOrder, embedding};
@@ -56,6 +56,19 @@ impl Formats {
         compressed: Format::Nvfp4,
         index: Format::Mxfp4,
     };
+
+    /// The index keys' record: an MXFP4 page keeps every key's values and then their scales,
+    /// as the paged index logits read it; an FP8 key keeps its scale after its values.
+    pub const fn index_record(&self) -> Record {
+        let layout = match self.index {
+            Format::Mxfp4 => Layout::Page,
+            _ => Layout::Entry,
+        };
+        Record {
+            layout,
+            ..Record::rows(self.index, 1, INDEX_WIDTH)
+        }
+    }
 }
 
 /// The owners of the compressed latent and of the index keys: layers 2, 8 and 14 compress pairs
@@ -96,33 +109,21 @@ pub fn fields(draft_tokens: u32, formats: Formats) -> Vec<CacheField> {
             history: History::Window {
                 tokens: WINDOW + draft_tokens,
             },
-            record: Record {
-                format: Format::Mxfp8,
-                heads: 1,
-                width: LATENT_WIDTH,
-            },
+            record: Record::rows(Format::Mxfp8, 1, LATENT_WIDTH),
         },
         CacheField {
             name: COMPRESSED,
             owners: compressors(),
             readers: compressed_readers,
             history: History::Full,
-            record: Record {
-                format: formats.compressed,
-                heads: 1,
-                width: LATENT_WIDTH,
-            },
+            record: Record::rows(formats.compressed, 1, LATENT_WIDTH),
         },
         CacheField {
             name: INDEX_KEY,
             owners: compressors(),
             readers: index_readers,
             history: History::Full,
-            record: Record {
-                format: formats.index,
-                heads: 1,
-                width: INDEX_WIDTH,
-            },
+            record: formats.index_record(),
         },
     ]
 }

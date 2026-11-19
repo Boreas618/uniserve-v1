@@ -1015,11 +1015,7 @@ mod tests {
                 .map(|(layer, ratio)| FieldOwner { layer, ratio })
                 .collect::<Vec<_>>()
         };
-        let record = |format, width| Record {
-            format,
-            heads: 1,
-            width,
-        };
+        let record = |format, width| Record::rows(format, 1, width);
         vec![
             CacheField {
                 name: "latent",

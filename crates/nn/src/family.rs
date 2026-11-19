@@ -37,6 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub use ops::record::Layout;
 use proto::config::Quantization;
 use tensor::DType;
 
@@ -501,11 +502,21 @@ pub enum History {
     },
 }
 
-/// One entry of a cache field: `heads` rows of `width` values each, in `format`.
+/// One entry of a cache field: `heads` rows of `width` values each, in `format`, its block
+/// scales where `layout` places them.
+///
+/// The record is the one statement of a page's bytes: execution sizes, copies and stores pages
+/// by it without reading them, and the model's writer and reader of the field encode and decode
+/// the entries by the same declaration ([`Self::operand`]), so they agree by construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
     /// How the values are stored.
     pub format: Format,
+    /// Where a page of a block-scaled format keeps its scales: after each row's values
+    /// ([`Layout::Entry`]), or after the values of every entry of the page ([`Layout::Page`]),
+    /// as DeepGEMM's paged index logits read index keys. An element format keeps no scale and
+    /// states [`Layout::Entry`]; a page layout holds entries of one row.
+    pub layout: Layout,
     /// The rows of one entry: key/value heads of a key or value field, one for a latent.
     pub heads: u32,
     /// The values of one row.
@@ -517,7 +528,8 @@ pub struct Record {
 /// An element format stores each value as one element, and a plane of it is lent as
 /// `[pages, entries, heads, width]` of that type. A block-scaled format packs each row's values
 /// and their block scales into bytes, as the kernels that read it address them, and a plane of
-/// it is lent as `[pages, entries, heads, row bytes]` U8 ([`Format::row_bytes`]).
+/// it is lent as `[pages, entries, heads, row bytes]` U8 ([`Format::row_bytes`]): a page holds
+/// `entries · heads` rows' bytes either way, arranged by the record's [`Layout`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     /// The deployment's cache element type (`kv_cache_config.dtype`, else the model's
@@ -569,7 +581,51 @@ impl Format {
     }
 }
 
+impl Format {
+    /// The record format of the operators that write and read paged records
+    /// ([`ops::record::Format`]): BF16 elements or a block-scaled format they encode; `None`
+    /// for the deployment's element type, another element type and [`Format::Fp8Scaled`],
+    /// which no record operator reads.
+    pub fn record(self) -> Option<ops::record::Format> {
+        match self {
+            Self::Elements(DType::BF16) => Some(ops::record::Format::Bf16),
+            Self::Mxfp8 => Some(ops::record::Format::Mxfp8),
+            Self::Nvfp4 => Some(ops::record::Format::Nvfp4),
+            Self::Mxfp4 => Some(ops::record::Format::Mxfp4),
+            Self::Deployment | Self::Elements(_) | Self::Fp8Scaled => None,
+        }
+    }
+}
+
 impl Record {
+    /// A record of `heads` rows of `width` values in `format`, its scales after each row's
+    /// values: every record but a page-laid one.
+    pub const fn rows(format: Format, heads: u32, width: u32) -> Self {
+        Self {
+            format,
+            layout: Layout::Entry,
+            heads,
+            width,
+        }
+    }
+
+    /// The format and layout the record operators read and write the record in
+    /// ([`crate::functional::Plane`]).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Unsupported`] for a record no record operator reads
+    /// ([`Format::record`]).
+    pub fn operand(&self) -> Result<(ops::record::Format, Layout)> {
+        let format = self.format.record().ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "a cache record in {:?} has no record format the record operators read",
+                self.format
+            ))
+        })?;
+        Ok((format, self.layout))
+    }
+
     /// The element type a plane of the record is lent in, for a deployment whose cache element
     /// type is `deployment`: that type, the record's own, or U8 for a block-scaled record.
     pub fn dtype(&self, deployment: DType) -> DType {
@@ -594,7 +650,18 @@ impl Record {
         };
 
         match width {
-            Some(width) if width > 0 && self.heads > 0 => Ok([self.heads, width]),
+            Some(width) if width > 0 && self.heads > 0 => {
+                // Every entry of a page-laid record shares the page's scale section, so an entry
+                // is one row and its format keeps scales.
+                let packed = self.format.block().is_some();
+                if self.layout == Layout::Page && (self.heads != 1 || !packed) {
+                    return Err(crate::Error::Unsupported(format!(
+                        "a cache record of {} rows in {:?} keeps no scales after its page's                          values: a page layout holds one block-scaled row an entry",
+                        self.heads, self.format
+                    )));
+                }
+                Ok([self.heads, width])
+            }
             _ => Err(crate::Error::Unsupported(format!(
                 "a cache record of {} rows of {} values in {:?} has no whole entry",
                 self.heads, self.width, self.format
@@ -671,11 +738,7 @@ impl CacheField {
                 .collect(),
             readers: Vec::new(),
             history: History::Full,
-            record: Record {
-                format: Format::Deployment,
-                heads,
-                width: head_dim,
-            },
+            record: Record::rows(Format::Deployment, heads, head_dim),
         }
     }
 
