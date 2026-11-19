@@ -192,9 +192,10 @@ message EngineInfo {
   // workers' capacities.
   GenerationLimits limits = 1;
   // The video denoiser as its model family describes it to its request
-  // processing (`nn::family::Description::details`): the encoding of a
-  // `VideoDenoiser` message, which the engine carries without reading it;
-  // empty when the engine generates no video.
+  // processing (`nn::family::Description::details`): the encoding of the
+  // family's own description message (MiniMax-H3's `VideoDenoiser`,
+  // `processing::minimax_h3::wire`), which the engine carries without reading
+  // it; empty when the engine generates no video.
   bytes video_denoiser = 2;
   reserved 3;
   reserved "latent_encoding_units";
@@ -1197,65 +1198,6 @@ message DiffusionRequest {
   optional EncoderInputs encoder_inputs = 9;
   // The stored ranks' page locations and numerical layouts, read by engines.
   bytes stored_layout = 10;
-}
-
-// What a placed video denoiser serves, as its model family describes it to
-// the family's request processing (`EngineInfo.video_denoiser` carries its
-// encoding): the tasks it serves, its fixed schedule, the canvases the
-// deployment prepared, the references one request may carry and how a
-// request's conditions are packed into its rows.
-message VideoDenoiser {
-  // The names of the tasks it serves, in the family's canonical order.
-  repeated string tasks = 1;
-  // Sigma points of the fixed schedule, the clean endpoint included: one
-  // more than the network evaluations of every request.
-  uint32 schedule_points = 2;
-  // Shift of the video schedule.
-  double video_shift = 3;
-  // Shift of the audio schedule.
-  double audio_shift = 4;
-  // The canvases the deployment serves, in the order the deployment names
-  // them; the first is the canvas of a request that states no size.
-  repeated ServedCanvas canvases = 5;
-  // The references one request may carry.
-  ReferenceLimits references = 6;
-  // How the denoiser packs a request's conditions into its rows.
-  ConditionPacking condition_packing = 7;
-}
-
-// A canvas a deployment serves, with the pair its model names it by.
-message ServedCanvas {
-  // The resolution class in pixels: the canvas's short edge as the model
-  // names it.
-  uint32 short_edge = 1;
-  // The display ratio as `W:H`.
-  string aspect_ratio = 2;
-  // The raster the pair selects.
-  Canvas canvas = 3;
-}
-
-// The references one request may carry, of each kind and in all, and the
-// largest short edge an image reference is encoded at; zeros for a denoiser
-// that takes none.
-message ReferenceLimits {
-  uint32 images = 1;
-  uint32 videos = 2;
-  uint32 audios = 3;
-  uint32 total = 4;
-  uint32 image_short_edge = 5;
-}
-
-// How a denoiser lays a request's conditions into its rows: the rows they may
-// take, and the tile each condition's rows fill whole.
-message ConditionPacking {
-  // Rows one request's conditions may take; zero for a denoiser that takes
-  // none.
-  uint32 capacity = 1;
-  // Rows of one tile, at least one.
-  uint32 tile_rows = 2;
-  // Tokens of one video tile along time, height and width, each at least
-  // one.
-  repeated uint32 video_tile = 3;
 }
 
 // The conditions of a video request (`proto::video::Conditions`): each

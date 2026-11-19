@@ -13,163 +13,21 @@
 //!
 //! The latent [`Layout`] a denoiser prepares for one request is stated here too: the model states
 //! it, the worker captures a graph for it and the scheduler names it in the batch it submits.
+//!
+//! The media a condition is decoded into ([`ConditionMedia`] and the rasters, clips and grids it
+//! holds) is the processing program's vocabulary too: a family's request processing states it
+//! through the processing interface, which owns it ([`scheduling::processing::video`]), and every
+//! stage after it reads the same types here.
 
 mod wire;
 
 use serde::{Deserialize, Serialize};
 
+pub use scheduling::processing::video::{
+    AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoClip,
+    VisionGrid,
+};
 pub use wire::ConditionsError;
-
-/// A video raster in pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Canvas {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-}
-
-/// How a condition relates to the generated video.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConditionRole {
-    /// A keyframe anchoring the first generated frame.
-    FirstFrame,
-    /// A keyframe anchoring the last generated frame.
-    LastFrame,
-    /// A reference conditioning the generation as a whole.
-    Reference,
-}
-
-impl ConditionRole {
-    /// Whether the condition anchors a generated frame.
-    pub const fn is_keyframe(self) -> bool {
-        matches!(self, Self::FirstFrame | Self::LastFrame)
-    }
-}
-
-/// A decoded still image put on a raster: resized with LANCZOS to `resized`,
-/// then the `size` window whose top-left corner is (`left`, `top`) kept.
-///
-/// A stretched image is resized straight to its raster (`resized == size`,
-/// no offset); a cover-cropped keyframe is resized past the canvas and
-/// centred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ImageFit {
-    /// Size the decoded image is resized to.
-    pub resized: Canvas,
-    /// Left edge of the kept window in the resized image.
-    pub left: u32,
-    /// Top edge of the kept window in the resized image.
-    pub top: u32,
-    /// The kept raster, which the video encoder encodes.
-    pub size: Canvas,
-}
-
-/// The frames of a reference video the media reader produces.
-///
-/// The video is resampled to the output frame rate and scaled onto `canvas`
-/// in one decoding pass; its first `start_frame` frames are skipped and the
-/// next `frames` kept. The conditioner samples the kept frames; the video encoder encodes
-/// their leading `vae_frames`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VideoClip {
-    /// The canvas of the video's own display aspect.
-    pub canvas: Canvas,
-    /// Frames of the output-rate timeline skipped at the start.
-    pub start_frame: u32,
-    /// Frames of the output-rate timeline kept after the start offset.
-    pub frames: u32,
-    /// The leading kept frames the video encoder encodes.
-    pub vae_frames: u32,
-}
-
-/// The samples of a soundtrack or audio reference the media reader produces.
-///
-/// The track is decoded at its native rate, its first `start_sample` samples
-/// skipped and the next `source_samples` kept, then resampled once to the
-/// model's audio rate, giving `samples` stereo samples.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AudioClip {
-    /// The track's native sample rate.
-    pub sample_rate: u32,
-    /// Native samples skipped at the start.
-    pub start_sample: u64,
-    /// Native samples kept after the start offset.
-    pub source_samples: u64,
-    /// Samples after resampling to the model's audio rate.
-    pub samples: u64,
-}
-
-/// What the media reader decodes a condition's bytes into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConditionMedia {
-    /// A keyframe or an image reference: one frame.
-    Image(ImageFit),
-    /// A reference video and, when the request conditions on it, its
-    /// soundtrack.
-    Video {
-        /// The frames.
-        clip: VideoClip,
-        /// The soundtrack.
-        soundtrack: Option<AudioClip>,
-    },
-    /// An audio reference.
-    Audio(AudioClip),
-}
-
-impl ConditionMedia {
-    /// The audio track the condition carries, if any.
-    pub const fn audio(&self) -> Option<&AudioClip> {
-        match self {
-            Self::Image(_) => None,
-            Self::Video { soundtrack, .. } => soundtrack.as_ref(),
-            Self::Audio(clip) => Some(clip),
-        }
-    }
-
-    /// The frame count and raster of the pixels the video encoder encodes,
-    /// if the condition has any.
-    pub const fn pixels(&self) -> Option<(u32, Canvas)> {
-        match self {
-            Self::Image(fit) => Some((1, fit.size)),
-            Self::Video { clip, .. } => Some((clip.vae_frames, clip.canvas)),
-            Self::Audio(_) => None,
-        }
-    }
-}
-
-/// A vision patch grid: `t` temporal patches of `h` by `w` spatial patches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VisionGrid {
-    /// Temporal patches; 1 for an image.
-    pub t: u32,
-    /// Patch rows.
-    pub h: u32,
-    /// Patch columns.
-    pub w: u32,
-}
-
-impl VisionGrid {
-    /// Patches of the grid.
-    pub const fn patches(&self) -> u64 {
-        self.t as u64 * self.h as u64 * self.w as u64
-    }
-}
-
-/// What the conditioner reads of a visual condition.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ConditionVision {
-    /// The patch grid the condition's frames are resized to.
-    pub grid: VisionGrid,
-    /// Vision tokens the condition occupies in the presentation, which is
-    /// the count of its vision placeholders.
-    pub tokens: u32,
-    /// The kept frames of a reference video the conditioner samples, in
-    /// order; empty for an image.
-    pub frame_indices: Vec<u32>,
-}
 
 /// One condition of a video request, as its model planned it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

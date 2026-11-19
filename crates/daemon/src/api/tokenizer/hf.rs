@@ -154,20 +154,6 @@ impl HuggingFaceTokenizer {
     }
 }
 
-/// The vocabulary the model families' request processing reads: each text is
-/// encoded on its own without special tokens added, and control tokens, vision
-/// markers and placeholders resolve by their text.
-impl processing::Vocabulary for HuggingFaceTokenizer {
-    fn token_id(&self, token: &str) -> Option<u32> {
-        self.token_to_id(token)
-    }
-
-    fn encode(&self, text: &str) -> std::result::Result<Vec<u32>, processing::VocabularyError> {
-        Self::encode(self, text, false)
-            .map_err(|error| processing::VocabularyError(Box::new(error)))
-    }
-}
-
 /// The special tokens a `tokenizer_config.json` declares beside its
 /// `added_tokens_decoder`, which `transformers` registers when it loads the
 /// tokenizer and `fastokens` does not.

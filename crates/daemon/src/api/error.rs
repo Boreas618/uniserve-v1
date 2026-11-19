@@ -7,9 +7,6 @@
 
 use crate::api::tokenizer::TokenizerError;
 
-/// A boxed source error.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
 /// Why the API server cannot process a request's text or its engine output.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,37 +35,31 @@ pub enum Error {
         /// The missing part.
         part: &'static str,
     },
-    /// The reasoning or tool-call parser the request's family declares cannot be built for it.
-    #[error("cannot build the {kind} parser {name:?}")]
-    Parser {
-        /// `reasoning` or `tool`.
-        kind: &'static str,
-        /// The format's name.
-        name: String,
-        /// Why it cannot be built.
-        #[source]
-        source: BoxError,
-    },
-    /// The model's text is not a tool call of the format its family declares: it breaks the
-    /// format's grammar, a value is not what its tool's schema states, or the text ended
-    /// inside a call.
-    #[error("the model wrote a malformed {format} tool call: {message}")]
-    ToolCall {
-        /// The tool-call format's name.
-        format: &'static str,
-        /// What the text breaks.
+    /// The family's parsers refuse the model's output: a tool call that breaks its format's
+    /// grammar or its tool's schema, text that ended inside a call; the processing program's
+    /// report.
+    #[error("{message}")]
+    Output {
+        /// The program's report.
         message: String,
-        /// The syntax error of the call's JSON, where the format's JSON broke.
-        #[source]
-        source: Option<BoxError>,
     },
     /// Tool-call events arrive out of the order the response assembles them in: arguments with
-    /// no open call, or for another call than the open one.
+    /// no open call.
     #[error("tool call stream state is inconsistent: {message}")]
     ToolCallStream {
         /// The violated order.
         message: String,
     },
+    /// The epoch's processing program failed: the request's instance ended.
+    #[error(transparent)]
+    Processing(#[from] crate::api::program::Error),
+}
+
+impl Error {
+    /// The output refusal the processing program reports as `message`.
+    pub fn output(message: String) -> Self {
+        Self::Output { message }
+    }
 }
 
 /// Result type of the API server's processing.

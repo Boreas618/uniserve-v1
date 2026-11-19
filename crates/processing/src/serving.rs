@@ -89,7 +89,7 @@ impl Eq for ChatProfile {}
 /// of the vocabulary.
 ///
 /// The delimiters are the family's data, and request processing reads every family's reasoning
-/// with one parser parameterized by them; a response's handoff carries them as they are.
+/// with one parser parameterized by them (`crate::output::reasoning`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReasoningFormat {
     /// The text that opens a reasoning section.
@@ -126,20 +126,12 @@ pub enum ToolCallFormat {
 }
 
 impl ToolCallFormat {
-    /// Every tool-call format.
-    pub const ALL: [Self; 2] = [Self::Json, Self::Xml];
-
-    /// The format's name, which a response's handoff states it by.
+    /// The format's name, which a malformed call's failure states it by.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Json => "json",
             Self::Xml => "xml",
         }
-    }
-
-    /// The format named `name` ([`Self::name`]); `None` for no format's name.
-    pub fn named(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|format| format.name() == name)
     }
 
     /// The text that opens one tool-call region and the text that closes it.

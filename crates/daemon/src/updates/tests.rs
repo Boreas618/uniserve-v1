@@ -80,6 +80,7 @@ impl Deployment {
                 engine: serving.modules.engine.clone(),
                 kernels: serving.modules.kernels.clone(),
                 policy: serving.modules.policy.clone(),
+                processing: serving.modules.processing.clone(),
                 previous: None,
                 status: EpochState::Serving,
                 generation: Some(1),
