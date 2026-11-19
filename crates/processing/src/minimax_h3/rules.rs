@@ -26,7 +26,9 @@
 
 use std::num::NonZeroU32;
 
-use proto::video::{Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VisionGrid};
+use scheduling::processing::video::{
+    Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VisionGrid,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -171,7 +173,7 @@ impl ReferenceSizing {
 }
 
 /// The samples of a soundtrack the request conditions on: what the media reader decodes
-/// ([`proto::video::AudioClip`]) and the latents it encodes to.
+/// ([`scheduling::processing::video::AudioClip`]) and the latents it encodes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AudioClip {
     /// The native sample rate.
@@ -193,8 +195,8 @@ impl AudioClip {
     }
 
     /// What the media reader decodes.
-    const fn media(&self) -> proto::video::AudioClip {
-        proto::video::AudioClip {
+    const fn media(&self) -> scheduling::processing::video::AudioClip {
+        scheduling::processing::video::AudioClip {
             sample_rate: self.sample_rate,
             start_sample: self.start_sample,
             source_samples: self.source_samples,
@@ -355,7 +357,7 @@ impl PreparedCondition {
             Preparation::Video(clip) => (
                 ConditionRole::Reference,
                 ConditionMedia::Video {
-                    clip: proto::video::VideoClip {
+                    clip: scheduling::processing::video::VideoClip {
                         canvas: clip.canvas,
                         start_frame: clip.start_frame,
                         frames: clip.frames,

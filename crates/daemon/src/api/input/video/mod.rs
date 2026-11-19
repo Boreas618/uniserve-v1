@@ -3,14 +3,15 @@
 //! The public request is the same for every video model
 //! (`protocol::VideoGenerationRequest`): a prompt,
 //! an output size and length, and reference media, each anchoring a generated frame or
-//! conditioning the generation as a whole. What a model makes of it is the model's: its
-//! processor (`processing::VideoProcessor`), which the deployment's family bound from what its
-//! workers described, holds the request to the model's rules and processes it.
+//! conditioning the generation as a whole. What a model makes of it is the model's: its video
+//! family in the epoch's processing program, which the deployment bound to what its workers
+//! described, holds the request to the model's rules and processes it, in the request's own
+//! instance of the program.
 //!
 //! [`VideoService::process`] runs one request through five stages in order:
 //!
-//! 1. The processor's request-only rules ([`VideoProcessor::check`]), so a malformed request is
-//!    refused before anything is fetched.
+//! 1. The family's request-only rules (`video_check`), so a malformed request is refused before
+//!    anything is fetched.
 //! 2. The service's [`MediaConnector`] resolves each `input_references[i].url` under the server's
 //!    media policy (`data:`, `file://` under the media directory, `http(s)://` with size, time and
 //!    address limits) into an owned buffer, the media of one request sharing one total.
@@ -18,9 +19,10 @@
 //!    reader decodes them with (`media::probe`): an image's displayed size, its EXIF orientation
 //!    applied; a video's display aspect, frame rate, decoded frame count and soundtrack, and an
 //!    audio file's sample rate and decoded sample count.
-//! 4. The processor processes the request from the probed media with the checkpoint's tokenizer
-//!    ([`VideoProcessor::process`]): its size and frames, how each reference is decoded and encoded,
-//!    the prompt as the text encoder encodes it, and the denoiser rows the references take.
+//! 4. The family processes the request from the probed media (`video_process`), its prompt
+//!    tokenized with the checkpoint's tokenizer, which the daemon answers the program with: its
+//!    size and frames, how each reference is decoded and encoded, the prompt as the text encoder
+//!    encodes it, and the denoiser rows the references take.
 //! 5. Each reference's media is copied into a sealed anonymous memory file, which the request holds
 //!    and the request interface carries beside it to the engine's media reader, and the request
 //!    becomes one `DiffusionRequest` describing every condition and stating the rows they take, by
@@ -29,10 +31,9 @@
 //! Stages 1 to 3 wait only on I/O and run on the async runtime; stages 4 and 5 are CPU work and
 //! run on the blocking pool.
 //!
-//! Every refusal is a `processing::InputError::Invalid` naming the request parameter at fault,
+//! Every refusal is an `InputError::Invalid` naming the request parameter at fault,
 //! `input_references[i]` for a reference; the API answers it as an `invalid_request_error`.
-//! Failures of the server's own resources (the blocking pool) are
-//! `processing::InputError::Internal`.
+//! Failures of the server's own resources (the blocking pool) are `InputError::Internal`.
 
 mod encodings;
 pub mod probe;
@@ -40,16 +41,19 @@ pub mod probe;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use processing::{InputError, Length, Reference, ReferenceKind, VideoProcessor, VideoSpec};
 use proto::MappedMedia;
 use proto::request::{DiffusionRequest, DiffusionSamplingParams, RequestId, Trajectory};
-use proto::video::{Canvas, Conditions};
+use proto::video::{Canvas, Condition, Conditions};
+use scheduling::processing::video::{
+    ConditionInput, Facts, InputError, Length, Process, Reference, ReferenceKind, VideoInput,
+    VideoSpec,
+};
 use serde_json::{Value, json};
 
 use crate::api::input::media::{FetchedMedia, MediaConnector};
 use crate::api::input::{ServeError, TokenizeError};
+use crate::api::program::Binding;
 use crate::api::protocol::{VideoGenerationRequest, request_field_names};
-use crate::api::tokenizer::DynTokenizer;
 use proto::config::MediaConfig;
 
 use probe::MediaProber;
@@ -142,48 +146,48 @@ impl ProcessedVideo {
 /// Processes the video requests of one deployment.
 ///
 /// One instance is shared by all requests; [`VideoService::process`] takes `&self` and runs
-/// concurrently.
+/// concurrently, each request in an instance of its own of the family's binding.
 pub struct VideoService {
-    /// The deployment's processor, which the blocking pool shares.
-    processor: Arc<dyn VideoProcessor>,
+    /// The video family bound to the placed denoiser in the epoch's processing program.
+    binding: Arc<Binding>,
+    /// What the bound family serves.
+    facts: Facts,
     /// The media policy, which `capabilities` reports.
     media: MediaConfig,
     connector: MediaConnector,
     prober: MediaProber,
-    tokenizer: DynTokenizer,
 }
 
 impl VideoService {
-    /// The service of a deployment whose processor is `processor`, under the media policy
-    /// `media`, tokenizing with the checkpoint's `tokenizer`.
+    /// The service of a deployment whose video family is bound as `binding`, under the media
+    /// policy `media`.
     ///
     /// # Errors
     ///
-    /// Fails when the media connector cannot be built.
-    pub fn new(
-        processor: Box<dyn VideoProcessor>,
-        media: &MediaConfig,
-        tokenizer: DynTokenizer,
-    ) -> anyhow::Result<Self> {
+    /// Fails when the binding is no video family's or the media connector cannot be built.
+    pub fn new(binding: Arc<Binding>, media: &MediaConfig) -> anyhow::Result<Self> {
+        let scheduling::processing::Bound::Video(facts) = binding.facts().clone() else {
+            anyhow::bail!("the binding of a video service states no video facts");
+        };
         Ok(Self {
-            processor: Arc::from(processor),
+            binding,
+            facts,
             media: media.clone(),
             connector: MediaConnector::new(media)?,
             prober: MediaProber::new(media)?,
-            tokenizer,
         })
     }
 
     /// The denoiser evaluations of every request.
     pub fn denoise_steps(&self) -> u32 {
-        self.processor.denoise_steps()
+        self.facts.denoise_steps
     }
 
     /// Describes what the deployment serves of video for `GET /v1/capabilities`: the model's own part, the
     /// prompt capacity, the media sources and size caps, and the request fields.
     pub fn capabilities(&self, max_prompt_tokens: u32) -> Value {
         json!({
-            "model": self.processor.capabilities(),
+            "model": self.facts.capabilities,
             "max_prompt_tokens": max_prompt_tokens,
             "media": {
                 "data": true,
@@ -219,7 +223,8 @@ impl VideoService {
         use service::span::{Stage, enter};
 
         let spec = request.spec()?;
-        self.processor.check(&spec)?;
+        let mut session = self.binding.checkout()?;
+        session.check_video(&spec)??;
 
         // Fetches and probes of different references run concurrently; the first failure ends
         // the request.
@@ -243,13 +248,15 @@ impl VideoService {
             .await?;
         drop(fetch);
 
-        let processor = Arc::clone(&self.processor);
-        let tokenizer = Arc::clone(&self.tokenizer);
         let request_id = request_id.to_owned();
         let priority = request.priority.unwrap_or(0);
         tokio::task::spawn_blocking(move || {
             let preprocess = (trace != 0).then(|| enter(Stage::Preprocess, trace));
-            let input = processor.process(&spec, &probes, &*tokenizer)?;
+            let input = session.process_video(&Process {
+                spec,
+                media: probes,
+            })??;
+            drop(session);
             drop(preprocess);
             let prompt_len = u32::try_from(input.prompt_token_ids.len()).map_err(|_| {
                 InputError::Internal("a prompt of more tokens than a u32 counts".into())
@@ -275,7 +282,7 @@ impl VideoService {
 /// The engine request of `input` at scheduler `priority` and of trace id `trace`, holding each
 /// reference's media in a sealed memory file.
 fn submission(
-    input: processing::VideoInput,
+    input: VideoInput,
     media: &[FetchedMedia],
     priority: i32,
     trace: u64,
@@ -289,7 +296,7 @@ fn submission(
                 "holding input_references[{index}] for the engine failed: {error}"
             ))
         })?;
-        conditions.push(condition.of_length(fetched.bytes.len() as u64));
+        conditions.push(condition_of(condition, fetched.bytes.len() as u64));
         copies.push(Arc::new(copy));
     }
     let conditions = Conditions {
@@ -352,6 +359,19 @@ fn submission(
     Ok((request, video))
 }
 
+/// The condition `input` states, whose fetched media are `bytes` long and travel beside the
+/// request.
+fn condition_of(input: ConditionInput, bytes: u64) -> Condition {
+    Condition {
+        role: input.role,
+        bytes,
+        media: input.media,
+        vision: input.vision,
+        latent_units: input.latent_units,
+        audio_rows: input.audio_rows,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
@@ -399,11 +419,14 @@ mod tests {
             (spec.size.unwrap().width, spec.size.unwrap().height),
             (1344, 768)
         );
-        assert_eq!(spec.length, Some(processing::Length::Seconds(5.0)));
+        assert_eq!(
+            spec.length,
+            Some(scheduling::processing::video::Length::Seconds(5.0))
+        );
         assert_eq!(spec.references[0].frame_index, Some(-1));
 
         let refused = |body: Value| match request(body).spec() {
-            Err(processing::InputError::Invalid { param, .. }) => param,
+            Err(scheduling::processing::video::InputError::Invalid { param, .. }) => param,
             other => panic!("not refused: {other:?}"),
         };
         assert_eq!(
@@ -471,10 +494,12 @@ mod tests {
             "seconds": 0.5,
             "input_references": [{"type": "image", "url": "data:,"}],
         }));
-        let Err(ServeError::Video(processing::InputError::Invalid { param, .. })) =
-            test_video_service()
-                .process("rules", &body, 1 << 16, 0)
-                .await
+        let Err(ServeError::Video(scheduling::processing::video::InputError::Invalid {
+            param,
+            ..
+        })) = test_video_service()
+            .process("rules", &body, 1 << 16, 0)
+            .await
         else {
             panic!("the request is refused");
         };

@@ -128,10 +128,9 @@ pub(crate) enum First {
     Serving(Box<Brought>),
 }
 
-/// What a node is started with: its model families, its own options, its deployment's name and
-/// persistent state, its instance directory and readiness, and the stop signal that ends it.
+/// What a node is started with: its own options, its deployment's name and persistent state, its
+/// instance directory and readiness, and the stop signal that ends it.
 pub(crate) struct Start {
-    pub(crate) families: processing::Registry,
     /// The node's own options: its HTTP server's (`server_config`) and its admin API's
     /// (`admin_config`), whose listeners it bound.
     pub(crate) options: Config,
@@ -156,7 +155,6 @@ pub(crate) struct Ended {
 
 /// The node's state.
 pub(crate) struct Node {
-    families: processing::Registry,
     server: ServerConfig,
     deployment: String,
     revisions: Arc<Revisions>,
@@ -231,7 +229,6 @@ pub(crate) async fn run(
     first: First,
 ) -> Result<Ended> {
     let Start {
-        families,
         options,
         deployment,
         revisions,
@@ -241,7 +238,6 @@ pub(crate) async fn run(
         shutdown,
     } = start;
     let node = Arc::new(Node {
-        families,
         server: options.server_config.clone(),
         deployment,
         revisions,
@@ -627,7 +623,7 @@ impl Node {
         Daemon::advance_updates(Arc::clone(&updates), awake)
             .context("starting the updater's thread")?;
         let leader = tokio::select! {
-            leader = Leader::start(&self.families, &config, &stated, address, &self.instance, updates, self.recorder.clone(), revision, lock) => leader,
+            leader = Leader::start(&config, &stated, address, &self.instance, updates, self.recorder.clone(), revision, lock) => leader,
             () = token.cancelled() => {
                 stop_daemon(Some(daemon)).await?;
                 return Ok(None);
@@ -1696,7 +1692,6 @@ mod tests {
             then: None,
         };
         let start = Start {
-            families: processing::Registry::new([]).unwrap(),
             options: config.clone(),
             deployment: "sim".to_owned(),
             revisions: Arc::clone(&revisions),

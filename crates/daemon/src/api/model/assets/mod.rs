@@ -6,16 +6,19 @@
 //! Either way a checkpoint is read from a local directory, which is also what the engines open
 //! ([`Checkpoint`]).
 //!
-//! Which files of that directory are read is what the checkpoint's family declares: the root
-//! files that declare the family ([`declared_family`]); a chat checkpoint's tokenizer,
-//! configuration and template ([`ChatFiles`]); a diffusers pipeline's stage folders, over the
-//! release a layered checkpoint pins ([`PipelineCheckpoint`]). [`config`] deserializes the JSON
-//! metadata. Every failure is this module's [`Error`].
+//! Which files of that directory are read is what the checkpoint's family declares in the
+//! epoch's processing program: the root files that declare the family ([`declared_family`]); a
+//! chat checkpoint's tokenizer and the files its family's binding reads ([`ChatFiles`]); a
+//! diffusers pipeline's stage folders, over the release a layered checkpoint pins
+//! ([`PipelineCheckpoint`]). Every failure is this module's [`Error`].
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub mod config;
+use scheduling::processing::Family;
+
+use crate::api::program::Program;
+
 pub mod error;
 mod files;
 mod hub;
@@ -24,12 +27,8 @@ mod hub_stub;
 mod pipeline;
 mod pipeline_index;
 
-pub use config::{
-    GenerationConfig, HfSpecialTokens, HfTokenizerConfig, NamedSpecialToken, OneOrManyTokenIds,
-    load_generation_config, load_tokenizer_config, read_json,
-};
 pub use error::{Error, Result};
-pub use files::ChatFiles;
+pub use files::{ChatFiles, TOKENIZER_FILE};
 pub use hub::{Hub, HubAsset, HubSettings, Snapshot};
 pub use pipeline::PipelineCheckpoint;
 
@@ -130,23 +129,22 @@ fn optional_text(directory: &Path, name: &str) -> Result<Option<String>> {
         .transpose()
 }
 
-/// The family of `registry` the checkpoint in `directory` declares in the root files the
-/// registry's families declare their classes in ([`processing::Registry::root_files`]), under
-/// request processing's one rule ([`processing::Registry::resolve`]).
+/// The family of `program` the checkpoint in `directory` declares in the root files the
+/// program's families declare their classes in ([`Program::root_files`]), under the processing
+/// interface's one rule ([`Program::resolve`]).
 ///
 /// # Errors
 ///
-/// Returns [`Error::Family`] when the checkpoint declares no family `registry` serves, and the
+/// Returns [`Error::Family`] when the checkpoint declares no family `program` serves, and the
 /// errors of reading the root files.
-pub fn declared_family(
-    directory: &Path,
-    registry: &processing::Registry,
-) -> Result<processing::Family> {
+pub fn declared_family(directory: &Path, program: &Program) -> Result<Family> {
     let mut files = Vec::new();
-    for file in registry.root_files() {
+    for file in program.root_files() {
         if let Some(text) = optional_text(directory, file.name())? {
             files.push((file, text));
         }
     }
-    Ok(registry.resolve(files.iter().map(|(file, text)| (*file, text.as_str())))?)
+    Ok(program
+        .resolve(files.iter().map(|(file, text)| (*file, text.as_str())))?
+        .clone())
 }

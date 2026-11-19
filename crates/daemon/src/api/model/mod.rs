@@ -1,30 +1,21 @@
-// The served checkpoint's files and JSON metadata, and the model facts startup resolves.
+// The served checkpoint's files, and the model facts startup resolves.
 //
 // [`assets`] resolves where a checkpoint lies (a Hugging Face repository's snapshot or a local
 // directory) and reads the files its family declares. The server identifies the served model
 // family from the checkpoint itself, by what its root `config.json` or, for a diffusers pipeline,
-// its root index declares (`processing::Registry::resolve`). The result is one [`ModelConfig`],
-// built at startup by `ModelConfig::load` in `input::processor`. The leader's startup reads it,
-// and `Processor::new` then binds the worker's capabilities onto it before request preprocessing
-// and discovery share it immutably.
-//
-// Which family a checkpoint is, and what that family serves, is the executable's registry of
-// families (`processing::Registry`), whose request processing reads the checkpoint's tokenizer
-// (`crate::api::tokenizer`) through `processing::Vocabulary`.
+// its root index declares, among the families the epoch's processing program declares
+// (`crate::api::program::Program::resolve`). The result is one [`ModelConfig`], built at startup
+// by `ModelConfig::load` in `input::processor` from what the program's binding of the family
+// states. The leader's startup reads it, and `Processor::new` then binds the worker's
+// capabilities onto it before request preprocessing and discovery share it immutably.
 
 pub mod assets;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-use processing::Family;
-use processing::{ChatProfile, Serving, VideoFamily};
-
-use crate::api::model::assets::{
-    ChatFiles, GenerationConfig, HfTokenizerConfig, OneOrManyTokenIds, load_generation_config,
-    load_tokenizer_config,
-};
-use crate::api::tokenizer::HuggingFaceTokenizer;
+use scheduling::processing::video::Pipeline;
+use scheduling::processing::{ChatFacts, Family, Serving};
 
 /// Model-provided sampling defaults. `None` remains distinct from an explicit zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -44,17 +35,28 @@ pub struct SamplingDefaults {
     pub max_output_tokens: Option<u32>,
 }
 
+/// What a chat family's request processing parses and takes, as its binding states it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatFeatures {
+    /// Whether the family's tool calls are parsed from its output.
+    pub tools: bool,
+    /// Whether the family delimits reasoning in its output.
+    pub reasoning: bool,
+    /// Whether the family takes image parts.
+    pub images: bool,
+}
+
 /// Immutable model facts shared by startup, request preprocessing, and discovery.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfig {
-    /// The checkpoint's family, which states what it serves. What a video
-    /// family's placed denoiser serves belongs to the loaded workers, whose
+    /// The checkpoint's family, as the epoch's processing program declares it: what it serves.
+    /// What a video family's placed denoiser serves belongs to the loaded workers, whose
     /// startup handshake reports it.
     pub family: Family,
     /// Checkpoint defaults applied only to omitted request fields.
     pub sampling_defaults: SamplingDefaults,
     /// Combined input/output token ceiling: the configured `--max-model-len`,
-    /// else the bound the checkpoint states where its family declares it. The
+    /// else the bound the checkpoint states where its family keeps it. The
     /// leader passes it to the workers, and request preprocessing enforces it.
     pub max_model_len: u32,
     /// Tokenizer-config `eos_token` resolved through the vocabulary.
@@ -65,49 +67,33 @@ pub struct ModelConfig {
     pub primary_eos_token_id: Option<u32>,
     /// Complete EOS set resolved from tokenizer and generation metadata.
     pub eos_token_ids: BTreeSet<u32>,
+    /// What a chat family parses and takes; `None` for a family that serves no chat.
+    pub chat: Option<ChatFeatures>,
 }
 
 impl ModelConfig {
-    /// Resolves vocabulary and checkpoint defaults for `family`, the chat
-    /// family the checkpoint declares, from its `files`.
-    ///
-    /// A configured `max_model_len` takes precedence over the context length
-    /// the checkpoint states where its family declares it
-    /// ([`ChatFiles::context_length`]); a checkpoint that states no generation
-    /// defaults leaves every sampling default unset.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a metadata file cannot be read or parsed, or no
-    /// `max_model_len` is configured and the checkpoint states no context
-    /// length.
-    pub fn from_files(
-        family: Family,
-        files: &ChatFiles,
-        max_model_len: Option<u32>,
-        tokenizer: &HuggingFaceTokenizer,
-    ) -> assets::Result<Self> {
-        let generation_config = files
-            .generation_config()
-            .map(load_generation_config)
-            .transpose()?;
-        let tokenizer_config = load_tokenizer_config(files.tokenizer_config())?;
-        let (primary_eos_token_id, eos_token_ids) =
-            stop_token_ids(&tokenizer_config, generation_config.as_ref(), tokenizer);
-
-        Ok(Self {
+    /// The facts of a chat `family` its binding states (`facts`).
+    pub fn of_chat(family: Family, facts: &ChatFacts) -> Self {
+        let sampling = &facts.sampling;
+        Self {
             family,
-            sampling_defaults: generation_config
-                .as_ref()
-                .map(generation_defaults)
-                .unwrap_or_default(),
-            max_model_len: match max_model_len {
-                Some(configured) => configured,
-                None => files.context_length()?,
+            sampling_defaults: SamplingDefaults {
+                temperature: sampling.temperature,
+                top_p: sampling.top_p,
+                top_k: sampling.top_k,
+                min_p: sampling.min_p,
+                repetition_penalty: sampling.repetition_penalty,
+                max_output_tokens: sampling.max_output_tokens,
             },
-            primary_eos_token_id,
-            eos_token_ids,
-        })
+            max_model_len: facts.max_model_len,
+            primary_eos_token_id: facts.primary_eos,
+            eos_token_ids: facts.eos.iter().copied().collect(),
+            chat: Some(ChatFeatures {
+                tools: facts.tools,
+                reasoning: facts.reasoning,
+                images: facts.images,
+            }),
+        }
     }
 
     /// Resolves a family that ships as a diffusers pipeline.
@@ -126,7 +112,7 @@ impl ModelConfig {
     pub fn from_pipeline(family: Family, max_model_len: Option<u32>) -> assets::Result<Self> {
         let Serving::Video(_) = family.serving else {
             return Err(assets::Error::UnsupportedPipeline {
-                class_name: family.id.to_owned(),
+                class_name: family.id,
             });
         };
         Ok(Self {
@@ -135,28 +121,20 @@ impl ModelConfig {
             max_model_len: max_model_len.ok_or(assets::Error::MissingPromptLength)?,
             primary_eos_token_id: None,
             eos_token_ids: BTreeSet::new(),
+            chat: None,
         })
     }
 
     /// The family's stable identifier.
-    pub const fn id(&self) -> &'static str {
-        self.family.id
+    pub fn id(&self) -> &str {
+        &self.family.id
     }
 
-    /// The output formats of a chat family; `None` for a family that serves
-    /// no chat.
-    pub const fn chat(&self) -> Option<ChatProfile> {
-        match self.family.serving {
-            Serving::Chat(profile) => Some(profile),
-            Serving::Video(_) => None,
-        }
-    }
-
-    /// The video family; `None` for a family that serves no video.
-    pub fn video(&self) -> Option<&'static dyn VideoFamily> {
-        match self.family.serving {
-            Serving::Video(video) => Some(video),
-            Serving::Chat(_) => None,
+    /// The video family's pipeline; `None` for a family that serves no video.
+    pub fn video(&self) -> Option<&Pipeline> {
+        match &self.family.serving {
+            Serving::Video(pipeline) => Some(pipeline),
+            Serving::Chat { .. } => None,
         }
     }
 
@@ -171,10 +149,10 @@ impl ModelConfig {
     /// states none of their limits.
     pub fn generation_limits(&self) -> proto::request::GenerationLimits {
         let mut limits = proto::request::GenerationLimits::default();
-        if self.chat().is_some() {
+        if self.chat.is_some() {
             limits.max_logprobs = u32::MAX;
         }
-        if self.chat().is_some_and(|profile| profile.images.is_some()) {
+        if self.chat.is_some_and(|chat| chat.images) {
             limits.max_vision_feature_bytes = u64::MAX;
             limits.max_vit_grid_tokens = u32::MAX;
             limits.encoder_cache_entries = u32::MAX;
@@ -183,69 +161,20 @@ impl ModelConfig {
     }
 }
 
-/// Extracts serving generation defaults from repository configuration.
-fn generation_defaults(config: &GenerationConfig) -> SamplingDefaults {
-    SamplingDefaults {
-        temperature: config.temperature,
-        top_p: config.top_p,
-        top_k: config.top_k,
-        min_p: config.min_p,
-        repetition_penalty: config.repetition_penalty,
-        max_output_tokens: config.max_new_tokens,
-    }
-}
-
-/// Combines tokenizer and generation metadata into one canonical termination policy.
-///
-/// Returns the tokenizer-config `eos_token` as the primary id and the union of
-/// the generation-config `eos_token_id` values, when the checkpoint states
-/// generation defaults, with that primary. An `eos_token` absent from the
-/// vocabulary yields no primary rather than an error.
-fn stop_token_ids(
-    tokenizer_config: &HfTokenizerConfig,
-    generation_config: Option<&GenerationConfig>,
-    tokenizer: &HuggingFaceTokenizer,
-) -> (Option<u32>, BTreeSet<u32>) {
-    let primary = tokenizer_config
-        .special_tokens
-        .eos_token
-        .as_ref()
-        .and_then(|token| tokenizer.token_to_id(token.as_str()));
-    let mut ids = generation_config
-        .and_then(|config| config.eos_token_id.clone())
-        .map(OneOrManyTokenIds::into_set)
-        .unwrap_or_default();
-    if let Some(primary) = primary {
-        ids.insert(primary);
-    }
-    (primary, ids)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
+    use scheduling::processing::ResolveError;
     use tempfile::tempdir;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-    use processing::{
-        BasePin, ChatCheckpoint, ChatProfile, ChatTemplate, Family, ReasoningFormat, Registry,
-        RootFile, Serving, ToolCallFormat, VideoBinding, VideoFamily, VideoProcessor,
-    };
-
     use super::ModelConfig;
     use crate::api::input::ModelResolutionError;
-    use crate::api::model::assets::{ChatFiles, Hub, HubSettings, Source};
-    use crate::api::tokenizer::HuggingFaceTokenizer;
+    use crate::api::model::assets::{Hub, HubSettings, Source};
 
     const SPECIAL_TOKENS: &[&str] = &["<|start|>", "<|end|>", "<think>", "</think>"];
-
-    /// Where [`CHAT`]'s checkpoints keep what request processing reads.
-    const CHECKPOINT: ChatCheckpoint = ChatCheckpoint {
-        context_length: &["max_position_embeddings"],
-        chat_template: ChatTemplate::TokenizerConfig,
-    };
 
     /// Writes a minimal checkpoint of the model class `class`: a character-level BPE
     /// tokenizer over ASCII plus [`SPECIAL_TOKENS`], and root, tokenizer, and
@@ -301,136 +230,98 @@ mod tests {
         .unwrap()
     }
 
-    /// The family the checkpoint [`checkpoint`] writes for `class` declares, as startup loads
-    /// it with a registry of [`CHAT`] and [`VIDEO`].
-    async fn loaded(class: &str) -> Result<ModelConfig, ModelResolutionError> {
-        let (directory, cache) = (checkpoint(class), tempdir().unwrap());
-        let registry = Registry::new([CHAT, VIDEO]).unwrap();
-        let loaded = ModelConfig::load(
+    /// The model facts startup loads the checkpoint in `directory` with, through the tests'
+    /// processing program, under a configured `max_model_len`.
+    async fn loaded(
+        directory: &std::path::Path,
+        max_model_len: Option<u32>,
+    ) -> Result<ModelConfig, ModelResolutionError> {
+        let cache = tempdir().unwrap();
+        ModelConfig::load(
             &offline_hub(cache.path()),
-            &Source::Directory(directory.path().to_path_buf()),
+            &Source::Directory(directory.to_path_buf()),
             None,
-            None,
+            max_model_len.and_then(std::num::NonZeroU32::new),
             &proto::config::ChatConfig::default(),
             &serde_json::Map::new(),
-            &registry,
+            &crate::api::test_support::program(),
         )
-        .await;
-        loaded.map(|loaded| loaded.config)
+        .await
+        .map(|loaded| loaded.config)
     }
 
-    /// A chat family of the class these checkpoints declare.
-    const CHAT: Family = Family {
-        id: "chat",
-        root: RootFile::Config,
-        classes: &["ChatForCausalLM"],
-        serving: Serving::Chat(ChatProfile {
-            reasoning: Some(ReasoningFormat {
-                open: "<think>",
-                close: "</think>",
-            }),
-            tool_calls: Some(ToolCallFormat::Json),
-            images: None,
-            checkpoint: CHECKPOINT,
-        }),
-    };
-
-    /// A video family that binds nothing: these tests read only how it is resolved.
-    struct Video;
-
-    impl VideoFamily for Video {
-        fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
-            &[]
-        }
-
-        fn default_sizes(&self) -> &'static [&'static str] {
-            &["768x768"]
-        }
-
-        fn default_max_seconds(&self) -> f64 {
-            4.0
-        }
-
-        fn processing_parts(&self) -> &'static [&'static str] {
-            &[]
-        }
-
-        fn base_pin(&self) -> Option<BasePin> {
-            None
-        }
-
-        fn bind(&self, _: VideoBinding<'_>) -> Result<Box<dyn VideoProcessor>, String> {
-            Err("this family binds no processor".to_owned())
-        }
-    }
-
-    const VIDEO: Family = Family {
-        id: "video",
-        root: RootFile::ModularIndex,
-        classes: &["VideoModularPipeline"],
-        serving: Serving::Video(&Video),
-    };
-
-    /// A chat checkpoint's facts are the files it publishes: its context bound and its
-    /// generation defaults; one that publishes no generation defaults states none.
-    #[test]
-    fn a_chat_checkpoint_states_its_bound_and_defaults() {
+    /// A chat checkpoint resolves to the program's family its configuration declares, whose
+    /// binding states the checkpoint's facts: its context bound, its generation defaults and
+    /// its EOS ids; a deployment's `max_model_len` takes the bound's place, and a checkpoint that
+    /// publishes no generation defaults states none.
+    #[tokio::test]
+    async fn a_chat_checkpoint_binds_to_the_facts_its_files_state() {
         let directory = checkpoint("ChatForCausalLM");
-        let files = ChatFiles::locate(directory.path(), CHECKPOINT).unwrap();
-        let tokenizer = HuggingFaceTokenizer::load(files.tokenizer_directory()).unwrap();
-        let profile = ModelConfig::from_files(CHAT, &files, None, &tokenizer).unwrap();
-        assert_eq!(profile.family, CHAT);
-        assert_eq!(profile.max_model_len, 4096);
-        assert_eq!(profile.sampling_defaults.max_output_tokens, Some(512));
+        let config = loaded(directory.path(), None).await.unwrap();
+        assert_eq!(config.id(), "chat");
+        assert_eq!(config.max_model_len, 4096);
+        assert_eq!(config.sampling_defaults.max_output_tokens, Some(512));
+        assert_eq!(config.sampling_defaults.temperature, Some(0.6));
+        let chat = config.chat.expect("a chat family");
+        assert!(chat.tools && chat.reasoning && !chat.images);
 
-        let bounded = ModelConfig::from_files(CHAT, &files, Some(1024), &tokenizer).unwrap();
-        assert_eq!(bounded.max_model_len, 1024);
+        assert_eq!(
+            loaded(directory.path(), Some(1024))
+                .await
+                .unwrap()
+                .max_model_len,
+            1024
+        );
 
         fs::remove_file(directory.path().join("generation_config.json")).unwrap();
-        let files = ChatFiles::locate(directory.path(), CHECKPOINT).unwrap();
-        let undefaulted = ModelConfig::from_files(CHAT, &files, None, &tokenizer).unwrap();
+        let undefaulted = loaded(directory.path(), None).await.unwrap();
         assert_eq!(
             undefaulted.sampling_defaults,
             super::SamplingDefaults::default()
         );
-        assert_eq!(
-            undefaulted.eos_token_ids,
-            [tokenizer.token_to_id("<|end|>").unwrap()].into()
-        );
+        // `<|end|>` follows `<unk>` and the 127 ASCII tokens in the vocabulary.
+        assert_eq!(undefaulted.eos_token_ids, [129].into());
+        assert_eq!(undefaulted.primary_eos_token_id, Some(129));
     }
 
-    /// Startup serves the family the checkpoint declares; a video family's class named in a
-    /// root configuration rather than its pipeline index, and a class no family claims, are
-    /// refused.
+    /// A video family's class named in a root configuration rather than its pipeline index, and
+    /// a class no family of the program claims, are refused, naming what the program serves.
     #[tokio::test]
-    async fn startup_serves_the_family_the_checkpoint_declares() {
-        assert_eq!(loaded("ChatForCausalLM").await.unwrap().family, CHAT);
-        assert!(matches!(
-            loaded("VideoModularPipeline").await,
-            Err(ModelResolutionError::Assets(super::assets::Error::Family(
-                processing::ResolveError::Unserved { .. }
-            )))
-        ));
-        assert!(matches!(
-            loaded("unsupported_architecture").await,
-            Err(ModelResolutionError::Assets(super::assets::Error::Family(
-                processing::ResolveError::Unserved { .. }
-            )))
-        ));
+    async fn a_checkpoint_no_family_of_the_program_claims_is_refused() {
+        for class in ["TestVideoPipeline", "UnsupportedForCausalLM"] {
+            let directory = checkpoint(class);
+            let refused = loaded(directory.path(), None).await;
+            let Err(ModelResolutionError::Assets(super::assets::Error::Family(
+                ResolveError::Unserved { served, .. },
+            ))) = refused
+            else {
+                panic!("{class} is refused: {refused:?}");
+            };
+            assert!(served.contains("ChatForCausalLM"), "{served}");
+        }
     }
 
-    /// A pipeline admits the prompt length its deployment states, and a
-    /// deployment that states none is refused: no checkpoint figure implies
-    /// one.
+    /// A pipeline admits the prompt length its deployment states, and a deployment that states
+    /// none is refused: no checkpoint figure implies one; a chat family has no pipeline form.
     #[test]
     fn a_pipeline_admits_the_prompt_length_its_deployment_states() {
-        let profile = ModelConfig::from_pipeline(VIDEO, Some(2048)).unwrap();
-        assert_eq!(profile.family, VIDEO);
+        let program = crate::api::test_support::program();
+        let family = |id: &str| {
+            program
+                .families()
+                .iter()
+                .find(|family| family.id == id)
+                .cloned()
+                .unwrap()
+        };
+        let profile = ModelConfig::from_pipeline(family("video"), Some(2048)).unwrap();
+        assert_eq!(profile.id(), "video");
         assert_eq!(profile.max_model_len, 2048);
+        assert!(profile.video().is_some());
         assert!(matches!(
-            ModelConfig::from_pipeline(VIDEO, None),
+            ModelConfig::from_pipeline(family("video"), None),
             Err(super::assets::Error::MissingPromptLength)
         ));
-        assert!(ModelConfig::from_pipeline(CHAT, Some(2048)).is_err());
+        assert!(ModelConfig::from_pipeline(family("chat"), Some(2048)).is_err());
     }
 }

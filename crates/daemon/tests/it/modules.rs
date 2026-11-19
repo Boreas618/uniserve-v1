@@ -35,13 +35,14 @@ fn write(root: &Path, files: &[(&str, &str)]) {
     }
 }
 
-/// A source tree of the two packages every apply fixes, as a workspace of two crates: the engine
-/// package, an executable whose vocabulary (`engine/operators.toml`) is [`LATER`] alone, and the
-/// default scheduling policy's program package. Neither is built: fixing a module set selects
-/// among installed revisions and builds nothing.
+/// A source tree of the three packages every apply fixes, as a workspace of three crates: the
+/// engine package, an executable whose vocabulary (`engine/operators.toml`) is [`LATER`] alone,
+/// the default scheduling policy's program package and the default processing program's package.
+/// None is built: fixing a module set selects among installed revisions and builds nothing.
 struct Tree {
     engine: PathBuf,
     policy: PathBuf,
+    processing: PathBuf,
 }
 
 impl Tree {
@@ -50,12 +51,17 @@ impl Tree {
             "op = \"program\"\nbackend = \"{}\"\n\n[source]\nkind = \"wasm\"\n",
             proto::config::DEFAULT_SCHEDULING
         );
+        let processing = format!(
+            "op = \"program\"\nbackend = \"{}\"\n\n[source]\nkind = \"wasm\"\n",
+            proto::config::DEFAULT_PROCESSING
+        );
         write(
             root,
             &[
                 (
                     "Cargo.toml",
-                    "[workspace]\nmembers = [\"engine\", \"policy\"]\nresolver = \"2\"\n",
+                    "[workspace]\nmembers = [\"engine\", \"policy\", \"processing\"]\n\
+                     resolver = \"2\"\n",
                 ),
                 (
                     "engine/Cargo.toml",
@@ -83,11 +89,19 @@ impl Tree {
                 ),
                 ("policy/src/lib.rs", ""),
                 ("policy/package.toml", &policy),
+                (
+                    "processing/Cargo.toml",
+                    "[package]\nname = \"processing-fixture\"\nversion = \"0.1.0\"\n\
+                     edition = \"2024\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+                ),
+                ("processing/src/lib.rs", ""),
+                ("processing/package.toml", &processing),
             ],
         );
         Self {
             engine: root.join("engine"),
             policy: root.join("policy"),
+            processing: root.join("processing"),
         }
     }
 }
@@ -228,7 +242,13 @@ fn the_module_set_is_fixed_over_the_engine_revision_s_operators() {
     let unstated = kernel_package(&directory.path().join("unstated"), UNSTATED, "first");
     let serving = Serving::start(
         &directory.path().join("server"),
-        &[&tree.engine, &tree.policy, &later, &unstated],
+        &[
+            &tree.engine,
+            &tree.policy,
+            &tree.processing,
+            &later,
+            &unstated,
+        ],
     );
 
     // The pin is the deployment's to state: the configuration names no engine revision yet.

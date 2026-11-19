@@ -75,6 +75,12 @@ CHECKPOINTS: dict[str, Checkpoint] = {
     "qwen3": Checkpoint(
         "Qwen/Qwen3-30B-A3B", "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     ),
+    # Qwen3.6-35B-A3B in BF16, a checkpoint of the Qwen3.5-MoE family
+    # (`Qwen3_5MoeForConditionalGeneration`), which the processing program
+    # case serves after an epoch change brings its request side.
+    "qwen3.6": Checkpoint(
+        "Qwen/Qwen3.6-35B-A3B", "345d467b117d1fd5eda9b879a5988de9ae5f47a7"
+    ),
     # The same model's files with other weight values, which a weight
     # update moves a deployment to.
     "qwen3-other-weights": Checkpoint(

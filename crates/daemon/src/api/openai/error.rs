@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use thiserror_ext::{Construct, Macro};
 
 use crate::api::protocol::{ErrorDetail, ErrorResponse};
-use processing::InputError;
+use scheduling::processing::video::InputError;
 
 use crate::api::input::{ServeError, TokenizeError};
 use crate::api::output::OutputError;
@@ -235,6 +235,15 @@ impl From<ServeError> for ApiError {
                 source: TokenizeError::InvalidParameter { param, message },
                 ..
             } => Self::invalid_request(message, param.map(str::to_owned)),
+            // So does a field the family's prompt cannot be made of, as the program names it.
+            ServeError::Tokenize {
+                source:
+                    TokenizeError::Render(scheduling::processing::Refusal {
+                        param: Some(param),
+                        message,
+                    }),
+                ..
+            } => Self::invalid_request(message, Some(param)),
             ServeError::Tokenize { ref source, .. } => {
                 Self::invalid_request(format!("{error}: {source}"), None)
             }
@@ -253,6 +262,10 @@ impl From<ServeError> for ApiError {
             },
             ServeError::Submit(source) => {
                 Self::server_error(format!("engine runtime error: {source}"))
+            }
+            // A fault of the family's code, which ended the request's instance of the program.
+            ServeError::Processing(source) => {
+                Self::server_error(format!("request processing failed: {source}"))
             }
         }
     }

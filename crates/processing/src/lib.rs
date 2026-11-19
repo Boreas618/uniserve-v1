@@ -15,8 +15,14 @@
 //!   ([`VideoFamily::bind`]); the processor validates a model-agnostic request ([`VideoSpec`])
 //!   and processes it into the engine's input ([`VideoInput`]).
 //!
-//! The executable registers the families it serves once; request processing reads them as one
-//! [`Registry`], and nothing in the daemon or the frontend names a model.
+//! The crate is also the **processing program**: built for `wasm32-unknown-unknown`
+//! (`package.toml`), its module serves [`FAMILIES`] through the processing interface
+//! (`scheduling::processing`), and the leader daemon loads the module its epoch's module set
+//! fixes, so an epoch's request side is built from the same tree as its engine and nothing in the
+//! daemon names a model ([`program`]). The request side of chat lives here with the families:
+//! the Jinja chat template a request renders with ([`chat`]) and the parsers of a response's
+//! reasoning and tool calls ([`output`]). The engine links the crate natively for the numerical
+//! facts its models read, and registers the numerical side of the same families.
 //!
 //! The family-neutral rules a video request is processed with are stated here once, each
 //! parameterized by values the family states: the frame rule ([`FrameClips`]), the canvas rule
@@ -30,14 +36,21 @@
 //! model crates read those facts from here.
 
 mod canvas;
+pub mod chat;
+#[cfg(target_arch = "wasm32")]
+mod entropy;
 mod family;
 mod frames;
 mod image;
 mod media;
 pub mod minimax_h3;
+pub mod output;
+pub mod program;
 pub mod qwen;
 pub mod qwen_vl;
 mod serving;
+#[cfg(test)]
+mod testing;
 mod video;
 mod vocabulary;
 
@@ -56,3 +69,8 @@ pub use video::{
     VideoFamily, VideoInput, VideoProcessor, VideoSpec,
 };
 pub use vocabulary::{Vocabulary, VocabularyError};
+
+// The module's exports: the release's families through the processing interface. A crate that
+// serves other families with this one's machinery (a test program) builds it without them.
+#[cfg(feature = "module")]
+scheduling::export_processing!(program::Program<program::Release>);

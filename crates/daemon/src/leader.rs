@@ -42,13 +42,13 @@ use tracing::{debug, info, warn};
 use crate::api::input::media::MediaConnector;
 use crate::api::input::video::{ProcessedVideo, VideoService};
 use crate::api::input::{
-    AdapterSelection, LoadedModel, LoadedRenderer, Processor, RequestRenderer, ServeError,
-    TokenizeError,
+    AdapterSelection, LoadedBinding, LoadedModel, Processor, ServeError, TokenizeError,
 };
 use crate::api::model::ModelConfig;
 use crate::api::output::RequestOutputStream;
+use crate::api::program::Program;
 use crate::api::protocol::VideoGenerationRequest;
-use crate::config::{Config, ReasoningParser, Stated};
+use crate::config::{Config, Stated};
 use crate::engine::client::{EngineClient, EngineReport, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
@@ -62,9 +62,6 @@ use scheduling::routing::Role;
 /// Construction spawns Tokio tasks, so every constructor must be called
 /// within a Tokio runtime.
 pub struct Leader {
-    /// The model families the executable serves, which every preparation of an epoch resolves
-    /// its checkpoint with.
-    pub(crate) families: processing::Registry,
     /// The single model name the API serves, which a change of `served_model_name` renames from
     /// the next request on.
     served_model_name: std::sync::Mutex<Arc<str>>,
@@ -495,6 +492,34 @@ pub(crate) async fn fix_modules(
     fixed.map_err(|error| UpdateError::Refused(format!("fixing the module set: {error:#}")))
 }
 
+/// The processing program `modules` fixes (`ModuleSet::processing`), resolved at the Build
+/// Server at `socket`, which builds its module first when its store does not hold it, and
+/// loaded: the request side of the epoch the set is of.
+///
+/// # Errors
+///
+/// Fails when the set fixes no processing program, or the program cannot be resolved or loaded.
+pub(crate) async fn load_program(
+    socket: &std::path::Path,
+    modules: &crate::epoch::ModuleSet,
+) -> anyhow::Result<Arc<Program>> {
+    let revision = modules
+        .processing
+        .clone()
+        .context("the epoch's module set fixes no processing program")?;
+    let socket = socket.to_owned();
+    let program =
+        tokio::task::spawn_blocking(move || crate::api::program::fetch(&socket, &revision))
+            .await
+            .context("loading the processing program did not complete")??;
+    info!(
+        program = %format!("{}@{}", program.revision().backend, program.revision().revision),
+        families = program.families().len(),
+        "the epoch's processing program is loaded"
+    );
+    Ok(program)
+}
+
 /// The hosts the processes of an epoch of `config` run on, each once, in the order its replicas
 /// and their worlds name them: every replica's scheduler node and its peers'
 /// ([`crate::engine::control::world_hosts`]). Each prepares the epoch's module set before any of
@@ -596,10 +621,10 @@ pub(crate) fn epoch_launches(
 
 /// What a leader prepares before it has an engine (`Leader::prepare`).
 pub(crate) struct Prepared {
-    families: processing::Registry,
     pub(crate) model_config: ModelConfig,
     tokenizer: crate::api::tokenizer::DynTokenizer,
-    renderer: LoadedRenderer,
+    /// The checkpoint's family in the epoch's processing program.
+    binding: LoadedBinding,
     /// The deployment's engine configuration, with the facts the model's files determine.
     pub(crate) engine: proto::config::EngineConfig,
 }
@@ -1042,12 +1067,11 @@ impl Leader {
     /// workers report.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the model families, the options as validated and as stated, the node's daemon \
-                  and instance, the deployment's updater and observation writer, and the \
-                  revision started with its module lock"
+        reason = "the options as validated and as stated, the node's daemon and instance, the \
+                  deployment's updater and observation writer, and the revision started with \
+                  its module lock"
     )]
     pub(crate) async fn start(
-        families: &processing::Registry,
         config: &Config,
         stated: &Stated,
         daemon: String,
@@ -1057,8 +1081,6 @@ impl Leader {
         revision: u64,
         lock: Option<crate::epoch::ModuleSet>,
     ) -> anyhow::Result<Self> {
-        let prepared = Self::prepare(families, config, stated).await?;
-        info!(parallel = ?prepared.engine.parallel, "starting the engine process");
         // The deployment's name is the updater's: every node's daemon and servers know it by it.
         let deployment = updates.deployment().to_owned();
         let build_server = crate::engine::control::ensure_build_server(
@@ -1086,7 +1108,7 @@ impl Leader {
             socket: build_server,
             targets: Vec::new(),
         };
-        let hosts = epoch_hosts(&prepared.engine)?;
+        let hosts = epoch_hosts(&config.engine_config()?)?;
         let named = lock.unwrap_or_else(|| crate::epoch::modules_of(config));
         let modules = fix_modules(local, Some(Arc::clone(&control)), hosts.clone(), named)
             .await
@@ -1099,6 +1121,11 @@ impl Leader {
             policy = %modules.policy.backend,
             "the epoch's module set is fixed"
         );
+        // The epoch's request side is the processing program its module set fixed, built from
+        // the same tree as its engine; the checkpoint resolves among its families.
+        let program = load_program(control.build_server(), &modules).await?;
+        let prepared = Self::prepare(&program, config, stated).await?;
+        info!(parallel = ?prepared.engine.parallel, "starting the engine process");
 
         // The deployment's first epoch takes the number of its first engine, and every replica
         // starts in it.
@@ -1138,7 +1165,6 @@ impl Leader {
         )?;
         for (index, (client, served, observer)) in clients.enumerate() {
             let replica = Replica::new(
-                leader.families.clone(),
                 config,
                 Arc::new(client),
                 observer,
@@ -1216,7 +1242,7 @@ impl Leader {
     ///
     /// As [`Leader::start`], before the engine starts.
     pub(crate) async fn prepare(
-        families: &processing::Registry,
+        program: &Arc<Program>,
         config: &Config,
         stated: &Stated,
     ) -> anyhow::Result<Prepared> {
@@ -1226,7 +1252,7 @@ impl Leader {
         let LoadedModel {
             config: model_config,
             tokenizer,
-            renderer,
+            binding,
             checkpoint,
         } = ModelConfig::load(
             &hub,
@@ -1235,7 +1261,7 @@ impl Leader {
             config.max_model_len,
             &config.chat_config,
             &config.mm_processor_kwargs,
-            families,
+            program,
         )
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model()))?;
@@ -1264,25 +1290,20 @@ impl Leader {
         // sizes requests may target; the family states the sizes and the
         // longest output a configuration leaves unset. Another family's
         // configuration states no `video_config` (`refuse_foreign_options`).
-        if let Some(family) = model_config.video() {
+        if let Some(pipeline) = model_config.video() {
             let video = &mut engine.video;
-            video.sizes.get_or_insert_with(|| {
-                family
-                    .default_sizes()
-                    .iter()
-                    .map(|&size| size.to_owned())
-                    .collect()
-            });
+            video
+                .sizes
+                .get_or_insert_with(|| pipeline.default_sizes.clone());
             video
                 .max_seconds
-                .get_or_insert_with(|| family.default_max_seconds());
+                .get_or_insert(pipeline.default_max_seconds);
         }
 
         Ok(Prepared {
-            families: families.clone(),
             model_config,
             tokenizer,
-            renderer,
+            binding,
             engine,
         })
     }
@@ -1310,10 +1331,8 @@ impl Leader {
         updates: Arc<crate::updates::Updater>,
         recorder: Recorder,
     ) -> anyhow::Result<Self> {
-        let families = prepared.families.clone();
         let processor = Self::processor_of(config, prepared, client.info(), &served)?;
         let engine = Self::new(
-            families,
             vec![Arc::new(client)],
             processor,
             config,
@@ -1342,59 +1361,46 @@ impl Leader {
         served: &proto::config::EngineArgs,
     ) -> anyhow::Result<Processor> {
         let Prepared {
-            families: _,
             model_config,
             tokenizer,
-            renderer,
+            binding,
             engine: _,
         } = prepared;
 
-        // A video checkpoint serves what its placed denoiser declares in the
-        // worker handshake, prepared against the conditioner's vision
-        // processor.
-        // A chat family that takes images lowers them through its bound processor.
-        let mut images = None;
-        let renderer = match renderer {
-            LoadedRenderer::Chat {
-                renderer,
-                images: processor,
-            } => {
-                images = processor;
-                RequestRenderer::Chat(*renderer)
-            }
-            LoadedRenderer::Video { family, files } => {
+        // A video checkpoint serves what its placed denoiser declares in the worker handshake:
+        // its family binds to the description, and its requests are processed through the
+        // binding's video service.
+        let (binding, video) = match binding {
+            LoadedBinding::Chat(binding) => (binding, None),
+            LoadedBinding::Video { program, bind } => {
                 anyhow::ensure!(
                     !info.video_denoiser.is_empty(),
                     "the video worker reported no video denoiser"
                 );
-                let processor = family
-                    .bind(processing::VideoBinding {
-                        description: &info.video_denoiser,
-                        max_seconds: served
-                            .engine_config
-                            .video
-                            .max_seconds
-                            .context("the leader states a video deployment's longest output")?,
-                        processor_options: &config.mm_processor_kwargs,
-                        files: &files,
-                    })
-                    .map_err(|message| anyhow::anyhow!("binding the video processor: {message}"))?;
-                RequestRenderer::Video(
-                    VideoService::new(processor, &config.media_config, Arc::clone(&tokenizer))
-                        .context("failed to bind the video service")?,
-                )
+                let video = scheduling::processing::video::Binding {
+                    description: info.video_denoiser.clone(),
+                    max_seconds: served
+                        .engine_config
+                        .video
+                        .max_seconds
+                        .context("the leader states a video deployment's longest output")?,
+                };
+                let bind = scheduling::processing::Bind {
+                    video: Some(video),
+                    ..*bind
+                };
+                let binding = program
+                    .bind(bind, Arc::clone(&tokenizer))
+                    .context("binding the video processor")?;
+                let service = VideoService::new(Arc::clone(&binding), &config.media_config)
+                    .context("failed to bind the video service")?;
+                (binding, Some(service))
             }
         };
 
-        let processor = Processor::new(
-            model_config,
-            tokenizer,
-            renderer,
-            info.limits.clone(),
-            config.chat_config.reasoning_parser == ReasoningParser::Auto,
-        )
-        .context("failed to bind the configured model description")?
-        .with_images(images);
+        let processor =
+            Processor::new(model_config, tokenizer, binding, video, info.limits.clone())
+                .context("failed to bind the configured model description")?;
         Ok(processor)
     }
 
@@ -1402,14 +1408,12 @@ impl Leader {
     /// statistics read through `observer`, under the names `options` states (its
     /// `served_model_name` for the API, its model for the metrics' labels), resolving every
     /// request's image references as its `image_fetch_config` states, and logging and migrating
-    /// requests as its `logging_config` and `migration_config` state. `families` resolves the
-    /// checkpoint of every later update.
+    /// requests as its `logging_config` and `migration_config` state.
     ///
     /// # Errors
     ///
     /// Fails when the image fetcher cannot be built.
     pub(crate) fn new(
-        families: processing::Registry,
         clients: Vec<Arc<EngineClient>>,
         processor: Processor,
         options: &Config,
@@ -1438,7 +1442,6 @@ impl Leader {
                     .enumerate()
                     .map(|(index, client)| {
                         Replica::new(
-                            families.clone(),
                             &replica_options,
                             client,
                             Arc::clone(&observer),
@@ -1462,7 +1465,6 @@ impl Leader {
         }
         let directory = Arc::new(crate::directory::Directory::new(updates.deployment()));
         Ok(Self {
-            families,
             served_model_name: std::sync::Mutex::new(Arc::from(served_model_name)),
             replicas,
             images,
@@ -1503,12 +1505,11 @@ impl Leader {
         info!(%former, name, "the deployment serves under its new name");
     }
 
-    /// The tasks this engine serves: what the served family declares it serves
-    /// ([`processing::Family::serving`]).
+    /// The tasks this engine serves: what the served family declares it serves.
     pub fn supported_tasks(&self) -> Vec<Task> {
         match self.processor().config().family.serving {
-            processing::Serving::Chat(_) => vec![Task::Generate],
-            processing::Serving::Video(_) => vec![Task::VideoGeneration],
+            scheduling::processing::Serving::Chat { .. } => vec![Task::Generate],
+            scheduling::processing::Serving::Video(_) => vec![Task::VideoGeneration],
         }
     }
 
@@ -1574,7 +1575,7 @@ impl Leader {
                 source: error.source,
             })?;
         drop(fetch);
-        let (request, lowering) = preprocess(&request_id, {
+        let (request, lowering, parser) = preprocess(&request_id, {
             let request_id = request_id.clone();
             let processor = Arc::clone(&processor);
             move || processor.process(&request_id, &request, adapter.as_ref(), images, trace)
@@ -1594,18 +1595,13 @@ impl Leader {
         let output = crate::api::output::OutputProcessor::new(
             processor.tokenizer(),
             lowering,
+            parser,
             compile_us,
             Box::new(stats),
         )?
         .traced(trace);
 
         Ok((Box::new(events), output))
-    }
-
-    /// The model's tokenizer, which a successor builds the decoder of a
-    /// handoff's body from.
-    pub(crate) fn tokenizer(&self) -> crate::api::tokenizer::DynTokenizer {
-        self.processor().tokenizer()
     }
 
     /// The statistics recorder of a request this process takes over, under
@@ -2056,91 +2052,74 @@ pub(crate) enum UpdateError {
 }
 
 /// Whether the daemon processes requests for the checkpoint in the directory `path` as it does
-/// for the served checkpoint in the directory `served`, whose family of `families` both must
-/// declare: the files its family reads to process a request, each the same in both, byte for
-/// byte, and published by both or by neither.
+/// for the served checkpoint in the directory `served`, whose family of the epoch's processing
+/// `program` both must declare: the files its family reads to process a request, each the same
+/// in both, byte for byte, and published by both or by neither.
 ///
-/// What a family reads is declared, not probed: a chat family's request processing reads the
-/// checkpoint's tokenizer, tokenizer settings, generation defaults and chat template where the
-/// family keeps them ([`crate::api::model::assets::ChatFiles`]); a video family's reads its
-/// pipeline index and every file of the pipeline parts it declares
-/// ([`processing::VideoFamily::processing_parts`]). The model facts (`config.json`) are compared
-/// by the engine configuration's own comparison (`proto::config::ModelConfig::processes_as`).
+/// What a family reads is declared by the program, not probed: a chat family's request
+/// processing reads the checkpoint's tokenizer and the files its binding reads (its tokenizer
+/// settings, generation defaults and chat template where the family keeps them,
+/// [`crate::api::model::assets::ChatFiles`]); a video family's reads its pipeline index and
+/// every file of the pipeline parts it declares (`Pipeline::processing_parts`). The model
+/// facts (`config.json`) are also compared by the engine configuration's own comparison
+/// (`proto::config::ModelConfig::processes_as`).
 ///
 /// # Errors
 ///
 /// The reason the checkpoints differ, or the reason a checkpoint's files cannot be resolved or
 /// read.
 pub(crate) async fn same_processing(
-    families: &processing::Registry,
+    program: &Program,
     served: &str,
     path: &str,
 ) -> Result<(), String> {
     let declared = |directory: &str| {
-        crate::api::model::assets::declared_family(std::path::Path::new(directory), families)
+        crate::api::model::assets::declared_family(std::path::Path::new(directory), program)
             .map_err(|error| format!("resolving the family of {directory}: {error}"))
     };
     let family = declared(served)?;
     let other = declared(path)?;
-    if other != family {
+    if other.id != family.id {
         return Err(format!(
             "the checkpoint at {path} is a {} model, not a {} model as the served one: deploy it \
              instead",
             other.id, family.id
         ));
     }
-    match family.serving {
-        processing::Serving::Video(video) => same_pipeline(
+    match &family.serving {
+        scheduling::processing::Serving::Video(video) => same_pipeline(
             family.root,
-            video.processing_parts(),
+            &video.processing_parts,
             std::path::Path::new(served),
             std::path::Path::new(path),
         ),
-        processing::Serving::Chat(profile) => same_model_files(profile.checkpoint, served, path),
+        scheduling::processing::Serving::Chat { files } => same_model_files(files, served, path),
     }
 }
 
-/// [`same_processing`] for a chat checkpoint: the files of it request processing reads, where
-/// its family (`checkpoint`) keeps them.
+/// [`same_processing`] for a chat checkpoint: the files of it request processing reads, as its
+/// family declares them (`declared`), and its tokenizer.
 fn same_model_files(
-    checkpoint: processing::ChatCheckpoint,
+    declared: &[scheduling::processing::CheckpointFile],
     served: &str,
     path: &str,
 ) -> Result<(), String> {
     use crate::api::model::assets::ChatFiles;
 
     let locate = |directory: &str| {
-        ChatFiles::locate(std::path::Path::new(directory), checkpoint)
+        ChatFiles::locate(std::path::Path::new(directory), declared)
             .map_err(|error| format!("resolving the files of {directory}: {error}"))
     };
     let (old, new) = (locate(served)?, locate(path)?);
-    let template = |files: &ChatFiles| files.chat_template().map_err(|error| error.to_string());
-    if template(&old)? != template(&new)? {
-        return Err(format!(
-            "the checkpoint at {path} has another chat template than the served model, which \
-             changes how requests are processed: deploy it instead"
-        ));
-    }
-    let tokenizer = |files: &ChatFiles| files.tokenizer_directory().join("tokenizer.json");
-    let (old_tokenizer, new_tokenizer) = (tokenizer(&old), tokenizer(&new));
-    for (name, old, new) in [
-        (
-            "tokenizer.json",
-            Some(old_tokenizer.as_path()),
-            Some(new_tokenizer.as_path()),
-        ),
-        (
-            "tokenizer_config.json",
-            Some(old.tokenizer_config()),
-            Some(new.tokenizer_config()),
-        ),
-        (
-            "generation_config.json",
-            old.generation_config(),
-            new.generation_config(),
-        ),
-    ] {
-        if read_published(old)? != read_published(new)? {
+    let listed = |files: &ChatFiles| -> BTreeMap<String, std::path::PathBuf> {
+        files.processing_files().into_iter().collect()
+    };
+    let (old, new) = (listed(&old), listed(&new));
+    let names: std::collections::BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    for name in names {
+        if read_published(old.get(name).map(std::path::PathBuf::as_path))?
+            != read_published(new.get(name).map(std::path::PathBuf::as_path))?
+        {
             return Err(format!(
                 "the checkpoint at {path} has another {name} than the served model, which \
                  changes how requests are processed: deploy it instead"
@@ -2177,8 +2156,8 @@ fn part_files(
 /// [`same_processing`] for a diffusers checkpoint: the same pipeline index, and in every part of
 /// `parts` the same files, compared both ways.
 fn same_pipeline(
-    index: processing::RootFile,
-    parts: &[&str],
+    index: scheduling::processing::RootFile,
+    parts: &[String],
     served: &std::path::Path,
     path: &std::path::Path,
 ) -> Result<(), String> {
@@ -2238,9 +2217,6 @@ fn same_pipeline(
 /// One independent replica: the engine its requests go to, the arguments
 /// that engine serves with, and its standby.
 pub(crate) struct Replica {
-    /// The model families the executable serves, which an update of this replica resolves its
-    /// target checkpoint with.
-    pub(crate) families: processing::Registry,
     pub(crate) registry: std::sync::Weak<Replicas>,
     pub(crate) ordinal: usize,
     pub(crate) migrator: Migrator,
@@ -2309,14 +2285,7 @@ impl Replica {
             .unwrap_or(Role::Mixed)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a replica's model families, options and engine, the two readers of its \
-                  engine's reports (its observer and the deployment's recorder), and its place in \
-                  the replica set with the set's adapters"
-    )]
     pub(crate) fn new(
-        families: processing::Registry,
         options: &Config,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
@@ -2328,7 +2297,6 @@ impl Replica {
         let hold = Arc::new(RequestHold::new());
         let reroute: std::sync::Weak<Replicas> = std::sync::Weak::clone(&registry);
         let replica = Arc::new(Replica {
-            families,
             registry,
             ordinal,
             migrator: Migrator::new(
@@ -2720,7 +2688,6 @@ impl Replica {
                 Some(replica) => Arc::clone(replica),
                 None => {
                     let replica = Replica::new(
-                        self.families.clone(),
                         &config,
                         Arc::clone(client),
                         Arc::clone(&observers[index]),
@@ -4763,51 +4730,15 @@ mod tests {
     /// part the family does not declare decides nothing.
     #[tokio::test]
     async fn a_pipeline_differs_by_a_part_file_either_side_holds_alone() {
-        struct Parts;
-
-        impl processing::VideoFamily for Parts {
-            fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
-                &[]
-            }
-
-            fn default_sizes(&self) -> &'static [&'static str] {
-                &["64x64"]
-            }
-
-            fn default_max_seconds(&self) -> f64 {
-                1.0
-            }
-
-            fn processing_parts(&self) -> &'static [&'static str] {
-                &["processor"]
-            }
-
-            fn base_pin(&self) -> Option<processing::BasePin> {
-                None
-            }
-
-            fn bind(
-                &self,
-                _: processing::VideoBinding<'_>,
-            ) -> Result<Box<dyn processing::VideoProcessor>, String> {
-                Err("this family binds no processor".to_owned())
-            }
-        }
-
-        const PARTS: processing::Family = processing::Family {
-            id: "parts",
-            root: processing::RootFile::ModularIndex,
-            classes: &["PartsPipeline"],
-            serving: processing::Serving::Video(&Parts),
-        };
-        let families = processing::Registry::new([PARTS]).unwrap();
+        // The tests' program's video family declares its `processor` part.
+        let program = crate::api::test_support::program();
         let checkpoint = |files: &[(&str, &str)]| {
             let directory = tempfile::tempdir().unwrap();
             std::fs::write(
                 directory
                     .path()
-                    .join(processing::RootFile::ModularIndex.name()),
-                r#"{"_class_name": "PartsPipeline"}"#,
+                    .join(scheduling::processing::RootFile::ModularIndex.name()),
+                r#"{"_class_name": "TestVideoPipeline"}"#,
             )
             .unwrap();
             for (name, text) in files {
@@ -4818,10 +4749,10 @@ mod tests {
             directory
         };
         let compare = |served: &tempfile::TempDir, other: &tempfile::TempDir| {
-            let families = families.clone();
+            let program = Arc::clone(&program);
             let served = served.path().to_str().unwrap().to_owned();
             let other = other.path().to_str().unwrap().to_owned();
-            async move { super::same_processing(&families, &served, &other).await }
+            async move { super::same_processing(&program, &served, &other).await }
         };
 
         let processor = ("processor/preprocessor_config.json", "{}");

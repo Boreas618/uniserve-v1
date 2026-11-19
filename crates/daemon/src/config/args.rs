@@ -312,10 +312,11 @@ role = \"prefill\"
         let (reread, _) = parse(&text).unwrap();
         assert_eq!(reread, config, "{text}");
 
-        for (description, body) in [
-            (&CHAT, "[chat_config]\nreasoning_parser = \"none\"\n"),
-            (&VIDEO, "[video_config]\nmax_seconds = 5\n"),
+        for (family, body) in [
+            (CHAT, "[chat_config]\nreasoning_parser = \"none\"\n"),
+            (VIDEO, "[video_config]\nmax_seconds = 5\n"),
         ] {
+            let description = &crate::test_support::test_model(family).family;
             let (config, stated) = parse(&package(body)).unwrap();
             config.validate(&stated).unwrap();
             stated.refuse_foreign_options(description).unwrap();
@@ -559,10 +560,11 @@ role = \"prefill\"
     /// unstated defaults never are.
     #[test]
     fn options_of_another_family_are_refused() {
-        use crate::test_support::{CHAT as Chat, VIDEO as Video};
+        let chat_family = crate::test_support::test_model(crate::test_support::CHAT).family;
+        let video_family = crate::test_support::test_model(crate::test_support::VIDEO).family;
 
         let (_, defaults) = parse(&package("")).unwrap();
-        for description in [&Chat, &Video] {
+        for description in [&chat_family, &video_family] {
             assert!(defaults.refuse_foreign_options(description).is_ok());
         }
         let refused = |body: &str, description| {
@@ -571,18 +573,18 @@ role = \"prefill\"
         };
         let video = "[video_config]\nmax_seconds = 5\n";
         let chat = "[chat_config]\nreasoning_parser = \"none\"\n";
-        assert!(refused(video, &Chat));
-        assert!(!refused(video, &Video));
-        assert!(refused(chat, &Video));
-        assert!(!refused(chat, &Chat));
+        assert!(refused(video, &chat_family));
+        assert!(!refused(video, &video_family));
+        assert!(refused(chat, &video_family));
+        assert!(!refused(chat, &chat_family));
         // A video pipeline schedules no token batches and renders no chat.
         for token_option in [
             "max_num_batched_tokens = 2048\n",
             "[scheduler_config]\nchunked_prefill_size = 512\n",
             chat,
         ] {
-            assert!(refused(token_option, &Video), "{token_option}");
-            assert!(!refused(token_option, &Chat), "{token_option}");
+            assert!(refused(token_option, &video_family), "{token_option}");
+            assert!(!refused(token_option, &chat_family), "{token_option}");
         }
     }
 

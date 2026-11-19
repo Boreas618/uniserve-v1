@@ -12,7 +12,7 @@
 //! lands on the same side. How the sized pixels become the tower's patch rows is the model's
 //! (`qwen3::vision::patch_format`).
 
-use proto::video::VisionGrid;
+use scheduling::processing::video::VisionGrid;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

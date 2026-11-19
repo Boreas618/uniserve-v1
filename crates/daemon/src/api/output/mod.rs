@@ -3,7 +3,7 @@
 //!
 //! A token request's [`OutputProcessor`] decodes its events (`text`), parses
 //! reasoning and tool calls in the formats the request's model family writes
-//! (`chat`, `reasoning`, `tools`) and frames the result as [`RequestOutput`]s,
+//! through the epoch's processing program (`chat`) and frames the result as [`RequestOutput`]s,
 //! which the route's response body writes; `media_output` frames a video
 //! request's events, whose artifacts `video` collects. What a request's
 //! output processing is built from is the lowering its input processing
@@ -13,9 +13,7 @@ mod assembly;
 pub mod chat;
 mod events;
 mod processor;
-pub mod reasoning;
 pub mod text;
-pub mod tools;
 pub mod video;
 
 use std::pin::Pin;

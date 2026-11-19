@@ -11,11 +11,10 @@ publish = false
 # the OpenAI-compatible routes, input processing, output processing,
 # tokenizers and the wire protocol), the served model over the engine
 # processes, and the client of their request interface. The API server runs
-# no numerical code: of a model family it reads only what request processing
-# serves (`processing::Family`).
+# no numerical code and links no model family: a family's request side is the
+# epoch's processing program (`api::program`), which the daemon loads with each
+# epoch's module set.
 [dependencies]
-# The strict push parser a JSON tool call is read with as it streams.
-actson.workspace = true
 anyhow.workspace = true
 # The record batches of the observation tables and their JSON and Arrow IPC encodings.
 arrow.workspace = true
@@ -40,13 +39,11 @@ http-body.workspace = true
 # own connections parse (`http::conn`).
 httparse.workspace = true
 image.workspace = true
+# The ordered tables of a checkpoint's tokenizer files, read in the order the file states them.
+indexmap = { workspace = true, features = ["serde"] }
 # The IANA special-purpose address registries: the destinations a media fetch may not reach.
 iprfc.workspace = true
-# The ordered tables of a checkpoint's JSON files, read in the order the file states them.
-indexmap = { workspace = true, features = ["serde"] }
 itertools.workspace = true
-# The schemas of a request's tools, which type and check a tag tool call's arguments.
-jsonschema.workspace = true
 libc.workspace = true
 # This host's name (`uname(2)`), the default host identity; a handed
 # connection's socket family; the monotonic clock a handoff's pause is
@@ -55,17 +52,15 @@ rustix = { workspace = true, features = ["net", "time"] }
 llm-multimodal.workspace = true
 # The media decoders condition media is probed with, the ones that read it.
 media.workspace = true
-minijinja.workspace = true
-minijinja-contrib.workspace = true
 # The Build Server's client, which an epoch's modules are selected with
 # (`epoch`, the generation layer of a change).
 build-server.workspace = true
 # The OTLP messages of the observation store's push (`observation::export`).
 opentelemetry-proto.workspace = true
 prost.workspace = true
-processing.workspace = true
-# The program host, which runs the policy package's control and routing programs on the leader
-# (`programs`), and the program SDK whose inputs and outputs they read and give.
+# The program host, which runs the policy package's control and routing programs and each
+# epoch's processing program on the leader (`programs`, `api::program`), and the program SDK
+# whose inputs and outputs they read and give.
 program.workspace = true
 scheduling.workspace = true
 proto.workspace = true
@@ -77,7 +72,6 @@ serde.workspace = true
 # The video request schema's field names (`protocol::video`).
 serde-aux.workspace = true
 serde_json.workspace = true
-serde-json-fmt.workspace = true
 serde_path_to_error.workspace = true
 # The form-encoded parameters of `/admin/query`.
 serde_urlencoded.workspace = true
@@ -111,6 +105,9 @@ validator.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# The wasm32 modules of the processing programs the tests serve (`api::test_support::program`),
+# built by the cargo that runs the tests.
+program-testing.workspace = true
 # The paused clock of the tests that wait on a deadline (`tokio::time::pause`).
 tokio = { workspace = true, features = ["test-util"] }
 expect-test.workspace = true
@@ -138,9 +135,6 @@ platform.workspace = true
 name = "tokenizer_hf"
 harness = false
 
-[[bench]]
-name = "tool_parsers"
-harness = false
 
 # Helper binaries of the integration tests (`tests/it`), which reach them through
 # `CARGO_BIN_EXE_<name>`: the stand-in engine a node starts as it starts an engine, and a node's

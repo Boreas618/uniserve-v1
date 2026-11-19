@@ -26,8 +26,12 @@
 //! - Every call is given a fuel budget ([`Budget`]), the instructions it may execute, and its
 //!   memory is bounded.
 //! - The host functions are answered by the embedder: `uniserve.log` by [`Host`], which every
-//!   program may call, and `uniserve.stats`, `uniserve.group`, `uniserve.events` and
-//!   `uniserve.validate` by [`Control`], which only a control program's module is linked with.
+//!   program may call, `uniserve.stats`, `uniserve.group`, `uniserve.events` and
+//!   `uniserve.validate` by [`Control`], which only a control program's module is linked with,
+//!   and `uniserve.token` and `uniserve.encode` by [`Vocabulary`], which only a processing
+//!   program's module is linked with ([`Module::processing`]).
+//! - A processing program (`scheduling::processing`) has exports of its own: its instance is a
+//!   [`Processor`], whose calls each run within the budget of their export ([`Budgets`]).
 //! - A program that panics, runs past its fuel, traps or breaks the protocol ends its instance
 //!   ([`Error::Ended`] with its [`Reason`]); the embedder records it. The host never panics on
 //!   a program's behaviour.
@@ -37,11 +41,13 @@
 
 mod host;
 mod instance;
+mod processing;
 
 use std::sync::OnceLock;
 
 pub use host::{Control, Host};
 pub use instance::{Budget, Call, Error, Instance, Reason, Usage};
+pub use processing::{Budgets, Fuel, Processor, Vocabulary};
 pub use scheduling::control::{
     Config, Filter, Function, Group, Query, Record, Report, Room, State,
 };
@@ -138,7 +144,7 @@ impl<H: 'static> Module<H> {
 
 impl<H: Host> Module<H> {
     /// Compiles `bytes`, a wasm32 module of a routing or KV program: linked with `uniserve.log`
-    /// only.
+    /// only. A processing program's module is compiled by [`Module::processing`].
     ///
     /// # Errors
     ///
@@ -174,7 +180,12 @@ impl<H: Host> Module<H> {
 
         let module = wasmtime::Module::new(engine()?, bytes)
             .map_err(|error| Error::Load(format!("the bytes are not a program module: {error}")))?;
-        instance::check(&module)?;
+        let exports: &[&str] = if kind == Kind::Processing {
+            &scheduling::processing::EXPORTS
+        } else {
+            &scheduling::program::EXPORTS
+        };
+        instance::check(&module, exports)?;
 
         let pre = linker
             .instantiate_pre(&module)

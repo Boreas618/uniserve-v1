@@ -247,7 +247,10 @@ impl Leader {
         let Some((serving, record)) = self.updates.epochs().serving() else {
             return self.apply_in_place(target, stated, revision).await;
         };
-        let form = if named == Change::Epoch || record.engine != next.modules.engine {
+        let form = if named == Change::Epoch
+            || record.engine != next.modules.engine
+            || record.processing != next.modules.processing
+        {
             Effect::Epoch
         } else if named == Change::Generation
             || record.kernels != next.modules.kernels
@@ -366,7 +369,8 @@ impl Leader {
         };
         Ok(record.engine != modules.engine
             || record.kernels != modules.kernels
-            || record.policy != modules.policy)
+            || record.policy != modules.policy
+            || record.processing != modules.processing)
     }
 
     /// The per-replica path of a change that starts no update: the daemon's own options (a
@@ -560,11 +564,16 @@ impl Leader {
             .unwrap_or(serving.number())
             + 1;
 
+        // The target's request side is the processing program its module set fixed, built from
+        // the same tree as its engine; its checkpoint resolves among that program's families.
+        let program = crate::leader::load_program(control.build_server(), &next.modules)
+            .await
+            .map_err(refused)?;
         // The target's engine configuration is resolved as a deployment's
         // start resolves it: the options state the scheduler and the rank
         // layout, and the model's files complete what they determine.
         let prepared = Leader::prepare(
-            &self.families,
+            &program,
             target,
             &crate::config::Stated::from_paths(Vec::new()),
         )
@@ -577,10 +586,11 @@ impl Leader {
         // epoch holds continue nowhere else: it runs every one to its end (a complete drain),
         // none migrating, and a rollback does the same the other way.
         let served = service::lock(&replicas[0].served).clone();
+        let serving_program = Arc::clone(self.processor().program());
         let processes_otherwise = match served {
             Some(served) if served.engine_config.model.model != engine.model.model => {
                 let files = crate::leader::same_processing(
-                    &self.families,
+                    &serving_program,
                     &served.engine_config.model.model,
                     &engine.model.model,
                 )
@@ -594,6 +604,17 @@ impl Leader {
                 model = target.model(),
                 "the target's model files process requests otherwise: it serves with a processor \
                  of its own, and the serving epoch runs its requests to their ends"
+            );
+        }
+        // Another processing program processes the target's new requests: from the switch on
+        // they render and parse in it, while the requests the serving epoch holds keep the
+        // instances of the program they arrived with, whichever engine computes them.
+        let reprocesses = processes_otherwise || program.digest() != serving_program.digest();
+        if reprocesses && !processes_otherwise {
+            info!(
+                program = %format!("{}@{}", program.revision().backend, program.revision().revision),
+                "the target processes requests through another processing program from its \
+                 switch on"
             );
         }
 
@@ -690,6 +711,7 @@ impl Leader {
         record.engine = next.modules.engine.clone();
         record.kernels = next.modules.kernels.clone();
         record.policy = next.modules.policy.clone();
+        record.processing = next.modules.processing.clone();
         record.previous = None;
         // The target's generation is set only by its own engines' reports.
         record.generation = None;
@@ -730,7 +752,7 @@ impl Leader {
                 config: Box::new(target.clone()),
                 epoch: target_epoch,
                 keep: options.in_flight == InFlight::Keep,
-                processing: processes_otherwise.then(|| Box::new(prepared)),
+                processing: reprocesses.then(|| Box::new(prepared)),
             }),
         );
         Ok(Applied::Update(Box::new(report)))
@@ -825,7 +847,13 @@ impl Replica {
         // The target's engine configuration is resolved as a deployment's start resolves it:
         // from the options, completed by what the model's files determine, and divided into the
         // deployment's replicas.
-        let prepared = Leader::prepare(&self.families, &target, &stated)
+        // An in-place change keeps the serving epoch, and with it the epoch's processing program.
+        let program = self
+            .registry
+            .upgrade()
+            .map(|replicas| Arc::clone(replicas.processor().program()))
+            .ok_or(UpdateError::NoEngine)?;
+        let prepared = Leader::prepare(&program, &target, &stated)
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
         let replicas = crate::leader::replica_configs(&prepared.engine)

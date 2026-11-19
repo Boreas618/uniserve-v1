@@ -552,6 +552,11 @@ mod tests {
             },
             kernels: BTreeMap::new(),
             programs: Default::default(),
+            processing: Some(proto::module::PackageRevision {
+                backend: "processing".to_owned(),
+                revision: 2,
+                arguments: toml::Table::new(),
+            }),
         };
         revisions.lock(one, &modules).unwrap();
         assert_eq!(revisions.load(one).unwrap().lock, Some(modules));

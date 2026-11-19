@@ -2,13 +2,16 @@
 //!
 //! A pipeline checkpoint holds its stages in the folders its root index names
 //! ([`PipelineIndex`]). A family whose checkpoints may hold only some of them declares where they
-//! pin the release whose folders supply the others ([`processing::BasePin`]); such a checkpoint
+//! pin the release whose folders supply the others (`scheduling::processing::video::BasePin`); such
+//! a checkpoint
 //! holds the stage folders it replaces, and every other stage is read from the release's
 //! snapshot. An engine opens the checkpoint and the release as one checkpoint
 //! ([`super::Checkpoint::base`]).
 
 use std::path::{Path, PathBuf};
 
+use scheduling::processing::RootFile;
+use scheduling::processing::video::BasePin;
 use serde_json::Value;
 
 use crate::api::model::assets::error::{Error, Result};
@@ -28,8 +31,9 @@ pub struct PipelineCheckpoint {
 }
 
 impl PipelineCheckpoint {
-    /// Opens the pipeline checkpoint `snapshot` holds, of the video family `family`, whose
-    /// checkpoints publish their stage index in `index`; `None` for a checkpoint that publishes
+    /// Opens the pipeline checkpoint `snapshot` holds, of a video family whose checkpoints
+    /// publish their stage index in `index` and pin the release they continue where `pin` says
+    /// (`None` for a family whose checkpoints pin none); `None` for a checkpoint that publishes
     /// no index.
     ///
     /// The checkpoint's root files and the folders of the stages its index declares are fetched
@@ -44,8 +48,8 @@ impl PipelineCheckpoint {
     /// fetching either snapshot.
     pub async fn open(
         snapshot: &Snapshot,
-        index: processing::RootFile,
-        family: &dyn processing::VideoFamily,
+        index: RootFile,
+        pin: Option<&BasePin>,
         hub: &Hub,
     ) -> Result<Option<Self>> {
         let directory = snapshot.directory();
@@ -57,7 +61,7 @@ impl PipelineCheckpoint {
             .fetch(|file| root_file(file) || index.holds(file))
             .await?;
 
-        let pinned = match family.base_pin() {
+        let pinned = match pin {
             Some(pin) => pinned_release(directory, pin)?,
             None => None,
         };
@@ -129,16 +133,16 @@ impl PipelineCheckpoint {
 ///
 /// Fails when the file cannot be read, is not JSON, or states a field that is not
 /// `hf://<owner>/<name>@<revision>`.
-fn pinned_release(directory: &Path, pin: processing::BasePin) -> Result<Option<HubAsset>> {
-    let Some(text) = optional_text(directory, pin.file)? else {
+fn pinned_release(directory: &Path, pin: &BasePin) -> Result<Option<HubAsset>> {
+    let Some(text) = optional_text(directory, &pin.file)? else {
         return Ok(None);
     };
-    let path = directory.join(pin.file);
+    let path = directory.join(&pin.file);
     let description: Value = serde_json::from_str(&text).map_err(|source| Error::Json {
         path: path.clone(),
         source,
     })?;
-    match description.get(pin.field) {
+    match description.get(&pin.field) {
         None => Ok(None),
         Some(Value::String(release)) => HubAsset::parse_pin(release).map(Some),
         Some(_) => Err(Error::invalid(format!(
@@ -154,7 +158,6 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use processing::{BasePin, VideoBinding, VideoFamily, VideoProcessor};
     use tempfile::{TempDir, tempdir};
 
     use super::*;
@@ -162,38 +165,11 @@ mod tests {
 
     const BASE: &str = "org/base";
 
-    /// A family whose checkpoints pin their release in `release.json`.
-    struct Layered;
-
-    impl VideoFamily for Layered {
-        fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
-            &[]
-        }
-
-        fn default_sizes(&self) -> &'static [&'static str] {
-            &["64x64"]
-        }
-
-        fn default_max_seconds(&self) -> f64 {
-            1.0
-        }
-
-        fn processing_parts(&self) -> &'static [&'static str] {
-            &["tokenizer", "processor"]
-        }
-
-        fn base_pin(&self) -> Option<BasePin> {
-            Some(BasePin {
-                file: "release.json",
-                field: "base",
-            })
-        }
-
-        fn bind(
-            &self,
-            _: VideoBinding<'_>,
-        ) -> std::result::Result<Box<dyn VideoProcessor>, String> {
-            Err("this family binds no processor".to_owned())
+    /// Where the tests' family's checkpoints pin their release: `release.json`'s `base`.
+    fn layered() -> BasePin {
+        BasePin {
+            file: "release.json".to_owned(),
+            field: "base".to_owned(),
         }
     }
 
@@ -251,8 +227,8 @@ mod tests {
 
         let checkpoint = PipelineCheckpoint::open(
             &Snapshot::local(export.path().to_path_buf()),
-            processing::RootFile::ModularIndex,
-            &Layered,
+            RootFile::ModularIndex,
+            Some(&layered()),
             &hub,
         )
         .await
@@ -288,8 +264,8 @@ mod tests {
 
         let checkpoint = PipelineCheckpoint::open(
             &Snapshot::local(export.path().to_path_buf()),
-            processing::RootFile::ModularIndex,
-            &Layered,
+            RootFile::ModularIndex,
+            Some(&layered()),
             &hub,
         )
         .await

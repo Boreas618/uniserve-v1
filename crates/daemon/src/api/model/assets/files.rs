@@ -1,64 +1,55 @@
-//! The files of a chat checkpoint that request processing reads, where its family keeps them.
+//! The files of a chat checkpoint that request processing reads, as its family declares them.
 //!
-//! Every chat checkpoint publishes, at its root, the configuration that declares its family
-//! ([`processing::RootFile::Config`]) and its tokenizer (`tokenizer.json` with `tokenizer_config.json`,
-//! as `transformers` saves a tokenizer). Its generation defaults (`generation_config.json`) are
-//! optional in the format. Where it states its context bound and keeps its chat template is the
-//! family's declaration ([`processing::ChatCheckpoint`]), so nothing is found by trying the places
-//! other families use.
+//! Every chat checkpoint publishes its tokenizer definition at its root (`tokenizer.json`, with
+//! the tokens `tokenizer_config.json` declares, as `transformers` saves a tokenizer), which the
+//! daemon loads itself. Every other file request processing reads is the family's declaration
+//! (`scheduling::processing::Serving::Chat`): the processing program names each file its binding
+//! reads and whether a checkpoint must publish it, and the daemon reads exactly those, so
+//! nothing is found by trying the places other families use.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use processing::{ChatCheckpoint, ChatTemplate};
-use serde_json::Value;
+use scheduling::processing::CheckpointFile;
 
-use crate::api::model::assets::config::{load_tokenizer_config, read_json};
 use crate::api::model::assets::error::{Error, Result};
 use crate::api::model::assets::{optional_file, required_file};
 
 /// The tokenizer definition every chat checkpoint publishes at its root.
-const TOKENIZER_FILE: &str = "tokenizer.json";
-
-/// The tokenizer metadata every chat checkpoint publishes beside its definition.
-const TOKENIZER_CONFIG_FILE: &str = "tokenizer_config.json";
-
-/// The generation defaults a checkpoint may publish.
-const GENERATION_CONFIG_FILE: &str = "generation_config.json";
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
 /// The files of one chat checkpoint request processing reads.
 #[derive(Debug, Clone)]
 pub struct ChatFiles {
     /// The checkpoint's directory, which holds its tokenizer.
     directory: PathBuf,
-    /// The configuration that declares the family.
-    config: PathBuf,
-    /// The tokenizer metadata.
-    tokenizer_config: PathBuf,
-    /// The generation defaults, when the checkpoint publishes them.
-    generation_config: Option<PathBuf>,
-    /// Where the family keeps what else request processing reads.
-    checkpoint: ChatCheckpoint,
+    /// Every declared file the checkpoint publishes, by its path relative to the root.
+    files: BTreeMap<String, PathBuf>,
 }
 
 impl ChatFiles {
-    /// The files of the chat checkpoint in `directory`, whose family keeps its context bound and
-    /// template as `checkpoint` states.
+    /// The files of the chat checkpoint in `directory` whose family's binding reads `declared`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MissingFile`] when the checkpoint lacks its configuration, either
-    /// tokenizer file, or the template file its family declares.
-    pub fn locate(directory: &Path, checkpoint: ChatCheckpoint) -> Result<Self> {
+    /// Returns [`Error::MissingFile`] when the checkpoint lacks its tokenizer definition or a
+    /// file its family requires.
+    pub fn locate(directory: &Path, declared: &[CheckpointFile]) -> Result<Self> {
         required_file(directory, TOKENIZER_FILE)?;
-        if let ChatTemplate::File(name) = checkpoint.chat_template {
-            required_file(directory, name)?;
+        let mut files = BTreeMap::new();
+        for file in declared {
+            let path = if file.required {
+                Some(required_file(directory, &file.name)?)
+            } else {
+                optional_file(directory, &file.name)
+            };
+            if let Some(path) = path {
+                files.insert(file.name.clone(), path);
+            }
         }
         Ok(Self {
             directory: directory.to_path_buf(),
-            config: required_file(directory, processing::RootFile::Config.name())?,
-            tokenizer_config: required_file(directory, TOKENIZER_CONFIG_FILE)?,
-            generation_config: optional_file(directory, GENERATION_CONFIG_FILE),
-            checkpoint,
+            files,
         })
     }
 
@@ -67,62 +58,40 @@ impl ChatFiles {
         &self.directory
     }
 
-    /// The checkpoint's tokenizer metadata (`tokenizer_config.json`).
-    pub fn tokenizer_config(&self) -> &Path {
-        &self.tokenizer_config
+    /// Every file request processing reads of the checkpoint, the tokenizer definition first,
+    /// each by its path relative to the root and where it lies: what decides how its requests
+    /// are processed.
+    pub fn processing_files(&self) -> Vec<(String, PathBuf)> {
+        let tokenizer = (
+            TOKENIZER_FILE.to_owned(),
+            self.directory.join(TOKENIZER_FILE),
+        );
+        std::iter::once(tokenizer)
+            .chain(
+                self.files
+                    .iter()
+                    .map(|(name, path)| (name.clone(), path.clone())),
+            )
+            .collect()
     }
 
-    /// The checkpoint's generation defaults (`generation_config.json`); `None` for a checkpoint
-    /// that states none.
-    pub fn generation_config(&self) -> Option<&Path> {
-        self.generation_config.as_deref()
-    }
-
-    /// The checkpoint's chat template, read where its family keeps it.
+    /// The text of every declared file the checkpoint publishes, by its path: what the family is
+    /// bound with.
     ///
     /// # Errors
     ///
-    /// Fails when the file that holds it cannot be read, or a tokenizer configuration that
-    /// should hold it states none.
-    pub fn chat_template(&self) -> Result<String> {
-        match self.checkpoint.chat_template {
-            ChatTemplate::TokenizerConfig => load_tokenizer_config(&self.tokenizer_config)?
-                .chat_template
-                .ok_or_else(|| {
-                    Error::invalid(format!(
-                        "{} states no chat_template, where the checkpoint's family keeps it",
-                        self.tokenizer_config.display()
-                    ))
-                }),
-            ChatTemplate::File(name) => {
-                let path = self.directory.join(name);
-                std::fs::read_to_string(&path).map_err(|source| Error::Io { path, source })
-            }
-        }
-    }
-
-    /// The longest sequence the model's positions cover, in tokens, stated where the family's
-    /// checkpoints state it.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the configuration cannot be read, or states no count of 32-bit range at the
-    /// family's field.
-    pub fn context_length(&self) -> Result<u32> {
-        let field = self.checkpoint.context_length;
-        let config: Value = read_json(&self.config)?;
-        field
+    /// [`Error::Io`] for a file that cannot be read as UTF-8.
+    pub fn texts(&self) -> Result<BTreeMap<String, String>> {
+        self.files
             .iter()
-            .try_fold(&config, |value, key| value.get(key))
-            .and_then(Value::as_u64)
-            .and_then(|length| u32::try_from(length).ok())
-            .ok_or_else(|| {
-                Error::invalid(format!(
-                    "{} states no context length at `{}`, where the checkpoint's family states it",
-                    self.config.display(),
-                    field.join(".")
-                ))
+            .map(|(name, path)| {
+                let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                Ok((name.clone(), text))
             })
+            .collect()
     }
 }
 
@@ -134,83 +103,50 @@ mod tests {
 
     use super::*;
 
-    /// A family that keeps its template in its tokenizer configuration and its context bound at
-    /// the root of its configuration.
-    const ROOT: ChatCheckpoint = ChatCheckpoint {
-        context_length: &["max_position_embeddings"],
-        chat_template: ChatTemplate::TokenizerConfig,
-    };
+    /// The declaration of a family that reads its configuration and tokenizer metadata, and
+    /// generation defaults when a checkpoint publishes them.
+    fn declared() -> Vec<CheckpointFile> {
+        let file = |name: &str, required| CheckpointFile {
+            name: name.to_owned(),
+            required,
+        };
+        vec![
+            file("config.json", true),
+            file("tokenizer_config.json", true),
+            file("generation_config.json", false),
+        ]
+    }
 
-    /// A family whose language model is a section of its configuration and whose template is a
-    /// file of its own.
-    const SECTION: ChatCheckpoint = ChatCheckpoint {
-        context_length: &["text_config", "max_position_embeddings"],
-        chat_template: ChatTemplate::File("chat_template.jinja"),
-    };
-
-    /// A checkpoint directory with a tokenizer, `config` and `tokenizer_config`.
-    fn checkpoint(config: &str, tokenizer_config: &str) -> tempfile::TempDir {
+    /// A checkpoint's declared files are read where they lie, an optional one it does not
+    /// publish left out; a required one it lacks, like its tokenizer, is refused.
+    #[test]
+    fn a_checkpoint_is_read_as_its_family_declares() {
         let directory = tempdir().unwrap();
-        fs::write(directory.path().join(TOKENIZER_FILE), "{}").unwrap();
-        fs::write(
-            directory.path().join(processing::RootFile::Config.name()),
-            config,
-        )
-        .unwrap();
-        fs::write(
-            directory.path().join(TOKENIZER_CONFIG_FILE),
-            tokenizer_config,
-        )
-        .unwrap();
-        directory
-    }
+        for (name, text) in [
+            ("tokenizer.json", "{}"),
+            ("config.json", "{\"a\": 1}"),
+            ("tokenizer_config.json", "{}"),
+        ] {
+            fs::write(directory.path().join(name), text).unwrap();
+        }
 
-    #[test]
-    fn a_checkpoint_states_its_bound_and_template_where_its_family_keeps_them() {
-        let directory = checkpoint(
-            r#"{"max_position_embeddings": 40960}"#,
-            r#"{"chat_template": "{{ messages }}"}"#,
+        let files = ChatFiles::locate(directory.path(), &declared()).unwrap();
+        let texts = files.texts().unwrap();
+        assert_eq!(
+            texts.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["config.json", "tokenizer_config.json"]
         );
+        assert_eq!(texts["config.json"], "{\"a\": 1}");
 
-        let files = ChatFiles::locate(directory.path(), ROOT).unwrap();
-
-        assert_eq!(files.context_length().unwrap(), 40960);
-        assert_eq!(files.chat_template().unwrap(), "{{ messages }}");
-        assert_eq!(files.generation_config(), None);
-    }
-
-    /// A family's declaration is the one place read: a bound at the root of a sectioned
-    /// configuration is not its language model's, and a template the tokenizer configuration
-    /// also states is read from the family's file, verbatim.
-    #[test]
-    fn a_sectioned_checkpoint_is_read_where_its_family_says() {
-        let directory = checkpoint(
-            r#"{"max_position_embeddings": 1, "text_config": {"max_position_embeddings": 262144}}"#,
-            r#"{"chat_template": "from the configuration"}"#,
-        );
+        fs::remove_file(directory.path().join("tokenizer_config.json")).unwrap();
         assert!(matches!(
-            ChatFiles::locate(directory.path(), SECTION),
+            ChatFiles::locate(directory.path(), &declared()),
             Err(Error::MissingFile { .. })
         ));
-        fs::write(directory.path().join("chat_template.jinja"), "{{ x }}\\n\n").unwrap();
-        fs::write(directory.path().join(GENERATION_CONFIG_FILE), "{}").unwrap();
-
-        let files = ChatFiles::locate(directory.path(), SECTION).unwrap();
-
-        assert_eq!(files.context_length().unwrap(), 262144);
-        assert_eq!(files.chat_template().unwrap(), "{{ x }}\\n\n");
-        assert!(files.generation_config().is_some());
-    }
-
-    /// A checkpoint that does not state what its family says it does is refused rather than
-    /// served with a substitute.
-    #[test]
-    fn an_unstated_bound_or_template_is_refused() {
-        let directory = checkpoint(r#"{"text_config": {}}"#, "{}");
-
-        let files = ChatFiles::locate(directory.path(), ROOT).unwrap();
-
-        assert!(matches!(files.context_length(), Err(Error::Invalid(_))));
-        assert!(matches!(files.chat_template(), Err(Error::Invalid(_))));
+        fs::remove_file(directory.path().join("tokenizer.json")).unwrap();
+        assert!(matches!(
+            ChatFiles::locate(directory.path(), &[]),
+            Err(Error::MissingFile { .. })
+        ));
     }
 }
