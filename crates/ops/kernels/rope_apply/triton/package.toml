@@ -1,9 +1,11 @@
 # The rope_apply operator's Triton backend: design 5.2's package.
 #
-# One program rotates `rows` tokens' heads: a head's leading `rotated` channels
-# turn by the token's own cosine and sine factors in the descriptor's pairing,
-# and the channels past the rotation are copied. The tables arrive already
-# evaluated, so nothing here reads a position or a frequency.
+# One program rotates `rows` tokens' heads: a head's `rotated` channels from
+# channel `first` on turn by the token's own cosine and sine factors in the
+# descriptor's pairing (by their negated angles for the inverse rotation),
+# and the other channels are copied, or left in place when the output is the
+# input. The tables arrive already evaluated, so nothing here reads a position
+# or a frequency.
 
 op = "rope_apply"
 backend = "triton"
@@ -14,8 +16,10 @@ kind = "triton"
 
 # The two programs differ in their launch words: a narrowed rotation's call also names how many
 # channels turn. The derivation gives the rotation's width (the whole head when the key names
-# none), its pairs and the pairs' power-of-two tile, and refuses a rotation wider than the head
-# or a head tile narrower than the head count.
+# none), its first channel (zero when the key names none), its direction, whether the narrowed
+# program copies the channels it does not turn (not in place), its pairs and the pairs'
+# power-of-two tile, and refuses a rotation that leaves the head or a head tile narrower than
+# the head count.
 [launch]
 kernel = { field = "narrowed", values = { false = "_rope_apply_full_kernel", true = "_rope_apply_narrowed_kernel" } }
 warps = { field = "block", steps = [[256, 8]], otherwise = 4 }
@@ -40,6 +44,9 @@ HEADS = { field = "heads" }
 ROWS = { field = "rows" }
 HEADS_TILE = { field = "block" }
 INTERLEAVED = { field = "rotation", values = { half = false, interleaved = true } }
+FIRST = { field = "first" }
+INVERSE = { field = "inverse" }
+COPY = { field = "copy" }
 
 # `dtype_bf16_output_bf16_head_dim_72_heads_16_rotation_half_rows_8_block_128_pdl_false`.
 #
@@ -50,10 +57,14 @@ INTERLEAVED = { field = "rotation", values = { half = false, interleaved = true 
 # head tile `block` is a `tl.arange` extent, so a power of two.
 #
 # The second shape is a rotation narrower than the head — a multimodal
-# transformer turns part of a head — which is the same program with the tail
-# copied through; the operator prints `rotated` only for that form.
+# transformer turns part of a head, a latent attention its trailing channels —
+# which is the same program with the other channels copied through or, in
+# place, left alone; the operator prints `rotated` only for that form, and
+# `first` only for a rotation that does not start at the head's first channel.
+# Either shape may turn by the inverse rotation or write in place, which the
+# operator prints as `inverse_true` and `inplace_true` after the rest.
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { multiple = 2 }, heads = { min = 1 }, rotation = ["half", "interleaved"], rows = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { multiple = 2 }, heads = { min = 1 }, rotation = ["half", "interleaved"], rows = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"], inverse = ["true", "false"], inplace = ["true", "false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { multiple = 2 }, heads = { min = 1 }, rotation = ["half", "interleaved"], rows = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"], rotated = { multiple = 2 } }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { multiple = 2 }, heads = { min = 1 }, rotation = ["half", "interleaved"], rows = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"], rotated = { multiple = 2 }, first = { min = 1 }, inverse = ["true", "false"], inplace = ["true", "false"] }

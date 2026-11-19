@@ -24,7 +24,9 @@
 //! three ulp in the table and widely in the factors. A model keeps the rule its reference uses,
 //! so the table is computed in scalar arithmetic at that precision and published as it is; a
 //! tensor expression has no power of that rounding. The f64 power and the f64 reciprocal of
-//! the power give the same table at every shipped base, so f64 is one rule.
+//! the power give the same table at every shipped base, so f64 is one rule. A YaRN spectrum
+//! follows the rule too: in f64 it is transformers' `_compute_yarn_parameters`, in f32 the
+//! table DeepSeek's reference blends in f32 (`precompute_freqs_cis`), with no attention factor.
 //!
 //! **A configuration's recipe is read in one layout.** transformers states a rotary embedding
 //! in one object, `rope_parameters`; a configuration written before that layout states the
@@ -141,8 +143,9 @@ pub struct RotaryConfig {
     pub dim: u32,
     /// How the frequencies follow from the base and which position axis each reads.
     pub spectrum: Spectrum,
-    /// The arithmetic the table and the softmax scale are computed in; a YaRN spectrum is
-    /// computed in f64.
+    /// The arithmetic the table and the softmax scale are computed in. A YaRN spectrum in f64 is
+    /// transformers' table; in f32 it is the table DeepSeek's reference computes, whose
+    /// interpolation has no attention factor.
     pub precision: Precision,
 }
 
@@ -384,12 +387,6 @@ impl RotaryConfig {
                         ),
                     ));
                 }
-                if self.precision != Precision::F64 {
-                    return Err(Error::shape(
-                        OWNER,
-                        "a YaRN spectrum is computed in f64".to_owned(),
-                    ));
-                }
             }
             Spectrum::Sectioned { widths, axes } => {
                 let stated = widths.iter().take(axes as usize);
@@ -458,15 +455,18 @@ impl RotaryConfig {
                 let series = power_series(self.theta, self.series_width(), self.precision);
                 Ok((0..axes).flat_map(|_| series.iter().copied()).collect())
             }
-            Spectrum::Yarn(yarn) => Ok(yarn_frequencies(self.theta, self.dim, &yarn)?.0),
+            Spectrum::Yarn(yarn) => match self.precision {
+                Precision::F64 => Ok(yarn_frequencies(self.theta, self.dim, &yarn)?.0),
+                Precision::F32 => yarn_frequencies_f32(self.theta, self.dim, &yarn),
+            },
         }
     }
 
     /// The softmax scale a head of `head_dim` channels attends with under this embedding.
     ///
-    /// `1 / sqrt(head_dim)` in the configuration's precision; a YaRN spectrum multiplies it by
-    /// its attention factor squared, because the reference scales both the cosine and the sine
-    /// by it and a product of two rotated vectors has the square.
+    /// `1 / sqrt(head_dim)` in the configuration's precision; a YaRN spectrum in f64 multiplies
+    /// it by its attention factor squared, because the reference scales both the cosine and the
+    /// sine by it and a product of two rotated vectors has the square.
     ///
     /// # Errors
     ///
@@ -480,8 +480,9 @@ impl RotaryConfig {
         }
         let denominator = f64::from(head_dim).sqrt();
 
+        // A YaRN spectrum under the f32 rule has no attention factor (module documentation).
         match (self.spectrum, self.precision) {
-            (Spectrum::Yarn(yarn), _) => {
+            (Spectrum::Yarn(yarn), Precision::F64) => {
                 let attention = yarn_frequencies(self.theta, self.dim, &yarn)?.1;
                 Ok((f64::from(attention * attention) / denominator) as f32)
             }
@@ -574,6 +575,48 @@ fn yarn_frequencies(theta: f32, dim: u32, yarn: &Yarn) -> Result<(Vec<f32>, f32)
         (None, ..) => yarn_mscale(factor, mscale),
     };
     Ok((frequencies, attention as f32))
+}
+
+/// The YaRN-interpolated table under the f32 rule: the power series `1 / θ^((2i) as f32 / dim)`
+/// and every blend in f32, the correction range in f64, as DeepSeek's reference computes its
+/// table (`precompute_freqs_cis` of `inference/model.py`):
+///
+/// ```text
+/// ramp   = clamp((i − low) / max(high − low, 0.001), 0, 1)       f32
+/// smooth = 1 − ramp
+/// freq   = freq / factor · (1 − smooth) + freq · smooth           f32, left to right
+/// ```
+///
+/// The rule states no attention factor: a model that reads this table scales its scores itself.
+fn yarn_frequencies_f32(theta: f32, dim: u32, yarn: &Yarn) -> Result<Vec<f32>> {
+    let fitted = f64::from(yarn.original_max_position_embeddings);
+    if !(fitted > 0.0 && yarn.factor.is_finite() && yarn.factor > 0.0) {
+        return Err(Error::shape(
+            "Rotary",
+            format!(
+                "a YaRN extension of {} over a {fitted}-position window",
+                yarn.factor
+            ),
+        ));
+    }
+
+    let (low, high) = correction_range(
+        f64::from(yarn.beta_fast),
+        f64::from(yarn.beta_slow),
+        f64::from(dim),
+        f64::from(theta),
+        fitted,
+    );
+    let span = (high - low).max(1e-3) as f32;
+    Ok(power_series(theta, dim, Precision::F32)
+        .into_iter()
+        .enumerate()
+        .map(|(index, frequency)| {
+            let ramp = ((index as f32 - low as f32) / span).clamp(0.0, 1.0);
+            let smooth = 1.0 - ramp;
+            frequency / yarn.factor * (1.0 - smooth) + frequency * smooth
+        })
+        .collect())
 }
 
 /// transformers' `_yarn_get_mscale`.
