@@ -6,6 +6,12 @@
 
 pub use nn_testing::Release;
 
+/// DeepSeek-V4.1-Flash, a block-scaled FP8 export with MXFP4 routed experts.
+pub const DEEPSEEK_V41_FLASH: Release = Release {
+    repository: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    revision: "08c8657f02291e11b6f6b63e0e16014f8e748518",
+};
+
 /// The FastH3 export of four denoising steps with sparse video attention.
 pub const FAST_H3_4_STEP: Release = Release {
     repository: "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
