@@ -12,12 +12,16 @@
 //! - [`text`]: what a causal language model's forward is lent: its batch, its state, and the
 //!   model itself, loaded as execution loads it.
 //! - [`values`]: CPU tensors of stated values, their elements, and comparisons of them.
+//! - [`reference`]: direct ports of the reference formulas of a hyper-connected residual and of a
+//!   hashed n-gram memory, in FP64, and the comparison of an output with them under an
+//!   operator's bound.
 //!
 //! Every helper fails the calling test with a message naming what failed: a fixture that cannot
 //! be written or a release that cannot be resolved is the test's failure, not a value to handle.
 
 pub mod checkpoint;
 pub mod forward;
+pub mod reference;
 pub mod release;
 pub mod text;
 pub mod values;

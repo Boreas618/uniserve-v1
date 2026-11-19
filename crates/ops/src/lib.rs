@@ -67,6 +67,17 @@
 //! | [`norm::LayerNorm`] | `layer_norm` | [`norm`] |
 //! | [`norm::Softmax`] | `softmax` | [`norm`] |
 //! | [`embedding::Embedding`] | `embedding` | [`embedding`] |
+//! | [`embedding::EmbeddingMxfp8`] | `embedding_mxfp8` | [`embedding`] |
+//!
+//! Residuals of several streams and hashed n-gram memories:
+//!
+//! | Operator | `NAME` | Module |
+//! | --- | --- | --- |
+//! | [`mhc::MhcBoundary`] | `mhc_boundary` | [`mhc`] |
+//! | [`mhc::MhcPost`] | `mhc_post` | [`mhc`] |
+//! | [`mhc::MhcPre`] | `mhc_pre` | [`mhc`] |
+//! | [`ngram::NgramHash`] | `ngram_hash` | [`ngram`] |
+//! | [`ngram::NgramGate`] | `ngram_gate` | [`ngram`] |
 //!
 //! Encoded products and their factors:
 //!
@@ -172,8 +183,10 @@ pub mod kernel;
 pub mod kv;
 mod launch;
 pub mod logits;
+pub mod mhc;
 pub mod modulation;
 pub mod moe;
+pub mod ngram;
 pub mod noise;
 pub mod norm;
 pub mod op;

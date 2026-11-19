@@ -76,3 +76,11 @@ pub(crate) const FASTH3_4_STEP_NVFP4: Release = Release {
     repository: "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4",
     revision: "3e7ccea5cb400e802cdb8aa1848707a6b0c82b06",
 };
+
+/// DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`): FP8 block-scaled projections, MXFP4 routed
+/// experts, hyper-connected streams and two n-gram memories, with the reference implementation
+/// in its `inference/`.
+pub(crate) const DEEPSEEK_V41_FLASH: Release = Release {
+    repository: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    revision: "1bae0e1088993b9b82de08f59de5be5a34e42170",
+};
