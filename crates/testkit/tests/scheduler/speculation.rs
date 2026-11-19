@@ -200,6 +200,38 @@ fn a_verification_commits_the_drafts_its_samples_confirm_and_the_token_after_the
     assert!(verifications.len() < 19, "drafts save calls");
 }
 
+/// The synthetic acceptance length is a step value: every batch a step assembles carries the
+/// length of the step values the step began with to its ranks, from the step after a change on,
+/// and a batch of no stated length accepts what the model selects (SD §7.1, step values).
+#[test]
+fn every_batch_carries_the_synthetic_acceptance_length_of_its_step() {
+    let mut harness = Deployment::tokens().speculative(DRAFTS).build();
+    drafter(&harness, 2);
+    let lengths = |harness: &Harness, id: RequestId| -> Vec<Option<f64>> {
+        let batches = harness.batches_of(id).into_iter();
+        batches
+            .map(|batch| batch.columns.synthetic_acceptance_length)
+            .collect()
+    };
+
+    harness.tune(|tuning| tuning.synthetic_acceptance_length = Some(2.5));
+    let stated = harness.submit(token(1, 6, 20));
+    harness.settle(200);
+    let carried = lengths(&harness, stated);
+    assert!(!carried.is_empty());
+    assert!(
+        carried.iter().all(|length| *length == Some(2.5)),
+        "{carried:?}"
+    );
+
+    harness.tune(|tuning| tuning.synthetic_acceptance_length = None);
+    let unstated = harness.submit(token(2, 6, 20));
+    harness.settle(200);
+    let carried = lengths(&harness, unstated);
+    assert!(!carried.is_empty());
+    assert!(carried.iter().all(Option::is_none), "{carried:?}");
+}
+
 /// A deployment whose token groups verify in place of decoding, as a speculating rank states
 /// them, serves token requests: the workers serve understanding when they serve a prefill and
 /// token progress, and a verification is a speculating deployment's token progress (SD §7.2, the
