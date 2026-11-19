@@ -19,14 +19,33 @@ differ from `inference/generate.py`:
   DSpark draft stages (`mtp.*`) and the vision tower are not built
   (`dspark_block_size=0`, `vision_n_layers=0`): a text prompt does not
   reach them, so their tensors and the image routing bias are not read.
-- The head returns the logits of every position (`ParallelHead.forward`
-  with `full_logits=True`) instead of the last one. The logits are the
-  reference's FP32 head output, gathered over the ranks.
+- The head's product runs over every position instead of the last one
+  (`ParallelHead.forward` with `full_logits=True`), in blocks of `ROWS`
+  positions: the head is handed the normalized hidden rows, and each
+  block's logits are its own `F.linear` of the FP32 rows and the gather
+  over the ranks, so a prompt of 128K positions never holds its
+  `[n, vocab]` FP32 logits at once. The logits are the reference's FP32
+  head output.
+- A prefill of more than `QUERIES` tokens scores its index queries in
+  blocks of `QUERIES` queries (`Indexer.forward`, the reference's code
+  with its scoring, masking, candidate blocks and top-k taken per block of
+  query rows, which every query computes alone), so a 128K-token prompt
+  never holds its `[n, heads, n]` scores; the candidate blocks layer 20
+  hands the later indexers are kept per block (the first column of each
+  block of its mask, which the mask repeats) and repeated when read.
+  The hyper-connections' collapse and expansion (`Block.hc_pre`,
+  `Block.hc_post`), which multiply each position's streams by its own mix
+  in FP32 and sum over the four streams, run the reference's expression
+  per block of `POSITIONS` positions, the same arithmetic for every
+  element without the `[n, 4, 4, dim]` FP32 products of a 128K-token
+  prompt. Shorter prompts run the reference's indexer as it is, and
+  `--check-blocked` runs a prompt's composition A a second time with the
+  indexer whole and states how far the two lie apart.
 
 Protocol:
 
-- Prompts: four texts of this repository's documentation, one source each,
-  `docs/expert_parallelism.md`, `docs/configuration.md`,
+- Prompts (`--sources`): four texts of this repository's documentation,
+  one source each, `docs/expert_parallelism.md`, `docs/configuration.md`,
   `docs/architecture.md` and `docs/architecture.md` followed by
   `docs/configuration.md` (a source of several files joins them, each
   without its leading and trailing newlines, by a blank line), read from
@@ -34,6 +53,15 @@ Protocol:
   the last blank line (paragraph boundary) whose prefix encodes to at
   most its target, 1024, 4096, 8192 and 16384 tokens in that order. The cut
   text is stored in the manifest, so a comparison sends exactly that text.
+- Prompts (`--agentx`): AgentX payloads of the InferenceX corpus
+  `semianalysisai/cc-traces-weka-062126` (the request bodies AIPerf sends,
+  `payloads.jsonl`, and vLLM's `deepseek_v41` token ids of each,
+  `vllm.jsonl`, of one directory): for each target of `--targets`, the
+  payload of the most prompt tokens at or below it (`vllm_counts.jsonl`).
+  Its ids are vLLM's, checked to be the reference encoder's rendering of
+  its messages (thinking mode at the encoder's default reasoning effort,
+  which vLLM's renderer applies), and the manifest keeps its messages, so
+  a comparison sends exactly them.
 - Encoding: the reference's chat mode for one user message, as
   `encoding/encoding.py` renders it (`thinking_mode="chat"`): the
   beginning-of-sentence token, `<｜User｜>`, the text, `<｜Assistant｜>`
@@ -97,11 +125,12 @@ release of torch's build): without it TileLang takes the `nvcc` of a pip
 `nvidia-cuda-nvcc`, which need not match the pip runtime's headers.
 
 `--sources` and `--targets` (pairwise) select a subset of the prompts, for
-example the first one alone to prove a setup.
+example the first one alone to prove a setup. With `--agentx <payloads>`
+the prompts are the AgentX payloads nearest below each of `--targets`, for
+example `--targets 65536 131072`.
 """
 
 import argparse
-import functools
 import hashlib
 import json
 import os
@@ -144,12 +173,22 @@ DECODED = 32
 #: The reference's tensor parallelism the values are of.
 MODEL_PARALLEL = 4
 
-#: The cache capacity in tokens, `generate.py`'s interactive setting. It
-#: sizes the caches and the rotary tables, which every prompt fits in.
+#: The least cache capacity in tokens, `generate.py`'s interactive setting,
+#: raised to the longest prompt rounded up to 1024. It sizes the caches and
+#: the rotary tables.
 MAX_SEQ_LEN = 64 * 1024
 
-#: The logit rows reduced at once, which bounds the reduction's memory.
+#: The positions whose logits are formed and reduced at once, which bounds
+#: the head's and the reduction's memory.
 ROWS = 1024
+
+#: The index queries a long prefill scores at once: a block of 1024 queries
+#: against 128K keys holds 2 GiB of BF16 scores per rank's 8 heads.
+QUERIES = 1024
+
+#: The positions whose hyper-connection mixes are formed at once: 16384
+#: positions' `[4, 4, 5120]` FP32 products are 5 GiB.
+POSITIONS = 16384
 
 #: The tensors `convert.py` shards along a dimension, by the name component
 #: it keys them with (its `mapping`, whose renames are all identities).
@@ -432,9 +471,210 @@ def prompts(arguments, tokenizer, encode_messages) -> list[dict]:
                 "tokens": len(ids),
                 "text": text,
                 "ids": ids,
+                "compare_blocked": target in arguments.check_blocked,
             }
         )
     return records
+
+
+def agentx_prompts(arguments, tokenizer, encode_messages) -> list[dict]:
+    """The AgentX payloads of the protocol: one per target, with vLLM's ids.
+
+    The ids must be the reference encoder's rendering of the payload's
+    messages, tokenized without added special tokens.
+    """
+    root = arguments.agentx
+    counts = [json.loads(line) for line in (root / "vllm_counts.jsonl").open()]
+    chosen = {}
+    for target in arguments.targets:
+        below = [row for row in counts if row["num_tokens"] <= target]
+        best = max(below, key=lambda row: (row["num_tokens"], row["id"]))
+        chosen[best["id"]] = target
+
+    def lines(name: str) -> dict:
+        """The lines of `name` of the chosen payloads, by id."""
+        found = {}
+        for line in (root / name).open():
+            identity = json.loads(line[: line.index(",")] + "}")["id"]
+            if identity in chosen:
+                found[identity] = json.loads(line)
+                if len(found) == len(chosen):
+                    break
+        return found
+
+    payloads, tokens = lines("payloads.jsonl"), lines("vllm.jsonl")
+    records = []
+    for identity, target in chosen.items():
+        messages = payloads[identity]["payload"]["messages"]
+        ids = tokens[identity]["token_ids"]
+        rendered = encode_messages(messages, thinking_mode="thinking")
+        assert tokenizer.encode(rendered, add_special_tokens=False) == ids, (
+            identity
+        )
+        records.append(
+            {
+                "file": f"agentx_{target}.safetensors",
+                "source": f"agentx:{identity}",
+                "target": target,
+                "tokens": len(ids),
+                "messages": messages,
+                "ids": ids,
+                "compare_blocked": target in arguments.check_blocked,
+            }
+        )
+    return records
+
+
+def head_logits(head, rows: torch.Tensor) -> torch.Tensor:
+    """The reference head's FP32 logits of `rows`, `[m, dim]` normalized
+    hidden rows: `ParallelHead.forward` over every row given.
+    """  # noqa: D205
+    logits = torch.nn.functional.linear(rows.float(), head.weight)
+    if dist.get_world_size() > 1:
+        parts = [torch.empty_like(logits) for _ in range(dist.get_world_size())]
+        dist.all_gather(parts, logits)
+        logits = torch.cat(parts, dim=-1)
+    return logits
+
+
+def blocked_indexer(reference):
+    """`Indexer.forward` of `reference` with a long prefill's scoring taken
+    per block of `QUERIES` query rows.
+
+    The reference's statements are kept in their order; only the scores'
+    einsum and what reads them run per block. A query's scores, its
+    visibility mask, its candidate blocks and its top-k depend on its own
+    row alone, so the blocks are the reference's rows. Layer 20's candidate
+    blocks are kept as the first column of each block of their mask and
+    repeated when a later indexer reads them, which is the mask.
+    """  # noqa: D205
+    original = reference.Indexer.forward
+    shared = reference.shared_attn
+
+    def forward(self, x, qr, latent, start_pos, offset):
+        bsz, seqlen, _ = x.size()
+        if start_pos != 0 or seqlen <= QUERIES:
+            return original(self, x, qr, latent, start_pos, offset)
+        ratio, rd, end_pos = (
+            self.compress_ratio,
+            self.rope_head_dim,
+            start_pos + seqlen,
+        )
+
+        if self.owns_k and latent is not None:
+            freqs = self.freqs_cis[: seqlen - seqlen % ratio : ratio]
+            k = self.k_norm(self.wk(latent))
+            reference.apply_rotary_emb(k[..., -rd:], freqs)
+            reference.fp4_act_quant(k, reference.fp4_block_size, True)
+            self.k_cache[
+                :bsz, start_pos // ratio : start_pos // ratio + k.size(1)
+            ] = k
+        if self.owns_k:
+            shared.index_k = self.k_cache
+
+        q = self.wq_b(qr).unflatten(
+            -1, (self.n_local_heads, self.index_head_dim)
+        )
+        reference.apply_rotary_emb(
+            q[..., -rd:], self.freqs_cis[start_pos:end_pos]
+        )
+        reference.fp4_act_quant(q, reference.fp4_block_size, True)
+
+        index_k = shared.index_k[:bsz, : end_pos // ratio]
+        weights = self.weights_proj(x) * (
+            self.softmax_scale * self.n_heads**-0.5
+        )
+        width = end_pos // ratio
+        topk = min(self.index_topk, end_pos // ratio)
+        block = self.candidate_block_size
+        kept_blocks, selected = [], []
+        for first in range(0, seqlen, QUERIES):
+            last = min(seqlen, first + QUERIES)
+            index_score = torch.einsum(
+                "bshd,btd->bsht", q[:, first:last], index_k
+            )
+            index_score = (
+                index_score.relu_() * weights[:, first:last].unsqueeze(-1)
+            ).sum(dim=2)
+            if reference.world_size > 1:
+                dist.all_reduce(index_score)
+
+            positions = torch.arange(first + 1, last + 1, device=x.device)
+            compress_lens = (positions // ratio).unsqueeze(-1)
+            index_score.masked_fill_(
+                torch.arange(seqlen // ratio, device=x.device) >= compress_lens,
+                -torch.inf,
+            )
+            if self.is_candidate_source:
+                mask = reference.select_candidate_blocks(
+                    index_score,
+                    compress_lens,
+                    self.candidate_topk_blocks,
+                    block,
+                )
+                kept_blocks.append(mask[..., ::block])
+            elif self.uses_candidates:
+                keep = shared.candidates[:, first:last]
+                mask = keep.repeat_interleave(block, dim=-1)[..., :width]
+                index_score = index_score.masked_fill(~mask, -torch.inf)
+
+            idxs = (
+                index_score.topk(topk, dim=-1, sorted=False)
+                .indices.sort(dim=-1)
+                .values
+            )
+            selected.append(
+                torch.where(idxs < compress_lens, idxs + offset, -1).int()
+            )
+        if self.is_candidate_source:
+            shared.candidates = torch.cat(kept_blocks, dim=1)
+        return torch.cat(selected, dim=1)
+
+    return forward
+
+
+def blocked_hyper_connections(reference) -> None:
+    """`Block.hc_pre` and `Block.hc_post` of `reference` per block of
+    `POSITIONS` positions.
+
+    Each position's output is the reference's expression of its own rows
+    (its mix times its streams, summed over the streams in the reference's
+    order), so the blocks compute every element as the whole does.
+    """  # noqa: D205
+    block = reference.Block
+    pre, post = block.hc_pre, block.hc_post
+
+    def hc_pre(self, x, pre_mix):
+        if x.size(1) <= POSITIONS:
+            return pre(self, x, pre_mix)
+        return torch.cat(
+            [
+                pre(
+                    self, x[:, i : i + POSITIONS], pre_mix[:, i : i + POSITIONS]
+                )
+                for i in range(0, x.size(1), POSITIONS)
+            ],
+            dim=1,
+        )
+
+    def hc_post(self, x, residual, mix, comb):
+        if x.size(1) <= POSITIONS:
+            return post(self, x, residual, mix, comb)
+        return torch.cat(
+            [
+                post(
+                    self,
+                    x[:, i : i + POSITIONS],
+                    residual[:, i : i + POSITIONS],
+                    mix[:, i : i + POSITIONS],
+                    comb[:, i : i + POSITIONS],
+                )
+                for i in range(0, x.size(1), POSITIONS)
+            ],
+            dim=1,
+        )
+
+    block.hc_pre, block.hc_post = hc_pre, hc_post
 
 
 def rest_logprob(logprobs: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
@@ -521,6 +761,35 @@ def spread(
 
 
 @torch.inference_mode()
+def prefill(model, ids: torch.Tensor, positions: torch.Tensor):
+    """Composition A of `ids`: one prefill of the whole prompt, the head's
+    logits of every position but the last formed and reduced a block of
+    `ROWS` positions at a time.
+
+    Returns:
+        The reduced quantities of every predicting position (on rank 0, an
+        empty dict elsewhere) and the log-probabilities of `positions` (on
+        every rank).
+    """  # noqa: D205
+    leader = dist.get_rank() == 0
+    n = ids.numel()
+    hidden = model.forward(ids[None], 0)[1][0]
+    parts = defaultdict(list)
+    for first in range(0, n - 1, ROWS):
+        last = min(n - 1, first + ROWS)
+        logits = head_logits(model.head, hidden[first:last])
+        if leader:
+            reduced = reduce(logits, ids[first + 1 : last + 1])
+            for name, part in reduced.items():
+                parts[name].append(part)
+    tensors = {name: torch.cat(part) for name, part in parts.items()}
+    logprobs = torch.log_softmax(
+        head_logits(model.head, hidden[positions]), dim=-1
+    )
+    return tensors, logprobs
+
+
+@torch.inference_mode()
 def evaluate(model, record: dict) -> dict | None:
     """Runs compositions A and B of one prompt on every rank.
 
@@ -537,14 +806,33 @@ def evaluate(model, record: dict) -> dict | None:
 
     # A: the whole prompt in one prefill.
     start = time.monotonic()
-    logits = model.forward(ids[None], 0)[1][0]
-    tensors, a_logprobs = {}, None
-    if leader:
-        tensors = reduce(logits[:-1], ids[1:])
-        a_logprobs = torch.log_softmax(logits[positions].float(), dim=-1)
-    del logits
+    tensors, a_logprobs = prefill(model, ids, positions)
     torch.cuda.synchronize()
     a_seconds = time.monotonic() - start
+
+    # The blocked indexer against the reference's own, on a prompt whose
+    # whole scores fit: A again with every indexer as it is.
+    blocked = None
+    if record.get("compare_blocked"):
+        global QUERIES
+        queries, QUERIES = QUERIES, n
+        whole, _ = prefill(model, ids, positions)
+        QUERIES = queries
+        if leader:
+            delta = (whole["next_logprob"] - tensors["next_logprob"]).abs()
+            blocked = {
+                "queries": queries,
+                "next_logprob_max_abs_difference": delta.max().item(),
+                "next_logprob_mean_abs_difference": delta.double()
+                .mean()
+                .item(),
+                "argmax_agreement": (
+                    (whole["argmax"] == tensors["argmax"])
+                    .double()
+                    .mean()
+                    .item()
+                ),
+            }
 
     # B: a prefill of the first n - 32 tokens, whose last position predicts
     # token n - 32, then one decode step per token up to n - 2.
@@ -553,12 +841,12 @@ def evaluate(model, record: dict) -> dict | None:
     for position in range(n - DECODED, n - 1):
         token = ids[None, position : position + 1]
         rows.append(model.forward(token, position)[1][0, -1])
+    b_logits = head_logits(model.head, torch.stack(rows))
     torch.cuda.synchronize()
     b_seconds = time.monotonic() - start
     if not leader:
         return None
 
-    b_logits = torch.stack(rows)
     b_logprobs = torch.log_softmax(b_logits.float(), dim=-1)
     decoded = reduce(b_logits, ids[positions + 1])
     tensors.update({f"decode_{name}": t for name, t in decoded.items()})
@@ -580,6 +868,7 @@ def evaluate(model, record: dict) -> dict | None:
     difference = tensors["next_logprob"][rows_of_b]
     difference = (difference - tensors["decode_next_logprob"]).abs()
     summary = {
+        **({"blocked_against_whole_indexer": blocked} if blocked else {}),
         "mean_next_logprob": tensors["next_logprob"].double().mean().item(),
         "argmax_is_next": hits.double().mean().item(),
         "decode": {
@@ -630,6 +919,19 @@ def main() -> None:
     )
     parser.add_argument("--sources", nargs="+", default=list(SOURCES))
     parser.add_argument("--targets", nargs="+", type=int, default=list(TARGETS))
+    parser.add_argument(
+        "--agentx",
+        type=Path,
+        help="a directory of AgentX payloads to take the prompts from",
+    )
+    parser.add_argument(
+        "--check-blocked",
+        nargs="*",
+        type=int,
+        default=[],
+        help="targets whose prompts also run composition A with the "
+        "reference's indexer whole, against the blocked one",
+    )
     arguments = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -649,7 +951,8 @@ def main() -> None:
     # Rank 0 cuts and encodes the prompts; every rank runs the same ids.
     shared = [None]
     if rank == 0:
-        shared = [prompts(arguments, tokenizer, encode_messages)]
+        chosen = agentx_prompts if arguments.agentx else prompts
+        shared = [chosen(arguments, tokenizer, encode_messages)]
     dist.broadcast_object_list(shared, 0)
     records = shared[0]
     if rank == 0:
@@ -659,9 +962,10 @@ def main() -> None:
     # The release's arguments for one sequence of the text model, sampling
     # greedily so the reference's `sample` is the argmax of the logits.
     config = json.loads((root / "inference/config.json").read_text())
+    longest = max(record["tokens"] for record in records)
     overrides = {
         "max_batch_size": 1,
-        "max_seq_len": MAX_SEQ_LEN,
+        "max_seq_len": max(MAX_SEQ_LEN, -(-longest // 1024) * 1024),
         "temperature": 0.0,
         "dspark_block_size": 0,
         "vision_n_layers": 0,
@@ -679,81 +983,94 @@ def main() -> None:
     load_seconds = time.monotonic() - start
     torch.set_default_device("cuda")
 
-    # Every position's logits rather than the last one's.
-    model.head.forward = functools.partial(
-        type(model.head).forward, model.head, full_logits=True
-    )
+    # The head is handed the normalized rows of every position, whose
+    # logits `evaluate` forms a block at a time (`head_logits`), and a long
+    # prefill's indexers score a block of queries at a time.
+    model.head.forward = lambda rows, full_logits=False: rows
+    reference.Indexer.forward = blocked_indexer(reference)
+    blocked_hyper_connections(reference)
 
     if rank == 0:
         arguments.out.mkdir(parents=True, exist_ok=True)
     release = revision(root)
     start = time.monotonic()
+    done = []
     for record in records:
         result = evaluate(model, record)
-        if result is None:
-            continue
-        metadata = {
-            "release": f"deepseek-ai/DeepSeek-V4.1-Flash-1017@{release}",
-            "source": record["source"],
-            "target": str(record["target"]),
-        }
-        tensors = {k: t.contiguous() for k, t in result["tensors"].items()}
-        save_file(tensors, arguments.out / record["file"], metadata)
-        record.update(result["summary"])
-        log(f"{record['file']}: {json.dumps(result['summary'])}")
-    run_seconds = time.monotonic() - start
+        if result is not None:
+            metadata = {
+                "release": f"deepseek-ai/DeepSeek-V4.1-Flash-1017@{release}",
+                "source": record["source"],
+                "target": str(record["target"]),
+            }
+            tensors = {k: t.contiguous() for k, t in result["tensors"].items()}
+            save_file(tensors, arguments.out / record["file"], metadata)
+            record.update(result["summary"])
+            log(f"{record['file']}: {json.dumps(result['summary'])}")
+        done.append({k: v for k, v in record.items() if k != "ids"})
 
-    peak = {
-        "allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
-        "reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
-    }
-    peaks = [None] * world_size
-    dist.all_gather_object(peaks, peak)
-    if rank == 0:
-        for record in records:
-            del record["ids"]
-        manifest = {
-            "release": {
-                "repository": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-                "revision": release,
-            },
-            "reference_sha256": {
-                name: sha256(root / name) for name in REFERENCE_FILES
-            },
-            "environment": {
-                "python": platform.python_version(),
-                "torch": torch.__version__,
-                "cuda": torch.version.cuda,
-                "tilelang": tilelang.__version__,
-                "safetensors": safetensors.__version__,
-                "transformers": transformers.__version__,
-                "gpu": torch.cuda.get_device_name(),
-            },
-            "model_parallel": world_size,
-            "model_args_overrides": overrides,
-            "protocol": {
-                "encoding": PREFIX + "{text}" + SUFFIX,
-                "thinking_mode": "chat",
-                "add_special_tokens": False,
-                "top_k": TOP_K,
-                "decode_positions": DECODED,
-                "logprobs": "float32 log_softmax of the float32 head logits",
-                "decode_kl": (
-                    "KL(A||B) on the partition into A's top-k ids and the "
-                    "rest of the vocabulary"
-                ),
-            },
-            "seconds": {
-                "build": build_seconds,
-                "load": load_seconds,
-                "run": run_seconds,
-            },
-            "peak_gpu_memory": peaks,
-            "prompts": records,
+        # The manifest of the prompts done so far, after each one, so a
+        # later prompt's failure leaves the earlier ones stated.
+        peak = {
+            "allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
+            "reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
         }
-        path = arguments.out / "manifest.json"
-        path.write_text(json.dumps(manifest, indent=1, ensure_ascii=False))
-        log(f"wrote {path}")
+        peaks = [None] * world_size
+        dist.all_gather_object(peaks, peak)
+        if rank == 0:
+            manifest = {
+                "release": {
+                    "repository": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+                    "revision": release,
+                },
+                "reference_sha256": {
+                    name: sha256(root / name) for name in REFERENCE_FILES
+                },
+                "environment": {
+                    "python": platform.python_version(),
+                    "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "tilelang": tilelang.__version__,
+                    "safetensors": safetensors.__version__,
+                    "transformers": transformers.__version__,
+                    "gpu": torch.cuda.get_device_name(),
+                },
+                "model_parallel": world_size,
+                "model_args_overrides": overrides,
+                "protocol": {
+                    "encoding": (
+                        "AgentX: vLLM's deepseek_v41 ids of the payload's "
+                        "messages, the reference encoder's thinking mode"
+                        if arguments.agentx
+                        else PREFIX + "{text}" + SUFFIX
+                    ),
+                    "thinking_mode": (
+                        "thinking" if arguments.agentx else "chat"
+                    ),
+                    "add_special_tokens": False,
+                    "top_k": TOP_K,
+                    "decode_positions": DECODED,
+                    "index_queries_per_block": QUERIES,
+                    "hyper_connection_positions_per_block": POSITIONS,
+                    "logprobs": (
+                        "float32 log_softmax of the float32 head logits"
+                    ),
+                    "decode_kl": (
+                        "KL(A||B) on the partition into A's top-k ids and "
+                        "the rest of the vocabulary"
+                    ),
+                },
+                "seconds": {
+                    "build": build_seconds,
+                    "load": load_seconds,
+                    "run": time.monotonic() - start,
+                },
+                "peak_gpu_memory": peaks,
+                "prompts": done,
+            }
+            path = arguments.out / "manifest.json"
+            path.write_text(json.dumps(manifest, indent=1, ensure_ascii=False))
+            log(f"wrote {path}")
     dist.barrier()
     dist.destroy_process_group()
 
