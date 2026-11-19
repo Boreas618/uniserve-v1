@@ -387,13 +387,28 @@ class Deployments:
                 scale=self.settings.time_scale,
             )
             server.package = package
+            server.runtime = runtime
             owned.callback(server.stop)
-            server.wait("serving" if serving else "listening", timeout_s)
-            # The deployment's Build Server, which its daemon started before
-            # its engines: where a case installs a revision the deployment
-            # selects next.
-            server.build_server = BuildServer.of(self.uniserve, runtime, name)
+            if serving:
+                server.wait("serving", timeout_s)
+                self.bind_build_server(server)
+            else:
+                # A leader starts its deployment's Build Server once the
+                # deployment's other nodes joined it: :meth:`follower` binds
+                # it once the leader serves.
+                server.wait("listening", timeout_s)
             yield server
+
+    def bind_build_server(self, server: Server) -> None:
+        """Bind the Build Server of the serving daemon `server`'s deployment
+        (``server.build_server``), which its daemon started before its
+        engines: where a case installs a revision the deployment selects
+        next.
+        """  # noqa: D205
+        assert server.package is not None and server.runtime is not None
+        server.build_server = BuildServer.of(
+            self.uniserve, server.runtime, server.package.name
+        )
 
     def calibration(self, *, reads: bool = False) -> Path:
         """The transfer calibration of the case's GPUs and this host's
@@ -441,7 +456,8 @@ class Deployments:
         daemon finds itself in the package's ``hosts`` by its host name and
         joins the leader at the first host's ``admin_config.join``, and the
         leader serves once it joined (within `timeout_s` seconds, scaled,
-        when stated), which this waits for before the block begins. Each
+        when stated), which this waits for before the block begins, and
+        binds the leader's ``build_server`` then. Each
         host resolves the other's name (``docs/testing.md``, Two hosts).
 
         The second host serves the leader's package, with the deployment's
@@ -504,6 +520,7 @@ class Deployments:
             )
             try:
                 leader.wait("serving", timeout_s)
+                self.bind_build_server(leader)
                 yield Follower(runtime=runtime)
             finally:
                 leader.stop()
