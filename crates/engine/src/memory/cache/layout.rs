@@ -1015,11 +1015,7 @@ mod tests {
                 .map(|(layer, ratio)| FieldOwner { layer, ratio })
                 .collect::<Vec<_>>()
         };
-        let record = |format, width| Record {
-            format,
-            heads: 1,
-            width,
-        };
+        let record = |format, width| Record::rows(format, 1, width);
         vec![
             CacheField {
                 name: "latent",
@@ -1028,7 +1024,7 @@ mod tests {
                     .collect(),
                 readers: Vec::new(),
                 history: History::Window { tokens: 128 },
-                record: record(Format::Mxfp8, 512),
+                record: record(Format::MXFP8, 512),
             },
             CacheField {
                 name: "compressed_latent",
@@ -1095,7 +1091,7 @@ mod tests {
     fn a_window_lies_in_a_pool_of_its_own_beside_the_full_history() -> Result<()> {
         let layout = CacheLayout::of(
             64,
-            &latent(Format::Nvfp4, Format::Mxfp4),
+            &latent(Format::NVFP4, Format::MXFP4),
             PrefixCacheDtype::BFloat16,
         )?;
 
@@ -1129,10 +1125,10 @@ mod tests {
         assert_eq!(window.fields[0].dims, [1, 528]);
         assert_eq!(window.unit_bytes(), 43 * (64 * 528 + 1));
 
-        // MXFP8 and FP8 index keys with a scale each.
+        // MXFP8 latents and MXFP8 index keys, 132 B each.
         let wide = CacheLayout::of(
             64,
-            &latent(Format::Mxfp8, Format::Fp8Scaled),
+            &latent(Format::MXFP8, Format::MXFP8),
             PrefixCacheDtype::BFloat16,
         )?;
         assert_eq!(
@@ -1174,7 +1170,7 @@ mod tests {
     /// keeps a window or other fields than the pool's, more drafter layers than columns.
     #[test]
     fn fields_the_pools_cannot_hold_are_refused() {
-        let window_only: Vec<CacheField> = latent(Format::Nvfp4, Format::Mxfp4)
+        let window_only: Vec<CacheField> = latent(Format::NVFP4, Format::MXFP4)
             .into_iter()
             .take(1)
             .collect();
@@ -1202,7 +1198,7 @@ mod tests {
         );
         let latent = CacheLayout::of(
             64,
-            &latent(Format::Nvfp4, Format::Mxfp4),
+            &latent(Format::NVFP4, Format::MXFP4),
             PrefixCacheDtype::BFloat16,
         )
         .unwrap();
@@ -1227,13 +1223,13 @@ mod tests {
 
         let windowed = CacheLayout::of(
             64,
-            &latent(Format::Nvfp4, Format::Mxfp4),
+            &latent(Format::NVFP4, Format::MXFP4),
             PrefixCacheDtype::BFloat16,
         )?;
         let refused = windowed.unit_layout().unwrap_err().to_string();
         assert!(refused.contains("sliding-window"), "{refused}");
 
-        let full: Vec<CacheField> = latent(Format::Nvfp4, Format::Mxfp4)
+        let full: Vec<CacheField> = latent(Format::NVFP4, Format::MXFP4)
             .into_iter()
             .skip(1)
             .collect();

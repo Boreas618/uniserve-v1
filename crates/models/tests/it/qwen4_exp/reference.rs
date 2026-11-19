@@ -40,10 +40,11 @@
 
 use std::collections::HashMap;
 
-use models::qwen4_exp::causal_lm::{coordinates, ngram_context, token_columns};
+use models::qwen4_exp::causal_lm::{coordinates, token_columns};
 use models::qwen4_exp::{Config, DecoderLayer, HyperConnection, NgramEmbedding, PleLayer};
 use nn::family::{Family, INDEX_KEY, KEY, TextModel, TextPlacement, VALUE};
 use nn::modules::Rotary;
+use nn::modules::ngram_context;
 use nn::quantization::Declaration;
 use nn::{
     CpuWeights, DType, Device, KvCache, KvPlane, Phase, RecurrentState, Shape, Split, Tensor,
@@ -323,15 +324,7 @@ fn the_ngram_ids_are_the_references() {
                     before.to_dtype(DType::U32).unwrap(),
                 )),
             );
-            let slots = Tensor::zeros((requests, STEP), DType::U32, &Device::Cpu).unwrap();
-            let state = request_state(
-                &vec![54; requests],
-                &slots,
-                &column(&vec![1; requests]),
-                Vec::new(),
-            );
-            let columns = token_columns(&batch, &state).expect("the token columns");
-            let context = ngram_context(&batch, &columns).expect("the n-gram context");
+            let context = ngram_context(&batch).expect("the n-gram context");
 
             let rows: Vec<Vec<i64>> = embedding.ids(&context).unwrap().to_vec2().unwrap();
             let expected: Vec<Vec<i64>> = vector(&vectors, &name("ids")).to_vec2().unwrap();
@@ -403,8 +396,7 @@ fn the_ple_layer_is_the_references() {
                 &vector(&vectors, &name("num_accepted")),
                 vec![vec![window.clone()]],
             );
-            let columns = token_columns(&batch, &state).expect("the token columns");
-            let context = ngram_context(&batch, &columns).expect("the n-gram context");
+            let context = ngram_context(&batch).expect("the n-gram context");
 
             let added = layer
                 .forward(&folded, &context, &batch, &state, 0)

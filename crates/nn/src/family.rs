@@ -37,6 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub use ops::record::Layout;
 use proto::config::Quantization;
 use tensor::DType;
 
@@ -275,6 +276,14 @@ pub trait TextModel: CausalLm + Send + Sync {
         None
     }
 
+    /// Whether its forwards issue collectives along the expert union beside the expert exchange
+    /// ([`EXPERT_AXIS`]), such as a lookup of a table its ranks split between them: execution
+    /// then forms the union's communicator and states its axis on every forward of a member of
+    /// a union. `false` for a model that meets the union only in its exchange.
+    fn expert_collectives(&self) -> bool {
+        false
+    }
+
     /// The token ids its layers read beside the embeddings, such as an n-gram hash embedding
     /// that hashes each token with the ones before it: execution then lends
     /// [`crate::capability::TokenBatch::token_ids`] and the history before each row
@@ -282,6 +291,14 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// for a model that states `None`.
     fn token_history(&self) -> Option<TokenHistory>;
 }
+
+/// The axis a causal language model's forward addresses its expert union along
+/// ([`crate::collective::along`]): the data-parallel ranks that share their routed experts
+/// ([`TextPlacement::experts`]), each serving a batch of its own, every member taking part in
+/// every step (a member without tokens joins it, [`crate::CausalLm::join_expert_step`]). Axis 0
+/// is the rank's worker group, which a member of a union does not partition; execution states
+/// this axis after it for a model that collects along it ([`TextModel::expert_collectives`]).
+pub const EXPERT_AXIS: usize = 1;
 
 /// The token ids before each token a model's layers read, as the model states them
 /// ([`TextModel::token_history`]).
@@ -501,11 +518,21 @@ pub enum History {
     },
 }
 
-/// One entry of a cache field: `heads` rows of `width` values each, in `format`.
+/// One entry of a cache field: `heads` rows of `width` values each, in `format`, its block
+/// scales where `layout` places them.
+///
+/// The record is the one statement of a page's bytes: execution sizes, copies and stores pages
+/// by it without reading them, and the model's writer and reader of the field encode and decode
+/// the entries by the same declaration ([`Self::operand`]), so they agree by construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
     /// How the values are stored.
     pub format: Format,
+    /// Where a page of a block-scaled format keeps its scales: after each row's values
+    /// ([`Layout::Entry`]), or after the values of every entry of the page ([`Layout::Page`]),
+    /// as DeepGEMM's paged index logits read index keys. An element format keeps no scale and
+    /// states [`Layout::Entry`]; a page layout holds entries of one row.
+    pub layout: Layout,
     /// The rows of one entry: key/value heads of a key or value field, one for a latent.
     pub heads: u32,
     /// The values of one row.
@@ -516,8 +543,11 @@ pub struct Record {
 ///
 /// An element format stores each value as one element, and a plane of it is lent as
 /// `[pages, entries, heads, width]` of that type. A block-scaled format packs each row's values
-/// and their block scales into bytes, as the kernels that read it address them, and a plane of
-/// it is lent as `[pages, entries, heads, row bytes]` U8 ([`Format::row_bytes`]).
+/// and their block scales into bytes, as the record operators that write and read it address
+/// them, and a plane of it is lent as `[pages, entries, heads, row bytes]` U8
+/// ([`Format::row_bytes`]): a page holds `entries · heads` rows' bytes either way, arranged by
+/// the record's [`Layout`]. The block-scaled formats are the record operators' own
+/// ([`ops::record::Format`]), which state their bytes and their encoding once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     /// The deployment's cache element type (`kv_cache_config.dtype`, else the model's
@@ -527,27 +557,26 @@ pub enum Format {
     /// Elements of a fixed type, whatever the deployment states, such as index keys kept in the
     /// type the model computes in.
     Elements(DType),
-    /// MXFP8: E4M3 values, then one UE8M0 scale byte per 32 values (`width + width / 32` bytes).
-    Mxfp8,
-    /// NVFP4: E2M1 values two to a byte, then one E4M3 scale per 16 values
-    /// (`width / 2 + width / 16` bytes).
-    Nvfp4,
-    /// MXFP4: E2M1 values two to a byte, then one UE8M0 scale per 32 values
-    /// (`width / 2 + width / 32` bytes).
-    Mxfp4,
-    /// E4M3 values, then one F32 scale for the row (`width + 4` bytes).
-    Fp8Scaled,
+    /// A block-scaled byte format of the record operators: MXFP8, NVFP4 or MXFP4 (a format that
+    /// keeps a block scale; BF16 records are [`Format::Elements`]).
+    Scaled(ops::record::Format),
 }
 
 impl Format {
+    /// MXFP8: E4M3 values, then one UE8M0 scale byte per 32 values (`width + width / 32` bytes).
+    pub const MXFP8: Self = Self::Scaled(ops::record::Format::Mxfp8);
+    /// NVFP4: E2M1 values two to a byte, then one E4M3 scale per 16 values
+    /// (`width / 2 + width / 16` bytes).
+    pub const NVFP4: Self = Self::Scaled(ops::record::Format::Nvfp4);
+    /// MXFP4: E2M1 values two to a byte, then one UE8M0 scale per 32 values
+    /// (`width / 2 + width / 32` bytes).
+    pub const MXFP4: Self = Self::Scaled(ops::record::Format::Mxfp4);
+
     /// The values of a row one block scale of the format covers; `None` for an element format.
     pub fn block(self) -> Option<u32> {
         match self {
             Self::Deployment | Self::Elements(_) => None,
-            Self::Mxfp8 | Self::Mxfp4 => Some(32),
-            Self::Nvfp4 => Some(16),
-            // One scale covers the whole row, whatever its width.
-            Self::Fp8Scaled => Some(1),
+            Self::Scaled(format) => format.block().map(|block| block as u32),
         }
     }
 
@@ -558,25 +587,61 @@ impl Format {
         if width == 0 || !width.is_multiple_of(block) {
             return None;
         }
+        match self {
+            Self::Scaled(format) => u32::try_from(format.record_bytes(u64::from(width))).ok(),
+            Self::Deployment | Self::Elements(_) => None,
+        }
+    }
 
-        Some(match self {
-            Self::Mxfp8 => width + width / 32,
-            Self::Nvfp4 => width / 2 + width / 16,
-            Self::Mxfp4 => width / 2 + width / 32,
-            Self::Fp8Scaled => width + 4,
-            Self::Deployment | Self::Elements(_) => return None,
-        })
+    /// The record format of the operators that write and read paged records
+    /// ([`ops::record::Format`]): BF16 elements or a block-scaled format they encode; `None`
+    /// for the deployment's element type and another element type, which no record operator
+    /// reads.
+    pub fn record(self) -> Option<ops::record::Format> {
+        match self {
+            Self::Elements(DType::BF16) => Some(ops::record::Format::Bf16),
+            Self::Scaled(format) => Some(format),
+            Self::Deployment | Self::Elements(_) => None,
+        }
     }
 }
 
 impl Record {
+    /// A record of `heads` rows of `width` values in `format`, its scales after each row's
+    /// values: every record but a page-laid one.
+    pub const fn rows(format: Format, heads: u32, width: u32) -> Self {
+        Self {
+            format,
+            layout: Layout::Entry,
+            heads,
+            width,
+        }
+    }
+
+    /// The format and layout the record operators read and write the record in
+    /// ([`crate::functional::Plane`]).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Unsupported`] for a record no record operator reads
+    /// ([`Format::record`]).
+    pub fn operand(&self) -> Result<(ops::record::Format, Layout)> {
+        let format = self.format.record().ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "a cache record in {:?} has no record format the record operators read",
+                self.format
+            ))
+        })?;
+        Ok((format, self.layout))
+    }
+
     /// The element type a plane of the record is lent in, for a deployment whose cache element
     /// type is `deployment`: that type, the record's own, or U8 for a block-scaled record.
     pub fn dtype(&self, deployment: DType) -> DType {
         match self.format {
             Format::Deployment => deployment,
             Format::Elements(dtype) => dtype,
-            Format::Mxfp8 | Format::Nvfp4 | Format::Mxfp4 | Format::Fp8Scaled => DType::U8,
+            Format::Scaled(_) => DType::U8,
         }
     }
 
@@ -594,7 +659,19 @@ impl Record {
         };
 
         match width {
-            Some(width) if width > 0 && self.heads > 0 => Ok([self.heads, width]),
+            Some(width) if width > 0 && self.heads > 0 => {
+                // Every entry of a page-laid record shares the page's scale section, so an entry
+                // is one row and its format keeps scales.
+                let packed = self.format.block().is_some();
+                if self.layout == Layout::Page && (self.heads != 1 || !packed) {
+                    return Err(crate::Error::Unsupported(format!(
+                        "a cache record of {} rows in {:?} keeps no scales after its page's \
+                         values: a page layout holds one block-scaled row an entry",
+                        self.heads, self.format
+                    )));
+                }
+                Ok([self.heads, width])
+            }
             _ => Err(crate::Error::Unsupported(format!(
                 "a cache record of {} rows of {} values in {:?} has no whole entry",
                 self.heads, self.width, self.format
@@ -671,11 +748,7 @@ impl CacheField {
                 .collect(),
             readers: Vec::new(),
             history: History::Full,
-            record: Record {
-                format: Format::Deployment,
-                heads,
-                width: head_dim,
-            },
+            record: Record::rows(Format::Deployment, heads, head_dim),
         }
     }
 

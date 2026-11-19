@@ -29,7 +29,8 @@
 //! from the first held expert's weight; a calibrated export stores every packed expert as its
 //! own module (ModelOpt's unified export), which is the one layout packed experts are read in.
 //! A block-scaled export's MXFP4 experts are read the same way, into the stacks the MXFP4
-//! products read ([`functional::gather_gemm_mxfp4`]); a rank holds whole MXFP4 experts.
+//! products read ([`functional::gather_gemm_mxfp4`]); a rank holds whole MXFP4 experts, every
+//! slot or its window of a tensor group that holds whole experts or of an expert group.
 //!
 //! ## Where the experts sit
 //!
@@ -118,6 +119,10 @@ pub struct MoEConfig {
     pub limit: Option<f32>,
     /// The router's module name.
     pub router: &'static str,
+    /// The element type the router's product reads its weight and the rows in and states its
+    /// logits in: the activations' when `None`, or a wider one (F32) for a model whose reference
+    /// routes in it, so near ties select as the reference's do.
+    pub router_dtype: Option<DType>,
     /// The name of the module list that holds the experts: expert `e`'s projections are
     /// `<list>.<e>.<up|gate|down>`.
     pub list: &'static str,
@@ -309,9 +314,12 @@ impl MoE {
         let window = &config.order[local.start as usize..local.end as usize];
         let intermediate = config.intermediate / split.size();
 
+        let router_vb = match config.router_dtype {
+            Some(dtype) => vb.pp(config.router).to_dtype(dtype),
+            None => vb.pp(config.router),
+        };
         let router = Linear::new(
-            vb.pp(config.router)
-                .get((experts as usize, config.hidden as usize), "weight")?,
+            router_vb.get((experts as usize, config.hidden as usize), "weight")?,
             None,
             WeightOrder::NxK,
         )?;
@@ -360,13 +368,13 @@ impl MoE {
         }
         let packed = scheme == Scheme::Nvfp4;
         let (stacks, intermediate) = if scheme == Scheme::Mxfp4 {
-            if split.size() > 1 || exchange.size() > 1 || config.activation != Activation::Silu {
+            // A rank holds whole MXFP4 experts: its window of the slots, over a tensor group that
+            // holds whole experts or over an expert group, whose exchange carries BF16 rows.
+            if split.size() > 1 || config.activation != Activation::Silu {
                 return Err(refuse(format!(
-                    "MXFP4 experts are held whole, without an expert group, and gated by SiLU: \
-                     a tensor group of {} that holds whole experts serves them, and an expert \
-                     group of {} or {} gating has no MXFP4 product",
+                    "MXFP4 experts are held whole and gated by SiLU: a tensor group of {} \
+                     splitting each expert's width, or {} gating, has no MXFP4 product",
                     split.size(),
-                    exchange.size(),
                     config.activation
                 )));
             }
@@ -811,8 +819,13 @@ impl MoE {
             bias: self.selection_bias.as_ref(),
             scale: self.routed_scale.as_ref(),
         };
+        // A router held in a wider type than the rows reads them widened.
+        let rows = match self.router.weight().dtype() {
+            dtype if dtype != x.dtype() => x.to_dtype(dtype)?,
+            _ => x.clone(),
+        };
         functional::topk_softmax(
-            &self.router.forward(x)?,
+            &self.router.forward(&rows)?,
             &routing,
             Some(&self.map),
             live_tokens,
@@ -1035,7 +1048,7 @@ impl MoE {
         live_tokens: Option<&Tensor>,
         exchange: &ExpertExchange,
     ) -> Result<Tensor> {
-        let (up_gate, down) = match &self.experts {
+        let stacks = match &self.experts {
             Experts::Fused {
                 up_gate,
                 down,
@@ -1056,12 +1069,12 @@ impl MoE {
                 );
             }
 
-            Experts::Dense { up_gate, down } if !exchange.fused => (up_gate, down),
+            stacks @ (Experts::Dense { .. } | Experts::Mxfp4 { .. }) if !exchange.fused => stacks,
 
             _ => {
                 return Err(Error::Unsupported(
-                    "MoE: a fused exchange runs packed experts and an exchange of two launches \
-                     dense ones, and this block holds the other"
+                    "MoE: a fused exchange runs packed NVFP4 experts and an exchange of two \
+                     launches dense or MXFP4 ones, and this block holds the other"
                         .to_owned(),
                 ));
             }
@@ -1096,10 +1109,35 @@ impl MoE {
             )?;
 
             // 3. Both products over this rank's stacks, and each received row's sum left where
-            //    the combine returns it from.
-            let gated =
-                functional::gather_gemm(&states, up_gate, &received_ids, &maps, self.activation)?;
-            let products = functional::route_gemm(&gated, down, &received_ids, &maps)?;
+            //    the combine returns it from. The rows arrive in the activation type; MXFP4
+            //    products encode them as their first product reads them.
+            let products = match stacks {
+                Experts::Dense { up_gate, down } => {
+                    let gated = functional::gather_gemm(
+                        &states,
+                        up_gate,
+                        &received_ids,
+                        &maps,
+                        self.activation,
+                    )?;
+                    functional::route_gemm(&gated, down, &received_ids, &maps)?
+                }
+                Experts::Mxfp4 {
+                    up_gate,
+                    down,
+                    limit,
+                } => {
+                    let (codes, scales) =
+                        functional::gather_gemm_mxfp4(&states, up_gate, limit, &maps, self.top)?;
+                    functional::route_gemm_mxfp4(&codes, &scales, down, &maps, self.top)?
+                }
+                // Matched out before the dispatch: a fused exchange returned above.
+                Experts::Packed { .. } | Experts::Fused { .. } => {
+                    return Err(Error::Unsupported(
+                        "MoE: packed NVFP4 experts run through a fused exchange".to_owned(),
+                    ));
+                }
+            };
             functional::moe_unpermute(
                 &products,
                 &maps,

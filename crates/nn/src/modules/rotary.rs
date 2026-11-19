@@ -737,6 +737,12 @@ impl Rotary {
         &self.config
     }
 
+    /// `[dim / 2]` F32: the published inverse frequencies, which a cache write turns an entry by
+    /// at its own position.
+    pub fn inverse_frequencies(&self) -> &Tensor {
+        &self.inv_freq
+    }
+
     /// The columns of one factor table row: one per rotated pair.
     pub const fn columns(&self) -> u32 {
         self.config.dim / 2

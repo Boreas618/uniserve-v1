@@ -636,20 +636,25 @@ impl ModelRunner {
 
     /// The member of the node's expert union this rank is on `device` of `multiprocessors`
     /// multiprocessors, over the union's host group `group`, asking the other members to join
-    /// its steps through `join`; `None` for a rank of no union.
+    /// its steps through `join`, its forwards' collectives along the union over `communicator`
+    /// (`nn::family::EXPERT_AXIS`, `None` on the meta device and for a model that collects
+    /// nothing along it); `None` for a rank of no union.
     pub(crate) fn union_member(
         &self,
         (device, multiprocessors): (DeviceId, u32),
         model: &dyn TextModel,
         group: Arc<HostGroup>,
         join: JoinHook,
+        communicator: Option<Arc<ops::Group>>,
     ) -> Result<Option<Member>> {
         if self.union.is_none() {
             return Ok(None);
         }
         let (shape, mode) = self.transport_shape((device, multiprocessors), model)?;
         let beside = self.engine_config().moe.beside_rows.get();
-        Ok(Some(Member::new(group, shape, mode, join, beside)?))
+        Ok(Some(
+            Member::new(group, shape, mode, join, beside)?.with_communicator(communicator),
+        ))
     }
 
     /// The shape of the transport a member of an expert union creates on `device`, whose

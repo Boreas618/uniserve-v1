@@ -94,6 +94,35 @@ pub struct TokenBatch {
 }
 
 impl TokenBatch {
+    /// Each packed token's row of the batch, `[tokens]` U32, and its index among its row's
+    /// tokens, `[tokens]` I32, as tensors of the batch's device: a padding token past the batch's
+    /// tokens is counted in its last row.
+    ///
+    /// # Errors
+    ///
+    /// What a tensor operation refuses.
+    pub fn token_rows(&self) -> Result<(Tensor, Tensor)> {
+        let (rows, tokens) = (self.rows(), self.tokens());
+        let device = self.query_offsets.device();
+        let offsets = self.query_offsets.to_dtype(DType::I32)?;
+        let token =
+            Tensor::arange(0_i32, tokens as i32, &tensor::Device::Cpu)?.to_device(device)?;
+
+        // A token lies in the row whose end is the first past it: the count of ends at or
+        // before it.
+        let ends = offsets.narrow(0, 1, rows)?;
+        let row = token
+            .unsqueeze(1)?
+            .broadcast_ge(&ends.unsqueeze(0)?)?
+            .to_dtype(DType::I32)?
+            .sum(1)?
+            .minimum((rows - 1) as f64)?
+            .to_dtype(DType::U32)?;
+        let first = offsets.narrow(0, 0, rows)?.index_select(&row, 0)?;
+        let index = token.sub(&first)?.maximum(0.0)?;
+        Ok((row, index))
+    }
+
     /// The number of rows (sequences) of the batch.
     pub fn rows(&self) -> usize {
         self.seq_lens.elem_count()
@@ -282,6 +311,31 @@ pub struct KvPlane {
     /// it back in FP32. The scale is one plane's: two planes of one group keep their pages
     /// apart and each has its own.
     pub scale: Option<Tensor>,
+}
+
+impl KvPlane {
+    /// The plane's entries as the record operators read them (`crate::functional::Plane`):
+    /// `[pages, entries, heads · row]`, one record of an entry's rows a slot. A page of a
+    /// page-laid record ([`crate::family::Layout::Page`]) holds the same bytes, its entries'
+    /// values first and their scales after them, which the operators address by the layout.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Shape`] for entries that are not `[pages, entries, heads, row]`.
+    pub fn records(&self) -> Result<Tensor> {
+        let &[pages, entries, heads, row] = self.entries.dims() else {
+            return Err(Error::shape(
+                "KvPlane",
+                format!(
+                    "the {} plane of layer {} is {:?}, not [pages, entries, heads, row]",
+                    self.field,
+                    self.layer,
+                    self.entries.dims()
+                ),
+            ));
+        };
+        Ok(self.entries.reshape((pages, entries, heads * row))?)
+    }
 }
 
 /// The paged cache of one cache group, as execution lends it for one forward: how rows address
@@ -1710,11 +1764,7 @@ mod tests {
                     FieldReader { layer: 2, owner: 0 },
                 ],
                 history: History::Full,
-                record: Record {
-                    format: Format::Nvfp4,
-                    heads: 1,
-                    width: 512,
-                },
+                record: Record::rows(Format::NVFP4, 1, 512),
             },
             CacheField::attention(crate::family::KEY, 2, 2, 8),
         ]
@@ -1783,11 +1833,61 @@ mod tests {
         let mut blocks = fields.clone();
         blocks[0].record.width = 520;
         assert!(CacheField::check(&blocks, 64).is_err());
-        assert_eq!(Format::Mxfp8.row_bytes(512), Some(528));
-        assert_eq!(Format::Mxfp4.row_bytes(128), Some(68));
-        assert_eq!(Format::Fp8Scaled.row_bytes(128), Some(132));
-        let mut window = fields;
+        assert_eq!(Format::MXFP8.row_bytes(512), Some(528));
+        assert_eq!(Format::MXFP4.row_bytes(128), Some(68));
+        assert_eq!(Format::MXFP8.row_bytes(128), Some(132));
+        // A record of the record operators' BF16 elements keeps no scale: it is an element
+        // format, and refused as a block-scaled one.
+        assert_eq!(
+            Format::Scaled(ops::record::Format::Bf16).row_bytes(128),
+            None
+        );
+        let mut window = fields.clone();
         window[0].history = History::Window { tokens: 0 };
         assert!(CacheField::check(&window, 64).is_err());
+
+        // A page keeps one section of scales: its entries are one block-scaled row each.
+        let mut paged = fields;
+        paged[0].record.layout = crate::family::Layout::Page;
+        CacheField::check(&paged, 64).unwrap();
+        paged[1].record.layout = crate::family::Layout::Page;
+        let error = CacheField::check(&paged, 64).unwrap_err().to_string();
+        assert!(error.contains("page layout"), "{error}");
+    }
+
+    /// A page-laid record is lent in its page's extents and bound to the record operators in
+    /// the format and the layout its declaration states: what its writer and its reader read.
+    #[test]
+    fn a_plane_binds_in_the_layout_its_record_states() {
+        use crate::family::{Format, Layout, Record};
+
+        let keys = Record {
+            layout: Layout::Page,
+            ..Record::rows(Format::MXFP4, 1, 128)
+        };
+        assert_eq!(
+            keys.operand().unwrap(),
+            (ops::record::Format::Mxfp4, Layout::Page)
+        );
+        assert_eq!(
+            Record::rows(Format::Elements(DType::BF16), 1, 128)
+                .operand()
+                .unwrap(),
+            (ops::record::Format::Bf16, Layout::Entry)
+        );
+        assert!(Record::rows(Format::Deployment, 1, 128).operand().is_err());
+
+        let mut fields = latent_and_keys();
+        fields[0].record = keys;
+        let planes = KvCache::planes_of(&fields, DType::BF16, 2, 64, |shape, dtype| {
+            Ok(Tensor::zeros(shape, dtype, &Device::Cpu)?)
+        })
+        .unwrap();
+
+        // 32 keys of 64 + 4 bytes a page, whichever section holds their scales.
+        assert_eq!(planes[0].entries.dims(), [2, 32, 1, 68]);
+        assert_eq!(planes[0].records().unwrap().dims(), [2, 32, 68]);
+        // A key field of two heads of eight is two heads' elements a slot.
+        assert_eq!(planes[1].records().unwrap().dims(), [2, 64, 16]);
     }
 }

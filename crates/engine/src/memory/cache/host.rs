@@ -561,11 +561,7 @@ mod tests {
             owners: (0..4).map(|layer| FieldOwner { layer, ratio: 4 }).collect(),
             readers: Vec::new(),
             history: History::Full,
-            record: Record {
-                format: Format::Elements(DType::BF16),
-                heads: 1,
-                width: 128,
-            },
+            record: Record::rows(Format::Elements(DType::BF16), 1, 128),
         }
     }
 
@@ -636,11 +632,7 @@ mod tests {
             ],
             readers: Vec::new(),
             history: History::Full,
-            record: Record {
-                format,
-                heads: 1,
-                width: 512,
-            },
+            record: Record::rows(format, 1, 512),
         };
         let shape = |format, ratio| {
             let layout = CacheLayout::of(64, &[latent(format, ratio)], PrefixCacheDtype::BFloat16)?;
@@ -648,12 +640,12 @@ mod tests {
         };
 
         // Thirty-two NVFP4 entries of 288 bytes, then sixty-four.
-        let nvfp4 = shape(Format::Nvfp4, 2)?;
+        let nvfp4 = shape(Format::NVFP4, 2)?;
         assert_eq!(nvfp4.page_bytes, (32 + 64) * 288);
-        let mxfp8 = shape(Format::Mxfp8, 2)?;
+        let mxfp8 = shape(Format::MXFP8, 2)?;
         assert_eq!(mxfp8.page_bytes, (32 + 64) * 528);
         assert_ne!(nvfp4.layout, mxfp8.layout);
-        assert_ne!(nvfp4.layout, shape(Format::Nvfp4, 4)?.layout);
+        assert_ne!(nvfp4.layout, shape(Format::NVFP4, 4)?.layout);
         Ok(())
     }
 }

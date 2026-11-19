@@ -5,7 +5,8 @@
 //! The export is written here as DeepSeek's `fp8` producer writes one, at small widths the
 //! products admit (hidden 128, expert width 128): routed experts of packed E2M1 codes with one
 //! UE8M0 scale per 32 elements of each row, a shared expert of E4M3 codes under 32 × 32 block
-//! scales, a BF16 router and its FP32 selection bias. Nothing here touches a GPU.
+//! scales, a BF16 router and its FP32 selection bias; over an expert group, the launches a rank
+//! states between the exchange's dispatch and combine. Nothing here touches a GPU.
 
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
@@ -18,8 +19,10 @@ use nn::modules::{
     ExpertLayout, GateUp, MlpConfig, MoE, MoEConfig, SharedExpert, SharedExpertConfig,
 };
 use nn::quantization::Declaration;
-use nn::{Checkpoint, CpuWeights, DType, WeightLoader};
-use nn_testing::{encode, sequence, tensor, values, write_checkpoint};
+use nn::{Checkpoint, CpuWeights, DType, ExpertExchange, MetaWeights, WeightLoader};
+use nn_testing::{
+    Recording, encode, meta, operators, record, sequence, tensor, values, write_checkpoint,
+};
 
 const HIDDEN: usize = 128;
 const INTERMEDIATE: usize = 128;
@@ -253,6 +256,7 @@ fn config() -> MoEConfig {
         routed_scale: Some(ROUTED_SCALE),
         limit: Some(LIMIT),
         router: "gate",
+        router_dtype: None,
         list: "experts",
         up: "w3",
         gate: "w1",
@@ -478,4 +482,82 @@ fn an_mxfp4_block_and_its_shared_expert_compute_the_references_experts() {
             index % HIDDEN
         );
     }
+}
+
+/// The rows of an exchange over `ranks` ranks of `rank_rows` rows each, as meta tensors.
+fn exchange(ranks: u32, rank_rows: u32) -> ExpertExchange {
+    let rows = (ranks * rank_rows) as usize;
+
+    ExpertExchange {
+        ranks,
+        attention: 0,
+        rank_rows,
+        step_rows: rank_rows,
+        multiprocessors: 148,
+        states: meta((rows, HIDDEN), DType::BF16),
+        ids: meta((rows, TOP), DType::U32),
+        weights: meta((rows, TOP), DType::F32),
+        combined: meta((rows, HIDDEN), DType::BF16),
+        live: meta(1, DType::U32),
+        packed: meta((rank_rows as usize, HIDDEN / 2), DType::U8),
+        packed_scales: meta((rank_rows as usize, HIDDEN / 16), DType::F8E4M3),
+        fused: false,
+        source_only: false,
+    }
+}
+
+/// Over an expert group a rank holds its window of whole MXFP4 experts and runs the MXFP4
+/// products over the BF16 rows the exchange delivered: the dispatch, the rows' MXFP8 encoding, its
+/// experts' two products and the weighted sums left for the combine, which returns its tokens' sums. A rank with no
+/// tokens of its own joins the step and serves its peers' routes the same way.
+#[test]
+fn an_mxfp4_block_over_an_expert_group_runs_its_window_between_dispatch_and_combine() {
+    let directory = tempfile::tempdir().unwrap();
+    export(directory.path());
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
+    let group = Split::new(2, 1).unwrap();
+    let block = MoE::load(
+        &MoEConfig {
+            exchange: group,
+            ..config()
+        },
+        loader.root().pp("ffn"),
+    )
+    .unwrap();
+    assert_eq!((block.experts(), block.local_experts()), (4, 2));
+
+    // The products of the rank's two experts over the rows every rank sent, eight of them.
+    let lent = exchange(2, 4);
+    let (output, Recording { launches, .. }) = record(&[group], || {
+        block.forward(&meta((3, HIDDEN), DType::BF16), None, Some(&lent))
+    });
+    assert_eq!(output.unwrap().dims(), [3, HIDDEN]);
+    let mxfp4_products = [
+        "expert_exchange",
+        "moe_sort",
+        "mxfp8_quantize",
+        "gather_gemm_mxfp4",
+        "route_gemm_mxfp4",
+        "moe_unpermute",
+        "expert_exchange",
+    ];
+    let stated = operators(&launches);
+    assert_eq!(
+        stated[stated.len() - mxfp4_products.len()..],
+        mxfp4_products
+    );
+    let (_, sort) = launches
+        .iter()
+        .find(|(operator, _)| *operator == "moe_sort")
+        .unwrap();
+    assert!(sort.contains("experts_4_top_2_local_2"), "{sort}");
+
+    let (joined, Recording { launches, .. }) = record(&[group], || block.join_expert_step(&lent));
+    joined.unwrap();
+    assert_eq!(operators(&launches), mxfp4_products);
 }

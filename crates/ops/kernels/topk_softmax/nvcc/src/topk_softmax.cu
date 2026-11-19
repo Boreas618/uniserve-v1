@@ -239,10 +239,12 @@ extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_k
                                       : (partial[0] < FLT_EPSILON ? FLT_EPSILON : partial[0]);
     weight = weight / total;
   }
-  if (scale_kind != kAbsent) weight = weight * load_value(scale, scale_kind, expert);
   // A padding row of a captured bucket holds no scores: its picks may name no
-  // expert, and `moe_sort` drops such an id. The map is read for real ids alone.
+  // expert (a row of NaN or -inf keys picks none), and `moe_sort` drops such an
+  // id. The per-expert scale and the map are read for real ids alone: an unnamed
+  // pick's expert is no index of either.
   const bool named = expert >= 0 && expert < experts;
+  if (scale_kind != kAbsent && named) weight = weight * load_value(scale, scale_kind, expert);
   const bool mapped = map != nullptr && named;
   ids[static_cast<int64_t>(row) * top + lane] = mapped ? map[expert] : expert;
   weights[static_cast<int64_t>(row) * top + lane] = weight;

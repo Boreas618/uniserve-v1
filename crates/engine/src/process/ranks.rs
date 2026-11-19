@@ -257,11 +257,25 @@ pub(crate) struct TextRank {
     /// The serving vision runner of a rank that encodes images, from its opening until its worker
     /// takes it beside the causal runner.
     pub(crate) vision_runner: Option<VisionRunner>,
-    /// The node's expert union this rank is a member of: the union's host group, the members'
-    /// workers once [`spawn`] set them, the rank's place among them, and the multiprocessors of
-    /// the rank's device its exchange is compiled for, as its start's backing stated them
-    /// ([`Backing`]); `None` outside a union.
-    pub(crate) union: Option<(Arc<HostGroup>, Members, usize, u32)>,
+    /// The node's expert union this rank is a member of; `None` outside a union.
+    pub(crate) union: Option<UnionPlace>,
+}
+
+/// A rank's place in the node's expert union, as its start formed it.
+pub(crate) struct UnionPlace {
+    /// The union's host group: the step agreement's gathers and the transport package's own.
+    pub(crate) group: Arc<HostGroup>,
+    /// The members' workers, once [`spawn`] set them, which a member asks to join its steps.
+    pub(crate) targets: Members,
+    /// The rank's place among the members.
+    pub(crate) place: usize,
+    /// The multiprocessors of the rank's device its exchange is compiled for, as its start's
+    /// backing stated them ([`Backing`]).
+    pub(crate) multiprocessors: u32,
+    /// The union's device communicator, over every member in place order, when the model's
+    /// forwards collect along the union (`nn::family::EXPERT_AXIS`); `None` for a model that
+    /// meets the union only in its exchange, and on the meta device.
+    pub(crate) communicator: Option<Arc<ops::Group>>,
 }
 
 impl LoadedRank {
@@ -610,20 +624,41 @@ fn load_rank(
     // A member of the expert union takes its place in the union and the multiprocessors its
     // exchange is compiled for, which the backing states of its device; the profile run's
     // member records the exchange's keys for them, and the opening's member is shaped alike.
+    // A model whose forwards collect along the union beside its exchange
+    // (`nn::family::TextModel::expert_collectives`) has the union's communicator formed here, one
+    // group of every member in place order, before any device measurement as the worker group's
+    // is; the profile run's member states the axis without it.
     let union = match union {
         Some((group, targets)) => {
             let multiprocessors = backing.multiprocessors(device)?;
             let place = group.rank();
-            Some((Arc::new(group), targets, place, multiprocessors))
+            let communicator = if meta.expert_collectives() {
+                let collective = Collective {
+                    groups: vec![(0..group.size()).collect()],
+                    member: Some((0, place)),
+                };
+                group_over(&group, device, &collective, client.is_some(), None)
+                    .context("forming the expert union's communicator")?
+            } else {
+                None
+            };
+            Some(UnionPlace {
+                group: Arc::new(group),
+                targets,
+                place,
+                multiprocessors,
+                communicator,
+            })
         }
         None => None,
     };
     let meta_member = match &union {
-        Some((group, targets, place, multiprocessors)) => model_runner.union_member(
-            (device, *multiprocessors),
+        Some(union) => model_runner.union_member(
+            (device, union.multiprocessors),
             meta.as_ref(),
-            Arc::clone(group),
-            join_hook(Arc::clone(targets), *place),
+            Arc::clone(&union.group),
+            join_hook(Arc::clone(&union.targets), union.place),
+            None,
         )?,
         None => None,
     };
@@ -771,9 +806,11 @@ fn load_rank(
     }
     // Only a member of the expert union holds a transport.
     let transport = match &union {
-        Some((.., multiprocessors)) => {
-            model_runner.transport_bytes((device, *multiprocessors), model.as_ref(), &kernels)?
-        }
+        Some(union) => model_runner.transport_bytes(
+            (device, union.multiprocessors),
+            model.as_ref(),
+            &kernels,
+        )?,
         None => 0,
     };
     regions.push(("expert transport", transport));
@@ -2753,11 +2790,12 @@ fn open_rank(
     let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
     let inputs = CausalLmRunner::input_bytes(&config, rank.model.as_ref())?;
     let member = match &rank.union {
-        Some((group, targets, place, multiprocessors)) => model_runner.union_member(
-            (device, *multiprocessors),
+        Some(union) => model_runner.union_member(
+            (device, union.multiprocessors),
             rank.model.as_ref(),
-            Arc::clone(group),
-            join_hook(Arc::clone(targets), *place),
+            Arc::clone(&union.group),
+            join_hook(Arc::clone(&union.targets), union.place),
+            union.communicator.clone(),
         )?,
         None => None,
     };
@@ -3952,7 +3990,7 @@ pub(crate) fn spawn(
         Loaded::Text(text) => text.union.as_ref(),
         Loaded::Video(_) => None,
     });
-    if let Some((_, targets, ..)) = union {
+    if let Some(UnionPlace { targets, .. }) = union {
         targets
             .set(workers.iter().map(Arc::downgrade).collect())
             .map_err(|_| anyhow::anyhow!("the expert union's workers were set already"))?;

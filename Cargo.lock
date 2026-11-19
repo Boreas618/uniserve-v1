@@ -4001,6 +4001,7 @@ dependencies = [
 name = "models"
 version = "2.0.0"
 dependencies = [
+ "build-server",
  "nn",
  "nn-testing",
  "ops",

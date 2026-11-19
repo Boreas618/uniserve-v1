@@ -1309,11 +1309,7 @@ mod tests {
                 .collect(),
             readers: Vec::new(),
             history: History::Full,
-            record: Record {
-                format: Format::Elements(DType::BF16),
-                heads: 1,
-                width: 6,
-            },
+            record: Record::rows(Format::Elements(DType::BF16), 1, 6),
         }
     }
 
@@ -1443,11 +1439,7 @@ mod tests {
             ],
             readers: Vec::new(),
             history: History::Full,
-            record: Record {
-                format: Format::Nvfp4,
-                heads: 1,
-                width: 512,
-            },
+            record: Record::rows(Format::NVFP4, 1, 512),
         };
         let layout = layout(&[latent], PrefixCacheDtype::BFloat16);
         let pool = layout.kv();

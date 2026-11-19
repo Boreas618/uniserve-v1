@@ -127,55 +127,6 @@ pub fn token_columns(batch: &TokenBatch, state: &RecurrentState) -> Result<Vec<T
     Ok(vec![row, position, slot, leading, trailing, index])
 }
 
-/// Each token's n-gram context, `[tokens, width + 1]` U32: the `width` ids before it, oldest
-/// first, then its own, from the batch's token ids and, for a row's first tokens, from the
-/// ids before the row ([`TokenBatch::token_history`], `[rows, width]`).
-///
-/// # Errors
-///
-/// A batch that states no token ids or no history.
-pub fn ngram_context(batch: &TokenBatch, columns: &[Tensor]) -> Result<Tensor> {
-    let (Some(ids), Some(before)) = (&batch.token_ids, &batch.token_history) else {
-        return Err(ID.config(
-            "the n-gram embedding hashes token ids, and the batch states none \
-             (token_ids, token_history)"
-                .to_owned(),
-        ));
-    };
-    let (tokens, rows) = (batch.tokens(), batch.rows());
-    let width = before.dim(1)?;
-    let index = &columns[INDEX];
-    let token = Tensor::arange(0_i32, tokens as i32, &Device::Cpu)?.to_device(ids.device())?;
-    let constant = |value: usize| int(value as i64, index);
-
-    // The history the context is read from: every row's ids before it, `width` a row, then
-    // the batch's token ids.
-    let history = Tensor::cat(&[&before.flatten_all()?, ids], 0)?;
-    let own = token.broadcast_add(&constant(width * rows)?)?;
-    let before_row = columns[ROW]
-        .to_dtype(DType::I32)?
-        .broadcast_mul(&constant(width)?)?;
-
-    let earlier = |back: usize| -> Result<Tensor> {
-        // The token `back` before a token is the row's own when the row reaches that far
-        // back, and the row's history otherwise: its last id for the token before the row's
-        // first, and so on.
-        let in_row = own.broadcast_sub(&constant(back)?)?;
-        let in_context = before_row
-            .add(index)?
-            .broadcast_add(&constant(width - back)?)?;
-        let entry = index
-            .broadcast_ge(&constant(back)?)?
-            .where_cond(&in_row, &in_context)?;
-
-        Ok(history.index_select(&entry.to_dtype(DType::U32)?, 0)?)
-    };
-
-    let mut context = (1..=width).rev().map(earlier).collect::<Result<Vec<_>>>()?;
-    context.push(ids.clone());
-    Ok(Tensor::stack(&context, 1)?)
-}
-
 /// The rotary coordinates of a batch's tokens, `[3, tokens]` I32: the batch's own when it
 /// holds image rows, and each token's position on every axis otherwise.
 pub fn coordinates(batch: &TokenBatch) -> Result<Tensor> {
@@ -350,7 +301,7 @@ impl CausalLm for Qwen4ExpForCausalLm {
             let (cos, sin) = self.rotary_emb.forward(&coordinates)?;
             let columns = token_columns(batch, state)?;
             let context = if self.layers.iter().any(DecoderLayer::has_ple) {
-                Some(ngram_context(batch, &columns)?)
+                Some(nn::modules::ngram_context(batch)?)
             } else {
                 None
             };
@@ -534,11 +485,7 @@ pub(crate) fn cache_fields(
             .collect(),
         readers: Vec::new(),
         history: History::Full,
-        record: Record {
-            format: Format::Elements(dtype),
-            heads: 1,
-            width: indexer.head_dim,
-        },
+        record: Record::rows(Format::Elements(dtype), 1, indexer.head_dim),
     });
     fields
 }
@@ -598,11 +545,7 @@ mod tests {
         );
         assert_eq!(
             keys.record,
-            Record {
-                format: Format::Elements(DType::BF16),
-                heads: 1,
-                width: 128
-            }
+            Record::rows(Format::Elements(DType::BF16), 1, 128)
         );
 
         let rank = cache_fields(&config, Split::new(4, 3).unwrap(), 2, DType::BF16);

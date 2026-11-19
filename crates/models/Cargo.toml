@@ -27,6 +27,8 @@ tokenizers.workspace = true
 # denoiser's unit test installs a meta context of its own, which the library target names
 # nothing of.
 [dev-dependencies]
+# The kernel packages' manifests, which the profile runs hold the stated keys to.
+build-server.workspace = true
 nn-testing.workspace = true
 ops.workspace = true
 # The digest of DeepSeek-V4.1's normalized vocabulary, which its reference fixture states.
