@@ -276,6 +276,14 @@ pub trait TextModel: CausalLm + Send + Sync {
         None
     }
 
+    /// Whether its forwards issue collectives along the expert union beside the expert exchange
+    /// ([`EXPERT_AXIS`]), such as a lookup of a table its ranks split between them: execution
+    /// then forms the union's communicator and states its axis on every forward of a member of
+    /// a union. `false` for a model that meets the union only in its exchange.
+    fn expert_collectives(&self) -> bool {
+        false
+    }
+
     /// The token ids its layers read beside the embeddings, such as an n-gram hash embedding
     /// that hashes each token with the ones before it: execution then lends
     /// [`crate::capability::TokenBatch::token_ids`] and the history before each row
@@ -283,6 +291,14 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// for a model that states `None`.
     fn token_history(&self) -> Option<TokenHistory>;
 }
+
+/// The axis a causal language model's forward addresses its expert union along
+/// ([`crate::collective::along`]): the data-parallel ranks that share their routed experts
+/// ([`TextPlacement::experts`]), each serving a batch of its own, every member taking part in
+/// every step (a member without tokens joins it, [`crate::CausalLm::join_expert_step`]). Axis 0
+/// is the rank's worker group, which a member of a union does not partition; execution states
+/// this axis after it for a model that collects along it ([`TextModel::expert_collectives`]).
+pub const EXPERT_AXIS: usize = 1;
 
 /// The token ids before each token a model's layers read, as the model states them
 /// ([`TextModel::token_history`]).

@@ -125,6 +125,7 @@ impl ModelRunner {
         member: Option<Member>,
         kernels: &Generation,
     ) -> Result<CausalLmRunner> {
+        let collects = model.expert_collectives();
         let mut runner = {
             let cache = service::lock(cache);
             let state = state.map(|state| service::lock(state));
@@ -149,10 +150,15 @@ impl ModelRunner {
         }
 
         // The group's one axis is its whole width: a rank's split is its position among the
-        // group's ranks. The meta contexts take the split alone: a profile run issues no
-        // collective.
+        // group's ranks. A member of an expert union whose model collects along the union states
+        // the union's axis after it (`nn::family::EXPERT_AXIS`). The meta contexts take the
+        // splits alone: a profile run issues no collective.
         let (rank, ranks) = super::split(self.mapping.position as usize, self.world_size);
-        crate::runner::Forward::graphs(&runner).set_group(group, rank, ranks)?;
+        let mut axes = vec![(group, rank, ranks)];
+        if let Some(member) = member.as_ref().filter(|_| collects) {
+            axes.push(member.axis());
+        }
+        crate::runner::Forward::graphs(&runner).set_axes(axes)?;
 
         // A serving runner counts the tokens each routed layer's experts take. The ranks of a
         // tensor group route the same tokens, so its first rank counts them for the group;
