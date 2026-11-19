@@ -50,12 +50,19 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
 NAME = "qwen3.5-speculation"
 DRAFTS = 3
-#: The options every deployment of the cases states.
+#: The options every deployment of the cases states: graphs of the batches
+#: the cases send, so that the model and its graph pools fit one GPU's share
+#: beside each other.
 OPTIONS: Config = {
     "model": CHECKPOINTS["qwen3.5"].model,
     "served_model_name": NAME,
+    "max_running_requests": 64,
     "speculative_config": {"num_draft_tokens": DRAFTS},
     "kv_cache_config": {"prefix_caching": False, "host_tier": False},
+    "cuda_graph_config": {
+        "prefill_token_sizes": [2048],
+        "decode_batch_sizes": [1, 2, 4, 8, 16, 32],
+    },
 }
 COMMITTED = "uniserve_spec_verify_committed_tokens_total"
 VERIFIED = "uniserve_spec_verify_rows_total"
