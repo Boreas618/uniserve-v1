@@ -14,7 +14,7 @@
 //!   calls of one diffusion request.
 //!
 //! The interface is numerical. A family reads its checkpoint and states its mathematical facts
-//! (widths, cache shape, frame rule, the layout of a request and the extents of its conditions);
+//! (widths, cache fields, frame rule, the layout of a request and the extents of its conditions);
 //! it receives the deployment's mathematical partition ([`Split`], [`SequenceSplit`],
 //! [`DenoiserSplit`]) and the rows execution sizes its layouts for ([`LayoutCapacity`]), and it
 //! holds no runtime object: execution owns the devices, streams, memory, graphs, the buckets it
@@ -243,8 +243,9 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// The element type of its activations.
     fn dtype(&self) -> DType;
 
-    /// The key/value cache its layers read, as this rank holds it.
-    fn cache(&self) -> CacheShape;
+    /// The fields of the paged cache its layers read and write, as this rank holds them
+    /// ([`CacheField`]).
+    fn cache(&self) -> Vec<CacheField>;
 
     /// The recurrent state its layers keep per request slot, as this rank holds it: one entry
     /// per run of consecutive recurrent layers that keep the same fields, in the order
@@ -424,28 +425,331 @@ impl StateShape {
     }
 }
 
-/// The paged key/value cache a causal language model reads, as one rank holds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CacheShape {
-    /// Layers that store keys and values.
-    pub layers: u32,
-    /// Key/value heads each layer stores on this rank.
-    pub kv_heads: u32,
-    /// Width of one head.
-    pub head_dim: u32,
-    /// The index keys each layer stores beside its keys and values
-    /// ([`crate::capability::KvPlanes::index_keys`]), for a model whose attention reads the
-    /// tokens an indexer selects; `None` otherwise.
-    pub index_keys: Option<IndexKeys>,
+/// The field of the paged cache that holds an attention layer's keys.
+pub const KEY: &str = "key";
+/// The field that holds an attention layer's values.
+pub const VALUE: &str = "value";
+/// The field that holds the keys an indexer scores, one per `ratio` tokens.
+pub const INDEX_KEY: &str = "index_key";
+
+/// One field of the paged cache a causal language model reads, as one rank holds it
+/// ([`TextModel::cache`]).
+///
+/// A field is one plane per owner layer: the entries the owner writes for its request's tokens,
+/// one entry per `ratio` consecutive tokens of a page, each entry one [`Record`]. Execution lays
+/// every field out on the page tables of the group its [`History`] names and lends each owner's
+/// plane to a forward ([`crate::capability::KvCache::plane`]); readers find their owner's plane
+/// there under their own layer. A model of separate keys and values states the fields [`KEY`]
+/// and [`VALUE`] over the same owners; a model whose attention reads one latent as both key and
+/// value states that latent as one field.
+///
+/// A layer is the index the model gives it among the cache layers this rank holds, the index a
+/// forward passes the cache functions ([`crate::functional::kv_write_`]). A drafter's fields
+/// ([`crate::capability::Drafter::cache`]) are the draft cache's, a group of their own, whose
+/// layers the drafter numbers from zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheField {
+    /// What the field holds: the name a forward finds its planes by, which also names its
+    /// storage. The (name, owner) pairs of a model's fields are distinct.
+    pub name: &'static str,
+    /// The layers that write their own entries, ascending, each with its ratio.
+    pub owners: Vec<FieldOwner>,
+    /// The layers that read an owner's entries and write none, each with the owner it reads.
+    pub readers: Vec<FieldReader>,
+    /// How much of a request's history the field keeps.
+    pub history: History,
+    /// One entry of the field.
+    pub record: Record,
 }
 
-/// The index-key plane of an attention layer: one key per `ratio` consecutive tokens of a page.
+/// An owner of a cache field: a layer and the tokens one of its entries stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IndexKeys {
-    /// Elements of one index key.
-    pub width: u32,
-    /// Tokens one key stands for; it divides the page size.
+pub struct FieldOwner {
+    /// The layer.
+    pub layer: u32,
+    /// Consecutive tokens of a page one entry stands for, which divides the page: one for an
+    /// entry per token, two for a compression of every pair. Entry `g` of a page stands for the
+    /// page's tokens `g · ratio .. (g + 1) · ratio`, and its writer writes it once they are all
+    /// computed.
     pub ratio: u32,
+}
+
+/// A reader of a cache field: a layer that reads `owner`'s entries in place of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldReader {
+    /// The layer that reads.
+    pub layer: u32,
+    /// The owner whose entries it reads.
+    pub owner: u32,
+}
+
+/// How much of a request's history a cache field keeps, which names the cache group its planes
+/// lie in: the fields of one history share the group's page tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum History {
+    /// Every token of the request, from its first: the full-history group, which the prefix
+    /// cache keys, stores and reloads.
+    Full,
+    /// The last `tokens` tokens before each token a forward computes, that token included: a
+    /// sliding window, whose group keeps no page outside the window of the request's next
+    /// token. The window states every token any reader reads, the rows a verification may roll
+    /// back included. Its pages are never cached: a request that resumes from a prefix hit
+    /// recomputes the window before the hit (bounded replay).
+    Window {
+        /// The tokens a reader reads.
+        tokens: u32,
+    },
+}
+
+/// One entry of a cache field: `heads` rows of `width` values each, in `format`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Record {
+    /// How the values are stored.
+    pub format: Format,
+    /// The rows of one entry: key/value heads of a key or value field, one for a latent.
+    pub heads: u32,
+    /// The values of one row.
+    pub width: u32,
+}
+
+/// How a record's values are stored.
+///
+/// An element format stores each value as one element, and a plane of it is lent as
+/// `[pages, entries, heads, width]` of that type. A block-scaled format packs each row's values
+/// and their block scales into bytes, as the kernels that read it address them, and a plane of
+/// it is lent as `[pages, entries, heads, row bytes]` U8 ([`Format::row_bytes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    /// The deployment's cache element type (`kv_cache_config.dtype`, else the model's
+    /// activation type). An FP8 cache keeps one F32 scale per page of the plane, which its
+    /// writer divides the page by and its reader multiplies back.
+    Deployment,
+    /// Elements of a fixed type, whatever the deployment states, such as index keys kept in the
+    /// type the model computes in.
+    Elements(DType),
+    /// MXFP8: E4M3 values, then one UE8M0 scale byte per 32 values (`width + width / 32` bytes).
+    Mxfp8,
+    /// NVFP4: E2M1 values two to a byte, then one E4M3 scale per 16 values
+    /// (`width / 2 + width / 16` bytes).
+    Nvfp4,
+    /// MXFP4: E2M1 values two to a byte, then one UE8M0 scale per 32 values
+    /// (`width / 2 + width / 32` bytes).
+    Mxfp4,
+    /// E4M3 values, then one F32 scale for the row (`width + 4` bytes).
+    Fp8Scaled,
+}
+
+impl Format {
+    /// The values of a row one block scale of the format covers; `None` for an element format.
+    pub fn block(self) -> Option<u32> {
+        match self {
+            Self::Deployment | Self::Elements(_) => None,
+            Self::Mxfp8 | Self::Mxfp4 => Some(32),
+            Self::Nvfp4 => Some(16),
+            // One scale covers the whole row, whatever its width.
+            Self::Fp8Scaled => Some(1),
+        }
+    }
+
+    /// The bytes one row of `width` values takes in a block-scaled format; `None` for an element
+    /// format, whose rows are elements, or a width the format's blocks do not divide.
+    pub fn row_bytes(self, width: u32) -> Option<u32> {
+        let block = self.block()?;
+        if width == 0 || !width.is_multiple_of(block) {
+            return None;
+        }
+
+        Some(match self {
+            Self::Mxfp8 => width + width / 32,
+            Self::Nvfp4 => width / 2 + width / 16,
+            Self::Mxfp4 => width / 2 + width / 32,
+            Self::Fp8Scaled => width + 4,
+            Self::Deployment | Self::Elements(_) => return None,
+        })
+    }
+}
+
+impl Record {
+    /// The element type a plane of the record is lent in, for a deployment whose cache element
+    /// type is `deployment`: that type, the record's own, or U8 for a block-scaled record.
+    pub fn dtype(&self, deployment: DType) -> DType {
+        match self.format {
+            Format::Deployment => deployment,
+            Format::Elements(dtype) => dtype,
+            Format::Mxfp8 | Format::Nvfp4 | Format::Mxfp4 | Format::Fp8Scaled => DType::U8,
+        }
+    }
+
+    /// The extents of one entry as a plane of the record is lent, `[heads, width]` elements of
+    /// [`Self::dtype`] or `[heads, row bytes]` of a block-scaled record.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Unsupported`] for a record of no row, or a width its format's blocks do
+    /// not divide.
+    pub fn dims(&self) -> Result<[u32; 2]> {
+        let width = match self.format {
+            Format::Deployment | Format::Elements(_) => Some(self.width),
+            packed => packed.row_bytes(self.width),
+        };
+
+        match width {
+            Some(width) if width > 0 && self.heads > 0 => Ok([self.heads, width]),
+            _ => Err(crate::Error::Unsupported(format!(
+                "a cache record of {} rows of {} values in {:?} has no whole entry",
+                self.heads, self.width, self.format
+            ))),
+        }
+    }
+
+    /// The bytes of one entry for a deployment whose cache element type is `deployment`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::dims`], and an element type the operator ABI gives no whole-byte width.
+    pub fn bytes(&self, deployment: DType) -> Result<u64> {
+        let [heads, width] = self.dims()?;
+        let dtype = self.dtype(deployment);
+        let element = ops::abi::bytes(dtype).ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "a cache record of {} elements, which have no whole-byte width",
+                ops::abi::name(dtype)
+            ))
+        })?;
+
+        Ok(u64::from(heads) * u64::from(width) * element)
+    }
+
+    /// Whether a plane of the record keeps one F32 scale per page beside its entries: a
+    /// record in the deployment's type when that type is FP8.
+    pub fn scaled(&self, deployment: DType) -> bool {
+        self.format == Format::Deployment && deployment == DType::F8E4M3
+    }
+}
+
+impl CacheField {
+    /// The owner `layer`, when it is one.
+    pub fn owner(&self, layer: u32) -> Option<FieldOwner> {
+        self.owners
+            .iter()
+            .copied()
+            .find(|owner| owner.layer == layer)
+    }
+
+    /// The owner whose entries `layer` reads: itself when it owns the field, the owner its
+    /// reader entry names otherwise; `None` for a layer that neither owns nor reads the field.
+    pub fn source(&self, layer: u32) -> Option<u32> {
+        if self.owner(layer).is_some() {
+            return Some(layer);
+        }
+        self.readers
+            .iter()
+            .find(|reader| reader.layer == layer)
+            .map(|reader| reader.owner)
+    }
+
+    /// The layers that read `owner`'s entries in place of their own, ascending.
+    pub fn readers_of(&self, owner: u32) -> Vec<u32> {
+        let mut layers: Vec<u32> = self
+            .readers
+            .iter()
+            .filter(|reader| reader.owner == owner)
+            .map(|reader| reader.layer)
+            .collect();
+        layers.sort_unstable();
+        layers
+    }
+
+    /// The field as a model of separate keys and values states its keys or values (`name`,
+    /// [`KEY`] or [`VALUE`]): every layer of `layers` an owner of one entry per token of
+    /// `heads × head_dim` elements in the deployment's type, over the full history.
+    pub fn attention(name: &'static str, layers: u32, heads: u32, head_dim: u32) -> Self {
+        Self {
+            name,
+            owners: (0..layers)
+                .map(|layer| FieldOwner { layer, ratio: 1 })
+                .collect(),
+            readers: Vec::new(),
+            history: History::Full,
+            record: Record {
+                format: Format::Deployment,
+                heads,
+                width: head_dim,
+            },
+        }
+    }
+
+    /// The [`KEY`] and [`VALUE`] fields of `layers` attention layers of `heads` heads of
+    /// `head_dim` each: what a model of separate keys and values states.
+    pub fn keys_and_values(layers: u32, heads: u32, head_dim: u32) -> Vec<Self> {
+        vec![
+            Self::attention(KEY, layers, heads, head_dim),
+            Self::attention(VALUE, layers, heads, head_dim),
+        ]
+    }
+
+    /// Checks a model's `fields` against each other and against a page of `page` tokens: owners
+    /// ascending and distinct, every ratio dividing the page, every reader reading an owner of
+    /// its field and owning none of it, (name, owner) pairs distinct across fields, and every
+    /// record whole.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Unsupported`] naming the field and what it states.
+    pub fn check(fields: &[Self], page: u32) -> Result<()> {
+        let refuse = |field: &Self, what: String| {
+            Err(crate::Error::Unsupported(format!(
+                "the cache field {} {what}",
+                field.name
+            )))
+        };
+
+        let mut owned = BTreeSet::new();
+        for field in fields {
+            if field.owners.is_empty() {
+                return refuse(field, "has no owner".to_owned());
+            }
+            if field
+                .owners
+                .windows(2)
+                .any(|pair| pair[0].layer >= pair[1].layer)
+            {
+                return refuse(field, "states its owners out of order or twice".to_owned());
+            }
+            for owner in &field.owners {
+                if owner.ratio == 0 || !page.is_multiple_of(owner.ratio) {
+                    return refuse(
+                        field,
+                        format!(
+                            "keeps one entry per {} tokens at layer {}, which does not divide a \
+                             page of {page}",
+                            owner.ratio, owner.layer
+                        ),
+                    );
+                }
+                if !owned.insert((field.name, owner.layer)) {
+                    return refuse(field, format!("is owned twice by layer {}", owner.layer));
+                }
+            }
+            for reader in &field.readers {
+                if field.owner(reader.layer).is_some() || field.owner(reader.owner).is_none() {
+                    return refuse(
+                        field,
+                        format!(
+                            "is read by layer {} from layer {}, which is no owner of it, or the \
+                             reader owns it itself",
+                            reader.layer, reader.owner
+                        ),
+                    );
+                }
+            }
+            if let History::Window { tokens: 0 } = field.history {
+                return refuse(field, "keeps a window of no token".to_owned());
+            }
+            field.record.dims()?;
+        }
+        Ok(())
+    }
 }
 
 /// The routed experts of a causal language model, as an expert exchange carries them.

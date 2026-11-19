@@ -10,6 +10,8 @@
 //! - [`assets`]: released checkpoints by Hugging Face repository and commit, read from the cache.
 //! - [`buffer_pool`]: the in-process buffer pool and the knobs a case paces it with.
 //! - [`engine`]: the fake engine's start over both, and the thread that runs its control thread.
+//! - [`latent`]: a stub of DeepSeek-V4.1-Flash's cache fields, which the engine's cache tests
+//!   serve on the meta path.
 //! - [`layouts`]: the worker-group layouts the engine's media tests place a pipeline in.
 //! - [`pools`]: the launch a fake engine is started with and what its worker groups serve.
 //! - [`policy`]: the workspace's policy packages and the modules they build, and the arguments a
@@ -23,6 +25,7 @@ pub mod assets;
 pub mod buffer_pool;
 pub mod engine;
 pub mod executor;
+pub mod latent;
 pub mod layouts;
 pub mod policy;
 pub mod pools;

@@ -58,6 +58,7 @@ mod resize;
 mod rows;
 mod schedule;
 mod stats;
+pub(crate) use kv::LOW_WATERMARK;
 pub(crate) use stats::STATS_PERIOD;
 #[cfg(test)]
 pub(crate) mod tests;

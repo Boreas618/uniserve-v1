@@ -542,8 +542,13 @@ pub struct Row {
     pub slot: u32,
     /// What the call computes: a prefill (or a refill) chunk, a decode or a verification.
     pub kind: Phase,
-    /// The attention cache group the call's keys and values belong to.
-    pub cache_group: u32,
+    /// The positions of a prefix hit the call recomputes the sliding windows of (bounded
+    /// replay, `specs/scheduler-design.md` §4.4): from the first position the request's
+    /// sliding-window groups hold, where the replay started, to the end of the hit. A token
+    /// before the end writes the sliding windows alone and reads the hit's full-history
+    /// entries, which it writes none of; a window reader reads no position before the start.
+    /// `0..0` for a request that replays nothing.
+    pub replay: std::ops::Range<u32>,
     /// The half-open row range the call owns in the batch's device columns.
     pub rows: std::ops::Range<u32>,
 }
@@ -1411,13 +1416,13 @@ mod tests {
                         Row {
                             slot: 1,
                             kind: Phase::Verify,
-                            cache_group: 0,
+                            replay: 0..0,
                             rows: 0..2,
                         },
                         Row {
                             slot: 2,
                             kind: Phase::Verify,
-                            cache_group: 0,
+                            replay: 0..0,
                             rows: 2..3,
                         },
                     ],

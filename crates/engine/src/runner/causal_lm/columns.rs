@@ -8,16 +8,18 @@
 //!
 //! ## The columns
 //!
-//! `T` is the layout's tokens and `R` its rows. A *padding entry* is what a column holds past
+//! `T` is the layout's tokens, `R` its rows and `G` the model's attention groups (the
+//! full-history group and each sliding window's). A *padding entry* is what a column holds past
 //! the batch's own tokens or rows, up to the bucket's.
 //!
 //! | Column | Type and extent | Holds | Padding entry |
 //! | --- | --- | --- | --- |
 //! | [`Column::InputIds`] | U32 `[T]` | the token ids a prefill embeds | `0` |
 //! | [`Column::Positions`] | I32 `[T]` | rotary positions | `0` |
-//! | [`Column::SlotMapping`] | U32 `[T]` | the cache slot each token writes ([`slot_mapping`]) | [`NO_SLOT`] |
+//! | [`Column::SlotMapping`] | U32 `[G, T]` | the cache slot each token writes in each attention group, a bucket's tokens per group ([`slot_mapping`]) | [`NO_SLOT`] |
 //! | [`Column::Targets`] | U32 `[T]` | the prompt token each token's logits score | [`NO_SLOT`] |
 //! | [`Column::SeqLens`] | U32 `[R]` | keys visible to each row's last query | `0` |
+//! | [`Column::Starts`] | U32 `[R]` | the first position each row's sliding windows hold: where a replay of a prefix hit starts (`Row::replay`) | `0` |
 //! | [`Column::QueryOffsets`] | U32 `[R + 1]` | packed query offsets | the batch's token count |
 //! | [`Column::LogitsRows`] | U32 `[R]` | the hidden row each row's logits are computed from | `0` |
 //! | [`Column::Slots`] | U32 `[R]` | each row's request slot, as the sampler and the recurrent state read it | [`NO_SLOT`] |
@@ -113,13 +115,15 @@
 //!
 //! ## Cache slots
 //!
-//! A batch names the cache position each token writes its key and value at, `-1` for none
+//! A batch names the cache position each token writes its entries at, `-1` for none
 //! (`Rows::cache_positions`), never a unit. The cache slot is computed here through the rank's
-//! device block table ([`slot_mapping`]): position `p` of a call on slot `s` lies in the block
-//! at position `p / page_size` of the slot's table of the call's cache group, whose run's unit
-//! `u` gives the slot `u · page_size + p % page_size`. A token is written only into an entry
-//! the table states writable: a call one of whose tokens names a position whose entry is
-//! missing or read-only is refused, and none of its tokens writes.
+//! device block table, in every attention group the model has ([`slot_mapping`]): position `p`
+//! of a call on slot `s` lies in the block at position `p / page_size` of the slot's table of
+//! the group's class, whose run's unit `u` gives the slot `u · page_size + p % page_size`. A
+//! token is written only into an entry the table states writable: a call one of whose tokens
+//! names a position whose entry is missing or read-only is refused, and none of its tokens
+//! writes. A token a call replays (`Row::replay`) writes the sliding windows alone: its
+//! full-history entries are the prefix hit's, which the call reads and holds read-only.
 //!
 //! ## Request slots
 //!
@@ -177,6 +181,7 @@ pub(crate) enum Column {
     SlotMapping,
     Targets,
     SeqLens,
+    Starts,
     QueryOffsets,
     LogitsRows,
     Slots,
@@ -248,21 +253,20 @@ impl Column {
         }
     }
 
-    /// The elements of the column in a layout of `rows` rows and `tokens` tokens, for
-    /// verifications of at most `drafts` drafts, a drafter's page table of `pages` pages a
-    /// row and a model that reads `history` ids before each token.
+    /// The elements of the column in a layout of `rows` rows and `tokens` tokens of `groups`
+    /// attention groups, for verifications of at most `drafts` drafts, a drafter's page table of
+    /// `pages` pages a row and a model that reads `history` ids before each token.
     const fn elements(
         self,
-        rows: usize,
-        tokens: usize,
+        (rows, tokens, groups): (usize, usize, usize),
         drafts: usize,
         pages: usize,
         history: usize,
     ) -> usize {
         match self {
+            Self::SlotMapping => groups * tokens,
             Self::InputIds
             | Self::Positions
-            | Self::SlotMapping
             | Self::Targets
             | Self::Drafts
             | Self::NextIds
@@ -303,6 +307,8 @@ pub(crate) struct Layout {
     rows: usize,
     /// The tokens a token column holds.
     tokens: usize,
+    /// The model's attention groups, each with a slot of every token.
+    groups: usize,
     /// The drafts a verification holds at most; zero for a runner that speculates nothing.
     drafts: usize,
     /// The pages of a row of the drafter's page table; zero without speculation.
@@ -317,12 +323,11 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    /// The layout of columns of `rows` rows and `tokens` tokens, for verifications of at most
-    /// `drafts` drafts, a drafter's page table of `pages` pages a row and a model that reads
-    /// `history` ids before each token.
+    /// The layout of columns of `rows` rows and `tokens` tokens of `groups` attention groups,
+    /// for verifications of at most `drafts` drafts, a drafter's page table of `pages` pages a
+    /// row and a model that reads `history` ids before each token.
     pub(crate) fn new(
-        rows: usize,
-        tokens: usize,
+        (rows, tokens, groups): (usize, usize, usize),
         drafts: usize,
         pages: usize,
         history: usize,
@@ -333,13 +338,14 @@ impl Layout {
         for (offset, column) in offsets.iter_mut().zip(Column::iter()) {
             *offset = bytes;
 
-            let elements = column.elements(rows, tokens, drafts, pages, history) as u64;
+            let elements = column.elements((rows, tokens, groups), drafts, pages, history) as u64;
             bytes += (elements * column.element()).next_multiple_of(ALIGNMENT);
         }
 
         Self {
             rows,
             tokens,
+            groups,
             drafts,
             pages,
             history,
@@ -348,9 +354,9 @@ impl Layout {
         }
     }
 
-    /// The layout that holds every bucket of `buckets`, for verifications of at most `drafts`
-    /// drafts, a drafter's page table of `pages` pages a row and a model that reads `history`
-    /// ids before each token.
+    /// The layout that holds every bucket of `buckets` over `groups` attention groups, for
+    /// verifications of at most `drafts` drafts, a drafter's page table of `pages` pages a row
+    /// and a model that reads `history` ids before each token.
     ///
     /// Each token of a verification is an attention row and a sampling row, so a verification
     /// bucket's row columns hold its tokens.
@@ -360,6 +366,7 @@ impl Layout {
     /// [`Error::Invalid`] for an empty set.
     pub(crate) fn of<'a>(
         buckets: impl IntoIterator<Item = &'a Bucket>,
+        groups: u32,
         drafts: u32,
         pages: u32,
         history: u32,
@@ -381,12 +388,16 @@ impl Layout {
             ));
         }
         Ok(Self::new(
-            rows,
-            tokens,
+            (rows, tokens, groups.max(1) as usize),
             drafts as usize,
             pages as usize,
             history as usize,
         ))
+    }
+
+    /// The attention groups each token has a slot of.
+    pub(crate) const fn groups(&self) -> usize {
+        self.groups
     }
 
     /// The tokens a token column holds.
@@ -434,8 +445,7 @@ impl Layout {
         let source: &[u8] = bytemuck::cast_slice(values);
         let start = self.offset(column) as usize;
         let elements = column.elements(
-            self.rows,
-            self.tokens,
+            (self.rows, self.tokens, self.groups),
             self.drafts,
             self.pages,
             self.history,
@@ -486,30 +496,30 @@ fn count(name: &str, value: i32) -> Result<u32> {
 /// A call [`slot_mapping`] refused: its index among the batch's calls, and why.
 pub(crate) type Refusal = (usize, String);
 
-/// The cache slot each token of `rows` writes, as [`Column::SlotMapping`] holds it, and the
-/// calls refused for a token whose entry may not be written (module documentation).
+/// The cache slot each token of `rows` writes in each attention group, as [`Column::SlotMapping`]
+/// holds it, `[groups][tokens]`, and the calls refused for a token whose entry may not be written
+/// (module documentation).
 ///
 /// `tables` is the rank's device block table and `page_size` the tokens of a block of the
-/// calls' cache groups, of which a call may write the first `groups`, the attention groups;
-/// the class of cache group `g` is class `g`. A token at a negative cache
-/// position writes nothing ([`NO_SLOT`]). A token at position `p` of a call on slot `s` writes
-/// `u · page_size + p % page_size`, `u` the unit of the entry at position `p / page_size` of
-/// the slot's table of the call's class, when that entry is writable
-/// ([`BlockTables::writable`]). A call one of whose tokens names an entry that is missing or
-/// read-only is returned among the refusals, with its index and the reason, and none of its
-/// tokens writes.
+/// groups; `windows[g]` states whether attention group `g` (class `g`) is a sliding window's. A
+/// token at a negative cache position writes nothing ([`NO_SLOT`]). A token at position `p` of a
+/// call on slot `s` writes, in group `g`, `u · page_size + p % page_size`, `u` the unit of the
+/// entry at position `p / page_size` of the slot's table of class `g`, when that entry is
+/// writable ([`BlockTables::writable`]); a token the call replays (`p` before the end of
+/// `Row::replay`) writes no full-history group, whose entry the prefix hit holds read-only. A
+/// call one of whose tokens names an entry that is missing or read-only where it writes is
+/// returned among the refusals, with its index and the reason, and none of its tokens writes.
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] for rows whose offsets or calls do not describe its tokens, a call that
-/// writes a cache group past `groups`, or an entry whose block is not one unit: a token's cache
-/// slot names one.
+/// [`Error::Invalid`] for rows whose offsets or calls do not describe its tokens, or an entry
+/// whose block is not one unit: a token's cache slot names one.
 pub(crate) fn slot_mapping(
     rows: &Rows,
     tables: &BlockTables,
     page_size: u32,
-    groups: u32,
-) -> Result<(Vec<u32>, Vec<Refusal>)> {
+    windows: &[bool],
+) -> Result<(Vec<Vec<u32>>, Vec<Refusal>)> {
     let tokens = rows.tokens();
     if page_size == 0 || rows.cache_positions.len() != tokens {
         return Err(Error::Invalid(format!(
@@ -531,75 +541,70 @@ pub(crate) fn slot_mapping(
             })
     };
 
-    let mut mapping = vec![NO_SLOT; tokens];
+    let mut mapping = vec![vec![NO_SLOT; tokens]; windows.len()];
     let mut refused = Vec::new();
     for (index, call) in rows.calls.iter().enumerate() {
         let (first, last) = (offset(call.rows.start)?, offset(call.rows.end)?);
-        let class = u8::try_from(call.cache_group).map_err(|_| {
-            Error::Invalid(format!(
-                "call {index} writes cache group {}, which names no class",
-                call.cache_group
-            ))
-        })?;
 
         // The call's slots, written only once every token of it is known to be writable.
-        let mut written = Vec::with_capacity(last.saturating_sub(first));
+        let mut written = Vec::with_capacity(last.saturating_sub(first) * windows.len());
         let mut refusal = None;
-        for token in first..last {
+        'tokens: for token in first..last {
             let Ok(position) = u32::try_from(rows.cache_positions[token]) else {
                 continue;
             };
-            if call.cache_group >= groups {
-                return Err(Error::Invalid(format!(
-                    "call {index} on slot {} writes cache group {}, and the forward writes {groups} \
-                     attention groups",
-                    call.slot, call.cache_group
-                )));
-            }
             let block = position / page_size;
+            let replayed = position < call.replay.end;
 
-            let reason = match tables.run(call.slot, class, block) {
-                None => Some("holds no entry"),
-                Some(_) if !tables.writable(call.slot, class, block) => Some("is read-only"),
-                Some((_, unit, 1)) => {
-                    let slot =
-                        u64::from(unit) * u64::from(page_size) + u64::from(position % page_size);
-                    let slot = u32::try_from(slot)
-                        .ok()
-                        .filter(|slot| *slot != NO_SLOT)
-                        .ok_or_else(|| {
-                            Error::Invalid(format!(
-                                "cache slot {slot} lies outside the slots a cache column \
-                                 addresses"
-                            ))
-                        })?;
-                    written.push((token, slot));
-                    None
+            for (group, &window) in windows.iter().enumerate() {
+                // A replayed token reads the hit's full-history entries and writes none.
+                if replayed && !window {
+                    continue;
                 }
-                Some((_, _, units)) => {
-                    return Err(Error::Invalid(format!(
-                        "the block at position {block} of class {class} of slot {} spans \
-                         {units} units, and a token's cache slot names one",
+                let class = group as u8;
+                let reason = match tables.run(call.slot, class, block) {
+                    None => Some("holds no entry"),
+                    Some(_) if !tables.writable(call.slot, class, block) => Some("is read-only"),
+                    Some((_, unit, 1)) => {
+                        let slot = u64::from(unit) * u64::from(page_size)
+                            + u64::from(position % page_size);
+                        let slot = u32::try_from(slot)
+                            .ok()
+                            .filter(|slot| *slot != NO_SLOT)
+                            .ok_or_else(|| {
+                                Error::Invalid(format!(
+                                    "cache slot {slot} lies outside the slots a cache column \
+                                     addresses"
+                                ))
+                            })?;
+                        written.push((group, token, slot));
+                        None
+                    }
+                    Some((_, _, units)) => {
+                        return Err(Error::Invalid(format!(
+                            "the block at position {block} of class {class} of slot {} spans \
+                             {units} units, and a token's cache slot names one",
+                            call.slot
+                        )));
+                    }
+                };
+
+                if let Some(reason) = reason {
+                    refusal = Some(format!(
+                        "call {index} on slot {} writes cache position {position}, whose block \
+                         at position {block} of class {class} {reason}",
                         call.slot
-                    )));
+                    ));
+                    break 'tokens;
                 }
-            };
-
-            if let Some(reason) = reason {
-                refusal = Some(format!(
-                    "call {index} on slot {} writes cache position {position}, whose block at \
-                     position {block} of class {class} {reason}",
-                    call.slot
-                ));
-                break;
             }
         }
 
         match refusal {
             Some(reason) => refused.push((index, reason)),
             None => {
-                for (token, slot) in written {
-                    mapping[token] = slot;
+                for (group, token, slot) in written {
+                    mapping[group][token] = slot;
                 }
             }
         }
@@ -612,10 +617,11 @@ pub(crate) fn slot_mapping(
 ///
 /// `slots` is the runner's request slots, whose count is also the padding row of the pooled
 /// page tables and of the slot state; `vocabulary` is the width of a logit row. `mapping` is
-/// the cache slot each of the batch's tokens writes: [`slot_mapping`] for a serving step,
-/// [`scratch_column`] for a paired forward, and empty for a step that writes none; the
-/// bucket's tokens past it write nothing. `scratch` is the scratch pages each row of a paired
-/// forward takes ([`scratch_spans`]), and `None` for every other step.
+/// the cache slot each of the batch's tokens writes in each attention group: [`slot_mapping`]
+/// for a serving step, [`scratch_column`] of every group for a paired forward, and empty for a
+/// step that writes none; the bucket's tokens past it, and a group it states none of, write
+/// nothing. `scratch` is the scratch pages each row of a paired forward takes
+/// ([`scratch_spans`]), and `None` for every other step.
 ///
 /// # Errors
 ///
@@ -633,7 +639,7 @@ pub(crate) fn fill(
     vocabulary: u32,
     columns: &Columns,
     bucket: &Bucket,
-    mapping: &[u32],
+    mapping: &[Vec<u32>],
     scratch: Option<&[Range<u32>]>,
     block: &mut [u8],
 ) -> Result<()> {
@@ -673,14 +679,19 @@ pub(crate) fn fill(
     positions[..tokens].copy_from_slice(&rows.positions);
     layout.put(block, Column::Positions, &positions)?;
 
-    if mapping.len() > bucket_tokens {
+    // Group `g`'s slots are the bucket's tokens from `g · tokens`: a forward reads the head
+    // of the column as `[groups, tokens]`.
+    let groups = layout.groups();
+    if mapping.len() > groups || mapping.iter().any(|group| group.len() > bucket_tokens) {
         return Err(Error::Invariant(format!(
-            "a slot mapping of {} tokens for bucket {bucket}",
+            "a slot mapping of {} groups for bucket {bucket} of {groups} attention groups",
             mapping.len()
         )));
     }
-    let mut padded = vec![NO_SLOT; bucket_tokens];
-    padded[..mapping.len()].copy_from_slice(mapping);
+    let mut padded = vec![NO_SLOT; groups * bucket_tokens];
+    for (group, slots) in mapping.iter().enumerate() {
+        padded[group * bucket_tokens..][..slots.len()].copy_from_slice(slots);
+    }
     layout.put(block, Column::SlotMapping, &padded)?;
 
     let mut targets = vec![NO_SLOT; bucket_tokens];
@@ -698,6 +709,19 @@ pub(crate) fn fill(
         *length = count("sequence length", *held)?;
     }
     layout.put(block, Column::SeqLens, &lengths)?;
+
+    // Each row's sliding windows hold its positions from the start of its call's replay on, the
+    // first its window readers read; a row that replays nothing holds every position it reads.
+    let mut starts = vec![0_u32; bucket_rows];
+    for call in &rows.calls {
+        let start = call.replay.start;
+        for row in call.rows.clone() {
+            if let Some(held) = starts.get_mut(row as usize) {
+                *held = start;
+            }
+        }
+    }
+    layout.put(block, Column::Starts, &starts)?;
 
     // The offsets end where the batch's own tokens end: every row past the batch's holds no
     // query, and the padding tokens belong to no row.
@@ -895,7 +919,7 @@ pub(crate) fn idle(bucket: &Bucket, page_size: u32, max_kv_len: u32) -> Columns 
             .map(|row| Row {
                 slot: 0,
                 kind: Phase::Decode,
-                cache_group: 0,
+                replay: 0..0,
                 rows: row..row + 1,
             })
             .collect()
@@ -903,7 +927,7 @@ pub(crate) fn idle(bucket: &Bucket, page_size: u32, max_kv_len: u32) -> Columns 
         vec![Row {
             slot: 0,
             kind: Phase::Prefill,
-            cache_group: 0,
+            replay: 0..0,
             rows: 0..bucket.rows,
         }]
     };

@@ -128,7 +128,7 @@ fn a_prefill_row_states_its_prompt_positions_lengths_sampling_and_commit() {
     let row = |slot, rows| Row {
         slot,
         kind: Phase::Prefill,
-        cache_group: 0,
+        replay: 0..0,
         rows,
     };
     assert_eq!(rows.calls, [row(slots[0], 0..1), row(slots[1], 1..2)]);
@@ -220,7 +220,7 @@ fn a_decode_row_reads_its_last_token_and_advances_its_slot_by_one() {
     let row = |slot, rows| Row {
         slot,
         kind: Phase::Decode,
-        cache_group: 0,
+        replay: 0..0,
         rows,
     };
     assert_eq!(rows.calls, [row(slots[0], 0..1), row(slots[1], 1..2)]);
@@ -324,7 +324,7 @@ fn a_verification_row_carries_its_token_and_drafts_and_asks_for_proposals() {
         [Row {
             slot,
             kind: Phase::Verify,
-            cache_group: 0,
+            replay: 0..0,
             rows: 0..1
         }]
     );

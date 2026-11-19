@@ -44,7 +44,7 @@ use std::ops::Range;
 
 use nn::causal_lm::CausalLmConfig;
 use nn::family::{
-    CacheShape, ExpertOrder, ExpertShape, SequenceSplit, StateShape, TextModel, TextPlacement,
+    CacheField, ExpertOrder, ExpertShape, SequenceSplit, StateShape, TextModel, TextPlacement,
     TokenHistory,
 };
 use nn::modules::{
@@ -409,17 +409,14 @@ impl TextModel for Qwen3ForCausalLm {
         self.embed_tokens.weight().dtype()
     }
 
-    fn cache(&self) -> CacheShape {
+    /// The keys and values of every attention layer the rank holds.
+    fn cache(&self) -> Vec<CacheField> {
         let text = &self.config.text;
 
-        CacheShape {
-            layers: self.held_layers(false),
-            // The load checked that the split divides the heads; at most one of the two splits
-            // is above one.
-            kv_heads: text.num_key_value_heads / (self.tensor.size() * self.sequence.split.size()),
-            head_dim: text.head_dim,
-            index_keys: None,
-        }
+        // The load checked that the split divides the heads; at most one of the two splits is
+        // above one.
+        let kv_heads = text.num_key_value_heads / (self.tensor.size() * self.sequence.split.size());
+        CacheField::keys_and_values(self.held_layers(false), kv_heads, text.head_dim)
     }
 
     /// The gated delta networks' fields, every linear layer the rank holds keeping the same;

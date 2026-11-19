@@ -38,7 +38,7 @@ use engine::runner::graphs::Graphs;
 use engine::runner::{CausalLmRunner, Forward, GraphOptions, Runner};
 use nn::capability::Drafter;
 use nn::family::{
-    CacheShape, ExpertShape, StateField, StateRows, StateShape, TextModel, TokenHistory,
+    CacheField, ExpertShape, StateField, StateRows, StateShape, TextModel, TokenHistory,
 };
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
@@ -101,13 +101,8 @@ struct TinyDrafter {
 }
 
 impl Drafter for TinyDrafter {
-    fn cache(&self) -> CacheShape {
-        CacheShape {
-            index_keys: None,
-            layers: 0,
-            kv_heads: 0,
-            head_dim: 0,
-        }
+    fn cache(&self) -> Vec<CacheField> {
+        Vec::new()
     }
 
     fn state_layers(&self) -> Vec<StateShape> {
@@ -228,13 +223,8 @@ impl TextModel for Tiny {
         DType::F32
     }
 
-    fn cache(&self) -> CacheShape {
-        CacheShape {
-            index_keys: None,
-            layers: 0,
-            kv_heads: 0,
-            head_dim: 0,
-        }
+    fn cache(&self) -> Vec<CacheField> {
+        Vec::new()
     }
 
     /// A state of one layer for a model [`Tiny::stated`]: a window of one input of four FP32
@@ -386,8 +376,10 @@ impl Bench {
         // The draft cache of a drafter that reads none: no layer, and tensors nothing reads.
         let draft = |unread: Tensor| KvCache {
             block_tables: unread.clone(),
+            slot_mapping: unread.clone(),
+            starts: None,
             page_size: POOL.page,
-            layers: Vec::new(),
+            planes: Vec::new(),
             workspace: unread,
         };
 
@@ -658,7 +650,12 @@ impl Bench {
 /// The cache whose state region holds the checkpoints of the recurrent state `runs` over one
 /// attention layer of pages of the bench's tokens, which the runner reads none of.
 fn state_cache(runs: &[StateShape]) -> Outcome<KvCacheConfig> {
-    let layout = CacheLayout::hybrid(PAGE, 1, 1, 8, PrefixCacheDtype::BFloat16, runs)?;
+    let layout = CacheLayout::of(
+        PAGE,
+        &CacheField::keys_and_values(1, 1, 8),
+        PrefixCacheDtype::BFloat16,
+    )?
+    .with_state(runs)?;
 
     Ok(KvCacheConfig {
         layout: Arc::new(layout),
@@ -668,6 +665,7 @@ fn state_cache(runs: &[StateShape]) -> Outcome<KvCacheConfig> {
         segments: None,
         workspace_bytes: 1 << 20,
         states: (8, None),
+        windows: Vec::new(),
     })
 }
 
@@ -695,7 +693,7 @@ fn batch(kind: Phase, variant: Variant, slot: u32, mut columns: Columns) -> Batc
     columns.rows.calls = vec![Row {
         slot,
         kind,
-        cache_group: 0,
+        replay: 0..0,
         rows: 0..1,
     }];
     columns.rows.cache_positions = vec![-1; tokens as usize];
