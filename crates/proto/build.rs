@@ -1,9 +1,10 @@
-//! Compiles the cross-build interfaces' Protobuf schemas into Rust, and
-//! names the build this crate is compiled in (`UNISERVE_SOURCE_DIGEST`).
+//! Compiles the cross-build interfaces' Protobuf schemas and the operator
+//! vocabulary into Rust, and names the build this crate is compiled in
+//! (`UNISERVE_SOURCE_DIGEST`).
 //!
 //! The schemas are compiled with `protox`, a Protobuf compiler written in
-//! Rust, so a build needs no `protoc`. They lie under `src/`, so they count
-//! towards the build identity like every other source.
+//! Rust, so a build needs no `protoc`. They and the vocabulary lie under
+//! `src/`, so they count towards the build identity like every other source.
 //!
 //! The build identity is a digest of the workspace sources every artifact of
 //! a build is compiled from. The engine process, a node's daemon and the rank
@@ -34,6 +35,13 @@ const ROOT_FILES: [&str; 3] = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"
 /// Hex digits of the digest the build version carries: its leading 64 bits,
 /// which tell builds apart as a short commit hash does.
 const DIGEST_HEX_DIGITS: usize = 16;
+
+/// The operator vocabulary, relative to this crate: the one statement of the
+/// operators' names, which [`emit_operators`] compiles into
+/// `proto::module::operator` and the engine package names as the vocabulary
+/// its revisions record at the Build Server (`operators` in
+/// `crates/engine/package.toml`).
+const OPERATORS: &str = "src/module/operators.toml";
 
 /// The workspace root, as Cargo itself locates it: the directory of the
 /// workspace manifest. The Cargo that runs this script names itself in `CARGO`,
@@ -126,6 +134,68 @@ fn emit_source_digest() -> io::Result<()> {
     Ok(())
 }
 
+/// Writes `operators.rs` into `OUT_DIR` from the vocabulary [`OPERATORS`] of
+/// the crate at `manifest`, which `proto::module::operator` includes: one
+/// constant per operator, named by the operator's name in upper case, and
+/// `ALL`, every constant in the order the vocabulary lists them.
+///
+/// The vocabulary is a TOML table of the one key `operators`, an array of
+/// names. A name is a lowercase ASCII letter followed by lowercase letters,
+/// digits and `_`, so it is one path segment of the module store and its upper
+/// case one Rust identifier, and each name is listed once; anything else fails
+/// the build, naming the file. The Build Server reads the same file of an
+/// engine revision by the same rules (`build_server::manifest::read_operators`).
+fn emit_operators(manifest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path = manifest.join(OPERATORS);
+    println!("cargo:rerun-if-changed={}", path.display());
+    let table: toml::Table = std::fs::read_to_string(&path)?.parse()?;
+    let invalid = |reason: String| format!("{}: {reason}", path.display());
+    if let Some(key) = table.keys().find(|key| *key != "operators") {
+        return Err(invalid(format!("`{key}` is no key of the vocabulary")).into());
+    }
+    let names = table
+        .get("operators")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| invalid("`operators` is no array of names".to_owned()))?;
+
+    let mut listed = std::collections::BTreeSet::new();
+    let mut constants = String::new();
+    let mut all = String::new();
+    for name in names {
+        let name = name
+            .as_str()
+            .ok_or_else(|| invalid(format!("{name} is no name")))?;
+        let spelled = name.starts_with(|first: char| first.is_ascii_lowercase())
+            && name
+                .chars()
+                .all(|char| char.is_ascii_lowercase() || char.is_ascii_digit() || char == '_');
+        if !spelled {
+            return Err(invalid(format!(
+                "`{name}` is no operator name: a lowercase letter, then lowercase letters, digits \
+                 and `_`"
+            ))
+            .into());
+        }
+        if !listed.insert(name) {
+            return Err(invalid(format!("`{name}` is listed twice")).into());
+        }
+
+        let constant = name.to_ascii_uppercase();
+        constants.push_str(&format!(
+            "/// The operator `{name}`.\npub const {constant}: &str = \"{name}\";\n"
+        ));
+        all.push_str(&format!("    {constant},\n"));
+    }
+
+    let generated = format!(
+        "{constants}\n/// Every operator of the vocabulary, in the order it lists them.\n\
+         pub const ALL: &[&str] = &[\n{all}];\n"
+    );
+    let out = PathBuf::from(std::env::var("OUT_DIR")?);
+    std::fs::write(out.join("operators.rs"), generated)?;
+    Ok(())
+}
+
 /// Adds every member crate below `directory` (relative to `root`): each
 /// directory holding a `Cargo.toml`, without descending into it.
 fn find_members(root: &Path, directory: &Path, members: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -183,6 +253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     config.compile_fds(descriptors)?;
 
+    emit_operators(&manifest)?;
     emit_source_digest()?;
     Ok(())
 }

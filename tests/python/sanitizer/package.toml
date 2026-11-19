@@ -5,6 +5,10 @@
 
 op = "engine"
 backend = "memcheck"
+# The operators of the engine it runs: `operators.toml` beside this manifest
+# links the tree's vocabulary (`crates/proto/src/module/operators.toml`), which
+# the installation copies into the revision.
+operators = "operators.toml"
 # The engine interface of the engine it runs (`crates/engine/package.toml`): the daemon refuses an
 # engine package of another version than it speaks.
 interface_version = 9

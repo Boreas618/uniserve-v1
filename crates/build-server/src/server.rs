@@ -71,6 +71,10 @@ pub struct Package {
     /// Where the revision's sources came from: the commit of the tree it was
     /// installed from and whether that tree was clean.
     pub origin: Origin,
+    /// The operators whose kernel packages the revision launches, as the vocabulary its
+    /// snapshot holds names them ([`Manifest::operators`]): an engine revision's; empty for
+    /// every other package.
+    pub operators: Vec<String>,
 }
 
 impl Package {
@@ -496,13 +500,15 @@ impl BuildServer {
                     packages: self
                         .list()?
                         .into_iter()
-                        .map(|(package, origin, modules)| wire::PackageEntry {
-                            op: package.op,
-                            backend: package.backend,
-                            revision: package.revision,
-                            commit: origin.commit,
-                            clean: origin.clean,
-                            modules: modules
+                        .map(|entry| wire::PackageEntry {
+                            op: entry.package.op,
+                            backend: entry.package.backend,
+                            revision: entry.package.revision,
+                            commit: entry.origin.commit,
+                            clean: entry.origin.clean,
+                            operators: entry.operators,
+                            modules: entry
+                                .modules
                                 .into_iter()
                                 .map(|module| wire::ModuleEntry {
                                     target: module.target.to_string(),
@@ -821,6 +827,10 @@ impl BuildServer {
     /// Installs the snapshot `files` of a package whose manifest is `manifest`
     /// as the next revision of its operator and backend, with its build inputs
     /// and origin recorded beside it.
+    ///
+    /// A package that names an operator vocabulary is refused unless the
+    /// snapshot holds it and it reads, before anything is written: every
+    /// installed revision lists the operators its own files name.
     fn install_files(
         &self,
         manifest: Manifest,
@@ -828,6 +838,19 @@ impl BuildServer {
         inputs: Inputs,
         origin: Origin,
     ) -> Result<protocol::Package> {
+        // The package's directory, which a refusal names: the one its manifest was taken from.
+        let directory = files
+            .iter()
+            .find(|(name, _)| name == Manifest::FILE)
+            .and_then(|(_, path)| path.parent())
+            .unwrap_or(Path::new(""));
+        let operators = operators(&manifest, directory, |name| {
+            files
+                .iter()
+                .find(|(file, _)| file == name)
+                .map(|(_, path)| path.clone())
+        })?;
+
         let mut packages = self
             .packages
             .write()
@@ -860,6 +883,7 @@ impl BuildServer {
             source,
             inputs,
             origin,
+            operators,
         });
         let (op, backend) = (
             package.manifest.op.clone(),
@@ -925,6 +949,7 @@ impl BuildServer {
             source: package.manifest.source(&package.root),
             inputs: package.inputs.clone(),
             origin,
+            operators: package.operators.clone(),
         });
         packages.insert(key, adopted);
         Ok(())
@@ -1283,8 +1308,9 @@ impl BuildServer {
         })
     }
 
-    /// Lists every installed package revision with its origin and its modules.
-    pub fn list(&self) -> Result<Vec<(protocol::Package, Origin, Vec<protocol::ModuleEntry>)>> {
+    /// Lists every installed package revision with its origin, the operators it launches and its
+    /// modules.
+    pub fn list(&self) -> Result<Vec<protocol::PackageEntry>> {
         let packages = self
             .packages
             .read()
@@ -1321,20 +1347,21 @@ impl BuildServer {
         Ok(listed
             .into_iter()
             .map(|(key, modules)| {
-                let origin = packages
+                let (origin, operators) = packages
                     .get(&key)
-                    .map(|package| package.origin.clone())
+                    .map(|package| (package.origin.clone(), package.operators.clone()))
                     .unwrap_or_default();
                 let (op, backend, revision) = key;
-                (
-                    protocol::Package {
+                protocol::PackageEntry {
+                    package: protocol::Package {
                         op,
                         backend,
                         revision,
                     },
                     origin,
+                    operators,
                     modules,
-                )
+                }
             })
             .collect())
     }
@@ -2046,6 +2073,7 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
                 // the modules it builds.
                 let inputs = Inputs::read(&revision)?;
                 let origin = Origin::read(&revision)?;
+                let operators = operators(&manifest, &revision, |name| Some(revision.join(name)))?;
                 let source = manifest.source(&revision);
                 packages.insert(
                     (op_name.clone(), backend_name.clone(), number),
@@ -2055,12 +2083,42 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
                         source,
                         inputs,
                         origin,
+                        operators,
                     }),
                 );
             }
         }
     }
     Ok(packages)
+}
+
+/// The operators the package of `manifest` launches ([`Manifest::operators`]): the vocabulary
+/// `locate` finds by its name inside the package's revision ([`Manifest::operators_file`]),
+/// read; none for a package that names none.
+///
+/// # Errors
+///
+/// [`Error::Manifest`], naming `package`, when `locate` finds no such file or the vocabulary does
+/// not read ([`crate::manifest::read_operators`]).
+fn operators(
+    manifest: &Manifest,
+    package: &Path,
+    locate: impl FnOnce(&str) -> Option<PathBuf>,
+) -> Result<Vec<String>> {
+    let Some(name) = manifest.operators_file() else {
+        return Ok(Vec::new());
+    };
+    let refused = |source| Error::Manifest {
+        package: package.to_path_buf(),
+        source: Box::new(source),
+    };
+    let path = locate(&name).ok_or_else(|| {
+        refused(crate::manifest::ManifestError::Invalid(format!(
+            "the package's snapshot holds no {name}, the vocabulary its `operators` names: no \
+             crate of its workspace packages that file"
+        )))
+    })?;
+    crate::manifest::read_operators(&path).map_err(refused)
 }
 
 /// Writes a package's snapshot into its revision's directory with the record
