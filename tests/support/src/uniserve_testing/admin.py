@@ -295,15 +295,17 @@ def gauge(
     seconds (scaled), until a whole second after `after` holds a value of
     the gauge, whatever its labels, and a series no longer stated by then
     is none of them. Without it, the read waits the same way until a whole
-    second of the span holds the leader's sampling (:data:`SAMPLED`), so a
-    deployment that just began to serve is read once its first second was
-    sampled. A gauge stated only when what it states changes is read with
-    ``after=0``, over the store's whole retention. A gauge the leader samples
-    itself (``crates/daemon/src/status.rs``) and states only while what it
-    states stands, such as a replica's serving launch generation, is read
-    with `sampled`: the read after `after` waits for a whole second holding
-    the leader's sampling, as one without `after` does, so a series the
-    leader did not state then is none rather than awaited.
+    second of the span holds a value of the gauge: the leader states a
+    gauge it reads from reports (a node's storage usage) once the first
+    report arrived, which can be seconds after a deployment began to serve
+    and after the leader's own sampling began. A gauge stated only when what
+    it states changes is read with ``after=0``, over the store's whole
+    retention. A gauge the leader samples itself
+    (``crates/daemon/src/status.rs``) and states only while what it states
+    stands, such as a replica's serving launch generation, is read with
+    `sampled`: the read waits for a whole second holding the leader's
+    sampling (:data:`SAMPLED`) instead, so a series the leader did not state
+    then is none rather than awaited.
 
     Raises:
         TimeoutError: When no whole second after `after` was recorded in
@@ -319,11 +321,10 @@ def gauge(
         "AND time < date_trunc('second', now())"
     )
     # The second that must be whole before the gauge is read: one holding
-    # the gauge after `after`, or one of the span holding the leader's
-    # sampling.
+    # the gauge, or with `sampled` one holding the leader's sampling.
     awaited = (
         window
-        if after is not None and not sampled
+        if not sampled
         else (
             f"name = {literal(SAMPLED)} AND CAST(time AS BIGINT) > {lower} "
             "AND time < date_trunc('second', now())"
@@ -335,7 +336,7 @@ def gauge(
     ):
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                f"no value of {name if after is not None else SAMPLED} was "
+                f"no value of {SAMPLED if sampled else name} was "
                 f"recorded after {lower} within "
                 f"{server.scaled(SAMPLED_S):.0f} s"
             )
