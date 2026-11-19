@@ -13,19 +13,12 @@ publish = false
 # rules) lives here beside its model's numerics, not inside them. It holds no
 # runtime object and reads no file of its own.
 #
-# The crate is the processing program (`package.toml`): built for
-# `wasm32-unknown-unknown`, its module serves the families through the
-# processing interface (`scheduling::processing`), which the leader daemon
-# loads per epoch. The engine links it natively for its numerical facts.
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[features]
-default = ["module"]
-# The module's exports over the release's families. A program crate that
-# serves other families with this crate's machinery builds it without them, so
-# its own exports are the module's only ones.
-module = []
+# The crate is the machinery of the processing programs, which link it for
+# `wasm32-unknown-unknown`: the release's (`program/`, whose module serves
+# `FAMILIES` through the processing interface `scheduling::processing`, which
+# the leader daemon loads per epoch) and the daemon tests' (`testing/`). The
+# engine and the model crates link it natively for its numerical facts. It is
+# an ordinary library: a program's module is its own crate's cdylib.
 
 [dependencies]
 # The strict push parser a JSON tool call is read with as it streams.
@@ -50,8 +43,8 @@ serde_with.workspace = true
 thiserror.workspace = true
 thiserror-ext.workspace = true
 
-# The custom `getrandom` backend of the wasm32 module (`entropy`), which the schema validator's
-# hash maps are seeded through.
+# The custom `getrandom` backend of a processing program's wasm32 module (`entropy`), which the
+# schema validator's hash maps are seeded through.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom.workspace = true
 
@@ -59,19 +52,9 @@ getrandom.workspace = true
 criterion.workspace = true
 expect-test.workspace = true
 itertools.workspace = true
-# The program host the module runs in, as the leader daemon runs it, and the build of the module
-# its interface tests run (`tests/program.rs`).
-program.workspace = true
-program-testing.workspace = true
 
 [[bench]]
 name = "tool_parsers"
-harness = false
-
-# The render and parse cost of the module in the program host against the same calls made
-# natively, on long conversations.
-[[bench]]
-name = "program"
 harness = false
 
 [lints]

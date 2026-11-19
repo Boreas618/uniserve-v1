@@ -1,20 +1,20 @@
 //! The cost of the processing program's calls in the program host against the same calls made
 //! natively: rendering long agentic conversations, and parsing a long streamed completion.
 //!
-//! `cargo bench -p processing --bench program -- [--template FILE] [--iterations N]`
+//! `cargo bench -p processing-program --bench program -- [--template FILE] [--iterations N]`
 //!
 //! The module is the crate's own, built for wasm32 by the cargo that runs the bench, as the Build
-//! Server builds it, and run in the program host under the leader's budgets as the daemon runs
-//! it; the native calls are the same code linked into the bench. Both bind the Qwen3 family to a
-//! checkpoint whose template is `--template` (a checkpoint's `chat_template`, the crate's ChatML
-//! template when unset). A conversation is an agent's: a system prompt, tool schemas, and turns of
-//! a user's request, the assistant's reasoning and a tool call, and the tool's long result, each
-//! turn about 1,800 tokens at four characters a token; the conversations are 16, 64, 192, 384 and
-//! 576 turns, about 30,000, 120,000, 350,000, 700,000 and 1,000,000 tokens: the input lengths of
-//! agentic coding sessions, whose requests' median is about 250,000 tokens and longest about
-//! 1,000,000. The completion is 10,000 tokens of reasoning, content and a tool call, pushed as one
-//! engine event of one token and of eight tokens at a time; an update that decodes to no text
-//! measures the cost of a call alone.
+//! Server builds it, and run in the program host under the leader's budgets as the daemon runs it;
+//! the native calls are the same code linked into the bench. Both bind the Qwen3 family to a
+//! checkpoint whose template is `--template` (a checkpoint's `chat_template`, the `processing`
+//! crate's ChatML template when unset). A conversation is an agent's: a system prompt, tool
+//! schemas, and turns of a user's request, the assistant's reasoning and a tool call, and the
+//! tool's long result, each turn about 1,800 tokens at four characters a token; the conversations
+//! are 16, 64, 192, 384 and 576 turns, about 30,000, 120,000, 350,000, 700,000 and 1,000,000
+//! tokens: the input lengths of agentic coding sessions, whose requests' median is about 250,000
+//! tokens and longest about 1,000,000. The completion is 10,000 tokens of reasoning, content and a
+//! tool call, pushed as one engine event of one token and of eight tokens at a time; an update that
+//! decodes to no text measures the cost of a call alone.
 //!
 //! Every time is the mean of `--iterations` calls after one warm-up call, but the module's
 //! compilation, timed once; the report states each side's time and the program's overhead, and
@@ -259,13 +259,13 @@ fn main() {
     let template = arguments
         .template
         .clone()
-        .unwrap_or_else(|| include_str!("../src/chat/chatml.jinja").to_owned());
+        .unwrap_or_else(|| include_str!("../../src/chat/chatml.jinja").to_owned());
     let bind = bind(&template);
 
     // What an epoch's load and a request's fresh instance cost: compiling the module, once per
     // epoch, and instantiating and binding an instance, which a request that finds no idle
     // instance in its binding's pool waits for.
-    let bytes = program_testing::module!("processing");
+    let bytes = program_testing::module!("processing-program");
     let compiling = Instant::now();
     let module = Module::<Hosted>::processing(&bytes).expect("the module loads");
     let compiled = compiling.elapsed();

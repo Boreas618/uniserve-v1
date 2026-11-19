@@ -403,8 +403,8 @@ fn a_build_reports_the_keys_no_package_built_and_builds_the_rest() {
 }
 
 /// Every program of the release (`crates/scheduling/policies/<name>` and the
-/// processing program `crates/processing`, the packages the server installs
-/// from a source tree) is built by the server
+/// processing program `crates/processing/program`, the packages the server
+/// installs from a source tree) is built by the server
 /// from the snapshot its installation took of its whole workspace, with the
 /// lockfile's sources vendored and nothing fetched, into a module that states
 /// its kind; a second server over the same roots resolves the committed

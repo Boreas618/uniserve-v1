@@ -1131,7 +1131,7 @@ pub struct WorkerConfig {
     pub engine_revision: Option<u32>,
     /// The processing program the leader daemon serves the epoch's requests through: the name
     /// of a program package installed at the Build Server, which a source tree installs beside
-    /// its engine (`crates/processing/package.toml`).
+    /// its engine (`crates/processing/program/package.toml`).
     #[reload(epoch)]
     pub processing: String,
     /// The revision of the processing program to run; the latest installed one, fixed when the
@@ -1284,7 +1284,7 @@ pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_ENGINE: &str = "uniserve";
 
 /// The processing program a deployment serves its requests through when its configuration names
-/// none: the one this tree holds (`crates/processing/package.toml`).
+/// none: the one this tree holds (`crates/processing/program/package.toml`).
 pub const DEFAULT_PROCESSING: &str = "processing";
 
 /// What the server logs about its serving (`logging_config`). A process's

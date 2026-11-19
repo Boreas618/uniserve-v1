@@ -8,8 +8,8 @@
 //! - the serving packages of the tree's release ([`packages`]): every kernel
 //!   package of the operator tree (`crates/ops/kernels/<op>/<backend>`), every
 //!   program of the release (`crates/scheduling/policies/<name>`), the
-//!   processing program (`crates/processing`) and the engine, which an epoch
-//!   takes from one tree together. The upstream server installs them when
+//!   processing program (`crates/processing/program`) and the engine, which an
+//!   epoch takes from one tree together. The upstream server installs them when
 //!   it starts ([`crate::server::BuildServer::install_tree`]), so a deployment
 //!   selects from the tree it was started with.
 
@@ -30,7 +30,7 @@ const KERNEL_TREE: &str = "crates/ops/kernels";
 const PROGRAM_TREE: &str = "crates/scheduling/policies";
 
 /// The processing program: the request side of the tree's model families.
-const PROCESSING_PACKAGE: &str = "crates/processing";
+const PROCESSING_PACKAGE: &str = "crates/processing/program";
 
 /// The engine package.
 const ENGINE_PACKAGE: &str = "crates/engine";

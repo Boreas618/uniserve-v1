@@ -15,15 +15,16 @@
 //!   ([`VideoFamily::bind`]); the processor validates a model-agnostic request ([`VideoSpec`])
 //!   and processes it into the engine's input ([`VideoInput`]).
 //!
-//! The crate is also the **processing program**: built for `wasm32-unknown-unknown`
-//! (`package.toml`), its module serves [`FAMILIES`] through the processing interface
-//! (`scheduling::processing`), and the leader daemon loads the module its epoch's module set
-//! fixes, so an epoch's request side is built from the same tree as its engine and nothing in the
-//! daemon names a model ([`program`]). The request side of chat lives here with the families:
-//! the Jinja chat template a request renders with, or the encoder of a family whose checkpoints
-//! state their prompt format as a reference encoder instead ([`chat`]), and the parsers of a
-//! response's reasoning and tool calls ([`output`]). The engine links the crate natively for the
-//! numerical facts its models read, and registers the numerical side of the same families.
+//! The crate is also the machinery of the **processing program**, which serves [`FAMILIES`]
+//! through the processing interface (`scheduling::processing`) as a module of its own crate
+//! (`crates/processing/program`, built for `wasm32-unknown-unknown`): the leader daemon loads the
+//! module its epoch's module set fixes, so an epoch's request side is built from the same tree as
+//! its engine and nothing in the daemon names a model ([`program`]). The request side of chat
+//! lives here with the families: the Jinja chat template a request renders with, or the encoder of
+//! a family whose checkpoints state their prompt format as a reference encoder instead
+//! ([`chat`]), and the parsers of a response's reasoning and tool calls ([`output`]). The engine
+//! links the crate natively for the numerical facts its models read, and registers the numerical
+//! side of the same families.
 //!
 //! The family-neutral rules a video request is processed with are stated here once, each
 //! parameterized by values the family states: the frame rule ([`FrameClips`]), the canvas rule
@@ -73,8 +74,3 @@ pub use video::{
     VideoFamily, VideoInput, VideoProcessor, VideoSpec,
 };
 pub use vocabulary::{Vocabulary, VocabularyError};
-
-// The module's exports: the release's families through the processing interface. A crate that
-// serves other families with this one's machinery (a test program) builds it without them.
-#[cfg(feature = "module")]
-scheduling::export_processing!(program::Program<program::Release>);

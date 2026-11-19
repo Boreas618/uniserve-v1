@@ -4838,8 +4838,6 @@ dependencies = [
  "jsonschema",
  "minijinja",
  "minijinja-contrib",
- "program",
- "program-testing",
  "prost",
  "scheduling",
  "serde",
@@ -4848,6 +4846,17 @@ dependencies = [
  "serde_with",
  "thiserror 2.0.18",
  "thiserror-ext",
+]
+
+[[package]]
+name = "processing-program"
+version = "2.0.0"
+dependencies = [
+ "processing",
+ "program",
+ "program-testing",
+ "scheduling",
+ "serde_json",
 ]
 
 [[package]]

@@ -57,6 +57,7 @@ The checkpoints and adapters the cases serve are released Hugging Face repositor
 | --- | --- | --- |
 | `qwen3` | `Qwen/Qwen3-30B-A3B` | every Qwen3 module |
 | `qwen3.5` | `Qwen/Qwen3.5-35B-A3B` | `test_speculation_http.py` |
+| `qwen3.6` | `Qwen/Qwen3.6-35B-A3B` | `test_processing_program_http.py` |
 | `deepseek-v41` | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | `test_deepseek_v41_http.py` (four GPUs of one host; its log-probability case also reads the reference vectors `crates/models/tests/it/deepseek_v41/generate_logprobs.py` writes into `artifacts/deepseek_v41/reference`) |
 | `fasth3` | `FastVideo/FastVideo-FastH3-8-Step-V2` | the FastH3 modules |
 | `minimax-h3` | `MiniMaxAI/MiniMax-H3` | `test_minimax_h3_http.py`, `test_minimax_h3_conditions_http.py` |

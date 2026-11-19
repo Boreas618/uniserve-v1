@@ -48,7 +48,9 @@ impl Vocabulary for Characters {
 fn module() -> Module<Characters> {
     static MODULE: std::sync::OnceLock<Module<Characters>> = std::sync::OnceLock::new();
     MODULE
-        .get_or_init(|| Module::processing(&program_testing::module!("processing")).unwrap())
+        .get_or_init(|| {
+            Module::processing(&program_testing::module!("processing-program")).unwrap()
+        })
         .clone()
 }
 

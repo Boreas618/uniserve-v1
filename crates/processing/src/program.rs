@@ -1,8 +1,9 @@
 //! The processing program: a build's families served through the processing interface
 //! (`scheduling::processing`), as the leader daemon loads it per epoch.
 //!
-//! [`Program`] implements the interface over a list of families ([`Families`]); the release's
-//! list is [`Release`], `crate::FAMILIES`, which the crate's own module exports. An instance is
+//! [`Program`] implements the interface over a list of families ([`Families`]), which a program
+//! crate exports: the release's (`crates/processing/program`) over [`Release`], `crate::FAMILIES`,
+//! and the daemon tests' (`crates/processing/testing`) over its test families. An instance is
 //! bound to one family and one checkpoint ([`Program::bind_with`]): a chat family's binding reads
 //! the checkpoint's files the family declared ([`declare`]), compiles its template (or takes the
 //! family's encoder, for checkpoints that publish none) and states the model's facts; a video
@@ -39,7 +40,8 @@ pub trait Families: 'static {
     fn families() -> &'static [Family];
 }
 
-/// The release's families (`crate::FAMILIES`).
+/// The release's families (`crate::FAMILIES`), which the release's program
+/// (`crates/processing/program`) exports and the native tests and bench drive.
 pub struct Release;
 
 impl Families for Release {

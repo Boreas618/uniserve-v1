@@ -44,10 +44,10 @@ pytestmark = [
 NAME = "processing-program"
 
 #: The tree's processing program, relative to the repository.
-PROCESSING_PACKAGE = Path("crates", "processing")
+PROCESSING_PACKAGE = Path("crates", "processing", "program")
 
-#: The release's family list in the processing program's source, and the
-#: list of the earlier tree, which omits Qwen3.5-MoE.
+#: The release's family list in the request-processing library the program
+#: serves, and the list of the earlier tree, which omits Qwen3.5-MoE.
 FAMILIES_SOURCE = Path("crates", "processing", "src", "family.rs")
 #: The release's family list, whatever families it holds: its declared length
 #: and its entries.

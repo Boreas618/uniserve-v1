@@ -1,0 +1,38 @@
+[package]
+name = "processing-program"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The processing program of the release: the request side of the tree's model families (processing::FAMILIES) exported through the processing interface, as the leader daemon loads it per epoch."
+
+[lib]
+# A program package is compiled to `wasm32-unknown-unknown` (`package.toml`) and loaded by the
+# leader daemon's program host. The crate is the module's exports alone, a cdylib no crate links:
+# the engine, the model crates and the native side of the bench link the `processing` library,
+# an ordinary rlib. A cdylib's outputs carry no hash in their names, and one test build can
+# compile a library other targets link more than once (the engine's compiles `processing` so),
+# whose builds would then write the same files.
+crate-type = ["cdylib"]
+
+[dependencies]
+# The request-processing machinery and the release's families, which the module exports.
+processing.workspace = true
+# The processing interface the families are exported through.
+scheduling.workspace = true
+
+[dev-dependencies]
+# The program host the module runs in, as the leader daemon runs it, and the build of the module
+# its interface tests run (`tests/program.rs`).
+program.workspace = true
+program-testing.workspace = true
+serde_json.workspace = true
+
+# The render and parse cost of the module in the program host against the same calls made
+# natively, on long conversations.
+[[bench]]
+name = "program"
+harness = false
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 //! The processing program's interface: how the leader daemon asks an epoch's request processing
-//! (`crates/processing`, built as a wasm32 module) what the epoch's model families are, binds one
+//! (`crates/processing/program`, a wasm32 module) what the epoch's model families are, binds one
 //! to a checkpoint, renders chat requests into prompts, parses completions into reasoning,
 //! content and tool calls, and applies a video family's request rules.
 //!
