@@ -20,10 +20,14 @@ drafts a verification (``speculative_config.num_draft_tokens``), greedily.
   (``data_parallel_size = 2`` with ``moe_config.expert_parallel``) speculate
   across their expert union: every step of the union is the model's expert
   layers and the drafter's, once per drafter forward, on both ranks, a rank
-  without a batch joining them. The same greedy requests, sent at once so
-  that both ranks verify in some steps and one joins in others, answer as
-  they do from two replicas that hold every expert themselves, and none
-  fails.
+  without a batch joining them. Greedy requests, sent at once so that both
+  ranks verify in some steps and one joins in others, fail none, carry
+  drafts, and answer as the same union answers them without speculation by
+  the rule of vLLM's ``check_logprobs_close``
+  (:func:`uniserve_testing.chat.assert_logprobs_close`): the tokens are
+  equal, or at their first difference each side's token is among the other
+  side's five most likely, since a verification reduces its token rows in
+  another order than a decode does and may break a near tie.
 
 The schedulers' statistics reach the observation store (``/admin/query``) in a
 report once a report period (``worker_config.report_period``, a second), so
@@ -74,8 +78,9 @@ SYNTHETIC_TOKENS = 1 + 3 * 64
 #: counts before a phase's are read, and how long they may take, in seconds.
 STILL_READS = 3
 STILL_S = 120
-#: The greedy requests the expert union and the replicas answer, and their
-#: tokens.
+#: The greedy requests the expert union answers with and without speculation,
+#: their tokens, the likeliest tokens each position ranks, and the union's
+#: options.
 PROMPTS = [
     "Explain how a binary search works, step by step.",
     "Write a short poem about the sea at night.",
@@ -87,11 +92,19 @@ PROMPTS = [
     "Translate 'good morning, how are you?' into French and Spanish.",
 ]
 ANSWER_TOKENS = 96
+TOP_LOGPROBS = 5
+UNION: Config = {
+    "data_parallel_size": 2,
+    "moe_config": {"expert_parallel": True},
+}
 
 
-def _ask(server: Server, prompt: str, tokens: int, seed: int) -> dict[str, Any]:
+def _ask(
+    server: Server, prompt: str, tokens: int, seed: int, **fields: Any
+) -> dict[str, Any]:
     """The greedy answer to `prompt`, exactly `tokens` tokens long, of a
-    request seeded `seed`: the seed keys its synthetic acceptance draws.
+    request seeded `seed` with `fields` beside: the seed keys its synthetic
+    acceptance draws.
     """  # noqa: D205
     request = chat.body(
         NAME,
@@ -101,6 +114,7 @@ def _ask(server: Server, prompt: str, tokens: int, seed: int) -> dict[str, Any]:
         temperature=0,
         ignore_eos=True,
         seed=seed,
+        **fields,
     )
     return chat.complete(
         server.base_url, request, server.scaled(chat.COMPLETION_S)
@@ -108,12 +122,16 @@ def _ask(server: Server, prompt: str, tokens: int, seed: int) -> dict[str, Any]:
 
 
 def _ask_all(
-    server: Server, prompts: list[str], tokens: int
+    server: Server, prompts: list[str], tokens: int, **fields: Any
 ) -> list[dict[str, Any]]:
-    """The answers to `prompts`, sent at once."""
+    """The answers to `prompts`, sent at once, each request seeded by its
+    place among them.
+    """  # noqa: D205
     with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
         answers = pool.map(
-            lambda indexed: _ask(server, indexed[1], tokens, indexed[0]),
+            lambda indexed: _ask(
+                server, indexed[1], tokens, indexed[0], **fields
+            ),
             enumerate(prompts),
         )
         return list(answers)
@@ -196,24 +214,37 @@ def test_synthetic_acceptance_commits_its_length_and_changes_at_a_step(
 
 
 @pytest.mark.gpus(2)
-def test_an_expert_union_speculates_as_replicas_that_hold_every_expert(
-    deployments: Deployments,
-):
-    def answers(name: str, topology: Config) -> list[str]:
-        # Each deployment is named for its topology, under which its Build
+def test_an_expert_union_speculates_as_it_decodes(deployments: Deployments):
+    def answers(
+        name: str, speculative: Config
+    ) -> tuple[list[list[tuple[str, set[str]]]], float]:
+        # Each deployment is named for what it serves, under which its Build
         # Server keeps what it compiles.
-        with deployments.serve(
-            merged(OPTIONS, {"data_parallel_size": 2}, topology), name=name
-        ) as server:
-            replies = _ask_all(server, PROMPTS, ANSWER_TOKENS)
+        options = merged(OPTIONS, UNION, {"speculative_config": speculative})
+        with deployments.serve(options, name=name) as server:
+            replies = _ask_all(
+                server,
+                PROMPTS,
+                ANSWER_TOKENS,
+                logprobs=True,
+                top_logprobs=TOP_LOGPROBS,
+            )
 
-            # No request failed, and the verifications carried drafts.
+            # No request failed.
             for reply in replies:
                 assert reply["choices"][0]["finish_reason"] == "length", reply
-            assert _counts(server)[0] > 0
-            return [chat.content(reply) for reply in replies]
 
-    union = answers("union", {"moe_config": {"expert_parallel": True}})
-    replicas = answers("replicas", {})
+            verified = _counts(server)[0]
+            return [chat.ranked_tokens(reply) for reply in replies], verified
 
-    assert union == replicas
+    speculated, verified = answers("union", {"num_draft_tokens": DRAFTS})
+    decoded, _ = answers("union-decoding", {"num_draft_tokens": 0})
+
+    # The speculating union's verifications carried drafts, and each answer
+    # agrees with the union's answer without speculation.
+    assert verified > 0, "no verification carried drafts"
+    for index, (expected, actual) in enumerate(
+        zip(decoded, speculated, strict=True)
+    ):
+        assert len(actual) == len(expected) == ANSWER_TOKENS, index
+        chat.assert_logprobs_close(expected, actual, f"prompt {index}")
