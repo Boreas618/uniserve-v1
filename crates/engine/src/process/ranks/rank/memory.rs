@@ -385,8 +385,19 @@ impl ModelRunner {
             &[("cache's fewest units", layout.unit_bytes)],
         )?;
         // A slot of a model that keeps a recurrent state costs one checkpoint beside its storages.
+        // The state region holds the slots' checkpoints in whole segments
+        // (`division::state_units`), so the slots that fit are counted with their checkpoints
+        // rounded up to whole segments, which the region then holds.
+        let segment = match state_bytes {
+            0 => 1,
+            bytes => segments::segment_units(bytes, granularity)
+                .context("a checkpoint of no bytes splits into no segment")?,
+        };
         let slots = division::request_slots(self.slots(), left, |slots| {
-            let checkpoints = u64::from(slots) * state_bytes;
+            let checkpoints = match state_bytes {
+                0 => 0,
+                bytes => division::state_floor(slots, segment) * bytes,
+            };
             Ok::<u64, anyhow::Error>(self.slot_storage(model, layout, slots)? + checkpoints)
         })?;
         let slots = host
@@ -412,8 +423,6 @@ impl ModelRunner {
         // The state region first: its floor and its ratio of the KV planes' bytes, agreed over the host
         // group; the planes take what it leaves.
         let states = if state_bytes > 0 {
-            let segment = segments::segment_units(state_bytes, granularity)
-                .context("a checkpoint of no bytes splits into no segment")?;
             let kv_capacity = capacity.map(|units| units.saturating_mul(layout.unit_bytes));
             let ratio = self.engine_config().kv_cache.state_ratio;
             let states =
