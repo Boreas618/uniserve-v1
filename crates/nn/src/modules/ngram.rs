@@ -26,8 +26,9 @@
 //! group takes part in every lookup of a step, a rank with no tokens of its own included
 //! ([`NgramMemory::join`]).
 
-use tensor::{DType, Tensor};
+use tensor::{DType, Device, Tensor};
 
+use crate::capability::TokenBatch;
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
 use crate::functional;
@@ -168,8 +169,8 @@ pub enum Tokens {
     /// Every rank looks the same tokens up: a tensor-parallel group.
     Shared,
     /// Each rank looks tokens of its own up, at most `block` of them: the ranks of a group that
-    /// serve batches of their own and shaped the step for `block` rows each. Every rank's rows
-    /// travel padded to `block`, so the group's collectives move equal blocks.
+    /// serve batches of their own, which state the same `block` in every lookup of a step.
+    /// Every rank's rows travel padded to `block`, so the group's collectives move equal blocks.
     Own {
         /// Rows per rank of the step.
         block: usize,
@@ -323,13 +324,13 @@ impl NgramTable {
         grouped("a table split by heads gathers every rank's row ids over its group")?;
 
         // Every rank's ids in rank order, each padded to the block: a padding id reads row 0,
-        // whose values no rank keeps.
+        // whose values no rank keeps. A rank of no tokens sends padding alone.
         let share = columns / size;
-        let padded = if tokens < block {
-            let padding = Tensor::zeros((block - tokens, columns), rows.dtype(), rows.device())?;
-            Tensor::cat(&[rows, &padding], 0)?
-        } else {
-            rows.clone()
+        let padding = || Tensor::zeros((block - tokens, columns), rows.dtype(), rows.device());
+        let padded = match tokens {
+            0 => padding()?,
+            _ if tokens < block => Tensor::cat(&[rows, &padding()?], 0)?,
+            _ => rows.clone(),
         };
         let ids = collective::gathered(&padded.contiguous()?)?;
 
@@ -343,13 +344,67 @@ impl NgramTable {
 
         // Block j holds rank j's columns of this rank's tokens: ranks in order are columns in
         // order.
-        Ok(returned
+        let ordered = returned
             .reshape((size, block, share, width))?
             .transpose(0, 1)?
             .contiguous()?
-            .reshape((block, columns * width))?
-            .narrow(0, 0, tokens)?)
+            .reshape((block, columns * width))?;
+        Ok(match tokens {
+            _ if tokens == block => ordered,
+            _ => ordered.narrow(0, 0, tokens)?,
+        })
     }
+}
+
+/// Each token's n-gram context, `[tokens, width + 1]` U32: the `width` ids before it, oldest
+/// first, then its own, from the batch's token ids and, for a row's first tokens, from the ids
+/// before the row ([`TokenBatch::token_history`], `[rows, width]`), which state the model's fill
+/// id before a request's first token.
+///
+/// # Errors
+///
+/// A batch that states no token ids or no history, or what a tensor operation refuses.
+pub fn ngram_context(batch: &TokenBatch) -> Result<Tensor> {
+    let (Some(ids), Some(before)) = (&batch.token_ids, &batch.token_history) else {
+        return Err(Error::shape(
+            "NgramMemory",
+            "an n-gram hashes token ids, and the batch states none (token_ids, token_history)"
+                .to_owned(),
+        ));
+    };
+    let (tokens, rows) = (batch.tokens(), batch.rows());
+    let width = before.dim(1)?;
+    let (row, index) = batch.token_rows()?;
+    let device = ids.device();
+    let constant = |value: usize| -> Result<Tensor> {
+        Ok(Tensor::new(&[value as i32], &Device::Cpu)?.to_device(device)?)
+    };
+    let token = Tensor::arange(0_i32, tokens as i32, &Device::Cpu)?.to_device(device)?;
+
+    // The history the context is read from: every row's ids before it, `width` a row, then the
+    // batch's token ids.
+    let history = Tensor::cat(&[&before.flatten_all()?, ids], 0)?;
+    let own = token.broadcast_add(&constant(width * rows)?)?;
+    let before_row = row.to_dtype(DType::I32)?.broadcast_mul(&constant(width)?)?;
+
+    let earlier = |back: usize| -> Result<Tensor> {
+        // The token `back` before a token is the row's own when the row reaches that far back,
+        // and the row's history otherwise: its last id for the token before the row's first,
+        // and so on.
+        let in_row = own.broadcast_sub(&constant(back)?)?;
+        let in_context = before_row
+            .add(&index)?
+            .broadcast_add(&constant(width - back)?)?;
+        let entry = index
+            .broadcast_ge(&constant(back)?)?
+            .where_cond(&in_row, &in_context)?;
+
+        Ok(history.index_select(&entry.to_dtype(DType::U32)?, 0)?)
+    };
+
+    let mut context = (1..=width).rev().map(earlier).collect::<Result<Vec<_>>>()?;
+    context.push(ids.clone());
+    Ok(Tensor::stack(&context, 1)?)
 }
 
 /// Refuses a split table's lookup in a forward that has no group to complete it over.
@@ -472,8 +527,9 @@ impl NgramMemory {
     /// What the lookup refuses.
     pub fn join(&self, block: usize, dtype: DType) -> Result<()> {
         if let TableShard::Heads(_) = self.table.shard {
+            // No rows of its own: the lookup sends a block of padding ids.
             let columns = self.config.columns() as usize;
-            let none = ops::empty(vec![0, columns], DType::I64)?;
+            let none = Tensor::zeros((0, columns), DType::I64, self.table.values.device())?;
             self.table.lookup(&none, dtype, Tokens::Own { block })?;
         }
         Ok(())

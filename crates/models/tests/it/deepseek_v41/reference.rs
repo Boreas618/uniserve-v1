@@ -28,6 +28,7 @@ use nn::functional::WeightOrder;
 use nn::modules::{
     Linear, MhcConnection, MhcResidual, NgramMemory, NgramTable, TableShard, Tokens,
 };
+use nn::quantization::Declaration;
 use nn::{DType, Device, Tensor};
 use nn_testing::reference::{self, Mixing, assert_within};
 use nn_testing::{tensor, values};
@@ -54,7 +55,11 @@ fn config(root: &Path) -> Config {
     let value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("config.json")).expect("config.json"))
             .expect("config.json is JSON");
-    Config::parse(&Fields::of("config.json", &value).expect("fields")).expect("the configuration")
+    Config::parse(
+        &Fields::of("config.json", &value).expect("fields"),
+        Declaration::dense(),
+    )
+    .expect("the configuration")
 }
 
 /// The fixture's integers at `key`, flattened.

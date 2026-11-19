@@ -94,6 +94,35 @@ pub struct TokenBatch {
 }
 
 impl TokenBatch {
+    /// Each packed token's row of the batch, `[tokens]` U32, and its index among its row's
+    /// tokens, `[tokens]` I32, as tensors of the batch's device: a padding token past the batch's
+    /// tokens is counted in its last row.
+    ///
+    /// # Errors
+    ///
+    /// What a tensor operation refuses.
+    pub fn token_rows(&self) -> Result<(Tensor, Tensor)> {
+        let (rows, tokens) = (self.rows(), self.tokens());
+        let device = self.query_offsets.device();
+        let offsets = self.query_offsets.to_dtype(DType::I32)?;
+        let token =
+            Tensor::arange(0_i32, tokens as i32, &tensor::Device::Cpu)?.to_device(device)?;
+
+        // A token lies in the row whose end is the first past it: the count of ends at or
+        // before it.
+        let ends = offsets.narrow(0, 1, rows)?;
+        let row = token
+            .unsqueeze(1)?
+            .broadcast_ge(&ends.unsqueeze(0)?)?
+            .to_dtype(DType::I32)?
+            .sum(1)?
+            .minimum((rows - 1) as f64)?
+            .to_dtype(DType::U32)?;
+        let first = offsets.narrow(0, 0, rows)?.index_select(&row, 0)?;
+        let index = token.sub(&first)?.maximum(0.0)?;
+        Ok((row, index))
+    }
+
     /// The number of rows (sequences) of the batch.
     pub fn rows(&self) -> usize {
         self.seq_lens.elem_count()

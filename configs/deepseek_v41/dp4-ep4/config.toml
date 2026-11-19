@@ -1,0 +1,21 @@
+# DeepSeek-V4.1-Flash on the four GPUs of one host: four data-parallel schedulers whose ranks
+# share their routed experts, each rank holding the attention, the shared experts and the dense
+# weights whole, 96 of every layer's 384 MXFP4 experts and a quarter of the n-gram tables' hash
+# heads (`docs/deepseek_v41.md`).
+
+model = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+data_parallel_size = 4
+max_model_len = 20480
+max_running_requests = 16
+max_num_batched_tokens = 4096
+# The weights take 125 GiB of each GPU: the default share of 0.7 does not hold them beside the
+# graph pool and the KV cache.
+mem_fraction_static = 0.95
+
+[moe_config]
+expert_parallel = true
+
+# A worker captures its largest decode batch (max_running_requests) beside these.
+[cuda_graph_config]
+decode_batch_sizes = [1, 2, 4, 8]
+prefill_token_sizes = [1024, 4096]

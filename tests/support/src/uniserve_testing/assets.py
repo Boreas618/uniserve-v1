@@ -89,6 +89,12 @@ CHECKPOINTS: dict[str, Checkpoint] = {
         "checkpoint with other weight values (the weight-update cases' "
         "target): publish one, then name it here",
     ),
+    # DeepSeek-V4.1-Flash, block-scaled FP8 with MXFP4 experts
+    # (`DeepseekV41ForCausalLM`), which its four-GPU case serves.
+    "deepseek-v41": Checkpoint(
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "1bae0e1088993b9b82de08f59de5be5a34e42170",
+    ),
     # FastH3, the distilled MiniMax-H3 the video cases serve.
     "fasth3": Checkpoint(
         "FastVideo/FastVideo-FastH3-8-Step-V2",

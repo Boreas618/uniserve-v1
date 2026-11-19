@@ -45,7 +45,9 @@ pub use hyper::{MhcConfig, MhcConnection, MhcResidual};
 pub use linear::{Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearConfig, QkvNames};
 pub use mlp::{GateUp, Mlp, MlpConfig};
 pub use moe::{ExpertLayout, MoE, MoEConfig, SharedExpert, SharedExpertConfig};
-pub use ngram::{NgramConfig, NgramHashing, NgramMemory, NgramTable, TableShard, Tokens};
+pub use ngram::{
+    NgramConfig, NgramHashing, NgramMemory, NgramTable, TableShard, Tokens, ngram_context,
+};
 pub use norm::{
     GatedRmsNorm, GatedRmsNormConfig, LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig,
 };

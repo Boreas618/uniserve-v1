@@ -30,6 +30,8 @@ The token transport is the package that fills the `expert_exchange` operator's d
 
 `alltoall` and `deepep` dispatch the activation rows and combine their sums in two launches, and each rank runs its own experts' grouped products between them: BF16 experts, or the MXFP4 experts of a block-scaled export (DeepSeek-V4.1), whose first product encodes the received rows into MXFP8 as it reads them. `megamoe` runs calibrated NVFP4 experts inside its one launch.
 
+A model may also split a weight other than its experts between the schedulers, which it then completes by collectives over them: DeepSeek-V4.1's n-gram tables (203 GB) are split by hash heads, and each lookup gathers every scheduler's row ids and returns each its own tokens' rows. Such a model states that its forwards collect along the union (`nn::family::TextModel::expert_collectives`), each worker forms the union's NCCL communicator as it starts, and the forwards address it as their second axis (`nn::family::EXPERT_AXIS`); a worker that joins a step takes part in those collectives as it takes part in the exchange.
+
 Each step's capacity is the smallest power of two (or the batch token bound) that holds the largest participating batch, so startup captures every graph shape at every capacity that can hold it; this lengthens startup in proportion to the number of capacities. Different peer batches change the expert kernels' batching and can change floating-point rounding.
 
 ## Tensor-parallel ranks sharing their experts
