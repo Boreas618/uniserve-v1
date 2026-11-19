@@ -389,9 +389,10 @@ pub(crate) struct EpochTarget {
     /// longer an engine that succeeds another, and its world's engines
     /// by host and launch generation, the scheduler node's first.
     pub(crate) targets: Vec<(proto::config::EngineArgs, Vec<(String, u64)>)>,
-    /// The deployment's replicas the targets replace, by index, in the order of `targets`: every
-    /// replica when the change gives the deployment another number of them, and otherwise the
-    /// replicas the change touches, the others serving on in their epochs.
+    /// The deployment's replicas the update moves, by index ([`crate::updates::entry::Sides`]):
+    /// every replica when the target has another number of replicas, which `targets` then all
+    /// replace; and otherwise the replicas the change touches, in the order of `targets`, each
+    /// replaced by the target of its index, the others serving on in their epochs.
     pub(crate) moved: Vec<usize>,
     /// The configuration the target serves.
     pub(crate) config: Box<Config>,
@@ -2541,17 +2542,14 @@ impl Replica {
             return;
         };
         // The replicas the update moves: every replica, or those the change touches, which their
-        // targets replace one for one while the others serve on as they are.
+        // targets replace one for one while the others serve on as they are (a partial update,
+        // which only a target of as many replicas as the deployment's makes).
         let deployment: Vec<Arc<Replica>> = registry.serving.borrow().clone();
-        let partial = moved.len() == targets.len() && moved.len() < deployment.len();
-        let previous: Vec<Arc<Replica>> = if partial {
-            moved
-                .iter()
-                .filter_map(|index| deployment.get(*index).cloned())
-                .collect()
-        } else {
-            deployment.clone()
-        };
+        let previous: Vec<Arc<Replica>> = moved
+            .iter()
+            .filter_map(|index| deployment.get(*index).cloned())
+            .collect();
+        let partial = previous.len() < deployment.len();
         let mut phases = updater.watch();
 
         // While the targets prepare, their transfers yield to the serving

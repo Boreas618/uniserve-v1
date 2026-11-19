@@ -18,6 +18,7 @@ use crate::epoch::{Epoch, EpochRecord, Epochs, PackageRevision, Recorded};
 use crate::observe::Observer;
 use crate::supervision::processes::Processes;
 use crate::test_support::Engines;
+use crate::updates::entry::{Serving, Sides};
 use crate::updates::trial::{Baseline, Trial};
 use crate::updates::update::{EpochSwitch, Node, Update};
 use crate::updates::{Transition, Updater};
@@ -231,6 +232,79 @@ impl Deployment {
             switch,
             trial,
         )
+    }
+
+    /// The deployment's `count` serving replicas on [`HOST`], as an epoch change finds them:
+    /// replica `i` is one engine of launch generation [`PREVIOUS`]` + i` holding group rank `i`,
+    /// serving the serving epoch's launch.
+    fn serving_replicas(&mut self, count: u32) -> Vec<Serving> {
+        (0..count)
+            .map(|index| {
+                let generation = PREVIOUS + u64::from(index);
+                if generation != PREVIOUS {
+                    self.engines.serve(generation);
+                }
+                let mut launch = target_launch(HOST, index, generation);
+                launch.engine_config = self.serving.engine.clone();
+                launch.modules = self.serving.modules.clone();
+                launch.epoch = SERVING;
+                launch.predecessor = None;
+                launch.replica = index;
+                Serving {
+                    launch: Some(launch),
+                    nodes: vec![Node::new(
+                        HOST.to_owned(),
+                        index,
+                        generation,
+                        generation,
+                        scopes(index..index + 1),
+                        self.layout(),
+                        SERVING,
+                    )],
+                }
+            })
+            .collect()
+    }
+
+    /// The launches of `count` target replicas on [`HOST`]: target `j` is one engine of launch
+    /// generation [`SPAWNED`]` + j` holding group rank `j`, running the target's modules.
+    fn target_replicas(&self, count: u32) -> Vec<proto::config::EngineArgs> {
+        (0..count)
+            .map(|index| {
+                let mut launch = target_launch(HOST, index, SPAWNED + u64::from(index));
+                launch.engine_config = self.target.engine.clone();
+                launch.modules = self.target.modules.clone();
+                launch.replica = index;
+                launch
+            })
+            .collect()
+    }
+
+    /// An epoch update numbered `number` from the `serving` replicas to the `targets`, over the
+    /// sides the update's entry gives the change ([`Sides::of`]), whose drains are complete when
+    /// `complete` (the target's model files process requests otherwise).
+    fn change(
+        &self,
+        number: u64,
+        serving: Vec<Serving>,
+        targets: Vec<proto::config::EngineArgs>,
+        complete: bool,
+    ) -> Update {
+        let sides = Sides::of(serving, targets, &self.target.modules);
+        let mut switch = self.switch(Vec::new());
+        switch.complete = complete;
+        switch.launches = sides
+            .targets
+            .into_iter()
+            .map(|(_, launch)| (launch, Vec::new()))
+            .collect();
+        switch.target_layouts = switch
+            .launches
+            .iter()
+            .map(|(launch, _)| launch.engine_config.layout())
+            .collect();
+        switch.bystanders = sides.bystanders;
+        self.epoch_over(number, sides.draining, switch, LONG)
     }
 
     /// Sends what the engine of launch generation `launch` withheld, and runs
@@ -1143,6 +1217,161 @@ fn an_epoch_update_moves_one_replica_and_the_other_serves_on() {
         .map(|claim| claim.scopes.clone())
         .collect();
     assert_eq!(kept, [scopes(0..2)]);
+}
+
+/// An epoch change to another number of replicas moves every replica, whichever side has more
+/// (N → 1, 1 → N, N → M): every target replica starts and is promoted, and once the targets serve
+/// every serving engine drains, completely when the target's model files process requests
+/// otherwise. The commit stops every serving engine and retires the previous epoch, which no
+/// replica serves any longer; a rollback promotes every serving engine again, then drains and
+/// stops every target and retires the target epoch, the previous epoch keeping every replica's
+/// scopes.
+#[test]
+fn a_change_of_the_replica_count_moves_every_replica() {
+    // Four independent replicas to one expert union of another model, as the drain is complete
+    // then; one replica to four; three to two.
+    for (serving, targets, complete) in [(4, 1, true), (1, 4, false), (3, 2, false)] {
+        for commit in [true, false] {
+            let case = format!("{serving} → {targets} replicas, commit: {commit}");
+            let mut deployment = Deployment::new(Refusals::default());
+            let replicas = deployment.serving_replicas(serving);
+            let launches = deployment.target_replicas(targets);
+            let update = deployment.change(1, replicas, launches, complete);
+            deployment.apply(update);
+
+            let previous: Vec<u64> = (0..serving).map(|i| PREVIOUS + u64::from(i)).collect();
+            let started: Vec<u64> = (0..targets).map(|j| SPAWNED + u64::from(j)).collect();
+            let spawned: Vec<u64> = deployment
+                .engines
+                .spawns()
+                .iter()
+                .map(|spawn| spawn.generation)
+                .collect();
+            assert_eq!(spawned, started, "{case}");
+            for target in &started {
+                assert_eq!(
+                    names(&deployment.engines.received(*target)),
+                    ["promote"],
+                    "{case}"
+                );
+            }
+            for engine in &previous {
+                assert_eq!(
+                    deployment.engines.received(*engine),
+                    [command::Kind::Drain(process::Drain {
+                        epoch: SERVING,
+                        deadline_ms: 5_000,
+                        shrink: false,
+                        complete,
+                    })],
+                    "{case}: engine {engine}"
+                );
+            }
+            assert_eq!(
+                deployment.status()["engines"],
+                serde_json::json!({ "serving": serving, "target": targets }),
+                "{case}"
+            );
+            assert_eq!(deployment.status()["phase"], "trial", "{case}");
+            assert_eq!(*deployment.epochs.served().borrow(), TARGET, "{case}");
+
+            if commit {
+                assert!(deployment.updater.commit().is_some());
+                deployment.run();
+                assert_eq!(deployment.status()["phase"], "committed", "{case}");
+                let stopped: Vec<Option<u64>> = previous.iter().copied().map(Some).collect();
+                assert_eq!(deployment.engines.stops(), stopped, "{case}");
+                let claims = deployment.engines.claims();
+                assert!(
+                    claims
+                        .iter()
+                        .any(|claim| claim.epoch == TARGET && claim.retire == [SERVING]),
+                    "{case}: the commit retires the previous epoch: {claims:?}"
+                );
+                assert!(
+                    claims.iter().all(|claim| claim.epoch != SERVING),
+                    "{case}: no replica keeps the previous epoch: {claims:?}"
+                );
+                assert_eq!(
+                    deployment.epochs.serving().map(|(epoch, _)| epoch.number()),
+                    Some(TARGET),
+                    "{case}"
+                );
+            } else {
+                deployment
+                    .updater
+                    .rollback(decision("the target answers worse"))
+                    .expect("an update is on trial");
+                deployment.run();
+                assert_eq!(deployment.status()["phase"], "rolled_back", "{case}");
+                assert_eq!(*deployment.epochs.served().borrow(), SERVING, "{case}");
+                for engine in &previous {
+                    assert_eq!(
+                        names(&deployment.engines.received(*engine)),
+                        ["drain", "promote"],
+                        "{case}: engine {engine}"
+                    );
+                }
+                for target in &started {
+                    assert_eq!(
+                        names(&deployment.engines.received(*target)),
+                        ["promote", "drain"],
+                        "{case}: target {target}"
+                    );
+                }
+                let stopped: Vec<Option<u64>> = started.iter().copied().map(Some).collect();
+                assert_eq!(deployment.engines.stops(), stopped, "{case}");
+                let retiring = deployment
+                    .engines
+                    .claims()
+                    .pop()
+                    .expect("the rollback's claim");
+                assert_eq!(
+                    (retiring.epoch, retiring.scopes, retiring.retire),
+                    (SERVING, scopes(0..serving), vec![TARGET]),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+/// A target of as many replicas as the deployment's pairs each target replica with the serving
+/// replica of its index and moves only the replicas whose launch it touches: the target of the
+/// touched replica alone starts, that replica's engine drains, and the other's serves on,
+/// commanded nothing, its epoch kept rather than retired at the commit.
+#[test]
+fn a_target_of_as_many_replicas_moves_the_replicas_it_touches() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let replicas = deployment.serving_replicas(2);
+    let mut launches = deployment.target_replicas(2);
+    // Target replica 1 holds another slot count, which its build part states.
+    let touched = &mut launches[1].engine_config;
+    touched.max_running_requests = touched
+        .max_running_requests
+        .checked_add(1)
+        .expect("a slot count below the maximum");
+    let update = deployment.change(1, replicas, launches, false);
+    deployment.apply(update);
+
+    let spawned: Vec<u64> = deployment
+        .engines
+        .spawns()
+        .iter()
+        .map(|spawn| spawn.generation)
+        .collect();
+    assert_eq!(spawned, [SPAWNED + 1]);
+    assert!(deployment.engines.received(PREVIOUS).is_empty());
+    assert_eq!(names(&deployment.engines.received(SECOND)), ["drain"]);
+
+    assert!(deployment.updater.commit().is_some());
+    deployment.run();
+    assert_eq!(deployment.engines.stops(), vec![Some(SECOND)]);
+    let claims = deployment.engines.claims();
+    assert!(
+        claims.iter().all(|claim| !claim.retire.contains(&SERVING)),
+        "the epoch the untouched replica serves is retired: {claims:?}"
+    );
 }
 
 /// A replica added on another host leaves the layout of the replica already serving: the
