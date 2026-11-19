@@ -5,20 +5,57 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# Request processing: what a model family supplies to the daemon that turns
-# public requests into engine requests. A chat family names the output formats
-# its checkpoints write; a video family binds the request processor that
-# validates and processes its requests. Family request preprocessing (the
-# Qwen-VL processor rules, MiniMax-H3's request rules) lives here beside its
-# model's numerics, not inside them. It holds no runtime object and reads no
-# file of its own.
+# Request processing: what a model family supplies to turn public requests
+# into engine requests. A chat family names the output formats its checkpoints
+# write and renders requests through its chat template; a video family binds
+# the request processor that validates and processes its requests. Family
+# request preprocessing (the Qwen-VL processor rules, MiniMax-H3's request
+# rules) lives here beside its model's numerics, not inside them. It holds no
+# runtime object and reads no file of its own.
+#
+# The crate is the machinery of the processing programs, which link it for
+# `wasm32-unknown-unknown`: the release's (`program/`, whose module serves
+# `FAMILIES` through the processing interface `scheduling::processing`, which
+# the leader daemon loads per epoch) and the daemon tests' (`testing/`). The
+# engine and the model crates link it natively for its numerical facts. It is
+# an ordinary library: a program's module is its own crate's cdylib.
+
 [dependencies]
-# A video denoiser's description is the request interface's `VideoDenoiser` message.
+# The strict push parser a JSON tool call is read with as it streams.
+actson.workspace = true
+# The ordered maps a template's JSON values are, as Python dicts keep their keys.
+indexmap.workspace = true
+# The schemas of a request's tools, which type and check a tag tool call's arguments.
+jsonschema.workspace = true
+# The Jinja engine chat templates render in, with Python's string and dict methods.
+minijinja.workspace = true
+minijinja-contrib.workspace = true
+# A video denoiser's description is the family's own Protobuf message (`minimax_h3::wire`).
 prost.workspace = true
-proto.workspace = true
+# The processing interface: its messages, its exports and its host functions, and the video
+# vocabulary its messages state.
+scheduling.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `tojson`'s Python `json.dumps` formatting.
+serde-json-fmt.workspace = true
+serde_with.workspace = true
 thiserror.workspace = true
+thiserror-ext.workspace = true
+
+# The custom `getrandom` backend of a processing program's wasm32 module (`entropy`), which the
+# schema validator's hash maps are seeded through.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+expect-test.workspace = true
+itertools.workspace = true
+
+[[bench]]
+name = "tool_parsers"
+harness = false
 
 [lints]
 workspace = true

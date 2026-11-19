@@ -4,7 +4,7 @@
 //! A family states the rule's values once ([`CanvasRule`]); the request processing resolves a
 //! requested or a keyframe's aspect with it, and the family names the canvases it serves by it.
 
-use proto::video::Canvas;
+use scheduling::processing::video::Canvas;
 use serde::{Deserialize, Serialize};
 
 /// How a display aspect resolves to a canvas.

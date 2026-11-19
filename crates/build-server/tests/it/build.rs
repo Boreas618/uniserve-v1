@@ -401,8 +401,9 @@ fn a_build_reports_the_keys_no_package_built_and_builds_the_rest() {
     assert_eq!(served(&store, &cache), [(1, vec![PAGE_64.to_owned()])]);
 }
 
-/// Every program of the release (`crates/scheduling/policies/<name>`, the
-/// packages the server installs from a source tree) is built by the server
+/// Every program of the release (`crates/scheduling/policies/<name>` and the
+/// processing program `crates/processing/program`, the packages the server
+/// installs from a source tree) is built by the server
 /// from the snapshot its installation took of its whole workspace, with the
 /// lockfile's sources vendored and nothing fetched, into a module that states
 /// its kind; a second server over the same roots resolves the committed
@@ -432,7 +433,8 @@ fn the_release_programs_are_built_from_their_installed_snapshots() {
             "expert-order",
             "layout",
             "role",
-            "ttft"
+            "ttft",
+            "processing"
         ]
     );
 

@@ -1,24 +1,27 @@
-//! Model-profile prompt preprocessing and generation-policy integration behavior.
+//! Model-profile prompt preprocessing and generation-policy integration behavior, over families
+//! the tests' processing program serves (`processing-testing`), resolved and bound through it as
+//! a deployment's start resolves and binds its checkpoint.
 
-use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
-use crate::api::input::chat::{CHATML_TEMPLATE, HfChatRenderer};
 use crate::api::input::media::ImageInput;
-use crate::api::input::{ModelResolutionError, Processor, RequestRenderer};
+use crate::api::input::{LoadedBinding, ModelResolutionError, Processor};
 use crate::api::model::ModelConfig;
-use crate::api::model::assets::ChatFiles;
+use crate::api::model::assets::{Hub, HubSettings, Source};
 use crate::api::openai::ApiError;
-use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
-use processing::{Family, Registry, RootFile};
-use proto::config::ChatTemplateContentFormat;
+use crate::api::program::Session;
+use crate::api::tokenizer::DynTokenizer;
 use proto::handoff::Lowering;
 use proto::request::{GenerationLimits, GenerationRequest};
+use scheduling::processing::Event;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
+
+/// A ChatML template of the output formats the test families parse (`<think>` reasoning, JSON
+/// tool calls in `<tool_call>` tags), the one the processing crate's renderer tests render.
+const CHATML_TEMPLATE: &str = include_str!("../../../../processing/src/chat/chatml.jinja");
 
 /// The model name every test request names and the routes check.
 const SERVED_MODEL: &str = "served-model";
@@ -42,46 +45,11 @@ const SPECIAL_TOKENS: &[&str] = &[
     "</answer>",
 ];
 
-/// A chat family that declares neither a reasoning nor a tool-call format.
-const PLAIN: Family = Family {
-    id: "plain",
-    root: RootFile::Config,
-    classes: &["PlainForCausalLM"],
-    serving: Serving::Chat(ChatProfile {
-        reasoning: None,
-        tool_calls: None,
-        images: None,
-        checkpoint: processing::ChatCheckpoint {
-            context_length: &["max_position_embeddings"],
-            chat_template: processing::ChatTemplate::TokenizerConfig,
-        },
-    }),
-};
-
-/// A chat family whose outputs are parsed in its formats.
-const CHAT: Family = Family {
-    id: "chat",
-    root: RootFile::Config,
-    classes: &["ChatForCausalLM"],
-    serving: Serving::Chat(ChatProfile {
-        reasoning: Some(ReasoningFormat {
-            open: "<think>",
-            close: "</think>",
-        }),
-        tool_calls: Some(ToolCallFormat::Json),
-        images: None,
-        checkpoint: processing::ChatCheckpoint {
-            context_length: &["max_position_embeddings"],
-            chat_template: processing::ChatTemplate::TokenizerConfig,
-        },
-    }),
-};
-
 /// Resolves a chat checkpoint of the model class `class` over a synthetic checkpoint with
 /// worker limits that cover every generation feature; see
 /// `try_resolved_model`.
 fn resolved_model(class: &str) -> (tempfile::TempDir, DynTokenizer, Processor) {
-    try_resolved_model(class, runtime_limits()).unwrap()
+    try_resolved_model(class, &Options::default(), runtime_limits()).unwrap()
 }
 
 /// Writes a synthetic checkpoint to a temporary directory and binds an
@@ -99,6 +67,7 @@ fn resolved_model(class: &str) -> (tempfile::TempDir, DynTokenizer, Processor) {
 /// cover a feature the profile needs. Other setup failures panic.
 fn try_resolved_model(
     class: &str,
+    options: &Options,
     limits: GenerationLimits,
 ) -> Result<(tempfile::TempDir, DynTokenizer, Processor), ModelResolutionError> {
     let directory = tempdir().unwrap();
@@ -138,39 +107,72 @@ fn try_resolved_model(
         ),
     )
     .unwrap();
-    // A family that keeps its template in a file of its own reads it there.
-    fs::write(directory.path().join("chat_template.jinja"), CHAT_TEMPLATE).unwrap();
     fs::write(
         directory.path().join("generation_config.json"),
         r#"{"eos_token_id":2,"max_new_tokens":128}"#,
     )
     .unwrap();
-    // The family the checkpoint's `config.json` declares, as startup resolves it.
-    let family = Registry::new([CHAT, PLAIN, processing::qwen::QWEN4_EXP])
-        .unwrap()
-        .resolve([(
-            RootFile::Config,
-            fs::read_to_string(directory.path().join("config.json"))
-                .unwrap()
-                .as_str(),
-        )])
-        .unwrap();
-    let Serving::Chat(profile) = family.serving else {
-        panic!("{} serves chat", family.id);
-    };
-    let files = ChatFiles::locate(directory.path(), profile.checkpoint).unwrap();
-    let tokenizer: DynTokenizer =
-        Arc::new(HuggingFaceTokenizer::load(files.tokenizer_directory()).unwrap());
-    let renderer = HfChatRenderer::new(
-        Some(CHAT_TEMPLATE.to_string()),
-        HashMap::new(),
-        Some(ChatTemplateContentFormat::String),
-    )
-    .unwrap();
-    let config = ModelConfig::from_files(family, &files, Some(4096), tokenizer.as_ref()).unwrap();
-    let renderer = RequestRenderer::Chat(renderer);
-    let model = Processor::new(config, Arc::clone(&tokenizer), renderer, limits, true)?;
+    let (tokenizer, model) = bound(directory.path(), options, limits)?;
     Ok((directory, tokenizer, model))
+}
+
+/// The processor of the checkpoint in `directory` under the chat `options`, its family resolved
+/// and bound in the tests' processing program as a deployment's start does, with `limits` as
+/// the workers' limits.
+fn bound(
+    directory: &std::path::Path,
+    options: &Options,
+    limits: GenerationLimits,
+) -> Result<(DynTokenizer, Processor), ModelResolutionError> {
+    let cache = tempdir().unwrap();
+    let hub = Hub::new(HubSettings {
+        cache: cache.path().to_path_buf(),
+        endpoint: None,
+        token: None,
+        offline: true,
+    })
+    .unwrap();
+    let chat = proto::config::ChatConfig {
+        template: options
+            .template
+            .map(|template| proto::config::ChatTemplateSource::Inline(template.to_owned())),
+        template_content_format: Some(proto::config::ChatTemplateContentFormat::String),
+        ..proto::config::ChatConfig::default()
+    };
+    let loaded = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(ModelConfig::load(
+            &hub,
+            &Source::Directory(directory.to_path_buf()),
+            None,
+            std::num::NonZeroU32::new(options.max_model_len),
+            &chat,
+            &serde_json::Map::new(),
+            &crate::api::test_support::program(),
+        ))?;
+    let LoadedBinding::Chat(binding) = loaded.binding else {
+        panic!("a chat checkpoint binds a chat family");
+    };
+    let tokenizer = loaded.tokenizer;
+    let processor = Processor::new(loaded.config, Arc::clone(&tokenizer), binding, None, limits)?;
+    Ok((tokenizer, processor))
+}
+
+/// How a test binds its checkpoint: the deployment's template in place of the checkpoint's,
+/// and its `max_model_len`.
+struct Options {
+    template: Option<&'static str>,
+    max_model_len: u32,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            template: None,
+            max_model_len: 4096,
+        }
+    }
 }
 
 /// Worker limits that cover every generation feature with capacities no test
@@ -195,9 +197,28 @@ fn preprocess_chat(
     request: crate::api::protocol::ChatCompletionRequest,
     images: Vec<ImageInput>,
 ) -> Result<(GenerationRequest, Lowering), ApiError> {
+    preprocess_session(processor, request_id, request, images)
+        .map(|(generation, lowering, _)| (generation, lowering))
+}
+
+/// [`preprocess_chat`] with the request's instance of the processing program, which holds its
+/// response's parser.
+fn preprocess_session(
+    processor: &Processor,
+    request_id: String,
+    request: crate::api::protocol::ChatCompletionRequest,
+    images: Vec<ImageInput>,
+) -> Result<(GenerationRequest, Lowering, Session), ApiError> {
     processor
         .process(&request_id, &request, None, images, 0)
         .map_err(ApiError::from)
+}
+
+/// The events `session`'s parser makes of `text`, finished.
+fn parsed(session: &mut Session, text: &str) -> Vec<Event> {
+    let mut events = session.push(text).unwrap().unwrap();
+    events.extend(session.finish().unwrap().unwrap());
+    events
 }
 
 /// A single-turn text chat request to the served model, with the wire
@@ -224,7 +245,7 @@ fn model_resolution_refuses_a_missing_runtime_branch() {
     limits
         .features
         .remove(proto::request::GenerationFeatures::UNDERSTANDING);
-    let error = match try_resolved_model("ChatForCausalLM", limits) {
+    let error = match try_resolved_model("ChatForCausalLM", &Options::default(), limits) {
         Ok(_) => panic!("incomplete worker limits must fail model resolution"),
         Err(error) => error,
     };
@@ -236,23 +257,12 @@ fn model_resolution_refuses_a_missing_runtime_branch() {
 
 #[test]
 fn context_length_limits_preprocessed_requests() {
-    let (_directory, tokenizer, loaded) = resolved_model("ChatForCausalLM");
-    let renderer = HfChatRenderer::new(
-        Some(CHAT_TEMPLATE.to_string()),
-        HashMap::new(),
-        Some(ChatTemplateContentFormat::String),
-    )
-    .unwrap();
-    let mut config = loaded.config().clone();
-    config.max_model_len = 8;
-    let processor = Processor::new(
-        config,
-        tokenizer,
-        RequestRenderer::Chat(renderer),
-        runtime_limits(),
-        true,
-    )
-    .unwrap();
+    let options = Options {
+        max_model_len: 8,
+        ..Options::default()
+    };
+    let (_directory, _tokenizer, processor) =
+        try_resolved_model("ChatForCausalLM", &options, runtime_limits()).unwrap();
 
     let error = preprocess_chat(
         &processor,
@@ -388,23 +398,15 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
 /// instead of JSON objects.
 const XML_CALL_TEMPLATE: &str = "{%- if tools -%}<|im_start|>system\n# Tools\n<tools>{%- for tool in tools -%}{{ tool | tojson }}{%- endfor -%}</tools>\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n{%- endif -%}{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
 
-/// Rebinds a resolved Qwen3-family model to `template`.
-fn with_template(class: &str, template: &str) -> Processor {
-    let (_directory, tokenizer, loaded) = resolved_model(class);
-    let renderer = HfChatRenderer::new(
-        Some(template.to_string()),
-        HashMap::new(),
-        Some(ChatTemplateContentFormat::String),
-    )
-    .unwrap();
-    Processor::new(
-        loaded.config().clone(),
-        tokenizer,
-        RequestRenderer::Chat(renderer),
-        runtime_limits(),
-        true,
-    )
-    .unwrap()
+/// The processor of a checkpoint of `class` the deployment binds to `template`.
+fn with_template(class: &str, template: &'static str) -> Processor {
+    let options = Options {
+        template: Some(template),
+        ..Options::default()
+    };
+    try_resolved_model(class, &options, runtime_limits())
+        .unwrap()
+        .2
 }
 
 /// A chat request that asks for image output is refused by name: no served
@@ -437,11 +439,10 @@ fn a_chat_request_for_image_output_is_refused_by_name() {
     }
 }
 
-/// A family's chat profile declares its tool-call format, and that alone
-/// decides whether requests with tools are served: whatever the checkpoint's
-/// template text instructs, a family that declares a format has its calls
-/// parsed in it, and the lowering states the format and the request's tools
-/// to output processing.
+/// A family's chat profile declares its tool-call format, and that alone decides whether
+/// requests with tools are served: whatever the deployment's template text instructs, a family
+/// that declares a format has its calls parsed in it, against the tools the request lets the
+/// model call.
 #[test]
 fn the_profile_declares_the_tool_call_format() {
     let tool_request = serde_json::json!({
@@ -452,47 +453,47 @@ fn the_profile_declares_the_tool_call_format() {
             "parameters": {"type": "object", "properties": {}}
         }}]
     });
-    for template in [CHATML_TEMPLATE, XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
+    let call = "<tool_call>\n{\"name\": \"weather\", \"arguments\": {}}\n</tool_call>";
+    for template in [XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
         let processor = with_template("ChatForCausalLM", template);
         assert!(processor.supports_tool_calling(), "{template}");
-        let (_, lowering) = preprocess_chat(
+        let (_, _, mut session) = preprocess_session(
             &processor,
             String::from("tools"),
             serde_json::from_value(tool_request.clone()).unwrap(),
             Vec::new(),
         )
         .unwrap();
-
-        let parser = lowering.parser.unwrap();
-        let reasoning = parser.reasoning_delimiters.as_ref().unwrap();
         assert_eq!(
-            (reasoning.open.as_str(), reasoning.close.as_str()),
-            ("<think>", "</think>")
+            parsed(&mut session, call),
+            [
+                Event::ToolCall {
+                    name: "weather".to_owned()
+                },
+                Event::Arguments("{}".to_owned()),
+            ],
+            "{template}"
         );
-        assert_eq!(parser.tool_calls, "json");
-        let tools: serde_json::Value = serde_json::from_str(&parser.tools).unwrap();
-        assert_eq!(tools[0]["function"]["name"], "weather");
     }
 
     // `tool_choice: none` withholds the tools from the model, so no call is parsed.
     let mut withheld = tool_request.clone();
     withheld["tool_choice"] = serde_json::json!("none");
-    let (_, lowering) = preprocess_chat(
-        &with_template("ChatForCausalLM", CHATML_TEMPLATE),
+    let (_, _, mut session) = preprocess_session(
+        &with_template("ChatForCausalLM", CHAT_TEMPLATE),
         String::from("no-tools"),
         serde_json::from_value(withheld).unwrap(),
         Vec::new(),
     )
     .unwrap();
-    let parser = lowering.parser.unwrap();
-    assert!(parser.tool_calls.is_empty());
-    assert!(parser.tools.is_empty());
+    assert_eq!(
+        parsed(&mut session, call),
+        [Event::Content(call.to_owned())]
+    );
 }
 
-/// A family whose profile declares no tool-call format refuses a request
-/// with tools by name, rather than returning its calls as unparsed text, and
-/// one that declares function and parameter tags has them stated to output
-/// processing.
+/// A family whose profile declares no tool-call format refuses a request with tools by name,
+/// rather than returning its calls as unparsed text.
 #[test]
 fn tool_calling_follows_the_familys_declared_format() {
     let tool_request = serde_json::json!({
@@ -509,7 +510,7 @@ fn tool_calling_follows_the_familys_declared_format() {
     let error = preprocess_chat(
         &plain,
         String::from("plain-tools"),
-        serde_json::from_value(tool_request.clone()).unwrap(),
+        serde_json::from_value(tool_request).unwrap(),
         Vec::new(),
     )
     .err()
@@ -517,18 +518,6 @@ fn tool_calling_follows_the_familys_declared_format() {
     assert_eq!(error.status_code().as_u16(), 400);
     let message = error.to_error_response().error.message;
     assert!(message.contains("tool_calling"), "{message}");
-
-    let (_directory, _, tagged) = resolved_model("Qwen4ExpForConditionalGeneration");
-    assert!(tagged.supports_tool_calling());
-    let (_, lowering) = preprocess_chat(
-        &tagged,
-        String::from("xml-tools"),
-        serde_json::from_value(tool_request).unwrap(),
-        Vec::new(),
-    )
-    .unwrap();
-    let parser = lowering.parser.unwrap();
-    assert_eq!(parser.tool_calls, "xml");
 }
 
 /// What an agent harness sends turn after turn is lowered as it sends it: tool
@@ -592,7 +581,6 @@ fn a_harness_conversation_grows_by_its_new_turns() {
     let (second_turn, _) = turn(second);
 
     assert_eq!(first_turn.max_und_tokens, 64);
-    assert!(!first_lowering.parser.unwrap().tool_calls.is_empty());
     assert!(first_lowering.response.unwrap().include_usage);
     assert!(first_turn.cache.isolation_key.is_some());
     assert_eq!(
@@ -713,27 +701,6 @@ fn a_logprob_count_above_max_logprobs_is_refused() {
     }
 }
 
-/// An image of a family that takes images: one merged token per 32-pixel square, spanning the
-/// larger side's tokens, as a Qwen-VL processor states a block.
-struct TestImages;
-
-impl processing::ImageProcessor for TestImages {
-    fn placeholder(&self) -> &str {
-        "<|image_pad|>"
-    }
-
-    fn markup(&self) -> &str {
-        "<|vision_start|><|image_pad|><|vision_end|>"
-    }
-
-    fn block(&self, width: u32, height: u32) -> Result<processing::ImageBlock, String> {
-        Ok(processing::ImageBlock {
-            tokens: (width / 32) * (height / 32),
-            positions: (width / 32).max(height / 32),
-        })
-    }
-}
-
 /// A fetched `width` x `height` PNG.
 fn png(width: u32, height: u32) -> ImageInput {
     let mut bytes = std::io::Cursor::new(Vec::new());
@@ -776,25 +743,7 @@ fn a_text_only_deployment_refuses_an_image_part() {
 /// digest that keys its encodings within the request's cache partition.
 #[test]
 fn an_image_part_becomes_a_vision_block_in_place_of_its_placeholder() {
-    let (_directory, tokenizer, loaded) = resolved_model("ChatForCausalLM");
-    let renderer = HfChatRenderer::new(
-        Some(CHAT_TEMPLATE.to_string()),
-        HashMap::new(),
-        Some(ChatTemplateContentFormat::String),
-    )
-    .unwrap()
-    .with_multimodal(Some(crate::api::input::chat::MultimodalRenderInfo {
-        placeholder_token: "<|vision_start|><|image_pad|><|vision_end|>".to_owned(),
-    }));
-    let processor = Processor::new(
-        loaded.config().clone(),
-        Arc::clone(&tokenizer),
-        RequestRenderer::Chat(renderer),
-        runtime_limits(),
-        true,
-    )
-    .unwrap()
-    .with_images(Some(Arc::new(TestImages)));
+    let (_directory, tokenizer, processor) = resolved_model("VisionForCausalLM");
     assert!(processor.supports_image_input());
 
     let lower = |salt: Option<&str>| {

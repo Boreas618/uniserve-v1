@@ -162,7 +162,6 @@ pub(crate) fn create_instance() -> Result<service::Instance> {
 pub async fn serve(
     package: crate::policy::Package,
     deployment: String,
-    families: processing::Registry,
     ready: Option<service::ReadyFd>,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -196,7 +195,6 @@ pub async fn serve(
     ready.report(service::State::Listening);
 
     let start = node::Start {
-        families,
         options: package.config.clone(),
         deployment,
         recorder: crate::observation::record::Recorder::new(
@@ -736,19 +734,23 @@ mod tests {
             .info()
             .limits
             .clone();
+        let doubled = scheduling::processing::Bind {
+            family: crate::test_support::CHAT.to_owned(),
+            files: crate::api::test_support::chat_files(
+                "ChatForCausalLM",
+                "{{ messages[0].content }}{{ messages[0].content }}",
+            ),
+            ..scheduling::processing::Bind::default()
+        };
+        let binding = crate::api::test_support::program()
+            .bind(doubled, crate::api::test_support::configured_tokenizer())
+            .unwrap();
         let repeating = crate::api::input::Processor::new(
             crate::test_support::test_model(crate::test_support::CHAT),
             crate::api::test_support::configured_tokenizer(),
-            crate::api::input::RequestRenderer::Chat(
-                crate::api::input::chat::HfChatRenderer::new(
-                    Some("{{ messages[0].content }}{{ messages[0].content }}".to_owned()),
-                    std::collections::HashMap::new(),
-                    Some(crate::config::ChatTemplateContentFormat::String),
-                )
-                .unwrap(),
-            ),
+            binding,
+            None,
             limits,
-            false,
         )
         .unwrap();
         let former = leader.replicas.process_with(Arc::new(repeating));
@@ -1038,7 +1040,6 @@ mod tests {
                 state.path().join("sim"),
             )?);
             let start = node::Start {
-                families: processing::Registry::new([]).unwrap(),
                 options: config,
                 deployment: "sim".to_owned(),
                 revisions,
