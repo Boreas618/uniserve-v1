@@ -2063,6 +2063,55 @@ mod tests {
         assert_eq!(resumed(STEPS, None), None);
     }
 
+    /// A drain at its deadline preempts a running video request that has a denoising step left
+    /// to offer, which leaves as migratable once its calls in flight return, and lets a request
+    /// whose denoising is scheduled whole run to its end (SD §3.8, §7.3 "Preemption";
+    /// `docs/architecture.md`, Video preemption). A sleep drains so.
+    #[test]
+    fn a_drain_preempts_a_video_request_with_steps_to_offer_and_lets_a_whole_one_end() {
+        let mut scheduler = scheduler(&[(A, &phases()[..])]);
+
+        // Both requests prepared and completed their first step; one holds its call window of
+        // steps in flight with a step left to offer, the other every step.
+        let denoising = |id: u64, scheduled: u32| {
+            let mut input = video(1, 40, Vec::new());
+            input.request_id = RequestId(id);
+            input.trajectory.id = std::num::NonZeroU64::new(id);
+            let mut request = request(input, &on(A));
+            for phase in [Phase::TextEncode, Phase::LatentPrepare] {
+                schedule(&mut request, phase, 1);
+                complete(&mut request, phase, 1);
+            }
+            schedule(&mut request, Phase::Denoise, scheduled);
+            complete(&mut request, Phase::Denoise, 1);
+            request
+        };
+        let (offering, whole) = (RequestId(1), RequestId(2));
+        for request in [denoising(1, STEPS - 1), denoising(2, STEPS)] {
+            scheduler.running.push(request.id);
+            scheduler.requests.insert(request.id, request);
+        }
+
+        let (reply, _replied) = crossbeam_channel::bounded(1);
+        scheduler.drain(MigrationCause::Drain, Some(Instant::now()), false, reply);
+
+        assert_eq!(scheduler.running, [whole]);
+        assert_eq!(scheduler.requests[&whole].status, RequestStatus::Running);
+        let preempted = &scheduler.requests[&offering];
+        assert_eq!(preempted.status, RequestStatus::Finished);
+        assert!(
+            matches!(
+                preempted.terminal,
+                Some(Event::Migratable {
+                    cause: MigrationCause::Drain,
+                    ..
+                })
+            ),
+            "{:?}",
+            preempted.terminal
+        );
+    }
+
     /// A decode is offered once the last denoising step is scheduled on its group only when each
     /// rank that decodes denoises too, reading the latents its own last step wrote; where a rank
     /// decodes that does not denoise, which receives its latents from another rank's step, once

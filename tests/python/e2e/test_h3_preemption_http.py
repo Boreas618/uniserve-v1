@@ -9,11 +9,13 @@ deployment's buffer pool under the trajectory's key (``specs/buffer-pool.md``
 §6, §13), and later restores it (``Restore``) into the slot of the admission
 that continues it:
 
-- by a sleep, which serving uses to give back device storage: the request
-  waits in the hold until the wake, after which the engine restores the
-  stored step and denoises the steps left;
+- by a sleep, which serving uses to give back device storage, applied once
+  the request completed its first step: the request waits in the hold
+  until the wake, after which the engine restores the stored step and
+  denoises the steps left;
 - by an epoch change whose denoising computes the same (a change of the
-  workers' watchdog, applied with ``PUT /admin/policy``): the switch
+  room of the main process's media pool, ``worker_config.host_queue_depth``,
+  which starts a new epoch, applied with ``PUT /admin/policy``): the switch
   promotes the target and drains the serving engine with the deadline of
   zero its package states (``update_config.drain_s``), which ends the
   request in flight at its next step boundary with its trajectory saved; the
@@ -26,6 +28,19 @@ that continues it:
   of the trajectory, whatever the two durations. The package holds no pause
   at a step boundary (``paused = true`` holds new requests only), so the
   process is paused by its signal.
+
+A preemption ends a request once its calls in flight complete, and a
+request whose denoising is scheduled whole finishes instead
+(``docs/architecture.md``, Video preemption). A request holds at most its
+denoising group's call window of steps in flight, its queue depth: the
+deployment files' depth of 6 schedules FastH3's eight steps whole once two
+completed, so the group states a depth of 2, with which a request offers its
+last step only after its sixth completed. A sleep applied once the first
+step completed reaches the engine within the five steps that follow, about
+four seconds against the second the daemon takes to apply it, so it finds
+steps left to offer; so does a drain whose engine was paused after the
+first step, which on continuing completes at most the two steps in flight
+and offers two more before the drain.
 
 Each preempted video is the reference video, frame for frame and sample
 for sample. Preemption starts only after the public job status reports
@@ -89,6 +104,10 @@ SEED = 4242
 # change commits by itself once the case read what it observes.
 UPDATES = {"update_config": {"drain_s": 0.0, "trial": "5s"}}
 
+# The model group's queue depth, which bounds a request's denoising steps in
+# flight (module documentation).
+QUEUE_DEPTH = 2
+
 # The model group's share of each GPU while an epoch change of the
 # denoiser's parallel configuration runs: both epochs lie on the two GPUs
 # during the change, the serving Ulysses-2 epoch with a transformer replica
@@ -118,7 +137,7 @@ def _layout(
     model: dict[str, Any] = {
         "id": "model",
         "ranks": ["cuda:0-1"],
-        "queue_depth": 6,
+        "queue_depth": QUEUE_DEPTH,
         "blocks": {
             "transformer": transformer,
             "text_encoder": {"tensor_parallel_size": 2},
@@ -244,7 +263,7 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         # A sleep preempts the request at a step boundary; the wake resumes
         # it from the stored step.
         job = _start_job(server)
-        media.wait_for_job(server, job, _denoised(2), "the job did not denoise")
+        media.wait_for_job(server, job, _denoised(1), "the job did not denoise")
         admin.revision(admin.change(server, {"asleep": True}))
         assert media.job(server, job)["status"] not in ("failed", "completed")
         admin.revision(admin.change(server, {"asleep": False}))
@@ -256,7 +275,7 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         # its drain ends the request at a step boundary and the target
         # continues the trajectory.
         job, update = _change_under_a_denoising_request(
-            server, {"worker_config": {"watchdog_timeout": "6m"}}
+            server, {"worker_config": {"host_queue_depth": 5}}
         )
         assert update["shrink"] is False, update
         media.assert_same_media(

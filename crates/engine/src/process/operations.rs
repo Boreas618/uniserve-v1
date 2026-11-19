@@ -116,8 +116,9 @@ pub(crate) fn at_boundary<T>(
 
 /// Puts the engine to sleep (`docs/admin.md`, `/admin/sleep`): every scheduler drains at once
 /// with its device memory given back, as a drain to another layout does (token requests leave
-/// as migratable and are computed again, video requests at their next denoising step with their
-/// trajectories stored), the head withdraws every segment of the KV planes, and the ranks release
+/// as migratable and are computed again, video requests at the denoising step boundary their
+/// calls in flight end at with their trajectories stored, and one whose steps are all scheduled
+/// runs to its end), the head withdraws every segment of the KV planes, and the ranks release
 /// them and suspend their graph pools. The drained schedulers form no batch until [`wake`].
 ///
 /// # Errors
