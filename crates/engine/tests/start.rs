@@ -13,8 +13,10 @@
 //! place them, a replica on each host, and one replica across both whose products cross between
 //! the two processes.
 //!
-//! No GPU is touched. The Build Server builds the `arrival` module for wasm32 from its installed
-//! snapshot of the workspace, and the engine compiles the module when it loads it.
+//! No GPU is touched, but by one ignored case: an engine of the released Qwen3-30B-A3B on two GPUs
+//! of this host, its kernels and policy from the host's `device-cases` Build Server, that sleeps
+//! and is shut down asleep. Otherwise the Build Server builds the `arrival` module for wasm32 from
+//! its installed snapshot of the workspace, and the engine compiles the module when it loads it.
 #![cfg(test)]
 
 use std::net::TcpListener;
@@ -205,17 +207,18 @@ fn until<T>(
 }
 
 /// An engine process the test plays the daemon of: its two interfaces, after the handshake and
-/// the claim.
+/// the claim, and the daemon's connection the claim lasts for.
 struct Daemon {
     engine: Engine,
     requests: Connection,
     processes: Connection,
+    _claim: storage::ClaimClient,
 }
 
 /// Starts the built `uniserve-engine` with `launch`, written into `directory` and passed as the
 /// inherited descriptor of that file (`proto::LAUNCH_OPTION`), and plays its daemon up to the
-/// claim, which it answers with `storage`: the engine says hello and `Starting` on its request
-/// interface, says hello on its process interface and claims. The process also inherits the
+/// claim, which it makes at `storage` for the engine and answers with: the engine says hello and
+/// `Starting` on its request interface, says hello on its process interface and claims. The process also inherits the
 /// descriptors `inherited` open, as the daemon's supervisor places the sockets it reserved for a
 /// scheduler node.
 fn started(
@@ -293,10 +296,31 @@ fn started(
     let Some(upstream::Kind::Request(request)) = claim.kind else {
         panic!("the engine's first frame on its process interface is no request");
     };
-    assert!(matches!(
-        request.kind,
-        Some(proto::process::request::Kind::Claim(_))
-    ));
+    let Some(proto::process::request::Kind::Claim(claim)) = &request.kind else {
+        panic!("the engine's first request is no claim");
+    };
+
+    // The claim is the daemon's, at the node's Storage Server, for as long as its connection
+    // lasts: what the server holds the storage the engine's processes publish to.
+    let scopes = claim
+        .scopes
+        .iter()
+        .map(|scope| storage::Scope {
+            deployment: claim.deployment.clone(),
+            group: scope.group.clone(),
+            rank: scope.rank,
+        })
+        .collect();
+    let mut claim_client =
+        storage::ClaimClient::connect(&storage.socket, &claim.deployment).unwrap();
+    let token = claim_client
+        .claim(
+            storage::Claimant::Engine(launch.engine),
+            claim.epoch,
+            scopes,
+            claim.retire.clone(),
+        )
+        .unwrap();
     processes
         .deliver(&proto::process::Downstream {
             kind: Some(downstream::Kind::Reply(proto::process::Reply {
@@ -305,7 +329,7 @@ fn started(
                 kind: Some(proto::process::reply::Kind::Claimed(
                     proto::process::Claimed {
                         socket: storage.socket.to_string_lossy().into_owned(),
-                        claim: vec![7; 16],
+                        claim: token.0.to_vec(),
                         tcp: String::new(),
                     },
                 )),
@@ -317,6 +341,7 @@ fn started(
         engine,
         requests,
         processes,
+        _claim: claim_client,
     }
 }
 
@@ -372,6 +397,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
         mut engine,
         mut requests,
         mut processes,
+        _claim: _held,
     } = started(directory.path(), &launch, &storage, &[]);
 
     // The start ends serving: `Serving` with what it serves on the request interface, and the
@@ -446,6 +472,93 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     assert!(status.success(), "the engine exited with {status}");
 
     // The epoch's session is open no more: a head of the epoch opens one again.
+    assert!(!holds_session(&storage, launch.epoch, launch.engine));
+}
+
+/// The deployment whose Build Server serves the kernels and the policy of an engine on a device:
+/// the device cases' (`uniserve build-server serve --deployment device-cases`, which holds the
+/// tree's packages).
+const DEVICE_CASES: &str = "device-cases";
+
+/// The bound of each step of an engine on a device: its start reads and maps the release's
+/// weights and has the Build Server build the kernels its store lacks, its sleep copies the graph
+/// pools to host storage, and its close waits for the devices' work.
+const DEVICE_BOUND: Duration = Duration::from_secs(1800);
+
+/// An engine serving the released Qwen3-30B-A3B at tensor degree 2 on GPUs 0 and 1 that sleeps
+/// and is then shut down ends in order: the sleep gives back its KV cache and suspends its graph
+/// pools, and the shutdown closes every owner of its devices' state, streams included, before
+/// the devices' contexts are reset, so the process exits with status 0 and its session closed
+/// (`docs/admin.md`, Sleep, and wake; `Engine::close`). The driver reads a stream of a reset
+/// context through freed state once another device's context was reset too, so the case takes
+/// two devices; the FP32 fixture has no kernels on a device.
+#[test]
+#[ignore = "needs GPUs 0 and 1, this host's device-cases Build Server and the released Qwen3-30B-A3B"]
+fn an_engine_on_a_device_shut_down_while_asleep_exits_in_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = StorageServer::start();
+    let build_server =
+        build_server::socket(&service::RuntimeDirectory::of_user().unwrap(), DEVICE_CASES).unwrap();
+    let mut launch = launch(directory.path(), &build_server);
+    launch.engine_config.device.device = proto::config::DeviceKind::Cuda;
+    launch.engine_config.model.model = testkit::assets::QWEN3_30B_A3B
+        .snapshot()
+        .to_string_lossy()
+        .into_owned();
+    launch.engine_config.model.max_model_len = 1024;
+    launch.devices = vec![0, 1];
+    let parallel = &mut launch.engine_config.parallel;
+    parallel.tensor_parallel_size = std::num::NonZeroUsize::new(2).unwrap();
+    parallel.worker_groups = vec![WorkerGroupConfig::placed(
+        &["localhost".to_owned()],
+        proto::config::DeviceKind::Cuda,
+        2,
+        2,
+        WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 2),
+    )];
+    // The process interface and the claim stay open until the engine exits, as its daemon's do.
+    let Daemon {
+        mut engine,
+        mut requests,
+        processes: _processes,
+        _claim: _held,
+    } = started(directory.path(), &launch, &storage, &[]);
+
+    // A start on a device captures its graphs and creates its KV cache before it serves.
+    until(&mut requests, DEVICE_BOUND, |kind| match kind {
+        from_engine::Kind::State(state) if state.state == wire::EngineState::Serving as i32 => {
+            Some(())
+        }
+        _ => None,
+    });
+
+    let sleep = wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+        id: 31,
+        change: wire::CacheChange::Sleep as i32,
+        ..Default::default()
+    });
+    requests
+        .deliver(&wire::ToEngine {
+            kind: Some(wire::to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(sleep),
+            })),
+        })
+        .unwrap();
+    let slept = until(&mut requests, DEVICE_BOUND, |kind| match kind {
+        from_engine::Kind::Operated(operated) if operated.id == 31 => Some(operated.error),
+        _ => None,
+    });
+    assert_eq!(slept, "");
+
+    requests
+        .deliver(&wire::ToEngine {
+            kind: Some(wire::to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::Shutdown(wire::Shutdown {})),
+            })),
+        })
+        .unwrap();
+    let status = engine.exited(DEVICE_BOUND);
+    assert!(status.success(), "the engine exited with {status}");
     assert!(!holds_session(&storage, launch.epoch, launch.engine));
 }
 

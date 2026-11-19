@@ -399,7 +399,12 @@ impl Engine {
     /// 4. the session ends ([`Engine::new`]'s `session`), the workers having stopped;
     /// 5. the devices' primary contexts are reset, which releases the driver state the process
     ///    created, when the engine's workers served on devices and nothing else holds the
-    ///    owners of their storage (`docs/architecture.md`, the orderly close).
+    ///    owners of their storage or their streams (`docs/architecture.md`, the orderly close).
+    ///
+    /// A reset leaves every handle of a context's objects dangling, so every owner of device
+    /// state the engine holds ends before it: the counters and the engine's handles of the
+    /// streams they record go with step 1, the workers' and the binding's with step 2. Every
+    /// field is named below, so a field added to the engine is placed in this order too.
     ///
     /// The caller makes no use of a device afterwards: this is the main process's last.
     ///
@@ -420,8 +425,18 @@ impl Engine {
             liveness,
             session,
             counters,
+            streams,
             prepared,
-            ..
+            // What holds no device state: bounds, step values, stamps and descriptions.
+            limits: _,
+            capacities: _,
+            ceilings: _,
+            graphs: _,
+            tuning: _,
+            max_running_requests: _,
+            served: _,
+            kernels: _,
+            video: _,
         } = self;
         let mut outcome: Result<()> = Ok(());
 
@@ -438,8 +453,12 @@ impl Engine {
                 outcome = outcome.and(Err(anyhow::anyhow!("scheduler {index} panicked")));
             }
         }
-        // The counters record the streams the workers issue on, and stop before they close.
+        // The counters record the streams the workers issue on, and stop before they close. The
+        // engine's handles of those streams go with them: each stream is destroyed with its last
+        // handle, the rank's that issues on it, which the worker's close ends below. A handle a
+        // job still holds would outlive the reset, which then waits for the process's exit.
         drop(service::lock(&counters).take());
+        let streams_released = Arc::into_inner(streams).is_some();
 
         // A worker's thread holds its runners, and an expert union's runners reach the other
         // members' workers: every queue closes before any worker is joined.
@@ -471,7 +490,7 @@ impl Engine {
 
         // The weight binding holds the owners of every rank's device storage; a peer's
         // operations thread held it until its link closed.
-        let released = Arc::into_inner(binding).is_some();
+        let released = Arc::into_inner(binding).is_some() && streams_released;
 
         outcome = outcome.and(session().context("ending the session with the buffer pool"));
         drop(head);
@@ -484,8 +503,8 @@ impl Engine {
             outcome = outcome.and(reset.map(drop).context("resetting the devices' contexts"));
         } else if devices {
             tracing::warn!(
-                "the weight binding is still held after the engine closed: the devices' contexts \
-                 are left to the process's exit"
+                "the weight binding or a stream is still held after the engine closed: the \
+                 devices' contexts are left to the process's exit"
             );
         }
         outcome
