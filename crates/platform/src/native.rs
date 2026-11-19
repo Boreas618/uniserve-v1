@@ -13,10 +13,11 @@
 //! (`Kernel::Native { library, entry }`): this module only opens the object
 //! and resolves the symbol with the type the caller declares.
 //!
-//! The library stays loaded while anything holds it and is closed when the
+//! The library's handle is held while anything holds it and closed when the
 //! last owner drops it; the order a generation purge follows (destroy or
 //! rebind the graphs that call it first) is the owner's rule, not this
-//! module's.
+//! module's. The library's code stays mapped until the process exits
+//! ([`NativeLibrary::open`]).
 //!
 //! An object's bytes can be asked what it defines
 //! ([`NativeLibrary::defined_functions`]) and what a named section of it holds
@@ -27,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use libloading::Library;
+use libloading::os::unix;
 use object::read::elf::ElfFile64;
 use object::{Endianness, Object as _, ObjectSection as _, ObjectSymbol as _, SymbolKind};
 
@@ -37,6 +39,14 @@ use crate::{Error, Result};
 /// The library is opened local to this process (`RTLD_LOCAL`), so its
 /// symbols stay out of the process's global namespace: two kernel packages
 /// may export the same entry point without seeing each other's.
+///
+/// It is never unloaded (`RTLD_NODELETE`): a kernel package's object, or a
+/// library it loads such as cuDNN's, may hold a CUDA runtime of its own, linked
+/// statically, which registers with the driver code of the object to run when
+/// a context it used is destroyed. The driver keeps that code's address, so
+/// unmapping the object before the process's contexts are destroyed makes
+/// the destruction (`cuDevicePrimaryCtxReset`, the orderly close's last step)
+/// jump into memory that is no longer mapped.
 pub struct NativeLibrary {
     library: Library,
     path: PathBuf,
@@ -51,20 +61,26 @@ unsafe impl Send for NativeLibrary {}
 unsafe impl Sync for NativeLibrary {}
 
 impl NativeLibrary {
-    /// Opens the shared object at `path`.
+    /// Opens the shared object at `path`, resolving its symbols as they are first called
+    /// (`RTLD_LAZY`), local to this process and never unloaded (`RTLD_NODELETE`, see
+    /// [`NativeLibrary`]): dropping the last owner closes the handle and leaves the object
+    /// mapped, with every library it loaded.
     ///
     /// # Errors
     ///
     /// [`Error::NativeLoad`] when the file cannot be opened.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let flags = unix::RTLD_LAZY | unix::RTLD_LOCAL | libc::RTLD_NODELETE;
         // SAFETY: `dlopen` runs only the library's own initializers.
-        let library = unsafe { Library::new(path) }.map_err(|source| Error::NativeLoad {
-            path: path.to_path_buf(),
-            source: Arc::new(source),
+        let library = unsafe { unix::Library::open(Some(path), flags) }.map_err(|source| {
+            Error::NativeLoad {
+                path: path.to_path_buf(),
+                source: Arc::new(source),
+            }
         })?;
         Ok(Self {
-            library,
+            library: library.into(),
             path: path.to_path_buf(),
         })
     }
@@ -168,6 +184,26 @@ mod tests {
             "{missing}"
         );
         assert_eq!(library.path(), Path::new("libc.so.6"));
+    }
+
+    /// A library stays mapped once its last owner dropped it, as a kernel package's object whose
+    /// CUDA runtime the driver calls back at a context's destruction must. `libutil.so.1` is one
+    /// that nothing else of the test process loads.
+    #[test]
+    fn a_dropped_library_stays_mapped() {
+        let mapped = || {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .contains("/libutil.so.1")
+        };
+        assert!(!mapped(), "the test process maps libutil.so.1 already");
+
+        drop(NativeLibrary::open("libutil.so.1").expect("the C library's libutil loads"));
+
+        assert!(
+            mapped(),
+            "libutil.so.1 was unmapped when its library dropped"
+        );
     }
 
     #[test]
