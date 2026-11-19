@@ -13,7 +13,7 @@ The plugin's options:
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--kernel-device {interpreter,cuda}` | `interpreter` | Where the kernel checks run |
-| `--e2e-devices` | every GPU NVML reports | The GPUs the end-to-end cases may lease, as comma-separated device indices; a case that needs more is skipped |
+| `--e2e-devices` | every GPU NVML reports | The GPUs the end-to-end cases may lease, as comma-separated device indices; a case that needs more is skipped. The run's Build Server sees these GPUs alone, so a run keeps off the host's other GPUs |
 | `--engine` | the tree's engine package | The engine package every test deployment runs, by its backend name |
 | `--serve-config FILE` | none | A TOML file of options every test deployment's `config.toml` states over its own |
 | `--time-scale` | `1` | The factor every wait of an end-to-end case is stretched by |

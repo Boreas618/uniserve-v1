@@ -33,7 +33,7 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -241,7 +241,12 @@ def deployment_config(run: BuildServer, packages: Path) -> dict[str, Any]:
 
 @contextmanager
 def build_server(
-    uniserve: Path, repository: Path, work: Path, *, scale: float = 1.0
+    uniserve: Path,
+    repository: Path,
+    work: Path,
+    *,
+    devices: Sequence[int] | None = None,
+    scale: float = 1.0,
 ) -> Iterator[BuildServer]:
     """A Build Server over a fresh store under `work` (:data:`STORE`), with
     `repository` as its source tree, until the block ends; its deployments'
@@ -255,12 +260,19 @@ def build_server(
     a store kept across runs would answer a changed package with the module
     older source built.
     It serves once it has installed the tree's packages, which the run's
-    deployments then read from its store.
+    deployments then read from its store. With `devices` it sees those GPUs
+    alone (CUDA's device visibility), whose architectures it builds for, and
+    opens no context on the host's other GPUs.
     """  # noqa: D205
     store = work / STORE
     data = work / "deployments"
     data.mkdir(parents=True, exist_ok=True)
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
+    visible = (
+        {"CUDA_VISIBLE_DEVICES": ",".join(map(str, devices))}
+        if devices is not None
+        else {}
+    )
     server = launch(
         [
             str(uniserve),
@@ -276,7 +288,7 @@ def build_server(
             str(store / "modules"),
         ],
         work / "build-server.log",
-        environment(XDG_RUNTIME_DIR=str(runtime)),
+        environment(XDG_RUNTIME_DIR=str(runtime), **visible),
         scale=scale,
     )
     try:
