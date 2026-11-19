@@ -4543,6 +4543,7 @@ mod tests {
             prefix_caching: true,
             host_tier: true,
             copy_budget: 0,
+            synthetic_acceptance_length: None,
         };
         let step = super::Step {
             groups: &groups,

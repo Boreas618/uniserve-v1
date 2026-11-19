@@ -1452,6 +1452,10 @@ pub trait CausalLm {
 ///
 /// Which positions a step evaluates, which drafts it proposes and how a verification accepts
 /// them are execution's: the drafter computes one forward over the rows it is given.
+///
+/// A drafter whose layers route experts the model's expert group splits across ranks runs
+/// them through the exchange its forward is lent, as the model's layers do, and joins the
+/// group's steps it holds no tokens of ([`Self::join_expert_step`]).
 pub trait Drafter: Send + Sync {
     /// The fields of the draft cache its layers read and write, as this rank holds them: fields
     /// of the full history over the drafter's own layers, numbered from zero
@@ -1467,20 +1471,37 @@ pub trait Drafter: Send + Sync {
     /// `state` holds the live buffers of the drafter's layers ([`Self::state_layers`]),
     /// advanced in place, with no checkpoint buffer, no trail and no verify slots; its rows are
     /// the batch's. Execution lends it exactly when the drafter declares a state, and `None`
-    /// otherwise.
+    /// otherwise. `exchange` is lent when the model's routed experts are split across ranks,
+    /// as to [`CausalLm::forward`], and is `None` otherwise.
     ///
     /// # Errors
     ///
-    /// Tensors a module refuses, a stateful drafter run without its state, or a stateless one
-    /// lent a state.
+    /// Tensors a module refuses, a stateful drafter run without its state, a stateless one
+    /// lent a state, or experts split across ranks run without their exchange.
     fn forward(
         &self,
         batch: &TokenBatch,
         cache: &KvCache,
         state: Option<&RecurrentState>,
+        exchange: Option<&ExpertExchange>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> Result<Tensor>;
+
+    /// Runs every expert layer of one drafter forward with no tokens of this rank's own: what
+    /// [`CausalLm::join_expert_step`] is for the model's layers. A drafter whose layers route
+    /// no experts across ranks launches nothing.
+    ///
+    /// # Errors
+    ///
+    /// A drafter that does not state how its layers join a step refuses, so execution serves
+    /// no expert union with it.
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> Result<()> {
+        let _ = exchange;
+        Err(Error::Unsupported(
+            "this drafter states no expert step of its layers to join".to_owned(),
+        ))
+    }
 
     /// The state its layers keep per request slot beside the draft cache, as runs of layers
     /// that keep the same fields ([`crate::family::TextModel::state_layers`]), in the order

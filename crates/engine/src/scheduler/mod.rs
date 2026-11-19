@@ -254,7 +254,7 @@ pub struct GraphLimits {
 
 /// What one step may assemble (`specs/configuration.md` §7, step values): the step values of the
 /// snapshot the step began with, lowered to what the groups' workers captured.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Budget {
     /// The configuration revision the values are of, which the step's batches name.
     pub(crate) revision: u64,
@@ -273,6 +273,9 @@ pub(crate) struct Budget {
     /// The bytes the copies started with each of the step's batches move together over the
     /// batch's group, which the batch carries to every rank.
     pub(crate) copy_budget: u64,
+    /// The mean tokens a verification of the step commits under synthetic acceptance, which each
+    /// of the step's batches carries to its ranks; `None` accepts what the model selects.
+    pub(crate) synthetic_acceptance_length: Option<f64>,
 }
 
 impl Budget {
@@ -307,6 +310,7 @@ impl Budget {
             prefix_caching: tuning.prefix_caching,
             host_tier: tuning.host_tier,
             copy_budget: tuning.copy_budget,
+            synthetic_acceptance_length: tuning.synthetic_acceptance_length,
         }
     }
 }

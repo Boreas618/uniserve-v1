@@ -469,19 +469,26 @@ impl Request {
 
     /// Whether a token that [`Request::check_stop`] judged `stop` is sent to the daemon
     /// (`S/output.rs:862-893`): every token that continues the request; a stop token only with
-    /// `include_stop_token`; any other token that ends it unless it is one of `eos`.
+    /// `include_stop_token`; any other token that ends it unless it is one of `eos` the request
+    /// does not ignore. A request that ignores `eos` generates them as any other token, so
+    /// the one its token limit ends it on is published as well: every token it counts reaches
+    /// the daemon, with its scores.
     pub(crate) fn publishes(
         &self,
         token: u32,
         stop: Option<&(FinishReason, Option<StopReason>)>,
         eos: &[u32],
     ) -> bool {
+        let generation = self.generation();
         match stop {
             None => true,
-            Some((_, Some(StopReason::Token(_)))) => self
-                .generation()
-                .is_some_and(|request| request.include_stop_token),
-            Some(_) => !eos.contains(&token),
+            Some((_, Some(StopReason::Token(_)))) => {
+                generation.is_some_and(|request| request.include_stop_token)
+            }
+            Some(_) => {
+                let ignored = generation.is_some_and(|request| request.sampling.ignore_eos);
+                ignored || !eos.contains(&token)
+            }
         }
     }
 
@@ -1221,6 +1228,12 @@ mod tests {
         generate(&mut request, &[9]);
         assert!(request.publishes(9, stop.as_ref(), &[EOS]));
         assert_eq!(request.check_stop(EOS, &[EOS]), None, "ignored");
+
+        // An ignored end-of-sequence token is generated as any other, the one the token limit
+        // ends the request on included.
+        generate(&mut request, &[5, 6, 7]);
+        assert_eq!(request.check_stop(EOS, &[EOS]), limit);
+        assert!(request.publishes(EOS, limit.as_ref(), &[EOS]));
     }
 
     /// The credit covers the bound of every call in flight, the terminal's reserve and the next

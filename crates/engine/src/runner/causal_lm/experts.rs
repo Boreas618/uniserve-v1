@@ -27,7 +27,10 @@
 //! The expert work of a graph is shaped for the rows per member its step holds. A bucket is
 //! therefore captured once per capacity class ([`classes`]), and a step runs the smallest
 //! class that holds the agreed capacity. The transport reads the exact capacity from device
-//! memory, where [`Member::write`] puts it ahead of the step's first launch.
+//! memory, where [`Member::write`] puts it ahead of the step's first launch. A speculating
+//! member's step is two graphs, the target's and the drafter's behind it, both at the class
+//! the agreement chose: the step's exchanges are the target's expert layers and then the
+//! drafter's, once per drafter forward, and a member's join runs as many.
 //!
 //! ## The exchange
 //!
@@ -62,42 +65,59 @@ use crate::worker::{Error, Result};
 /// What submits a join batch to the worker of every other member of the union.
 pub(crate) type JoinHook = Arc<dyn Fn(Batch) -> Result<()> + Send + Sync>;
 
-/// The buckets of a member of an expert union: each bucket of `buckets`, and the join,
-/// captured for the step capacities it meets, of which `capacity` is the largest.
+/// The buckets of a member of an expert union: each bucket of `buckets`, with a speculating
+/// member's verification and drafter buckets (`Buckets::with_drafts`), and the join, captured
+/// for the step capacities it meets, of which `capacity` is the largest.
 ///
-/// When every member decodes, a step holds at most the largest decode bucket's rows, which
-/// the smallest class holds. A decode beside another member's prefill of a few prompts takes
+/// When every member decodes, a step holds at most the largest decode bucket's rows, or the
+/// largest verification bucket's tokens of a speculating union, which the smallest class
+/// holds. A decode or a verification beside another member's prefill of a few prompts takes
 /// the middle class of `beside` rows (`moe_config.beside_rows`), and a step another member
 /// fills with a large prefill takes the class of the whole capacity. One class for every step
 /// would shape each decode's expert work for the largest prefill any member could send. A
 /// class within a quarter of the whole capacity is not captured: the smaller shape would save
-/// little.
+/// little. A drafter's bucket replays behind the bucket it follows, at the class the step
+/// agreed for both, so it is captured at that bucket's classes.
 pub(crate) fn classes(buckets: &Buckets, capacity: u32, beside: u32) -> Buckets {
+    let steps = |variant: Variant| variant.is_decode() || super::verifies(variant);
     let decode = buckets
         .iter()
-        .filter(|bucket| bucket.variant.is_decode())
-        .map(|bucket| bucket.rows)
+        .filter(|bucket| steps(bucket.variant))
+        .map(|bucket| bucket.tokens)
         .max()
         .unwrap_or(1);
 
-    let stated = buckets
-        .iter()
-        .copied()
-        .chain(std::iter::once(Bucket::expert_join()));
-
-    Buckets::new(stated.flat_map(|bucket| {
+    // The capacities a bucket that a step of its own serves is captured at.
+    let capacities = |bucket: &Bucket| {
         let small = bucket.tokens.max(decode).min(capacity);
-        let mut classes = vec![bucket.at_capacity(capacity)];
+        let mut classes = vec![capacity];
 
         if small.saturating_mul(4) <= capacity {
-            classes.push(bucket.at_capacity(small));
+            classes.push(small);
         }
 
-        let decodes = bucket.variant.is_decode() || bucket.variant == Variant::ExpertJoin;
+        let decodes = steps(bucket.variant) || bucket.variant == Variant::ExpertJoin;
         if decodes && small < beside && beside.saturating_mul(4) <= capacity {
-            classes.push(bucket.at_capacity(beside));
+            classes.push(beside);
         }
         classes
+    };
+
+    let targets = buckets
+        .iter()
+        .copied()
+        .filter(|bucket| bucket.variant != Variant::Draft)
+        .chain(std::iter::once(Bucket::expert_join()));
+
+    Buckets::new(targets.flat_map(|target| {
+        let drafter = Bucket::draft(target.rows, target.tokens);
+        let followed = buckets.contains(&drafter).then_some(drafter);
+
+        capacities(&target).into_iter().flat_map(move |class| {
+            std::iter::once(target)
+                .chain(followed)
+                .map(move |bucket| bucket.at_capacity(class))
+        })
     }))
 }
 

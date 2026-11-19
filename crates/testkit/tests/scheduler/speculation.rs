@@ -200,6 +200,87 @@ fn a_verification_commits_the_drafts_its_samples_confirm_and_the_token_after_the
     assert!(verifications.len() < 19, "drafts save calls");
 }
 
+/// A request that ignores the end-of-sequence token and asks for logprobs generates exactly its
+/// token limit, each token sent with its scores, when the verification that reaches the limit
+/// commits an end-of-sequence token as the last one it may: the client is sent every token the
+/// request counts, the ignored token included.
+#[test]
+fn a_verification_that_ends_a_request_on_an_ignored_eos_sends_every_token_and_its_scores() {
+    use crate::harness::EOS;
+
+    let mut harness = Deployment::tokens().speculative(DRAFTS).build();
+    let mut request = token(1, 6, 1 + DRAFTS as usize + 1);
+    request.sampling.ignore_eos = true;
+    request.sampling.n_logprobs = 1;
+
+    // The prompt samples 5 and proposes two drafts, which the verification accepts, then
+    // samples the end-of-sequence token at the request's last position.
+    let id = harness.submit(request);
+    harness.sample(id, &[5, EOS]);
+    harness.settle(200);
+
+    assert!(
+        verifications(&harness, id)
+            .iter()
+            .any(|(_, drafts)| drafts.len() == DRAFTS as usize),
+        "{:?}",
+        verifications(&harness, id)
+    );
+    let tokens = harness.tokens(id);
+    assert_eq!(tokens.len(), 1 + DRAFTS as usize + 1, "{tokens:?}");
+    assert_eq!(tokens.last(), Some(&EOS));
+
+    let scored: Vec<u32> = harness
+        .events(id)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::TokenLogprobs { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(scored, tokens);
+    assert!(
+        matches!(
+            harness.terminal(id),
+            Some(Event::Finished { completion_tokens, .. }) if completion_tokens == tokens.len()
+        ),
+        "{:?}",
+        harness.terminal(id)
+    );
+}
+
+/// The synthetic acceptance length is a step value: every batch a step assembles carries the
+/// length of the step values the step began with to its ranks, from the step after a change on,
+/// and a batch of no stated length accepts what the model selects (SD §7.1, step values).
+#[test]
+fn every_batch_carries_the_synthetic_acceptance_length_of_its_step() {
+    let mut harness = Deployment::tokens().speculative(DRAFTS).build();
+    drafter(&harness, 2);
+    let lengths = |harness: &Harness, id: RequestId| -> Vec<Option<f64>> {
+        let batches = harness.batches_of(id).into_iter();
+        batches
+            .map(|batch| batch.columns.synthetic_acceptance_length)
+            .collect()
+    };
+
+    harness.tune(|tuning| tuning.synthetic_acceptance_length = Some(2.5));
+    let stated = harness.submit(token(1, 6, 20));
+    harness.settle(200);
+    let carried = lengths(&harness, stated);
+    assert!(!carried.is_empty());
+    assert!(
+        carried.iter().all(|length| *length == Some(2.5)),
+        "{carried:?}"
+    );
+
+    harness.tune(|tuning| tuning.synthetic_acceptance_length = None);
+    let unstated = harness.submit(token(2, 6, 20));
+    harness.settle(200);
+    let carried = lengths(&harness, unstated);
+    assert!(!carried.is_empty());
+    assert!(carried.iter().all(Option::is_none), "{carried:?}");
+}
+
 /// A deployment whose token groups verify in place of decoding, as a speculating rank states
 /// them, serves token requests: the workers serve understanding when they serve a prefill and
 /// token progress, and a verification is a speculating deployment's token progress (SD §7.2, the

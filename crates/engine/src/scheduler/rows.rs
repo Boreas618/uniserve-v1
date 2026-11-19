@@ -520,9 +520,10 @@ impl Scheduler {
         })
     }
 
-    /// Completes a batch the step formed: stamps the generation it is assembled for, orders its
-    /// new slots, states the shape that selects its bucket, and checks it ([`Batch::check`]).
-    /// The batch's number is the one it was formed with.
+    /// Completes a batch the step formed: stamps the generation it is assembled for and the
+    /// step values its ranks read with it, orders its new slots, states the shape that selects
+    /// its bucket, and checks it ([`Batch::check`]). The batch's number is the one it was formed
+    /// with.
     ///
     /// The shape's rows and tokens are the batch's own. A prefill or refill batch is served by
     /// the scoring variant when a row scores its prompt, by the writing one when no row samples,
@@ -540,6 +541,7 @@ impl Scheduler {
         batch.policy = self.generations.policy();
         batch.revision = self.budget.revision;
         batch.copy_budget = self.budget.copy_budget;
+        batch.columns.synthetic_acceptance_length = self.budget.synthetic_acceptance_length;
         batch.new_slots.sort_unstable_by_key(|new| new.slot);
         if let Some(shape) = self.shape(batch) {
             batch.shape = shape;

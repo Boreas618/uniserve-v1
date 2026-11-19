@@ -22,6 +22,7 @@
 //! positions, computed once per forward, and may hold more than one spectrum (a text batch and
 //! an image batch of a Qwen3.5 model turn by different spectra of the same rotary width).
 
+use nn::causal_lm::MoeConfig;
 use nn::family::{ExpertOrder, TextPlacement};
 use nn::functional::Rounding;
 use nn::modules::{
@@ -100,23 +101,25 @@ impl DecoderLayer {
     /// states: its rank of the tensor-parallel group, its attention exchanging its rows over the
     /// Ulysses sequence split ([`nn::family::SequenceSplit::WHOLE`] for none).
     ///
-    /// `linear` loads a gated delta network as the mixer in place of attention. `routed` loads
-    /// routed experts (and the shared expert the configuration states) in place of the dense
+    /// `linear` loads a gated delta network as the mixer in place of attention. `experts` loads
+    /// the routed experts it states (and the shared expert it states) in place of the dense
     /// MLP, held at the placement's share of them (its window of the expert group's slots, or
-    /// of the tensor group's when that group holds whole experts). `stack` is the layer's index
+    /// of the tensor group's when that group holds whole experts): the configuration's own for
+    /// a layer of the model's stack, the drafter's for its layer, whose checkpoint may store
+    /// its experts in another layout ([`Config::mtp_experts`]). `stack` is the layer's index
     /// in the model's own decoder stack and the deployment's expert order, which name its routed
     /// block and its slots ([`nn::causal_lm::MoeConfig::block`]); `None` for a layer outside the
     /// stack, which holds its experts in the checkpoint's order.
     ///
     /// # Errors
     ///
-    /// A linear layer or a routed layer of a configuration that states neither network, a
-    /// module the loader refuses, or a split that does not divide what it shards.
+    /// A linear layer of a configuration that states no gated delta network, a module the
+    /// loader refuses, or a split that does not divide what it shards.
     pub fn load(
         config: &Config,
         vb: VarBuilder<'_, '_>,
         linear: bool,
-        routed: bool,
+        experts: Option<&MoeConfig>,
         placement: &TextPlacement,
         stack: Option<(u32, &ExpertOrder)>,
     ) -> Result<Self> {
@@ -171,11 +174,7 @@ impl DecoderLayer {
             (Some(Attention::load(&attention, vb.pp("self_attn"))?), None)
         };
 
-        let (mlp, routed_experts, shared_expert) = if routed {
-            let moe = config
-                .moe
-                .as_ref()
-                .ok_or_else(|| refuse("routed experts"))?;
+        let (mlp, routed_experts, shared_expert) = if let Some(moe) = experts {
             let block = moe.block(text.hidden_size, text.hidden_act, placement, stack);
             let shared = match moe.shared_expert_intermediate_size {
                 Some(intermediate) => Some(SharedExpert::load(

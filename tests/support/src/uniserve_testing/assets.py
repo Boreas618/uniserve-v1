@@ -81,6 +81,11 @@ CHECKPOINTS: dict[str, Checkpoint] = {
     "qwen3.6": Checkpoint(
         "Qwen/Qwen3.6-35B-A3B", "345d467b117d1fd5eda9b879a5988de9ae5f47a7"
     ),
+    # Qwen3.5-MoE in BF16, whose checkpoint carries a multi-token-prediction
+    # drafter: the speculation cases' model.
+    "qwen3.5": Checkpoint(
+        "Qwen/Qwen3.5-35B-A3B", "59d61f3ce65a6d9863b86d2e96597125219dc754"
+    ),
     # The same model's files with other weight values, which a weight
     # update moves a deployment to.
     "qwen3-other-weights": Checkpoint(

@@ -548,6 +548,7 @@ fn qwen3_6_profiles_its_buckets_its_drafter_and_its_tower() {
                 &batch(phase, rows, tokens, row_pages),
                 &cache,
                 None,
+                None,
                 &rows_of(),
                 &rows_of(),
             )

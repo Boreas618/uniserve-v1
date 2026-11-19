@@ -876,6 +876,7 @@ fn the_drafter_is_the_references() {
                 &step.batch,
                 &step.cache,
                 None,
+                None,
                 &embedded,
                 &vector(&vectors, "mtp.streams")
             )
@@ -886,6 +887,7 @@ fn the_drafter_is_the_references() {
             &step.batch,
             &step.cache,
             Some(&step.state),
+            None,
             &embedded,
             &vector(&vectors, "mtp.streams"),
         )
@@ -984,6 +986,7 @@ fn the_drafter_over_two_rounds_is_the_references() {
                     &batch,
                     &cache,
                     Some(&state),
+                    None,
                     &pick(&embedded),
                     &pick(&streams),
                 )
