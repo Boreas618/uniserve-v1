@@ -7,7 +7,10 @@
 //!   and the Qwen3-VL encoder and vision tower;
 //! - [`qwen4_exp`]: Qwen3.8 Flash Next (`Qwen4ExpForConditionalGeneration`), which shares the
 //!   vision tower and the configuration readers of [`qwen3`];
-//! - [`minimax_h3`]: MiniMax-H3 and FastH3, whose text encoder is [`qwen3`]'s Qwen3-VL model.
+//! - [`minimax_h3`]: MiniMax-H3 and FastH3, whose text encoder is [`qwen3`]'s Qwen3-VL model;
+//! - [`deepseek_v41`]: what DeepSeek-V4.1's hyper-connected residual and its n-gram memories read
+//!   from a checkpoint (its configuration and its n-gram hashing); the family is not registered
+//!   yet.
 //!
 //! The development feature `fixtures` adds the module `fixtures`, the paths of the tiny
 //! checkpoints this crate's tests hold, for the tests of the crates that serve them.
@@ -15,6 +18,7 @@
 //! A family owns no device, stream, buffer, scheduler or request state (`AGENTS.md`, Model
 //! Library Boundary): the crate depends on `nn`, the tensor library and `processing` only.
 
+pub mod deepseek_v41;
 #[cfg(feature = "fixtures")]
 pub mod fixtures;
 pub mod minimax_h3;

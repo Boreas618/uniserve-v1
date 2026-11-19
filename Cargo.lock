@@ -4022,9 +4022,11 @@ dependencies = [
  "processing",
  "proto",
  "serde_json",
+ "sha2",
  "tempfile",
  "tensor",
  "thiserror 2.0.18",
+ "tokenizers",
 ]
 
 [[package]]

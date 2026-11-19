@@ -18,6 +18,9 @@ processing.workspace = true
 proto.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The tokenizer a checkpoint ships, whose tokens DeepSeek-V4.1's n-gram memories normalize at
+# load with the tokenizer library's own normalizers, as the reference does.
+tokenizers.workspace = true
 
 # The integration tests' checkpoints, fixtures, released checkpoints and meta forwards
 # (`crates/nn/testing`), and the temporary directories they write tiny checkpoints into. The
@@ -26,6 +29,8 @@ thiserror.workspace = true
 [dev-dependencies]
 nn-testing.workspace = true
 ops.workspace = true
+# The digest of DeepSeek-V4.1's normalized vocabulary, which its reference fixture states.
+sha2.workspace = true
 tempfile.workspace = true
 
 [features]
