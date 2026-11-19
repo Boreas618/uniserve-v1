@@ -214,7 +214,15 @@ def rotated(rows, inv_freq, ratio):
     turned = torch.stack(
         (even * cos - odd * sin, odd * cos + even * sin), dim=-1
     )
-    terms = torch.stack(((even * cos).abs() + (odd * sin).abs(),) * 2, dim=-1)
+    # Each turned value's own two terms: the even one's `even · cos` and
+    # `odd · sin`, the odd one's `odd · cos` and `even · sin`.
+    terms = torch.stack(
+        (
+            (even * cos).abs() + (odd * sin).abs(),
+            (odd * cos).abs() + (even * sin).abs(),
+        ),
+        dim=-1,
+    )
     wide[:, -2 * pairs :] = turned.reshape(-1, 2 * pairs)
     spread = torch.zeros_like(wide)
     spread[:, -2 * pairs :] = terms.reshape(-1, 2 * pairs)

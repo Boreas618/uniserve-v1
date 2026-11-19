@@ -127,16 +127,15 @@ def _index_scores_kernel(
         live = column < columns
         block = tl.load(
             candidates + token * blocks + column // CANDIDATES, mask=live, other=-1
-        ).to(tl.int64)
-        group = block * CANDIDATES + column % CANDIDATES
-        valid = live & (block >= 0)
+        )
+        named = block.to(tl.int64) * CANDIDATES + column % CANDIDATES
+        valid = live & (block >= 0) & (named < seen) & (named < groups_of_table)
+        group = tl.where(valid, named, 0)
     else:
         columns = groups_of_table
         live = column < columns
-        group = column
-        valid = live
-    valid = valid & (group < seen) & (group < groups_of_table)
-    group = tl.where(valid, group, 0)
+        valid = live & (column < seen)
+        group = tl.where(valid, column, 0)
 
     page = tl.load(page_table + row * max_pages + group // GROUPS, mask=valid, other=0)
     page = page.to(tl.int64)

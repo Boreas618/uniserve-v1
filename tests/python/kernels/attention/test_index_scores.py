@@ -352,10 +352,13 @@ def test_the_key_the_operator_prints_compiles_the_case(
 
 #: Decode rows at the model's shapes: 32 heads of 128 over MXFP4 keys of 64
 #: groups a page, weighted and rounded: the rows of a step against a short
-#: context, and a few rows against a context of 2^20 groups.
+#: context, a few rows against a context of 2^20 groups, and rows restricted
+#: to 2048 candidate blocks of 8 groups, as the indexers after a candidate
+#: source score: `(tokens, max_pages, candidate block)`.
 MODEL_ROWS = {
-    "256 rows over 4096 groups": (256, 64),
-    "two rows over 2^20 groups": (2, 16384),
+    "256 rows over 4096 groups": (256, 64, 0),
+    "two rows over 2^20 groups": (2, 16384, 0),
+    "32 rows inside 2048 candidate blocks of 8": (32, 512, 8),
 }
 
 
@@ -364,8 +367,8 @@ MODEL_ROWS = {
 def test_the_model_shapes_score_within_the_bound(
     name, torch_device, stated_launch, launch_target
 ):
-    tokens, max_pages = MODEL_ROWS[name]
-    case = ("mxfp4", True, True, 0, tokens, 32, 64, max_pages, 256, 6)
+    tokens, max_pages, block = MODEL_ROWS[name]
+    case = ("mxfp4", True, True, block, tokens, 32, 64, max_pages, 256, 6)
     stated = stated_launch("index_scores", key(case), launch_target)
     generator = torch.Generator().manual_seed(case[-1])
     built = operands(case, generator)
