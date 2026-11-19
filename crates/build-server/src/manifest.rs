@@ -5,6 +5,7 @@
 //! what is particular to the package:
 //!
 //! - the operator and backend names, and the interface version it implements;
+//! - for the engine, the vocabulary of the operators it launches;
 //! - the kind of source (a Triton kernel with its launch table, CUDA C++ with
 //!   its declared compilation or a build module, CuTe DSL with a build module,
 //!   a vendor cubin, a crate cargo builds, an executable);
@@ -715,6 +716,56 @@ fn admits_bits(bits: u32, text: &str) -> bool {
         && (digits == "0" || !digits.starts_with('0'))
 }
 
+/// The operators the vocabulary at `path` names, in its order ([`Manifest::operators`]).
+///
+/// The vocabulary is a TOML table of the one key `operators`, an array of names. A name is a
+/// lowercase ASCII letter followed by lowercase letters, digits and `_`, so it is one path
+/// segment of the module store, and each name is listed once. The engine's build compiles the
+/// same file by the same rules (`crates/proto/build.rs`).
+///
+/// # Errors
+///
+/// Fails when the file cannot be read, is no such table, or names an operator by no such name or
+/// twice.
+pub fn read_operators(path: &Path) -> Result<Vec<String>, ManifestError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Vocabulary {
+        operators: Vec<String>,
+    }
+
+    let text = std::fs::read_to_string(path).map_err(|source| ManifestError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let vocabulary: Vocabulary = toml::from_str(&text).map_err(|source| ManifestError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    let mut listed = std::collections::BTreeSet::new();
+    for name in &vocabulary.operators {
+        let spelled = name.starts_with(|first: char| first.is_ascii_lowercase())
+            && name
+                .chars()
+                .all(|char| char.is_ascii_lowercase() || char.is_ascii_digit() || char == '_');
+        if !spelled {
+            return Err(ManifestError::Invalid(format!(
+                "{}: `{name}` is no operator name: a lowercase letter, then lowercase letters, \
+                 digits and `_`",
+                path.display()
+            )));
+        }
+        if !listed.insert(name.as_str()) {
+            return Err(ManifestError::Invalid(format!(
+                "{}: `{name}` is listed twice",
+                path.display()
+            )));
+        }
+    }
+    Ok(vocabulary.operators)
+}
+
 /// The kernel package a package provides: the architectures it supports and
 /// the descriptors it covers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -750,6 +801,19 @@ pub struct Manifest {
     pub op: String,
     /// The backend's name, which the configuration field selects.
     pub backend: String,
+    /// The vocabulary of the operators whose kernel packages the package launches: a file of the
+    /// package's snapshot that names them ([`read_operators`]), by its path relative to the root
+    /// of the workspace for a package cargo builds, whose snapshot is its workspace, and to the
+    /// package's directory for any other. Every engine package states it, and no other package
+    /// does.
+    ///
+    /// The tree's engine executable compiles its operators' names from that same file
+    /// (`proto::module::operator`), so the vocabulary an installed revision's snapshot holds is
+    /// the one the revision launches. The Build Server reads it from the snapshot, lists it with
+    /// the revision, and the daemon fixes an epoch's kernel packages over the vocabulary of the
+    /// epoch's engine revision and refuses a `[kernels]` pin of an operator outside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operators: Option<String>,
     /// The version of the interface the package implements: its operator's
     /// descriptor and argument layout, or the scheduling policy's decisions.
     /// Versions start at 1 and an interface raises its own with any change
@@ -803,6 +867,8 @@ pub struct Manifest {
 struct Declared {
     op: String,
     backend: String,
+    #[serde(default)]
+    operators: Option<String>,
     #[serde(default)]
     interface_version: Option<NonZeroU32>,
     #[serde(default)]
@@ -858,6 +924,7 @@ impl TryFrom<Declared> for Manifest {
         Ok(Manifest {
             op: declared.op,
             backend: declared.backend,
+            operators: declared.operators,
             interface_version: declared.interface_version,
             priority: declared.priority,
             toolchain,
@@ -896,6 +963,19 @@ impl Manifest {
         Ok(manifest)
     }
 
+    /// The name of the package's operator vocabulary ([`Self::operators`]) among the files of its
+    /// snapshot, and so inside each of its installed revisions: below the snapshot's workspace
+    /// ([`crate::snapshot::WORKSPACE`]) for a package cargo builds, and the stated path for any
+    /// other. `None` for a package that names none.
+    pub fn operators_file(&self) -> Option<String> {
+        let path = self.operators.as_ref()?;
+        Some(if self.source.kind.builds_with_cargo() {
+            format!("{}/{path}", crate::snapshot::WORKSPACE)
+        } else {
+            path.clone()
+        })
+    }
+
     /// An executable module's entry: the file its process runs as, which `[source] binary`
     /// names (the binary a cargo source builds, or the file of an executable source that is
     /// the executable); `None` for every other form.
@@ -911,6 +991,37 @@ impl Manifest {
             return Err(ManifestError::Invalid(
                 "the operator and backend names must not be empty".into(),
             ));
+        }
+        // The engine is the one package that launches kernel packages, so it alone names the
+        // vocabulary of the operators it launches, a file inside its snapshot.
+        match (self.op == proto::module::ENGINE, self.operators.as_deref()) {
+            (true, None) => {
+                return Err(ManifestError::Invalid(
+                    "an engine package names the vocabulary of the operators it launches in \
+                     `operators`, a file of its snapshot"
+                        .into(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(ManifestError::Invalid(format!(
+                    "only an engine package names the operators it launches: a {} package \
+                     states no `operators`",
+                    self.op
+                )));
+            }
+            (true, Some(path))
+                if path.is_empty()
+                    || !Path::new(path)
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))) =>
+            {
+                return Err(ManifestError::Invalid(format!(
+                    "`operators` names {path:?}: a file by its path inside the package, \
+                     relative to its workspace's root for a package cargo builds and to its \
+                     directory otherwise"
+                )));
+            }
+            (true, Some(_)) | (false, None) => {}
         }
         match (self.source.kind, self.interface_version) {
             (SourceKind::Cargo, Some(_)) => {
@@ -1096,6 +1207,13 @@ impl Manifest {
             .chain(self.source.cubin.iter())
             .chain(self.source.metadata.iter())
             .chain(self.tuning.iter())
+            // A cargo package's vocabulary is a file of its workspace, which the installation
+            // finds in the snapshot; any other package's lies in its own directory.
+            .chain(
+                self.operators
+                    .iter()
+                    .filter(|_| !self.source.kind.builds_with_cargo()),
+            )
             .cloned()
             .collect();
         if self.has_build_module() {

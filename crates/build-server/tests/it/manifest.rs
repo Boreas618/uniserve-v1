@@ -867,14 +867,15 @@ warps = 4
 }
 
 /// The manifest of an engine package with the `[source]` lines `source` and
-/// the `kernel` section: it states neither its interface version, which its
-/// executable states, nor its compiler release, which its workspace's
-/// `rust-toolchain.toml` selects.
+/// the `kernel` section: it names the vocabulary of the operators it launches,
+/// and states neither its interface version, which its executable states, nor
+/// its compiler release, which its workspace's `rust-toolchain.toml` selects.
 fn cargo(source: &str, kernel: &str) -> String {
     format!(
         r#"
 op = "engine"
 backend = "uniserve"
+operators = "crates/proto/src/module/operators.toml"
 
 [source]
 kind = "cargo"
@@ -927,6 +928,84 @@ fn a_cargo_package_states_no_interface_version_and_no_compiler_release() {
     let released = format!("{}\n[toolchain]\nversion = \"1.99.1\"\n", cargo(binary, ""));
     let error = load(&released, &[]).unwrap_err();
     assert!(error.contains("version"), "{error}");
+}
+
+/// The engine names the vocabulary of the operators it launches, a file inside its snapshot,
+/// and no other package names one: the operators an epoch fixes kernel packages for are the
+/// engine revision's.
+#[test]
+fn only_an_engine_package_names_its_operator_vocabulary_inside_its_workspace() {
+    let binary = r#"binary = "uniserve-engine""#;
+    let manifest = load(&cargo(binary, ""), &[]).unwrap();
+    assert_eq!(
+        manifest.operators.as_deref(),
+        Some("crates/proto/src/module/operators.toml")
+    );
+
+    let stated = r#"operators = "crates/proto/src/module/operators.toml""#;
+    let unstated = cargo(binary, "").replace(&format!("{stated}\n"), "");
+    let error = load(&unstated, &[]).unwrap_err();
+    assert!(error.contains("`operators`"), "{error}");
+    for outside in ["../operators.toml", "/operators.toml", ""] {
+        let named = cargo(binary, "").replace(stated, &format!("operators = {outside:?}"));
+        let error = load(&named, &[]).unwrap_err();
+        assert!(error.contains("inside the package"), "{error}");
+    }
+
+    let kernel = REASONABLE.replace(
+        "backend = \"triton\"\n",
+        &format!("backend = \"triton\"\n{stated}\n"),
+    );
+    let error = load(&kernel, &["src/rms_norm.py", "tuning/tactics.json"]).unwrap_err();
+    assert!(error.contains("only an engine package"), "{error}");
+}
+
+/// Every engine package of the tree, the engine and the sanitizer suite's `memcheck` package
+/// that runs it, names the vocabulary the tree's engine is compiled with, as a file its snapshot
+/// holds: an installation of either lists exactly the operators the executable launches.
+#[test]
+fn the_tree_s_engine_packages_name_the_vocabulary_the_engine_is_compiled_with() {
+    let repository = crate::support::repository();
+    let engine = Manifest::load(&repository.join("crates/engine")).unwrap();
+    let path = repository.join(engine.operators.as_deref().unwrap());
+    assert_eq!(
+        build_server::manifest::read_operators(&path).unwrap(),
+        proto::module::operator::ALL
+    );
+
+    let sanitizer = repository.join("tests/python/sanitizer");
+    let memcheck = Manifest::load(&sanitizer).unwrap();
+    let path = sanitizer.join(memcheck.operators_file().unwrap());
+    assert_eq!(
+        build_server::manifest::read_operators(&path).unwrap(),
+        proto::module::operator::ALL
+    );
+}
+
+/// A vocabulary names each operator once, by a name that is one store path segment, and the
+/// names come back in the order it lists them.
+#[test]
+fn a_vocabulary_names_each_operator_once_by_a_store_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let read = |text: &str| {
+        let path = directory.path().join("operators.toml");
+        fs::write(&path, text).unwrap();
+        build_server::manifest::read_operators(&path).map_err(|error| error.to_string())
+    };
+
+    assert_eq!(
+        read("operators = [\"rms_norm\", \"gemm\", \"activation1d\"]\n").unwrap(),
+        ["rms_norm", "gemm", "activation1d"]
+    );
+    for (text, refused) in [
+        ("operators = [\"rms_norm\", \"rms_norm\"]\n", "twice"),
+        ("operators = [\"RmsNorm\"]\n", "no operator name"),
+        ("operators = [\"rms/norm\"]\n", "no operator name"),
+        ("operators = []\nversion = 2\n", "version"),
+    ] {
+        let error = read(text).unwrap_err();
+        assert!(error.contains(refused), "{text}: {error}");
+    }
 }
 
 /// A scheduling policy: a crate cargo builds for wasm32, which fills the
