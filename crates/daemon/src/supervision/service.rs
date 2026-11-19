@@ -63,7 +63,7 @@ pub(crate) struct Stop {
 }
 
 impl Stop {
-    fn requested(&self) -> bool {
+    pub(crate) fn requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
 

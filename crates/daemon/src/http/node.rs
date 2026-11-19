@@ -59,7 +59,7 @@ use crate::policy::revision::{KEPT, Outcome, Record, Revisions};
 use crate::programs::{Current, Output, Programs, States};
 use crate::restart::Restarter;
 use crate::status::{self, NodeState};
-use crate::supervision::Daemon;
+use crate::supervision::{Daemon, Starting};
 use crate::updates::change::Applied;
 
 /// The writer a revision records for the package a node started with.
@@ -389,6 +389,12 @@ impl Node {
         package: Package,
         join: Option<(::service::Listener, ::service::Endpoint)>,
     ) -> Result<()> {
+        // A node stopped before its deployment's start began starts nothing and writes no
+        // revision; one stopped later abandons the start where it is (`Node::bring_up`).
+        if self.shutdown.is_cancelled() {
+            info!("the node stopped before its deployment started");
+            return Ok(());
+        }
         let began = Instant::now();
         let current = self.revisions.current()?;
         let stored = current
@@ -610,12 +616,13 @@ impl Node {
             listener
         });
         // The leader's start waits for the other nodes to join, which blocks.
-        let starting = tokio::task::spawn_blocking(move || Daemon::start(options, join));
-        let daemon = tokio::select! {
-            daemon = starting => daemon
-                .context("the daemon's start did not complete")?
-                .context("failed to start the deployment's daemon")?,
-            () = token.cancelled() => return Ok(None),
+        let start =
+            Starting::new(options, join).context("failed to start the deployment's daemon")?;
+        let Some(daemon) = start_daemon(start, &token)
+            .await
+            .context("failed to start the deployment's daemon")?
+        else {
+            return Ok(None);
         };
         let address = daemon
             .address()
@@ -1584,6 +1591,34 @@ async fn finish(
         return stopped.and(retired);
     }
     stopped
+}
+
+/// Runs the daemon's `start` until its service runs, or until `token` is cancelled: the stop
+/// then ends the start where it waits (for the deployment's other nodes on the leader, for the
+/// leader's welcome on a member), and this returns `None` once the start's thread ended, after a
+/// daemon that came up meanwhile stopped. Waiting for the thread keeps a stopped node from
+/// leaving a blocked start behind, which its runtime's end would wait for.
+///
+/// # Errors
+///
+/// Fails with the start's failure, or when a daemon that came up does not stop.
+pub(crate) async fn start_daemon(
+    start: Starting,
+    token: &CancellationToken,
+) -> Result<Option<Daemon>> {
+    let stopper = start.stopper();
+    let mut starting = tokio::task::spawn_blocking(move || start.run());
+    tokio::select! {
+        started = &mut starting => started.context("the daemon's start did not complete")?,
+        () = token.cancelled() => {
+            stopper.stop();
+            match starting.await.context("the daemon's start did not complete")? {
+                Ok(daemon) => stop_daemon(daemon).await?,
+                Err(error) => warn!("the daemon's start ended at the node's stop: {error:#}"),
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// Stops a deployment's daemon, ending every process it supervises.

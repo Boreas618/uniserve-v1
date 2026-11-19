@@ -2,11 +2,12 @@
 //! their readiness record on the descriptor their caller passes (`--ready-fd`); a host service
 //! answers `status` and `stop` over its socket.
 
+use std::io::BufRead as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
-use std::process::{Child, Command, Output};
-use std::time::Duration;
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use service::{Endpoint, Readiness, ReadyReader, State};
 
@@ -35,9 +36,9 @@ fn package(directory: &Path, text: &str) -> std::path::PathBuf {
 }
 
 /// `uniserve ARGUMENTS --ready-fd 3`, the readiness pipe's write end at descriptor 3, under the
-/// runtime and state directory `runtime` and with no device visible; returns the child and the
-/// pipe's read end.
-fn spawn_ready(runtime: &Path, arguments: &[&str]) -> (Child, ReadyReader) {
+/// runtime and state directory `runtime`, with no device visible and its output to `stdout`;
+/// returns the child and the pipe's read end.
+fn spawn_ready(runtime: &Path, arguments: &[&str], stdout: Stdio) -> (Child, ReadyReader) {
     let (reader, writer) = pipe();
     let write_end = writer.as_raw_fd();
     let mut command = Command::new(env!("CARGO_BIN_EXE_uniserve"));
@@ -46,7 +47,8 @@ fn spawn_ready(runtime: &Path, arguments: &[&str]) -> (Child, ReadyReader) {
         .args(["--ready-fd", &READY_FD.to_string()])
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", runtime)
-        .env("CUDA_VISIBLE_DEVICES", "");
+        .env("CUDA_VISIBLE_DEVICES", "")
+        .stdout(stdout);
     // SAFETY: dup2 is async-signal-safe; the duplicate is not close-on-exec, so the child
     // inherits it at its number.
     unsafe {
@@ -97,6 +99,7 @@ fn a_storage_server_reports_what_it_bound_and_stops_on_request() {
             "--settings",
             settings.to_str().unwrap(),
         ],
+        Stdio::inherit(),
     );
     let record: Readiness<serde_json::Value> = ready.wait(State::Serving, START).unwrap();
     assert_eq!(record.pid, server.id());
@@ -143,8 +146,11 @@ fn a_daemon_reports_the_listeners_it_bound_on_port_0() {
         runtime.path(),
         "model = \"org/model\"\n[admin_config]\nport = 0\n",
     );
-    let (mut daemon, mut ready) =
-        spawn_ready(runtime.path(), &["serve", package.to_str().unwrap()]);
+    let (mut daemon, mut ready) = spawn_ready(
+        runtime.path(),
+        &["serve", package.to_str().unwrap()],
+        Stdio::inherit(),
+    );
 
     let listening: Readiness = ready.wait(State::Listening, START).unwrap();
     let instance = listening.instance.clone().expect("an instance directory");
@@ -190,4 +196,87 @@ fn a_package_without_a_model_is_refused() {
     let message =
         String::from_utf8_lossy(&refused.stderr) + String::from_utf8_lossy(&refused.stdout);
     assert!(message.contains("names no model"), "{message}");
+}
+
+/// How long a daemon that serves no deployment yet takes to end once it was sent SIGTERM: far
+/// less than the join timeout (`daemon::JOIN_TIMEOUT`) a leader awaits its other nodes for.
+const STOP: Duration = Duration::from_secs(30);
+
+/// A leader of a deployment over two hosts that is sent SIGTERM while it awaits the other host's
+/// daemon ends at once, and cleanly, rather than waiting out the join timeout: no other node
+/// joins, and no deployment starts.
+#[test]
+fn a_leader_stopped_while_it_awaits_its_other_nodes_ends() {
+    let runtime = tempfile::tempdir().unwrap();
+    let host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned();
+    // A deployment of several nodes names a fixed join port, which the other nodes dial: one
+    // no listener of this host holds now, which the kernel picks.
+    let join = std::net::TcpListener::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    // The second host is one no node finds itself by, so the leader awaits it for as long as
+    // the join timeout lasts.
+    let package = package(
+        runtime.path(),
+        &format!(
+            "model = \"org/model\"\nhosts = [\"{host}\", \"member.invalid\"]\n\
+             [admin_config]\nport = 0\njoin = {join}\n"
+        ),
+    );
+    let (mut daemon, mut ready) = spawn_ready(
+        runtime.path(),
+        &["serve", package.to_str().unwrap()],
+        Stdio::piped(),
+    );
+    let listening: Readiness = ready.wait(State::Listening, START).unwrap();
+    assert_eq!(bound_port(listening.endpoints.join.as_ref()), join);
+
+    // The daemon's log states when the leader awaits its other nodes; the reader goes on
+    // draining the log to its end, so the daemon never blocks on it.
+    let (lines, logged) = std::sync::mpsc::channel();
+    let output = daemon.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            let _ = lines.send(line);
+        }
+    });
+    let deadline = Instant::now() + START;
+    loop {
+        let line = logged
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the leader awaits its other nodes");
+        if line.contains("awaiting the deployment's other nodes") {
+            break;
+        }
+    }
+
+    // SAFETY: a signal to this test's own child.
+    let signalled = unsafe { libc::kill(daemon.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(signalled, 0);
+    let stopped = Instant::now();
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break status;
+        }
+        if stopped.elapsed() > STOP {
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+            panic!("the leader did not end within {STOP:?} of SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "{status:?}");
+    let logged: Vec<String> = logged.try_iter().collect();
+    assert!(
+        !logged
+            .iter()
+            .any(|line| line.contains("the node serves the deployment")),
+        "{logged:#?}"
+    );
 }

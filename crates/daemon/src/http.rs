@@ -20,7 +20,7 @@ pub(crate) mod stream;
 
 use std::sync::Arc;
 
-use crate::supervision::Daemon;
+use crate::supervision::{Daemon, Starting};
 use anyhow::{Context as _, Result};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
@@ -234,12 +234,12 @@ async fn member(
     let runtime =
         service::RuntimeDirectory::of_user().context("finding the user's runtime directory")?;
     let options = config.daemon_options(&identity, instance.path(), runtime, &deployment);
-    let starting = tokio::task::spawn_blocking(move || Daemon::start(options, None));
-    let daemon = tokio::select! {
-        daemon = starting => daemon
-            .context("the daemon's start did not complete")?
-            .context("failed to start this node's daemon")?,
-        () = shutdown.cancelled() => return Ok(()),
+    let start = Starting::new(options, None).context("failed to start this node's daemon")?;
+    let Some(daemon) = node::start_daemon(start, &shutdown)
+        .await
+        .context("failed to start this node's daemon")?
+    else {
+        return Ok(());
     };
     ready.report(service::State::Serving);
     info!(node_rank = identity.rank, host = %identity.host, "serving this node's processes for the leader");

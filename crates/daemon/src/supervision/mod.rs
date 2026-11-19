@@ -245,6 +245,134 @@ impl LeaderEnds {
     }
 }
 
+/// A node's daemon while it starts, and the stop that ends its start ([`Starting::stopper`]).
+///
+/// The leader's start waits until every other node joined it, and a member's until the leader
+/// welcomed it. A stop requested from another thread ends either wait at once, so a node told to
+/// stop while it starts ends without bringing a service up rather than waiting out the join
+/// timeout. The stopper is the service's own: once the service runs, the same stopper stops it.
+pub(crate) struct Starting {
+    options: DaemonOptions,
+    /// The leader's join listener its caller bound ([`Daemon::bind_join`]).
+    join: Option<Listener>,
+    stop: Stop,
+    /// Fires the waker of `stop`.
+    wake: Wake,
+}
+
+impl Starting {
+    /// The start of this node's daemon with `options`; `join` is the join listener a leader of
+    /// several nodes waits for its members at.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the node's rank lies outside the deployment's nodes, a deployment of several
+    /// nodes names no leader address, or the daemon's waker cannot be made.
+    pub(crate) fn new(options: DaemonOptions, join: Option<Listener>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            options.nnodes >= 1 && options.node_rank < options.nnodes,
+            "node rank {} lies outside {} nodes",
+            options.node_rank,
+            options.nnodes
+        );
+        anyhow::ensure!(
+            options.nnodes == 1 || options.dist_init_addr.is_some(),
+            "a deployment of several nodes needs the leader's address (`--dist-init-addr`)"
+        );
+        let waker = Waker::new().context("creating the daemon's waker")?;
+        let wake = waker.wake();
+        Ok(Self {
+            options,
+            join,
+            stop: Stop {
+                requested: Arc::new(AtomicBool::new(false)),
+                handoff: Arc::new(AtomicBool::new(false)),
+                waker,
+            },
+            wake,
+        })
+    }
+
+    /// What stops this start from another thread while [`Starting::run`] waits, and the daemon's
+    /// service once it runs.
+    pub(crate) fn stopper(&self) -> Stopper {
+        Stopper {
+            requested: Arc::clone(&self.stop.requested),
+            wake: self.wake.clone(),
+        }
+    }
+
+    /// Starts the daemon. The leader binds its process socket and waits until every member below
+    /// `nnodes` joined at its join listener; a member joins the leader. Returns once the service
+    /// runs, or `None` when a stop ([`Starting::stopper`]) ended the start first: what had joined
+    /// is closed, and no service runs.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a socket cannot be bound, a member does not join in time,
+    /// or the leader cannot be reached or refuses this member.
+    pub(crate) fn run(self) -> anyhow::Result<Option<Daemon>> {
+        let Self {
+            options,
+            join,
+            mut stop,
+            wake,
+        } = self;
+        let requested = Arc::clone(&stop.requested);
+        let handoff = Arc::clone(&stop.handoff);
+
+        let (address, thread, ends) = if options.node_rank == 0 {
+            let Some((joins, members)) = join_members(&options, join, &mut stop)? else {
+                return Ok(None);
+            };
+            let leader_address = leader_address(&options)?;
+            // Engines may run on any joined node. A deployment with a
+            // network address exposes process control on that interface;
+            // single-host deployments retain their Unix socket.
+            let endpoint = match leader_address {
+                Some(ip) => ::service::Endpoint::tcp(std::net::SocketAddr::new(ip, 0)),
+                None => ::service::Endpoint::unix(&options.socket),
+            };
+            let listener = Listener::bind(&endpoint)
+                .with_context(|| format!("binding the process socket {endpoint}"))?;
+            let address = listener.endpoint().to_string();
+            // While nodes may join, their processes reach this node's
+            // Storage Server too: their Transfer Servers read its storage.
+            let local = local(&options, leader_address, joins.is_some(), wake.clone())?;
+            let host = options.host.clone();
+            let LeaderEnds {
+                service,
+                link,
+                awake,
+                table,
+            } = LeaderEnds::new(&wake);
+            let thread = std::thread::Builder::new()
+                .name("daemon".into())
+                .spawn(move || {
+                    service::serve_leader(
+                        &host, local, listener, joins, members, service, &mut stop,
+                    )
+                })
+                .context("starting the daemon's service")?;
+            (Some(address), thread, Some((link, awake, table)))
+        } else {
+            let Some(leader) = join_leader(&options, &mut stop)? else {
+                return Ok(None);
+            };
+            let address = leader.local_addr().map(|address| address.ip());
+            let local = local(&options, address, true, wake.clone())?;
+            let thread = std::thread::Builder::new()
+                .name("daemon".into())
+                .spawn(move || service::serve_member(local, leader, &mut stop))
+                .context("starting the daemon's service")?;
+            (None, thread, None)
+        };
+        Ok(Some(Daemon::running(
+            address, requested, handoff, wake, thread, ends,
+        )))
+    }
+}
+
 /// How the service thread ended: stopped (`None`), or stopped for a hot
 /// restart with what it served and its descriptors.
 type Served = anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>>;
@@ -281,80 +409,16 @@ impl Daemon {
         ))
     }
 
-    /// Starts this node's daemon. The leader binds its process socket and, given the join
-    /// listener its caller bound (`join`, [`Daemon::bind_join`]), waits until every member below
-    /// `nnodes` joined there; a member joins the leader. Returns once the service runs.
+    /// Starts this node's daemon ([`Starting::run`]), for a caller that never stops it while it
+    /// starts. Returns once the service runs.
     ///
     /// # Errors
     ///
-    /// Fails when a socket cannot be bound, a member does not join in time,
-    /// or the leader cannot be reached or refuses this member.
+    /// As [`Starting::new`] and [`Starting::run`].
     pub fn start(options: DaemonOptions, join: Option<Listener>) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            options.nnodes >= 1 && options.node_rank < options.nnodes,
-            "node rank {} lies outside {} nodes",
-            options.node_rank,
-            options.nnodes
-        );
-        anyhow::ensure!(
-            options.nnodes == 1 || options.dist_init_addr.is_some(),
-            "a deployment of several nodes needs the leader's address (`--dist-init-addr`)"
-        );
-        let waker = Waker::new().context("creating the daemon's waker")?;
-        let wake = waker.wake();
-        let requested = Arc::new(AtomicBool::new(false));
-        let handoff = Arc::new(AtomicBool::new(false));
-        let mut stop = Stop {
-            requested: Arc::clone(&requested),
-            handoff: Arc::clone(&handoff),
-            waker,
-        };
-
-        let (address, thread, ends) = if options.node_rank == 0 {
-            let (joins, members) = join_members(&options, join)?;
-            let leader_address = leader_address(&options)?;
-            // Engines may run on any joined node. A deployment with a
-            // network address exposes process control on that interface;
-            // single-host deployments retain their Unix socket.
-            let endpoint = match leader_address {
-                Some(ip) => ::service::Endpoint::tcp(std::net::SocketAddr::new(ip, 0)),
-                None => ::service::Endpoint::unix(&options.socket),
-            };
-            let listener = Listener::bind(&endpoint)
-                .with_context(|| format!("binding the process socket {endpoint}"))?;
-            let address = listener.endpoint().to_string();
-            // While nodes may join, their processes reach this node's
-            // Storage Server too: their Transfer Servers read its storage.
-            let local = local(&options, leader_address, joins.is_some(), wake.clone())?;
-            let host = options.host.clone();
-            let LeaderEnds {
-                service,
-                link,
-                awake,
-                table,
-            } = LeaderEnds::new(&wake);
-            let thread = std::thread::Builder::new()
-                .name("daemon".into())
-                .spawn(move || {
-                    service::serve_leader(
-                        &host, local, listener, joins, members, service, &mut stop,
-                    )
-                })
-                .context("starting the daemon's service")?;
-            (Some(address), thread, Some((link, awake, table)))
-        } else {
-            let leader = join_leader(&options)?;
-            let address = leader.local_addr().map(|address| address.ip());
-            let local = local(&options, address, true, wake.clone())?;
-            let thread = std::thread::Builder::new()
-                .name("daemon".into())
-                .spawn(move || service::serve_member(local, leader, &mut stop))
-                .context("starting the daemon's service")?;
-            (None, thread, None)
-        };
-        Ok(Self::running(
-            address, requested, handoff, wake, thread, ends,
-        ))
+        Starting::new(options, join)?
+            .run()?
+            .context("the daemon's start was stopped")
     }
 
     /// A running daemon of the service thread `thread`, which `wake` wakes; `ends` are the
@@ -600,20 +664,22 @@ fn local(
 /// The members that joined before the leader serves, at the join listener the caller bound
 /// (`join`, [`Daemon::bind_join`]) when the deployment names a join endpoint
 /// (`dist_init_addr`): every node rank below `nnodes` (other than the leader's) within the join
-/// timeout. The wait blocks on the listener and the joining connections, so a join ends it as it
-/// arrives. The listener stays bound while the leader serves, so a node may join the running
-/// deployment later (`Joins`).
+/// timeout; `None` once `stop` was requested first. The wait blocks on the listener, the joining
+/// connections and the stop's waker, so a join or a stop ends it as it arrives. The listener
+/// stays bound while the leader serves, so a node may join the running deployment later
+/// (`Joins`).
 fn join_members(
     options: &DaemonOptions,
     join: Option<Listener>,
-) -> anyhow::Result<(Option<service::Joins>, Vec<service::Membership>)> {
+    stop: &mut Stop,
+) -> anyhow::Result<Option<(Option<service::Joins>, Vec<service::Membership>)>> {
     let Some(listener) = join else {
         anyhow::ensure!(
             options.nnodes == 1,
             "a leader of {} nodes needs its join listener",
             options.nnodes
         );
-        return Ok((None, Vec::new()));
+        return Ok(Some((None, Vec::new())));
     };
     tracing::info!(endpoint = %listener.endpoint(), nodes = options.nnodes, "awaiting the deployment's other nodes");
 
@@ -626,10 +692,16 @@ fn join_members(
             .count()
     };
     loop {
+        // A stop ends the wait; dropping the joins closes the listener and every member's
+        // connection, so the members that joined end too.
+        if stop.requested() {
+            tracing::info!("the node stopped while it awaited the deployment's other nodes");
+            return Ok(None);
+        }
         let admitted = joins.admit(&members)?;
         members.extend(admitted);
         if awaited(&members) == 0 {
-            return Ok((Some(joins), members));
+            return Ok(Some((Some(joins), members)));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(
@@ -639,7 +711,10 @@ fn join_members(
             options.nnodes,
             options.join_timeout
         );
-        let mut descriptors: Vec<libc::pollfd> = joins.poll_fds().collect();
+        let mut descriptors: Vec<libc::pollfd> = joins
+            .poll_fds()
+            .chain(std::iter::once(stop.waker.poll_fd()))
+            .collect();
         ::service::wait_ready(&mut descriptors, Some(remaining))?;
     }
 }
@@ -673,8 +748,9 @@ fn leader_address(options: &DaemonOptions) -> anyhow::Result<Option<IpAddr>> {
 
 /// A member's join: connects to the leader at the join endpoint the leader reported bound
 /// (`dist_init_addr`, from the leader's readiness record), states this node and the address its
-/// connection reaches the leader from, and reads the leader's welcome.
-fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
+/// connection reaches the leader from, and reads the leader's welcome; `None` once `stop` was
+/// requested before the welcome arrived.
+fn join_leader(options: &DaemonOptions, stop: &mut Stop) -> anyhow::Result<Option<Connection>> {
     let address = options
         .dist_init_addr
         .as_ref()
@@ -697,14 +773,30 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
             address: reached_from.to_string(),
         })),
     })?;
-    let welcome: Welcome = connection
-        .recv(options.join_timeout)?
-        .context("the leader did not reply to this node's hello")?;
+    // The welcome, or a stop: the wait blocks on the connection and the stop's waker.
+    let deadline = Instant::now() + options.join_timeout;
+    let welcome: Welcome = loop {
+        if let Some(welcome) = connection.try_recv()? {
+            break welcome;
+        }
+        if stop.requested() {
+            tracing::info!(leader = %address, "the node stopped while it awaited the leader's welcome");
+            return Ok(None);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "the leader did not reply to this node's hello within {:?}",
+            options.join_timeout
+        );
+        let [socket, local] = connection.poll_fds();
+        ::service::wait_ready(&mut [socket, local, stop.waker.poll_fd()], Some(remaining))?;
+    };
     if let Some(refusal) = welcome.refusal {
         return Err(anyhow::Error::new(refusal).context("the leader refused this node"));
     }
     tracing::info!(leader = %address, node_rank = options.node_rank, "joined the leader");
-    Ok(connection)
+    Ok(Some(connection))
 }
 
 #[cfg(test)]
