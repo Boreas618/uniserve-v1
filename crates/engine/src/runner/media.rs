@@ -12,8 +12,8 @@
 //!    slot, the class of each product kind and the row's positions (`MediaRow::results`), copies
 //!    what the row reads to host memory on the runner's stream, from the rank's own run of the
 //!    block or, where it backs none, another rank's of its process (a round's decoded units from
-//!    the run of the rank that decoded each), waits for the copy, and hands the row's work to the
-//!    pool;
+//!    the run of the rank that decoded each, and the track from the run of the rank that decoded
+//!    it), waits for the copy, and hands the row's work to the pool;
 //! 2. once every row's work ended, `execute` copies what each row produced into every run of the
 //!    blocks it writes that the process maps, so each backing rank of the process holds it,
 //!    waits for the copies, and answers each row.
@@ -38,7 +38,7 @@
 //! | --- | --- | --- |
 //! | `MediaRead` | the request's condition media, the sealed memory files its row carries | condition pixels, condition samples and vision pixels, those the request's conditions call for, in that order |
 //! | `VideoEncode` | the frames of the units of its round that its process's ranks decoded, from the video units block's run on the rank that decoded each | each such unit's encoding into its own encoded units block, in the runs of that block the process maps |
-//! | `AudioEncode` | the video's duration of the decoded track | nothing: the encoded track joins the request's assembly |
+//! | `AudioEncode` | the video's duration of the decoded track, from the audio samples block's run on the rank that decoded it ([`HostConfig::track`]) where the process holds that rank | nothing: the encoded track joins the request's assembly |
 //! | `Mux`, handing rounds over | the encoded units blocks of the next rounds' units, as far as each framed unit reaches | nothing: the units join the assembly |
 //! | `Mux`, final | nothing | nothing: the call's output carries the artifact |
 //!
@@ -138,6 +138,12 @@ pub(crate) struct HostConfig {
     /// muxing call hands over per round its row states; the deal is the rank in whose run the
     /// encode finds each unit's frames.
     pub round: RoundConfig,
+    /// The rank that decodes a request's track, by its rank index in the process's media memory
+    /// (`BufferMemory::rank`), as the decoders state it: one rank decodes each track whole into
+    /// its own run of the audio samples block, which every other rank that backs the block
+    /// leaves unwritten, so an audio encode reads that rank's run wherever its process holds the
+    /// rank. `None` when every rank that serves audio decodes writes its own run.
+    pub track: Option<u32>,
     /// Frames per second of the artifact: the model's.
     pub frame_rate: u32,
     /// Samples per second of the track: the model's.
@@ -509,9 +515,26 @@ impl MediaHost {
                     return Err(mismatched());
                 };
 
+                // The track lies in the run of the rank that decoded it, where this process holds
+                // that rank; otherwise in the run this process received it in.
+                let decoded = self.config.track.filter(|&rank| self.memory.reaches(rank));
+                let run = match decoded {
+                    Some(rank) => {
+                        let class = class(&self.config, Product::AudioSamples)?;
+                        let runs = tables.runs(row.slot, class, *samples_at);
+                        self.memory.run_on(runs, rank).ok_or_else(|| {
+                            Error::Invalid(format!(
+                                "slot {} holds no audio samples block at position {samples_at} on \
+                                 rank {rank}, which decodes its track",
+                                row.slot
+                            ))
+                        })?
+                    }
+                    None => self.read(tables, row.slot, Product::AudioSamples, *samples_at)?,
+                };
+
                 // The video's duration of the track, which the decoder's window covers; a block
                 // that holds less is read whole, and the track padded with silence.
-                let run = self.read(tables, row.slot, Product::AudioSamples, *samples_at)?;
                 let duration = self.track_samples(row)? as u64 * PCM_SAMPLE;
                 let read = self.span(run, 0, duration.min(u64::from(run.2) * UNIT_BYTES))?;
                 Ok((vec![read], Vec::new()))
@@ -1570,6 +1593,7 @@ mod tests {
                 ranks: vec![0],
                 units: 1,
             },
+            track: Some(0),
             frame_rate: 24,
             audio_rate: 32_000,
             format: MediaFormat {
@@ -1966,6 +1990,37 @@ mod tests {
         assert_eq!(
             transfers[0].0,
             [(PRODUCTS[0], 0, first), (PRODUCTS[1], first, second)]
+        );
+    }
+
+    #[test]
+    fn an_audio_encode_reads_the_track_from_the_run_of_the_rank_that_decoded_it() {
+        let (pool, media) = (pool(), runner());
+        let [video, encoded, _] = blocks();
+
+        // Ranks 0 and 1 of one process both back the request's audio samples block, and rank 1
+        // decoded the track into its own run; the muxer's audio encode runs on rank 0.
+        let mut memories = [0, 1].map(|rank| memory(rank, held()));
+        BufferMemory::connect(&mut memories).unwrap();
+        let [own, _] = memories;
+        let mut config = config(&[Phase::AudioEncode]);
+        config.track = Some(1);
+        let host = MediaHost::new(config, kernels(), Arc::new(own), None, pool, media).unwrap();
+        let mut tables = tables(0).with_peers(&PRODUCTS);
+        for (slot, request, completion) in admission(&PRODUCTS) {
+            tables
+                .map(slot, runtime::RequestId(1), &request, &completion)
+                .unwrap();
+        }
+
+        // The video's duration of the track, from rank 1's run of the block.
+        let encode = batch(1, Phase::AudioEncode, vec![row(vec![AUDIO_AT], 1)]);
+        let transfers = host.transfers(&encode, &tables).unwrap();
+        let at = u64::from(video + 2 * encoded) * UNIT_BYTES;
+        let samples = media::audio_samples(FRAMES as usize, 24, 32_000) as u64;
+        assert_eq!(
+            transfers,
+            [(vec![(PRODUCTS[1], at, samples * PCM_SAMPLE)], Vec::new())]
         );
     }
 

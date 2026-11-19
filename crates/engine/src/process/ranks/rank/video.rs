@@ -512,6 +512,31 @@ impl ModelRunner {
         Ok(kinds)
     }
 
+    /// The block that serves `phase` (by the pipeline's declaration) in the group that serves it
+    /// for this rank's requests, with the deployment rank of that group's first rank: this rank's
+    /// own group when it places such a block, otherwise the first group that does. `None` when
+    /// no group places one, as for a group that places the whole model.
+    ///
+    /// # Errors
+    ///
+    /// A rank of a text deployment, which serves no pipeline.
+    fn serving_block(&self, phase: Phase) -> Result<Option<(usize, &BlockConfig)>> {
+        let groups = &self.engine_config().parallel.worker_groups;
+        let firsts = WorkerGroupConfig::first_ranks(groups);
+        let names: Vec<&str> = self
+            .pipeline()?
+            .serving(phase)
+            .map(|block| block.name.as_str())
+            .collect();
+        let block_of = |at: usize| names.iter().find_map(|name| groups[at].blocks.get(*name));
+        let own = groups.iter().position(|group| group.id.0 == self.group);
+        let serving = own
+            .filter(|at| block_of(*at).is_some())
+            .or_else(|| (0..groups.len()).find(|at| block_of(*at).is_some()));
+
+        Ok(serving.and_then(|at| Some((firsts[at], block_of(at)?))))
+    }
+
     /// How a video decode round is dealt to the ranks of the group that decodes this rank's
     /// requests: the ranks of its block that serves video decodes (by the pipeline's declaration)
     /// in order, by their rank index in the process's media memory (the deployment's rank), each
@@ -524,38 +549,16 @@ impl ModelRunner {
     ///
     /// No group that places the rank, or a rank number past the protocol's.
     pub(crate) fn round(&self) -> Result<RoundConfig> {
-        let groups = &self.engine_config().parallel.worker_groups;
-        let firsts = WorkerGroupConfig::first_ranks(groups);
-        let decoders: Vec<&str> = self
-            .pipeline()?
-            .serving(Phase::VideoDecode)
-            .map(|block| block.name.as_str())
-            .collect();
-        let block_of = |group: &'_ WorkerGroupConfig| {
-            decoders
-                .iter()
-                .find_map(|name| group.blocks.get(*name))
-                .is_some()
-        };
-        let own = groups.iter().position(|group| group.id.0 == self.group);
-        let decoder = own
-            .filter(|at| block_of(&groups[*at]))
-            .or_else(|| groups.iter().position(block_of));
-
-        let Some(at) = decoder else {
+        let Some((first, block)) = self.serving_block(Phase::VideoDecode)? else {
             return Ok(RoundConfig {
                 ranks: vec![self.rank],
                 units: 1,
             });
         };
-        let block = decoders
-            .iter()
-            .find_map(|name| groups[at].blocks.get(*name))
-            .context("the decoding group places its decoder block")?;
         let ranks = block
             .ranks
             .iter()
-            .map(|position| u32::try_from(firsts[at] + position))
+            .map(|position| u32::try_from(first + position))
             .collect::<Result<Vec<u32>, _>>()
             .context("a rank past what the protocol numbers")?;
         let units = block.rank_units();
@@ -563,6 +566,28 @@ impl ModelRunner {
             ranks,
             units: u32::try_from(units).context("more units per rank than a round numbers")?,
         })
+    }
+
+    /// The rank that decodes the tracks of this rank's requests, by its rank index in the
+    /// process's media memory (the deployment's rank): the first rank of the block that serves
+    /// audio decodes in the group that decodes them ([`Self::serving_block`]), which decodes each
+    /// track whole into its own run of the request's audio samples block. `None` when no group
+    /// places such a block, and every rank that serves the phase decodes into its own run.
+    ///
+    /// # Errors
+    ///
+    /// A block that places no rank, or a rank number past the protocol's.
+    pub(crate) fn track_rank(&self) -> Result<Option<u32>> {
+        let Some((first, block)) = self.serving_block(Phase::AudioDecode)? else {
+            return Ok(None);
+        };
+        let position = block
+            .ranks
+            .first()
+            .context("the block that decodes the tracks places no rank")?;
+        let rank =
+            u32::try_from(first + position).context("a rank past what the protocol numbers")?;
+        Ok(Some(rank))
     }
 
     /// The config of the rank's text encoder of `model`, writing the conditioning and reading the
@@ -815,6 +840,7 @@ impl ModelRunner {
             classes: classes.all()?,
             timelines,
             round: self.round()?,
+            track: self.track_rank()?,
             frame_rate: model.frame_rate(),
             audio_rate: model.audio_rate(),
             format: model
