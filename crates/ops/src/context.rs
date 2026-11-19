@@ -503,6 +503,16 @@ impl Context {
             .collect()
     }
 
+    /// The groups the forward's collectives go through, one per axis that has one
+    /// ([`Context::set_axes`]), in the order the forward addresses them by.
+    pub fn groups(&self) -> Vec<Arc<Group>> {
+        self.state()
+            .axes
+            .iter()
+            .filter_map(|(group, _)| group.clone())
+            .collect()
+    }
+
     /// The expert exchange of this context's forwards: `transport` is the package's transport for
     /// this device and expert group, which an exchange launch runs over
     /// ([`crate::collective::expert_exchange`]), and `None` withdraws it.

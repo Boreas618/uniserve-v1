@@ -69,6 +69,9 @@ const ENDS: usize = 16;
 /// stream of its own. The communicator may be called from one thread at a time,
 /// which the one worker thread of a device already keeps; the lock states it in the type, so
 /// that contexts sharing a group move to their device's thread with their runners.
+///
+/// Dropping the last group over a communicator leaks the communicator, as dropping a
+/// [`Communicator`] does: its owner destroys it in an orderly end with [`Group::destroy`].
 pub struct Group {
     communicator: Arc<Mutex<Communicator>>,
     /// The stream a started collective runs on, beside the forward's own, so a module's compute
@@ -160,12 +163,42 @@ impl Group {
         )
     }
 
-    /// The communicator, for one call. A panic while it was held leaves nothing half-issued that
-    /// this type could repair, so a poisoned lock gives the communicator as it stands.
-    fn communicator(&self) -> MutexGuard<'_, Communicator> {
+    /// The communicator, for one call: the collectives of this module, and the point-to-point
+    /// operations a runner issues on its own stream. A panic while it was held leaves nothing
+    /// half-issued that this type could repair, so a poisoned lock gives the communicator as it
+    /// stands.
+    pub fn communicator(&self) -> MutexGuard<'_, Communicator> {
         self.communicator
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Destroys the group's communicator once its side stream completed
+    /// ([`Communicator::destroy`]), which releases what NCCL holds for it: its device buffers,
+    /// its proxy threads and the host shared memory its ranks on this host exchange through.
+    ///
+    /// The caller is the communicator's owner in an orderly end: every member destroys its own
+    /// after all work of the group retired, and every graph that captured one of its
+    /// collectives was destroyed before, since NCCL's destroy waits for those graphs. Each
+    /// member destroys without waiting for the others, which it need not meet.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] while a group beside this one ([`Group::beside`]) is still held,
+    /// which leaves the communicator to it; the side stream's or NCCL's failure, after which the
+    /// communicator's remaining resources are leaked.
+    pub fn destroy(self) -> Result<()> {
+        self.side.synchronize()?;
+
+        let communicator =
+            Arc::into_inner(self.communicator).ok_or_else(|| Error::Unsupported {
+                operation: "destroying a group's communicator",
+                reason: "a group beside it still holds the communicator".to_owned(),
+            })?;
+        let communicator = communicator
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(communicator.destroy()?)
     }
 
     /// Runs `issue` on the side stream, ordered after everything `stream` issued so far, and

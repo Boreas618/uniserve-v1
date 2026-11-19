@@ -57,7 +57,7 @@ use nn::family::{VideoCheckpoint, VideoModel, VideoPlacement};
 use nn::pipeline::{Pipeline, Product};
 use nn::vae::Tiling;
 use ops::Generation;
-use platform::{Communicator, DeviceId, Stream};
+use platform::{DeviceId, Stream};
 use proto::config::{
     BlockConfig, DEFAULT_BLOCK, HostBlock, Partition, WorkerGroupConfig, WorkerGroupRole,
 };
@@ -126,11 +126,11 @@ pub(crate) struct VideoRank {
     /// partition ([`BLOCK_AXES`]); `None` for a group of one and on the meta device.
     pub(crate) tensor: Option<Arc<ops::Group>>,
     pub(crate) denoiser: DenoiserGroups,
-    /// The communicator of the ranks a video decode round is dealt to, over which they pass the
-    /// splice tails between consecutive shares, from the rank's load until its video decoder
-    /// takes it; `None` for a round of one rank, on a rank that decodes no video and on the meta
-    /// device.
-    pub(crate) decoder: Option<Communicator>,
+    /// The group of the ranks a video decode round is dealt to, over whose communicator they
+    /// pass the splice tails between consecutive shares, from the rank's load until its video
+    /// decoder takes it; `None` for a round of one rank, on a rank that decodes no video and on
+    /// the meta device.
+    pub(crate) decoder: Option<Arc<ops::Group>>,
     /// What the profile run states of each runner that replays in the graph pool.
     pub(crate) peaks: Vec<(RunnerId, Peaks)>,
     /// The device bytes the runners hold beside their regions of the graph pool: the denoiser's
@@ -855,7 +855,7 @@ impl ModelRunner {
     /// graphs that hold none, on a device its region of the graph pool. The text encoder computes
     /// over the tensor group `tensor`, the denoiser over its groups `denoiser` along each axis of
     /// its partition, each at this rank's place (meta graphs take the splits alone), and the
-    /// video decoder passes its rounds' tails over the communicator `decoder`; the decoders
+    /// video decoder passes its rounds' tails over the group `decoder`; the decoders
     /// bucket by `laid` ([`VideoRank::laid`]). The media host is [`ModelRunner::media_host`]'s.
     ///
     /// # Errors
@@ -869,7 +869,7 @@ impl ModelRunner {
         (tensor, denoiser, decoder): (
             Option<Arc<ops::Group>>,
             DenoiserGroups,
-            Option<Communicator>,
+            Option<Arc<ops::Group>>,
         ),
         (laid, classes): (&[(VideoRequest, Layout)], Classes<'_>),
     ) -> Result<DeviceRunners> {

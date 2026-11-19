@@ -735,6 +735,15 @@ impl Graphs {
         Ok(())
     }
 
+    /// The groups the runner's forwards communicate over (`ops::Context::groups`): its launching
+    /// context's; none for graphs that hold no device.
+    pub(crate) fn groups(&self) -> Vec<Arc<Group>> {
+        self.device
+            .as_ref()
+            .map(|cuda| cuda.launching.groups())
+            .unwrap_or_default()
+    }
+
     /// The expert exchange of the runner's forwards (`ops::Context::set_exchange`).
     pub(crate) fn set_exchange(&self, transport: Option<ExchangeTransport>, meet: Option<Meet>) {
         if let Some(cuda) = &self.device {

@@ -497,7 +497,9 @@ const DEVICE_BOUND: Duration = Duration::from_secs(1800);
 /// and is then shut down ends in order: the sleep gives back its KV cache and suspends its graph
 /// pools, and the shutdown closes every owner of its devices' state, streams included, before
 /// the devices' contexts are reset, so the process exits with status 0 and its session closed
-/// (`docs/admin.md`, Sleep, and wake; `Engine::close`). The driver reads a stream of a reset
+/// (`docs/admin.md`, Sleep, and wake; `Engine::close`), and its workers destroy the tensor
+/// group's communicators, so none of the NCCL shared memory the serving process mapped is left
+/// in `/dev/shm` (`docs/architecture.md`, the orderly close). The driver reads a stream of a reset
 /// context through freed state once another device's context was reset too, so the case takes
 /// two devices; the FP32 fixture has no kernels on a device.
 #[test]
@@ -538,6 +540,13 @@ fn an_engine_on_a_device_shut_down_while_asleep_exits_in_order() {
         }
         _ => None,
     });
+    // The tensor group's two ranks are threads of the one process, whose communicators' proxies
+    // map NCCL's shared memory while they serve.
+    let shared = nccl_shared_memory(engine.child.id());
+    assert!(
+        !shared.is_empty(),
+        "the serving engine maps no NCCL shared memory"
+    );
 
     let sleep = wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
         id: 31,
@@ -567,6 +576,27 @@ fn an_engine_on_a_device_shut_down_while_asleep_exits_in_order() {
     let status = engine.exited(DEVICE_BOUND);
     assert!(status.success(), "the engine exited with {status}");
     assert!(!holds_session(&storage, launch.epoch, launch.engine));
+
+    let left: Vec<&PathBuf> = shared.iter().filter(|path| path.exists()).collect();
+    assert!(
+        left.is_empty(),
+        "the engine's close left NCCL's shared memory {left:?}"
+    );
+}
+
+/// The files of NCCL's host shared memory (`/dev/shm/nccl-*`) that process `pid` maps and that
+/// are still linked: what its communicators' proxies exchange through, which NCCL removes when
+/// it destroys them.
+fn nccl_shared_memory(pid: u32) -> std::collections::BTreeSet<PathBuf> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+
+    // A mapping's path is its line's last field; an unlinked file's ends with " (deleted)".
+    maps.lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .filter(|path| path.starts_with("/dev/shm/nccl-"))
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect()
 }
 
 /// The launch of the main process of host `host` in an epoch whose one worker group, of tensor

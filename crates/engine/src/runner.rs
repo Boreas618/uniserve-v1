@@ -211,6 +211,13 @@ pub trait Runner: Forward {
     /// The phases this runner serves, as the scheduler names them in a batch.
     fn phases(&self) -> &[Phase];
 
+    /// The collective groups this runner communicates over, whose communicators its worker
+    /// destroys once the runner, its capture instances and the graphs they captured are gone
+    /// ([`Worker`](crate::worker::Worker)): its graphs' groups ([`Graphs::groups`]) by default.
+    fn groups(&self) -> Vec<std::sync::Arc<ops::Group>> {
+        self.graphs().groups()
+    }
+
     /// A second instance of the runner's forward over `graphs`, for the worker's capture
     /// thread: it shares the model's weights and every tensor the runner's forward reads at a
     /// fixed address beside its input tensors (slot state, cache planes, kept outputs), and takes

@@ -947,11 +947,10 @@ fn load_video_rank(
                 }
             }
             None => {
-                let communicator =
-                    communicator_over(&host, device, &formed.collective, communicates)
-                        .with_context(what)?;
-                if serves(&formed.block, Phase::VideoDecode) && communicator.is_some() {
-                    decoder = communicator;
+                let group = group_over(&host, device, &formed.collective, communicates, None)
+                    .with_context(what)?;
+                if serves(&formed.block, Phase::VideoDecode) && group.is_some() {
+                    decoder = group;
                 }
             }
         }

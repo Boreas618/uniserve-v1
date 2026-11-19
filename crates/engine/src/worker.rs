@@ -602,6 +602,16 @@ impl Worker {
             );
         }
         let capturer = Capturer::spawn(device, instances, Arc::clone(&queue))?;
+
+        // The communicators the runners issue on, each once: several runners of a rank may share
+        // a group.
+        let mut groups: Vec<Arc<ops::Group>> = Vec::new();
+        for group in runners.iter().flat_map(|runner| runner.groups()) {
+            if !groups.iter().any(|held| Arc::ptr_eq(held, &group)) {
+                groups.push(group);
+            }
+        }
+
         let readiness = Arc::new(Readiness::default());
         let first = kernels.number();
         let counters = Arc::new(Counters::default());
@@ -612,6 +622,7 @@ impl Worker {
         let state = Thread {
             device,
             runners,
+            groups,
             queue: Arc::clone(&queue),
             kernels: BTreeMap::from([(kernels.number(), kernels)]),
             capturer,
@@ -1133,6 +1144,9 @@ struct Thread {
     device: Option<DeviceId>,
     /// The device's runners; `RunnerId(index)` names `runners[index]`.
     runners: Vec<Box<dyn Runner>>,
+    /// The collective groups the runners communicate over ([`Runner::groups`]), whose
+    /// communicators the thread destroys when it ends ([`Thread::retire`]).
+    groups: Vec<Arc<ops::Group>>,
     queue: Arc<Queue>,
     /// The generations the runners' graphs hold, by number: the serving one, and the one being
     /// prepared or kept during a trial. Which of them serves is the graphs' to say
@@ -1290,6 +1304,58 @@ impl Thread {
                     );
                     self.queue.complete(submission, Err(error));
                 }
+            }
+        }
+
+        self.retire();
+    }
+
+    /// Ends the thread's state once its queue closed: the capture thread and the runners, with
+    /// every graph they hold, and then the communicators of the runners' groups
+    /// (`ops::Group::destroy`), each once no group beside it remains. A communicator that is not
+    /// destroyed keeps its device buffers, its proxy threads and its host shared memory until
+    /// the process exits, and the shared memory beyond it.
+    ///
+    /// NCCL's destroy waits for the communicator's work and for every graph that captured it,
+    /// so it follows the graphs' release, and a device with a sticky error, whose work never
+    /// retires, leaves its communicators to the process's exit.
+    fn retire(self) {
+        let Self {
+            device,
+            runners,
+            groups,
+            capturer,
+            sticky,
+            ..
+        } = self;
+
+        // The capture thread's instances hold groups beside the runners' and the graphs they
+        // captured; the runners hold the graphs that serve.
+        drop(capturer);
+        drop(runners);
+
+        if let Some(error) = sticky {
+            tracing::warn!(
+                ?device,
+                %error,
+                "the device's context failed: its communicators are left to the process's exit"
+            );
+            return;
+        }
+        for group in groups {
+            let destroyed = match Arc::into_inner(group) {
+                Some(group) => group.destroy(),
+                None => Err(ops::Error::Unsupported {
+                    operation: "destroying a group's communicator",
+                    reason: "another holder outlived the worker's runners".to_owned(),
+                }),
+            };
+            if let Err(error) = destroyed {
+                tracing::warn!(
+                    ?device,
+                    %error,
+                    "a communicator was not destroyed: it is left to the process's exit"
+                );
             }
         }
     }

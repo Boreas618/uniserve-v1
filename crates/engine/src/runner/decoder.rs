@@ -98,8 +98,7 @@ use nn::{Clip, Decoder, Splice, Splicer};
 use ops::pcm::{self, PcmInterleave};
 use ops::rgb::{self, RgbBytes};
 use platform::{
-    Communicator, DataType, DevicePtr, DeviceRange, Event, EventFlags, Pitched, PitchedBatch,
-    SourceOrder, Stream,
+    DataType, DevicePtr, DeviceRange, Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream,
 };
 use proto::video::Layout;
 use tensor::{DType, Device, Shape, Tensor};
@@ -231,11 +230,12 @@ pub(crate) struct DecoderRunner {
     /// that hold no device and for a capture or rehearsal instance (`Runner::capturer`), which
     /// issues no copy.
     stream: Option<Stream>,
-    /// A video decoder's communicator with the other ranks its rounds are dealt to, its member
-    /// index the rank's place among them ([`RoundConfig::member`]), over which a round's tails
-    /// pass between consecutive shares on `stream`; `None` for graphs that hold no device and
-    /// for a round of one rank. The runner alone issues on it, from its worker's thread.
-    communicator: Option<Communicator>,
+    /// A video decoder's group with the other ranks its rounds are dealt to, its member index
+    /// the rank's place among them ([`RoundConfig::member`]), over whose communicator a round's
+    /// tails pass between consecutive shares on `stream`; `None` for graphs that hold no device
+    /// and for a round of one rank. The runner alone issues on it, from its worker's thread,
+    /// and its worker destroys the communicator once the runner is gone ([`Runner::groups`]).
+    group: Option<Arc<ops::Group>>,
     /// Recorded behind a batch's last copy: what `execute` waits for.
     done: Option<Event>,
     /// Each bucket's latent layout: the model's map of a clip, or a track's own.
@@ -258,9 +258,9 @@ impl DecoderRunner {
     /// - `graphs` are made for no input tensors: a decode's host values are its forward's.
     /// - `stream` is the stream `graphs` replay on, on which the runner issues its copies; `None`
     ///   for graphs that hold no device, whose runner computes over meta tensors.
-    /// - `communicator` is the decoder ranks' communicator a video decoder on a device whose
-    ///   rounds are dealt to more than one rank exchanges its tails over; `None` for any other
-    ///   runner, which exchanges none.
+    /// - `group` is the decoder ranks' group a video decoder on a device whose rounds are dealt
+    ///   to more than one rank exchanges its tails over; `None` for any other runner, which
+    ///   exchanges none.
     ///
     /// # Errors
     ///
@@ -277,7 +277,7 @@ impl DecoderRunner {
         splicer: Option<Arc<dyn Splicer + Send + Sync>>,
         config: DecoderConfig,
         graphs: Graphs,
-        (stream, communicator): (Option<Stream>, Option<Communicator>),
+        (stream, group): (Option<Stream>, Option<Arc<ops::Group>>),
         memory: Arc<BufferMemory>,
     ) -> Result<Self> {
         if graphs.enter().is_ok() != stream.is_some() || config.buckets.is_empty() {
@@ -296,7 +296,8 @@ impl DecoderRunner {
             .iter()
             .any(|bucket| matches!(bucket.extent, Extent::Clip { .. }));
         let exchanges = clips && stream.is_some() && config.round.ranks.len() > 1;
-        let joined = communicator.as_ref().map(|communicator| {
+        let joined = group.as_ref().map(|group| {
+            let communicator = group.communicator();
             let members = usize::try_from(communicator.size()).ok();
             let place = u32::try_from(communicator.rank()).ok();
             members == Some(config.round.ranks.len()) && place == config.round.member(memory.rank())
@@ -436,7 +437,7 @@ impl DecoderRunner {
             graphs,
             memory,
             stream,
-            communicator,
+            group,
             layouts,
             staged: Cell::new(None),
             buffers,
@@ -796,7 +797,7 @@ impl DecoderRunner {
         let Some(stream) = &self.stream else {
             return Ok(());
         };
-        let communicator = self.communicator.as_ref().ok_or_else(|| {
+        let group = self.group.as_ref().ok_or_else(|| {
             Error::Invariant(
                 "a decoder that passes tails between ranks holds no communicator".into(),
             )
@@ -820,6 +821,7 @@ impl DecoderRunner {
             .map(|(from, bytes)| side(tail, from, bytes))
             .transpose()?;
 
+        let communicator = group.communicator();
         platform::nccl::group(|| {
             if let Some((range, count, peer)) = sent {
                 communicator.send(stream, range, count, TAIL_ELEMENT, peer)?;
@@ -1084,6 +1086,13 @@ impl Runner for DecoderRunner {
         &self.config.phases
     }
 
+    /// The decoder ranks' group, beside its graphs' groups.
+    fn groups(&self) -> Vec<Arc<ops::Group>> {
+        let mut groups = self.graphs.groups();
+        groups.extend(self.group.clone());
+        groups
+    }
+
     /// The decoder over `graphs`, over the runner's latent, tail and raster buffers when they
     /// lie beside the runner's graphs, and over buffers of its own for a rehearsal: a decode
     /// writes its tails and rasters there.
@@ -1097,7 +1106,7 @@ impl Runner for DecoderRunner {
             graphs,
             memory: Arc::clone(&self.memory),
             stream: None,
-            communicator: None,
+            group: None,
             done: None,
             layouts: self.layouts.clone(),
             staged: Cell::new(None),
