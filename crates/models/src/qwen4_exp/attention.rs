@@ -454,8 +454,9 @@ impl IndexedAttention {
         functional::place_rows_(&ring_keys, &ring_row, &raw_key)?;
         functional::place_rows_(&ring_positions, &ring_row, &own)?;
 
-        // The scores of the groups complete before each row, and the best of them.
-        // One key a group: the scoring reads the plane as `[pages, groups, width]`.
+        // The scores of the groups complete before each row, and the best of them. The field's
+        // plane holds one key a group, `[pages, groups, 1, width]`, which the scores read as
+        // `[pages, groups, width]` records.
         let records = plane.reshape((pages, groups, key_width))?;
         let keys = functional::Plane {
             records: &records,

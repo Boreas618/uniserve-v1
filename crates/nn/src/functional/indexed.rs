@@ -2,10 +2,10 @@
 //! of them, and the attention over the tokens a selection names.
 //!
 //! A sparse attention layer keeps one compressed index key per `ratio` consecutive tokens beside
-//! its cache, the plane of its [`crate::family::INDEX_KEY`] field ([`KvCache::plane`]). A query
-//! row scores the keys of the groups it may see ([`index_scores`]), keeps the best
-//! ([`index_select`]), and attends the tokens of those groups ([`indexed_attention`], or the
-//! compressed latents themselves, [`super::latent_attention`]):
+//! its cache, the plane of its [`INDEX_KEY`](crate::family::INDEX_KEY) field
+//! ([`KvCache::plane`]). A query row scores the keys of the groups it may see
+//! ([`index_scores`]), keeps the best ([`index_select`]), and attends the tokens of those groups
+//! ([`indexed_attention`], or the compressed latents themselves, [`super::latent_attention`]):
 //!
 //! ```text
 //! index_scores        s[t, g] = Σ_h relu(q[t, h] · key[g]) · w[t, h]   g < visible[t], −inf otherwise
