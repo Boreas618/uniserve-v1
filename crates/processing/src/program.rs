@@ -4,8 +4,9 @@
 //! [`Program`] implements the interface over a list of families ([`Families`]); the release's
 //! list is [`Release`], `crate::FAMILIES`, which the crate's own module exports. An instance is
 //! bound to one family and one checkpoint ([`Program::bind_with`]): a chat family's binding reads
-//! the checkpoint's files the family declared ([`declare`]), compiles its template and states the
-//! model's facts; a video family's binds the family's processor to what the workers described.
+//! the checkpoint's files the family declared ([`declare`]), compiles its template (or takes the
+//! family's encoder, for checkpoints that publish none) and states the model's facts; a video
+//! family's binds the family's processor to what the workers described.
 //! The bound instance renders chat requests, parses one response at a time and applies a video
 //! family's rules.
 //!
@@ -21,10 +22,10 @@ use scheduling::processing::{
     self as interface, Bind, Bound, ChatFacts, CheckpointFile, Event, ImageSize, Open, Processing,
     Prompt, Refusal, Render, SamplingDefaults, Segment,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::chat::metadata::{self, GenerationConfig, TokenizerConfig};
-use crate::chat::{GenerationPromptMode, HfChatRenderer, MultimodalRenderInfo};
+use crate::chat::{ChatEncoder, GenerationPromptMode, HfChatRenderer, MultimodalRenderInfo};
 use crate::family::{Family, RootFile};
 use crate::image::ImageProcessor;
 use crate::output::{self, Delimiters, Options, Parser};
@@ -63,10 +64,22 @@ enum Binding {
     Video(Box<dyn VideoProcessor>),
 }
 
+/// How a chat binding renders a request into its prompt.
+enum Renderer {
+    /// Through a Jinja chat template: the deployment's, else the checkpoint's.
+    Template(Box<HfChatRenderer>),
+    /// Through the family's encoder, for a checkpoint that publishes no template, with the
+    /// deployment's template arguments under each request's own.
+    Encoder {
+        encoder: &'static dyn ChatEncoder,
+        defaults: Map<String, Value>,
+    },
+}
+
 /// A chat family bound to one checkpoint.
 struct Chat {
     profile: ChatProfile,
-    renderer: HfChatRenderer,
+    renderer: Renderer,
     /// The family's image processor, bound to the checkpoint's processor files; `None` for a
     /// family that serves text alone.
     images: Option<Box<dyn ImageProcessor>>,
@@ -312,19 +325,6 @@ fn bind_chat(
         .unwrap_or_default();
     eos.extend(primary_eos);
 
-    let template = match &bind.chat.template {
-        Some(template) => template.clone(),
-        None => match profile.checkpoint.chat_template {
-            ChatTemplate::TokenizerConfig => tokenizer.chat_template.clone().ok_or_else(|| {
-                format!(
-                    "{} states no chat_template, where the checkpoint's family keeps it",
-                    metadata::TOKENIZER_CONFIG
-                )
-            })?,
-            ChatTemplate::File(name) => required(name)?.to_owned(),
-        },
-    };
-
     // A family that takes images binds its processor to the checkpoint's processor files; a
     // template that reads content parts writes its own image markup, and one that reads
     // flattened content is given the family's.
@@ -352,15 +352,36 @@ fn bind_chat(
     let multimodal = images.as_ref().map(|images| MultimodalRenderInfo {
         placeholder_token: images.markup().to_owned(),
     });
-    let special_tokens = Some(tokenizer.special_tokens).filter(|tokens| !tokens.is_empty());
-    let renderer = HfChatRenderer::new(
-        Some(template),
-        bind.chat.template_kwargs.clone(),
-        bind.chat.content_format,
-    )
-    .map_err(|error| error.to_string())?
-    .with_special_tokens(special_tokens)
-    .with_multimodal(multimodal);
+    // The deployment's template replaces the checkpoint's, or the family's encoder.
+    let template = |source: String| -> Result<Renderer, String> {
+        let special_tokens =
+            Some(tokenizer.special_tokens.clone()).filter(|tokens| !tokens.is_empty());
+        let renderer = HfChatRenderer::new(
+            Some(source),
+            bind.chat.template_kwargs.clone(),
+            bind.chat.content_format,
+        )
+        .map_err(|error| error.to_string())?
+        .with_special_tokens(special_tokens)
+        .with_multimodal(multimodal.clone());
+        Ok(Renderer::Template(Box::new(renderer)))
+    };
+    let renderer = match (&bind.chat.template, profile.checkpoint.chat_template) {
+        (Some(source), _) => template(source.clone())?,
+        (None, ChatTemplate::TokenizerConfig) => {
+            template(tokenizer.chat_template.clone().ok_or_else(|| {
+                format!(
+                    "{} states no chat_template, where the checkpoint's family keeps it",
+                    metadata::TOKENIZER_CONFIG
+                )
+            })?)?
+        }
+        (None, ChatTemplate::File(name)) => template(required(name)?.to_owned())?,
+        (None, ChatTemplate::Encoder(encoder)) => Renderer::Encoder {
+            encoder,
+            defaults: bind.chat.template_kwargs.clone(),
+        },
+    };
 
     // Each delimiter is one token of the vocabulary, whose id decides from the prompt where
     // generation starts.
@@ -494,9 +515,12 @@ impl<F: Families> Processing for Program<F> {
 
     fn render(&mut self, render: Render) -> Result<Prompt, Refusal> {
         let chat = self.chat().map_err(Refusal::new)?;
-        let text = chat
-            .renderer
-            .render(&render, GenerationPromptMode::StartNewAssistant)?;
+        let text = match &chat.renderer {
+            Renderer::Template(renderer) => {
+                renderer.render(&render, GenerationPromptMode::StartNewAssistant)?
+            }
+            Renderer::Encoder { encoder, defaults } => encoder.encode(&render, defaults)?,
+        };
         prompt(text, &render.images, chat.images.as_deref())
     }
 

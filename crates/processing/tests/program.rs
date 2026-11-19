@@ -87,7 +87,16 @@ fn qwen3() -> Bind {
 fn the_module_declares_the_release_families() {
     let families = instance().families().unwrap();
     let ids: Vec<&str> = families.iter().map(|family| family.id.as_str()).collect();
-    assert_eq!(ids, ["qwen3", "qwen3_5_moe", "qwen4_exp", "minimax_h3"]);
+    assert_eq!(
+        ids,
+        [
+            "qwen3",
+            "qwen3_5_moe",
+            "qwen4_exp",
+            "minimax_h3",
+            "deepseek_v41"
+        ]
+    );
     assert!(matches!(families[0].serving, Serving::Chat { .. }));
     assert!(matches!(families[3].serving, Serving::Video(_)));
 
@@ -140,6 +149,99 @@ fn a_bound_instance_renders_and_parses_through_its_exports() {
             Event::Content("b".to_owned()),
         ]
     );
+}
+
+/// The binding of a DeepSeek-V4.1 checkpoint, which publishes no chat template.
+fn deepseek_v41() -> Bind {
+    Bind {
+        family: "deepseek_v41".to_owned(),
+        files: BTreeMap::from([
+            (
+                "config.json".to_owned(),
+                json!({"architectures": ["DeepseekV41ForCausalLM"],
+                    "text_config": {"max_position_embeddings": 1048576}})
+                .to_string(),
+            ),
+            (
+                "tokenizer_config.json".to_owned(),
+                json!({"eos_token": {"__type": "AddedToken", "content": "<｜end▁of▁sentence｜>"}})
+                    .to_string(),
+            ),
+        ]),
+        chat: ChatOptions {
+            reasoning: true,
+            ..ChatOptions::default()
+        },
+        ..Bind::default()
+    }
+}
+
+/// A DeepSeek-V4.1 instance encodes a request with the family's encoder, in thinking mode, and
+/// parses a DSML response cut inside a call's text argument into the call closed where the text
+/// ended; its parser's state crosses to another instance mid-call.
+#[test]
+fn a_deepseek_v41_instance_encodes_and_parses_dsml_calls() {
+    let mut processor = instance();
+    let Bound::Chat(facts) = processor.bind(&deepseek_v41()).unwrap().unwrap() else {
+        panic!("a chat family binds to chat facts");
+    };
+    assert_eq!(facts.max_model_len, 1_048_576);
+
+    let render = Render {
+        messages: vec![Message::User {
+            content: Content::Text("hi".to_owned()),
+        }],
+        ..Render::default()
+    };
+    let prompt = processor.render(&render).unwrap().unwrap();
+    let [Segment::Text(text)] = prompt.segments.as_slice() else {
+        panic!("one text segment: {prompt:?}");
+    };
+    assert!(text.starts_with("<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75"));
+    assert!(
+        text.ends_with("<｜User｜>hi<｜Assistant｜><think>"),
+        "{text}"
+    );
+
+    processor
+        .open(&Open {
+            tools: Some(Vec::new()),
+            prompt: vec![5],
+        })
+        .unwrap()
+        .unwrap();
+    let mut events = processor
+        .push("r</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write\">\n")
+        .unwrap()
+        .unwrap();
+    events.extend(
+        processor
+            .push("<｜DSML｜ parameter name=\"text\" string=\"true\">ab")
+            .unwrap()
+            .unwrap(),
+    );
+    let state = processor.save().unwrap();
+
+    let mut successor = instance();
+    successor.bind(&deepseek_v41()).unwrap().unwrap();
+    successor.restore(&state).unwrap().unwrap();
+    events.extend(successor.push("c").unwrap().unwrap());
+    events.extend(successor.finish().unwrap().unwrap());
+    let arguments: String = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Arguments(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events[0], Event::Reasoning("r".to_owned()));
+    assert_eq!(
+        events[1],
+        Event::ToolCall {
+            name: "write".to_owned()
+        }
+    );
+    assert_eq!(arguments, r#"{"text": "abc"}"#);
 }
 
 /// A parser's state saved by one instance is restored by another, which goes on where the

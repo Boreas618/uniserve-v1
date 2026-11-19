@@ -8,7 +8,9 @@
 //! tool-call format (`tool`, over the format's parser in `tools`). Which parsers a response has
 //! is its family's chat profile, the deployment's choice to answer reasoning apart, and the
 //! tools the request lets the model call. Text a parser holds back as a possible partial
-//! delimiter is released by a later push or by [`Parser::finish`].
+//! delimiter is released by a later push or by [`Parser::finish`]. A tool-call format whose calls
+//! end the turn (`crate::ToolCallFormat::final_region`) also ends reasoning where its calls open,
+//! and from there on the text is the tool stage's alone.
 //!
 //! A parser's whole state is a value ([`State`]), which a handoff carries to the process that
 //! goes on writing the response, as opaque bytes.
@@ -183,9 +185,14 @@ impl Parser {
         delimiters: Result<Option<Delimiters>>,
         format: Option<ToolCallFormat>,
     ) -> Result<Self> {
+        // A format whose calls end the turn ends reasoning at its final region's opening, whether
+        // or not the request lets the model call tools.
+        let opening = format.and_then(ToolCallFormat::final_region);
         let reasoning = match options.reasoning {
             false => None,
-            true => delimiters?.map(DelimitedReasoningParser::new),
+            true => {
+                delimiters?.map(|delimiters| DelimitedReasoningParser::new(delimiters, opening))
+            }
         };
         let tools = match (format, options.tools.as_deref()) {
             (Some(format), Some(tools)) => Some(ToolStage::new(tools::parser(format, tools)?)),
