@@ -41,6 +41,6 @@ Every quantized value is the reference's (`inference/kernel.py`): the projection
 
 ## Limits
 
-- The attention, the indexer and the routed experts run correct-first Triton and trtllm-gen kernels.
+- The attention, the indexer and the routed experts run correct-first Triton and trtllm-gen kernels: on GB200 a cold prefill of a 575K-token prompt takes about 9 minutes, and AgentX's longest prompt (990K tokens) about 23 minutes beside three shorter ones. A prefix hit computes only the prompt past it and the window's pages before its end.
 - A tensor-parallel split of the attention, pipeline and sequence splits, and speculative decoding are refused.
 - Prefill/decode handoffs and the host KV tier do not hold the window.

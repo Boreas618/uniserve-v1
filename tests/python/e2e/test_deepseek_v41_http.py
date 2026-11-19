@@ -350,8 +350,9 @@ def test_a_long_prompt_names_its_code_and_a_prefix_hit_answers_alike(
     # Each completion position's divergence while both have generated the
     # same tokens before it; the candidates' rest is what they leave.
     divergences = []
+    # Answers that part may end at different lengths.
     for position, (first, again) in enumerate(
-        zip(_answer_candidates(cold), _answer_candidates(hit), strict=True)
+        zip(_answer_candidates(cold), _answer_candidates(hit), strict=False)
     ):
         if tokens[0][:position] != tokens[1][:position]:
             break
