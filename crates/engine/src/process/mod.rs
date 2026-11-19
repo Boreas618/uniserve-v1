@@ -199,7 +199,11 @@ pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
         .map_err(std::io::Error::from)
         .and_then(|endpoint| Connection::connect(&endpoint))
         .with_context(|| format!("connecting to the daemon's requests at {}", launch.requests))?;
-    let window = connect(&mut requests, &launch)?;
+    let (window, agreed) = connect(&mut requests, &launch)?;
+    tracing::info!(
+        version = agreed.0,
+        "the daemon serves this engine in its version of the engine interface"
+    );
 
     // What fails before the control thread runs is said on the request interface: the daemon
     // waits for the state a start ends in, and a connection that closes says only that it went.
@@ -215,7 +219,7 @@ pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
                     launch.processes
                 )
             })?;
-        let (storage, filed) = daemon::claim(&mut process, &launch)?;
+        let (storage, filed) = daemon::claim(&mut process, &launch, agreed)?;
         Ok((process, storage, filed))
     });
     let (process, storage, filed) = match claimed {
@@ -231,7 +235,7 @@ pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
         }
     };
 
-    let main = MainProcess::new(requests, window, process, launch)?;
+    let main = MainProcess::new(requests, window, agreed, process, launch)?;
     let lost = main.link_closed();
     let registry = registry.clone();
     let start: Start = Box::new(move |launch| {
@@ -310,8 +314,8 @@ fn check(launch: &EngineArgs) -> Result<()> {
 }
 
 /// Runs the control thread over `requests`, the daemon's request connection after [`connect`],
-/// and `process`, its process interface, with the engine `start` builds from `launch`, until the
-/// daemon shuts the engine down or closes both interfaces.
+/// which agreed on `agreed`, and `process`, its process interface, with the engine `start` builds
+/// from `launch`, until the daemon shuts the engine down or closes both interfaces.
 ///
 /// # Errors
 ///
@@ -321,11 +325,12 @@ fn check(launch: &EngineArgs) -> Result<()> {
 pub fn serve(
     requests: Connection,
     window: NonZeroU32,
+    agreed: proto::Agreed,
     process: Connection,
     launch: EngineArgs,
     start: Start,
 ) -> std::result::Result<(), Failed> {
-    MainProcess::new(requests, window, process, launch)?.serve(start, Vec::new())
+    MainProcess::new(requests, window, agreed, process, launch)?.serve(start, Vec::new())
 }
 
 /// The control thread's state, touched on that thread only.
@@ -338,6 +343,9 @@ pub(crate) struct MainProcess {
     /// The event window each front stated in its welcome, by front: a request it submits is sent
     /// no more events ahead of its consumption reports.
     windows: Vec<NonZeroU32>,
+    /// The version of the engine interface this process speaks on every link: the one its
+    /// request link agreed on, which every daemon it attaches to serves it in.
+    agreed: proto::Agreed,
     /// The write half of the process interface; `None` once the daemon closed it.
     process: Option<Connection>,
     launch: EngineArgs,
@@ -401,6 +409,7 @@ impl MainProcess {
     fn new(
         requests: Connection,
         window: NonZeroU32,
+        agreed: proto::Agreed,
         process: Connection,
         launch: EngineArgs,
     ) -> Result<Self> {
@@ -437,6 +446,7 @@ impl MainProcess {
             inbox,
             fronts: vec![Some(front)],
             windows: vec![window],
+            agreed,
             process: Some(writer),
             watchdog: Watchdog::new(launch.engine_config.worker.watchdog_timeout)?,
             launch,
@@ -1634,12 +1644,13 @@ impl MainProcess {
                 // connection; it waits on a thread of its own, so that no operation waits behind
                 // it.
                 let engine = self.launch.engine;
+                let agreed = self.agreed;
                 let inbox = self.inbox.0.clone();
                 let attaching =
                     std::thread::Builder::new()
                         .name("attach".to_owned())
                         .spawn(move || {
-                            let attached = daemon::attach(&attach.requests, engine);
+                            let attached = daemon::attach(&attach.requests, engine, agreed);
                             let _ = inbox.send(done(move |main| {
                                 main.attached(&attach.requests, attached);
                             }));

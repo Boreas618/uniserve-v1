@@ -9,11 +9,11 @@ use crate::protocol::{ErrorKind, Refusal};
 pub enum Error {
     #[error("storage server connection: {0}")]
     Io(#[from] io::Error),
-    /// The server refused the hello because it speaks another version of the
-    /// protocol than this client ([`Refusal::Version`]): `offered` is this
-    /// client's, `spoken` the server's.
-    #[error("the storage server speaks version {spoken}, this client {offered}")]
-    Version { offered: u32, spoken: u32 },
+    /// The server refused the hello because the windows of the protocol's
+    /// versions it and this client speak share none ([`Refusal::Version`]),
+    /// which the refusal names.
+    #[error("the storage server refused this client's versions: {0}")]
+    Version(crate::protocol::VersionRefusal),
     /// The server refused the connection's hello for another reason.
     #[error("the storage server refused the connection: {0}")]
     Refused(Refusal),

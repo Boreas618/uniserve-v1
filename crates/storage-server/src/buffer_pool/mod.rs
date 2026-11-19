@@ -57,7 +57,7 @@ use storage::runtime::{
     Cause, Completion, GroupId, Groups, OwnerId, Request, RequestId, Segments, Stamps, Tier,
 };
 
-pub(crate) use image::FORMAT;
+pub(crate) use image::FORMATS;
 pub use lends::{ImportWork, LentBlocks, NamedRun};
 use region::{Region, Run};
 /// A kind of block, as a session states it in its layout; the pool keeps

@@ -422,6 +422,13 @@ impl ClaimHolder {
         })
     }
 
+    /// The version of the Storage Server protocol the claim's connection agreed on at its hello,
+    /// once an engine claimed the node: a hot restart's successor goes on with the connection in
+    /// it.
+    pub(crate) fn version(&self) -> Option<u32> {
+        self.claim.as_ref().map(|(client, _)| client.version())
+    }
+
     /// The claim this node holds of `deployment`.
     fn held(&mut self, deployment: &str) -> anyhow::Result<&mut storage::ClaimClient> {
         self.claim

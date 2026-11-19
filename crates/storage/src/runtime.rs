@@ -17,19 +17,25 @@
 //! reader, which the buffer pool answers with [`Completion::Refused`] where
 //! it can read the number and drops otherwise.
 //!
-//! The version is stated when a session is opened ([`Open::version`]): an
-//! engine speaks the version of its build, [`VERSION`], and the buffer pool
-//! opens a session only of that version, refusing an `Open` of another. A
-//! change of a request, a completion or the `Open` is a new version, which
-//! the engines of the next release speak.
+//! The interface is versioned ([`VERSIONS`]): an engine states the window of
+//! versions its build speaks when it opens a session ([`Open::oldest`],
+//! [`Open::newest`]), and the buffer pool opens the session in the newest
+//! version both speak, which [`Opened::version`] states, refusing an `Open`
+//! whose window shares none with its own, naming both windows. The versions of
+//! a window are one encoding: a version adds a request or a completion
+//! variant, or a field at the end of a variant's record, and a writer writes
+//! what a version added only on a session whose agreed version has it; a
+//! change that is not an addition keeps the previous version's records beside
+//! its own, selected by the session's agreed version, until the window's
+//! oldest version passes them.
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Key, Result, Segment};
 
-/// The version of this interface that this build's engine and buffer pool
-/// speak, the one version either accepts.
-pub const VERSION: u32 = 12;
+/// The versions of this interface that this build's engine and buffer pool
+/// speak; a session is opened in the newest version both sides speak.
+pub const VERSIONS: service::Versions = service::Versions::one(12);
 
 /// The clock every instant of this interface is stated in: the host's
 /// monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds since an unspecified
@@ -112,9 +118,14 @@ pub enum Cause {
 /// the answer is [`Opened`], with one queue pair's descriptors per scheduler.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Open {
-    /// The version of this interface the engine speaks: its build's
-    /// [`VERSION`], the one the buffer pool opens a session of.
-    pub version: u32,
+    /// The oldest version of this interface the engine speaks (its build's
+    /// [`VERSIONS`]), its one version when it states no [`Open::newest`].
+    #[serde(rename = "version")]
+    pub oldest: u32,
+    /// The newest version of this interface the engine speaks; `None` for an
+    /// engine of one version.
+    #[serde(default)]
+    pub newest: Option<u32>,
     /// The engine epoch, and whether its update is on trial.
     pub epoch: u64,
     pub trial: bool,
@@ -309,6 +320,57 @@ pub struct Opened {
     /// The session's number in the buffer pool of its deployment on the host, which a
     /// [`Lender`] names it by. The pool never gives a number twice.
     pub session: u32,
+    /// The version of this interface the session is opened in: the newest the [`Open`] and the
+    /// buffer pool both speak. `None` from a buffer pool of one version, which opens the
+    /// `Open`'s oldest.
+    #[serde(default)]
+    pub version: Option<u32>,
+}
+
+impl Open {
+    /// The window of versions this `Open` states; `None` for one no engine speaks.
+    pub fn versions(&self) -> Option<service::Versions> {
+        service::Versions::stated(self.oldest, self.newest.unwrap_or(0))
+    }
+
+    /// The version a buffer pool of the window `spoken` opens this session in: the newest both
+    /// speak.
+    ///
+    /// # Errors
+    ///
+    /// The refusal, naming both windows, when they share no version.
+    pub fn agree(&self, spoken: service::Versions) -> std::result::Result<u32, String> {
+        self.versions()
+            .and_then(|offered| offered.agree(spoken))
+            .ok_or_else(|| {
+                let offered = self.versions().map_or_else(
+                    || format!("{} to {}", self.oldest, self.newest.unwrap_or(0)),
+                    |window| window.to_string(),
+                );
+                format!(
+                    "the engine speaks versions {offered} of the buffer pool's interface and the \
+                     buffer pool {spoken}, which share none"
+                )
+            })
+    }
+}
+
+impl Opened {
+    /// The version the session agreed on, as an engine that opened it with `offered` reads it.
+    ///
+    /// # Errors
+    ///
+    /// When the buffer pool states a version the offer does not hold.
+    pub fn agreed(&self, offered: service::Versions) -> std::result::Result<u32, String> {
+        match self.version {
+            None => Ok(offered.oldest()),
+            Some(version) if offered.speaks(version) => Ok(version),
+            Some(version) => Err(format!(
+                "the buffer pool opened the session in version {version} of its interface, \
+                 which an engine of versions {offered} does not speak"
+            )),
+        }
+    }
 }
 
 /// The owner whose blocks another replica imports in a handoff ([`Request::Lend`],
@@ -1163,7 +1225,7 @@ impl Request {
             }
             other => {
                 return Err(Error::Protocol(format!(
-                    "request variant {other} is not of version {VERSION}"
+                    "request variant {other} is of no version this build speaks ({VERSIONS})"
                 )));
             }
         };
@@ -1391,7 +1453,7 @@ impl Completion {
             },
             other => {
                 return Err(Error::Protocol(format!(
-                    "completion variant {other} is not of version {VERSION}"
+                    "completion variant {other} is of no version this build speaks ({VERSIONS})"
                 )));
             }
         };
@@ -1403,6 +1465,49 @@ impl Completion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty layout that states the window `versions`.
+    fn open_of(oldest: u32, newest: Option<u32>) -> Open {
+        Open {
+            oldest,
+            newest,
+            epoch: 1,
+            trial: false,
+            regions: Vec::new(),
+            classes: Vec::new(),
+            trajectory: 0,
+            groups: Vec::new(),
+            schedulers: Vec::new(),
+        }
+    }
+
+    /// A buffer pool opens a session in the newest version both windows hold, and refuses an
+    /// `Open` whose window shares none, naming both; an engine reads the agreed version, a pool
+    /// of one version stating none.
+    #[test]
+    fn a_session_opens_in_the_newest_version_both_speak() {
+        let pool = service::Versions::new(12, 13);
+        assert_eq!(open_of(12, Some(13)).agree(pool), Ok(13));
+        assert_eq!(open_of(13, Some(14)).agree(pool), Ok(13));
+        assert_eq!(open_of(12, None).agree(pool), Ok(12));
+
+        let refusal = open_of(14, Some(15)).agree(pool).unwrap_err();
+        assert!(refusal.contains("versions 14 to 15"), "{refusal}");
+        assert!(refusal.contains("buffer pool 12 to 13"), "{refusal}");
+
+        let opened = |version| Opened {
+            regions: Vec::new(),
+            segments: Vec::new(),
+            limits: Vec::new(),
+            registers: Vec::new(),
+            session: 0,
+            version,
+        };
+        let offered = service::Versions::new(12, 13);
+        assert_eq!(opened(None).agreed(offered), Ok(12));
+        assert_eq!(opened(Some(13)).agreed(offered), Ok(13));
+        assert!(opened(Some(14)).agreed(offered).is_err());
+    }
 
     fn key(byte: u8) -> Key {
         Key([byte; 32])

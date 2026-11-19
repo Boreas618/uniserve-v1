@@ -217,16 +217,20 @@ impl EngineControl {
             controls.push(self.spawn(launch, inherit)?);
         }
         let mut links = Vec::with_capacity(launches.len());
+        let mut versions = Vec::with_capacity(launches.len());
         for (launch, control) in launches.iter().zip(controls.iter_mut()) {
-            links.push(self.welcome(launch.engine, control)?);
+            let (reader, writer, version) = self.welcome(launch.engine, control)?;
+            links.push((reader, writer));
+            versions.push(version);
         }
         let started = await_started(&mut links, &mut controls, &launches, parked)?;
 
         let mut clients = Vec::with_capacity(launches.len());
         let mut sinks = std::iter::once(stats);
-        for (((reader, writer), control), (launch, (info, state))) in links
+        for ((((reader, writer), control), version), (launch, (info, state))) in links
             .into_iter()
             .zip(controls)
+            .zip(versions)
             .zip(launches.iter().zip(started))
         {
             // A peer holds no scheduler, so it reports no statistics.
@@ -234,7 +238,8 @@ impl EngineControl {
             clients.push(
                 EngineClient::new(reader, writer, epoch, info, state, sink, Some(control))?
                     .numbered(launch.engine)
-                    .on_host(&launch.host),
+                    .on_host(&launch.host)
+                    .speaking(version),
             );
         }
         let mut clients = clients.into_iter();
@@ -328,16 +333,16 @@ impl EngineControl {
     }
 
     /// Accepts engine `engine`'s request link and welcomes it ([`welcome`]); returns the link's
-    /// two ends.
+    /// two ends and the version of the engine interface it agreed on.
     fn welcome(
         &self,
         engine: u64,
         control: &mut Connection,
-    ) -> anyhow::Result<(Connection, Connection)> {
+    ) -> anyhow::Result<(Connection, Connection, u32)> {
         let (reader, mut writer, hello) = self.accept(engine, Some(control))?;
-        welcome(&mut writer, &hello, engine)?;
-        tracing::info!(engine, build = %hello.build, "the engine process connected; awaiting its start");
-        Ok((reader, writer))
+        let version = welcome(&mut writer, &hello, engine)?;
+        tracing::info!(engine, build = %hello.build, version, "the engine process connected; awaiting its start");
+        Ok((reader, writer, version))
     }
 
     /// The deployment the engines serve, which names its storage at the Storage Servers.
@@ -375,8 +380,8 @@ impl EngineControl {
     ///
     /// # Errors
     ///
-    /// Fails when an engine does not connect in time, speaks a major version this daemon does not,
-    /// fails to start, or exits before it stated that it parked.
+    /// Fails when an engine does not connect in time, speaks no version of the engine interface
+    /// this daemon speaks, fails to start, or exits before it stated that it parked.
     pub fn join_target(
         &self,
         processes: &[(String, u64)],
@@ -402,11 +407,11 @@ impl EngineControl {
     /// its request link, which ends the wait ([`await_start`]).
     fn join(&self, engine: u64, epoch: u64, stats: StatsSink) -> anyhow::Result<EngineClient> {
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
-        welcome(&mut writer, &hello, engine)?;
+        let version = welcome(&mut writer, &hello, engine)?;
         let (info, known) = await_start(&mut reader)?;
-        tracing::info!(engine, build = %hello.build, "the update's target joined this daemon");
+        tracing::info!(engine, build = %hello.build, version, "the update's target joined this daemon");
         EngineClient::new(reader, writer, epoch, info, known, stats, None)
-            .map(|client| client.numbered(engine))
+            .map(|client| client.numbered(engine).speaking(version))
     }
 
     /// Takes over the engine `engine` a daemon this one replaced started,
@@ -421,7 +426,8 @@ impl EngineControl {
     /// # Errors
     ///
     /// Fails when the engine's process exits or its request link closes before it states its
-    /// state, when it speaks another version of the engine interface than this daemon, is another
+    /// state, when it speaks no version of the engine interface this daemon speaks (an engine
+    /// attaching to a successor of another build offers the one version it speaks), is another
     /// engine, or reports anything but ready.
     pub fn adopt(
         &self,
@@ -433,7 +439,7 @@ impl EngineControl {
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
         let (mut reader, mut writer, hello) = self.accept(engine, control.as_mut())?;
-        welcome(&mut writer, &hello, engine)?;
+        let version = welcome(&mut writer, &hello, engine)?;
         loop {
             // An attaching engine states its state right after the welcome.
             let message: wire::FromEngine = reader.recv_next()?;
@@ -444,7 +450,7 @@ impl EngineControl {
                     state.error
                 );
                 let info = state.info.context("the engine reported no info")?;
-                tracing::info!(engine, build = %hello.build, "the engine attached");
+                tracing::info!(engine, build = %hello.build, version, "the engine attached");
                 // A daemon adopts the engine of its own node, which runs on this host: the
                 // updater names the processes it drains and commands by their host
                 // (`EngineClient::processes`), as it does for an engine this control started.
@@ -457,7 +463,12 @@ impl EngineControl {
                     stats,
                     control,
                 )
-                .map(|client| client.numbered(engine).on_host(&self.host));
+                .map(|client| {
+                    client
+                        .numbered(engine)
+                        .on_host(&self.host)
+                        .speaking(version)
+                });
             }
         }
     }
@@ -469,7 +480,8 @@ impl EngineControl {
         let mut control = Connection::connect(&self.processes)
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
         control.deliver(&process::Hello {
-            major: proto::ENGINE_INTERFACE_VERSION,
+            oldest: proto::ENGINE_INTERFACE.oldest(),
+            newest: proto::ENGINE_INTERFACE.newest(),
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(process::Engine {
                 deployment: self.deployment.clone(),
@@ -1008,8 +1020,10 @@ impl EngineControl {
 /// Answers the hello `hello` that engine `engine` said on its request link with this daemon's
 /// welcome, written on `writer`, the link's write half: the daemon's half of the request
 /// interface's handshake, wherever the link was made (this control's request socket, or a pair a
-/// test made). An engine of another version of the engine interface than this daemon's, or one
-/// that states another number, is refused in the welcome with the typed refusal.
+/// test made). The engine is served in the newest version of the engine interface both windows
+/// hold ([`proto::ENGINE_INTERFACE`]), which the welcome states; an engine whose window shares
+/// none with this daemon's, or one that states another number, is refused in the welcome with the
+/// typed refusal. Returns the version agreed on.
 ///
 /// # Errors
 ///
@@ -1018,24 +1032,28 @@ pub(crate) fn welcome(
     writer: &mut Connection,
     hello: &wire::Hello,
     engine: u64,
-) -> anyhow::Result<()> {
-    let refusal = wire::Refusal::of_version(hello.major).or_else(|| {
-        (hello.engine != engine).then_some(wire::Refusal {
-            reason: Some(wire::refusal::Reason::Engine(wire::EngineMismatch {
-                stated: hello.engine,
-                expected: engine,
-            })),
-        })
-    });
+) -> anyhow::Result<u32> {
+    let agreed = proto::agree(hello.oldest, hello.newest, proto::ENGINE_INTERFACE)
+        .map_err(wire::Refusal::of_versions)
+        .and_then(|version| {
+            if hello.engine == engine {
+                Ok(version)
+            } else {
+                Err(wire::Refusal {
+                    reason: Some(wire::refusal::Reason::Engine(wire::EngineMismatch {
+                        stated: hello.engine,
+                        expected: engine,
+                    })),
+                })
+            }
+        });
     writer.deliver(&wire::Welcome {
         build: proto::BUILD.to_owned(),
-        refusal,
+        refusal: agreed.as_ref().err().cloned(),
         event_window: crate::engine::client::EVENT_WINDOW,
+        version: agreed.as_ref().map_or(0, |version| *version),
     })?;
-    match refusal {
-        Some(refusal) => Err(anyhow::Error::new(refusal).context("refused the engine")),
-        None => Ok(()),
-    }
+    agreed.map_err(|refusal| anyhow::Error::new(refusal).context("refused the engine"))
 }
 
 /// What the state `state` an engine states on its request link says of its start: the state the

@@ -574,7 +574,8 @@ impl Deployment {
             .collect();
 
         runtime::Open {
-            version: runtime::VERSION,
+            oldest: runtime::VERSIONS.oldest(),
+            newest: Some(runtime::VERSIONS.newest()),
             epoch: 1,
             trial: false,
             regions,

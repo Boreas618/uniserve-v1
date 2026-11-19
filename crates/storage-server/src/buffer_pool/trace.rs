@@ -334,7 +334,7 @@ impl Trace {
 #[cfg(test)]
 mod tests {
     use storage::protocol::{Key, Segment};
-    use storage::runtime::{GroupId, Open, OwnerId, RequestId, VERSION};
+    use storage::runtime::{GroupId, Open, OwnerId, RequestId, VERSIONS};
 
     use super::Input;
 
@@ -348,7 +348,8 @@ mod tests {
             ordinal: 5,
         };
         let open = Open {
-            version: VERSION,
+            oldest: VERSIONS.oldest(),
+            newest: Some(VERSIONS.newest()),
             epoch: 6,
             trial: true,
             regions: Vec::new(),

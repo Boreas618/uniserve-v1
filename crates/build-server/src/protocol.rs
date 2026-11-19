@@ -41,6 +41,21 @@ pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/uniserve.build_server.rs"));
 }
 
+/// The interface versions a module's record states on the wire: `oldest` to `newest`, where an
+/// unset `oldest` is `newest` alone.
+///
+/// # Errors
+///
+/// [`Error::Protocol`] for versions no module implements: a newest of 0, or an oldest above it.
+fn recorded_interface(oldest: u32, newest: u32) -> Result<service::Versions> {
+    let oldest = if oldest == 0 { newest } else { oldest };
+    service::Versions::stated(oldest, newest).ok_or_else(|| {
+        Error::Protocol(format!(
+            "a module states interface versions {oldest} to {newest}, which no module implements"
+        ))
+    })
+}
+
 /// An installed package.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Package {
@@ -123,10 +138,10 @@ pub struct Module {
     /// (design section 4.2): [`LAUNCH_ENTRY`](crate::manifest::LAUNCH_ENTRY)
     /// and any lifecycle entries around it.
     pub entries: std::collections::BTreeMap<String, String>,
-    /// The version of the interface the module's package implements, as the
-    /// store recorded it when the module was built. Its loader compares it
-    /// with the version it was built for and refuses another.
-    pub interface_version: u32,
+    /// The versions of the interface the module's package implements, as the
+    /// store recorded them when the module was built. Its loader compares them
+    /// with the versions it speaks and refuses a module that shares none.
+    pub interface: service::Versions,
     /// An executable module's entry: the name among [`Self::files`] of the
     /// executable its process runs as, which the package's manifest names
     /// (`[source] binary`); `None` for every other form.
@@ -142,8 +157,8 @@ pub struct ModuleEntry {
     pub target: Target,
     pub descriptor: String,
     pub form: ModuleForm,
-    /// The interface version the module was built for.
-    pub interface_version: u32,
+    /// The interface versions the module was built for.
+    pub interface: service::Versions,
 }
 
 /// What `cover` asks: which installed package the Build Server selects for
@@ -575,7 +590,10 @@ impl Client {
                         files,
                         metadata: (!resolved.metadata.is_empty()).then_some(resolved.metadata),
                         entries: resolved.entries.into_iter().collect(),
-                        interface_version: resolved.interface_version,
+                        interface: recorded_interface(
+                            resolved.interface_oldest,
+                            resolved.interface_version,
+                        )?,
                         executable: (!resolved.executable.is_empty())
                             .then_some(resolved.executable),
                         origin: Origin {
@@ -615,7 +633,10 @@ impl Client {
                             target: Target::new(module.target),
                             descriptor: module.descriptor,
                             form,
-                            interface_version: module.interface_version,
+                            interface: recorded_interface(
+                                module.interface_oldest,
+                                module.interface_version,
+                            )?,
                         });
                     }
                     packages.push((

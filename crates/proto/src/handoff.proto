@@ -14,11 +14,13 @@
 // is a submission: the request's facts travel as the record of what the
 // response's pipeline processed, not to be sent again.
 //
-// The schema is one version of the engine interface
-// (`proto::ENGINE_INTERFACE_VERSION`), which a successor states at its hello
-// and a predecessor of another version refuses, so the two ends of a handoff
-// always read one schema. A successor that cannot read a state it is handed
-// refuses the whole handoff before it takes any response over, and the
+// The schema is part of the engine interface (`proto::ENGINE_INTERFACE`):
+// a predecessor states the window it speaks before it hands anything over,
+// the successor agrees on the newest version both speak or refuses the
+// restart, and the predecessor writes every state in the agreed version. The
+// messages change only by additions, so the two ends of a handoff read one
+// schema across their window. A successor that cannot read a state it is
+// handed refuses the whole handoff before it takes any response over, and the
 // predecessor goes on serving as after any refused restart.
 
 syntax = "proto3";

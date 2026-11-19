@@ -73,7 +73,7 @@ fn a_published_module_is_found_with_its_files_and_the_mark_is_not_one_of_them() 
             &path(),
             &workspace,
             &["module.cubin".to_owned(), "metadata.json".to_owned()],
-            1,
+            service::Versions::one(1),
         )
         .unwrap();
 
@@ -105,15 +105,16 @@ fn a_directory_without_a_recorded_mark_is_not_a_module() {
     for path in [path_at(3), path_at(4)] {
         assert!(!store.contains(&path), "{path} is no module");
         assert!(store.files(&path).unwrap().is_none());
-        assert_eq!(store.interface_version(&path), None);
+        assert_eq!(store.interface(&path), None);
     }
     assert!(store.list().unwrap().is_empty());
 }
 
-/// A module's mark records the version of the interface its package
-/// implements, which `resolve` hands to the loader with its files.
+/// A module's mark records the versions of the interface its package
+/// implements, which `resolve` hands to the loader with its files; a mark of a
+/// module of one version that states no oldest records that version alone.
 #[test]
-fn a_module_records_the_interface_version_it_was_built_for() {
+fn a_module_records_the_interface_versions_it_was_built_for() {
     let temporary = tempfile::tempdir().unwrap();
     let store = store(&temporary.path().join("store"));
     let workspace = workspace(
@@ -122,10 +123,26 @@ fn a_module_records_the_interface_version_it_was_built_for() {
     );
 
     store
-        .publish(&path(), &workspace, &["module.cubin".to_owned()], 2)
+        .publish(
+            &path(),
+            &workspace,
+            &["module.cubin".to_owned()],
+            service::Versions::new(2, 3),
+        )
         .unwrap();
-    assert_eq!(store.interface_version(&path()), Some(2));
+    assert_eq!(store.interface(&path()), Some(service::Versions::new(2, 3)));
     assert_eq!(store.list().unwrap(), [path()]);
+
+    let single = path_at(5);
+    let directory = store.directory(&single);
+    write(
+        &directory,
+        &[
+            ("module.cubin", b"one version"),
+            (COMMITTED, b"interface_version = 4\n"),
+        ],
+    );
+    assert_eq!(store.interface(&single), Some(service::Versions::one(4)));
 }
 
 #[test]
@@ -140,7 +157,12 @@ fn a_module_of_a_shared_read_only_root_is_found_and_never_written() {
         &[("module.cubin", b"shared cubin")],
     );
     self::store(&shared)
-        .publish(&path(), &elsewhere, &["module.cubin".to_owned()], 1)
+        .publish(
+            &path(),
+            &elsewhere,
+            &["module.cubin".to_owned()],
+            service::Versions::one(1),
+        )
         .unwrap();
 
     let store = Store::open(vec![
@@ -164,7 +186,12 @@ fn a_module_of_a_shared_read_only_root_is_found_and_never_written() {
         &[("module.cubin", b"built cubin")],
     );
     store
-        .publish(&path(), &here, &["module.cubin".to_owned()], 1)
+        .publish(
+            &path(),
+            &here,
+            &["module.cubin".to_owned()],
+            service::Versions::one(1),
+        )
         .unwrap();
     assert_eq!(
         fs::read(shared.join(path().relative()).join("module.cubin")).unwrap(),
@@ -187,20 +214,30 @@ fn a_committed_module_is_never_replaced() {
         &[("module.cubin", b"first")],
     );
     store
-        .publish(&path(), &first, &["module.cubin".to_owned()], 1)
+        .publish(
+            &path(),
+            &first,
+            &["module.cubin".to_owned()],
+            service::Versions::one(1),
+        )
         .unwrap();
 
     let second = workspace(
         &temporary.path().join("second"),
         &[("module.cubin", b"second")],
     );
-    match store.publish(&path(), &second, &["module.cubin".to_owned()], 2) {
+    match store.publish(
+        &path(),
+        &second,
+        &["module.cubin".to_owned()],
+        service::Versions::one(2),
+    ) {
         Err(Error::Io(error)) => assert_eq!(error.kind(), io::ErrorKind::AlreadyExists),
         other => panic!("a second publish returned {other:?}"),
     }
     let files = store.files(&path()).unwrap().unwrap();
     assert_eq!(fs::read(&files[0].1).unwrap(), b"first");
-    assert_eq!(store.interface_version(&path()), Some(1));
+    assert_eq!(store.interface(&path()), Some(service::Versions::one(1)));
 }
 
 /// A writer stages a module beside its place, in a directory it owns through
@@ -233,7 +270,12 @@ fn a_publish_sweeps_a_crashed_writers_staging_and_leaves_a_live_ones() {
         &[("module.cubin", b"whole")],
     );
     store
-        .publish(&path(), &workspace, &["module.cubin".to_owned()], 1)
+        .publish(
+            &path(),
+            &workspace,
+            &["module.cubin".to_owned()],
+            service::Versions::one(1),
+        )
         .unwrap();
 
     assert_eq!(
@@ -260,7 +302,12 @@ fn list_names_every_committed_module_of_every_root_once() {
     );
     let publish = |root: &Path, path: &ModulePath| {
         self::store(root)
-            .publish(path, &workspace, &["module.cubin".to_owned()], 1)
+            .publish(
+                path,
+                &workspace,
+                &["module.cubin".to_owned()],
+                service::Versions::one(1),
+            )
             .unwrap();
     };
     // This host built revisions 3 and 4; another host built 3 and 5 into the
@@ -315,7 +362,12 @@ fn a_build_may_not_publish_a_file_outside_the_module_directory() {
     );
 
     for name in ["/etc/passwd", "../escape", "tuning/../../escape"] {
-        let refused = store.publish(&path(), &cubin, &[name.to_owned()], 1);
+        let refused = store.publish(
+            &path(),
+            &cubin,
+            &[name.to_owned()],
+            service::Versions::one(1),
+        );
         assert!(refused.is_err(), "{name:?} escapes the module directory");
         assert!(!store.contains(&path()));
     }
@@ -325,7 +377,12 @@ fn a_build_may_not_publish_a_file_outside_the_module_directory() {
         &[("tuning/tactics.json", b"{}")],
     );
     store
-        .publish(&path(), &tuning, &["tuning/tactics.json".to_owned()], 1)
+        .publish(
+            &path(),
+            &tuning,
+            &["tuning/tactics.json".to_owned()],
+            service::Versions::one(1),
+        )
         .unwrap();
     let files = store.files(&path()).unwrap().unwrap();
     assert_eq!(files[0].0, "tuning/tactics.json");

@@ -262,11 +262,20 @@ fn started(
     let hello: wire::Hello = requests.recv(LONG).unwrap().unwrap();
     assert_eq!(hello.engine, launch.engine);
     assert_eq!(hello.interface, proto::process::Interface::Requests as i32);
+    // The first hello offers every version of the engine interface the build speaks.
+    assert_eq!(
+        (hello.oldest, hello.newest),
+        (
+            proto::ENGINE_INTERFACE.oldest(),
+            proto::ENGINE_INTERFACE.newest()
+        )
+    );
     requests
         .deliver(&wire::Welcome {
             build: proto::BUILD.to_owned(),
             refusal: None,
             event_window: 64,
+            version: proto::ENGINE_INTERFACE.newest(),
         })
         .unwrap();
     let from_engine::Kind::State(starting) = next(&mut requests, LONG) else {
@@ -277,6 +286,14 @@ fn started(
     // The process interface: hello, welcome, the claim answered with the Storage Server.
     let mut processes = accept(&processes_socket, &mut engine, LONG);
     let hello: proto::process::Hello = processes.recv(LONG).unwrap().unwrap();
+    // Every later link offers the one version the request link agreed on.
+    assert_eq!(
+        (hello.oldest, hello.newest),
+        (
+            proto::ENGINE_INTERFACE.newest(),
+            proto::ENGINE_INTERFACE.newest()
+        )
+    );
     assert!(matches!(
         hello.peer,
         Some(proto::process::hello::Peer::Engine(proto::process::Engine { engine, .. }))
@@ -291,6 +308,7 @@ fn started(
                 host: "localhost".to_owned(),
                 address: String::new(),
             }],
+            version: proto::ENGINE_INTERFACE.newest(),
         })
         .unwrap();
     let claim: proto::process::Upstream = processes.recv(LONG).unwrap().unwrap();
@@ -357,7 +375,8 @@ fn holds_session(storage: &StorageServer, epoch: u64, generation: u64) -> bool {
     )
     .unwrap();
     let empty = storage::runtime::Open {
-        version: storage::runtime::VERSION,
+        oldest: storage::runtime::VERSIONS.oldest(),
+        newest: Some(storage::runtime::VERSIONS.newest()),
         epoch,
         trial: false,
         regions: Vec::new(),

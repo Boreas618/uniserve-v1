@@ -16,7 +16,7 @@ use std::os::unix::fs::FileExt;
 
 use ::storage::protocol::UnitRun;
 use ::storage::runtime::{
-    Class, Completion, Group, GroupId, Lender, Open, OwnerId, Request, Tier, VERSION,
+    Class, Completion, Group, GroupId, Lender, Open, OwnerId, Request, Tier, VERSIONS,
 };
 use ::storage::{Access, Claimant, Key, Location};
 
@@ -179,7 +179,8 @@ fn processes() -> Open {
         parts: Vec::new(),
     };
     Open {
-        version: VERSION,
+        oldest: VERSIONS.oldest(),
+        newest: Some(VERSIONS.newest()),
         epoch: 0,
         trial: false,
         regions: vec![

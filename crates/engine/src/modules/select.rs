@@ -138,24 +138,24 @@ pub(crate) fn served<'a>(selections: impl IntoIterator<Item = &'a Packages>) -> 
     served
 }
 
-/// Refuses a module built for another version of `operator`'s interface than this build
+/// Refuses a module that implements none of the version of `operator`'s interface this build
 /// launches (`proto::module::operator::version`).
 ///
-/// `built_for` is the version the Build Server recorded with the module, which its package's
-/// manifest states. A module of another version would be launched through a descriptor or an
-/// argument layout it was not written for, so the generation that names it is not installed and
-/// what serves is untouched.
+/// `built_for` are the versions the Build Server recorded with the module, which its package's
+/// manifest states (one version for a kernel package). A module of another version would be
+/// launched through a descriptor or an argument layout it was not written for, so the generation
+/// that names it is not installed and what serves is untouched.
 pub(crate) fn interface_agrees(
     operator: &str,
     package: &PackageRevision,
-    built_for: u32,
+    built_for: service::Versions,
 ) -> std::result::Result<(), String> {
     let launched = proto::module::operator::version(operator);
-    if built_for == launched {
+    if built_for.speaks(launched) {
         return Ok(());
     }
     Err(format!(
-        "the {operator} package {} revision {} implements version {built_for} of the operator's \
+        "the {operator} package {} revision {} implements versions {built_for} of the operator's \
          interface and this engine launches version {launched}",
         package.backend, package.revision
     ))
@@ -427,8 +427,9 @@ mod tests {
         let package = package("triton", 4);
         let launched = proto::module::operator::version("rms_norm");
 
-        interface_agrees("rms_norm", &package, launched).expect("the versions agree");
-        let refusal = interface_agrees("rms_norm", &package, launched + 1)
+        interface_agrees("rms_norm", &package, service::Versions::one(launched))
+            .expect("the versions agree");
+        let refusal = interface_agrees("rms_norm", &package, service::Versions::one(launched + 1))
             .expect_err("another version is refused");
         assert!(refusal.contains("rms_norm"), "{refusal}");
         assert!(refusal.contains("triton"), "{refusal}");

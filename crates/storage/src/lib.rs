@@ -9,7 +9,7 @@
 //! deployment on the node, so that a restarted worker maps the retained storage
 //! instead of loading it again.
 //!
-//! - [`protocol`]: the messages, of one version per release checked at the
+//! - [`protocol`]: the messages, in a window of versions agreed at the
 //!   connection's hello, each a frame with its file descriptors on the workspace's one
 //!   connection (`service::Connection`).
 //! - [`queue`]: the queue pair in shared memory between a scheduler and the

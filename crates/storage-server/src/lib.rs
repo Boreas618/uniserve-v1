@@ -65,7 +65,7 @@ use ::storage::protocol::{
     Access, Allocation, Child, Claim, Claimant, ClientMessage, DeploymentListing, ErrorKind, Event,
     Hello, HostStorage, Item, Key, Listing, Location, Mode, Quota, Refusal, Request, Response,
     Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord,
-    Tensors, Usage, VERSION, Welcome,
+    Tensors, Usage, VERSIONS, Welcome,
 };
 pub use child::{Children, Program};
 pub use error::Error;
@@ -114,6 +114,8 @@ struct Client {
     /// transfer requests or a peer's requests.
     pidfd: Option<Arc<OwnedFd>>,
     role: Option<Role>,
+    /// The version of the protocol the connection agreed on at its hello; 0 before it.
+    version: u32,
     /// The server's child whose channel the connection is, which alone speaks as that child.
     child: Option<::storage::protocol::Child>,
     /// Requests received and not yet responded, in arrival order.
@@ -579,6 +581,7 @@ impl Server {
                     pid: 0,
                     pidfd: None,
                     role: None,
+                    version: 0,
                     child: None,
                     queue: VecDeque::new(),
                     held: false,
@@ -607,6 +610,7 @@ impl Server {
                     pid: started.pid,
                     pidfd: Some(started.pidfd),
                     role: None,
+                    version: 0,
                     child: Some(child),
                     queue: VecDeque::new(),
                     held: false,
@@ -626,6 +630,7 @@ impl Server {
             pid: pid.as_raw_nonzero().get(),
             pidfd: Some(Arc::new(pidfd)),
             role: None,
+            version: 0,
             child: None,
             queue: VecDeque::new(),
             held: false,
@@ -695,16 +700,15 @@ impl Server {
         }
     }
 
-    /// Admit a client's role, or refuse it: a client of another version of
-    /// the protocol than this build's is refused before anything else.
+    /// Admit a client's role in the newest version of the protocol both speak, or refuse it: a
+    /// client whose window shares no version with this build's ([`VERSIONS`]) is refused before
+    /// anything else, with both windows.
     fn welcome(&mut self, id: ClientId, hello: Hello) -> Welcome {
         let refused = |refusal| Welcome::Refused { refusal };
-        if hello.version != VERSION {
-            return refused(Refusal::Version {
-                offered: hello.version,
-                spoken: VERSION,
-            });
-        }
+        let version = match hello.agree(VERSIONS) {
+            Ok(version) => version,
+            Err(refusal) => return refused(refusal),
+        };
         let Some(client) = self.clients.get_mut(&id) else {
             return refused(Refusal::Repeated);
         };
@@ -727,6 +731,8 @@ impl Server {
             return refused(Refusal::Child { child });
         }
         let pid = client.pid;
+        let welcome = Welcome::of_version(&hello, version);
+        client.version = version;
         client.role = Some(hello.role);
         match stated {
             Some(Child::Connector) => {
@@ -741,7 +747,7 @@ impl Server {
             }
             None => {}
         }
-        Welcome::Accepted
+        welcome
     }
 
     /// Respond to every client's queued requests that can be responded now.
