@@ -5,9 +5,12 @@ row's pooled scores::
 
     pooled[t, b] = max_{c < pool} s[t, b * pool + c]     +inf for the block
                    (visible[t] - 1) // pool when pool > 1 and visible[t] > 0
-    out[t, i]    = the kept blocks, -1 where pooled is -inf; mapped through
-                   candidate blocks of B groups: candidates[t, c // B] * B
-                   + c % B for a kept column c
+    ranked[t]    = the blocks below ceil(visible[t] / pool), every column of
+                   candidate blocks
+    out[t, i]    = the kept ranked blocks, -1 where pooled is -inf or past
+                   the ranked ones; mapped through candidate blocks of B
+                   groups: candidates[t, c // B] * B + c % B for a kept
+                   column c
 
 and states the order they leave in: the strictly greater ones by column, then
 the ties at the ``kept``-th score by column, so a tie keeps the lower column.
@@ -17,7 +20,8 @@ by). The output is pre-filled with a sentinel no entry can be, so a slot
 nothing wrote fails the comparison.
 
 The cases: a row of a few thousand scores over several chunks with a ``-inf``
-tail; scores of a handful of values, where nearly everything ties; rows with
+tail, and one whose scores past its visible count are finite and unranked;
+scores of a handful of values, where nearly everything ties; rows with
 fewer finite scores than are kept, whose surplus slots are ``-1``; the block
 mode over a column count no block divides, whose newest visible block is
 pinned whatever its scores; and scores of candidate blocks, some unnamed,
@@ -64,6 +68,12 @@ def pooled(scores, visible, pool):
 def reference(scores, visible, kept, pool=1, candidates=None, block=0):
     """The kept entries of each row in the order the operator states."""
     ranked = pooled(scores, visible, pool)
+    if candidates is None:
+        # A row ranks the blocks its visible groups lie in alone.
+        for row in range(scores.shape[0]):
+            ranked[row, (int(visible[row]) + pool - 1) // pool :] = float(
+                "-inf"
+            )
     out = torch.empty(scores.shape[0], kept, dtype=torch.int32)
     for row in range(scores.shape[0]):
         keys = monotone(ranked[row])

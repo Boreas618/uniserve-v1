@@ -467,6 +467,12 @@ fn the_selection_keeps_the_best_lower_columns_first_and_pins_the_newest_block() 
         [vec![1, 3, 2], vec![0, 1, -1]]
     );
 
+    // A row ranks the groups its visible count covers alone: finite scores past them are not
+    // kept, and the slots past the ranked groups name none.
+    let past = tensor(&[1.0, 2.0, 9.0, 8.0], (1, 4), DType::F32);
+    let kept = functional::index_select(&past, &int(vec![2_u32], 1), None, 1, 3).unwrap();
+    assert_eq!(kept.to_vec2::<i32>().unwrap(), [vec![0, 1, -1]]);
+
     // Blocks of two: each row's newest visible block (row 0's group 4, block 2; row 1's group
     // 1, block 0) ranks first; row 0's tie between blocks 0 and 1 keeps block 0.
     let blocks = functional::index_select(&scores, &visible, None, 2, 2).unwrap();

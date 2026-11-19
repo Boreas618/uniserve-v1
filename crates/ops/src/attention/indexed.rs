@@ -394,7 +394,8 @@ impl fmt::Display for IndexSelectDescriptor {
 pub struct IndexSelectArgs {
     /// `[tokens, columns]` F32, contiguous: the scores ([`IndexScores`]).
     pub scores: Operand,
-    /// `[tokens]` U32: the groups each token sees, whose newest the block mode pins.
+    /// `[tokens]` U32: the groups each token sees, which bound the blocks a row of its request's
+    /// own groups ranks and whose newest the block mode pins.
     pub visible: Operand,
     /// `[tokens, blocks]` I32, contiguous: the candidate blocks the scores were restricted to,
     /// exactly when the descriptor maps through them.
@@ -417,6 +418,11 @@ pub struct IndexSelectArgs {
 /// The kept entries leave in the order the program compacts them: the strictly greater ones by
 /// column, then the ties at the k-th score by column. A selection is a set, so a consumer
 /// reads it in any order.
+///
+/// A row of the request's own groups (no candidates) ranks only the blocks below
+/// `⌈visible[t] / pool⌉`, the ones its visible groups lie in, whose scores past them
+/// [`IndexScores`] states `−∞`: a row costs its request's length rather than the table's, and the
+/// slots past its ranked blocks are `−1`.
 pub struct IndexSelect;
 
 impl Op for IndexSelect {
