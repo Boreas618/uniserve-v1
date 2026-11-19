@@ -43,6 +43,14 @@
 //! daemon, which owns every process's lifetime, replaces the epoch's failure domain and ends what
 //! is left of it. The scheduler node's orderly end closes its links with a `Close` frame first,
 //! which a peer reads as the end of the epoch: its control thread ends in order too.
+//!
+//! **The orderly end.** The scheduler node's process ending is what ends the epoch's processes
+//! on every host: its daemon then releases what the epoch's engines asked for, and every other
+//! node's daemon ends the peers. So after its `Close` the scheduler node waits for each peer to
+//! close its connection ([`Remote::end_epoch`]), within [`PEER_CLOSE`], and a peer keeps its
+//! connection until the last step of its own orderly close ([`Upstream::close`] keeps it, its
+//! drop closes it): a peer that ends in order has destroyed its communicators, released its
+//! storage and reset its devices' contexts before the scheduler node's process can end.
 
 pub mod link;
 pub mod messages;
@@ -67,6 +75,19 @@ use crate::worker::Sequences;
 use crate::worker::completion::{Fault, Outcome, Submission, SubmissionId, SubmissionState, Waker};
 use crate::worker::{Error, Result};
 use service::lock;
+
+/// How long the scheduler node's orderly end waits, after its `Close`, for a peer to close its
+/// connection at the end of its own orderly close (module documentation).
+///
+/// The peer's close is the scheduler node's, without schedulers: it joins its workers, whose jobs
+/// have all ended once the scheduler node's schedulers stopped, and each worker destroys its
+/// communicators; it releases its weight binding and its session with its host's buffer pool;
+/// and it resets its devices' primary contexts, which gives back every device allocation the
+/// process made. Measured on GB200 hosts the whole close takes 4 to 7 seconds (four MiniMax-H3
+/// ranks of an eight-rank block, Qwen3-30B-A3B at tensor degree two), the contexts' reset
+/// most of it. A minute bounds it with an order of magnitude to spare; a peer that has not closed
+/// by then waits on a device or a host that does not answer, and the daemons end it.
+pub const PEER_CLOSE: Duration = Duration::from_secs(60);
 
 /// Whether the processes at the far ends of an engine process's peer links still serve, and the
 /// first reason one stopped.
@@ -345,6 +366,9 @@ pub struct Remote {
     next: AtomicU64,
     liveness: Arc<Liveness>,
     closing: Arc<AtomicBool>,
+    /// Until when the link waits, once it sent the `Close`, for the peer to close the
+    /// connection ([`Remote::end_epoch`]); set before the `Close` is queued.
+    ending: Arc<Mutex<Instant>>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -360,6 +384,7 @@ impl Remote {
         let pending: Arc<Pending> = Arc::default();
         let asked: Arc<Asked> = Arc::default();
         let closing = Arc::new(AtomicBool::new(false));
+        let ending = Arc::new(Mutex::new(Instant::now()));
         let wake = channel.wake();
 
         let thread = {
@@ -367,12 +392,18 @@ impl Remote {
             let asked = Arc::clone(&asked);
             let liveness = Arc::clone(&liveness);
             let closing = Arc::clone(&closing);
+            let ending = Arc::clone(&ending);
 
             std::thread::Builder::new()
                 .name(format!("peer-{rank}"))
                 .spawn(move || {
                     remote_link(
-                        rank, channel, &queued, &pending, &asked, &liveness, &closing,
+                        rank,
+                        channel,
+                        &queued,
+                        (&pending, &asked),
+                        &liveness,
+                        (&closing, &ending),
                     );
                 })
                 .map_err(|error| Error::transport_source("starting a peer link", error))?
@@ -387,6 +418,7 @@ impl Remote {
             next: AtomicU64::new(1),
             liveness,
             closing,
+            ending,
             thread: Mutex::new(Some(thread)),
         }))
     }
@@ -472,15 +504,29 @@ impl Remote {
         Ok(submission)
     }
 
-    /// Closes the link: the peer reads the close and ends, as the scheduler node does.
-    pub fn close(&self) {
-        self.closing.store(true, Ordering::Release);
+    /// Ends the epoch on the peer: sends the `Close`, which the peer reads as the epoch's end and
+    /// ends in order on, and has the link wait up to `bound` from now for the peer to close the
+    /// connection, which it does at the end of its orderly close ([`PEER_CLOSE`]). Returns at
+    /// once; [`Remote::close`] waits for the link. A second call changes nothing.
+    pub fn end_epoch(&self, bound: Duration) {
+        if self.closing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *lock(&self.ending) = Instant::now() + bound;
+
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let _ = self.outbox.send(ToPeer {
             id,
             request: MainProcessRequest::close(),
         });
         self.wake.wake();
+    }
+
+    /// Closes the link: ends the epoch on the peer ([`Remote::end_epoch`]) unless that was done,
+    /// without waiting for the peer then, and returns once the link's thread ended, which is
+    /// when the peer closed the connection or the bound of [`Remote::end_epoch`] passed.
+    pub fn close(&self) {
+        self.end_epoch(Duration::ZERO);
 
         if let Some(thread) = lock(&self.thread).take()
             && thread.join().is_err()
@@ -526,10 +572,9 @@ fn remote_link(
     rank: u32,
     mut channel: Connection,
     queued: &Receiver<ToPeer>,
-    pending: &Pending,
-    asked: &Asked,
+    (pending, asked): (&Pending, &Asked),
     liveness: &Liveness,
-    closing: &AtomicBool,
+    (closing, ending): (&AtomicBool, &Mutex<Instant>),
 ) {
     let failure = loop {
         let mut failed = None;
@@ -541,14 +586,23 @@ fn remote_link(
                 break;
             }
             if close {
-                // An orderly close: the frame goes out before the connection does.
+                // An orderly close: the frame goes out, and the connection stays until the peer
+                // closed it at the end of its own close or the bound passed.
                 let _ = channel.flush();
-                channel.shutdown();
                 fail_open(
                     pending,
                     asked,
                     "the epoch's scheduler node closed its peer links",
                 );
+                let deadline = *lock(ending);
+                if !peer_closed(&mut channel, deadline) {
+                    tracing::warn!(
+                        rank,
+                        "the peer did not end its close within its bound: the scheduler node \
+                         ends without it"
+                    );
+                }
+                channel.shutdown();
                 return;
             }
         }
@@ -582,6 +636,28 @@ fn remote_link(
     // A close this side asked for is not a loss of the peer.
     if !closing.load(Ordering::Acquire) {
         liveness.lose(failure);
+    }
+}
+
+/// Whether the peer at the other end of `channel` closed it before `deadline`. What it still
+/// sends is read and dropped: every submission and request it could answer has failed already.
+fn peer_closed(channel: &mut Connection, deadline: Instant) -> bool {
+    loop {
+        loop {
+            match channel.try_recv::<FromPeer>() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => return true,
+            }
+        }
+
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        if channel.wait(left).is_err() {
+            return true;
+        }
     }
 }
 
@@ -685,7 +761,15 @@ type Awaited = (u64, Option<GroupId>, Submission);
 pub struct Upstream {
     closing: Arc<AtomicBool>,
     wake: service::Wake,
+    /// The link's thread, which returns the connection when the scheduler node closed it in
+    /// order.
+    link: Mutex<Option<JoinHandle<Option<Connection>>>>,
+    /// The responders and the operations thread.
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The connection the scheduler node closed in order, kept once [`Upstream::close`] ended
+    /// the threads and until this is dropped: its close tells the scheduler node, which waits
+    /// for it, that this process's orderly close ended (module documentation).
+    held: Mutex<Option<Connection>>,
 }
 
 impl Upstream {
@@ -765,7 +849,7 @@ impl Upstream {
                         &responded,
                         &liveness,
                         &closing,
-                    );
+                    )
                 })
                 .map_err(|error| Error::transport_source("starting the peer link", error))?
         };
@@ -773,15 +857,27 @@ impl Upstream {
         Ok(Self {
             closing,
             wake,
-            threads: Mutex::new(vec![link, responder, readiness, operator]),
+            link: Mutex::new(Some(link)),
+            threads: Mutex::new(vec![responder, readiness, operator]),
+            held: Mutex::new(None),
         })
     }
 
-    /// Ends the link: the scheduler node reads the close.
+    /// Ends the link's threads, which release what they hold of this process (the route, the
+    /// operations' weight binding). A connection the scheduler node closed in order is kept
+    /// until this is dropped, the last step of the process's orderly close: the scheduler node
+    /// waits for its close. Any other connection closes now, which the scheduler node reads as
+    /// this process's end.
     pub fn close(&self) {
         self.closing.store(true, Ordering::Release);
         self.wake.wake();
 
+        if let Some(link) = lock(&self.link).take() {
+            match link.join() {
+                Ok(held) => *lock(&self.held) = held,
+                Err(_) => tracing::warn!("a peer link's thread panicked"),
+            }
+        }
         for thread in std::mem::take(&mut *lock(&self.threads)) {
             if thread.join().is_err() {
                 tracing::warn!("a peer link's thread panicked");
@@ -793,6 +889,9 @@ impl Upstream {
 impl Drop for Upstream {
     fn drop(&mut self) {
         self.close();
+        if let Some(held) = lock(&self.held).take() {
+            held.shutdown();
+        }
     }
 }
 
@@ -848,7 +947,9 @@ fn respond(
 
 /// A peer's side of its connection: hands each job the scheduler node sends to this process's
 /// ranks and each data plane's operation to the operations thread, in the order they arrived,
-/// and sends each response the responder and the operations thread queued.
+/// and sends each response the responder and the operations thread queued. Returns the
+/// connection when the scheduler node closed it in order, which the process keeps until the end
+/// of its orderly close ([`Upstream::close`]); `None` when it closed here.
 fn upstream_link(
     mut channel: Connection,
     route: &Route,
@@ -860,12 +961,12 @@ fn upstream_link(
     responded: &Receiver<FromPeer>,
     liveness: &Liveness,
     closing: &AtomicBool,
-) {
+) -> Option<Connection> {
     let failure = loop {
         if closing.load(Ordering::Acquire) {
             let _ = channel.flush();
             channel.shutdown();
-            return;
+            return None;
         }
 
         let mut failed = None;
@@ -953,11 +1054,12 @@ fn upstream_link(
                     )),
                 ),
                 MainProcessRequest::Close => {
-                    // The scheduler node's orderly end: this process ends in order with it.
+                    // The scheduler node's orderly end: this process ends in order with it, and
+                    // closes the connection last, which the scheduler node waits for. Nothing
+                    // is read from it any more, so the scheduler node's own end is no loss.
                     let _ = channel.flush();
-                    channel.shutdown();
                     liveness.close();
-                    return;
+                    return Some(channel);
                 }
             };
 
@@ -996,6 +1098,7 @@ fn upstream_link(
     if !closing.load(Ordering::Acquire) {
         liveness.lose(failure);
     }
+    None
 }
 
 /// Maps the completion of a `Map` frame, with the request it answers, into this process's
@@ -1596,5 +1699,111 @@ mod tests {
 
         // Nothing the peer ran is counted as ended.
         assert_eq!(sequences.completed(), 0);
+    }
+
+    /// How long the peers of the closing tests take over their close.
+    const CLOSING: Duration = Duration::from_millis(300);
+
+    /// The scheduler node's orderly end returns only once the peer closed its connection: the
+    /// scheduler node's exit, which ends the epoch's processes on every host, comes after every
+    /// peer's close.
+    #[test]
+    fn the_scheduler_node_ends_after_the_peer_closed_its_connection() {
+        let (liveness, _called) = liveness();
+        let closed = Arc::new(AtomicBool::new(false));
+
+        let peer_closed = Arc::clone(&closed);
+        let (remote, peer) = linked(1, 3, liveness, move |mut channel| {
+            let (_, request) = next_request(&mut channel);
+            assert!(matches!(request, MainProcessRequest::Close));
+
+            // The peer's own close, then its connection's.
+            std::thread::sleep(CLOSING);
+            peer_closed.store(true, Ordering::Release);
+            channel.shutdown();
+        });
+
+        remote.end_epoch(LONG);
+        remote.close();
+        assert!(
+            closed.load(Ordering::Acquire),
+            "the scheduler node's close returned before the peer closed its connection"
+        );
+        peer.join().expect("the peer");
+    }
+
+    /// A peer that does not close its connection holds the scheduler node's end up only for the
+    /// bound its close was given.
+    #[test]
+    fn the_scheduler_node_waits_for_a_peer_that_does_not_close_within_its_bound() {
+        let (liveness, _called) = liveness();
+        let (release, released) = crossbeam_channel::bounded::<()>(1);
+
+        let (remote, peer) = linked(1, 3, Arc::clone(&liveness), move |mut channel| {
+            let (_, request) = next_request(&mut channel);
+            assert!(matches!(request, MainProcessRequest::Close));
+            let _ = released.recv_timeout(LONG);
+        });
+
+        let started = Instant::now();
+        remote.end_epoch(CLOSING);
+        remote.close();
+        let waited = started.elapsed();
+        assert!(waited >= CLOSING, "the close waited {waited:?}");
+        assert!(waited < LONG, "the close waited {waited:?}");
+        // The bound passing is the scheduler node's own end, no loss of the peer.
+        assert_eq!(liveness.lost(), None);
+
+        let _ = release.send(());
+        peer.join().expect("the peer");
+    }
+
+    /// A peer keeps the connection the scheduler node closed in order once its link's threads
+    /// ended, and closes it when it drops its side, the last step of its close.
+    #[test]
+    fn a_peer_closes_the_connection_the_scheduler_node_closed_at_the_end_of_its_close() {
+        let (listener, address) = listener();
+        let (peer_liveness, peer_called) = self::liveness();
+
+        let peer = std::thread::spawn(move || {
+            let channel = register(&address, 1, 3, LONG).expect("the peer registers");
+            let route = Route::new(Vec::new(), Vec::new(), Vec::new()).expect("a route");
+            let operate: Operate = Box::new(|_| Ok(Vec::new()));
+            Upstream::serve(
+                channel,
+                Arc::new(route),
+                Arc::clone(&peer_liveness),
+                operate,
+            )
+            .expect("the peer serves")
+        });
+        let (_, mut channel) = accept(&listener, 1, 3, LONG)
+            .expect("the peer registers")
+            .pop()
+            .expect("one peer");
+        let upstream = peer.join().expect("the peer");
+
+        channel
+            .deliver(&ToPeer {
+                id: 1,
+                request: MainProcessRequest::close(),
+            })
+            .expect("the close is sent");
+        peer_called.recv_timeout(LONG).expect("the close is told");
+        upstream.close();
+
+        // The link's threads ended, and the connection stays.
+        let read = channel.recv::<FromPeer>(CLOSING);
+        assert!(
+            matches!(read, Ok(None)),
+            "the peer closed its connection before its close ended: {:?}",
+            read.map(|frame| frame.map(|frame| frame.id))
+        );
+
+        drop(upstream);
+        assert!(
+            channel.recv::<FromPeer>(LONG).is_err(),
+            "the peer's connection stayed open after its close"
+        );
     }
 }

@@ -394,12 +394,18 @@ impl Engine {
     ///    its thread is joined;
     /// 2. the workers' queues close, ending the job in flight and cancelling the rest, and
     ///    their threads are joined;
-    /// 3. the peer links close, which the epoch's other main processes read as this one's end,
-    ///    and a peer's thread that runs the scheduler node's operations ends with its link;
+    /// 3. the peer links close: the scheduler node sends every peer the epoch's end and waits,
+    ///    within [`PEER_CLOSE`](crate::executor::peers::PEER_CLOSE), until each closed its
+    ///    connection, which a peer does last in its own close (step 6), so no daemon ends a peer
+    ///    while its close runs (the scheduler node's exit is what ends the epoch's processes on
+    ///    every host); a peer's threads that serve the link, the one that runs the scheduler
+    ///    node's operations among them, end here and it keeps the connection;
     /// 4. the session ends ([`Engine::new`]'s `session`), the workers having stopped;
     /// 5. the devices' primary contexts are reset, which releases the driver state the process
     ///    created, when the engine's workers served on devices and nothing else holds the
-    ///    owners of their storage or their streams (`docs/architecture.md`, the orderly close).
+    ///    owners of their storage or their streams (`docs/architecture.md`, the orderly close);
+    /// 6. on a peer, the connection the scheduler node closed is closed, which ends the scheduler
+    ///    node's wait of step 3.
     ///
     /// A reset leaves every handle of a context's objects dangling, so every owner of device
     /// state the engine holds ends before it: the counters and the engine's handles of the
@@ -480,13 +486,18 @@ impl Engine {
                 ),
             }
         }
+        // Every peer is told first, so the peers' closes run together and the wait is for the
+        // slowest of them.
+        for remote in &remotes {
+            remote.end_epoch(crate::executor::peers::PEER_CLOSE);
+        }
         for remote in &remotes {
             remote.close();
         }
         if let Some(upstream) = &upstream {
             upstream.close();
         }
-        drop((remotes, upstream, liveness, build, prepared));
+        drop((remotes, liveness, build, prepared));
 
         // The weight binding holds the owners of every rank's device storage; a peer's
         // operations thread held it until its link closed.
@@ -507,6 +518,9 @@ impl Engine {
                  devices' contexts are left to the process's exit"
             );
         }
+
+        // A peer's last step: the connection's close tells the scheduler node its close ended.
+        drop(upstream);
         outcome
     }
 }
