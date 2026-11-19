@@ -119,6 +119,7 @@ impl Drafter for TinyDrafter {
         _batch: &TokenBatch,
         _cache: &KvCache,
         _state: Option<&RecurrentState>,
+        _exchange: Option<&ExpertExchange>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {

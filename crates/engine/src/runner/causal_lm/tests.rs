@@ -150,6 +150,10 @@ struct TinyDrafter {
     /// Whether the layer keeps a state of one layer, [`drafter_ring`]: its forward then asks
     /// for that state, and its rows are read through its norm for their logits.
     stateful: bool,
+    /// Whether the layer routes experts its model's expert group splits: its forward then asks
+    /// for the step's exchange, and its join launches its norm over the exchange's first
+    /// received row, the one launch a join of the test model makes.
+    routed: bool,
 }
 
 /// The state of a drafter that keeps one: a ring of four hidden rows a request slot.
@@ -182,6 +186,7 @@ impl TinyDrafter {
             key: linear(),
             value: linear(),
             stateful,
+            routed: false,
         }
     }
 
@@ -251,9 +256,15 @@ impl Drafter for TinyDrafter {
         batch: &TokenBatch,
         cache: &KvCache,
         state: Option<&RecurrentState>,
+        exchange: Option<&ExpertExchange>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
+        if self.routed != exchange.is_some_and(|exchange| exchange.step_rows > 0) {
+            return Err(nn::Error::Unsupported(
+                "the drafter's expert exchange is not the step's".to_owned(),
+            ));
+        }
         if !self.stateful {
             if state.is_some() {
                 return Err(nn::Error::Unsupported(
@@ -283,6 +294,19 @@ impl Drafter for TinyDrafter {
             ));
         }
         self.attend(batch, cache, embedded, hidden)
+    }
+
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> nn::Result<()> {
+        if !self.routed {
+            return Err(nn::Error::Unsupported(
+                "the drafter routes no experts".to_owned(),
+            ));
+        }
+        exchange.check()?;
+
+        let received = exchange.states.narrow(0, 0, 1)?;
+        rms_norm(&received, &self.gain, 1e-6, false, received.dtype())?;
+        Ok(())
     }
 
     /// A drafter that keeps a state reads its rows through its own norm for their logits.
@@ -2301,6 +2325,110 @@ fn a_member_with_no_batch_is_driven_into_the_step_by_a_join_batch() {
     ));
 }
 
+/// A speculating runner of a model and a drafter whose experts are split across ranks, as
+/// `member` of a union, with every bucket profiled and captured: the test doubles refuse a
+/// forward lent no exchange, so every capture lends the step's.
+fn speculating_union_runner(member: Member) -> CausalLmRunner {
+    let config = speculating_config();
+    let model = Tiny {
+        routed: true,
+        drafter: Some(TinyDrafter {
+            routed: true,
+            ..TinyDrafter::new(false)
+        }),
+        ..Tiny::new(false)
+    };
+    let graphs = Graphs::meta(
+        Arc::new(Generation::new(0, [])),
+        CausalLmRunner::input_bytes(&config, &model).unwrap(),
+    );
+    let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
+
+    let mut runner = CausalLmRunner::new(
+        Arc::new(model),
+        config,
+        graphs,
+        None,
+        vec![group(PAGES, pooled)],
+        None,
+    )
+    .unwrap();
+    runner.set_draft_cache(draft_cache(), None, None).unwrap();
+    runner.join_union(member).unwrap();
+
+    runner.graphs().profile_run(&runner).unwrap();
+    for bucket in runner.buckets() {
+        crate::runner::graphs::tests::warm(&runner, &bucket).unwrap();
+    }
+    runner
+}
+
+#[test]
+fn a_speculating_member_verifies_and_drafts_in_the_union_s_steps() {
+    let groups = host_groups(2);
+    let (to_first, _first_inbox) = crossbeam_channel::unbounded();
+    let (to_second, second_inbox) = crossbeam_channel::unbounded();
+    let mut first = speculating_union_runner(member(&groups[0], 0, deliver(to_second)));
+    let mut second = speculating_union_runner(member(&groups[1], 1, deliver(to_first)));
+
+    // Every bucket, the verifications and the drafter's included, at the whole capacity, and
+    // each drafter bucket at every class of the bucket it follows.
+    let stated = speculating_config().buckets.with_drafts(DRAFTS);
+    let buckets = first.buckets();
+    for bucket in stated.iter() {
+        assert!(
+            buckets.contains(&bucket.at_capacity(UNION_ROWS)),
+            "{bucket}"
+        );
+    }
+    for target in stated
+        .iter()
+        .filter(|bucket| bucket.variant != Variant::Draft)
+    {
+        let drafter = Bucket::draft(target.rows, target.tokens);
+        let classes = buckets.iter().filter(|held| held.at_capacity(0) == *target);
+
+        for class in classes {
+            let behind = drafter.at_capacity(class.capacity);
+            assert!(buckets.contains(&behind), "{behind} behind {class}");
+        }
+    }
+
+    // When every member verifies, a step holds at most the largest verification's tokens, four
+    // rows of a committed token and two drafts, which the smallest class holds.
+    let verifying = 4 * (DRAFTS + 1);
+    let verification_class =
+        Bucket::verify(4, DRAFTS, Variant::VerifyGreedy).at_capacity(verifying);
+    assert!(buckets.contains(&verification_class));
+    assert!(buckets.contains(&Bucket::expert_join().at_capacity(verifying)));
+
+    // A member's join runs the model's expert layers, which launch nothing of the test model,
+    // and then the drafter's once per drafter forward of a step: its entries' and its chained
+    // step's.
+    let join = Bucket::expert_join().at_capacity(UNION_ROWS);
+    assert_eq!(
+        count(&operators(&first, &join), "rms_norm"),
+        DRAFTS as usize
+    );
+
+    // The first member's verification blocks in the agreement until the second member's worker
+    // takes the join batch; both then choose their graphs at the agreed class, the drafter's
+    // behind the verification's, and reach the replay, which graphs that hold no device refuse.
+    let tables = held(&[2, 4]);
+    std::thread::scope(|scope| {
+        let idle = scope.spawn(|| {
+            let join = second_inbox.recv().unwrap();
+            second.execute(&join, &held(&[]))
+        });
+
+        let served = first.execute(&verification(0.0), &tables);
+        assert!(matches!(served, Err(Error::State(_))), "{served:?}");
+
+        let joined = idle.join().unwrap();
+        assert!(matches!(joined, Err(Error::State(_))), "{joined:?}");
+    });
+}
+
 #[test]
 fn a_union_is_joined_by_a_runner_whose_model_routes_experts() {
     let groups = host_groups(1);
@@ -3956,12 +4084,20 @@ fn speculation_is_refused_where_the_runner_does_not_serve_it() {
             .is_err()
     );
 
-    // Experts split across ranks.
+    // A member of an expert union measures no shape of other drafts: its peers switch at
+    // boundaries of their own, and each step's drafter launches are every member's.
     let groups = host_groups(2);
     let (inbox, _outbox) = crossbeam_channel::unbounded();
-    let refused = speculating(false)
-        .join_union(member(&groups[0], 0, deliver(inbox)))
-        .unwrap_err();
+    let member = speculating_union_runner(member(&groups[0], 0, deliver(inbox)));
+    let options = |drafts: u32| crate::runner::GraphOptions {
+        buckets: config().buckets,
+        candidates: CANDIDATES,
+        drafts,
+    };
+    assert!(Runner::measure(&member, &options(DRAFTS), None).is_ok());
+    let refused = Runner::measure(&member, &options(DRAFTS + 1), None)
+        .err()
+        .unwrap();
     assert!(matches!(refused, Error::Unsupported(_)), "{refused}");
 
     // A refill of the draft cache of a model that keeps a recurrent state.

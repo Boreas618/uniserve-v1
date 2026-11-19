@@ -14,7 +14,8 @@
 //! The layer is the model's own decoder layer, rotated by the model's text spectrum at the
 //! entry's position. The embedding and the head are the model's ([`nn::Drafter`]); the
 //! drafter's experts keep the checkpoint's order, because an expert redistribution names only
-//! the model's layers.
+//! the model's layers. Over an expert group the layer holds the rank's window of the experts,
+//! as the model's layers do, and routes through the group's exchange.
 //!
 //! The references run one multi-token-prediction layer per forward: SGLang builds one
 //! (`sglang:python/sglang/srt/models/qwen3_5_mtp.py:139-140`), and vLLM runs layer
@@ -23,7 +24,10 @@
 
 use nn::family::{CacheShape, SequenceSplit, StateShape, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, Rotary};
-use nn::{D, Drafter, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder, functional};
+use nn::{
+    D, Drafter, ExpertExchange, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder,
+    functional,
+};
 
 use crate::qwen3::ID;
 use crate::qwen3::causal_lm::text_rotary;
@@ -133,11 +137,14 @@ impl Drafter for Mtp {
         Vec::new()
     }
 
+    /// The drafter's layer routes over the model's expert group: split across ranks, its
+    /// experts run through `exchange`, as the model's layers' do.
     fn forward(
         &self,
         batch: &TokenBatch,
         cache: &KvCache,
         state: Option<&RecurrentState>,
+        exchange: Option<&ExpertExchange>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
@@ -182,7 +189,7 @@ impl Drafter for Mtp {
                 batch,
                 Some(cache),
                 None,
-                None,
+                exchange,
                 0,
             )?;
             let (normalized, _) = self.norm.forward_residual(&output, &residual)?;
@@ -190,6 +197,11 @@ impl Drafter for Mtp {
         };
 
         nn::profiler::range(DRAFTER, &self.path, forward)
+    }
+
+    /// The layer's routed block, when the model routes: a dense drafter joins nothing.
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> nn::Result<()> {
+        nn::causal_lm::join_expert_step(self.layer.experts(), exchange)
     }
 }
 

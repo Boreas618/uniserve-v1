@@ -87,12 +87,25 @@
 //! The drafter's output is the rows its next chained step reads; the model's head projects the
 //! drafter's own read of them (`nn::Drafter::logits_rows`), whose argmax is the proposal.
 //!
+//! ## In an expert union
+//!
+//! A member of an expert union speculates as any runner does: the verification's and the
+//! drafter's forwards are lent the exchange of their capacity class, each drafter bucket is
+//! captured at the classes of the bucket it follows (`experts::classes`), and both graphs of a
+//! step replay at the class the step's agreement chose. A step of the union is therefore the
+//! target's expert layers and then the drafter's, once per drafter forward (its entries, then
+//! each chained step after the first: `D` forwards), on every member: a member that joins the
+//! step without a batch of its own runs the same, the model's expert layers and the drafter's
+//! `D` times ([`CausalLmRunner::forward`] of the join bucket).
+//!
 //! ## What is refused
 //!
-//! A runner that speculates joins no expert union, serves no paired forward of a verification
-//! (its token rows share one request's pages, and the scratch set gives each row its own), and
-//! refuses a draft cache refill of a model whose layers or drafter keep a recurrent state,
-//! which would need a scratch state per refill row.
+//! A runner that speculates serves no paired forward of a verification (its token rows share one
+//! request's pages, and the scratch set gives each row its own), and refuses a draft cache refill
+//! of a model whose layers or drafter keep a recurrent state, which would need a scratch state per
+//! refill row. A member of an expert union refuses a shape of other drafts than the serving
+//! one's: the members switch shapes at batch boundaries of their own, and every member of a step
+//! runs the drafter's expert layers as often.
 
 use std::sync::Arc;
 
@@ -1259,10 +1272,12 @@ impl CausalLmRunner {
             None => None,
         };
 
+        // A member of an expert union is lent the exchange of the bucket's capacity class.
+        let exchange = self.expert_exchange(bucket)?;
         let hidden = {
             let embedded = self.model.embed_input_ids(&ids)?;
             self.model
-                .forward(&batch, &cache, state.as_ref(), None, &embedded)?
+                .forward(&batch, &cache, state.as_ref(), exchange.as_ref(), &embedded)?
         };
 
         // ---- The selection of the token after every token ----
@@ -1485,6 +1500,9 @@ impl CausalLmRunner {
             }
             None => None,
         };
+        // A member of an expert union lends every drafter forward of the step the exchange of
+        // the bucket's capacity class, which the step's agreement chose for both graphs.
+        let exchange = self.expert_exchange(bucket)?;
         let run = |batch: &TokenBatch, embedded: &Tensor, hidden: &Tensor| -> Result<Tensor> {
             let state = lent
                 .as_ref()
@@ -1499,7 +1517,14 @@ impl CausalLmRunner {
                     verify: None,
                 });
 
-            Ok(drafter.forward(batch, &cache, state.as_ref(), embedded, hidden)?)
+            Ok(drafter.forward(
+                batch,
+                &cache,
+                state.as_ref(),
+                exchange.as_ref(),
+                embedded,
+                hidden,
+            )?)
         };
 
         let drafted = {

@@ -523,6 +523,7 @@ fn the_drafter_computes_the_references_hidden_states() {
                     &batch(phase, std::slice::from_ref(&range)),
                     cache,
                     None,
+                    None,
                     &embedded.narrow(0, first, count).expect("the entries"),
                     &hidden.narrow(0, first, count).expect("the entries"),
                 )
