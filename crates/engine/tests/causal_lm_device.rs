@@ -2,7 +2,8 @@
 //! step continues from it, also when it is launched while the step before it is in flight; a
 //! slot whose first step is a decode starts from its batch's row;
 //! a batch's page work is issued around the replay; a runner that speculates commits the
-//! prefix a verification's samples agree with and proposes the drafts after it; a kernel
+//! prefix a verification's samples agree with and proposes the drafts after it; a synthetic
+//! acceptance length commits the drafts its rates accept whatever the model selects; a kernel
 //! generation of other graph options (candidates, buckets, drafts, drafts from or to none with
 //! the model that loaded or released its drafter, other drafts of a model that keeps a recurrent
 //! state) serves its shape from its switch on, the slots' state carried across, a recurrent
@@ -119,6 +120,7 @@ impl Drafter for TinyDrafter {
         _batch: &TokenBatch,
         _cache: &KvCache,
         _state: Option<&RecurrentState>,
+        _exchange: Option<&ExpertExchange>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
@@ -975,6 +977,47 @@ fn a_verification_commits_the_drafts_its_samples_agree_with_and_proposes_the_nex
     let call = &output.calls[0];
     assert_eq!(call.tokens, [next(7)]);
     assert_eq!(call.draft_token_ids, [next(next(7)), next(next(next(7)))]);
+    assert_eq!((call.cache_computed_len, call.step_index), (4, 4));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_synthetic_acceptance_length_commits_the_drafts_its_rates_accept_whatever_the_model_selects()
+-> Outcome {
+    let mut bench = Bench::speculating(2)?;
+    let synthetic = |slot: u32, ids: &[i32], length: f64| {
+        let mut batch = verification(slot, ids, 3);
+        batch.columns.synthetic_acceptance_length = Some(length);
+        batch
+    };
+
+    // A length of three accepts both drafts, neither of which the model selects: the
+    // verification emits them, then the model's token after the last, and the drafter
+    // continues from that token.
+    let output = bench
+        .runner
+        .execute(&synthetic(2, &[7, 3, 2], 3.0), &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [3, 2, next(2)]);
+    assert_eq!(call.token_logprobs.len(), 3);
+    assert_eq!(call.draft_token_ids, [next(next(2)), next(next(next(2)))]);
+    assert_eq!((call.cache_computed_len, call.step_index), (6, 6));
+
+    // A length of two accepts the first draft alone, and the model's token at the second.
+    let output = bench
+        .runner
+        .execute(&synthetic(3, &[7, 3, 2], 2.0), &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [3, next(3)]);
+    assert_eq!((call.cache_computed_len, call.step_index), (5, 5));
+
+    // A length of one accepts no draft, though the model selects both.
+    let output = bench
+        .runner
+        .execute(&synthetic(4, &[7, 6, 5], 1.0), &tables())?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(7)]);
     assert_eq!((call.cache_computed_len, call.step_index), (4, 4));
     Ok(())
 }

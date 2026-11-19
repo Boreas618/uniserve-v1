@@ -129,7 +129,10 @@
 //! replays the smallest class of its bucket that holds it; a member with no batch is driven
 //! by a join batch (`Variant::ExpertJoin`) and replays the join bucket, the expert layers
 //! alone. Everything of a step that can refuse the batch is done before the agreement: once
-//! a step is agreed, every member launches it, or the others wait on their devices.
+//! a step is agreed, every member launches it, or the others wait on their devices. A
+//! speculating member replays the drafter's graph behind its own at the same class, and its
+//! join runs the drafter's expert layers once per drafter forward of a step after the model's
+//! (`speculation`, in an expert union).
 //!
 //! ## Shapes
 //!
@@ -191,7 +194,7 @@ use std::time::Instant;
 
 use crate::batch::{Batch, BatchOutput, Phase, Shape as BatchShape, TimingCounters, Variant};
 use nn::family::{StateField, StateShape, TextModel};
-use nn::{KvCache, RecurrentState, TokenBatch, VerifySlots};
+use nn::{ExpertExchange, KvCache, RecurrentState, TokenBatch, VerifySlots};
 use platform::{Event, Stream};
 use proto::module::commit::COMMIT_FIELDS;
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
@@ -899,8 +902,10 @@ impl CausalLmRunner {
     }
 
     /// Makes the runner `member` of an expert union: its buckets become the capacity classes
-    /// of the config's buckets and the join bucket (`experts::classes`), its forwards are lent
-    /// the member's exchange, and its steps are agreed with the other members.
+    /// of the config's buckets, with a speculating runner's verification and drafter buckets,
+    /// and of the join bucket (`experts::classes`), its forwards, the verification's and the
+    /// drafter's included, are lent the member's exchange, and its steps are agreed with the
+    /// other members.
     ///
     /// It is called before the profile run and the captures, which state the buckets, and for
     /// graphs that hold a device after the members created their transport
@@ -909,15 +914,10 @@ impl CausalLmRunner {
     /// # Errors
     ///
     /// [`Error::Invalid`] for a model that splits no experts, a member whose largest step is
-    /// smaller than the runner's largest bucket, or a runner that holds captured graphs;
-    /// [`Error::Unsupported`] for a runner that speculates.
+    /// smaller than the runner's largest bucket, or a runner that holds captured graphs.
     pub(crate) fn join_union(&mut self, member: Member) -> Result<()> {
-        if self.speculation.is_some() {
-            return Err(Error::Unsupported(
-                "speculative decoding of a model whose experts are split across ranks".into(),
-            ));
-        }
-        let (_, tokens) = self.config.buckets.bounds();
+        let stated = self.config.buckets.with_drafts(self.config.drafts);
+        let (_, tokens) = stated.bounds();
         if self.model.experts().is_none() || member.capacity() < tokens {
             return Err(Error::Invalid(format!(
                 "an expert union whose members send at most {} rows a step, for a model that \
@@ -935,7 +935,7 @@ impl CausalLmRunner {
             ));
         }
 
-        self.buckets = experts::classes(&self.config.buckets, member.capacity(), member.beside());
+        self.buckets = experts::classes(&stated, member.capacity(), member.beside());
         // A union's members meet in each step's agreement; a capture runs no exchange, and a
         // rehearsal issues none, so no forward meets the members on its own.
         self.graphs.set_exchange(member.transport(), None);
@@ -1015,7 +1015,8 @@ impl CausalLmRunner {
     /// than a member of an expert union sends, or a verification longer than the recurrent
     /// state's trail, for drafts of a model that loaded no drafter or over a cache that lays no
     /// draft cache out, or a state that is not the model's under the options; what `graphs` and
-    /// the allocations refuse.
+    /// the allocations refuse; [`Error::Unsupported`] for other drafts than the serving shape's
+    /// in a member of an expert union.
     fn shape(
         &self,
         options: &GraphOptions,
@@ -1041,9 +1042,21 @@ impl CausalLmRunner {
         let (mut buckets, layout) = stated(&config, &**model)?;
 
         // A member of an expert union captures every bucket at each capacity class, which bound
-        // what the member sends a step.
+        // what the member sends a step. Its peers switch shapes at batch boundaries of their own,
+        // so a shape that runs the drafter's expert layers another number of times a step than
+        // the serving one's would meet steps of the others with exchanges it does not launch.
         if let Some(member) = &self.union {
-            let (_, tokens) = config.buckets.bounds();
+            if config.drafts != self.config.drafts {
+                return Err(Error::Unsupported(format!(
+                    "a shape of {} drafts beside a serving shape of {} in an expert union: every \
+                     member of a step runs its drafter's expert layers once per draft, and the \
+                     members switch shapes at batch boundaries of their own",
+                    config.drafts, self.config.drafts
+                )));
+            }
+
+            let stated = config.buckets.with_drafts(config.drafts);
+            let (_, tokens) = stated.bounds();
             if member.capacity() < tokens {
                 return Err(Error::Invalid(format!(
                     "an expert union whose members send at most {} rows a step, for buckets of up \
@@ -1051,7 +1064,7 @@ impl CausalLmRunner {
                     member.capacity()
                 )));
             }
-            buckets = experts::classes(&config.buckets, member.capacity(), member.beside());
+            buckets = experts::classes(&stated, member.capacity(), member.beside());
         }
 
         // A shape over a state laid out for it computes over its buffers, which are the model's
@@ -1714,10 +1727,11 @@ impl CausalLmRunner {
         // slots its tokens write and the padding of the columns.
         let base = self.choose(batch)?;
 
-        // A runner that speculates issues the drafter's graph behind the batch's own.
+        // A runner that speculates issues the drafter's graph behind the batch's own, which a
+        // member of an expert union captured at the classes of the batch's bucket.
         let drafter = match &self.speculation {
             Some(_) => {
-                let drafter = Bucket::draft(base.rows, base.tokens);
+                let drafter = Bucket::draft(base.rows, base.tokens).at_capacity(base.capacity);
                 if self.graphs.select(|held| *held == drafter).is_none() {
                     return Err(Error::State(
                         "the drafter's bucket behind the batch's is not captured",
@@ -1753,19 +1767,23 @@ impl CausalLmRunner {
         }
 
         // A member of an expert union agrees the step with the other members, which blocks
-        // until each has entered it, and runs the capacity class that holds it.
-        let bucket = match self.union.as_mut() {
+        // until each has entered it, and runs the capacity class that holds it, the drafter's
+        // graph behind it as well: the step's expert layers are both graphs'.
+        let (bucket, drafter) = match self.union.as_mut() {
             Some(member) => {
                 let tokens = batch.columns.tokens() as u32;
                 let capacity = member.enter(tokens, batch)?;
 
                 let bucket = at_capacity(&self.graphs, &base, capacity)?;
+                let drafter = drafter
+                    .map(|drafter| at_capacity(&self.graphs, &drafter, capacity))
+                    .transpose()?;
                 if let Some(stream) = &self.stream {
                     member.write(capacity, stream)?;
                 }
-                bucket
+                (bucket, drafter)
             }
-            None => base,
+            None => (base, drafter),
         };
         self.prepare_staged(&bucket)?;
         span::end(Stage::CopyIn, id);
@@ -1904,6 +1922,37 @@ impl CausalLmRunner {
             .collect()
     }
 
+    /// The exchange a forward of `bucket` is lent: a member of an expert union's, shaped for the
+    /// bucket's capacity class; `None` for a runner outside a union.
+    ///
+    /// # Errors
+    ///
+    /// What `Regions::exchange` refuses: a class of no row, or of more than the transport holds.
+    fn expert_exchange(&self, bucket: &Bucket) -> Result<Option<ExpertExchange>> {
+        self.regions
+            .as_ref()
+            .map(|regions| regions.exchange(bucket.capacity))
+            .transpose()
+    }
+
+    /// The expert layers of one step of the union with no tokens of this member's own, which
+    /// returns no output: the model's, then, for a runner that speculates, the drafter's once
+    /// per drafter forward of a step, `D` of them, as each peer's step runs them behind its
+    /// target forward (`speculation`, in an expert union).
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> Result<Vec<Tensor>> {
+        self.model.join_expert_step(exchange)?;
+
+        if let Some(speculation) = &self.speculation {
+            let drafter = self.model.drafter().ok_or(Error::State(
+                "a speculating runner's model carries its drafter",
+            ))?;
+            for _ in 0..speculation.drafts {
+                drafter.join_expert_step(exchange)?;
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// The verify slots of a forward's `rows` state rows (`nn::VerifySlots`): their slots, an
     /// input column, and their slots' accepted counts, gathered by `slot_rows`, each row's row
     /// of the slot state (the padding row for a row on no slot). `None` for a runner whose
@@ -1974,21 +2023,10 @@ impl Forward for CausalLmRunner {
             )));
         }
 
-        // A runner that speculates states the verification buckets and the drafter's.
-        if verifies(bucket.variant) {
-            return self.forward_verification(bucket);
-        }
-        if bucket.variant == Variant::Draft {
-            return self.forward_drafter(bucket);
-        }
-
         // A member of an expert union is lent the exchange of the bucket's capacity class. Its
         // join, and every bucket of a member that holds experts alone, is the expert layers
         // of a step with no tokens of the member's own, and returns no output.
-        let exchange = match &self.regions {
-            Some(regions) => Some(regions.exchange(bucket.capacity)?),
-            None => None,
-        };
+        let exchange = self.expert_exchange(bucket)?;
         let joins = bucket.variant == Variant::ExpertJoin
             || self.regions.as_ref().is_some_and(Regions::experts_only);
         if joins {
@@ -1997,9 +2035,15 @@ impl Forward for CausalLmRunner {
                     "bucket {bucket} joins an expert step in a runner outside an expert union"
                 ))
             })?;
+            return self.join_expert_step(&exchange);
+        }
 
-            self.model.join_expert_step(&exchange)?;
-            return Ok(Vec::new());
+        // A runner that speculates states the verification buckets and the drafter's.
+        if verifies(bucket.variant) {
+            return self.forward_verification(bucket);
+        }
+        if bucket.variant == Variant::Draft {
+            return self.forward_drafter(bucket);
         }
         let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
         let decode = bucket.variant.is_decode();

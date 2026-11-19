@@ -481,6 +481,14 @@ pub struct Columns {
     /// runner that speculates with its model's drafter reads; empty for a batch whose calls draft
     /// nothing.
     pub drafts: Vec<DraftWork>,
+    /// The mean tokens a verification commits under synthetic acceptance
+    /// (`speculative_config.synthetic_acceptance_length` of the batch's revision), at least
+    /// one: each verification accepts its drafts by their offsets and its request's draws at
+    /// their positions alone, whatever the model selects there, and commits the model's own
+    /// selection after the last it accepts (`crate::runner::causal_lm::speculation`). `None`
+    /// accepts the drafts the model's selections agree with. Every rank of the batch's group
+    /// reads it with the batch.
+    pub synthetic_acceptance_length: Option<f64>,
     /// The image blocks the batch's prefill rows write, in token order: each block's token rows
     /// carry no id the embedding reads, and the runner writes the encoder output's rows there.
     pub vision: Vec<VisionRows>,
@@ -1290,6 +1298,13 @@ impl Columns {
         ensure_valid!(
             self.banned.iter().all(|tokens| increasing(tokens)),
             "a row's banned tokens are not strictly increasing"
+        );
+        // A verification commits at least its own token, so no mean commits fewer.
+        ensure_valid!(
+            self.synthetic_acceptance_length
+                .is_none_or(|length| length.is_finite() && length >= 1.0),
+            "the synthetic acceptance length {:?} is not a number of tokens of at least one",
+            self.synthetic_acceptance_length
         );
         Ok(())
     }

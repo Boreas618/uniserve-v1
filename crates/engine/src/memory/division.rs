@@ -408,6 +408,16 @@ pub(crate) fn cache_units(
         .map_err(|_| Error::Invalid("the cache exceeds the unit index range".into()))
 }
 
+/// The fewest checkpoints a state region of `slots` request slots holds in segments of
+/// `segment` units: one per slot, rounded up to whole segments, and at least one segment. A
+/// rank counts them in each slot's cost ([`request_slots`]), so the slots that fit leave the
+/// region its floor ([`state_units`]).
+pub(crate) fn state_floor(slots: u32, segment: u32) -> u64 {
+    let segment = u64::from(segment.max(1));
+
+    u64::from(slots).div_ceil(segment).max(1) * segment
+}
+
 /// The units of a rank's state region, each one checkpoint of `state_bytes` bytes on the rank,
 /// from `remainder`, the bytes its share leaves once its fixed regions and the storages of its
 /// `slots` request slots are taken out, for a model that keeps a recurrent state
@@ -449,6 +459,7 @@ pub(crate) fn state_units(
     }
 
     let floor = u64::from(slots);
+    let least = state_floor(slots, segment);
     let segment = u64::from(segment);
     let floor_bytes = floor.saturating_mul(state_bytes);
     let left = remainder.saturating_sub(floor_bytes);
@@ -459,8 +470,7 @@ pub(crate) fn state_units(
             .min(left.saturating_sub(bytes) / state_bytes),
     };
 
-    // Whole segments: the floor's rounded up, the rest's rounded down.
-    let least = floor.div_ceil(segment).max(1) * segment;
+    // Whole segments: the floor's rounded up (`least`), the rest's rounded down.
     let units = (floor + more) / segment * segment;
     let units = units.max(least);
 
@@ -948,6 +958,32 @@ mod tests {
         assert!(short.to_string().contains("2097152 short"), "{short}");
         assert!(state_units(GIB, 0, 1, (None, 1.0), segment).is_err());
         assert!(state_units(GIB, state, 1, (None, 1.0), 0).is_err());
+    }
+
+    /// The slots a share holds are counted with their checkpoints in the region's whole
+    /// segments, so the region always holds its floor beside them: a share whose slots fit one
+    /// checkpoint each but not the floor's segments holds fewer slots.
+    #[test]
+    fn the_slots_a_share_holds_leave_the_state_region_its_floor() {
+        // Slots of 1 MiB of storages beside checkpoints of 1 MiB in segments of sixteen.
+        let (state, segment) = (MIB, 16);
+        assert_eq!(state_floor(123, segment), 128);
+        assert_eq!(state_floor(0, segment), 16);
+
+        // 250 MiB holds 125 slots at one checkpoint each, whose floor of 128 checkpoints it
+        // would not hold beside them, and 122 with the floor's segments, whose 128 checkpoints
+        // the region then holds beside the slots' storages.
+        let left = 250 * MIB;
+        let slots = request_slots(128, left, |slots| {
+            Ok::<u64, Error>(u64::from(slots) * MIB + state_floor(slots, segment) * state)
+        })
+        .unwrap();
+        assert_eq!(slots, 122);
+        let remainder = left - u64::from(slots) * MIB;
+        assert_eq!(
+            state_units(remainder, state, slots, (None, 1.0), segment).unwrap(),
+            128
+        );
     }
 
     /// The state region takes `ratio` times the KV planes' bytes beside its floor: of what the

@@ -1118,6 +1118,7 @@ fn a_step_takes_the_step_values_it_began_with_within_the_workers_capture() {
         tuning.max_num_batched_tokens = NonZeroUsize::new(256);
         tuning.chunked_prefill_size = NonZeroUsize::new(64);
         tuning.max_queued_requests = NonZeroUsize::new(3);
+        tuning.synthetic_acceptance_length = Some(2.5);
     });
     bench.scheduler.step();
     assert_eq!(
@@ -1131,6 +1132,7 @@ fn a_step_takes_the_step_values_it_began_with_within_the_workers_capture() {
             prefix_caching: true,
             host_tier: true,
             copy_budget: proto::config::DEFAULT_COPY_BUDGET,
+            synthetic_acceptance_length: Some(2.5),
         }
     );
 
@@ -1141,6 +1143,7 @@ fn a_step_takes_the_step_values_it_began_with_within_the_workers_capture() {
         tuning.max_num_batched_tokens = None;
         tuning.chunked_prefill_size = NonZeroUsize::new(4096);
         tuning.max_queued_requests = None;
+        tuning.synthetic_acceptance_length = None;
     });
     bench.scheduler.step();
     assert_eq!(
@@ -1154,6 +1157,7 @@ fn a_step_takes_the_step_values_it_began_with_within_the_workers_capture() {
             prefix_caching: true,
             host_tier: true,
             copy_budget: proto::config::DEFAULT_COPY_BUDGET,
+            synthetic_acceptance_length: None,
         }
     );
 }
@@ -1386,6 +1390,7 @@ pub(crate) fn tuned() -> Arc<ArcSwap<Tuning>> {
         prefix_caching: true,
         host_tier: true,
         copy_budget: proto::config::DEFAULT_COPY_BUDGET,
+        synthetic_acceptance_length: None,
         report_period: proto::config::DEFAULT_REPORT_PERIOD,
         watchdog_timeout: proto::config::DEFAULT_WATCHDOG_TIMEOUT,
         compare_timeout: proto::config::DEFAULT_COMPARE_TIMEOUT,

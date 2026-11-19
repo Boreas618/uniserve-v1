@@ -37,18 +37,48 @@
 //! speculated run of a seeded request reproduces itself, and a greedy request's verification takes
 //! the argmax a decode would.
 //!
+//! ## Synthetic acceptance
+//!
+//! A batch that states a synthetic acceptance length `L` (`Columns::synthetic_acceptance_length`)
+//! accepts drafts by a law of their offsets alone, whatever the model selects (vLLM's synthetic
+//! rejection sampler, `rejection_sample_method = "synthetic"`, which a benchmark states so that
+//! the throughput it measures does not depend on the drafter's fitness). Draft `i` of a
+//! verification, counted from zero, is accepted with the conditional rate
+//!
+//! ```text
+//! c_i = clamp(L - 1 - i, 0, 1)
+//! ```
+//!
+//! once every draft before it was: the unconditional rates `p_i = c_0 · … · c_i` are then
+//! `[1] · ⌊L - 1⌋ + [L - 1 - ⌊L - 1⌋] + [0, …]`, the schedule of least variance whose
+//! expected committed tokens `1 + Σ p_i` are `L` for a verification of at least `⌈L - 1⌉`
+//! drafts (vLLM's `_acceptance_length_to_rates` and `unconditional_to_conditional_rates`).
+//! The draw of draft `i` is synthetic acceptance's draw at the draft's position in its
+//! request's stream (`DrawAddress::acceptance_word`), so a seeded request accepts the same
+//! drafts whenever and wherever it runs, a migrated one included; it is accepted when the
+//! draw's word `w` is below `⌈c_i · 2^24⌉`, which is `w · 2^-24 < c_i`. The verification
+//! stops at its first rejected draft and commits the drafts before it and the model's own
+//! selection at that offset, or after its last draft: a position whose draft is accepted
+//! emits the draft, not what the model selected there.
+//!
 //! ## On the device
 //!
 //! ```text
-//! agrees  [T]      = chosen == Drafts            a row's last token names no draft
-//! run     [R, D+1] = agrees gathered by Windows  offset j of row r, zero from its last token on
-//! agreed  [R]      = argmin(run)                 the first offset that disagrees
-//! last    [R]      = Firsts + agreed             the token whose sample ends the accepted prefix
+//! agrees  [2T]     = (chosen == Drafts)              the model's law: a row's last token names
+//!                    ‖ (AcceptDraws < AcceptBounds)  no draft; the synthetic law: its bound is 0
+//! run     [R, D+1] = agrees gathered by Windows      offset j of row r in the half of the law
+//!                                                    the batch states, zero from its last token on
+//! agreed  [R]      = argmin(run)                     the first offset that is not accepted
+//! last    [R]      = Firsts + agreed                 the token whose sample ends the accepted prefix
+//! emitted [T]      = TokenSteps < agreed[TokenRows]  a token's draft where its row accepted it,
+//!                    ? Drafts : chosen               the token's own selection otherwise
 //! ```
 //!
 //! A verification commits `agreed + 1` tokens: its agreed drafts and the sample after them.
-//! The drafter's entry at offset `j` of a verification is written when `j <= agreed`, reads
-//! the token chosen at that offset, and the row's first proposal reads the entry at `agreed`.
+//! Under the model's law an accepted draft is the selection at its offset, so `emitted` is
+//! `chosen`; the outputs and the scores are the emitted tokens'. The drafter's entry at offset
+//! `j` of a verification is written when `j <= agreed`, reads the token emitted at that offset,
+//! and the row's first proposal reads the entry at `agreed`.
 //!
 //! ## The recurrent state after a verification
 //!
@@ -87,16 +117,29 @@
 //! The drafter's output is the rows its next chained step reads; the model's head projects the
 //! drafter's own read of them (`nn::Drafter::logits_rows`), whose argmax is the proposal.
 //!
+//! ## In an expert union
+//!
+//! A member of an expert union speculates as any runner does: the verification's and the
+//! drafter's forwards are lent the exchange of their capacity class, each drafter bucket is
+//! captured at the classes of the bucket it follows (`experts::classes`), and both graphs of a
+//! step replay at the class the step's agreement chose. A step of the union is therefore the
+//! target's expert layers and then the drafter's, once per drafter forward (its entries, then
+//! each chained step after the first: `D` forwards), on every member: a member that joins the
+//! step without a batch of its own runs the same, the model's expert layers and the drafter's
+//! `D` times ([`CausalLmRunner::forward`] of the join bucket).
+//!
 //! ## What is refused
 //!
-//! A runner that speculates joins no expert union, serves no paired forward of a verification
-//! (its token rows share one request's pages, and the scratch set gives each row its own), and
-//! refuses a draft cache refill of a model whose layers or drafter keep a recurrent state,
-//! which would need a scratch state per refill row.
+//! A runner that speculates serves no paired forward of a verification (its token rows share one
+//! request's pages, and the scratch set gives each row its own), and refuses a draft cache refill
+//! of a model whose layers or drafter keep a recurrent state, which would need a scratch state per
+//! refill row. A member of an expert union refuses a shape of other drafts than the serving
+//! one's: the members switch shapes at batch boundaries of their own, and every member of a step
+//! runs the drafter's expert layers as often.
 
 use std::sync::Arc;
 
-use crate::batch::philox::DrawAddress;
+use crate::batch::philox::{self, DrawAddress};
 use crate::batch::{Batch, CallOutput, CallStatus, Columns, DraftWork, Phase, Row, Rows};
 use nn::{KvCache, NO_SLOT, RecurrentState, TokenBatch, functional};
 use platform::Stream;
@@ -478,18 +521,39 @@ pub(crate) struct Speculation {
     pub(crate) state: Option<StateBuffers>,
 }
 
+/// The conditional rate at which synthetic acceptance of mean length `length` accepts draft
+/// `draft` of a verification, counted from zero, once it accepted every draft before it:
+/// `clamp(length - 1 - draft, 0, 1)` (module documentation, synthetic acceptance).
+pub(crate) fn acceptance_rate(length: f64, draft: usize) -> f64 {
+    (length - 1.0 - draft as f64).clamp(0.0, 1.0)
+}
+
+/// The words of a draw below which synthetic acceptance of mean length `length` accepts draft
+/// `draft`: `⌈c · 2^24⌉` for its rate `c` ([`acceptance_rate`]), so a 24-bit word `w` is
+/// accepted exactly when its uniform `w · 2^-24` is below `c`.
+fn acceptance_bound(length: f64, draft: usize) -> u32 {
+    let words = f64::from(philox::UNIFORM_WORDS);
+
+    // The product is at most 2^24, which a u32 holds exactly.
+    (acceptance_rate(length, draft) * words).ceil() as u32
+}
+
 /// The agreed length of each verification and the token that ends its accepted prefix:
 /// `(agreed, last)`, both `[rows]` U32 (module documentation).
 ///
 /// - `chosen`: `[tokens]` U32, the token sampled at each token of the batch;
 /// - `drafts`: `[tokens]` U32, the draft each sample is compared with, [`NO_SLOT`] for the
 ///   last token of a row and for a token no row holds;
-/// - `windows`: `[rows, drafts + 1]` U32, the token of each row at each offset, the row's last
-///   token past its end, and [`NO_SLOT`] for a row the batch does not hold;
+/// - `draws`, `bounds`: `[tokens]` U32, synthetic acceptance's draw of the draft after each
+///   token and the words below which it accepts it, zero for a token that names no draft;
+/// - `windows`: `[rows, drafts + 1]` U32, where the agreement of each row's token at each
+///   offset lies, the row's last token's past its end, and [`NO_SLOT`] for a row the batch
+///   does not hold: token `t`'s under the model's law at `t`, under the synthetic law at
+///   `tokens + t`;
 /// - `firsts`: `[rows]` U32, each row's first token.
 ///
 /// Every operation is one between tensors, so the same launches serve any batch of the
-/// bucket.
+/// bucket, under either law.
 ///
 /// # Errors
 ///
@@ -497,14 +561,16 @@ pub(crate) struct Speculation {
 pub(crate) fn accept(
     chosen: &Tensor,
     drafts: &Tensor,
+    (draws, bounds): (&Tensor, &Tensor),
     windows: &Tensor,
     firsts: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
     let (rows, width) = windows.dims2()?;
 
-    // One where a token's sample is the draft after it. A row's last token names no draft,
-    // and a gather through `NO_SLOT` reads zero, so every row's run ends in a zero.
-    let agrees = chosen.eq(drafts)?;
+    // One where a token's sample is the draft after it, then one where synthetic acceptance
+    // accepts that draft. A row's last token names no draft and its bound is zero, and a
+    // gather through `NO_SLOT` reads zero, so every row's run ends in a zero under either law.
+    let agrees = Tensor::cat(&[&chosen.eq(drafts)?, &draws.lt(bounds)?], 0)?;
     let run = agrees
         .index_select(&windows.flatten_all()?, 0)?
         .reshape((rows, width))?;
@@ -720,7 +786,8 @@ pub(crate) fn idle_verification(
 /// `mapping` is the cache slot each token writes (`columns::slot_mapping`), empty for a step
 /// that writes none. The commit table holds the batch's row per call, whose task is the
 /// call's own, then one count row per draft of each call, which counts when the device
-/// accepted the draft.
+/// accepted the draft. A batch that states a synthetic acceptance length states each draft's
+/// draw and bound, and its windows address the synthetic law's agreements ([`accept`]).
 ///
 /// # Errors
 ///
@@ -790,6 +857,21 @@ pub(crate) fn fill_verification(
     let mut extras = vec![NO_SLOT; bucket_tokens * drafts];
     let mut windows = vec![NO_SLOT; bucket_rows * (drafts + 1)];
     let mut draft_tokens = vec![NO_SLOT; bucket_rows * drafts];
+    let mut token_owners = vec![NO_SLOT; bucket_tokens];
+    let mut token_offsets = vec![0_u32; bucket_tokens];
+
+    // ---- The law each verification accepts its drafts by ----
+
+    // The synthetic law's agreements follow the model's in `accept`, so a batch that states
+    // a synthetic length gathers its rows' agreements from the second half.
+    let synthetic = columns.synthetic_acceptance_length;
+    let law = if synthetic.is_some() {
+        bucket_tokens
+    } else {
+        0
+    };
+    let mut accept_draws = vec![0_u32; bucket_tokens];
+    let mut accept_bounds = vec![0_u32; bucket_tokens];
 
     let mut table = sampler::commit_table(&columns.commit, calls, layout.rows())?;
     let stride = layout.rows();
@@ -826,8 +908,20 @@ pub(crate) fn fill_verification(
         let drafted: Vec<u32> = ids.iter().skip(1).map(|id| (*id).max(0) as u32).collect();
 
         for (ahead, token) in (first..last).enumerate() {
+            token_owners[token] = index as u32;
+            token_offsets[token] = ahead as u32;
+
             if let Some(draft) = drafted.get(ahead) {
                 compared[token] = *draft;
+
+                // The draft after this token takes the position the token's sample does, whose
+                // address its token row draws at.
+                if let Some(length) = synthetic {
+                    let address = expanded.draws.get(token).copied().unwrap_or_default();
+
+                    accept_draws[token] = address.acceptance_word();
+                    accept_bounds[token] = acceptance_bound(length, ahead);
+                }
             }
             extras[token * drafts..][..ahead].copy_from_slice(&drafted[..ahead]);
 
@@ -843,7 +937,8 @@ pub(crate) fn fill_verification(
             }
         }
         for offset in 0..=drafts {
-            windows[index * (drafts + 1) + offset] = (first + offset.min(drafted.len())) as u32;
+            windows[index * (drafts + 1) + offset] =
+                (law + first + offset.min(drafted.len())) as u32;
         }
         draft_tokens[index * drafts..][..drafted.len()].copy_from_slice(&drafted);
 
@@ -882,6 +977,10 @@ pub(crate) fn fill_verification(
     layout.put(block, Column::StateSlots, &state_slots)?;
     layout.put(block, Column::Firsts, &firsts)?;
     layout.put(block, Column::Drafts, &compared)?;
+    layout.put(block, Column::AcceptDraws, &accept_draws)?;
+    layout.put(block, Column::AcceptBounds, &accept_bounds)?;
+    layout.put(block, Column::TokenRows, &token_owners)?;
+    layout.put(block, Column::TokenSteps, &token_offsets)?;
     layout.put(block, Column::Extras, &extras)?;
     layout.put(block, Column::Windows, &windows)?;
     layout.put(block, Column::DraftTokens, &draft_tokens)?;
@@ -1259,10 +1358,12 @@ impl CausalLmRunner {
             None => None,
         };
 
+        // A member of an expert union is lent the exchange of the bucket's capacity class.
+        let exchange = self.expert_exchange(bucket)?;
         let hidden = {
             let embedded = self.model.embed_input_ids(&ids)?;
             self.model
-                .forward(&batch, &cache, state.as_ref(), None, &embedded)?
+                .forward(&batch, &cache, state.as_ref(), exchange.as_ref(), &embedded)?
         };
 
         // ---- The selection of the token after every token ----
@@ -1296,17 +1397,36 @@ impl CausalLmRunner {
             (chosen, Some(valid))
         };
 
-        let scores = speculation.verifier.score(&logits, &chosen)?;
-        drop(logits);
+        // ---- The acceptance, the tokens it emits, and the state after the accepted prefix ----
 
-        // ---- The acceptance, and the recurrent state after the accepted prefix ----
-
+        let compared = self.column(Column::Drafts, tokens)?;
         let (agreed, last) = accept(
             &chosen,
-            &self.column(Column::Drafts, tokens)?,
+            &compared,
+            (
+                &self.column(Column::AcceptDraws, tokens)?,
+                &self.column(Column::AcceptBounds, tokens)?,
+            ),
             &self.column(Column::Windows, (rows, drafts + 1))?,
             &self.column(Column::Firsts, rows)?,
         )?;
+
+        // A position whose draft its row accepted emits the draft, a valid token, and any other
+        // its selection: the tokens the outputs report and score, and that the drafter's
+        // entries read. A token no row holds names no row, whose gather reads zero.
+        let ones = self.column(Column::Valid, tokens)?;
+        let drafted = {
+            let bound = agreed.index_select(&self.column(Column::TokenRows, tokens)?, 0)?;
+            self.column(Column::TokenSteps, tokens)?.lt(&bound)?
+        };
+        let emitted = drafted.where_cond(&compared, &chosen)?;
+        let valid = match valid {
+            Some(valid) => Some(drafted.where_cond(&ones, &valid)?),
+            None => None,
+        };
+
+        let scores = speculation.verifier.score(&logits, &emitted)?;
+        drop(logits);
 
         if let (Some((live, _)), Some(trail)) = (&self.state, &speculation.trail) {
             for (live, trail) in live.iter().flatten().zip(trail.iter().flatten()) {
@@ -1318,9 +1438,9 @@ impl CausalLmRunner {
 
         // ---- The commit: each verification's row, then a count row per draft ----
 
+        // The token a verification installs is its selection after the accepted prefix, which
+        // emits no draft.
         let counts = rows * drafts;
-        let ones = self.column(Column::Valid, tokens)?;
-
         let tasks = Tensor::cat(
             &[
                 &chosen.index_select(&last, 0)?,
@@ -1389,7 +1509,7 @@ impl CausalLmRunner {
 
         let kept = &speculation.kept;
         let mut scores = scores.into_iter();
-        let mut outputs = vec![kept.keep(Entry::Chosen, &chosen)?];
+        let mut outputs = vec![kept.keep(Entry::Chosen, &emitted)?];
 
         for (entry, score) in [Entry::Logprobs, Entry::Ranks]
             .into_iter()
@@ -1485,6 +1605,9 @@ impl CausalLmRunner {
             }
             None => None,
         };
+        // A member of an expert union lends every drafter forward of the step the exchange of
+        // the bucket's capacity class, which the step's agreement chose for both graphs.
+        let exchange = self.expert_exchange(bucket)?;
         let run = |batch: &TokenBatch, embedded: &Tensor, hidden: &Tensor| -> Result<Tensor> {
             let state = lent
                 .as_ref()
@@ -1499,7 +1622,14 @@ impl CausalLmRunner {
                     verify: None,
                 });
 
-            Ok(drafter.forward(batch, &cache, state.as_ref(), embedded, hidden)?)
+            Ok(drafter.forward(
+                batch,
+                &cache,
+                state.as_ref(),
+                exchange.as_ref(),
+                embedded,
+                hidden,
+            )?)
         };
 
         let drafted = {

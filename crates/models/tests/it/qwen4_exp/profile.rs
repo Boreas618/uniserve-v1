@@ -395,6 +395,7 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: &[Split]) {
                     &batch,
                     &cache,
                     Some(&state),
+                    None,
                     &meta((tokens, model.hidden() as usize), model.dtype()),
                     &meta((tokens, model.stream_width() as usize), model.dtype()),
                 )

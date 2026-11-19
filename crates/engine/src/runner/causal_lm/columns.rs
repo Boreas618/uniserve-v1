@@ -49,8 +49,12 @@
 //! | [`Column::StateLens`] | U32 `[R]` | the tokens each sequence has seen, its own included | `0` |
 //! | [`Column::StateSlots`] | U32 `[R]` | each sequence's request slot, as the recurrent state reads it | [`NO_SLOT`] |
 //! | [`Column::Drafts`] | U32 `[T]` | the draft each token's sample is compared with: the next token of its row | [`NO_SLOT`] |
+//! | [`Column::AcceptDraws`] | U32 `[T]` | the 24-bit word of synthetic acceptance's draw of the draft after each token | `0` |
+//! | [`Column::AcceptBounds`] | U32 `[T]` | the words below which synthetic acceptance accepts that draft; `0` for a row's last token | `0` |
+//! | [`Column::TokenRows`] | U32 `[T]` | the verification each token belongs to | [`NO_SLOT`] |
+//! | [`Column::TokenSteps`] | U32 `[T]` | each token's offset in its verification | `0` |
 //! | [`Column::Extras`] | U32 `[T, D]` | the drafts before each token in its row, which its penalties count | [`NO_SLOT`] |
-//! | [`Column::Windows`] | U32 `[R, D + 1]` | the token of each row at each offset, its last one past its end | [`NO_SLOT`] |
+//! | [`Column::Windows`] | U32 `[R, D + 1]` | where the agreement of each row's token at each offset lies, its last token's past its end (`speculation::accept`) | [`NO_SLOT`] |
 //! | [`Column::Firsts`] | U32 `[R]` | each row's first token | `0` |
 //! | [`Column::DraftTokens`] | U32 `[R, D]` | each row's drafts, the tokens its count tasks count | [`NO_SLOT`] |
 //! | [`Column::DraftSteps`] | U32 `[R, D]` | each draft's offset among its row's drafts | the offset |
@@ -197,6 +201,10 @@ pub(crate) enum Column {
     StateLens,
     StateSlots,
     Drafts,
+    AcceptDraws,
+    AcceptBounds,
+    TokenRows,
+    TokenSteps,
     Extras,
     Windows,
     Firsts,
@@ -265,6 +273,10 @@ impl Column {
             | Self::SlotMapping
             | Self::Targets
             | Self::Drafts
+            | Self::AcceptDraws
+            | Self::AcceptBounds
+            | Self::TokenRows
+            | Self::TokenSteps
             | Self::NextIds
             | Self::NextRows
             | Self::EntryRows
