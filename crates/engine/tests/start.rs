@@ -505,7 +505,6 @@ fn an_engine_on_a_device_shut_down_while_asleep_exits_in_order() {
         .snapshot()
         .to_string_lossy()
         .into_owned();
-    launch.engine_config.model.max_model_len = 1024;
     launch.devices = vec![0, 1];
     let parallel = &mut launch.engine_config.parallel;
     parallel.tensor_parallel_size = std::num::NonZeroUsize::new(2).unwrap();

@@ -280,6 +280,24 @@ pub(crate) fn shapes<'a>(
     kv_worker(request, groups).map_or(&[], |group| &group.capacity.cache_groups)
 }
 
+/// The longest sequence of `request`'s cache group, in tokens: the model's length its ranks laid
+/// their page tables out for (`Capacity::max_model_len`); unbounded for a request placed nowhere.
+fn longest(request: &Request, groups: &[WorkerGroup]) -> u32 {
+    kv_worker(request, groups).map_or(u32::MAX, |group| group.capacity.max_model_len)
+}
+
+/// The positions of an attention class's table of `block`-token blocks that a call writing the
+/// tokens before `end` needs held: the blocks it writes and the low watermark after them (SD
+/// §4.4), within the blocks a sequence of `longest` tokens holds. Every rank's pooled page table
+/// holds that many positions per request slot (`crate::memory::cache::tables`), so a block past
+/// them is one no call can write, and a request in its last block keeps no watermark.
+pub(crate) fn reach(end: u32, block: u32, longest: u32) -> u32 {
+    let written = end.div_ceil(block);
+    let most = longest.div_ceil(block).max(written);
+
+    written.saturating_add(LOW_WATERMARK).min(most)
+}
+
 fn kv_config<'a>(request: &Request, groups: &'a [WorkerGroup]) -> Option<&'a KvCacheConfig> {
     kv_worker(request, groups)?.capacity.kv_cache.as_ref()
 }
@@ -718,7 +736,8 @@ pub(crate) fn next_call(request: &Request, step: &Step) -> Option<(Phase, u32, u
 }
 
 /// The `Allocate`s a running token request needs so that the blocks asked for cover its next
-/// call and [`LOW_WATERMARK`] blocks beyond it (SD §3.4 `allocate_ahead`, §4.4), per class: the
+/// call and [`LOW_WATERMARK`] blocks beyond it (SD §3.4 `allocate_ahead`, §4.4), an attention
+/// class's within the blocks of the model's length ([`reach`]), per class: the
 /// class, the position, the count, and how many of those blocks the next call itself writes (the
 /// rest are the low watermark's). A full-attention or sliding-window class is grown from `asked`;
 /// a recurrent-state class asks for the checkpoint its next call or refill keeps, or a later
@@ -737,6 +756,7 @@ pub(crate) fn ahead(request: &Request, step: &Step) -> Vec<(u8, u32, u32, u32)> 
         return asks;
     };
     let groups = step.groups;
+    let longest = longest(request, groups);
     let drafts = step.config.draft_tokens;
     let state = state_shape(request, groups).map(|(class, block, _)| (class, block));
     let budget = step.budget.tokens;
@@ -795,7 +815,11 @@ pub(crate) fn ahead(request: &Request, step: &Step) -> Vec<(u8, u32, u32, u32)> 
             (true, Some(end)) => (end, false),
         };
         let written = end.div_ceil(block);
-        let wanted = written.saturating_add(LOW_WATERMARK);
+        let wanted = if kind.is_draft() {
+            written.saturating_add(LOW_WATERMARK)
+        } else {
+            reach(end, block, longest)
+        };
         if blocks.asked < wanted && (required || drafts > 0) {
             let needed = if required {
                 written.saturating_sub(blocks.asked)
@@ -932,7 +956,15 @@ impl Kv {
                     CacheGroupKind::Full => end.div_ceil(block),
                 };
                 let asked = blocks.asked.saturating_sub(blocks.first);
-                let need = most.saturating_add(LOW_WATERMARK).saturating_sub(asked);
+                // The watermark of an attention class stays within the longest sequence's blocks.
+                let ceiling = match kind {
+                    CacheGroupKind::State => u32::MAX,
+                    _ => longest.div_ceil(block).max(most),
+                };
+                let need = most
+                    .saturating_add(LOW_WATERMARK)
+                    .min(ceiling)
+                    .saturating_sub(asked);
                 self.charge_units(&mut units, (group_id, class), (need, 0), groups);
             }
         }
@@ -1084,6 +1116,7 @@ impl Kv {
         };
 
         let prompt = request.num_prompt_tokens;
+        let longest = longest(request, groups);
         let cached = hit.unwrap_or(0);
         let chunk = first_chunk(request, cached, budget);
         // The tiers `cache` expects of the prompt's blocks: a hit's blocks on the host alone are
@@ -1113,7 +1146,7 @@ impl Kv {
             let first = if kind.is_state() {
                 reaches(cached, cached + chunk)
             } else {
-                (cached + chunk).div_ceil(block) - cached / block + LOW_WATERMARK
+                reach(cached + chunk, block, longest) - cached / block
             };
             let blocks = if !keyed(request) && request.image_spans().next().is_some() {
                 if kind.is_state() {
@@ -1679,7 +1712,7 @@ impl Kv {
                 };
                 (boundary / block - 1, 1)
             } else {
-                let wanted = end.div_ceil(block) + LOW_WATERMARK;
+                let wanted = reach(end, block, longest(request, groups));
                 (table.asked, wanted.saturating_sub(table.asked))
             };
             if count > 0 && !(kind.is_state() && checkpoints(table).contains(&Some(at))) {
@@ -2074,7 +2107,7 @@ pub(crate) fn settled(request: &Request, groups: &[WorkerGroup], budget: &Budget
                     checkpoints(blocks).contains(&Some(boundary / block - 1))
                 })
             } else {
-                blocks.end >= end.div_ceil(block) + LOW_WATERMARK
+                blocks.end >= reach(end, block, longest(request, groups))
             };
             read && tail && private
         })
@@ -2189,7 +2222,7 @@ fn finalize(
         };
         // Up to the first chunk and the low watermark, and up to the blocks held beyond them, so
         // that the private entries are one run.
-        let reach = end.div_ceil(block) + LOW_WATERMARK;
+        let reach = reach(end, block, longest(request, groups));
         let wanted = hit / block..if held.is_empty() {
             reach
         } else {
@@ -3490,6 +3523,51 @@ mod tests {
             ahead(session.row(id), &session.scheduler.kv_step()),
             [(0, 2, 2, 1)]
         );
+    }
+
+    /// The low watermark of an attention class stays within the blocks a sequence of the group's
+    /// `max_model_len` holds, the positions every rank's page table holds per request slot
+    /// (SD §4.4): a request whose first chunk or next decode writes its last such block asks for
+    /// none beyond it. A model length of one block is a warm-up request's on a deployment whose
+    /// length is its block size.
+    #[test]
+    fn the_low_watermark_stays_within_the_blocks_of_the_model_s_length() {
+        let mut session = serving(&[full(4)], KvCacheConfig::default());
+        session.scheduler.groups[0].capacity.max_model_len = 4;
+        let one = session.request(1, vec![1]);
+        assert_eq!(
+            session.scheduler.admission_requests(one),
+            [allocate(1, 0, 0, 1)]
+        );
+
+        // A model length of two blocks: a five-token prompt's chunk writes both.
+        session.scheduler.groups[0].capacity.max_model_len = 8;
+        let id = session.request(2, (1..=5).collect());
+        assert_eq!(
+            session.scheduler.admission_requests(id),
+            [allocate(2, 0, 0, 2)]
+        );
+
+        // Running at six tokens, its next decode writes token 6 into block 1, its last: nothing
+        // is asked ahead, and its units to its end are the two blocks it holds.
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        request.num_computed_tokens = 6;
+        request.token_ids = (1..=6).collect();
+        request.blocks[0] = Blocks {
+            first: 0,
+            shared: 0,
+            end: 2,
+            asked: 2,
+        };
+        assert!(ahead(session.row(id), &session.scheduler.kv_step()).is_empty());
+        let running = [session.row(id).clone()];
+        let left = session.scheduler.kv.units_to_end(
+            running.iter(),
+            &session.scheduler.groups,
+            &session.scheduler.budget,
+        );
+        assert!(left.iter().all(|&units| units == 0), "{left:?}");
     }
 
     /// A request the whole cache cannot hold ends with `CacheCapacity`, at the length the cache
