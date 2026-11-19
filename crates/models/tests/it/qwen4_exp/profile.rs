@@ -22,9 +22,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use nn::family::{CacheShape, Family, TextModel, TextPlacement};
+use nn::family::{CacheField, Family, INDEX_KEY, TextModel, TextPlacement};
 use nn::{DType, KvCache, MetaWeights, Phase, RecurrentState, Split, WeightLoader};
-use nn_testing::text::{self, WORKSPACE_BYTES};
+use nn_testing::text::{self, WORKSPACE_BYTES, key_value_shape};
 use nn_testing::{
     Launch, PAGE_TOKENS, Recording, Release, assert_generic, assert_operators, meta, record, report,
 };
@@ -79,15 +79,23 @@ fn load(release: Release, placement: &TextPlacement) -> (Arc<dyn TextModel>, Vec
     (model, unnamed)
 }
 
-/// The meta cache group of `shape` in `dtype` over `rows` rows of `row_pages` pages each.
-fn cache(shape: CacheShape, dtype: DType, rows: usize, row_pages: usize) -> KvCache {
-    KvCache::allocate(
-        shape,
+/// The meta cache group of `fields` in `dtype` over `rows` rows of `row_pages` pages each, lent
+/// to a forward of `tokens` tokens.
+fn cache(
+    fields: &[CacheField],
+    dtype: DType,
+    (rows, row_pages): (usize, usize),
+    tokens: usize,
+) -> KvCache {
+    text::cache(
+        fields,
         dtype,
-        rows * row_pages,
-        PAGE_TOKENS,
-        meta((rows, row_pages), DType::U32),
-        meta(WORKSPACE_BYTES, DType::U8),
+        (rows * row_pages, PAGE_TOKENS),
+        (
+            meta((rows, row_pages), DType::U32),
+            meta(tokens, DType::U32),
+            meta(WORKSPACE_BYTES, DType::U8),
+        ),
         |shape, dtype| Ok(meta(shape, dtype)),
     )
     .expect("a meta cache group")
@@ -128,7 +136,6 @@ fn step(
             phase,
             [
                 meta(tokens, DType::I32),
-                meta(tokens, DType::U32),
                 meta(rows, DType::U32),
                 meta(rows + 1, DType::U32),
                 meta(rows, DType::U32),
@@ -137,7 +144,7 @@ fn step(
             PAGE_TOKENS,
             PAGE_TOKENS * row_pages as u32,
         );
-        let cache = cache(model.cache(), model.dtype(), rows, row_pages);
+        let cache = cache(&model.cache(), model.dtype(), (rows, row_pages), tokens);
         let shapes = model.state_layers();
         let state = text::state(
             [
@@ -279,10 +286,16 @@ const STEP: [&str; 14] = [
 fn assert_shapes(model: &dyn TextModel, tensor: Split) {
     let ranks = tensor.size() as usize;
     let cache = model.cache();
-    assert_eq!((cache.layers, cache.head_dim), (12, 256));
-    assert_eq!(cache.kv_heads as usize, (2 / ranks).max(1));
-    let keys = cache.index_keys.expect("index keys");
-    assert_eq!((keys.width, keys.ratio), (128, 4));
+    let (layers, kv_heads, head_dim) = key_value_shape(&cache);
+    assert_eq!((layers, head_dim), (12, 256));
+    assert_eq!(kv_heads as usize, (2 / ranks).max(1));
+    let keys = cache
+        .iter()
+        .find(|field| field.name == INDEX_KEY)
+        .expect("index keys");
+    assert_eq!(keys.record.width, 128);
+    assert!(keys.owners.iter().all(|owner| owner.ratio == 4));
+    assert_eq!(keys.owners.len(), 12);
 
     let [linear, ple, ring] = model
         .state_layers()
@@ -358,7 +371,8 @@ fn profile_packed(release: Release) {
 fn drafter_and_tower(name: &str, model: &dyn TextModel, group: &[Split]) {
     let drafter = model.drafter().expect("the drafter");
     let draft = drafter.cache();
-    assert_eq!((draft.layers, draft.head_dim), (1, 256));
+    let (layers, _, head_dim) = key_value_shape(&draft);
+    assert_eq!((layers, head_dim), (1, 256));
     let shapes = drafter.state_layers();
     assert_eq!(shapes.len(), 1);
 
@@ -368,7 +382,6 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: &[Split]) {
                 Phase::Decode,
                 [
                     meta(tokens, DType::I32),
-                    meta(tokens, DType::U32),
                     meta(rows, DType::U32),
                     meta(rows + 1, DType::U32),
                     meta(rows, DType::U32),
@@ -377,7 +390,7 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: &[Split]) {
                 PAGE_TOKENS,
                 PAGE_TOKENS * 2,
             );
-            let cache = cache(draft, model.dtype(), rows, 2);
+            let cache = cache(&draft, model.dtype(), (rows, 2), tokens);
             let state = text::state(
                 [
                     meta(requests + 1, DType::U32),

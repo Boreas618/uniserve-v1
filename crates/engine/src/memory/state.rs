@@ -442,7 +442,7 @@ impl StateMemory {
             let end = u64::from(checkpoint.first_plane) + u64::from(checkpoint.planes);
 
             for (first, bytes) in fields {
-                if u64::from(*first) + bytes.div_ceil(layout.plane_bytes) > end {
+                if u64::from(*first) + bytes.div_ceil(layout.plane_bytes()) > end {
                     return Err(Error::Invalid(format!(
                         "a checkpoint field of {bytes} bytes from plane {first} lies outside its \
                          layer's checkpoint, which ends at plane {end}"
@@ -455,7 +455,7 @@ impl StateMemory {
             config,
             planes,
             page_planes: layout.checkpoint_planes(),
-            plane_bytes: layout.plane_bytes,
+            plane_bytes: layout.plane_bytes(),
             units,
             layout: Arc::clone(layout),
             device: None,
@@ -1481,13 +1481,25 @@ mod tests {
         }
     }
 
+    /// The keys and values of `layers` attention layers of 4-token pages of one 8-wide BF16
+    /// head.
+    fn keys_and_values(layers: u32) -> CacheLayout {
+        CacheLayout::of(
+            4,
+            &nn::family::CacheField::keys_and_values(layers, 1, 8),
+            PrefixCacheDtype::BFloat16,
+        )
+        .expect("a dense layout")
+    }
+
     /// The cache of two attention layers of 4-token pages of one 8-wide BF16 head beside that
     /// state: planes of 64 bytes, so a layer's checkpoint is two planes and a state unit four,
     /// in a state region of eight units.
     fn cache() -> KvCacheConfig {
-        let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &[shape()])
+        let layout = keys_and_values(2)
+            .with_state(&[shape()])
             .expect("a hybrid layout");
-        assert_eq!(layout.plane_bytes, 64);
+        assert_eq!(layout.plane_bytes(), 64);
         assert_eq!(layout.groups[1].units_per_page, 1);
 
         KvCacheConfig {
@@ -1498,6 +1510,7 @@ mod tests {
             segments: None,
             workspace_bytes: 64,
             states: (8, None),
+            windows: Vec::new(),
         }
     }
 
@@ -1623,7 +1636,7 @@ mod tests {
     #[test]
     fn a_state_needs_a_state_group() {
         let mut dense = cache();
-        dense.layout = Arc::new(CacheLayout::dense(4, 2, 1, 8, PrefixCacheDtype::BFloat16));
+        dense.layout = Arc::new(keys_and_values(2));
         assert!(StateMemory::meta(config(0), &dense).is_err());
 
         let mut empty = config(0);
@@ -1652,7 +1665,7 @@ mod tests {
     /// The cache of three attention layers beside [`runs`]: three columns of 64-byte planes,
     /// the two layers of the first run two planes each and the last layer one.
     fn runs_cache() -> Result<KvCacheConfig> {
-        let layout = CacheLayout::hybrid(4, 3, 1, 8, PrefixCacheDtype::BFloat16, &runs())?;
+        let layout = keys_and_values(3).with_state(&runs())?;
 
         Ok(KvCacheConfig {
             layout: Arc::new(layout),

@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use crate::memory::allocation::Storage;
 use crate::memory::cache::segments::{self, PlaneSegment};
-use crate::memory::cache::{ATTENTION_WORKSPACE_BYTES, CacheLayout, KvCacheConfig};
+use crate::memory::cache::{ATTENTION_WORKSPACE_BYTES, CacheLayout, KvCacheConfig, window_units};
 use crate::memory::client::{StorageClient, quota_limit};
 use crate::memory::division;
 use crate::memory::state::StateConfig;
@@ -103,50 +103,29 @@ impl ModelRunner {
         Storage::peers(device, &served).context("reading which served devices reach the rank's")
     }
 
-    /// The layout of the rank's cache for `model` (step 5): one attention group of the model's
-    /// layers, the state group of a model that keeps a recurrent state, the index keys its
-    /// attention reads when it states them, and the draft group of the drafter the checkpoint
-    /// carries and the rank's placement loads ([`ModelRunner::drafter_cache`]).
+    /// The layout of the rank's cache for `model` (step 5): a group and a pool per history of the
+    /// model's cache fields (`nn::family::TextModel::cache`), the state group of a model that
+    /// keeps a recurrent state, and the draft group of the drafter the checkpoint carries and the
+    /// rank's placement loads ([`ModelRunner::drafter_cache`]).
     ///
     /// # Errors
     ///
-    /// A cache the model's shape cannot lay out, or a cache element type the model's activations
-    /// have none of.
+    /// Fields the layout refuses, or a cache element type the model's activations have none of.
     pub(crate) fn cache_layout(&self, model: &dyn TextModel) -> Result<CacheLayout> {
-        let shape = model.cache();
         let kv = &self.engine_config().kv_cache;
         let dtype = cache_dtype(model.dtype(), kv.dtype)?;
+        let layout = CacheLayout::of(self.page_tokens(), &model.cache(), dtype)
+            .context("describing the model's cache fields")?;
 
         // A model that keeps a recurrent state per request slot adds the state group its
         // checkpoints fill, laid out over every run of its recurrent layers.
         let runs = model.state_layers();
         let layout = if runs.is_empty() {
-            CacheLayout::dense(
-                self.page_tokens(),
-                shape.layers,
-                shape.kv_heads,
-                shape.head_dim,
-                dtype,
-            )
+            layout
         } else {
-            CacheLayout::hybrid(
-                self.page_tokens(),
-                shape.layers,
-                shape.kv_heads,
-                shape.head_dim,
-                dtype,
-                &runs,
-            )
-            .context("describing the model's KV cache and recurrent state")?
-        };
-
-        // A model whose attention reads the tokens an indexer selects keeps their index keys
-        // beside its keys and values.
-        let layout = match shape.index_keys {
-            Some(keys) => layout
-                .with_index_keys(keys)
-                .context("describing the model's index keys")?,
-            None => layout,
+            layout
+                .with_state(&runs)
+                .context("describing the model's recurrent state")?
         };
 
         // The drafter's draft cache lies in the same pool. It is laid out for every drafter the
@@ -156,25 +135,17 @@ impl ModelRunner {
         // A drafter the deployment does not load now whose cache the pool cannot hold is one no
         // generation speculates with: the pool lays out none for it.
         let layout = match model.drafter() {
-            Some(drafter) => {
-                let shape = drafter.cache();
-                layout
-                    .with_draft(shape.layers, shape.kv_heads, shape.head_dim)
-                    .context("describing the drafter's draft cache")?
-            }
+            Some(drafter) => layout
+                .with_draft(&drafter.cache())
+                .context("describing the drafter's draft cache")?,
             None => match self.drafter_cache()? {
-                Some(shape) => {
-                    match layout
-                        .clone()
-                        .with_draft(shape.layers, shape.kv_heads, shape.head_dim)
-                    {
-                        Ok(drafting) => drafting,
-                        Err(why) => {
-                            tracing::info!(%why, "the KV cache lays out no draft cache");
-                            layout
-                        }
+                Some(fields) => match layout.clone().with_draft(&fields) {
+                    Ok(drafting) => drafting,
+                    Err(why) => {
+                        tracing::info!(%why, "the KV cache lays out no draft cache");
+                        layout
                     }
-                }
+                },
                 None => layout,
             },
         };
@@ -185,7 +156,8 @@ impl ModelRunner {
     /// The cache of `layout` with `units` units, the padding unit included, made of `segments` on a
     /// device (`None` for planes that are not split), and the state region's units with their
     /// segments for a layout with a state group (`(0, None)` without): the rank's request slots,
-    /// and rows of the pages a request of the model's length holds (step 6).
+    /// rows of the pages a request of the model's length holds, and each sliding window's pool
+    /// sized for the slots and the tokens of the rank's largest step (`window_units`) (step 6).
     pub(crate) fn cache_config(
         &self,
         layout: Arc<CacheLayout>,
@@ -193,11 +165,17 @@ impl ModelRunner {
         segments: Option<Vec<PlaneSegment>>,
         states: (u32, Option<Vec<PlaneSegment>>),
     ) -> KvCacheConfig {
-        let width = self
-            .engine_config()
-            .model
-            .max_model_len
-            .div_ceil(self.page_tokens());
+        let page = self.page_tokens();
+        let width = self.engine_config().model.max_model_len.div_ceil(page);
+        let (_, tokens) = self.buckets().bounds();
+        let windows = layout
+            .window_groups()
+            .into_iter()
+            .map(|(group, _)| {
+                let window = layout.groups[group].kind.window().unwrap_or(0);
+                window_units(window, page, self.slots(), tokens)
+            })
+            .collect();
 
         KvCacheConfig {
             layout,
@@ -207,6 +185,7 @@ impl ModelRunner {
             segments,
             workspace_bytes: ATTENTION_WORKSPACE_BYTES,
             states,
+            windows,
         }
     }
 
@@ -382,7 +361,7 @@ impl ModelRunner {
             now,
             regions,
             u64::from(least),
-            &[("cache's fewest units", layout.unit_bytes)],
+            &[("cache's fewest units", layout.unit_bytes())],
         )?;
         // A slot of a model that keeps a recurrent state costs one checkpoint beside its storages.
         let slots = division::request_slots(self.slots(), left, |slots| {
@@ -408,13 +387,14 @@ impl ModelRunner {
             .kv_cache
             .max_tokens
             .map(|tokens| layout.token_units(tokens.get()));
+        let unit_bytes = layout.unit_bytes();
 
         // The state region first: its floor and its ratio of the KV planes' bytes, agreed over the host
         // group; the planes take what it leaves.
         let states = if state_bytes > 0 {
             let segment = segments::segment_units(state_bytes, granularity)
                 .context("a checkpoint of no bytes splits into no segment")?;
-            let kv_capacity = capacity.map(|units| units.saturating_mul(layout.unit_bytes));
+            let kv_capacity = capacity.map(|units| units.saturating_mul(unit_bytes));
             let ratio = self.engine_config().kv_cache.state_ratio;
             let states =
                 division::state_units(whole, state_bytes, slots, (kv_capacity, ratio), segment)?;
@@ -428,7 +408,7 @@ impl ModelRunner {
         let state_total = u64::from(states) * state_bytes;
         let units = division::cache_units(
             whole.saturating_sub(state_total),
-            layout.unit_bytes,
+            unit_bytes,
             u64::from(least),
             capacity,
             host,
@@ -437,13 +417,13 @@ impl ModelRunner {
         // Whole segments, each the fewest units that fill whole granules of every column's
         // allocation: what a start, a grow and a wake create and a release gives back, so the
         // region numbers what the quota holds less under one granule of each allocation.
-        let units = segments::segmented_units(units, layout.plane_bytes, granularity);
-        if segments::segment_layout(units, layout.plane_bytes, granularity).is_none() {
+        let plane = layout.segment_plane();
+        let units = segments::segmented_units(units, plane, granularity);
+        if segments::segment_layout(units, plane, granularity).is_none() {
             bail!(
-                "a cache of {units} units of {} plane bytes holds no segment of whole \
+                "a cache of {units} units of {plane} plane bytes holds no segment of whole \
                  {granularity}-byte granules, and a device KV region's memory is the segments its \
-                 ranks create",
-                layout.plane_bytes
+                 ranks create"
             );
         }
 
@@ -504,7 +484,7 @@ pub(crate) fn first_units(
     remainder: u64,
 ) -> u32 {
     let Some((count, per_segment)) =
-        segments::segment_layout(units, layout.plane_bytes, granularity)
+        segments::segment_layout(units, layout.segment_plane(), granularity)
     else {
         return 0;
     };
@@ -512,7 +492,7 @@ pub(crate) fn first_units(
     // One unit of the split planes over every column, which its segment holds; the rest of a
     // unit's bytes is in planes that are not split.
     let split = layout.split_bytes();
-    let unsplit = u64::from(units) * layout.unit_bytes.saturating_sub(split);
+    let unsplit = u64::from(units) * layout.unit_bytes().saturating_sub(split);
     let segment = (u64::from(per_segment) * split).max(1);
 
     let fitting = remainder
@@ -702,13 +682,14 @@ pub(crate) fn granularity(device: DeviceId) -> Result<u64> {
     Ok(granularity as u64)
 }
 
-/// The fewest units a cache of `layout` serves with: the padding unit and one page of every cache
-/// group but the state group, whose pages lie in the state region.
+/// The fewest units of the KV pool a cache of `layout` serves with: the padding unit and one
+/// page of every cache group of the pool, the state group's pages lying in the state region and
+/// a sliding window's in its own pool.
 pub(crate) fn fewest_units(layout: &CacheLayout) -> u32 {
     1 + layout
         .groups
         .iter()
-        .filter(|group| !group.state())
+        .filter(|group| !group.state() && group.pool == 0)
         .map(|group| group.units_per_page)
         .sum::<u32>()
 }
@@ -757,18 +738,23 @@ mod tests {
     /// A dense cache of four layers whose planes take 32 KiB a unit, so 64 units fill a granule:
     /// 1024 units split into sixteen segments of 64.
     fn layout() -> CacheLayout {
-        CacheLayout::dense(64, 4, 2, 128, PrefixCacheDtype::BFloat16)
+        CacheLayout::of(
+            64,
+            &nn::family::CacheField::keys_and_values(4, 2, 128),
+            PrefixCacheDtype::BFloat16,
+        )
+        .expect("a dense layout")
     }
 
     /// The bytes one unit of the value planes takes, which its segment holds.
     fn values(layout: &CacheLayout) -> u64 {
-        2 * u64::from(layout.columns) * layout.plane_bytes
+        2 * u64::from(layout.columns()) * layout.plane_bytes()
     }
 
     #[test]
     fn the_start_creates_the_whole_segments_the_quota_holds_beside_the_unsplit_planes() {
         let layout = layout();
-        let unsplit = 1024 * (layout.unit_bytes - values(&layout));
+        let unsplit = 1024 * (layout.unit_bytes() - values(&layout));
         let segment = 64 * values(&layout);
 
         // Three segments and most of a fourth fit beside the planes that are made whole: what is
@@ -803,10 +789,9 @@ mod tests {
                 rows: nn::family::StateRows::Whole,
             }],
         };
-        let layout =
-            CacheLayout::hybrid(64, 4, 2, 128, PrefixCacheDtype::BFloat16, &[state]).unwrap();
+        let layout = layout().with_state(&[state]).unwrap();
         let state_bytes = layout.state_bytes();
-        assert_eq!(state_bytes, 4 * layout.plane_bytes);
+        assert_eq!(state_bytes, 4 * layout.plane_bytes());
         assert_eq!(layout.split_bytes(), values(&layout));
         assert_eq!(fewest_units(&layout), 2);
         assert_eq!(fewest_states(&layout), 1);
@@ -829,7 +814,7 @@ mod tests {
     fn a_region_new_to_the_quota_creates_what_it_holds_and_leaves_the_rest_given_back() {
         let layout = layout();
         let (segments, stated) =
-            plane_segments(2, (1024, 192), layout.plane_bytes, GRANULE, &[]).unwrap();
+            plane_segments(2, (1024, 192), layout.plane_bytes(), GRANULE, &[]).unwrap();
 
         // Every segment of the split is the cache's; the first three are created and granted,
         // the other thirteen left given back for a grow to create.
@@ -848,11 +833,12 @@ mod tests {
         );
 
         // The quota's figure is rounded down to whole segments, never up: 191 units hold two.
-        let (_, stated) = plane_segments(2, (1024, 191), layout.plane_bytes, GRANULE, &[]).unwrap();
+        let (_, stated) =
+            plane_segments(2, (1024, 191), layout.plane_bytes(), GRANULE, &[]).unwrap();
         assert_eq!(stated.len(), 2);
 
         // A region with no segment, which the quota holds none of, cannot open.
-        let error = plane_segments(2, (1024, 0), layout.plane_bytes, GRANULE, &[]).unwrap_err();
+        let error = plane_segments(2, (1024, 0), layout.plane_bytes(), GRANULE, &[]).unwrap_err();
         assert!(format!("{error:#}").contains("holds none"), "{error:#}");
     }
 
@@ -864,7 +850,7 @@ mod tests {
 
         // The two segments of the table are mapped; the third, which the quota holds, is created.
         let (segments, stated) =
-            plane_segments(2, (1024, 192), layout.plane_bytes, GRANULE, &table).unwrap();
+            plane_segments(2, (1024, 192), layout.plane_bytes(), GRANULE, &table).unwrap();
         assert_eq!(segments.len(), 16);
         assert_eq!(segments[0].segment.epoch, 1);
         assert_eq!(
@@ -885,7 +871,7 @@ mod tests {
             .map(|ordinal| (first(ordinal), ordinal * 64, 64))
             .collect();
         let (segments, stated) =
-            plane_segments(2, (1024, 0), layout.plane_bytes, GRANULE, &whole).unwrap();
+            plane_segments(2, (1024, 0), layout.plane_bytes(), GRANULE, &whole).unwrap();
         assert_eq!(segments.len(), 16);
         assert!(stated.is_empty());
     }

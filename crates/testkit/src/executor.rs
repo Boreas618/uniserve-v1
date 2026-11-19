@@ -115,6 +115,9 @@ struct State {
     groups: BTreeMap<GroupId, Tables>,
     /// The classes a prefill, decode or verification row writes, each with its block's tokens.
     cache: Vec<(u8, u32)>,
+    /// Of `cache`, the sliding windows' classes: the only ones a token a call replays writes
+    /// (`Row::replay`).
+    windows: Vec<u8>,
     /// The class a refill row writes, with its block's tokens.
     draft: Option<(u8, u32)>,
     /// The class of recurrent-state checkpoints.
@@ -156,6 +159,7 @@ impl FakeExecutor {
                 .map(|group| (*group, Tables::default()))
                 .collect(),
             cache,
+            windows: Vec::new(),
             draft: None,
             checkpoints: None,
             end: None,
@@ -179,6 +183,14 @@ impl FakeExecutor {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         lock(&self.0)
+    }
+
+    /// The classes `classes` of those a row writes are sliding windows': a token a call replays
+    /// writes them alone (`engine::batch::Row::replay`).
+    #[must_use]
+    pub fn with_windows(self, classes: Vec<u8>) -> Self {
+        self.lock().windows = classes;
+        self
     }
 
     /// A refill row writes `class`, whose blocks hold `tokens` tokens.
@@ -474,7 +486,8 @@ impl State {
     }
 
     /// The breaches of A4 in `batch`: a token row writing a cache position, or keeping a
-    /// checkpoint, in a block its slot does not hold writable, or restoring a checkpoint its slot
+    /// checkpoint, in a block its slot does not hold writable (a token its call replays writing
+    /// the sliding windows alone), or restoring a checkpoint its slot
     /// holds no entry for, which a rank refuses before it launches the batch
     /// (`engine::runner::causal_lm::wiring::state_copies`).
     fn unwritable(&self, batch: &Batch) -> Vec<String> {
@@ -505,6 +518,9 @@ impl State {
                     continue;
                 };
                 for &(class, tokens) in classes {
+                    if position < call.replay.end && !self.windows.contains(&class) {
+                        continue;
+                    }
                     let block = position / tokens.max(1);
                     if !writable(call.slot, class, block) {
                         breaches.push(format!(
@@ -1031,7 +1047,7 @@ mod tests {
             rows.calls.push(Row {
                 slot: *slot,
                 kind: phase,
-                cache_group: 0,
+                replay: 0..0,
                 rows: index..index + 1,
             });
             rows.positions.extend(positions);

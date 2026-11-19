@@ -64,10 +64,19 @@ fn shape() -> StateShape {
     }
 }
 
+/// The keys and values of two attention layers of 4-token pages of one 8-wide BF16 head.
+fn keys_and_values() -> Outcome<CacheLayout> {
+    Ok(CacheLayout::of(
+        4,
+        &nn::family::CacheField::keys_and_values(2, 1, 8),
+        PrefixCacheDtype::BFloat16,
+    )?)
+}
+
 /// The cache of two attention layers of 4-token pages of one 8-wide BF16 head beside that
 /// state, with a state region of eight checkpoints of four 64-byte planes each.
 fn cache() -> Outcome<KvCacheConfig> {
-    let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &[shape()])?;
+    let layout = keys_and_values()?.with_state(&[shape()])?;
 
     Ok(KvCacheConfig {
         layout: Arc::new(layout),
@@ -77,6 +86,7 @@ fn cache() -> Outcome<KvCacheConfig> {
         segments: None,
         workspace_bytes: 1 << 20,
         states: (8, None),
+        windows: Vec::new(),
     })
 }
 
@@ -236,7 +246,7 @@ fn drafting(drafts: usize) -> StateShape {
 /// drafting state: a checkpoint keeps the window's two inputs, the state and the ring's first
 /// group, one 64-byte plane each, whatever the drafts.
 fn drafting_cache() -> Outcome<KvCacheConfig> {
-    let layout = CacheLayout::hybrid(4, 2, 1, 8, PrefixCacheDtype::BFloat16, &[drafting(0)])?;
+    let layout = keys_and_values()?.with_state(&[drafting(0)])?;
 
     Ok(KvCacheConfig {
         layout: Arc::new(layout),
@@ -246,6 +256,7 @@ fn drafting_cache() -> Outcome<KvCacheConfig> {
         segments: None,
         workspace_bytes: 1 << 20,
         states: (8, None),
+        windows: Vec::new(),
     })
 }
 

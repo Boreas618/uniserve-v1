@@ -2,8 +2,9 @@
 //! of them, and the attention over the tokens a selection names.
 //!
 //! A sparse attention layer keeps one compressed index key per `ratio` consecutive tokens beside
-//! its cache. A query row scores the keys of the groups it may see ([`index_scores`]), keeps the
-//! best ([`index_select`]), and attends the tokens of those groups ([`indexed_attention`], or the
+//! its cache, the plane of its [`crate::family::INDEX_KEY`] field ([`KvCache::plane`]). A query
+//! row scores the keys of the groups it may see ([`index_scores`]), keeps the best
+//! ([`index_select`]), and attends the tokens of those groups ([`indexed_attention`], or the
 //! compressed latents themselves, [`super::latent_attention`]):
 //!
 //! ```text
@@ -29,10 +30,21 @@ use super::latent::Plane;
 use super::{ACCUMULATE, Fused, compute};
 use crate::capability::KvCache;
 use crate::error::{Error, Result};
+use crate::family::{KEY, VALUE};
 
 /// The values of `column`, a U32 index column of a CPU batch.
 fn column(column: &Tensor) -> Result<Vec<u32>> {
     Ok(column.flatten_all()?.to_vec1::<u32>()?)
+}
+
+/// The cache layer `layer` names, as a plane states its owner.
+fn cache_layer(layer: usize) -> Result<u32> {
+    u32::try_from(layer).map_err(|_| {
+        Error::shape(
+            "KvCache",
+            format!("layer {layer} is beyond the cache's layers"),
+        )
+    })
 }
 
 /// Checks `rows`, the `[tokens]` U32 table row of each token.
@@ -626,8 +638,11 @@ pub fn indexed_attention(
 ) -> Result<Tensor> {
     const OWNER: &str = IndexedAttentionCall::OWNER;
 
-    let planes = cache.layer(layer)?;
-    let (key, value) = (&planes.key, &planes.value);
+    let layer = cache_layer(layer)?;
+    let (key, value) = (
+        &cache.plane(KEY, layer)?.entries,
+        &cache.plane(VALUE, layer)?.entries,
+    );
     let (&[tokens, heads, head_dim], &[pages, page, kv_heads, key_dim]) =
         (query.dims(), key.dims())
     else {

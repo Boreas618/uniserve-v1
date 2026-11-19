@@ -56,8 +56,9 @@ impl ModelRunner {
     /// The scratch page set is one set the rows of a paired forward share,
     /// `ceil(T / page) + R` pages for the `T` tokens and `R` rows of the largest bucket
     /// (`CausalLmRunner::scratch_pages`); a batch whose rows' contexts need more is not
-    /// compared. A model that keeps a recurrent state has no scratch state to advance and
-    /// computes no paired forward.
+    /// compared. A model that keeps a recurrent state has no scratch state to advance, and one
+    /// whose cache keeps a sliding window no scratch pages of the window's pool, so neither
+    /// computes a paired forward.
     ///
     /// # Errors
     ///
@@ -69,7 +70,8 @@ impl ModelRunner {
         units: u32,
     ) -> Result<CausalLmConfig> {
         let drafts = self.engine_config().speculative.num_draft_tokens;
-        let scratch_pages = if model.state_layers().is_empty() {
+        let scratch_pages = if model.state_layers().is_empty() && layout.window_groups().is_empty()
+        {
             CausalLmRunner::scratch_pages(&self.buckets, self.page_tokens())
         } else {
             0

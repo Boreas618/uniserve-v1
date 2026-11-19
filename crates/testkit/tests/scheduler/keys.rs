@@ -362,12 +362,13 @@ fn an_admission_pins_the_device_part_of_its_hit_and_loads_the_host_part_after_it
     assert_eq!(loaded[..], keys[1..]);
 }
 
-/// A request that leaves as migratable commits, in each full-attention and sliding-window class,
-/// its partial last block under its tail key with its token count, after the full blocks it
-/// committed as they filled, each under the class's chain (SD §4.3 "A tail"; §4.4 "Commit"; §3.7
+/// A request that leaves as migratable commits, in each full-attention class, its partial last
+/// block under its tail key with its token count, after the full blocks it committed as they
+/// filled, each under the class's chain; a sliding window's blocks are never committed, so its
+/// continuation recomputes its window (SD §4.3 "A tail"; §4.4 "Commit", "Bounded replay"; §3.7
 /// `free`).
 #[test]
-fn a_migrating_request_commits_its_partial_last_block_of_each_class_under_its_tail_key() {
+fn a_migrating_request_commits_its_full_history_s_partial_last_block_under_its_tail_key() {
     let window = CacheGroupKind::SlidingWindow { window: 8 };
     let mut harness = Deployment::tokens()
         .cache(&[(CacheGroupKind::Full, BLOCK), (window, BLOCK)])
@@ -380,26 +381,30 @@ fn a_migrating_request_commits_its_partial_last_block_of_each_class_under_its_ta
     harness.run(5);
 
     let commits = commits(&harness, owner);
-    for class in [0, 1] {
-        let keys = chain(u32::from(class), &tokens[..(full * BLOCK) as usize]);
-        let tail = page_key(
-            &keys[full as usize - 1],
-            u32::from(class),
-            0,
-            &tokens[(full * BLOCK) as usize..written as usize],
-        );
-        let mut expected: Vec<(u8, u32, Key, u16)> = (0..)
-            .zip(keys)
-            .map(|(at, key)| (class, at, key, BLOCK as u16))
-            .collect();
-        expected.push((class, full, tail, rest as u16));
-        let of_class: Vec<(u8, u32, Key, u16)> = commits
-            .iter()
-            .filter(|commit| commit.0 == class)
-            .copied()
-            .collect();
-        assert_eq!(of_class, expected, "class {class}");
-    }
+    assert!(
+        commits.iter().all(|commit| commit.0 != 1),
+        "a window's block is never committed"
+    );
+    // The full history's blocks, every complete one and the partial last under its tail key.
+    let class = 0_u8;
+    let keys = chain(u32::from(class), &tokens[..(full * BLOCK) as usize]);
+    let tail = page_key(
+        &keys[full as usize - 1],
+        u32::from(class),
+        0,
+        &tokens[(full * BLOCK) as usize..written as usize],
+    );
+    let mut expected: Vec<(u8, u32, Key, u16)> = (0..)
+        .zip(keys)
+        .map(|(at, key)| (class, at, key, BLOCK as u16))
+        .collect();
+    expected.push((class, full, tail, rest as u16));
+    let of_class: Vec<(u8, u32, Key, u16)> = commits
+        .iter()
+        .filter(|commit| commit.0 == class)
+        .copied()
+        .collect();
+    assert_eq!(of_class, expected);
 }
 
 /// A request whose cache policy reads nothing pins nothing and computes its prompt, though its

@@ -39,11 +39,11 @@ use storage::runtime::{self, Tier};
 use super::events::Events;
 use super::{Budget, ENCODER_IDENTITIES, Error, WorkerGroup, agreed, differ};
 
-pub(crate) use cache::{Cached, covered, stamped_groups};
+pub(crate) use cache::{Cached, LOW_WATERMARK, covered, stamped_groups};
 pub(super) use cache::{DEVICE, HOST, REMOTE};
 pub(super) use tables::{
     ahead, count_asked, draft_class, draft_order, draft_tokens, fit_chunk, holds_blocks_for, kept,
-    kv_owner, next_call, restored, settled, state_shape,
+    kv_owner, next_call, restored, resume, settled, shapes, state_shape,
 };
 
 /// What the scheduler states of itself to a KV decision that plans a request's calls, borrowed

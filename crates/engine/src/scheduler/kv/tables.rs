@@ -71,18 +71,42 @@ fn checkpoints(blocks: &Blocks) -> [Option<u32>; 2] {
     [Some(blocks.first), (ahead > blocks.first).then_some(ahead)]
 }
 
-/// The blocks of a class a reader continuing from token `boundary` needs (SD §4.4 "The hit"):
-/// every block before it for full attention and the draft cache, the blocks covering the window
-/// before it for a sliding window, and for a recurrent state the checkpoint that ends there.
-fn needed(kind: CacheGroupKind, block: u32, boundary: u32) -> Range<u32> {
-    let end = boundary / block;
+/// The blocks of a class a hit of `hit` tokens reads, for a request that computes on from
+/// `resume` (SD §4.4 "The hit", [`resume`]): every block before the hit for full attention and the
+/// draft cache; none for a sliding window, whose pages are never cached and whose table starts
+/// at the block of `resume`; and for a recurrent state the checkpoint that ends at `resume`, which
+/// the request restores.
+fn needed(kind: CacheGroupKind, block: u32, (hit, resume): (u32, u32)) -> Range<u32> {
     match kind {
-        CacheGroupKind::State => end.saturating_sub(1)..end,
-        CacheGroupKind::SlidingWindow { window } => {
-            (boundary.saturating_sub(window) / block).min(end)..end
+        CacheGroupKind::State => {
+            let end = resume / block;
+            end.saturating_sub(1)..end
         }
-        CacheGroupKind::Full | CacheGroupKind::Draft => 0..end,
+        CacheGroupKind::SlidingWindow { .. } => resume / block..resume / block,
+        CacheGroupKind::Full | CacheGroupKind::Draft => 0..hit / block,
     }
+}
+
+/// The tokens a hit of a model with sliding windows recomputes (SD §4.4 "Bounded replay"): the
+/// longest window of its classes in whole blocks of the class, so that a replay starts on a
+/// page boundary, where every entry of a ratio and every ring of the window's tokens is
+/// complete. `None` for a model of no sliding window, whose hits recompute nothing.
+fn rewind(shapes: &[(CacheGroupKind, u32)]) -> Option<u32> {
+    shapes
+        .iter()
+        .filter_map(|&(kind, block)| {
+            let window = kind.window()?;
+            Some(window.div_ceil(block.max(1)) * block.max(1))
+        })
+        .max()
+}
+
+/// Where a request whose hit holds `hit` tokens computes on from (SD §4.4 "Bounded replay"):
+/// the hit itself for a model of no sliding window; for one with sliding windows, whose pages
+/// are never cached, the hit rewound by the windows ([`rewind`]), from which the request
+/// recomputes them. A hit no longer than the rewind saves nothing and is none ([`Kv::lookup`]).
+pub(crate) fn resume(shapes: &[(CacheGroupKind, u32)], hit: u32) -> u32 {
+    rewind(shapes).map_or(hit, |rewind| hit.saturating_sub(rewind))
 }
 
 /// Whether a hit of `request` may read host copies: never for a request that continues another
@@ -152,35 +176,6 @@ fn ask(blocks: &mut Blocks, at: u32, count: u32) {
 fn step(shapes: &[(CacheGroupKind, u32)]) -> u32 {
     let sizes = shapes.iter().filter(|(kind, _)| !kind.is_draft());
     sizes.map(|&(_, block)| block).max().unwrap_or(1).max(1)
-}
-
-/// Whether block `at` of a sliding window of `window` tokens in blocks of `block` lies in the
-/// window before an aligned boundary (SD §4.4), the model's cache groups being `shapes`: a
-/// multiple of `boundary_interval` blocks of the largest block size, and, with the request's
-/// `prompt`, the last boundary a reissue of the prompt can reuse and the last boundary of the
-/// prompt.
-fn before_boundary(
-    shapes: &[(CacheGroupKind, u32)],
-    kv: &KvCacheConfig,
-    prompt: Option<u32>,
-    at: u32,
-    block: u32,
-    window: u32,
-) -> bool {
-    let step = step(shapes);
-    let interval = kv.boundary_interval.get();
-    let aligned = interval.saturating_mul(step).max(1);
-    let after = (at + 1).saturating_mul(block);
-    let reissued = prompt.map(|prompt| prompt.saturating_sub(1) / step * step);
-    let published = prompt.map(|prompt| prompt / step * step);
-    [
-        Some(after.div_ceil(aligned).saturating_mul(aligned)),
-        reissued,
-        published,
-    ]
-    .into_iter()
-    .flatten()
-    .any(|boundary| boundary >= after && boundary.saturating_sub(window) / block <= at)
 }
 
 /// Whether a request's blocks have keys (SD §4.3): a token request whose context holds no image,
@@ -625,10 +620,18 @@ pub(crate) fn holds_blocks_for(
         return false;
     }
 
+    // A token a call replays writes the sliding windows alone: a full-history class is
+    // written from the end of the replayed hit on, whose blocks it holds read-only.
     let classes = shapes(request, groups).iter().zip(&request.blocks);
     let writable = classes
         .filter(|((kind, _), _)| !kind.is_state() && kind.is_draft() == draft)
-        .all(|(&(_, block), blocks)| start / block >= blocks.shared);
+        .all(|(&(kind, block), blocks)| {
+            let written = match kind.window() {
+                Some(_) => start,
+                None => start.max(request.replay.end),
+            };
+            written / block >= blocks.shared
+        });
     writable && holds_state(request, phase, (start, end), groups)
 }
 
@@ -1118,7 +1121,7 @@ impl Kv {
         let prompt = request.num_prompt_tokens;
         let longest = longest(request, groups);
         let cached = hit.unwrap_or(0);
-        let chunk = first_chunk(request, cached, budget);
+        let chunk = first_chunk(request, resume(shapes(request, groups), cached), budget);
         // The tiers `cache` expects of the prompt's blocks: a hit's blocks on the host alone are
         // loaded into blocks the `Load` allocates on the device, those on the device are pinned.
         // A request alone in the regions holds every block of its hit, whatever its tier.
@@ -1131,6 +1134,12 @@ impl Kv {
             if kind.is_draft() {
                 continue;
             }
+            // A sliding window and a recurrent state are held from where the request computes
+            // on, full attention from the hit.
+            let from = match kind {
+                CacheGroupKind::Full | CacheGroupKind::Draft => cached,
+                _ => resume(shapes(request, groups), cached),
+            };
             let pages = prompt.div_ceil(block);
             let least = match kind {
                 CacheGroupKind::State => pages.min(2),
@@ -1143,10 +1152,12 @@ impl Kv {
             // The blocks the admission's first round or rounds hold before the request runs:
             // its first chunk from the hit and the low watermark, the checkpoint the chunk keeps
             // for a recurrent state (`settled`).
+            let start = resume(shapes(request, groups), cached);
+            let end = start + first_chunk(request, start, budget);
             let first = if kind.is_state() {
-                reaches(cached, cached + chunk)
+                reaches(start, end)
             } else {
-                reach(cached + chunk, block, longest) - cached / block
+                reach(end, block, longest).saturating_sub(from / block)
             };
             let blocks = if !keyed(request) && request.image_spans().next().is_some() {
                 if kind.is_state() {
@@ -1157,11 +1168,11 @@ impl Kv {
             } else if hit.is_none() {
                 least
             } else if kind.is_state() {
-                reaches(cached, prompt).min(least)
+                reaches(from, prompt).min(least)
             } else {
-                pages.saturating_sub(cached / block).min(least)
+                pages.saturating_sub(from / block).min(least)
             };
-            let range = needed(kind, block, cached);
+            let range = needed(kind, block, (cached, start));
             let read = if alone {
                 range.end.saturating_sub(range.start)
             } else {
@@ -1313,13 +1324,29 @@ impl Kv {
         let required: Vec<usize> = (0..shapes.len())
             .filter(|&class| !shapes[class].0.is_draft())
             .collect();
+        // A model with sliding windows recomputes the window before its hit: a hit no longer
+        // than that saves nothing, and one that ends inside a block would rewind into a block
+        // the windows retire, so it ends on a boundary.
+        let rewind = rewind(shapes);
 
+        // A hit reads the full history's blocks: a model whose classes are windows and states
+        // alone caches none, so it has no hit.
+        let full = required
+            .iter()
+            .any(|&class| shapes[class].0 == CacheGroupKind::Full);
         let accepts = |boundary: u32| {
+            let resumed = resume(shapes, boundary);
             let read = required.iter().all(|&class| {
                 let (kind, block) = shapes[class];
-                usable(&tiers[class], needed(kind, block, boundary), host).is_some()
+                usable(
+                    &tiers[class],
+                    needed(kind, block, (boundary, resumed)),
+                    host,
+                )
+                .is_some()
             });
-            read && self.holds_alone(request, boundary, groups, budget)
+            let saves = rewind.is_none_or(|rewind| boundary > rewind);
+            full && saves && read && self.holds_alone(request, boundary, groups, budget)
         };
         let mut hit = (1..=limit / step)
             .rev()
@@ -1328,12 +1355,13 @@ impl Kv {
             .unwrap_or(0);
 
         let top = prompt.saturating_sub(1).min(hit + step - 1);
+        let tails = tails && rewind.is_none();
         for end in (hit + 1..=top).rev().filter(|_| tails) {
             let held = required.iter().all(|&class| {
                 let (kind, block) = shapes[class];
                 let rest = end % block;
                 if (kind.is_state() && rest != 0)
-                    || usable(&tiers[class], needed(kind, block, end), host).is_none()
+                    || usable(&tiers[class], needed(kind, block, (end, end)), host).is_none()
                 {
                     return false;
                 }
@@ -1358,7 +1386,7 @@ impl Kv {
                     .count();
                 run(0, count(device), count(device))
             } else {
-                let range = needed(kind, block, hit);
+                let range = needed(kind, block, (hit, resume(shapes, hit)));
                 let (device, loaded) = usable(tiers, range.clone(), host).unwrap_or((0, 0));
                 let shared = range.start + device + loaded;
                 // A hit past the last boundary ends in a partial last block, held on the device
@@ -1425,7 +1453,7 @@ impl Kv {
         let tiers = self.tiers(request, group, groups);
         let present = |boundary: u32| {
             shapes.iter().zip(&tiers).all(|(&(kind, block), tiers)| {
-                let range = needed(kind, block, boundary);
+                let range = needed(kind, block, (boundary, resume(shapes, boundary)));
                 kind.is_draft()
                     || tiers
                         .get(range.start as usize..range.end as usize)
@@ -1457,7 +1485,7 @@ impl Kv {
         let deadline = now.saturating_add(u64::try_from(wait).unwrap_or(u64::MAX));
         let mut asks = Vec::new();
         for (class, (&(kind, block), outlook)) in shapes.iter().zip(outlooks).enumerate() {
-            let range = needed(kind, block, target);
+            let range = needed(kind, block, (target, resume(shapes, target)));
             let from = range.start.max(outlook.shared) as usize;
             let keys = request.keys.get(class).map_or(&[][..], Vec::as_slice);
             let keys = keys
@@ -1685,7 +1713,10 @@ impl Kv {
         step: &Step,
     ) {
         let groups = step.groups;
-        let end = hit.saturating_add(first_chunk(request, hit, step.budget));
+        // The first chunk runs from where the request computes on: the hit, or for a model of
+        // sliding windows the start of the window it recomputes before the hit.
+        let start = resume(shapes(request, groups), hit);
+        let end = start.saturating_add(first_chunk(request, start, step.budget));
         let interval = state_shape(request, groups).map_or(1, |(_, _, interval)| interval);
         for (index, (&(kind, block), table)) in
             shapes(request, groups).iter().zip(blocks).enumerate()
@@ -1707,7 +1738,7 @@ impl Kv {
                 let wanted = end.div_ceil(block) + LOW_WATERMARK;
                 (table.asked, wanted.saturating_sub(table.asked))
             } else if kind.is_state() {
-                let Some(boundary) = kept(Phase::Prefill, hit, end, block, interval) else {
+                let Some(boundary) = kept(Phase::Prefill, start, end, block, interval) else {
                     continue;
                 };
                 (boundary / block - 1, 1)
@@ -2053,7 +2084,7 @@ impl Kv {
         let shapes = shapes(request, groups);
         let holds = |boundary: u32, tail: bool| {
             let read = shapes.iter().zip(blocks).all(|(&(kind, block), table)| {
-                let range = needed(kind, block, boundary);
+                let range = needed(kind, block, (boundary, resume(shapes, boundary)));
                 let read =
                     range.is_empty() || (table.first <= range.start && range.end <= table.shared);
                 let clone = !tail
@@ -2091,19 +2122,20 @@ pub(crate) fn settled(request: &Request, groups: &[WorkerGroup], budget: &Budget
         return true;
     }
     let hit = request.num_cached_tokens;
-    let end = hit.saturating_add(first_chunk(request, hit, budget));
+    let start = resume(shapes(request, groups), hit);
+    let end = start.saturating_add(first_chunk(request, start, budget));
     let interval = state_shape(request, groups).map_or(1, |(_, _, interval)| interval);
     let shapes = shapes(request, groups).iter().zip(&request.blocks);
     shapes
         .filter(|((kind, _), _)| !kind.is_draft())
         .all(|(&(kind, block), blocks)| {
-            let range = needed(kind, block, hit);
+            let range = needed(kind, block, (hit, start));
             let read =
                 range.is_empty() || (blocks.first <= range.start && range.end <= blocks.shared);
             let tail = hit.is_multiple_of(block)
                 || (blocks.shared == hit / block && blocks.end > hit / block);
             let private = if kind.is_state() {
-                kept(Phase::Prefill, hit, end, block, interval).is_none_or(|boundary| {
+                kept(Phase::Prefill, start, end, block, interval).is_none_or(|boundary| {
                     checkpoints(blocks).contains(&Some(boundary / block - 1))
                 })
             } else {
@@ -2138,8 +2170,11 @@ fn finalize(
     step: &Step,
 ) {
     let groups = step.groups;
-    let end = hit.saturating_add(first_chunk(request, hit, step.budget));
+    let start = resume(shapes(request, groups), hit);
+    let end = start.saturating_add(first_chunk(request, start, step.budget));
     let interval = state_shape(request, groups).map_or(1, |(_, _, interval)| interval);
+    let resumed = (hit, start);
+    let expected_start = resume(shapes(request, groups), expected);
     let shapes = shapes(request, groups).iter().zip(blocks.iter_mut());
     for (index, (&(kind, block), table)) in shapes.enumerate() {
         let Ok(class) = u8::try_from(index) else {
@@ -2148,9 +2183,9 @@ fn finalize(
 
         if kind.is_state() {
             let [base, ahead] = checkpoints(table);
-            let start = hit.checked_div(block).and_then(|end| end.checked_sub(1));
-            let keep = base.filter(|base| Some(*base) == start && table.shared > *base);
-            let wanted = kept(Phase::Prefill, hit, end, block, interval)
+            let restored = start.checked_div(block).and_then(|end| end.checked_sub(1));
+            let keep = base.filter(|base| Some(*base) == restored && table.shared > *base);
+            let wanted = kept(Phase::Prefill, start, end, block, interval)
                 .map(|boundary| boundary / block - 1);
             // The first chunk keeps its checkpoint into a private block: a held one at that
             // position serves only when private, and a read-only one there (a checkpoint the
@@ -2184,7 +2219,7 @@ fn finalize(
         let keep = if kind.is_draft() {
             0..table.shared.min(hit / block)
         } else {
-            needed(kind, block, hit)
+            needed(kind, block, resumed)
         };
         let read = table.first..table.shared;
         let held = if kind.is_draft() {
@@ -2208,7 +2243,12 @@ fn finalize(
             continue;
         }
 
-        // The private entries held from the expected hit on.
+        // The private entries held from the expected hit on: a sliding window's from where the
+        // request computes on, the window it recomputes before the hit.
+        let (expected, hit) = match kind.window() {
+            Some(_) => (expected_start, start),
+            None => (expected, hit),
+        };
         let clone = expected / block;
         let held = if !expected.is_multiple_of(block) {
             if table.end > clone {
@@ -2319,8 +2359,8 @@ impl Kv {
 
     /// The `Commit`s of what a request that leaves as migratable holds and its continuation
     /// reads, once no call of it is in flight and before its owners' `Detach` (SD §3.7 `free`,
-    /// §4.3): every complete block not committed yet and each full-attention and sliding-window
-    /// class's partial last block under its tail key, whatever the write switches say; and its
+    /// §4.3): every complete block not committed yet and each full-attention class's partial last
+    /// block under its tail key, whatever the write switches say; and its
     /// recurrent-state base, when the target wrote it and no refill lags behind it. A request
     /// whose blocks have no keys commits nothing.
     pub(crate) fn commit_tails(
@@ -2364,6 +2404,10 @@ impl Kv {
                 continue;
             };
             let tokens = u16::try_from(block).unwrap_or(u16::MAX);
+            // A sliding window's pages are never cached: a hit recomputes its window.
+            if kind.window().is_some() {
+                continue;
+            }
             if kind.is_state() {
                 let held = checkpoint.filter(|position| {
                     *position >= table.shared && checkpoints(table).contains(&Some(*position))
@@ -2577,32 +2621,25 @@ impl Kv {
 
     /// What the write policy stores once request `asked` was answered `completion` (SD §4.4 "The
     /// write policy", `S/kv_cache/offload.rs:57-80`, `:880-904`): a `Committed` block of a
-    /// full-attention class, or of a sliding window that lies in the window before an aligned
-    /// boundary, is stored to the host by a group whose memory holds its device copy (the first
+    /// full-attention class is stored to the host by a group whose memory holds its device copy
+    /// (the first
     /// that stamped the `Commit`, whose table held the entry), when that group's deployment has a
     /// host tier, the step's values keep it on and the class has a host region; a host `Stored`
     /// is stored on to the remote store when the deployment has one. A block is offered once: a
     /// `Full` or a `Duplicate` stores nothing.
     ///
-    /// `holder` is the request of the owner `asked` acts for: a block whose `Committed` arrives
-    /// after its owner's `Detach` (a migratable request's tails and last blocks, committed as it
-    /// leaves) is stored as any other, its request gone: a sliding window's block is then judged
-    /// by the aligned boundaries alone, its prompt's being unknown.
+    /// A block whose `Committed` arrives after its owner's `Detach` (a migratable request's tails
+    /// and last blocks, committed as it leaves) is stored as any other, its request gone.
     pub(crate) fn write_policy(
         &self,
         (asked, completion): (&runtime::Request, &Completion),
-        holder: Option<&Request>,
         groups: &[WorkerGroup],
         budget: &Budget,
     ) -> Option<runtime::Request> {
         match (asked, completion) {
             (
                 runtime::Request::Commit {
-                    class,
-                    at,
-                    key,
-                    after,
-                    ..
+                    class, key, after, ..
                 },
                 Completion::Committed,
             ) => {
@@ -2610,18 +2647,11 @@ impl Kv {
                 let capacity = &group(groups, stamped)?.capacity;
                 let kv = capacity.kv_cache.as_ref()?;
                 self.classes.get(usize::from(*class))?.host?;
-                let shapes = &capacity.cache_groups;
-                let &(kind, block) = shapes.get(usize::from(*class))?;
-                let prompt = holder.map(|request| request.num_prompt_tokens);
-                // The step's values switch the host tier off where the epoch opened it.
+                let &(kind, _) = capacity.cache_groups.get(usize::from(*class))?;
+                // The step's values switch the host tier off where the epoch opened it. A sliding
+                // window's block is never committed, and a checkpoint and a draft never stored.
                 let tier = kv.host_tier && budget.host_tier;
-                let stores = match kind {
-                    CacheGroupKind::Full => tier,
-                    CacheGroupKind::SlidingWindow { window } => {
-                        tier && before_boundary(shapes, kv, prompt, *at, block, window)
-                    }
-                    CacheGroupKind::State | CacheGroupKind::Draft => false,
-                };
+                let stores = kind == CacheGroupKind::Full && tier;
                 stores.then(|| runtime::Request::Store {
                     group: stamped,
                     keys: vec![*key],
@@ -3154,10 +3184,10 @@ mod tests {
             session.row(id).keys[1].clone(),
         );
 
-        // Full blocks 0 to 4 on the device; the window holds block 3 but not block 4: 20 is
-        // rejected and the search goes on to 16.
+        // Full blocks 0 to 3 on the device: 20 is rejected and the search goes on to 16. A
+        // window block the cache lists is never read: a hit recomputes the window before it.
         let mut listed: Vec<(Key, u8, u8)> =
-            full_keys[..5].iter().map(|key| (*key, 0, DEVICE)).collect();
+            full_keys[..4].iter().map(|key| (*key, 0, DEVICE)).collect();
         listed.push((window_keys[3], 1, DEVICE));
         session.list(&listed);
         assert_eq!(
@@ -3170,21 +3200,22 @@ mod tests {
         );
 
         let asks = session.scheduler.admission_requests(id);
-        // From the hit, the first chunk of the prompt left (8 tokens) and one block beyond.
+        // The request computes on from 12, the window's block before the hit: its first chunk
+        // of 8 tokens and one block beyond, from the hit in the full class and from block 3 in
+        // the window.
         assert_eq!(
             asks,
             [
                 pin(1, 0, 0, &full_keys[..4]),
-                pin(1, 1, 3, &window_keys[3..4]),
-                allocate(1, 0, 4, 3),
-                allocate(1, 1, 4, 3),
+                allocate(1, 0, 4, 2),
+                allocate(1, 1, 3, 3),
             ]
         );
         assert_eq!(session.row(id).num_cached_tokens, 16);
 
-        // With the window's block 4 on the host, 20 is accepted: what the device lacks is loaded.
-        listed.push((window_keys[4], 1, HOST));
-        listed[4].2 = HOST;
+        // With the full class's block 4 on the host, 20 is accepted: what the device lacks is
+        // loaded, and the window starts at block 4.
+        listed.push((full_keys[4], 0, HOST));
         session.list(&listed);
         let asks = session.scheduler.admission_requests(id);
         let load = |class, at, keys: &[Key]| runtime::Request::Load {
@@ -3198,9 +3229,8 @@ mod tests {
             [
                 pin(1, 0, 0, &full_keys[..4]),
                 load(0, 4, &full_keys[4..5]),
-                load(1, 4, &window_keys[4..5]),
-                allocate(1, 0, 5, 3),
-                allocate(1, 1, 5, 3),
+                allocate(1, 0, 5, 2),
+                allocate(1, 1, 4, 3),
             ]
         );
         assert_eq!(session.row(id).num_cached_tokens, 20);
@@ -3376,34 +3406,33 @@ mod tests {
     }
 
     #[test]
-    fn a_window_that_falls_short_gives_up_the_blocks_it_no_longer_reads() {
+    fn a_hit_that_falls_short_rewinds_the_window_it_recomputes() {
         let mut session = serving(&[full(4), window(4, 4)], KvCacheConfig::default());
         let id = session.request(1, (1..=17).collect());
-        let (full_keys, window_keys) = (
-            session.row(id).keys[0].clone(),
-            session.row(id).keys[1].clone(),
-        );
-        let mut listed: Vec<(Key, u8, u8)> =
+        let full_keys = session.row(id).keys[0].clone();
+        let listed: Vec<(Key, u8, u8)> =
             full_keys[..4].iter().map(|key| (*key, 0, DEVICE)).collect();
-        listed.push((window_keys[3], 1, DEVICE));
         session.list(&listed);
 
+        // A hit of 16 recomputes from 12: the window's blocks from 3 on.
         let asks = session.scheduler.admission_requests(id);
         assert_eq!(session.row(id).num_cached_tokens, 16);
-        // The full class's pin falls short at 8, where the window's block 1 was never pinned:
-        // the hit ends at 0, and every read-only block goes.
-        session.answer(&asks, &[pinned(2), pinned(1), allocated(2), allocated(2)]);
-        let missing = session.scheduler.missing_requests(id);
-        assert_eq!(session.row(id).num_cached_tokens, 0);
         assert_eq!(
-            missing,
+            asks,
             [
-                release(1, 0, 0, 2),
-                allocate(1, 0, 0, 4),
-                release(1, 1, 3, 1),
-                allocate(1, 1, 0, 4),
+                pin(1, 0, 0, &full_keys[..4]),
+                allocate(1, 0, 4, 2),
+                allocate(1, 1, 3, 3),
             ]
         );
+
+        // The full class's pin falls short at 8: the hit ends there and the request computes
+        // on from 4, so the full class holds its first chunk from block 2 and the window from
+        // block 1, before the private blocks it holds.
+        session.answer(&asks, &[pinned(2), allocated(2), allocated(3)]);
+        let missing = session.scheduler.missing_requests(id);
+        assert_eq!(session.row(id).num_cached_tokens, 8);
+        assert_eq!(missing, [allocate(1, 0, 2, 2), allocate(1, 1, 1, 2)]);
     }
 
     #[test]
@@ -4046,7 +4075,7 @@ mod tests {
         };
         request.blocks[1] = Blocks {
             first: 0,
-            shared: 1,
+            shared: 0,
             end: 6,
             asked: 6,
         };
@@ -4265,12 +4294,8 @@ mod tests {
     }
 
     #[test]
-    fn the_write_policy_stores_full_blocks_and_windows_before_aligned_boundaries() {
-        let kv = KvCacheConfig {
-            boundary_interval: std::num::NonZeroU32::new(4).unwrap(),
-            ..KvCacheConfig::default()
-        };
-        let mut session = serving(&[full(4), window(4, 4)], kv);
+    fn the_write_policy_stores_full_blocks_and_never_a_window_block() {
+        let mut session = serving(&[full(4), window(4, 4)], KvCacheConfig::default());
         let id = session.request(1, (1..=100).collect());
         let key = session.row(id).keys[0][5];
         // A `Commit` is written with the stamp of group A, whose table held the entry.
@@ -4289,12 +4314,9 @@ mod tests {
         };
         let policy = |session: &Session, asked: &runtime::Request, answer: &Completion| {
             let scheduler = &session.scheduler;
-            let holder = scheduler.requests.get(&id);
             let answer = (asked, answer);
             let budget = &scheduler.budget;
-            scheduler
-                .kv
-                .write_policy(answer, holder, &scheduler.groups, budget)
+            scheduler.kv.write_policy(answer, &scheduler.groups, budget)
         };
 
         assert_eq!(
@@ -4305,21 +4327,13 @@ mod tests {
             policy(&session, &commit(0, 5), &Completion::Duplicate),
             None
         );
-        // A window block is stored only before a boundary of 16 blocks... of 4 tokens: block 15
-        // ends at 64; block 14 lies outside the window of 4 tokens before it; the last boundary
-        // a reissue reuses, 96, ends block 23.
-        assert_eq!(
-            policy(&session, &commit(1, 15), &Completion::Committed),
-            Some(store(Tier::Host))
-        );
-        assert_eq!(
-            policy(&session, &commit(1, 14), &Completion::Committed),
-            None
-        );
-        assert_eq!(
-            policy(&session, &commit(1, 23), &Completion::Committed),
-            Some(store(Tier::Host))
-        );
+        // A window's pages are never cached: a hit recomputes the window, so none is stored.
+        for at in [14, 15, 23] {
+            assert_eq!(
+                policy(&session, &commit(1, at), &Completion::Committed),
+                None
+            );
+        }
 
         // A host copy is stored on to the remote store only when the deployment has one.
         let stored = Completion::Stored { keys: Vec::new() };
@@ -4359,10 +4373,11 @@ mod tests {
             16 + 11
         );
 
-        // A hit of 896 tokens leaves 2 blocks after the prefix, the first chunk's and one more.
+        // A hit of 896 tokens leaves 2 blocks after the prefix, the first chunk's and one more;
+        // the window recomputes from 768, a chunk's window and query span from its block 12 on.
         assert_eq!(
             session.scheduler.units_needed(session.row(id), 896)[0],
-            3 + 3
+            3 + 5
         );
     }
 
@@ -4553,5 +4568,82 @@ mod tests {
             asked: 6,
         };
         assert_eq!(request.blocks[0], asked);
+    }
+
+    /// DeepSeek-V4.1-Flash's classes over 64-token pages, the full history's, a window of 128
+    /// tokens and the compressor's state: a hit of the full history rewinds the window in whole
+    /// pages, restores the state where the replay starts and holds no window page, and the
+    /// admitted request computes on from there, its calls replaying up to the hit.
+    #[test]
+    fn a_hit_beside_a_window_and_a_state_replays_the_window_from_the_restored_state() {
+        let state = (CacheGroupKind::State, 64);
+        let shapes = [full(64), window(128, 64), state];
+        let mut session = serving(&shapes, KvCacheConfig::default());
+        let id = session.request(1, (1..=400).collect());
+        let keys = session.row(id).keys.clone();
+
+        // Five full pages on the device and the checkpoint that ends at 192: the hit is 320, and
+        // the window before it, from 192, is recomputed.
+        let mut listed: Vec<(Key, u8, u8)> =
+            keys[0][..5].iter().map(|key| (*key, 0, DEVICE)).collect();
+        listed.push((keys[2][2], 2, DEVICE));
+        session.list(&listed);
+        let groups = &session.scheduler.groups;
+        let budget = &session.scheduler.budget;
+        assert_eq!(
+            session
+                .scheduler
+                .kv
+                .expected(session.row(id), groups, budget),
+            320
+        );
+
+        // The full pages and the checkpoint are pinned, and the window's pages are allocated
+        // from the replay's first, over the first chunk and the low watermark; the full history
+        // holds the chunk already.
+        let asks = session.scheduler.admission_requests(id);
+        assert_eq!(
+            asks,
+            [
+                pin(1, 0, 0, &keys[0][..5]),
+                pin(1, 2, 2, &keys[2][2..3]),
+                allocate(1, 1, 3, 2),
+            ]
+        );
+        session.answer(&asks, &[pinned(5), pinned(1), allocated(2)]);
+        assert!(settled(
+            session.row(id),
+            &session.scheduler.groups,
+            &session.scheduler.budget
+        ));
+
+        session.scheduler.admitted(id);
+        let request = session.row(id);
+        assert_eq!(
+            (request.num_cached_tokens, request.num_computed_tokens),
+            (320, 192)
+        );
+        assert_eq!(request.replay, 192..320);
+        assert_eq!(request.blocks[1].first, 3);
+    }
+
+    /// A hit no longer than the window it would rewind saves nothing, and is none.
+    #[test]
+    fn a_hit_no_longer_than_the_window_is_none() {
+        let mut session = serving(&[full(64), window(128, 64)], KvCacheConfig::default());
+        let id = session.request(1, (1..=400).collect());
+        let keys = session.row(id).keys.clone();
+
+        let listed: Vec<(Key, u8, u8)> = keys[0][..2].iter().map(|key| (*key, 0, DEVICE)).collect();
+        session.list(&listed);
+        let groups = &session.scheduler.groups;
+        let budget = &session.scheduler.budget;
+        assert_eq!(
+            session
+                .scheduler
+                .kv
+                .expected(session.row(id), groups, budget),
+            0
+        );
     }
 }

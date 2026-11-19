@@ -688,7 +688,7 @@ pub(crate) fn idle_verification(
         .map(|row| Row {
             slot: 0,
             kind: Phase::Verify,
-            cache_group: 0,
+            replay: 0..0,
             rows: row..row + 1,
         })
         .collect();
@@ -717,8 +717,8 @@ pub(crate) fn idle_verification(
 /// verification bucket (`columns` documents each).
 ///
 /// `expanded` is [`token_rows`] of `columns`: the generic columns are its rows, one per token.
-/// `mapping` is the cache slot each token writes (`columns::slot_mapping`), empty for a step
-/// that writes none. The commit table holds the batch's row per call, whose task is the
+/// `mapping` is the cache slot each token writes in each attention group
+/// (`columns::slot_mapping`), empty for a step that writes none. The commit table holds the batch's row per call, whose task is the
 /// call's own, then one count row per draft of each call, which counts when the device
 /// accepted the draft.
 ///
@@ -738,7 +738,7 @@ pub(crate) fn fill_verification(
     columns: &Columns,
     expanded: &Columns,
     bucket: &Bucket,
-    mapping: &[u32],
+    mapping: &[Vec<u32>],
     block: &mut [u8],
 ) -> Result<()> {
     let drafts = layout.drafts();
@@ -1197,7 +1197,8 @@ impl CausalLmRunner {
         // ---- The model: each token an attention row, each verification a state row ----
 
         let slots = self.column(Column::Slots, tokens)?;
-        let cache = self.gathered_cache(&self.column(Column::TableRows, tokens)?)?;
+        let cache =
+            self.gathered_cache(&self.column(Column::TableRows, tokens)?, (tokens, tokens))?;
         let ids = self.column(Column::InputIds, tokens)?;
 
         // A model that reads token ids reads the two ids before each token: its request's
@@ -1216,7 +1217,6 @@ impl CausalLmRunner {
             token_ids: contexts.as_ref().map(|_| ids.clone()),
             token_history: contexts.clone(),
             positions: self.column(Column::Positions, tokens)?,
-            slot_mapping: self.column(Column::SlotMapping, tokens)?,
             seq_lens: self.column(Column::SeqLens, tokens)?,
             query_offsets: self.column(Column::QueryOffsets, tokens + 1)?,
             logits_rows: self.column(Column::LogitsRows, tokens)?,
@@ -1460,7 +1460,6 @@ impl CausalLmRunner {
             token_ids: None,
             token_history: None,
             positions: self.column(Column::Positions, tokens)?,
-            slot_mapping,
             seq_lens: lens.clone(),
             query_offsets: self.column(Column::StateOffsets, rows + 1)?,
             logits_rows: lens,
@@ -1485,7 +1484,12 @@ impl CausalLmRunner {
             }
             None => None,
         };
-        let run = |batch: &TokenBatch, embedded: &Tensor, hidden: &Tensor| -> Result<Tensor> {
+        // Each forward of the drafter writes the draft slots its own column names.
+        let run = |batch: &TokenBatch,
+                   slot_mapping: &Tensor,
+                   embedded: &Tensor,
+                   hidden: &Tensor|
+         -> Result<Tensor> {
             let state = lent
                 .as_ref()
                 .map(|(live, slots, keeps_none)| RecurrentState {
@@ -1499,6 +1503,11 @@ impl CausalLmRunner {
                     verify: None,
                 });
 
+            let cache = KvCache {
+                slot_mapping: slot_mapping.clone(),
+                ..cache.clone()
+            };
+            cache.check(batch)?;
             Ok(drafter.forward(batch, &cache, state.as_ref(), embedded, hidden)?)
         };
 
@@ -1506,7 +1515,7 @@ impl CausalLmRunner {
             let embedded = self.model.embed_input_ids(&next)?;
             let hidden = kept.tensor(Entry::Hidden).narrow(0, 0, tokens)?;
 
-            run(&batch, &embedded, &hidden)?
+            run(&batch, &slot_mapping, &embedded, &hidden)?
         };
 
         // ---- The proposals: the first from each row's last entry, then the chained steps ----
@@ -1540,7 +1549,6 @@ impl CausalLmRunner {
                     token_ids: None,
                     token_history: None,
                     positions: step_column(Column::ChainPositions, step)?.add(&ahead_positions)?,
-                    slot_mapping: slots.index_select(&index, 0)?,
                     seq_lens: lens.clone(),
                     query_offsets: self.column(Column::ChainOffsets, rows + 1)?,
                     logits_rows: lens,
@@ -1558,7 +1566,7 @@ impl CausalLmRunner {
                 let embedded = self
                     .model
                     .embed_input_ids(&previous.minimum(&cap.narrow(0, 0, rows)?)?)?;
-                current = run(&batch, &embedded, &current)?;
+                current = run(&batch, &slots.index_select(&index, 0)?, &embedded, &current)?;
             }
 
             // The model's head projects the drafter's own read of its rows.

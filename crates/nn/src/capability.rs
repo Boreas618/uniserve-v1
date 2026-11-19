@@ -52,8 +52,6 @@ pub const NO_SLOT: u32 = u32::MAX;
 pub struct TokenBatch {
     /// `[tokens]` I32 rotary positions.
     pub positions: Tensor,
-    /// `[tokens]` U32 cache slots; [`NO_SLOT`] writes nothing and initializes nothing.
-    pub slot_mapping: Tensor,
     /// `[rows]` U32 keys visible to each row's last query.
     pub seq_lens: Tensor,
     /// `[rows + 1]` U32 packed query offsets.
@@ -149,7 +147,6 @@ impl TokenBatch {
         let (rows, tokens) = (self.rows(), self.tokens());
         for (name, column, expected, dtype) in [
             ("positions", &self.positions, tokens, DType::I32),
-            ("slot_mapping", &self.slot_mapping, tokens, DType::U32),
             ("seq_lens", &self.seq_lens, rows, DType::U32),
             ("query_offsets", &self.query_offsets, rows + 1, DType::U32),
         ] {
@@ -252,54 +249,66 @@ impl TokenBatch {
     }
 }
 
-/// The key/value planes of one attention layer: external tensors over the layer's cache pages.
+/// One owner's plane of a cache field: external tensors over the owner's entries in the cache's
+/// pages ([`crate::family::CacheField`]).
 ///
-/// A plane is `[pages, page_size, kv_heads, head_dim]` with one initialization flag per page: a
-/// reader must not read a page before its flag is raised, and a page's owner zeroes only storage
-/// it created.
+/// The entries are `[pages, page_size / ratio, heads, width]` in the record's element type, or
+/// `[pages, page_size / ratio, heads, row bytes]` U8 for a block-scaled record
+/// ([`crate::family::Record::dims`]). Entry `g` of a page stands for the page's tokens
+/// `g · ratio .. (g + 1) · ratio`: a token's entry is its slot divided by the ratio. Each page
+/// has one initialization flag: a reader must not read a page before its flag is raised, and a
+/// page's owner zeroes only storage it created.
 #[derive(Clone)]
-pub struct KvPlanes {
-    /// `[pages, page_size, kv_heads, head_dim]` cached keys.
-    pub key: Tensor,
-    /// `[pages, page_size, kv_heads, head_dim]` cached values.
-    pub value: Tensor,
-    /// `[pages, 1, 1, 1]` **U8**, one flag per page of `key`.
+pub struct KvPlane {
+    /// The field the plane holds.
+    pub field: &'static str,
+    /// The layer that owns the entries.
+    pub layer: u32,
+    /// The layers that read the owner's entries in place of their own, ascending.
+    pub readers: Vec<u32>,
+    /// Tokens one entry stands for.
+    pub ratio: u32,
+    /// The entries.
+    pub entries: Tensor,
+    /// `[pages, 1, 1, 1]` **U8**, one flag per page of `entries`.
     ///
     /// One byte, not four: the Storage Server holds one byte per page, and a wider flag would
     /// write over its neighbours.
-    pub key_initialized: Tensor,
-    /// `[pages, 1, 1, 1]` **U8**, one flag per page of `value`.
-    pub value_initialized: Tensor,
-    /// `[pages, 1, 1, 1]` F32: each page's key scale, present exactly when `key` is FP8.
+    pub initialized: Tensor,
+    /// `[pages, 1, 1, 1]` F32: each page's scale, present exactly when the plane stores the
+    /// deployment's FP8 type ([`crate::family::Record::scaled`]).
     ///
-    /// An FP8 cache stores a page divided by its own scale and the attention kernel multiplies
-    /// it back in FP32. The scale is one layer's: two layers of one group keep their caches
+    /// An FP8 plane stores a page divided by its own scale and the attention kernel multiplies
+    /// it back in FP32. The scale is one plane's: two planes of one group keep their pages
     /// apart and each has its own.
-    pub key_scale: Option<Tensor>,
-    /// `[pages, 1, 1, 1]` F32: each page's value scale, present exactly when `value` is FP8.
-    pub value_scale: Option<Tensor>,
-    /// `[pages, page_size / ratio, width]` index keys, for a layer whose attention reads the
-    /// tokens an indexer selects ([`crate::family::CacheShape::index_keys`]): row `g` of a page
-    /// is the compressed key of the page's group `g` of `ratio` consecutive tokens, written when
-    /// the group completes. It lies on the key/value page table, so a page reused from the
-    /// prefix cache brings its groups' keys. `None` for a layer that attends every key.
-    pub index_keys: Option<Tensor>,
+    pub scale: Option<Tensor>,
 }
 
-/// The paged cache of one attention group, as execution lends it for one forward: how rows
-/// address pages and where each layer's pages are.
+/// The paged cache of one cache group, as execution lends it for one forward: how rows address
+/// pages, where each token writes, and where each owner's entries are.
 ///
-/// A model with one attention type has one group; a model whose layers attend differently has
-/// one per group, in the order its attention layers index them. The element type of a group's
-/// pages is its planes' own: BF16, or FP8 for a group whose layers state scales.
+/// A model's fields of one [`crate::family::History`] share a group: the full-history group
+/// first, then each sliding window's, the order [`CausalLm::forward`] is lent them in. The
+/// element type of a plane is its record's ([`KvPlane::entries`]).
 #[derive(Clone)]
 pub struct KvCache {
     /// `[rows, max_pages]` U32: each row's page ids.
     pub block_tables: Tensor,
+    /// `[tokens]` U32: the cache slot each token writes in this group, `page · page_size +
+    /// offset`; [`NO_SLOT`] writes nothing and initializes nothing. A token writes nothing in
+    /// a group whose page at its position the row reads from a prefix hit, such as the
+    /// full-history entries of a token a sliding window recomputes.
+    pub slot_mapping: Tensor,
+    /// `[rows]` U32 for a sliding-window group: the first position whose entries the group
+    /// holds for each row, from which its readers read their windows; the position a request
+    /// resumed from a prefix hit recomputes its window from, and zero for one that computed
+    /// every token. `None` for the full-history group.
+    pub starts: Option<Tensor>,
     /// Tokens per page; the same as the batch's `page_size`.
     pub page_size: u32,
-    /// One entry per layer that reads this group, in model order.
-    pub layers: Vec<KvPlanes>,
+    /// The planes of the group: every owner of every field of the group, fields in the model's
+    /// order and owners ascending.
+    pub planes: Vec<KvPlane>,
     /// `[bytes]` U8: the paged-attention kernel's transient workspace, which execution reserves
     /// for the forward at the size the loaded kernel needs. Its head holds the decode's arrival
     /// counters, which the model clears once per forward.
@@ -307,108 +316,127 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    /// The cache group of `shape`'s layers over `pages` pages of `page_size` tokens, its planes
-    /// in `dtype`, each tensor taken from `tensor` by its extents and element type.
-    ///
-    /// Each layer holds a key and a value plane `[pages, page_size, kv_heads, head_dim]` of
-    /// `dtype`, a U8 initialization flag per page of each, an F32 scale per page of each when
-    /// `dtype` is FP8, and, when `shape` keeps index keys, `[pages, page_size / ratio, width]`
-    /// index keys of `dtype`. `block_tables` (`[rows, max_pages]` U32) and `workspace`
-    /// (`[bytes]` U8) are the group's as the caller sized them. `tensor` decides where the memory
-    /// lies (zeroed host tensors, meta tensors, a pool's storage) and is called once per tensor,
-    /// layer after layer, in the order of the fields of [`KvPlanes`].
+    /// The planes of every owner of `fields` over `pages` pages of `page_size` tokens, each
+    /// tensor taken from `tensor` by its extents and element type, in the order of
+    /// [`KvCache::planes`] and, within a plane, of the fields of [`KvPlane`]: entries, flags,
+    /// then the scale of a plane that keeps one. `deployment` is the cache element type of the
+    /// fields that state the deployment's ([`crate::family::Format::Deployment`]). `tensor`
+    /// decides where the memory lies (zeroed host tensors, meta tensors, a pool's storage).
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for an FP8 cache that keeps index keys: those are written in the
-    /// type the model computes in, which the planes' type does not state. [`Error::Shape`] for
-    /// index keys whose ratio does not divide the page. What `tensor` returns.
-    pub fn allocate(
-        shape: crate::family::CacheShape,
-        dtype: DType,
+    /// Fields [`crate::family::CacheField::check`] refuses for the page, and what `tensor`
+    /// returns.
+    pub fn planes_of(
+        fields: &[crate::family::CacheField],
+        deployment: DType,
         pages: usize,
         page_size: u32,
-        block_tables: Tensor,
-        workspace: Tensor,
         mut tensor: impl FnMut(Shape, DType) -> Result<Tensor>,
-    ) -> Result<Self> {
-        let scaled = dtype == DType::F8E4M3;
-        if scaled && shape.index_keys.is_some() {
-            return Err(Error::Unsupported(
-                "an FP8 cache keeps its index keys in the type the model computes in, which the \
-                 planes' type does not state"
-                    .to_owned(),
+    ) -> Result<Vec<KvPlane>> {
+        crate::family::CacheField::check(fields, page_size)?;
+
+        let flags = Shape::from((pages, 1, 1, 1));
+        let mut planes = Vec::new();
+        for field in fields {
+            let [heads, width] = field.record.dims()?;
+            let dtype = field.record.dtype(deployment);
+
+            for owner in &field.owners {
+                let entries = (page_size / owner.ratio) as usize;
+                let shape = Shape::from((pages, entries, heads as usize, width as usize));
+
+                planes.push(KvPlane {
+                    field: field.name,
+                    layer: owner.layer,
+                    readers: field.readers_of(owner.layer),
+                    ratio: owner.ratio,
+                    entries: tensor(shape, dtype)?,
+                    initialized: tensor(flags.clone(), DType::U8)?,
+                    scale: field
+                        .record
+                        .scaled(deployment)
+                        .then(|| tensor(flags.clone(), DType::F32))
+                        .transpose()?,
+                });
+            }
+        }
+        Ok(planes)
+    }
+
+    /// The plane of `field` that `layer` reads: its own when it owns the field, its owner's
+    /// when it reads another layer's entries.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Shape`] for a layer that neither owns nor reads the field in this group.
+    pub fn plane(&self, field: &str, layer: u32) -> Result<&KvPlane> {
+        self.planes
+            .iter()
+            .find(|plane| {
+                plane.field == field && (plane.layer == layer || plane.readers.contains(&layer))
+            })
+            .ok_or_else(|| {
+                Error::shape(
+                    "KvCache",
+                    format!(
+                        "layer {layer} reads no plane of the field {field} among the group's {} \
+                         planes",
+                        self.planes.len()
+                    ),
+                )
+            })
+    }
+
+    /// The layers that own a plane of `field` in this group, ascending.
+    pub fn owners(&self, field: &str) -> Vec<u32> {
+        self.planes
+            .iter()
+            .filter(|plane| plane.field == field)
+            .map(|plane| plane.layer)
+            .collect()
+    }
+
+    /// Checks the group's columns against `batch`: a U32 slot per token, for a sliding-window
+    /// group a U32 start per row, and the batch's page size.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Shape`], naming the column that disagrees.
+    pub fn check(&self, batch: &TokenBatch) -> Result<()> {
+        let (rows, tokens) = (batch.rows(), batch.tokens());
+        if self.slot_mapping.elem_count() != tokens || self.slot_mapping.dtype() != DType::U32 {
+            return Err(Error::shape(
+                "KvCache",
+                format!(
+                    "slot_mapping is {} {} elements, [{tokens}] u32 expected",
+                    self.slot_mapping.elem_count(),
+                    ops::abi::name(self.slot_mapping.dtype())
+                ),
             ));
         }
-        if let Some(keys) = shape.index_keys
-            && (keys.ratio == 0 || !page_size.is_multiple_of(keys.ratio))
+        if let Some(starts) = &self.starts
+            && (starts.elem_count() != rows || starts.dtype() != DType::U32)
         {
             return Err(Error::shape(
                 "KvCache",
                 format!(
-                    "index keys of one per {} tokens do not divide a page of {page_size}",
-                    keys.ratio
+                    "starts is {} {} elements, [{rows}] u32 expected",
+                    starts.elem_count(),
+                    ops::abi::name(starts.dtype())
                 ),
             ));
         }
-
-        let plane = Shape::from((
-            pages,
-            page_size as usize,
-            shape.kv_heads as usize,
-            shape.head_dim as usize,
-        ));
-        let flags = Shape::from((pages, 1, 1, 1));
-        let mut layers = Vec::with_capacity(shape.layers as usize);
-
-        for _ in 0..shape.layers {
-            layers.push(KvPlanes {
-                key: tensor(plane.clone(), dtype)?,
-                value: tensor(plane.clone(), dtype)?,
-                key_initialized: tensor(flags.clone(), DType::U8)?,
-                value_initialized: tensor(flags.clone(), DType::U8)?,
-                key_scale: scaled
-                    .then(|| tensor(flags.clone(), DType::F32))
-                    .transpose()?,
-                value_scale: scaled
-                    .then(|| tensor(flags.clone(), DType::F32))
-                    .transpose()?,
-                index_keys: match shape.index_keys {
-                    Some(keys) => {
-                        let groups = (page_size / keys.ratio) as usize;
-                        Some(tensor(
-                            Shape::from((pages, groups, keys.width as usize)),
-                            dtype,
-                        )?)
-                    }
-                    None => None,
-                },
-            });
-        }
-
-        Ok(Self {
-            block_tables,
-            page_size,
-            layers,
-            workspace,
-        })
-    }
-
-    /// The planes of `layer`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Shape`] for a layer the group does not hold.
-    pub fn layer(&self, layer: usize) -> Result<&KvPlanes> {
-        self.layers.get(layer).ok_or_else(|| {
-            Error::shape(
+        if self.page_size != batch.page_size {
+            return Err(Error::shape(
                 "KvCache",
                 format!(
-                    "layer {layer} was asked for but the group holds {}",
-                    self.layers.len()
+                    "a group of {}-token pages under a batch of {}-token pages",
+                    self.page_size, batch.page_size
                 ),
-            )
-        })
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1365,8 +1393,10 @@ pub trait CausalLm {
     /// ([`crate::family::TextModel::stream_width`]), and reads them out in
     /// [`Self::compute_logits`].
     ///
-    /// `cache` holds the model's attention groups, in the order its attention layers index
-    /// them, whose pages the batch's slot mapping writes in place. `state` is the recurrent
+    /// `cache` holds the groups of the model's cache fields ([`crate::family::TextModel::cache`]):
+    /// the full-history group when a field keeps the full history, then one group per sliding
+    /// window, shortest first, each with the planes of its fields, which each group's own slot
+    /// mapping writes in place. `state` is the recurrent
     /// state of a model whose [`crate::family::TextModel::state_layers`] declares one, advanced
     /// in place, and `None` for a model that keeps none. `exchange` is lent to a model whose
     /// routed experts are split across ranks, and is `None` otherwise.
@@ -1423,8 +1453,10 @@ pub trait CausalLm {
 /// Which positions a step evaluates, which drafts it proposes and how a verification accepts
 /// them are execution's: the drafter computes one forward over the rows it is given.
 pub trait Drafter: Send + Sync {
-    /// The key/value cache its layers read, the draft cache, as this rank holds it.
-    fn cache(&self) -> crate::family::CacheShape;
+    /// The fields of the draft cache its layers read and write, as this rank holds them: fields
+    /// of the full history over the drafter's own layers, numbered from zero
+    /// ([`crate::family::CacheField`]).
+    fn cache(&self) -> Vec<crate::family::CacheField>;
 
     /// Runs the drafter over `batch`: `embedded [tokens, hidden]` holds the embedding of each
     /// entry's next token and `hidden` the rows each entry reads, rows of the model's
@@ -1556,7 +1588,6 @@ mod tests {
     fn batch(rows: usize) -> TokenBatch {
         TokenBatch {
             positions: column(DType::I32, rows),
-            slot_mapping: column(DType::U32, rows),
             seq_lens: column(DType::U32, rows),
             query_offsets: column(DType::U32, rows + 1),
             logits_rows: column(DType::U32, rows),
@@ -1577,12 +1608,11 @@ mod tests {
         // The consistent one passes, or the rest of this test proves nothing.
         batch(15).check().expect("a consistent batch");
 
-        // A slot short: the write would scatter 14 rows and address a fifteenth slot that is
-        // not there.
+        // A position short: the rotation would read a fifteenth position that is not there.
         let mut short = batch(15);
-        short.slot_mapping = column(DType::U32, 14);
-        let error = short.check().expect_err("a slot mapping of another length");
-        assert!(format!("{error}").contains("slot_mapping"), "{error}");
+        short.positions = column(DType::I32, 14);
+        let error = short.check().expect_err("positions of another length");
+        assert!(format!("{error}").contains("positions"), "{error}");
 
         // An index column is unsigned: a signed one is another element type.
         let mut signed = batch(15);
@@ -1645,26 +1675,98 @@ mod tests {
         assert_eq!(prefix_rows(&layout), 512 + 6144 + 1);
     }
 
+    /// The cache field of a latent read as both key and value, which layer 0 owns and layers 1
+    /// and 2 read, and the keys of two layers, as a forward is lent their planes.
+    fn latent_and_keys() -> Vec<crate::family::CacheField> {
+        use crate::family::{CacheField, FieldOwner, FieldReader, Format, History, Record};
+
+        vec![
+            CacheField {
+                name: "latent",
+                owners: vec![FieldOwner { layer: 0, ratio: 2 }],
+                readers: vec![
+                    FieldReader { layer: 1, owner: 0 },
+                    FieldReader { layer: 2, owner: 0 },
+                ],
+                history: History::Full,
+                record: Record {
+                    format: Format::Nvfp4,
+                    heads: 1,
+                    width: 512,
+                },
+            },
+            CacheField::attention(crate::family::KEY, 2, 2, 8),
+        ]
+    }
+
+    /// Each owner's plane takes its entries per page from its ratio, a block-scaled record its
+    /// bytes, and a reader finds its owner's plane under its own layer.
     #[test]
-    fn a_cache_refuses_a_layer_its_group_does_not_hold() {
-        let plane = || column(DType::U8, 1);
+    fn a_reader_finds_its_owners_plane_and_a_ratio_takes_fewer_entries() {
+        let fields = latent_and_keys();
+        let planes = KvCache::planes_of(&fields, DType::F8E4M3, 4, 64, |shape, dtype| {
+            Ok(Tensor::zeros(shape, dtype, &Device::Cpu)?)
+        })
+        .unwrap();
         let cache = KvCache {
             block_tables: column(DType::U32, 4),
+            slot_mapping: column(DType::U32, 4),
+            starts: None,
             page_size: 64,
-            layers: vec![KvPlanes {
-                key: plane(),
-                value: plane(),
-                key_initialized: plane(),
-                value_initialized: plane(),
-                key_scale: None,
-                value_scale: None,
-                index_keys: None,
-            }],
-            workspace: plane(),
+            planes,
+            workspace: column(DType::U8, 1),
         };
 
-        assert!(cache.layer(0).is_ok());
-        let error = cache.layer(2).err().unwrap().to_string();
-        assert!(error.contains("layer 2"), "{error}");
+        // NVFP4: 512 values a row are 256 bytes of pairs and 32 scales, one entry per two
+        // tokens; it is no deployment FP8 plane, so it keeps no page scale.
+        let latent = cache.plane("latent", 2).unwrap();
+        assert_eq!((latent.layer, latent.ratio), (0, 2));
+        assert_eq!(latent.entries.dims(), [4, 32, 1, 288]);
+        assert_eq!(latent.entries.dtype(), DType::U8);
+        assert!(latent.scale.is_none());
+
+        // The deployment's FP8 keys keep a scale per page.
+        let key = cache.plane(crate::family::KEY, 1).unwrap();
+        assert_eq!(key.entries.dims(), [4, 64, 2, 8]);
+        assert_eq!(key.entries.dtype(), DType::F8E4M3);
+        assert_eq!(key.scale.as_ref().unwrap().dims(), [4, 1, 1, 1]);
+        assert_eq!(cache.owners(crate::family::KEY), [0, 1]);
+
+        // Layer 3 neither owns nor reads the latent, and layer 2 holds no key of its own.
+        let error = cache.plane("latent", 3).err().unwrap().to_string();
+        assert!(error.contains("layer 3"), "{error}");
+        assert!(cache.plane(crate::family::KEY, 2).is_err());
+    }
+
+    /// A model's fields are refused by what they state wrong.
+    #[test]
+    fn fields_that_disagree_are_refused_by_the_field() {
+        use crate::family::{CacheField, FieldOwner, FieldReader, Format, History};
+
+        let fields = latent_and_keys();
+        CacheField::check(&fields, 64).unwrap();
+
+        // A ratio that does not divide the page, an owner stated twice, a reader of no owner.
+        let mut ratio = fields.clone();
+        ratio[0].owners = vec![FieldOwner { layer: 0, ratio: 3 }];
+        assert!(CacheField::check(&ratio, 64).is_err());
+        let mut twice = fields.clone();
+        twice[1].owners.push(FieldOwner { layer: 1, ratio: 1 });
+        assert!(CacheField::check(&twice, 64).is_err());
+        let mut orphan = fields.clone();
+        orphan[0].readers.push(FieldReader { layer: 3, owner: 5 });
+        let error = CacheField::check(&orphan, 64).unwrap_err().to_string();
+        assert!(error.contains("latent"), "{error}");
+
+        // A block-scaled row is whole blocks, and a window holds a token.
+        let mut blocks = fields.clone();
+        blocks[0].record.width = 520;
+        assert!(CacheField::check(&blocks, 64).is_err());
+        assert_eq!(Format::Mxfp8.row_bytes(512), Some(528));
+        assert_eq!(Format::Mxfp4.row_bytes(128), Some(68));
+        assert_eq!(Format::Fp8Scaled.row_bytes(128), Some(132));
+        let mut window = fields;
+        window[0].history = History::Window { tokens: 0 };
+        assert!(CacheField::check(&window, 64).is_err());
     }
 }

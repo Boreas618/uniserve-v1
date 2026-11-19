@@ -1551,14 +1551,17 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
 
     // The start creates the stated capacity whole before its warm-up: the quota holds it beside
     // the warm process the reservations below count.
-    let (_, segment) =
-        crate::memory::cache::segments::segment_layout(units, layout.plane_bytes, GB200_GRANULE)
-            .unwrap();
+    let (_, segment) = crate::memory::cache::segments::segment_layout(
+        units,
+        layout.segment_plane(),
+        GB200_GRANULE,
+    )
+    .unwrap();
     assert_eq!(first, units);
 
     // A segment is one granule of each column's allocation: 32 units of the 64 KiB pages of four
     // heads of 128 BF16 elements, so a region holds what the quota holds to within 32 units.
-    assert_eq!(u64::from(segment) * layout.plane_bytes, GB200_GRANULE);
+    assert_eq!(u64::from(segment) * layout.plane_bytes(), GB200_GRANULE);
 
     // Every reservation the Storage Server admits the rank with, and what the quota leaves. The
     // warm process holds the request slots' storages, which are counted a second time here, as
@@ -1567,7 +1570,7 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
         .model_runner
         .slot_storage(text.model.as_ref(), &layout, slots)
         .unwrap();
-    let planes = u64::from(units) * layout.unit_bytes;
+    let planes = u64::from(units) * layout.unit_bytes();
     let reserved = RETAINED_WEIGHTS + planes + graph + scratch + WARM_PROCESS;
     eprintln!(
         "E1 at 0.70 of a GB200: limit {limit}; weights {RETAINED_WEIGHTS}; cache {units} units, \
@@ -1959,7 +1962,7 @@ fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
             format!(
                 "shape_{}x{}_",
                 u64::from(layout.checkpoint_planes()) * u64::from(units),
-                layout.plane_bytes
+                layout.plane_bytes()
             )
         };
         let copies = |keys: &Keys, units: u32| -> Vec<&'static str> {
@@ -2114,8 +2117,13 @@ fn a_pipeline_and_a_sequence_group_start_as_one_group_of_the_session() {
         let shapes: Vec<(u32, u32)> = ranks
             .iter()
             .map(|rank| {
-                let shape = rank.text().unwrap().model.cache();
-                (shape.layers, shape.kv_heads)
+                // The layers and the key heads of the model's key field.
+                let fields = rank.text().unwrap().model.cache();
+                let key = fields
+                    .iter()
+                    .find(|field| field.name == nn::family::KEY)
+                    .unwrap();
+                (key.owners.len() as u32, key.record.heads)
             })
             .collect();
         assert_eq!(shapes, [held, held], "{axis}");
@@ -2125,7 +2133,7 @@ fn a_pipeline_and_a_sequence_group_start_as_one_group_of_the_session() {
             .map(|rank| {
                 service::lock(&rank.text().unwrap().cache)
                     .layout()
-                    .unit_bytes
+                    .unit_bytes()
             })
             .collect();
         assert_eq!(units[0], units[1], "{axis}");

@@ -65,7 +65,7 @@ impl CausalLmRunner {
 
         let mut groups = Vec::new();
         for group in attention_groups(cache) {
-            groups.push(cache.lend(group, cache.page_table(group)?)?);
+            groups.push(lent(cache, group, cache.page_table(group)?)?);
         }
         let buffers = match state {
             Some(state) => Some((state.live()?, state.checkpoint()?)),
@@ -114,7 +114,7 @@ impl CausalLmRunner {
         let unread = attention_groups(cache)
             .next()
             .ok_or_else(|| Error::Invalid("a draft cache beside no attention group".into()))?;
-        let draft = cache.lend_draft(cache.page_table(unread)?)?;
+        let draft = cache.lend_draft(cache.page_table(unread)?, unread_column()?)?;
 
         let (trail, drafter) = match state {
             Some(state) if self.config.drafts > 0 => (state.trail()?, state.drafter()?),
@@ -137,12 +137,29 @@ impl CausalLmRunner {
         let mut groups = Vec::new();
         for group in attention_groups(cache) {
             groups.push(KvCache {
-                layers: cache.scratch_planes(group)?,
-                ..cache.lend(group, table.clone())?
+                planes: cache.scratch_planes(group)?,
+                ..lent(cache, group, table.clone())?
             });
         }
         self.set_scratch(groups)
     }
+}
+
+/// A column a forward replaces before anything reads it: a meta tensor of no element.
+fn unread_column() -> Result<tensor::Tensor> {
+    // SAFETY: a meta tensor has no data and its address is never read.
+    unsafe { crate::memory::lend(0, 0_usize, tensor::DType::U32, None) }
+}
+
+/// Attention group `group` of `cache` as a runner keeps it, over `block_tables`: each forward
+/// gathers its rows' tables from them and lends the group the batch's own slot mapping and,
+/// for a sliding window's group, the rows' starts (`CausalLmRunner::gathered_cache`), which the
+/// kept group states as unread columns.
+fn lent(cache: &KvCacheMemory, group: usize, block_tables: tensor::Tensor) -> Result<KvCache> {
+    let window = cache.layout().groups[group].window();
+    let starts = window.then(unread_column).transpose()?;
+
+    cache.lend(group, (block_tables, unread_column()?, starts))
 }
 
 /// The indices of the attention groups of `cache`, in the order a model's layers index them.

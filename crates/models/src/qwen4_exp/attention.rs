@@ -22,9 +22,9 @@
 //! ## What a request keeps
 //!
 //! Beside the keys and values, a layer keeps the compressed **index keys**, one per group, on
-//! the cache's pages ([`nn::KvPlanes::index_keys`]), and a **ring** of the request's most
-//! recent raw index keys with their rotary positions, from which a group whose first tokens
-//! an earlier forward saw is pooled. The ring holds `round_up(ratio + drafts, ratio)` rows at
+//! the cache's pages (its plane of the [`INDEX_KEY`] field), and a **ring** of the request's
+//! most recent raw index keys with their rotary positions, from which a group whose first
+//! tokens an earlier forward saw is pooled. The ring holds `round_up(ratio + drafts, ratio)` rows at
 //! `position mod capacity` (`common/qsa_indexer.py:817-866`): a step's draft rows never
 //! overwrite a member of the group still open at the last committed token. Nothing is rolled
 //! back after a verification: the rows of rejected positions are overwritten when those
@@ -38,7 +38,7 @@
 //! valid entries and appends their count (`nvidia/ops/qsa_indexer.py:236-277`); the entries
 //! are the same.
 
-use nn::family::{StateField, StateRows};
+use nn::family::{INDEX_KEY, StateField, StateRows};
 use nn::functional::Activation;
 use nn::modules::{
     Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearConfig, QkvNames, Rotary,
@@ -240,7 +240,6 @@ impl IndexedAttention {
             rotary,
             coordinates,
             columns,
-            batch,
             cache,
             layer,
             state,
@@ -281,7 +280,6 @@ impl IndexedAttention {
         rotary: &Rotary,
         coordinates: &Tensor,
         columns: &[Tensor],
-        batch: &TokenBatch,
         cache: &KvCache,
         layer: usize,
         state: &RecurrentState,
@@ -294,12 +292,10 @@ impl IndexedAttention {
         let device = hidden.device().clone();
 
         // The layer's index keys and ring, as rows.
-        let plane = cache
-            .layer(layer)?
-            .index_keys
-            .as_ref()
-            .ok_or_else(|| ID.config(format!("cache layer {layer} holds no index keys")))?;
-        let (&[pages, groups, key_width], &[_, max_pages]) =
+        let owner = u32::try_from(layer)
+            .map_err(|_| ID.config(format!("cache layer {layer} is beyond the cache's layers")))?;
+        let plane = &cache.plane(INDEX_KEY, owner)?.entries;
+        let (&[pages, groups, 1, key_width], &[_, max_pages]) =
             (plane.dims(), cache.block_tables.dims())
         else {
             return Err(ID.config(format!(
@@ -434,7 +430,7 @@ impl IndexedAttention {
         let stored_at = page
             .broadcast_mul(&groups_i)?
             .add(&group.broadcast_remainder(&groups_i)?)?;
-        let written = batch.slot_mapping.view(DType::I32)?.ge(0.0)?;
+        let written = cache.slot_mapping.view(DType::I32)?.ge(0.0)?;
         let none = int(-1, position)?.broadcast_as(position.shape())?;
         let stored_at = partial
             .eq(0.0)?
@@ -459,8 +455,10 @@ impl IndexedAttention {
         functional::place_rows_(&ring_positions, &ring_row, &own)?;
 
         // The scores of the groups complete before each row, and the best of them.
+        // One key a group: the scoring reads the plane as `[pages, groups, width]`.
+        let records = plane.reshape((pages, groups, key_width))?;
         let keys = functional::Plane {
-            records: plane,
+            records: &records,
             table: &cache.block_tables,
             format: functional::Format::Bf16,
             layout: functional::Layout::Page,
