@@ -857,12 +857,13 @@ impl Leader {
             worlds.push((args, hosts, numbers));
         }
         // A replica's layout (`EngineConfig::layout`: its parallel configuration with its devices
-        // and hosts, slot count, KV layout and graph buckets, not the cache's size or tiers) names
-        // its device regions. A serving replica whose layout a target replica shares keeps its
-        // regions and their segments, which that target maps, through its drain; one whose layout
-        // no target shares gives its memory back (`shrink`), and the targets of layouts of their
-        // own grow into it (`Node::moves_across`). A change of the replica count alone keeps the
-        // layout of every replica it leaves in place.
+        // and hosts, slot count, KV layout and graph buckets, not the cache's size or tiers), with
+        // its model's page shapes, names its device regions. A serving replica whose regions a
+        // target replica names (an equal layout, and a target that states its start mapped them)
+        // keeps them and their segments through its drain; one whose regions no target names
+        // gives its memory back (`shrink`), and the targets of regions of their own grow into it
+        // (`update::drains_across`). A change of the replica count alone keeps the layout of
+        // every replica it leaves in place.
         let target_layouts: Vec<_> = configs.iter().map(EngineConfig::layout).collect();
         // Each target world's launch files. A target starts parked: its launch
         // names the epoch it succeeds.
@@ -1217,6 +1218,84 @@ impl Replica {
         }
         *service::lock(&self.config) = target;
         Ok(Applied::InPlace)
+    }
+}
+
+/// Makes the room the targets of the leader's epoch updates ask for in their GPUs' quotas, until
+/// `stop` is cancelled: each ask in turn, every serving engine giving back the tail of its KV
+/// cache until each GPU the ask names holds its bytes beside everything its quota reserves
+/// ([`Leader::make_room`]), then the target answered ([`crate::updates::Updater::room_made`]).
+pub(crate) fn make_rooms(leader: &Arc<Leader>, stop: &tokio_util::sync::CancellationToken) {
+    let Some(mut asks) = leader.updates.room_asks() else {
+        return;
+    };
+    let weak = Arc::downgrade(leader);
+    let stop = stop.clone();
+    tokio::spawn(async move {
+        loop {
+            let wanted = tokio::select! {
+                () = stop.cancelled() => return,
+                wanted = asks.recv() => match wanted {
+                    Some(wanted) => wanted,
+                    None => return,
+                },
+            };
+            let Some(leader) = weak.upgrade() else {
+                return;
+            };
+            let made = leader.make_room(&wanted).await;
+            match &made {
+                Ok(()) => info!(
+                    update = wanted.update,
+                    host = %wanted.host,
+                    launch = wanted.launch,
+                    "the serving engines made the room the target asked for"
+                ),
+                Err(reason) => tracing::warn!(
+                    update = wanted.update,
+                    host = %wanted.host,
+                    launch = wanted.launch,
+                    %reason,
+                    "the serving engines could not make the room the target asked for"
+                ),
+            }
+            leader.updates.room_made(&wanted, made);
+        }
+    });
+}
+
+impl Leader {
+    /// Has every serving engine give back the tail of its KV cache until each GPU `wanted` names
+    /// holds the stated bytes beside everything its quota reserves (`ResizeCache { MakeRoom }`,
+    /// [`EngineClient::reserve_storage`](crate::engine::client::EngineClient::reserve_storage)):
+    /// cached blocks in the tail are evicted, the requests that hold some of it run on and the
+    /// release takes it once they let it go, and segment 0 stays. An engine whose ranks use none
+    /// of the GPUs gives nothing back.
+    ///
+    /// # Errors
+    ///
+    /// An engine's refusal, which changed nothing of its cache (even its whole tail leaves a GPU
+    /// too little room, or another change of its cache is in progress), or no serving engine.
+    async fn make_room(&self, wanted: &crate::updates::update::RoomWanted) -> Result<(), String> {
+        let devices: BTreeMap<storage::manifest::Gpu, u64> =
+            wanted.devices.iter().copied().collect();
+        let mut clients: Vec<Arc<crate::engine::client::EngineClient>> = Vec::new();
+        for replica in self.replicas() {
+            if let Some(client) = replica.hold().client()
+                && !clients.iter().any(|held| Arc::ptr_eq(held, &client))
+            {
+                clients.push(client);
+            }
+        }
+        if clients.is_empty() {
+            return Err("no serving engine holds a KV cache to give room from".to_owned());
+        }
+        for client in clients {
+            client
+                .reserve_storage(crate::engine::client::Room::Devices(devices.clone()))
+                .await?;
+        }
+        Ok(())
     }
 }
 

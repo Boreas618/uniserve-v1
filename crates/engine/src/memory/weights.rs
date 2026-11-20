@@ -39,6 +39,13 @@
 //! A table a model writes after its load ([`nn::RetainedWeights::writable`]) is device storage
 //! of this process alone, since published storage is read-only.
 //!
+//! ## Room for a publication
+//!
+//! The server refuses a publication that would take its GPU's quota past the limit. A store of
+//! a starting rank beside a serving epoch holds that start's [`RoomAsk`]: a refused publication asks
+//! for room for its allocation, which the serving epoch gives back from its KV cache, and is
+//! published again ([`WeightStore::with_room`]).
+//!
 //! ## A replacement in place
 //!
 //! A weight tensor is `ops::retained` over the address the weight is mapped at, and the
@@ -62,6 +69,7 @@ use storage::{Key, Location, Mode, StorageRecord, TensorRecord};
 
 use crate::memory::allocation::Storage;
 use crate::memory::client::{StorageClient, byte_tensor};
+use crate::memory::room::RoomAsk;
 use crate::worker::error::report;
 use crate::worker::{Error, Result};
 use service::lock;
@@ -219,6 +227,9 @@ pub struct WeightStore {
     granularity: usize,
     /// The stream the store's copies run on, beside the streams the rank serves on.
     stream: Stream,
+    /// Whom a publication the GPU's quota refuses asks for room: a starting rank's start, which
+    /// the epoch serving beside it answers. `None` for a store whose refused publication fails.
+    room: Option<Arc<dyn RoomAsk>>,
     state: Mutex<State>,
 }
 
@@ -244,8 +255,51 @@ impl WeightStore {
             gpu,
             granularity,
             stream: Stream::new(device)?,
+            room: None,
             state: Mutex::new(State::default()),
         })
+    }
+
+    /// The store, whose publications the GPU's quota refuses asking `room` for room for their
+    /// allocations and publishing again once it is made.
+    pub(crate) fn with_room(mut self, room: Arc<dyn RoomAsk>) -> Self {
+        self.room = Some(room);
+        self
+    }
+
+    /// Publishes a storage of `bytes` device bytes by `put`, the server's request doing `what`.
+    /// A refusal for want of quota asks the store's [`RoomAsk`] for room for the bytes, and the
+    /// storage is published again once it is made.
+    ///
+    /// # Errors
+    ///
+    /// The server's refusal, including the quota's when the store asks no one for room, the room
+    /// was not made, or the quota refuses again.
+    fn put(
+        &self,
+        what: &str,
+        bytes: u64,
+        put: impl Fn(&mut storage::Client) -> storage::Result<()>,
+    ) -> Result<()> {
+        let Some(room) = &self.room else {
+            return self.client.call(what, &put);
+        };
+        let Err(refused) = self.client.call_within_quota(what, &put)? else {
+            return Ok(());
+        };
+
+        room.ask(&[(self.gpu, bytes)]).map_err(|reason| {
+            Error::Unsupported(format!(
+                "{what}: the GPU's quota refused {bytes} bytes ({refused}), and no room was made                  for them: {reason}"
+            ))
+        })?;
+        self.client
+            .call_within_quota(what, &put)?
+            .map_err(|refused| {
+                Error::Unsupported(format!(
+                    "{what}: the GPU's quota refused {bytes} bytes again once room was made for                      them: {refused}"
+                ))
+            })
     }
 
     /// The device this store's weights are mapped on.
@@ -278,10 +332,11 @@ impl WeightStore {
                 bytes: pack.written.bytes() as u64,
                 fabric: None,
             };
-            self.client
-                .call("publishing an allocation of packed weights", |client| {
-                    client.put(pack.tensors, &[(record, pack.descriptor.as_fd())])
-                })?;
+            self.put(
+                "publishing an allocation of packed weights",
+                record.bytes,
+                |client| client.put(pack.tensors.clone(), &[(record, pack.descriptor.as_fd())]),
+            )?;
         }
 
         Ok(std::mem::take(&mut state.order))
@@ -768,8 +823,8 @@ impl WeightStore {
             fabric: None,
         };
         let tensor = byte_tensor(key, weight_name(&key), 0, length as u64, Access::ReadOnly);
-        self.client.call("publishing a retained weight", |client| {
-            client.put(vec![tensor], &[(record, descriptor.as_fd())])
+        self.put("publishing a retained weight", record.bytes, |client| {
+            client.put(vec![tensor.clone()], &[(record, descriptor.as_fd())])
         })?;
         drop(written);
 

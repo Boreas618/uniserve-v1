@@ -274,6 +274,28 @@ impl StorageClient {
         request(&mut lock(&self.state).client).map_err(|error| storage_error(what, error))
     }
 
+    /// [`Self::call`], with the server's refusal of a request that would take a GPU's quota past
+    /// its limit (`ErrorKind::Quota`) kept apart as `Ok(Err(message))`, so the caller can have
+    /// room made and send the request again.
+    ///
+    /// # Errors
+    ///
+    /// Any other refusal or the connection's failure, stated with `what`.
+    pub(crate) fn call_within_quota<T>(
+        &self,
+        what: &str,
+        request: impl FnOnce(&mut Client) -> storage::Result<T>,
+    ) -> Result<std::result::Result<T, String>> {
+        match request(&mut lock(&self.state).client) {
+            Ok(value) => Ok(Ok(value)),
+            Err(storage::Error::Server {
+                kind: ErrorKind::Quota,
+                message,
+            }) => Ok(Err(message)),
+            Err(error) => Err(storage_error(what, error)),
+        }
+    }
+
     /// The UUID of `device`, which the keys and records of its storage name.
     pub(super) fn gpu(&self, device: DeviceId) -> Result<[u8; 16]> {
         lock(&self.state).gpu(device)

@@ -405,11 +405,33 @@ pub(crate) fn serving(launch_generation: u64, generation: u64) -> Report {
     }))
 }
 
-/// `Parked` at `generation`, for an engine launched at `launch_generation`.
-pub(crate) fn parked(launch_generation: u64, generation: u64) -> Report {
+/// `Parked` at `generation`, for an engine launched at `launch_generation` whose start opened
+/// regions another epoch created segments of (`shares_regions`; `None` for a peer, which opens
+/// none).
+pub(crate) fn parked(
+    launch_generation: u64,
+    generation: u64,
+    shares_regions: Option<bool>,
+) -> Report {
     report(report::Kind::Parked(proto::process::Parked {
         launch_generation,
         generation,
+        shares_regions,
+    }))
+}
+
+/// `RoomWanted`, the start's ask `id` for `devices`'s room in their quotas, each a GPU's identity
+/// and the bytes its quota must hold.
+pub(crate) fn room_wanted(id: u64, devices: &[crate::memory::room::DeviceRoom]) -> Report {
+    report(report::Kind::RoomWanted(proto::process::RoomWanted {
+        id,
+        devices: devices
+            .iter()
+            .map(|(gpu, bytes)| proto::process::GpuRoom {
+                gpu: gpu.to_vec(),
+                bytes: *bytes,
+            })
+            .collect(),
     }))
 }
 

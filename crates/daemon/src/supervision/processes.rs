@@ -62,7 +62,7 @@ pub(crate) struct Started {
 }
 
 /// What the deployment's engines tell an update.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Event {
     /// The engine of launch generation `generation` on `host` connected,
     /// saying what build it runs.

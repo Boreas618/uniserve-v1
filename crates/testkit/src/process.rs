@@ -8,8 +8,9 @@
 //! interface states, and records what it was sent. A test states a failure by
 //! arming it ([`Engine::refuse_prepare`], [`Engine::fault_at_switch`]) or by
 //! sending the report itself ([`Engine::fault`], [`Engine::rolled_back`]),
-//! and an engine slower than the others by withholding its acknowledgements
-//! ([`Engine::withhold`]).
+//! an engine slower than the others by withholding its acknowledgements
+//! ([`Engine::withhold`]), and a target whose start lacks room by arming its
+//! ask ([`Engine::want_room`]).
 //!
 //! [`node_reply`] replies to the requests a leader makes of a node's daemon
 //! (`Spawn`, `Claim`, `PublishEpochs`, `Stop`, `KeepWeights`) the way a node
@@ -17,6 +18,10 @@
 
 use proto::process::{self, Command, Report, command, report};
 use proto::request::wire::EngineState;
+
+/// A GPU's identity (its UUID's bytes) and the bytes its quota must hold, as an ask for room
+/// names them.
+pub type GpuRoom = ([u8; 16], u64);
 
 /// A fake engine: its lifecycle, its generations, and what it was sent.
 #[derive(Debug, Clone)]
@@ -39,6 +44,11 @@ pub struct Engine {
     /// The acknowledgements of `Promote` and `Drain` it took effect for and
     /// has not sent yet, while it withholds them.
     withheld: Option<Vec<Report>>,
+    /// What its `Parked` states of the regions its start opened (`Parked.shares_regions`).
+    shares_regions: Option<bool>,
+    /// The room its start asks for before it parks, when armed: the ask's id and each GPU's
+    /// identity with the bytes its quota must hold.
+    wanting: Option<(u64, Vec<GpuRoom>)>,
 }
 
 impl Engine {
@@ -65,6 +75,8 @@ impl Engine {
             prepare_refusal: None,
             switch_fault: None,
             withheld: None,
+            shares_regions: None,
+            wanting: None,
         }
     }
 
@@ -86,6 +98,35 @@ impl Engine {
     /// Every command the engine was sent, in order.
     pub fn received(&self) -> &[command::Kind] {
         &self.received
+    }
+
+    /// The engine's `Parked` states `shares` of the regions its start opened: whether they map
+    /// segments another epoch created (`None`, an engine of an earlier build, states nothing).
+    pub fn state_shares_regions(&mut self, shares: Option<bool>) {
+        self.shares_regions = shares;
+    }
+
+    /// The engine's start asks for room before it parks, as a target beside a serving epoch that
+    /// holds its GPUs' quotas does: ask `id` for `devices` (each a GPU's identity and the bytes its
+    /// quota must hold). It parks once a `Room` of that id answers that the room was made, and
+    /// reports nothing more when the answer refuses it, as a start that failed.
+    pub fn want_room(&mut self, id: u64, devices: &[GpuRoom]) {
+        self.wanting = Some((id, devices.to_vec()));
+    }
+
+    /// The report a target's start sends when its GPUs' quotas lack room: ask `id` for the room
+    /// `devices` names, each a GPU's identity and the bytes its quota must hold.
+    pub fn room_wanted(&self, id: u64, devices: &[GpuRoom]) -> Report {
+        report(report::Kind::RoomWanted(process::RoomWanted {
+            id,
+            devices: devices
+                .iter()
+                .map(|(gpu, bytes)| process::GpuRoom {
+                    gpu: gpu.to_vec(),
+                    bytes: *bytes,
+                })
+                .collect(),
+        }))
     }
 
     /// The engine's next `Prepare` fails with `reason`, and nothing changes.
@@ -115,6 +156,9 @@ impl Engine {
     /// What the engine reports once its start completed: that it parked, or
     /// that it serves.
     pub fn started(&self) -> Report {
+        if let Some((id, devices)) = &self.wanting {
+            return self.room_wanted(*id, devices);
+        }
         match self.lifecycle {
             EngineState::Parked => self.parked_report(),
             _ => self.serving_report(),
@@ -200,6 +244,18 @@ impl Engine {
                 let serving = self.serving_report();
                 self.acknowledge(serving)
             }
+            command::Kind::Room(room) => {
+                let asked = self.wanting.as_ref().is_some_and(|(id, _)| *id == room.id);
+                if !asked {
+                    return Vec::new();
+                }
+                self.wanting = None;
+                if room.refused.is_empty() {
+                    vec![self.started()]
+                } else {
+                    Vec::new()
+                }
+            }
             command::Kind::Pause(_) | command::Kind::Grow(_) => Vec::new(),
         }
     }
@@ -219,6 +275,7 @@ impl Engine {
         report(report::Kind::Parked(process::Parked {
             launch_generation: self.launch_generation,
             generation: self.generation,
+            shares_regions: self.shares_regions,
         }))
     }
 

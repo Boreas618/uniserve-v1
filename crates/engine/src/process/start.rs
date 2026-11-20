@@ -86,6 +86,7 @@ use super::ranks::{
 use super::{epoch, operations};
 use crate::executor::{Executor, Shadow, WorkerExecutor};
 use crate::memory::client::{StorageClient, StorageLaunch};
+use crate::memory::room::RoomAsk;
 use crate::modules::load;
 use crate::parallel::Rendezvous;
 use crate::process::binding::{Target as LoadTarget, WeightBinding};
@@ -156,6 +157,12 @@ pub struct Engine {
     /// request processing (`nn::family::Description::details`), which the daemon binds the video
     /// processor with; empty for an engine that generates no video.
     pub(crate) video: Vec<u8>,
+    /// On the scheduler node, whether the device regions the start opened map segments another
+    /// epoch created: the engine names the serving epoch's regions (one of its layout and page
+    /// shapes), which keep their memory through a switch, rather than regions of its own
+    /// (`Parked.shares_regions`). `None` on a peer, which opens no session: its world's scheduler
+    /// node states it.
+    pub(crate) shares_regions: Option<bool>,
 }
 
 /// One scheduler of an [`Engine`] and how the control thread reaches it.
@@ -382,6 +389,7 @@ impl Engine {
             counters: Arc::new(Mutex::new(None)),
             streams: Arc::new(Vec::new()),
             video: Vec::new(),
+            shares_regions: None,
         })
     }
 
@@ -437,6 +445,7 @@ impl Engine {
             served: _,
             kernels: _,
             video: _,
+            shares_regions: _,
         } = self;
         let mut outcome: Result<()> = Ok(());
 
@@ -522,6 +531,10 @@ impl Engine {
 /// The ranks load onto the meta device when the launch's `engine_config.device.device` is
 /// `meta`: nothing is allocated, no kernel is resolved, and the generation served holds none.
 ///
+/// Where a rank's start lacks room in its GPU's quota (a weight publication the quota refuses,
+/// its division's fewest bytes, its warm process) it asks `room`, which the epoch serving beside
+/// it answers through the daemon (`crate::memory::room`).
+///
 /// # Errors
 ///
 /// What the family, a rank's load or opening, the session, a warm-up, a scheduler or the
@@ -535,6 +548,7 @@ pub(crate) fn start(
     build: Option<Arc<Mutex<build_server::Client>>>,
     policy: (Arc<wasmtime::Module>, Parameters),
     liveness: Arc<Liveness>,
+    room: Arc<dyn RoomAsk>,
 ) -> Result<Engine> {
     let family =
         crate::process::catalogue::resolve(registry, Path::new(&launch.engine_config.model.model))?;
@@ -608,6 +622,7 @@ pub(crate) fn start(
         Backing::Serving {
             storage,
             kernels: &resolve,
+            room: &room,
         }
     };
     let mut ranks = load_ranks(model_runner.ranks()?, backing, launch, meeting)?;
@@ -649,6 +664,9 @@ pub(crate) fn start(
         .iter()
         .map(|(_, remote)| Ok((remote.rank(), remote.session(&open, &opened)?)))
         .collect::<Result<Vec<(u32, Answer)>>>()?;
+    // A region another epoch created segments of is that epoch's, which this one maps: the
+    // engine shares the serving epoch's regions rather than holding its own.
+    let shares_regions = shares_regions(&open, &opened, launch.epoch);
     let mut created = open_ranks(&mut ranks, &open, &opened, resolved)?;
     let kernels = served();
     bind(&mut ranks, &open, &opened, true)?;
@@ -694,6 +712,9 @@ pub(crate) fn start(
     let binding = weight_binding(launch, &model_runner, &ranks, &workers, remotes.clone())?;
     if !standby(launch) {
         keep_warm_slots(&mut ranks)?;
+        // Beside a serving epoch that holds the quota, the warm processes may pass it by more
+        // than this start's own segments give back: the serving epoch gives the rest first.
+        epoch::ask_warm_room(&head, &binding, room.as_ref())?;
         epoch::keep_warm_segments(&mut head, &binding)?;
         binding
             .reserve_serving()
@@ -782,12 +803,25 @@ pub(crate) fn start(
     engine.head = Some(head);
     engine.kernels = kernels;
     engine.video = video;
+    engine.shares_regions = Some(shares_regions);
     engine.build = build;
     if !remotes.is_empty() {
         engine.liveness = Some(liveness);
     }
     engine.remotes = remotes.into_iter().map(|(_, remote)| remote).collect();
     Ok(engine)
+}
+
+/// Whether a device region of the session `open` (as the buffer pool answered it, `opened`)
+/// holds segments an epoch other than `epoch` created: the region is that epoch's, named alike by
+/// both, and this one maps its memory. A region new to the pool holds none.
+fn shares_regions(open: &Open, opened: &Opened, epoch: u64) -> bool {
+    epoch::kv_regions(open).into_iter().any(|index| {
+        opened
+            .segments
+            .get(index)
+            .is_some_and(|segments| segments.iter().any(|(segment, ..)| segment.epoch != epoch))
+    })
 }
 
 /// Where a peer's ranks placed their units, as its answer to the relayed session states it
@@ -999,6 +1033,7 @@ fn start_peer(
         // The caller states what the peer's ranks selected.
         kernels: proto::module::Packages::new(),
         video: Vec::new(),
+        shares_regions: None,
         remotes: Vec::new(),
         upstream: Some(upstream),
         prepared: Some(prepared),

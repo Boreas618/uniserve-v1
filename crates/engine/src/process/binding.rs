@@ -100,6 +100,7 @@ use crate::memory::client::{StorageClient, quota_limit};
 use crate::memory::division::{self, process_bytes};
 use crate::memory::graph_pool::{GraphPool, Usage};
 use crate::memory::reload::{MetaWeights, Reload, paired};
+use crate::memory::room::{self, DeviceRoom};
 use crate::memory::state::StateMemory;
 use crate::memory::weights::WeightStore;
 use crate::profiling::session::{Change, ProfileAnswer};
@@ -583,6 +584,22 @@ pub(crate) fn measure(
 /// would pass its limit once the rank reserves its warm process (`division::excess`). Only the
 /// segments epoch `epoch` created are given back: a segment another epoch created and the rank
 /// maps stays that epoch's storage, and giving it back would free nothing of the quota.
+/// The bytes of the segments of `table` past its first that epoch `epoch` created, counted from
+/// its tail to the first segment another epoch created: what a warm rank of `epoch` can give back
+/// of its own ([`kept_beside`]) while its region keeps the first segment it serves from. A unit
+/// takes `unit_bytes`.
+fn own_tail_bytes(table: &CacheTable, unit_bytes: u64, epoch: u64) -> u64 {
+    let held = (table.held as usize).min(table.segments.len());
+    table.segments[..held]
+        .iter()
+        .skip(1)
+        .rev()
+        .take_while(|segment| segment.epoch == epoch)
+        .fold(0_u64, |bytes, segment| {
+            bytes.saturating_add(u64::from(segment.units).saturating_mul(unit_bytes))
+        })
+}
+
 fn kept_beside(table: &CacheTable, unit_bytes: u64, epoch: u64, excess: u64) -> u32 {
     let mut kept = table.held;
     let mut freed: u64 = 0;
@@ -1928,6 +1945,95 @@ impl WeightBinding {
         Ok(kept.into_iter().flatten().min())
     }
 
+    /// The room each GPU of the ranks that hold `regions` (each region's worker groups and
+    /// number), this process's then every peer's, must hold beside everything it reserves for the
+    /// process's warm process to fit once the rank's own segments past each region's first are
+    /// given back: one [`DeviceRoom`] per GPU whose own segments do not cover what the warm
+    /// process passes the quota by (`division::excess`), and none for a GPU whose do. What a
+    /// start beside a serving epoch asks the serving epoch for before it keeps its warm segments
+    /// (`crate::process::epoch::ask_warm_room`).
+    ///
+    /// # Errors
+    ///
+    /// When NVML cannot state a rank's process, or a rank's quota or device cannot be read, here
+    /// or on a peer's host.
+    pub(crate) fn warm_rooms(&self, regions: &[(Vec<GroupId>, u8)]) -> Result<Vec<DeviceRoom>> {
+        let answers = self.ask_peers(None, || DataOperation::WarmRooms {
+            regions: regions.to_vec(),
+        })?;
+        let here = self.warm_rooms_here(regions);
+        let (mut rooms, peers) = both(here, answered::<Vec<DeviceRoom>>(answers))?;
+        rooms.extend(peers.into_iter().flatten());
+        Ok(rooms)
+    }
+
+    /// [`Self::warm_rooms`] of this process's ranks. The process is measured once per device, as
+    /// [`Self::warm_here`] measures it, and the own segments of every rank and region on the
+    /// device count together.
+    ///
+    /// # Errors
+    ///
+    /// When NVML cannot state a rank's process, or a rank's quota or device cannot be read.
+    pub(crate) fn warm_rooms_here(
+        &self,
+        regions: &[(Vec<GroupId>, u8)],
+    ) -> Result<Vec<DeviceRoom>> {
+        // Per device: a rank there, to read the quota and the device by, and the bytes of the own
+        // segments its ranks give back before the room is asked of anyone else.
+        let mut devices: BTreeMap<DeviceId, (Arc<StorageClient>, u64)> = BTreeMap::new();
+        for rank in &self.ranks {
+            let rank = lock(rank);
+            let entry = devices
+                .entry(rank.device)
+                .or_insert_with(|| (Arc::clone(&rank.client), 0));
+            let Some(cache) = &rank.cache else {
+                continue;
+            };
+            let epoch = rank.client.epoch();
+            for (groups, region) in regions {
+                if !rank.of(groups) {
+                    continue;
+                }
+                if let Some((table, unit_bytes)) = lock(cache).segment_table(*region) {
+                    entry.1 = entry
+                        .1
+                        .saturating_add(own_tail_bytes(&table, unit_bytes, epoch));
+                }
+            }
+        }
+
+        let nvml = Nvml::init()?;
+        let pools = self.device_pools();
+        let mut rooms = Vec::new();
+        for (device, (client, own)) in devices {
+            let (graphs, unattributed) = pools.get(&device).cloned().unwrap_or_default();
+            let process = measure(&nvml, device, &graphs, unattributed)?;
+            let (quota, _) = client.usage(device)?;
+            let excess = division::excess(&quota, client.epoch(), process)?;
+            let lacking = room::warm_lacking(excess, own);
+            if lacking == 0 {
+                continue;
+            }
+
+            let free = device.memory_info()?.free;
+            let measured = Room::of(&quota, free, client.epoch());
+            tracing::info!(
+                device = device.0,
+                process,
+                excess,
+                own,
+                lacking,
+                "the warm process passes the GPU's quota by more than the rank's own segments \
+                 give back: it asks for room"
+            );
+            rooms.push((
+                device.uuid()?.0,
+                room::wanted(measured.quota.min(measured.free), lacking),
+            ));
+        }
+        Ok(rooms)
+    }
+
     /// The room of the device of every rank of the worker groups `groups` whose memory of device
     /// region `region` is split, the peers' after this process's: its GPU's identity, its room,
     /// and the device bytes one unit of that memory takes, which a release of a unit gives back to
@@ -2695,6 +2801,24 @@ mod tests {
         assert_eq!(kept_beside(&table(2), UNIT, 1, segment + 1), 0);
         // Segments another epoch created stay, whatever the excess.
         assert_eq!(kept_beside(&table(3), UNIT, 2, 3 * segment), 3);
+    }
+
+    /// What a warm rank can give back of its own before it asks the serving epoch for room: the
+    /// segments it created past the first it serves from, from the tail to the first another
+    /// epoch created, and none it gave back already.
+    #[test]
+    fn a_warm_rank_counts_its_own_tail_segments_past_the_first() {
+        const UNIT: u64 = 1 << 20;
+        let segment = 16 * UNIT;
+
+        assert_eq!(own_tail_bytes(&table(3), UNIT, 1), 2 * segment);
+        assert_eq!(own_tail_bytes(&table(1), UNIT, 1), 0);
+        assert_eq!(own_tail_bytes(&table(0), UNIT, 1), 0);
+        // Another epoch's segments stay that epoch's storage.
+        assert_eq!(own_tail_bytes(&table(3), UNIT, 2), 0);
+        let mut mixed = table(3);
+        mixed.segments[1].epoch = 2;
+        assert_eq!(own_tail_bytes(&mixed, UNIT, 1), segment);
     }
 
     /// The ranks of a region keep, once warm, the fewest segments any of them, a peer's included,

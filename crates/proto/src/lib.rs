@@ -86,7 +86,13 @@ pub mod handoff {
 /// The engine's other interfaces have windows of their own, each agreed at that interface's
 /// hello: the Storage Server's protocol (`storage::protocol::VERSIONS`) at the Storage Server,
 /// the buffer pool's runtime interface (`storage::runtime::VERSIONS`) when a session opens.
-pub const ENGINE_INTERFACE: service::Versions = service::Versions::one(14);
+pub const ENGINE_INTERFACE: service::Versions = service::Versions::new(14, ROOM);
+
+/// The version of the engine interface that added a target's ask for room in its GPUs' quotas
+/// (`process::RoomWanted`, answered by `process::Command`'s `Room`): an epoch update's target asks
+/// only on a process link agreed on this version or a later one, since a daemon of an earlier
+/// version would leave the ask unanswered.
+pub const ROOM: u32 = 15;
 
 /// The version of the engine interface a peer of the window `spoken` agrees on with a peer
 /// whose hello states `oldest` and `newest` ([`process::Hello`], [`request::wire::Hello`]): the

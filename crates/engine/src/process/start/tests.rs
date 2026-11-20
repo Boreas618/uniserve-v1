@@ -78,8 +78,14 @@ fn start_on_meta(server: &StorageServer, launch: &EngineArgs) -> Engine {
         None,
         policy,
         liveness,
+        no_room(),
     )
     .unwrap()
+}
+
+/// The asks for room of a start beside no serving epoch: none is made.
+fn no_room() -> Arc<dyn crate::memory::room::RoomAsk> {
+    Arc::new(crate::memory::room::NoRoom)
 }
 
 /// Opens admission on `engine` as its process does when the engine is promoted: once its start
@@ -305,7 +311,16 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
 
     // One scheduler over the one group of the one rank, assembling batches for the start's
     // generation.
-    let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
+    let engine = start(
+        &launch,
+        &registry,
+        &storage,
+        None,
+        policy,
+        liveness,
+        no_room(),
+    )
+    .unwrap();
     assert_eq!(engine.served.kernels(), FIRST_GENERATION);
     assert_eq!(engine.schedulers.len(), 1);
     assert_eq!(engine.workers.len(), 1);
@@ -407,7 +422,16 @@ fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region
     };
 
     let liveness = Liveness::new(Arc::new(|| {}));
-    let serving = start(&launch, &registry, &storage, None, policy(), liveness).unwrap();
+    let serving = start(
+        &launch,
+        &registry,
+        &storage,
+        None,
+        policy(),
+        liveness,
+        no_room(),
+    )
+    .unwrap();
     let (open, opened) = session(&serving);
     let kv = kv_regions(&open)[0];
 
@@ -417,7 +441,16 @@ fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region
         epoch: launch.epoch,
     });
     let liveness = Liveness::new(Arc::new(|| {}));
-    let standby = start(&parked, &registry, &storage, None, policy(), liveness).unwrap();
+    let standby = start(
+        &parked,
+        &registry,
+        &storage,
+        None,
+        policy(),
+        liveness,
+        no_room(),
+    )
+    .unwrap();
     let (standby_open, standby_opened) = session(&standby);
     assert_eq!(standby_open.regions[kv].name, open.regions[kv].name);
     assert_eq!(standby_opened.regions[kv].0, opened.regions[kv].0);
@@ -469,7 +502,16 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
 
     // One scheduler over the one media group of the one rank, whose worker is warm, with no
     // KV region to grow: every video phase on the group, with its steps and product sizes.
-    let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
+    let engine = start(
+        &launch,
+        &registry,
+        &storage,
+        None,
+        policy,
+        liveness,
+        no_room(),
+    )
+    .unwrap();
     assert_eq!(engine.schedulers.len(), 1);
     assert_eq!(engine.workers.len(), 1);
     let (id, capacity) = &engine.capacities[0];
@@ -533,7 +575,16 @@ fn a_meta_start_of_a_model_with_a_vision_tower_encodes_images_beside_its_prefill
         crate::scheduler::policy::tests::packaged("arrival"),
         parameters,
     );
-    let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
+    let engine = start(
+        &launch,
+        &registry,
+        &storage,
+        None,
+        policy,
+        liveness,
+        no_room(),
+    )
+    .unwrap();
 
     // The rank's one worker serves the prefills and the image encodings: its causal runner and
     // its vision runner. A row of an encoder output is a row of features and its coordinates.
