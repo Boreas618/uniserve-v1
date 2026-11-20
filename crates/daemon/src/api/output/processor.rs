@@ -209,9 +209,15 @@ impl OutputProcessor {
         self.ended
     }
 
-    /// Counts the request as one its client abandoned or a successor took over.
+    /// Counts the request as one its client abandoned.
     pub fn abandoned(&mut self) {
         self.stats.abandoned();
+    }
+
+    /// Leaves the request's count to the successor that took the response over, which records
+    /// it when the request ends there.
+    pub fn handed_over(&mut self) {
+        self.stats.handed_over();
     }
 
     /// The response deltas one engine event produces, in order: the prompt and scheduling

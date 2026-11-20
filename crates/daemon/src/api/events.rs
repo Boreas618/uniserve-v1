@@ -94,6 +94,10 @@ pub trait Stats: Send {
     /// at its terminal output.
     fn observe(&mut self, output: &RequestOutput);
 
-    /// Counts a request the client abandoned or a successor took over.
+    /// Counts a request the client abandoned.
     fn abandoned(&mut self);
+
+    /// Leaves the request to the successor that took its response over: the daemon that ends a
+    /// request counts it, so this process records nothing of it.
+    fn handed_over(&mut self);
 }

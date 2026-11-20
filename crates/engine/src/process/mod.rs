@@ -240,7 +240,9 @@ pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
     let registry = registry.clone();
     let start: Start = Box::new(move |launch| {
         // The module set's policy is resolved at the node's Build Server, which the ranks'
-        // kernels and every later generation are resolved through too.
+        // kernels and every later generation are resolved through too. The client connects to
+        // the launch's socket again once the server it reached closed the connection, so a
+        // generation after the deployment replaced its Build Server reaches the new one.
         let socket = Path::new(&launch.build_server);
         let mut build = build_server::Client::connect(socket)
             .with_context(|| format!("connecting to the Build Server at {}", socket.display()))?;

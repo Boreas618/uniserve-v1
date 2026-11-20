@@ -817,11 +817,17 @@ impl crate::api::events::Stats for Request {
     fn abandoned(&mut self) {
         self.record(Outcome::Abort, None);
     }
+
+    /// The successor's recorder of the request counts it when it ends there, as its outcome.
+    fn handed_over(&mut self) {
+        self.recorded = true;
+    }
 }
 
 impl Drop for Request {
-    /// Records a request whose output ended before its terminal event as aborted, so a
-    /// handed-over, abandoned or dropped response is counted once.
+    /// Records a request whose output ended before its terminal event as aborted, so an
+    /// abandoned or dropped response is counted once; a response a successor took over is
+    /// counted by the successor ([`crate::api::events::Stats::handed_over`]).
     fn drop(&mut self) {
         self.record(Outcome::Abort, None);
     }

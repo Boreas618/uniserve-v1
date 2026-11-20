@@ -279,6 +279,8 @@ impl crate::api::events::Stats for Unrecorded {
     fn observe(&mut self, _: &crate::api::output::RequestOutput) {}
 
     fn abandoned(&mut self) {}
+
+    fn handed_over(&mut self) {}
 }
 
 /// Wire chat messages and requests for the tests that render or lower chat:

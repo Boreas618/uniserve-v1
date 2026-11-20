@@ -438,7 +438,7 @@ impl<S: ResponseSink> Session for GenerationRun<S> {
     }
 
     fn detach(&mut self) {
-        self.output.abandoned();
+        self.output.handed_over();
         self.events.hand_over();
     }
 
@@ -610,6 +610,18 @@ mod tests {
         events: Box<dyn Events>,
         sink: S,
     ) -> GenerationRun<S> {
+        let stats = Box::new(Unrecorded(std::time::Instant::now()));
+        recorded_run(parser, decode, logprobs, events, (sink, stats))
+    }
+
+    /// [`run`], whose request `stats` records.
+    fn recorded_run<S: ResponseSink>(
+        parser: Instance,
+        decode: handoff::TextDecode,
+        logprobs: bool,
+        events: Box<dyn Events>,
+        (sink, stats): (S, Box<dyn Stats>),
+    ) -> GenerationRun<S> {
         let lowering = handoff::Lowering {
             prompt_token_ids: vec![u32::from(b'p')],
             decode_options: Some(decode),
@@ -622,7 +634,7 @@ mod tests {
             lowering,
             parser,
             7,
-            Box::new(Unrecorded(std::time::Instant::now())),
+            stats,
         )
         .unwrap();
         GenerationRun::new(events, output, sink)
@@ -823,6 +835,80 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// The outcome of every request a daemon's store records, in the order they were recorded.
+    async fn recorded_outcomes(recorder: &crate::observation::record::Recorder) -> Vec<Value> {
+        let rows = recorder
+            .store()
+            .query(
+                "SELECT fields['outcome'] AS outcome FROM events \
+                 WHERE kind = 'request' ORDER BY time",
+            )
+            .await
+            .unwrap()
+            .json()
+            .unwrap();
+        let rows: Vec<Value> = serde_json::from_slice(&rows).unwrap();
+        rows.into_iter().map(|row| row["outcome"].clone()).collect()
+    }
+
+    /// A request is counted once, by the daemon that ends it. A streamed response a successor
+    /// took over (`detach`) records nothing in the daemon that handed it over, and the
+    /// successor's recorder of it counts it with the outcome it ends with there; a response
+    /// whose client left (`abort`) counts as an abort.
+    #[tokio::test]
+    async fn a_response_a_successor_took_over_is_counted_by_the_successor() {
+        use crate::observation::record::{Recorder, Request};
+        use crate::observation::{Retention, Store, System};
+
+        let daemon = || {
+            Recorder::new(
+                Store::new(std::sync::Arc::new(System), Retention::default()).unwrap(),
+                1,
+            )
+        };
+        let (predecessor, successor) = (daemon(), daemon());
+        // A streamed response over `events` whose request `recorder` records.
+        let stream = |recorder: &Recorder, events: Box<dyn Events>| {
+            let stats = Request::new(recorder.clone(), (0, None), std::time::Instant::now(), None);
+            let sink = ChatStreamEmitter::new(&response(false));
+            recorded_run(plain(), decode(), false, events, (sink, Box::new(stats)))
+        };
+        // Drives `body` to the frames of its first token, the boundary a handoff freezes at.
+        async fn first_frames(body: &mut GenerationRun<ChatStreamEmitter>) {
+            let step = std::future::poll_fn(|cx| body.poll_step(cx)).await;
+            assert!(matches!(step, Step::Frames(_)), "the first token's frames");
+        }
+
+        let mut taken = stream(&predecessor, engine_events([text_token(b'a')]));
+        first_frames(&mut taken).await;
+        taken.detach();
+        drop(taken);
+        let mut resumed = stream(
+            &successor,
+            engine_events([
+                text_token(b'b'),
+                finished(proto::request::FinishReason::Eos, 2),
+            ]),
+        );
+        let (_, failed) = responded(&mut resumed).await;
+        assert!(failed.is_none());
+        drop(resumed);
+        assert_eq!(recorded_outcomes(&predecessor).await, Vec::<Value>::new());
+        assert_eq!(
+            recorded_outcomes(&successor).await,
+            vec![Value::from("stop")]
+        );
+
+        let mut left = stream(&predecessor, engine_events([text_token(b'a')]));
+        first_frames(&mut left).await;
+        left.abort();
+        drop(left);
+        assert_eq!(
+            recorded_outcomes(&predecessor).await,
+            vec![Value::from("abort")]
+        );
     }
 
     /// An engine rejection of a non-streamed request is the status of its

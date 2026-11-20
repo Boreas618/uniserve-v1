@@ -4,11 +4,16 @@
 
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use build_server::Error;
 use build_server::manifest::ModuleForm;
-use build_server::protocol::{Client, Descriptors, PackageRequest, PrepareRequest, Selector, wire};
+use build_server::protocol::{
+    Client, CoverRequest, Descriptors, PackageRequest, PrepareRequest, Selector, wire,
+};
 use build_server::store::ModulePath;
 use build_server::target::Target;
 use proto::module::{ModuleSlot, PackageRevision};
@@ -66,6 +71,136 @@ fn server_on(serve: impl FnOnce(&mut Connection) + Send + 'static) -> Client {
         serve(&mut connection);
     });
     Client::new(Connection::new(client).unwrap())
+}
+
+/// A stand-in for a deployment's Build Server, listening at a socket: it answers every `cover`
+/// with one candidate of the operator at its own `revision`, which tells apart the servers a test
+/// starts one after another at one socket. Each connection it accepts is answered on a thread of
+/// its own until the client closes it.
+struct StandIn {
+    socket: PathBuf,
+    stopping: Arc<AtomicBool>,
+    /// The server's end of every connection it accepted, which its stop closes.
+    accepted: Arc<Mutex<Vec<UnixStream>>>,
+    listening: std::thread::JoinHandle<()>,
+}
+
+impl StandIn {
+    /// Listens at `socket`, answering `cover` at `revision`.
+    fn start(socket: &Path, revision: u32) -> Self {
+        let listener = UnixListener::bind(socket).unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let listening = {
+            let (stopping, accepted) = (Arc::clone(&stopping), Arc::clone(&accepted));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let stream = stream.unwrap();
+                    // The stop wakes the accept with a connection of its own.
+                    if stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    accepted.lock().unwrap().push(stream.try_clone().unwrap());
+                    std::thread::spawn(move || answer_cover(stream, revision));
+                }
+            })
+        };
+        Self {
+            socket: socket.to_owned(),
+            stopping,
+            accepted,
+            listening,
+        }
+    }
+
+    /// Stops as a Build Server's process ends: the listener and every accepted connection are
+    /// closed, and the socket is gone, so a client's next send on its connection fails.
+    fn stop(self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        drop(UnixStream::connect(&self.socket).unwrap());
+        self.listening.join().unwrap();
+        for stream in self.accepted.lock().unwrap().drain(..) {
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        std::fs::remove_file(&self.socket).unwrap();
+    }
+}
+
+/// Answers each `cover` the client sends on `stream` with one `triton` candidate of its operator
+/// at `revision`, until the connection closes.
+fn answer_cover(stream: UnixStream, revision: u32) {
+    let mut connection = Connection::new(stream).unwrap();
+    while let Ok((request, _)) = connection.receive::<wire::Request>() {
+        let Some(wire::request::Request::Cover(cover)) = request.request else {
+            panic!("the stand-in answers cover alone");
+        };
+        let coverage = wire::Coverage {
+            covered: Vec::new(),
+            uncovered: Vec::new(),
+            candidates: vec![wire::Package {
+                op: cover.op,
+                backend: "triton".into(),
+                revision,
+            }],
+        };
+        let answered = connection.post(
+            &wire::ServerMessage {
+                message: Some(wire::server_message::Message::Coverage(coverage)),
+            },
+            &[],
+        );
+        if answered.is_err() {
+            return;
+        }
+    }
+}
+
+/// A `cover` of `rms_norm`, as a generation's selection asks it of the deployment's Build Server.
+fn rms_norm_cover() -> CoverRequest {
+    CoverRequest {
+        op: "rms_norm".into(),
+        targets: vec![arch()],
+        keys: vec!["dtype_bf16".into()],
+        pins: Default::default(),
+        fixed: Vec::new(),
+        interface_version: None,
+    }
+}
+
+/// The revision of the candidate `client`'s `cover` of `rms_norm` names.
+fn covered_revision(client: &mut Client) -> u32 {
+    client.cover(&rms_norm_cover()).unwrap().candidates[0].revision
+}
+
+/// A client opened at a socket follows the Build Server that listens there, as a main process's
+/// one client does across its epoch's generations: once the server it reached stopped and
+/// another started at the socket, as a deployment's Build Server is replaced between two
+/// generations, its next request is answered by the new server. A request while nothing listens
+/// fails, and the request after it reaches the server started since.
+#[test]
+fn a_client_reaches_the_build_server_started_again_at_its_socket() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("build-server.sock");
+    let first = StandIn::start(&socket, 1);
+    let mut client = Client::connect(&socket).unwrap();
+    assert_eq!(covered_revision(&mut client), 1);
+
+    first.stop();
+    let replacement = StandIn::start(&socket, 2);
+    assert_eq!(
+        covered_revision(&mut client),
+        2,
+        "the request after the replacement reaches the new server"
+    );
+
+    replacement.stop();
+    assert!(
+        matches!(client.cover(&rms_norm_cover()), Err(Error::Io(_))),
+        "nothing listens at the socket"
+    );
+    let restarted = StandIn::start(&socket, 3);
+    assert_eq!(covered_revision(&mut client), 3);
+    restarted.stop();
 }
 
 #[test]
