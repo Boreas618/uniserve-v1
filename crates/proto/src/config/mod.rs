@@ -1162,8 +1162,10 @@ pub struct WorkerConfig {
     /// of the engine interface installed at the Build Server.
     #[reload(epoch)]
     pub engine: String,
-    /// The revision of the engine package to run; the latest installed one, fixed when the
-    /// configuration is applied, when unset.
+    /// The revision of the engine package to run. Unset, a start fixes the latest installed
+    /// one, and every later apply keeps the serving epoch's, so a revision installed later runs
+    /// only once a configuration names it. Its change, compared as the deployment runs it, is
+    /// an epoch: stating the serving revision changes nothing.
     #[reload(epoch)]
     pub engine_revision: Option<u32>,
     /// The processing program the leader daemon serves the epoch's requests through: the name
@@ -1171,9 +1173,10 @@ pub struct WorkerConfig {
     /// its engine (`crates/processing/program/package.toml`).
     #[reload(epoch)]
     pub processing: String,
-    /// The revision of the processing program to run; the latest installed one, fixed when the
-    /// configuration is applied, when unset. A tree installs its processing program and its
-    /// engine together, so the latest revisions of both are one tree's.
+    /// The revision of the processing program to run, unset as `engine_revision` is: a start
+    /// fixes the latest installed one, and every later apply keeps the serving epoch's. A tree
+    /// installs its processing program and its engine together, so the latest revisions of both
+    /// are one tree's, and an epoch keeps both of its tree.
     #[reload(epoch)]
     pub processing_revision: Option<u32>,
     /// Time a job of a rank's worker may stay in flight before it is reported `Stalled`, which
