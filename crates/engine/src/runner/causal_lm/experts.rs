@@ -327,6 +327,26 @@ impl Member {
         self.shape.attention_ranks > 0 && self.shape.rank >= self.shape.attention_ranks
     }
 
+    /// Releases the member's transport, collectively: every member of the union calls this at
+    /// the same point of its worker's retirement, each on its worker thread, once its runner,
+    /// the runner's capture instances and every graph they captured are gone, and the call
+    /// returns once the members have met (`Transport::release`). The member's host group and
+    /// the package's link to it stay alive until the release returns; a member without a
+    /// transport releases nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] with the package's refusal; the transport's memory is then left to
+    /// the process's exit.
+    pub(crate) fn release(mut self) -> Result<()> {
+        match self.transport.take() {
+            Some(transport) => transport.release().map_err(|error| {
+                Error::Invalid(format!("releasing the expert transport: {error}"))
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// The transport's handle, for the context of the member's forwards; `None` before the
     /// transport exists.
     pub(crate) fn transport(&self) -> Option<ExchangeTransport> {

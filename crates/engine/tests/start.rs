@@ -584,6 +584,94 @@ fn an_engine_on_a_device_shut_down_while_asleep_exits_in_order() {
     );
 }
 
+/// An engine serving the released Qwen3-30B-A3B with its attention on GPU 0 and its routed
+/// experts on a dedicated expert group on GPU 1, the two ranks members of one expert union, ends
+/// in order when it is shut down: the workers release the union's exchange transport, whose
+/// package opens an NCCL communicator over the members (`deepep`, the selection of the
+/// `expert_exchange` keys), so none of the NCCL shared memory the serving process mapped is left
+/// in `/dev/shm` (`docs/architecture.md`, the orderly close).
+#[test]
+#[ignore = "needs GPUs 0 and 1, this host's device-cases Build Server and the released Qwen3-30B-A3B"]
+fn an_engine_of_a_dedicated_expert_group_releases_its_exchange_when_it_shuts_down() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = StorageServer::start();
+    let build_server =
+        build_server::socket(&service::RuntimeDirectory::of_user().unwrap(), DEVICE_CASES).unwrap();
+    let mut launch = launch(directory.path(), &build_server);
+    launch.engine_config.device.device = proto::config::DeviceKind::Cuda;
+    launch.engine_config.model.model = testkit::assets::QWEN3_30B_A3B
+        .snapshot()
+        .to_string_lossy()
+        .into_owned();
+
+    // The attention group serves the requests; the expert group, which no scheduler serves,
+    // computes the routed experts of the attention rank's tokens.
+    let rank = |device: &str| proto::config::WorkerRank {
+        host: "localhost".to_owned(),
+        device: device.parse().unwrap(),
+    };
+    let attention = WorkerGroupConfig {
+        id: proto::config::WorkerGroupId("attention".to_owned()),
+        role: proto::config::WorkerGroupRole::default(),
+        copies: 1,
+        ranks: vec![rank("cuda:0")],
+        blocks: WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    let experts = WorkerGroupConfig {
+        id: proto::config::WorkerGroupId("experts".to_owned()),
+        role: proto::config::WorkerGroupRole::Experts,
+        copies: 1,
+        ranks: vec![rank("cuda:1")],
+        blocks: std::collections::BTreeMap::new(),
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    launch.engine_config.parallel.worker_groups = vec![attention, experts];
+    launch.engine_config.moe.expert_parallel = true;
+    launch.group = "attention".to_owned();
+    launch.devices = vec![0, 1];
+    launch.world_size = 2;
+
+    // The process interface and the claim stay open until the engine exits, as its daemon's do.
+    let Daemon {
+        mut engine,
+        mut requests,
+        processes: _processes,
+        _claim: _held,
+    } = started(directory.path(), &launch, &storage, &[]);
+    until(&mut requests, DEVICE_BOUND, |kind| match kind {
+        from_engine::Kind::State(state) if state.state == wire::EngineState::Serving as i32 => {
+            Some(())
+        }
+        _ => None,
+    });
+    // The union's two members are threads of the one process, whose exchange communicator's
+    // proxies map NCCL's shared memory while they serve.
+    let shared = nccl_shared_memory(engine.child.id());
+    assert!(
+        !shared.is_empty(),
+        "the serving engine maps no NCCL shared memory"
+    );
+
+    requests
+        .deliver(&wire::ToEngine {
+            kind: Some(wire::to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::Shutdown(wire::Shutdown {})),
+            })),
+        })
+        .unwrap();
+    let status = engine.exited(DEVICE_BOUND);
+    assert!(status.success(), "the engine exited with {status}");
+
+    let left: Vec<&PathBuf> = shared.iter().filter(|path| path.exists()).collect();
+    assert!(
+        left.is_empty(),
+        "the engine's close left NCCL's shared memory {left:?}"
+    );
+}
+
 /// The files of NCCL's host shared memory (`/dev/shm/nccl-*`) that process `pid` maps and that
 /// are still linked: what its communicators' proxies exchange through, which NCCL removes when
 /// it destroys them.

@@ -2282,6 +2282,10 @@ impl Runner for CausalLmRunner {
         &self.config.phases
     }
 
+    fn leave_union(&mut self) -> Option<crate::runner::UnionMember> {
+        self.union.take().map(crate::runner::UnionMember::new)
+    }
+
     /// The runner's forward over `graphs`: the model, the slot state, the cache and the state
     /// buffers, the scratch page set, the feature buffer and the union's regions are the
     /// runner's own, which idle inputs address only at their padding rows and pages. A

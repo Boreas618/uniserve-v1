@@ -494,13 +494,22 @@ pub struct TransportViews {
 
 /// A transport the worker owns: what the package's `create` returned, and the entries that drive
 /// it through its life.
+///
+/// The worker ends a transport with [`Transport::release`], which frees what the package
+/// created: its device memory and, for a package that drives NCCL itself, its communicator,
+/// whose proxies' host shared memory outlives the process otherwise. A transport that is dropped
+/// unreleased leaves those to the process's exit.
 pub struct Transport {
     /// Keeps the module loaded while the handle lives.
     _kernel: Arc<Kernel>,
     call: Lifecycle,
     step: LifecycleEntry,
     info: InfoEntry,
+    release: LifecycleEntry,
     shape: TransportShape,
+    /// The stream the transport was created on, whose device's context the package's entries
+    /// run in.
+    stream: Stream,
 }
 
 // SAFETY: a transport is created and driven on its device's thread, and moves there with its runner.
@@ -520,11 +529,12 @@ impl Transport {
     ) -> Result<Self> {
         // SAFETY: each symbol is the package's lifecycle or info entry, which takes the structure
         // its type names and the stream, as every native entry does (`kernel`).
-        let (create, step, info) = unsafe {
+        let (create, step, info, release) = unsafe {
             (
                 kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_create")?,
                 kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_step")?,
                 kernel.native_symbol::<InfoEntry>("uniserve_expert_exchange_info")?,
+                kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_release")?,
             )
         };
         let mut call = shape.lifecycle(group)?;
@@ -546,8 +556,37 @@ impl Transport {
             call,
             step,
             info,
+            release,
             shape,
+            stream: stream.clone(),
         })
+    }
+
+    /// Calls the package's `release` entry, collectively over the group, which frees everything
+    /// the package's `create` made. Every rank of the group calls this at the same point of its
+    /// retirement, each on its own thread: the entry waits for every rank before any frees memory
+    /// a peer reads. The group `create` was given must stay alive until this returns.
+    ///
+    /// Nothing may launch over the transport after it: the caller releases it once the graphs
+    /// that captured launches over it are gone and the forwards that borrowed its handle ended.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Platform`] when the stream's context cannot be made current, or the package's
+    /// refusal; the package's memory is then left to the process's exit.
+    pub fn release(mut self) -> Result<()> {
+        let handle = self.stream.raw() as *mut std::ffi::c_void;
+        // The entry frees on the device the calling thread holds current, as `create` allocates.
+        let (release, call) = (self.release, &mut self.call);
+        let status = self
+            .stream
+            .with_context(|| {
+                // SAFETY: the transport is live, nothing launches over it any longer, and the
+                // call has the header's layout; its group is the caller's to keep until now.
+                unsafe { release(call, handle) }
+            })
+            .map_err(Error::Platform)?;
+        check(status, "release", &call.error)
     }
 
     /// The device bytes a transport of `shape` takes once `kernel`'s package creates it, as the

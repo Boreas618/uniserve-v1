@@ -1311,23 +1311,34 @@ impl Thread {
     }
 
     /// Ends the thread's state once its queue closed: the capture thread and the runners, with
-    /// every graph they hold, and then the communicators of the runners' groups
+    /// every graph they hold, then the transport of each runner's member of an expert union
+    /// (`Member::release`), and then the communicators of the runners' groups
     /// (`ops::Group::destroy`), each once no group beside it remains. A communicator that is not
-    /// destroyed keeps its device buffers, its proxy threads and its host shared memory until
-    /// the process exits, and the shared memory beyond it.
+    /// destroyed, the runners' or one an exchange package opened for its transport, keeps its
+    /// device buffers, its proxy threads and its host shared memory until the process exits,
+    /// and the shared memory beyond it.
     ///
     /// NCCL's destroy waits for the communicator's work and for every graph that captured it,
-    /// so it follows the graphs' release, and a device with a sticky error, whose work never
-    /// retires, leaves its communicators to the process's exit.
+    /// so it follows the graphs' release. A transport's release meets the union's other members,
+    /// whose workers retire alike when the engine closes their queues. A device with a sticky
+    /// error, whose work never retires, leaves its transports and its communicators to the
+    /// process's exit.
     fn retire(self) {
         let Self {
             device,
-            runners,
+            mut runners,
             groups,
             capturer,
             sticky,
             ..
         } = self;
+
+        // The members outlive their runners: a transport's group and the package's link to it
+        // are the member's, and the release follows the graphs that captured exchanges over it.
+        let members: Vec<_> = runners
+            .iter_mut()
+            .filter_map(|runner| runner.leave_union())
+            .collect();
 
         // The capture thread's instances hold groups beside the runners' and the graphs they
         // captured; the runners hold the graphs that serve.
@@ -1338,9 +1349,19 @@ impl Thread {
             tracing::warn!(
                 ?device,
                 %error,
-                "the device's context failed: its communicators are left to the process's exit"
+                "the device's context failed: its transports and communicators are left to the \
+                 process's exit"
             );
             return;
+        }
+        for member in members {
+            if let Err(error) = member.release() {
+                tracing::warn!(
+                    ?device,
+                    %error,
+                    "an expert transport was not released: it is left to the process's exit"
+                );
+            }
         }
         for group in groups {
             let destroyed = match Arc::into_inner(group) {

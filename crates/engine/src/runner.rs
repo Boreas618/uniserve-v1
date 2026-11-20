@@ -206,6 +206,26 @@ pub struct Measure {
     pub keys: std::collections::BTreeSet<(&'static str, String)>,
 }
 
+/// A runner's member of an expert union as it leaves its runner ([`Runner::leave_union`]): what
+/// the runner's worker releases once the runner is gone.
+pub struct UnionMember(causal_lm::experts::Member);
+
+impl UnionMember {
+    /// The member `member` leaving its runner.
+    pub(crate) const fn new(member: causal_lm::experts::Member) -> Self {
+        Self(member)
+    }
+
+    /// Releases the member's transport, collectively over the union (`Member::release`).
+    ///
+    /// # Errors
+    ///
+    /// As `Member::release`.
+    pub(crate) fn release(self) -> Result<()> {
+        self.0.release()
+    }
+}
+
 /// One stage a rank holds, as the worker and [`Graphs`] drive it.
 pub trait Runner: Forward {
     /// The phases this runner serves, as the scheduler names them in a batch.
@@ -216,6 +236,14 @@ pub trait Runner: Forward {
     /// ([`Worker`](crate::worker::Worker)): its graphs' groups ([`Graphs::groups`]) by default.
     fn groups(&self) -> Vec<std::sync::Arc<ops::Group>> {
         self.graphs().groups()
+    }
+
+    /// The runner's member of an expert union, which the runner leaves: its worker takes it when
+    /// its queue closes, and releases the member's transport once the runner, its capture
+    /// instances and the graphs they captured are gone (`Member::release`). The runner issues
+    /// nothing afterwards. `None` for a runner of no union, by default.
+    fn leave_union(&mut self) -> Option<UnionMember> {
+        None
     }
 
     /// A second instance of the runner's forward over `graphs`, for the worker's capture
