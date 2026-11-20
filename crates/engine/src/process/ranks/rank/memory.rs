@@ -590,6 +590,33 @@ pub(crate) fn unreserved(
     Ok((now.min(own), alone.min(own)))
 }
 
+/// Whether a starting rank of `client`'s scope replaces another process of its scope and epoch on
+/// `device`, as a lost rank's relaunch does: the GPU's quota holds reservations of that scope and
+/// epoch the rank has not made ([`division::reserved_by`]), which the Storage Server keeps for
+/// the process that replaces the lost one. Such a rank takes the memory of its regions as its
+/// predecessor left it and creates none past it at its start ([`plane_segments`]).
+///
+/// Agreed over `host`, whose ranks create the same segments of their regions: when one of them
+/// replaces a process, they all start as replacements.
+///
+/// # Errors
+///
+/// The Storage Server's refusal, or a host group that cannot agree.
+pub(crate) fn replaces(client: &StorageClient, device: DeviceId, host: &HostGroup) -> Result<bool> {
+    let (quota, _) = client.usage(device)?;
+    let scope = client
+        .scope()
+        .context("the head's connection holds no rank's quota")?;
+    let replaces = division::reserved_by(&quota, scope, client.epoch()) > 0;
+
+    // The fewest over the group of 0 for a rank that replaces a process and 1 for one that does
+    // not: 0 when any of them does.
+    let agreed = host
+        .all_reduce_min(&[i64::from(!replaces)])
+        .context("agreeing whether the ranks replace processes of their epoch")?;
+    Ok(agreed[0] == 0)
+}
+
 /// The segments of a region of `units` units whose memory is allocated in granules of
 /// `granularity` bytes, a column of a unit taking `part_bytes` (a plane of the KV planes, or a
 /// whole state unit) (step 16), given the region's segment table `table`
@@ -598,7 +625,10 @@ pub(crate) fn unreserved(
 /// the units past them up to `held`, the units the GPU's quota holds now
 /// ([`ModelRunner::divide`]), and past those the segments left given back, which a grow creates
 /// once the quota holds them; and the created segments alone, as a segment table states them
-/// (the segment, its first unit and its units), which the session's head grants.
+/// (the segment, its first unit and its units), which the session's head grants. `held` is zero
+/// on a standby, and on a rank that replaces a process of its scope and epoch ([`replaces`]) and
+/// finds the region's table holding segments: those are the memory its predecessor left, which
+/// it maps whole, and what its quota holds past them it creates once warm.
 ///
 /// The segments past the table are the ones `segments::own` splits the whole cache into, from
 /// the end of the table on: a region of one layout is split alike by every epoch that names it,
