@@ -47,6 +47,21 @@ pub const ENVIRONMENT_PROGRAM: &str = "uniserve-build-server";
 /// uv, which creates the Python environment from its project's lock.
 pub const UV: &str = "uv";
 
+/// The environment's directory in its project: uv's default, the project's own
+/// `.venv`.
+pub const ENVIRONMENT_DIRECTORY: &str = ".venv";
+
+/// The file in the environment's directory that records the lock the
+/// environment was last brought to: the SHA-256 of the project's `uv.lock`, in
+/// hexadecimal.
+pub const SYNCED_LOCK: &str = "uniserve-synced-lock";
+
+/// The file in the project that a server holds an exclusive lock of while it
+/// decides whether to sync the environment and syncs it. It lies beside the
+/// environment's directory rather than in it, because uv creates that
+/// directory.
+pub const SYNC_LOCK: &str = ".venv.lock";
+
 /// The Build Server's Python environment: the locked project of a source tree
 /// ([`crate::tree::ENVIRONMENT_PROJECT`]) as uv installs it, in the project's
 /// own `.venv`.
@@ -58,15 +73,63 @@ pub struct Environment {
 
 impl Environment {
     /// The environment of the source tree `source`, created, or brought to the
-    /// tree's lock, by `uv sync --locked`: an environment already at the lock
-    /// is left as it is, so servers of one tree share it.
+    /// tree's lock, by `uv sync --locked`. An environment already brought to
+    /// the tree's lock is left as it is, so the servers of one tree, on every
+    /// host that mounts it, share it while they run.
+    ///
+    /// uv does not leave every environment at its lock as it is: it reinstalls a
+    /// distribution whose wheel states a platform tag uv does not count as the
+    /// host's (NVIDIA's aarch64 cuSPARSELt wheel states `manylinux2014_sbsa`), and
+    /// a server that lists the environment's distributions while another
+    /// server's sync reinstalls one finds a distribution with no metadata. A
+    /// sync therefore runs only for a lock the environment does not record
+    /// ([`SYNCED_LOCK`]), and the decision and the sync run under an exclusive
+    /// lock of [`SYNC_LOCK`], which a server holds on every host that shares the
+    /// tree (`flock`, coherent across a cluster file system mounted with it).
+    /// A server of a tree whose lock changed brings the environment to it, and
+    /// its compilations then run in the environment at that lock.
     ///
     /// # Errors
     ///
-    /// Why there is no environment: uv cannot be run, or its sync fails, with
-    /// what uv said.
+    /// Why there is no environment: the project's lock cannot be read or held,
+    /// uv cannot be run, its sync fails, with what uv said, or the record of the
+    /// synced lock cannot be written.
     pub fn sync(source: &Path) -> std::result::Result<Environment, String> {
         let project = source.join(crate::tree::ENVIRONMENT_PROJECT);
+        let directory = project.join(ENVIRONMENT_DIRECTORY);
+        let environment = Environment {
+            program: directory.join("bin").join(ENVIRONMENT_PROGRAM),
+        };
+
+        // The lock the environment is brought to, as the project's `uv.lock`
+        // states it; `uv sync --locked` refuses a lock its project does not
+        // match, so the lock's bytes stand for every locked distribution.
+        let lock = std::fs::read(project.join("uv.lock")).map_err(|error| {
+            format!(
+                "the Build Server's Python environment has no lock: {} cannot be read ({error})",
+                project.join("uv.lock").display()
+            )
+        })?;
+        let digest = format!("{:x}", Sha256::digest(&lock));
+
+        // Held until the function returns, whichever way: a server that finds
+        // the record written by another one's sync waits for that sync first.
+        let guard = std::fs::File::create(project.join(SYNC_LOCK))
+            .and_then(|file| file.lock().map(|()| file))
+            .map_err(|error| {
+                format!(
+                    "the Build Server's Python environment cannot be held: {} ({error})",
+                    project.join(SYNC_LOCK).display()
+                )
+            })?;
+
+        let record = directory.join(SYNCED_LOCK);
+        let recorded = std::fs::read_to_string(&record).ok();
+        if recorded.as_deref().map(str::trim) == Some(digest.as_str()) {
+            drop(guard);
+            return Ok(environment);
+        }
+
         // The project's own `.venv`, whatever environment the starter runs in:
         // `uv run` names its own project's environment in `VIRTUAL_ENV`, and
         // `UV_PROJECT_ENVIRONMENT` would move this project's.
@@ -90,9 +153,21 @@ impl Environment {
                 String::from_utf8_lossy(&synced.stderr).trim()
             ));
         }
-        Ok(Environment {
-            program: project.join(".venv/bin").join(ENVIRONMENT_PROGRAM),
-        })
+
+        // Written whole before it is named, so a reader finds either no record
+        // or the complete digest.
+        let written = directory.join(format!("{SYNCED_LOCK}.{}", std::process::id()));
+        std::fs::write(&written, &digest)
+            .and_then(|()| std::fs::rename(&written, &record))
+            .map_err(|error| {
+                format!(
+                    "the lock the Build Server's Python environment was synced to cannot be \
+                     recorded in {} ({error})",
+                    record.display()
+                )
+            })?;
+        drop(guard);
+        Ok(environment)
     }
 
     /// A command of the environment's program.
@@ -674,6 +749,62 @@ mod tests {
             .to_string();
         assert!(refused.contains("no environment"), "{refused}");
         assert_eq!(none.identity(ToolchainKind::None, here).unwrap(), "none");
+    }
+
+    /// A tree's environment is synced once per lock: a second server of the tree leaves the
+    /// environment at its lock as it is, so a distribution the lock does not name, which a sync
+    /// removes, stays; a server of a tree whose lock changed brings the environment to that lock.
+    #[test]
+    fn an_environment_at_its_lock_is_left_as_it_is() {
+        let tree = tempfile::tempdir().unwrap();
+        let project = tree.path().join(crate::tree::ENVIRONMENT_PROJECT);
+        std::fs::create_dir_all(&project).unwrap();
+
+        // A project of no dependencies, locked offline, whose version is its lock's one change.
+        let lock = |version: &str| {
+            let manifest = format!(
+                "[project]\nname = \"environment\"\nversion = \"{version}\"\n\
+                 requires-python = \">=3.12\"\ndependencies = []\n\n[tool.uv]\npackage = false\n"
+            );
+            std::fs::write(project.join("pyproject.toml"), manifest).unwrap();
+            let locked = Command::new(UV)
+                .args(["lock", "--offline", "--project"])
+                .arg(&project)
+                .output()
+                .unwrap();
+            assert!(locked.status.success(), "{locked:?}");
+        };
+        lock("1.0.0");
+        Environment::sync(tree.path()).unwrap();
+
+        // A distribution the lock does not name, as an installer leaves one.
+        let lib = project.join(ENVIRONMENT_DIRECTORY).join("lib");
+        let python = std::fs::read_dir(&lib).unwrap().next().unwrap().unwrap();
+        let extraneous = python.path().join("site-packages/extraneous-1.0.dist-info");
+        std::fs::create_dir_all(&extraneous).unwrap();
+        std::fs::write(
+            extraneous.join("METADATA"),
+            "Metadata-Version: 2.1\nName: extraneous\nVersion: 1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            extraneous.join("RECORD"),
+            "extraneous-1.0.dist-info/METADATA,,\nextraneous-1.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        Environment::sync(tree.path()).unwrap();
+        assert!(
+            extraneous.exists(),
+            "a sync at the recorded lock changed the environment"
+        );
+
+        lock("1.0.1");
+        Environment::sync(tree.path()).unwrap();
+        assert!(
+            !extraneous.exists(),
+            "a changed lock left the environment as it was"
+        );
     }
 
     /// A build whose compiler is not where the host said names the executable, its arguments and
