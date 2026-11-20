@@ -18,9 +18,11 @@
 //! - [`attention`]: a layer's sparse latent attention;
 //! - [`decoder`]: a hyper-connected decoder layer;
 //! - [`causal_lm`]: [`DeepseekV41ForCausalLm`], the model execution serves;
+//! - [`dspark`]: [`Dspark`], the checkpoint's DSpark drafter (`mtp.*`), which drafts a block of
+//!   tokens in one forward ([`nn::BlockDrafter`]);
 //! - [`family`]: the registration.
 //!
-//! The checkpoint's DSpark drafter (`mtp.*`) and vision tower are not loaded.
+//! The checkpoint's vision tower is not loaded.
 //!
 //! ## References
 //!
@@ -33,11 +35,13 @@ pub mod cache;
 pub mod causal_lm;
 pub mod config;
 pub mod decoder;
+pub mod dspark;
 pub mod engram;
 pub mod family;
 
 pub use causal_lm::DeepseekV41ForCausalLm;
-pub use config::{Config, EngramConfig};
+pub use config::{Config, DsparkConfig, EngramConfig};
+pub use dspark::Dspark;
 pub use engram::Hashing;
 
 /// The family's refusals are raised under this id.

@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash
 
-UniServe serves `deepseek-ai/DeepSeek-V4.1-Flash-1017` (`DeepseekV41ForCausalLM`) at its context of 1M tokens (`max_position_embeddings = 1048576`) with the checkpoint's own numerics: FP8 dense projections under 32 × 32 UE8M0 block scales, read as MXFP8; MXFP4 routed experts; the window, compressed-latent and index-key caches in the reference's MXFP8, NVFP4 and MXFP4 records; the hyper-connected residual of four streams; and the hashed n-gram memories (Engram) of layers 1 and 14. The DSpark drafter and the vision tower are not served: a deployment does not speculate, and a request's image parts are refused.
+UniServe serves `deepseek-ai/DeepSeek-V4.1-Flash-1017` (`DeepseekV41ForCausalLM`) at its context of 1M tokens (`max_position_embeddings = 1048576`) with the checkpoint's own numerics: FP8 dense projections under 32 × 32 UE8M0 block scales, read as MXFP8; MXFP4 routed experts; the window, compressed-latent and index-key caches in the reference's MXFP8, NVFP4 and MXFP4 records; the hyper-connected residual of four streams; and the hashed n-gram memories (Engram) of layers 1 and 14. Its DSpark drafter speculates in a deployment that states drafts ([Speculation](#speculation)). The vision tower is not served: a request's image parts are refused.
 
 ## Serving it on four GPUs
 
@@ -27,6 +27,22 @@ The weights take about 125 GiB of each GPU's 185, so the package raises the depl
 
 The checkpoint publishes no chat template; its prompt format is its reference encoder (`encoding/encoding.py`), which the family's request side ports (`processing::deepseek_v41`): thinking mode by default, chat mode with `reasoning_effort` `none` or `chat_template_kwargs` `{"enable_thinking": false}`, reasoning between `<think>` and `</think>`, and DSML tool calls.
 
+## Speculation
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 uniserve serve configs/deepseek_v41/dp4-ep4-dspark
+```
+
+The checkpoint carries a DSpark drafter (`mtp.*`, `inference/model.py` `DSparkBlock`): three hyper-connected layers after the decoder's 40 that draft a block of five tokens in one forward. A deployment that states `speculative_config.num_draft_tokens = 5`, the drafter's block, loads it and verifies six tokens a request each step: the token it committed last and the block's five drafts.
+
+- **Context.** The drafter reads the residual entering layers 37, 38 and 39, averaged over its four streams, which the model's forward returns beside its read-out rows; each draft layer projects it (`main_proj`, `main_norm`, then its own `wkv` and `kv_norm`) into its sliding window of 128 latents. The window is the model's own window field, whose owners are the 40 decoder layers and the draft layers 40 to 42, so a step writes the drafter's entries of every token the target computed: a prompt's tokens, and a verification's up to the drafts it accepted. A prefix hit replays them with the target's window, and the drafter keeps no cache of its own to refill.
+- **Block.** The block is the token the verification commits after its accepted drafts, at the position after them, and four noise tokens (`dspark_noise_token_id`) at the positions after it. Every block token attends the window's 128 entries before the block and the whole block, non-causally, and the block's entries are written into the window first: the next step's context overwrites them.
+- **Drafts.** The model's FP32 head projects the block's rows, and each draft is the argmax of those logits plus the Markov term of the token before it (`markov_head`, rank 256): the anchor for the first draft, then each draft for the next.
+- **Verification.** A verification accepts each draft its own argmax (or sample) confirms, up to the first it does not, and commits the model's token after them; with `speculative_config.synthetic_acceptance_length` it accepts draft `i` at the rate `clamp(L − 1 − i, 0, 1)` instead ([Configuration](configuration.md)). The compressor rings advance in place, since a ring of eight rows holds a verification's six tokens beside the group open before them.
+- **Experts.** The draft layers route 3 of their 128 MXFP4 experts a token and hold them whole on every rank of the expert union: a rank drafts its own rows alone, and a member that joins a step runs none of the drafter's experts.
+
+The drafter adds 7.4 GiB of weights to each GPU (6.7 GiB of experts), about 132 GiB in all. The package states the synthetic acceptance length of InferenceX's golden DSpark curve of the model (five drafts, thinking on: 3.51), at which throughput benchmarks compare systems; removing it makes the verifications accept what the model selects. The synthetic acceptance length is a step value. The drafts change with a kernel generation, which an expert union refuses: a deployment of this layout starts or stops speculating with an epoch update, such as the one that moves it to an engine revision serving the drafter.
+
 ## Caches
 
 Every layer keeps a sliding window of its last 128 latents; four layers (2, 8 and 14 compressing every two tokens, 20 every token) keep the compressed latents and the index keys the layers after them read; layers 2, 8 and 14 keep each request's compressor remainder. A request's full history takes about 891 bytes a token (the compressed latents' 720 and the index keys' 170), so a prompt of 1M tokens holds under 1 GB of a rank's KV cache beside its window of a few megabytes. The window's pages are never cached: a prefix hit of the compressed fields rewinds the window in whole pages and recomputes it (bounded replay, [Architecture](architecture.md#storage-and-device-storage)).
@@ -42,5 +58,6 @@ Every quantized value is the reference's (`inference/kernel.py`): the projection
 ## Limits
 
 - The attention, the indexer and the routed experts run correct-first Triton and trtllm-gen kernels: on GB200 a cold prefill of a 575K-token prompt takes about 9 minutes, and AgentX's longest prompt (990K tokens) about 23 minutes beside three shorter ones. A prefix hit computes only the prompt past it and the window's pages before its end.
-- A tensor-parallel split of the attention, pipeline and sequence splits, and speculative decoding are refused.
+- A tensor-parallel split of the attention, pipeline and sequence splits are refused.
+- The DSpark drafter proposes the argmax of its logits and a verification accepts each draft by the point-mass rule (`p(d)`, the target's own probability of the draft); its sampled drafts with rejection against their distribution, block verification, and the confidence head's adaptive verification (`confidence_head`, not loaded) are not served. A deployment drafts five tokens, the drafter's block.
 - Prefill/decode handoffs and the host KV tier do not hold the window.

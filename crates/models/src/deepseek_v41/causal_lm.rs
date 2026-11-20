@@ -10,7 +10,10 @@
 //!
 //! [`CausalLm::forward`] returns the read-out rows, `[tokens, d]`, and
 //! [`CausalLm::compute_logits`] projects them through the head in FP32, as the reference's FP32
-//! head does.
+//! head does. A model that loaded its DSpark drafter ([`Dspark`]) returns beside each read-out
+//! row the residual entering each of the drafter's target layers, averaged over its streams
+//! (`h.mean(dim=2)`, `model.py:1263-1264`): `[tokens, d · (1 + targets)]`, the rows the drafter's
+//! context reads ([`TextModel::stream_width`]); the head reads the first `d` of them.
 //!
 //! ## Rotation
 //!
@@ -40,14 +43,15 @@ use nn::modules::{
     MhcResidual, NgramMemory, NgramTable, Parallel, Rotary, TableShard, Tokens, ngram_context,
 };
 use nn::{
-    CausalLm, Checkpoint, DType, Device, Drafter, ExpertExchange, KvCache, RecurrentState, Result,
-    Shape, Tensor, TokenBatch, VarBuilder, WeightLayout, WeightSource,
+    BlockDrafter, CausalLm, Checkpoint, DType, Device, Drafter, ExpertExchange, KvCache,
+    RecurrentState, Result, Shape, Tensor, TokenBatch, VarBuilder, WeightLayout, WeightSource,
 };
 
 use crate::deepseek_v41::attention::{Carried, Inputs};
 use crate::deepseek_v41::cache;
 use crate::deepseek_v41::config::Config;
 use crate::deepseek_v41::decoder::DecoderLayer;
+use crate::deepseek_v41::dspark::Dspark;
 use crate::deepseek_v41::engram::Hashing;
 use crate::deepseek_v41::{CLASS, ID};
 
@@ -61,7 +65,7 @@ fn int(value: i32, like: &Tensor) -> Result<Tensor> {
 
 /// For each token, its position where `slots` (`[tokens]` U32 cache slots) writes one, and `-1`
 /// where it names [`nn::NO_SLOT`]: the entries a token writes in a group.
-fn written(slots: &Tensor, positions: &Tensor) -> Result<Tensor> {
+pub(crate) fn written(slots: &Tensor, positions: &Tensor) -> Result<Tensor> {
     let none = int(-1, positions)?.broadcast_as(positions.shape())?;
     Ok(slots
         .view(DType::I32)?
@@ -85,6 +89,8 @@ pub struct DeepseekV41ForCausalLm {
     /// Whether the n-gram tables are split over an expert union of ranks that serve their own
     /// tokens, whose lookups collect along its axis.
     served: bool,
+    /// The DSpark drafter, when the placement loads it.
+    dspark: Option<Dspark>,
 }
 
 impl DeepseekV41ForCausalLm {
@@ -94,9 +100,9 @@ impl DeepseekV41ForCausalLm {
     ///
     /// # Errors
     ///
-    /// A tensor, pipeline or sequence split, which this model's layers do not serve; a drafter,
-    /// which it does not load; a tokenizer the n-gram hashing cannot read; or a module the loader
-    /// refuses.
+    /// A tensor, pipeline or sequence split, which this model's layers do not serve; a drafter
+    /// for a checkpoint that carries none; a tokenizer the n-gram hashing cannot read; or a
+    /// module the loader refuses.
     pub fn load(
         config: &Config,
         checkpoint: &Checkpoint,
@@ -107,17 +113,21 @@ impl DeepseekV41ForCausalLm {
         if placement.tensor.size() > 1
             || placement.pipeline.size() > 1
             || placement.sequence.split.size() > 1
-            || placement.drafter
         {
             return Err(ID.config(format!(
-                "a tensor split over {}, a pipeline over {}, a sequence split over {} or a \
-                 drafter: a rank holds the attention whole and its share of the routed experts \
-                 and n-gram tables of an expert union, and the drafter is not loaded",
+                "a tensor split over {}, a pipeline over {} or a sequence split over {}: a rank \
+                 holds the attention whole and its share of the routed experts and n-gram \
+                 tables of an expert union",
                 placement.tensor.size(),
                 placement.pipeline.size(),
                 placement.sequence.split.size()
             )));
         }
+        let dspark = if placement.drafter {
+            Some(Dspark::load(config, vb.clone(), placement)?)
+        } else {
+            None
+        };
 
         // The n-gram tables follow the experts' split: whole on a rank of no union, by hash heads
         // over a union, each rank serving its own tokens.
@@ -177,6 +187,7 @@ impl DeepseekV41ForCausalLm {
                 vb.pp("head").to_dtype(DType::F32),
             )?,
             served: hashing.is_some() && union.size() > 1,
+            dspark,
         })
     }
 
@@ -374,7 +385,23 @@ impl CausalLm for DeepseekV41ForCausalLm {
             let mut residual = MhcResidual::expand(&self.config.mhc(), hidden)?;
             let mut carried = Carried::default();
             let mut pooling = 0;
+            // The residual entering each of the drafter's target layers, averaged over its
+            // streams in FP32 and rounded once, as the reference's BF16 `mean` does.
+            let targets = match &self.dspark {
+                Some(dspark) => dspark.config().target_layer_ids.as_slice(),
+                None => &[],
+            };
+            let mut read = Vec::with_capacity(targets.len());
             for (index, layer) in self.layers.iter().enumerate() {
+                if targets.contains(&(index as u32)) {
+                    read.push(
+                        residual
+                            .streams()?
+                            .to_dtype(DType::F32)?
+                            .mean(1)?
+                            .to_dtype(DType::BF16)?,
+                    );
+                }
                 let sources = &self.config.layers[index];
                 let ring = if sources.compresses(index as u32) && sources.ratio > 1 {
                     let rows = state
@@ -414,15 +441,27 @@ impl CausalLm for DeepseekV41ForCausalLm {
                     exchange,
                 )?;
             }
-            residual.collapse(&self.norm, self.config.rms_norm_eps)
+            let rows = residual.collapse(&self.norm, self.config.rms_norm_eps)?;
+            if read.is_empty() {
+                return Ok(rows);
+            }
+            read.insert(0, rows);
+            Ok(Tensor::cat(&read, 1)?)
         };
 
         nn::profiler::range(TRANSFORMER, "model", forward)
     }
 
-    /// The FP32 logits of read-out rows `hidden`, `[rows, d]`.
+    /// The FP32 logits of the read-out rows of `hidden`, `[rows, stream_width]`: its first `d`
+    /// columns.
     fn compute_logits(&self, hidden: &Tensor) -> Result<Tensor> {
-        self.head.forward(&hidden.to_dtype(DType::F32)?)
+        let width = self.config.hidden_size as usize;
+        let rows = if hidden.dim(1)? == width {
+            hidden.clone()
+        } else {
+            hidden.narrow(1, 0, width)?
+        };
+        self.head.forward(&rows.to_dtype(DType::F32)?)
     }
 
     /// Every layer's part of a step this rank holds no tokens of, in the order a forward takes
@@ -471,8 +510,25 @@ impl TextModel for DeepseekV41ForCausalLm {
         })
     }
 
+    /// The read-out rows, and beside them the rows the drafter's context reads when the model
+    /// loaded it (module documentation).
+    fn stream_width(&self) -> u32 {
+        let targets = self
+            .dspark
+            .as_ref()
+            .map_or(0, |dspark| dspark.config().target_layer_ids.len() as u32);
+        self.config.hidden_size * (1 + targets)
+    }
+
+    /// The drafter drafts a block a forward: it is the block form's ([`Self::block_drafter`]).
     fn drafter(&self) -> Option<&dyn Drafter> {
         None
+    }
+
+    fn block_drafter(&self) -> Option<&dyn BlockDrafter> {
+        self.dspark
+            .as_ref()
+            .map(|dspark| dspark as &dyn BlockDrafter)
     }
 
     /// The n-gram memories hash each token with the `N − 1` before it, a position before the

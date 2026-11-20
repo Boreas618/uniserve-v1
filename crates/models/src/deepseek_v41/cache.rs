@@ -4,7 +4,7 @@
 //!
 //! | Field | Owners | Readers | History | Entries per page of 64 | Record |
 //! | --- | --- | --- | --- | --- | --- |
-//! | [`WINDOW`], read as key and value | every layer | — | the last `sliding_window` tokens | 64 | MXFP8: 512 E4M3 then 16 UE8M0 (528 B) |
+//! | [`WINDOW`], read as key and value | every layer, and each DSpark layer after them | — | the last `sliding_window` tokens | 64 | MXFP8: 512 E4M3 then 16 UE8M0 (528 B) |
 //! | [`COMPRESSED`] | the compressed sources (2, 8, 14 of ratio 2; 20 of ratio 1) | the layers after each source of its ratio | full | 32 / 64 | NVFP4: 256 B of E2M1 pairs then 32 E4M3 scales (288 B) |
 //! | [`INDEX_KEY`] | the same sources | the index sources that read a source's keys (24, 28, 32, 36 read 20's) | full | 32 / 64 | MXFP4 in the page layout: a page's 64 B of E2M1 pairs per key, then its 4 UE8M0 scales per key (68 B a key) |
 //!
@@ -17,6 +17,14 @@
 //!
 //! A ratio-2 source keeps a ring of the projections of its request's last tokens, values then
 //! gates in FP32, from which the group its next tokens complete is pooled ([`remainder`]).
+//!
+//! The DSpark layers (`crate::deepseek_v41::dspark`) keep their windows in the same field, as
+//! owners `num_hidden_layers + i`: each holds the latents its layer projects from the decoder's
+//! rows of the request's tokens, and its next block's while the block is drafted. A checkpoint
+//! that carries the drafter declares them whether or not a placement loads it, so the window's
+//! pages are laid out alike for a deployment that speculates and one that does not, and a
+//! kernel generation that starts drafting finds them. The block's positions lie at most a
+//! verification's drafts past its tokens, which the window's pages a verification holds cover.
 
 use nn::family::{
     CacheField, FieldOwner, FieldReader, Format, History, INDEX_KEY, Layout, Record, StateField,
@@ -98,6 +106,7 @@ pub fn fields(config: &Config) -> Result<Vec<CacheField>> {
         CacheField {
             name: WINDOW,
             owners: (0..layers)
+                .chain(config.draft_layers())
                 .map(|layer| FieldOwner { layer, ratio: 1 })
                 .collect(),
             readers: Vec::new(),

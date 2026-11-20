@@ -65,7 +65,7 @@ pub struct Inputs<'t> {
 /// Layer `layer`'s plane of `field` in `cache`, as the record operators read it: its records,
 /// held in `records`, over the group's page table, in the format and layout of `record`, the
 /// field's declaration ([`crate::deepseek_v41::cache`]).
-fn plane<'t>(
+pub(crate) fn plane<'t>(
     cache: &'t KvCache,
     (field, record): (&str, Record),
     layer: u32,
