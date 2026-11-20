@@ -7,7 +7,8 @@
 //! allocated, packed as `ptr << 32 | len` (`0` for none), or for `place` the chosen index
 //! itself (`scheduling::wire`). Every export the host enters, the two buffer exports
 //! included, starts with a fuel budget of its own, so a policy that loops ends its call instead
-//! of the step; a call's budget grows with the message it decodes.
+//! of the step; a call's budget, and the budget of the allocation that holds its message, grow
+//! with the message.
 //!
 //! The policy holds the view, and the scheduler tells it what changed as events (§5.2); the host
 //! keeps the view of each request the policy holds as those events leave it, so that a request
@@ -540,7 +541,11 @@ impl Instance {
         let len = u32::try_from(message.len())
             .map_err(|_| malformed(call, "the message is larger than wasm32 addresses"))?;
         let call_fuel = self.budget.call_fuel.get();
-        let ptr = enter(&mut self.store, call, &self.alloc, len, call_fuel, fuel)?;
+        // The buffer that holds the message costs as the message's bytes do (a module's allocator
+        // zeroes it at about a fuel a byte), so its allocation is given the message's share as
+        // the decoding is; a call fuel alone would refuse every message longer than it in bytes.
+        let budget = message_fuel(&self.budget, len);
+        let ptr = enter(&mut self.store, call, &self.alloc, len, budget, fuel)?;
         if ptr == 0 && len != 0 {
             return Err(malformed(call, "the module could not hold the message"));
         }
@@ -549,7 +554,6 @@ impl Instance {
             .map_err(|error| malformed(call, format!("cannot write the message: {error}")))?;
 
         let buffer = (ptr, len);
-        let budget = message_fuel(&self.budget, len);
         let store = &mut self.store;
         let result = match call {
             Call::Init => enter(store, call, &self.init, buffer, budget, fuel)?,
@@ -1774,5 +1778,50 @@ pub(crate) mod tests {
             assert!(spent <= LIMIT, "observe and dispatch took {spent} fuel");
             assert_eq!(output.offload, released);
         }
+    }
+
+    /// A message longer in bytes than a call's fuel is received whole: a step tells 100,000
+    /// blocks as `Cached`, as a scheduler that starts beside a warm cache does, in a message of
+    /// more bytes than the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]). The buffer that
+    /// holds the message and its decoding are both given fuel for every byte of it, so `observe`
+    /// takes the whole step, and a shortage then takes the least recently used of those blocks.
+    #[test]
+    fn a_message_longer_in_bytes_than_a_calls_fuel_is_received_whole() {
+        const BLOCKS: u64 = 100_000;
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+
+        let events: Vec<Event> = (0..BLOCKS)
+            .map(|number| Event::Cached {
+                page: block(spread(number), number, true),
+            })
+            .collect();
+        let message = wire::encode(&events).unwrap();
+        assert!(
+            message.len() as u64 > DEFAULT_POLICY_CALL_FUEL.get(),
+            "the message is longer in bytes than a call's fuel"
+        );
+        policy.call(Call::Observe, Ok(message)).unwrap();
+
+        let shortage = Shortage {
+            kind: Storage::KvUnits,
+            need: 4,
+        };
+        let reply = policy.call(Call::Preempt, wire::encode(&shortage)).unwrap();
+        let victims: Vec<Victim> = wire::decode(&reply.unwrap()).unwrap();
+        let oldest: Vec<Victim> = (0..4).map(|number| Victim::Page(spread(number))).collect();
+        assert_eq!(victims, oldest);
     }
 }
