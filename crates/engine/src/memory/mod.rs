@@ -19,6 +19,7 @@
 //! | [`graph_pool`] | [`GraphPool`](graph_pool::GraphPool): the runners' regions and the scratch pool of one device, mapped at fixed addresses and reserved in the GPU's quota |
 //! | [`weights`] | [`WeightStore`](weights::WeightStore): the retained weights of one device, which `nn::WeightLoader` publishes to and maps from |
 //! | [`reload`] | A second load of a serving model: its order compared with the one that serves, and the load that publishes what changed for an update in place |
+//! | [`room`] | [`RoomAsk`](room::RoomAsk): a starting rank's ask for room in its GPU's quota, which the epoch serving beside it gives back, and the figures it asks with |
 //! | [`state`] | [`StateMemory`](state::StateMemory): the live, checkpoint and trail buffers of a model's recurrent layers, and the copies between them and the cache's state pages |
 //! | [`tables`] | [`BlockTables`](tables::BlockTables): the device block table of one rank of a worker group as its worker keeps it on the host, fed by the buffer pool's completions |
 //!
@@ -58,6 +59,7 @@ pub mod graph_pool;
 pub(crate) mod host_pages;
 pub(crate) mod latent;
 pub mod reload;
+pub(crate) mod room;
 pub mod state;
 pub mod tables;
 pub mod weights;

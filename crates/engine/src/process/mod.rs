@@ -44,6 +44,7 @@ mod operations;
 pub(crate) mod ranks;
 mod reports;
 mod requests;
+mod room;
 mod shapes;
 mod start;
 
@@ -101,6 +102,12 @@ pub(crate) enum Input {
     LinkClosed(String),
     /// The worker of rank `.0` of the started epoch found a sticky error on its device's context.
     Faulted(usize),
+    /// The start asks for room in its GPUs' quotas (`crate::memory::room`): each GPU's identity
+    /// and the bytes its quota must hold, and where the answer goes.
+    RoomWanted(
+        Vec<crate::memory::room::DeviceRoom>,
+        Sender<std::result::Result<(), String>>,
+    ),
     /// A job ended: what it produced, applied on the control thread.
     Done(Box<dyn FnOnce(&mut MainProcess) + Send>),
 }
@@ -237,6 +244,7 @@ pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
 
     let main = MainProcess::new(requests, window, agreed, process, launch)?;
     let lost = main.link_closed();
+    let room = main.room();
     let registry = registry.clone();
     let start: Start = Box::new(move |launch| {
         // The module set's policy is resolved at the node's Build Server, which the ranks'
@@ -250,7 +258,7 @@ pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
         let liveness = Liveness::new(lost);
 
         let build = Some(Arc::new(Mutex::new(build)));
-        start::start(launch, &registry, &storage, build, policy, liveness)
+        start::start(launch, &registry, &storage, build, policy, liveness, room)
     });
     if let Err(failed) = main.serve(start, filed) {
         let error = format!("{:#}", failed.error);
@@ -401,6 +409,10 @@ pub(crate) struct MainProcess {
     tuned: Option<Arc<Tuning>>,
     /// What the engine last announced it serves, which an attaching daemon is told.
     announced: Option<wire::EngineInfo>,
+    /// The start's asks for room the daemon has not answered, by the id their `RoomWanted`
+    /// states, each with where its answer goes; and the id the next ask takes.
+    rooms: BTreeMap<u64, Sender<std::result::Result<(), String>>>,
+    next_room: u64,
     /// Why the control thread ends: a shutdown or the daemon gone (`Ok`), or a failure.
     ending: Option<Result<()>>,
 }
@@ -477,11 +489,57 @@ impl MainProcess {
             next_metrics: Instant::now() + report_period,
             tuned: None,
             announced: None,
+            rooms: BTreeMap::new(),
+            next_room: 1,
             ending: None,
         })
     }
 
     /// What the start's peer links call once one closes: it tells the control thread.
+    /// The start's asks for room in its GPUs' quotas, relayed through this control thread to the
+    /// daemon ([`Self::want_room`]) and answered by its `Room`.
+    fn room(&self) -> Arc<dyn crate::memory::room::RoomAsk> {
+        Arc::new(room::Relay::new(self.inbox.0.clone()))
+    }
+
+    /// Relays the start's ask for `devices`'s room to the daemon as `RoomWanted`, its answer to
+    /// go to `answer` once the daemon's `Room` names it. A daemon whose agreed version of the
+    /// engine interface precedes `proto::ROOM` leaves such an ask unanswered, so the start is
+    /// told at once that no room is made, and fails as it fails for want of room otherwise.
+    fn want_room(
+        &mut self,
+        devices: Vec<crate::memory::room::DeviceRoom>,
+        answer: Sender<std::result::Result<(), String>>,
+    ) {
+        if self.agreed.0 < proto::ROOM {
+            let _ = answer.send(Err(format!(
+                "the daemon speaks version {} of the engine interface, which makes no room for \
+                 a start",
+                self.agreed.0
+            )));
+            return;
+        }
+        let id = self.next_room;
+        self.next_room += 1;
+        tracing::info!(id, devices = ?devices, "the start asks the daemon for room in its GPUs' quotas");
+        self.rooms.insert(id, answer);
+        self.report(lifecycle::room_wanted(id, &devices));
+    }
+
+    /// `Room`: the daemon's answer to the start's ask `id`, made or refused.
+    fn room_made(&mut self, room: proto::process::Room) {
+        let Some(answer) = self.rooms.remove(&room.id) else {
+            tracing::warn!(id = room.id, "a room no ask of this process waits for");
+            return;
+        };
+        let answered = if room.refused.is_empty() {
+            Ok(())
+        } else {
+            Err(room.refused)
+        };
+        let _ = answer.send(answered);
+    }
+
     fn link_closed(&self) -> crate::worker::completion::Waker {
         let inbox = self.inbox.0.clone();
         Arc::new(move || {
@@ -600,6 +658,7 @@ impl MainProcess {
                 self.end_when_unserved();
             }
             Input::Faulted(rank) => self.faulted(rank),
+            Input::RoomWanted(devices, answer) => self.want_room(devices, answer),
             Input::LinkClosed(reason) => {
                 let liveness = self
                     .engine
@@ -841,7 +900,15 @@ impl MainProcess {
     fn park(&mut self) {
         self.lifecycle = lifecycle::started(true);
         self.announce(true);
-        self.report(lifecycle::parked(self.launch.engine, self.generation));
+        let shares = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.shares_regions);
+        self.report(lifecycle::parked(
+            self.launch.engine,
+            self.generation,
+            shares,
+        ));
     }
 
     /// Opens admission: the graph storage restored, what serving holds reserved, the regions
@@ -932,6 +999,7 @@ impl MainProcess {
                 self.release();
             }
             command::Kind::Grow(_) => self.grow(),
+            command::Kind::Room(room) => self.room_made(room),
         }
     }
 

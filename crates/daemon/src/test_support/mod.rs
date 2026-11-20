@@ -611,6 +611,9 @@ fn take_sent(sent: &Sent, taken: &Taken, timeline: &std::sync::Mutex<Vec<Seen>>)
     }
 }
 
+/// What a test arms each engine the leader spawns with before its start ends.
+type Arm = Box<dyn Fn(&mut testkit::process::Engine)>;
+
 /// The engines' and the node daemons' ends of a process link, played by
 /// `testkit::process`: every request the leader makes of a node gets the reply
 /// a node gives it, every engine the leader spawns is a fake engine that
@@ -633,6 +636,11 @@ pub(crate) struct Engines {
     greetings: std::sync::mpsc::Sender<crate::supervision::Greeting>,
     /// The engines the leader's service started for the daemon's engine control.
     controlled: std::sync::mpsc::Sender<crate::supervision::processes::Started>,
+    /// What the fake nodes refuse, from the next request on ([`Self::refuse`]).
+    refusals: Arc<std::sync::Mutex<testkit::process::Refusals>>,
+    /// What each engine the leader spawns is armed with before its start ends
+    /// ([`Self::arm_spawned`]).
+    armed: Option<Arm>,
     /// The fake engines by launch generation.
     engines: std::collections::BTreeMap<u64, testkit::process::Engine>,
     /// How many of the recorded spawns were started as engines.
@@ -658,6 +666,8 @@ impl Engines {
         let timeline = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (node_sent, node_taken, recorded) =
             (Arc::clone(&sent), Arc::clone(&taken), Arc::clone(&timeline));
+        let refusals = Arc::new(std::sync::Mutex::new(refusals));
+        let refused = Arc::clone(&refusals);
         // The leader waits for each reply, so a request is recorded before the call that made
         // it returns; and it sent every command it sent before the request by then, so those
         // are recorded ahead of it.
@@ -667,7 +677,8 @@ impl Engines {
                 if let Some(kind) = &request.kind {
                     service::lock(&recorded).push(Seen::Request(Box::new(kind.clone())));
                 }
-                let _ = reply.send(testkit::process::node_reply(&request, &refusals));
+                let reply_of = testkit::process::node_reply(&request, &service::lock(&refused));
+                let _ = reply.send(reply_of);
             }
         });
         let (reports, reported) = std::sync::mpsc::channel();
@@ -690,11 +701,24 @@ impl Engines {
             exits,
             greetings,
             controlled,
+            refusals,
+            armed: None,
             engines: std::collections::BTreeMap::new(),
             started: 0,
             _waker: waker,
         };
         (engines, link)
+    }
+
+    /// The fake nodes refuse what `refusals` names from the next request on.
+    pub(crate) fn refuse(&self, refusals: testkit::process::Refusals) {
+        *service::lock(&self.refusals) = refusals;
+    }
+
+    /// Arms each engine the leader spawns from now on with `arm` before its start ends: what
+    /// its `Parked` states, or an ask for room ([`testkit::process::Engine::want_room`]).
+    pub(crate) fn arm_spawned(&mut self, arm: impl Fn(&mut testkit::process::Engine) + 'static) {
+        self.armed = Some(Box::new(arm));
     }
 
     /// Adds the serving engine of launch generation `generation`, which the
@@ -737,11 +761,14 @@ impl Engines {
         for spawn in new {
             let launch: EngineArgs =
                 serde_json::from_slice(&spawn.launch).expect("a launch the interface states");
-            let engine = if launch.parked() {
+            let mut engine = if launch.parked() {
                 testkit::process::Engine::parked(spawn.generation)
             } else {
                 testkit::process::Engine::serving(spawn.generation)
             };
+            if let Some(arm) = &self.armed {
+                arm(&mut engine);
+            }
             let _ = self.greetings.send(crate::supervision::Greeting {
                 engine: spawn.generation,
                 build: build.to_owned(),

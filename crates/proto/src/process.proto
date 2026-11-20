@@ -674,6 +674,10 @@ message Command {
     // and has its schedulers grow their regions into them. Answered by
     // nothing; a target promoted with `grow` takes each one as it comes.
     Grow grow = 9;
+    // The answer to the target's `RoomWanted` of the same `id`: the serving
+    // engines made the room, or `refused` states why they could not, and the
+    // update is abandoned (version `proto::ROOM` of the engine interface).
+    Room room = 10;
   }
 }
 
@@ -770,6 +774,13 @@ message Pause {
 
 message Grow {}
 
+message Room {
+  // The `RoomWanted` this answers.
+  uint64 id = 1;
+  // Why the room could not be made; empty when it was.
+  string refused = 2;
+}
+
 // What an engine tells its daemon, unasked: the acknowledgement of a command,
 // the lifecycle state it reached, or a failure it observed.
 message Report {
@@ -818,6 +829,8 @@ message Report {
     // the scheduler node's main process. The daemon sends `Grow` to the
     // scheduler node of each target engine with ranks on that host.
     Shrunk shrunk = 14;
+    // A target's start lacks room in its GPUs' quotas and waits for `Room`.
+    RoomWanted room_wanted = 15;
   }
 }
 
@@ -858,6 +871,28 @@ message Parked {
   uint64 launch_generation = 1;
   // The generation of modules it holds and would execute once promoted.
   uint64 generation = 2;
+  // Whether the device regions it opened map segments another epoch created:
+  // it names the serving epoch's regions, which keep their memory through a
+  // switch, rather than regions of its own, into which the serving epoch's
+  // memory moves as it drains. Unset by an engine of an earlier build.
+  optional bool shares_regions = 3;
+}
+
+// A target's start lacks room in its GPUs' quotas (version `proto::ROOM` of
+// the engine interface): for each GPU, the bytes the quota must hold beside
+// everything it reserves for the start to go on. The start waits for the
+// `Room` of the same `id`.
+message RoomWanted {
+  // Numbers the asks of one engine, which its `Room` answers name.
+  uint64 id = 1;
+  repeated GpuRoom devices = 2;
+}
+
+// The room one GPU's quota must hold.
+message GpuRoom {
+  // The GPU's identity (its UUID's 16 bytes).
+  bytes gpu = 1;
+  uint64 bytes = 2;
 }
 
 // A serving engine's readiness.

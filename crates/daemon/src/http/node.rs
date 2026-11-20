@@ -722,6 +722,7 @@ impl Node {
         let restarting = restarter.restarting();
         let mut decided = restarter.decide();
         status::watch(&leader, &token);
+        crate::updates::entry::make_rooms(&leader, &token);
         // A query of the `span` events reads them from the rings of the deployment's processes.
         self.recorder
             .store()

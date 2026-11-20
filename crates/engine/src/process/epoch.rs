@@ -39,6 +39,7 @@ use storage::runtime::{GroupId, Open, Opened, Tier};
 
 use super::operations::{resume, stopped};
 use crate::memory::client::StorageClient;
+use crate::memory::room::RoomAsk;
 use crate::process::binding::{Released, WeightBinding};
 use crate::scheduler::Message;
 
@@ -269,6 +270,39 @@ pub(crate) fn create_fitting(
         );
     }
     Ok(created)
+}
+
+/// Asks `room` for room in the quota of every GPU whose warm process passes what the quota holds
+/// by more than the start's own segments past each region's first give back
+/// ([`WeightBinding::warm_rooms`]), on this process's ranks and every peer's, in one ask: a target
+/// starting beside a serving epoch that holds the quota has the serving epoch give back from its
+/// KV cache what keeping its warm segments ([`keep_warm_segments`]) could not. Nothing is asked
+/// when every GPU's own segments cover its warm process.
+///
+/// # Errors
+///
+/// A rank's failure to measure its process or read its quota, or the room that was not made.
+pub(crate) fn ask_warm_room(
+    head: &StorageClient,
+    binding: &WeightBinding,
+    room: &dyn RoomAsk,
+) -> Result<()> {
+    let regions: Vec<(Vec<GroupId>, u8)> = device_regions(head)?
+        .into_iter()
+        .map(|(_, number, _, groups, _)| (groups, number))
+        .collect();
+    let rooms = binding
+        .warm_rooms(&regions)
+        .context("measuring the warm processes beside the KV planes")?;
+    if rooms.is_empty() {
+        return Ok(());
+    }
+    room.ask(&rooms).map_err(|reason| {
+        anyhow::anyhow!(
+            "the warm processes pass their GPUs' quotas by more than the start's own segments give \
+             back, and no room was made: {reason}"
+        )
+    })
 }
 
 /// Gives back, once a start's ranks are warm, the tail segments of each device region that

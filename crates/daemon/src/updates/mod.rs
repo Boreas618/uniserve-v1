@@ -31,7 +31,7 @@ use crate::epoch::{Epoch, Epochs};
 use crate::leader::UpdateError;
 use crate::supervision::processes::Processes;
 use trial::Trial;
-use update::Update;
+use update::{RoomWanted, Update};
 
 /// One phase an update entered, for the admin event log.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +77,11 @@ pub(crate) struct Updater {
     transitions: tokio::sync::mpsc::UnboundedSender<Transition>,
     /// The log's end, taken once by its reader.
     entered: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Transition>>>,
+    /// Every ask of an epoch update's target for room in its GPUs' quotas, for the leader to have
+    /// the serving engines make ([`Self::room_made`] answers it).
+    rooms: tokio::sync::mpsc::UnboundedSender<RoomWanted>,
+    /// The asks' end, taken once by the leader.
+    asked: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<RoomWanted>>>,
 }
 
 struct State {
@@ -126,6 +131,7 @@ impl Updater {
     /// The updater of the deployment whose engines `processes` commands.
     pub(crate) fn new(epochs: Arc<Epochs>, processes: Processes) -> Self {
         let (transitions, entered) = tokio::sync::mpsc::unbounded_channel();
+        let (rooms, asked) = tokio::sync::mpsc::unbounded_channel();
         Self {
             epochs,
             deployment: processes.deployment().to_owned(),
@@ -142,6 +148,8 @@ impl Updater {
             phase: tokio::sync::watch::Sender::new(None),
             transitions,
             entered: Mutex::new(Some(entered)),
+            rooms,
+            asked: Mutex::new(Some(asked)),
         }
     }
 
@@ -159,6 +167,29 @@ impl Updater {
     /// once taken.
     pub(crate) fn transitions(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Transition>> {
         service::lock(&self.entered).take()
+    }
+
+    /// The asks of epoch updates' targets for room in their GPUs' quotas, for the one reader that
+    /// has the serving engines make it; `None` once taken.
+    pub(crate) fn room_asks(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<RoomWanted>> {
+        service::lock(&self.asked).take()
+    }
+
+    /// Answers `wanted`: the serving engines made its room, or `made` states why they could not,
+    /// which abandons the update. Nothing is answered for an update that ended meanwhile, whose
+    /// target was stopped.
+    pub(crate) fn room_made(&self, wanted: &RoomWanted, made: Result<(), String>) {
+        let mut state = self.lock();
+        let State {
+            processes, update, ..
+        } = &mut *state;
+        if let Some(update) = update
+            .as_mut()
+            .filter(|update| update.number() == wanted.update)
+        {
+            update.room_made(processes, wanted, made);
+        }
+        self.settle(&mut state);
     }
 
     /// The number and phase of the update in flight, as they change.
@@ -225,7 +256,24 @@ impl Updater {
         } = &mut *state;
         match update.as_mut() {
             Some(update) => update.advance(processes),
-            None => drop(processes.events()),
+            // A start that asks for room with no update in flight is no target beside a serving
+            // epoch: it is told no room is made, and fails as it would for want of room.
+            None => {
+                for event in processes.events() {
+                    if let crate::supervision::processes::Event::Report {
+                        host,
+                        generation,
+                        report,
+                    } = &event
+                    {
+                        update::refuse_room(
+                            processes,
+                            (host, *generation, report),
+                            "no epoch update prepares this engine",
+                        );
+                    }
+                }
+            }
         }
         self.settle(&mut state);
     }
@@ -238,6 +286,10 @@ impl Updater {
         let Some(update) = state.update.as_mut() else {
             return;
         };
+        for wanted in update.take_room_wanted() {
+            // The leader's reader ends only with the daemon, whose updates end with it.
+            let _ = self.rooms.send(wanted);
+        }
         let entered = update.take_entered();
         let (number, phase) = (update.number(), update.phase());
         let report = update.report();
