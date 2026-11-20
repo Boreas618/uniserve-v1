@@ -77,6 +77,9 @@ pub(crate) struct Reader {
     pub(crate) logs: Logs,
     /// What a kernel generation to a target takes on the serving engines' devices.
     pub(crate) measure: Measure,
+    /// The leader's epoch records, the epoch that serves among them, which a validation compares
+    /// a configuration with the current revision's as the deployment runs them.
+    pub(crate) epochs: Arc<crate::epoch::Epochs>,
 }
 
 /// Measures what a kernel generation to a target configuration takes on each GPU of the serving
@@ -107,7 +110,7 @@ impl program::Control for Reader {
 
     fn validate(&mut self, config: &program::Config) -> Result<Report, String> {
         let current = Arc::clone(&self.logs.current.borrow());
-        validate(&current, config, Some(&self.measure))
+        validate(&current, &self.epochs, config, Some(&self.measure))
     }
 }
 
@@ -211,8 +214,9 @@ fn record(event: Event) -> Record {
 }
 
 /// What applying `config` would do to the deployment `current` serves, without applying it: the
-/// heaviest effect among the options it changes, and whether serving stops meanwhile; or why the
-/// same validation an apply runs refuses it.
+/// heaviest effect among the options it changes, as an apply compares them with the serving epoch
+/// `epochs` records (`Epochs::changes`), and whether serving stops meanwhile; or why the same
+/// validation an apply runs refuses it.
 ///
 /// No change interrupts serving: an update starts its new engines beside the serving ones and
 /// moves the requests to them, and one whose engines do not fit is refused when it prepares,
@@ -220,6 +224,7 @@ fn record(event: Event) -> Record {
 /// generation states what the generation takes of each GPU beside the serving graphs.
 pub(crate) fn validate(
     current: &Current,
+    epochs: &crate::epoch::Epochs,
     config: &program::Config,
     measure: Option<&Measure>,
 ) -> Result<Report, String> {
@@ -235,7 +240,7 @@ pub(crate) fn validate(
         .config
         .engine_config()
         .map_err(|error| format!("{error:#}"))?;
-    let changes = proto::reload::changes(Some(&current.package.config), &package.config);
+    let changes = epochs.changes(Some(&current.package.config), &package.config);
     let effects = proto::reload::Effects::of(&changes);
     // A kernel generation holds both generations' graphs until it commits: what that takes of
     // each GPU, and the KV pages its cache yields when the room lacks it.

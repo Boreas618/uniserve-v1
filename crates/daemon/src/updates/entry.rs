@@ -3,16 +3,19 @@
 //!
 //! The target is a whole configuration, compared with the current one option by option
 //! ([`proto::reload::changes`]) and merged into the effects each component executes
-//! ([`proto::reload::Effects`]):
+//! ([`proto::reload::Effects`]). Both are compared as the deployment runs them
+//! ([`crate::epoch::Epochs::kept`]): an engine or processing revision a configuration leaves
+//! unset is the serving epoch's, so a change keeps the epoch's engine and request side unless a
+//! configuration names another revision.
 //!
 //! - the daemon's own options: a hot restart of the daemon, whose successor applies what else
 //!   the change states;
-//! - an epoch (the engine package, the build configuration, the checkpoint) or a replaced
-//!   Storage Server: an update in its epoch form, target engines started beside the serving
-//!   ones;
+//! - an epoch (the engine package or revision, the processing program, the build configuration,
+//!   the checkpoint) or a replaced Storage Server: an update in its epoch form, target engines
+//!   started beside the serving ones;
 //! - kernel or program modules: an update in its generation form, inside the serving engines,
-//!   once the target's module set is fixed at the Build Servers, so a revision installed since
-//!   the serving epoch's apply is a change too;
+//!   once the target's module set is fixed at the Build Servers, so a kernel or program revision
+//!   installed since the serving epoch's apply is a change too;
 //! - step options: in place, at the engines' next step.
 //!
 //! `Leader::apply` decides in that order and starts the update, which commits by itself once
@@ -316,12 +319,16 @@ impl Leader {
         }
         let current = service::lock(&replicas[0].config).clone();
         // The one selection of an apply: every interface's revision is fixed at the Build
-        // Servers before anything is compared, so a revision installed since the serving epoch
-        // was applied is a change. The daemon's own options change first, by a hot restart whose
-        // successor applies the change again, so nothing is selected for them.
+        // Servers before anything is compared, so a kernel or program revision installed since
+        // the serving epoch was applied is a change. An engine or processing revision either
+        // configuration leaves unset is the serving epoch's (`Epochs::kept`): one installed
+        // since runs only once a configuration names it, and stating the serving one changes
+        // nothing. The daemon's own options change first, by a hot restart whose successor
+        // applies the change again, so nothing is selected for them.
+        let epochs = self.updates.epochs();
         let named = crate::epoch::change(
-            &crate::leader::deployment(&current)?,
-            &crate::leader::deployment(&target)?,
+            &crate::leader::deployment(&epochs.kept(&current))?,
+            &crate::leader::deployment(&epochs.kept(&target))?,
         );
         if named == Change::Host {
             return self.apply_in_place(target, stated, revision).await;
@@ -368,9 +375,10 @@ impl Leader {
 
     /// What a generation update to `target`'s kernels would take on every serving engine's
     /// devices beside the graphs they serve: the kernel packages `target` names fixed at this
-    /// node's Build Server as an apply fixes them (`with_store_modules`, nothing built), and each
-    /// replica's engine measuring the graphs the packages that differ from the serving epoch's
-    /// would capture again (`MeasureRoom`). Empty when the kernels are the serving epoch's, or
+    /// node's Build Server as an apply fixes them (`with_store_modules` of the target as the
+    /// deployment runs it, `Epochs::kept`, nothing built), and each replica's engine measuring
+    /// the graphs the packages that differ from the serving epoch's would capture again
+    /// (`MeasureRoom`). Empty when the kernels are the serving epoch's, or
     /// no engine serves.
     ///
     /// # Errors
@@ -391,7 +399,7 @@ impl Leader {
             socket: control.build_server().to_owned(),
             targets: Vec::new(),
         };
-        let named = crate::epoch::modules_of(target);
+        let named = crate::epoch::modules_of(&self.updates.epochs().kept(target));
         let fixed = tokio::task::spawn_blocking(move || {
             crate::engine::control::with_store_modules(&local, &named)
         })
@@ -435,9 +443,11 @@ impl Leader {
     }
 
     /// Whether `target`, the current configuration again, selects other module revisions than
-    /// the serving epoch runs: a `latest` the Build Servers resolve to a revision installed since
-    /// the serving epoch's apply. Such a target is a change though no option changed
-    /// (`specs/configuration.md` §8).
+    /// the serving epoch runs: a kernel `latest`, or an installed kernel or program package, the
+    /// Build Servers resolve to a revision installed since the serving epoch's apply. Such a
+    /// target is a change though no option changed (`specs/configuration.md` §8). An engine or
+    /// processing revision it leaves unset stays the serving epoch's ([`Self::fix_modules`]), so a
+    /// later engine or processing revision installed meanwhile reselects nothing.
     ///
     /// # Errors
     ///
@@ -493,12 +503,14 @@ impl Leader {
     /// Fixes the module set `target` runs: every interface's revision, as
     /// the deployment's Build Server on this node selects it with `cover`, with every module built
     /// on every host `target`'s processes run on before anything starts from
-    /// it.
+    /// it. An engine or processing revision `target` leaves unset is the serving epoch's
+    /// ([`crate::epoch::Epochs::kept`]), which the Build Server checks is installed.
     async fn fix_modules(
         &self,
         target: &Config,
         programs: BTreeMap<String, proto::module::Program>,
     ) -> Result<crate::epoch::ModuleSet, UpdateError> {
+        let target = &self.updates.epochs().kept(target);
         let named = crate::epoch::with_programs(crate::epoch::modules_of(target), target, programs);
         // A daemon that starts no engine of its own has no Build Server to
         // select at, no daemons of other hosts to reach, and no engine to move.
@@ -907,10 +919,20 @@ impl Replica {
             .try_lock()
             .map_err(|_| UpdateError::InProgress)?;
         let current = service::lock(&self.config).clone();
+        // Both configurations are compared as the deployment runs them: a revision either leaves
+        // unset is the serving epoch's, so stating the serving one changes nothing here either.
+        let changes = match self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+        {
+            Some(updates) => updates.epochs().changes(Some(&current), &target),
+            None => proto::reload::changes(Some(&current), &target),
+        };
         // The programs are replaced by their hosts between two calls: the leader's by the node,
         // the scheduling program by a generation of its module, the KV program by the Storage
         // Servers. No engine moves for them here.
-        let changes: Vec<_> = proto::reload::changes(Some(&current), &target)
+        let changes: Vec<_> = changes
             .into_iter()
             .filter(|change| change.effect != Effect::Program)
             .collect();
@@ -1300,5 +1322,304 @@ mod tests {
             target.cuda_graph.decode_batch_sizes =
                 Some(vec![std::num::NonZeroU32::new(2).unwrap()]);
         }));
+    }
+
+    /// One installed package revision: its operator, backend and revision.
+    type Installed = (String, String, u32);
+
+    /// The deployment's Build Server on the leader's node, which an apply selects the target's
+    /// module revisions at (`cover`) and has build them (`prepare`), played by the test: it holds
+    /// the package revisions a test installs, answers `cover` with each backend's latest
+    /// revision or the revision the request fixes, refusing one it does not hold, `list` with
+    /// what it holds, and `prepare` with the revisions it was asked for, as a store that holds
+    /// every module does. It keeps the engine revision of every `prepare`, which is what the
+    /// apply has every host build before anything starts from the target.
+    struct BuildServer {
+        socket: std::path::PathBuf,
+        installed: Arc<std::sync::Mutex<Vec<Installed>>>,
+        prepared: Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    impl BuildServer {
+        /// Serves on a socket in `directory` until the test process ends.
+        fn serve(directory: &std::path::Path) -> Self {
+            let socket = directory.join("build-server.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let installed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let prepared = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (held, built) = (Arc::clone(&installed), Arc::clone(&prepared));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else {
+                        return;
+                    };
+                    let (held, built) = (Arc::clone(&held), Arc::clone(&built));
+                    std::thread::spawn(move || answer(stream, &held, &built));
+                }
+            });
+            Self {
+                socket,
+                installed,
+                prepared,
+            }
+        }
+
+        /// Installs `backend`'s revision `revision` of operator `op`.
+        fn install(&self, op: &str, backend: &str, revision: u32) {
+            service::lock(&self.installed).push((op.to_owned(), backend.to_owned(), revision));
+        }
+
+        /// The engine revision of every `prepare` so far, in order.
+        fn prepared(&self) -> Vec<u32> {
+            service::lock(&self.prepared).clone()
+        }
+    }
+
+    /// Answers each request a client sends on `stream`, one after another, until it closes.
+    fn answer(
+        stream: std::os::unix::net::UnixStream,
+        installed: &std::sync::Mutex<Vec<Installed>>,
+        prepared: &std::sync::Mutex<Vec<u32>>,
+    ) {
+        use build_server::protocol::wire::{self, request::Request, server_message::Message};
+
+        let Ok(mut connection) = service::Connection::new(stream) else {
+            return;
+        };
+        while let Ok(request) = connection.recv_next::<wire::Request>() {
+            let message = match request.request {
+                Some(Request::Cover(cover)) => cover_of(&service::lock(installed), &cover),
+                Some(Request::List(_)) => Message::Listing(wire::ListResponse {
+                    packages: service::lock(installed)
+                        .iter()
+                        .map(|(op, backend, revision)| wire::PackageEntry {
+                            op: op.clone(),
+                            backend: backend.clone(),
+                            revision: *revision,
+                            ..Default::default()
+                        })
+                        .collect(),
+                }),
+                Some(Request::Prepare(prepare)) => {
+                    let mut packages = Vec::new();
+                    for requested in prepare.packages {
+                        let Some(wire::package_request::Selector::Package(package)) =
+                            requested.selector
+                        else {
+                            continue;
+                        };
+                        if requested.op == proto::module::ENGINE {
+                            service::lock(prepared).push(package.revision);
+                        }
+                        packages.push(wire::SlotPackage {
+                            op: requested.op,
+                            key: requested.key,
+                            package: Some(package),
+                            part: requested.part,
+                        });
+                    }
+                    Message::Prepared(wire::PrepareResponse { packages })
+                }
+                _ => Message::Refused(wire::Refusal {
+                    reason: "the test's Build Server answers cover, list and prepare".to_owned(),
+                    upstream: String::new(),
+                }),
+            };
+            let reply = wire::ServerMessage {
+                message: Some(message),
+            };
+            if connection.deliver(&reply).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// The candidates of `cover`'s operator among `installed`: each backend at the revision the
+    /// request fixes for it, or at its latest; a fixed revision that is not installed is refused.
+    fn cover_of(
+        installed: &[Installed],
+        cover: &build_server::protocol::wire::Cover,
+    ) -> build_server::protocol::wire::server_message::Message {
+        use build_server::protocol::wire::{self, server_message::Message};
+
+        let mut backends: Vec<&str> = installed
+            .iter()
+            .filter(|(op, _, _)| *op == cover.op)
+            .map(|(_, backend, _)| backend.as_str())
+            .collect();
+        backends.sort_unstable();
+        backends.dedup();
+        let mut candidates = Vec::new();
+        for backend in backends {
+            let revisions: Vec<u32> = installed
+                .iter()
+                .filter(|(op, held, _)| *op == cover.op && held == backend)
+                .map(|(_, _, revision)| *revision)
+                .collect();
+            let fixed = cover.fixed.iter().find(|fixed| fixed.backend == backend);
+            let revision = match fixed {
+                Some(fixed) if revisions.contains(&fixed.revision) => fixed.revision,
+                Some(fixed) => {
+                    return Message::Refused(wire::Refusal {
+                        reason: format!(
+                            "no {} package {backend} revision {} is installed",
+                            cover.op, fixed.revision
+                        ),
+                        upstream: String::new(),
+                    });
+                }
+                None => revisions.into_iter().max().unwrap_or_default(),
+            };
+            candidates.push(wire::Package {
+                op: cover.op.clone(),
+                backend: backend.to_owned(),
+                revision,
+            });
+        }
+        Message::Coverage(wire::Coverage {
+            covered: Vec::new(),
+            uncovered: cover.keys.clone(),
+            candidates,
+        })
+    }
+
+    /// A leader that serves epoch 1 of the test engine's configuration, whose module set its
+    /// start fixed at its Build Server, which held the engine package, the scheduling program
+    /// and the processing program at revision 1 each; and that Build Server, at which a later
+    /// tree's engine and processing program, revision 2 of each, are installed since.
+    async fn serving_with_later_revisions_installed(
+        directory: &std::path::Path,
+    ) -> (Leader, BuildServer) {
+        let leader = crate::test_support::served_engine(crate::test_support::CHAT);
+        let config = service::lock(&leader.replicas()[0].config).clone();
+        let build_server = BuildServer::serve(directory);
+        build_server.install(proto::module::ENGINE, proto::config::DEFAULT_ENGINE, 1);
+        build_server.install(proto::module::PROGRAM, proto::config::DEFAULT_SCHEDULING, 1);
+        build_server.install(proto::module::PROGRAM, proto::config::DEFAULT_PROCESSING, 1);
+
+        let control = crate::engine::control::EngineControl::new(
+            &directory.join("requests.sock"),
+            service::Endpoint::unix(directory.join("processes.sock")).to_string(),
+            config.leader_host(),
+            "deployment".to_owned(),
+            build_server.socket.clone(),
+        )
+        .unwrap();
+        let _ = leader.replicas()[0].control.set(Arc::new(control));
+
+        // The start's selection: every unset revision at the latest installed one.
+        let local = crate::engine::control::BuildServer {
+            host: config.leader_host(),
+            socket: build_server.socket.clone(),
+            targets: Vec::new(),
+        };
+        let named = crate::epoch::modules_of(&config);
+        let started = tokio::task::spawn_blocking(move || {
+            crate::engine::control::with_store_modules(&local, &named)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(started.engine.revision, 1);
+        leader.updates.epochs().record(
+            1,
+            crate::epoch::EpochRecord {
+                config: config.engine_config().unwrap(),
+                engine: started.engine,
+                kernels: started.kernels,
+                policy: started.policy,
+                processing: started.processing,
+                previous: None,
+                status: proto::admin::EpochState::Serving,
+                generation: Some(1),
+            },
+        );
+
+        build_server.install(proto::module::ENGINE, proto::config::DEFAULT_ENGINE, 2);
+        build_server.install(proto::module::PROGRAM, proto::config::DEFAULT_PROCESSING, 2);
+        (leader, build_server)
+    }
+
+    /// `leader`'s current configuration, with `change` made to it.
+    fn changed(leader: &Leader, change: impl FnOnce(&mut Config)) -> Config {
+        let mut config = service::lock(&leader.replicas()[0].config).clone();
+        change(&mut config);
+        config
+    }
+
+    /// Applies `target` to `leader` as a change of no programs.
+    async fn apply(leader: &Leader, target: Config) -> Result<Applied, UpdateError> {
+        let stated = crate::config::Stated::from_paths(Vec::new());
+        Box::pin(leader.apply(target, stated, false, 2, 2, BTreeMap::new())).await
+    }
+
+    /// The deployment's own package again, once a later engine and processing program were
+    /// installed at its Build Server, selects nothing new and converges unchanged: no epoch
+    /// moves the deployment onto the later revisions, which run only once a package names them.
+    /// A change of another option that takes an epoch runs the serving engine revision too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unchanged_package_keeps_the_serving_revisions_installed_later_ones_aside() {
+        let directory = tempfile::tempdir().unwrap();
+        let (leader, build_server) = serving_with_later_revisions_installed(directory.path()).await;
+        let current = changed(&leader, |_| {});
+
+        let reselects = leader.reselects(&current, BTreeMap::new()).await.unwrap();
+        assert!(
+            !reselects,
+            "the package again selects the serving revisions"
+        );
+        let applied = apply(&leader, current).await.unwrap();
+        assert_eq!(applied, Applied::Unchanged);
+        assert!(leader.updates.in_flight().is_none(), "no update started");
+        assert_eq!(build_server.prepared(), vec![1, 1]);
+
+        // An epoch for another option builds the serving engine revision, not the later one.
+        let fewer = changed(&leader, |config| {
+            config.max_running_requests = std::num::NonZeroUsize::new(3).unwrap();
+        });
+        let moved = apply(&leader, fewer).await;
+        assert!(
+            !matches!(moved, Ok(Applied::Unchanged | Applied::InPlace)),
+            "a change of the slot count is an epoch: {moved:?}"
+        );
+        assert_eq!(build_server.prepared(), vec![1, 1, 1]);
+    }
+
+    /// A package that comes to state the engine and processing revisions the serving epoch
+    /// runs changes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stating_the_serving_revisions_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (leader, build_server) = serving_with_later_revisions_installed(directory.path()).await;
+        let stated = changed(&leader, |config| {
+            config.worker_config.engine_revision = Some(1);
+            config.worker_config.processing_revision = Some(1);
+        });
+
+        let applied = apply(&leader, stated.clone()).await.unwrap();
+        assert_eq!(applied, Applied::Unchanged);
+        assert!(leader.updates.in_flight().is_none(), "no update started");
+        assert_eq!(build_server.prepared(), vec![1]);
+        // The replica serves the package as it states it.
+        assert_eq!(*service::lock(&leader.replicas()[0].config), stated);
+    }
+
+    /// A package that states another engine revision moves the deployment to it, an epoch: the
+    /// apply has the stated revision built before anything starts from it, and takes nothing in
+    /// place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stated_later_revision_is_an_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let (leader, build_server) = serving_with_later_revisions_installed(directory.path()).await;
+        let later = changed(&leader, |config| {
+            config.worker_config.engine_revision = Some(2);
+        });
+
+        let applied = apply(&leader, later).await;
+        assert!(
+            !matches!(applied, Ok(Applied::Unchanged | Applied::InPlace)),
+            "another engine revision is an epoch: {applied:?}"
+        );
+        assert_eq!(build_server.prepared(), vec![2]);
     }
 }

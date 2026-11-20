@@ -853,8 +853,9 @@ impl Node {
             .map(|number| self.revisions.load(number))
             .transpose()
             .map_err(Refused::state)?;
-        // The current package again changes nothing unless `latest` now resolves to another
-        // revision: every write resolves it anew, and a restart never does.
+        // The current package again changes nothing unless a kernel or program `latest` now
+        // resolves to another revision: every write resolves it anew, and a restart never does.
+        // An engine or processing revision it leaves unset stays the serving epoch's.
         if let Some(stored) = &stored
             && stored.package == package
         {
@@ -880,8 +881,14 @@ impl Node {
             }
         }
         let previous = stored.as_ref().map(|stored| &stored.package);
-        let changes =
-            proto::reload::changes(previous.map(|previous| &previous.config), &package.config);
+        // The revision records what the change does to the deployment as it runs: stating the
+        // engine or processing revision the serving epoch runs, or no longer stating it, changes
+        // nothing (`Epochs::changes`).
+        let changes = routes
+            .leader
+            .updates
+            .epochs()
+            .changes(previous.map(|previous| &previous.config), &package.config);
         let number = self
             .revisions
             .begin(&package, writer, previous, &changes)
@@ -1134,6 +1141,7 @@ impl Node {
             outputs,
             Arc::clone(leader.router()),
             measure,
+            Arc::clone(leader.updates.epochs()),
         ));
         tokio::spawn(Arc::clone(&self).start_programs(
             Arc::clone(leader),
@@ -1273,7 +1281,11 @@ impl Node {
             let json = serde_json::to_value(&merged)
                 .map_err(|error| format!("the output has no JSON form: {error}"))?;
             // Refused by the validation a start runs, the output writes no revision.
-            crate::programs::validate(&current_state, &program::Config(json), None)?;
+            let epochs = self
+                .routes()
+                .map(|routes| Arc::clone(routes.leader.updates.epochs()))
+                .unwrap_or_default();
+            crate::programs::validate(&current_state, &epochs, &program::Config(json), None)?;
             let package = Package::of(merged, stored.package.programs.clone())
                 .map_err(|error| format!("{error:#}"))?;
             match self.apply(package, &output.writer, current, false).await {
