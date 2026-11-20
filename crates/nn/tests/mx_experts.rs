@@ -829,3 +829,51 @@ fn a_block_loaded_for_the_fused_exchange_runs_the_layer_in_one_launch() {
         );
     }
 }
+
+/// A shared expert whose own MLP reads its gate and up modules as one product (`GateUp::Merged`,
+/// as DeepSeek-V4.1's decoder states it) loads for the fused exchange as the split form does:
+/// the launch reads the two checkpoint modules in its own arrangement either way, and states the
+/// same work.
+#[test]
+fn a_shared_expert_read_as_one_product_loads_for_the_fused_exchange() {
+    use nn::family::{ExpertWeights, FusedExperts};
+
+    let directory = tempfile::tempdir().unwrap();
+    export(directory.path(), EXPERTS);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
+    let split = shared_config();
+    let merged = SharedExpertConfig {
+        mlp: MlpConfig {
+            gate_up: GateUp::Merged {
+                gate: "w1",
+                up: "w3",
+            },
+            ..split.mlp
+        },
+        ..split
+    };
+
+    let block = MoE::load(
+        &MoEConfig {
+            exchange: Split::new(2, 1).unwrap(),
+            fused_exchange: true,
+            shared: Some(merged),
+            ..config(EXPERTS)
+        },
+        loader.root().pp("ffn"),
+    )
+    .unwrap();
+    assert_eq!(
+        block.fused_experts(),
+        FusedExperts {
+            weights: ExpertWeights::Mxfp4,
+            shared: 1,
+            limit: LIMIT.into(),
+        }
+    );
+}
