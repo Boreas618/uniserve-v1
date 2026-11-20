@@ -101,7 +101,8 @@ fn the_leader_routes_each_node_s_requests_to_its_daemon() {
         .collect();
     assert_eq!(nodes, [(0, "leader"), (1, "member")]);
 
-    // The member's exit comes back through the leader, naming the node.
+    // The member's exit comes back through the leader, naming the node and the error the
+    // process stated as it ended.
     engine.spawn(launch("member", "group", 1, 2, package::FAILS));
     assert_eq!(
         engine.exit(),
@@ -111,6 +112,7 @@ fn the_leader_routes_each_node_s_requests_to_its_daemon() {
             rank: 1,
             generation: 2,
             status: "exit status: 1".into(),
+            reason: package::FAILURE.into(),
         }
     );
 

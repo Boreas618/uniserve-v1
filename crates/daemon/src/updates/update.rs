@@ -721,8 +721,9 @@ impl Update {
                 Event::Exit {
                     host,
                     generation,
-                    code,
-                } => self.exit(processes, &host, generation, code),
+                    status,
+                    reason,
+                } => self.exit(processes, &host, generation, &status, &reason),
             }
         }
         self.progress(processes);
@@ -941,15 +942,27 @@ impl Update {
         self.acknowledged.insert(node);
     }
 
-    /// An engine of launch generation `launch` exited.
-    fn exit(&mut self, processes: &mut Processes, host: &str, launch: u64, code: Option<i32>) {
+    /// An engine of launch generation `launch` exited as `status` states, having stated `reason`
+    /// of its end (its exit reason, which its node read bounded): the update's failure, when the
+    /// exit is one, names both.
+    fn exit(
+        &mut self,
+        processes: &mut Processes,
+        host: &str,
+        launch: u64,
+        status: &str,
+        reason: &str,
+    ) {
         let Some((index, target)) = self.node_of(host, launch) else {
             return;
         };
-        let reason = format!(
-            "the engine of launch generation {launch} on {host} exited{}",
-            code.map(|code| format!(" with {code}")).unwrap_or_default()
-        );
+        let stated = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(": {reason}")
+        };
+        let reason =
+            format!("the engine of launch generation {launch} on {host} exited ({status}){stated}");
         let exited = Failure::new(FailureKind::ProcessExit, reason);
 
         let Form::Epoch(trial) = &mut self.form else {

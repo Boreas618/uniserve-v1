@@ -77,11 +77,13 @@ pub(crate) enum Event {
         generation: u64,
         report: Report,
     },
-    /// The engine of launch generation `generation` on `host` exited.
+    /// The engine of launch generation `generation` on `host` exited as `status` states, having
+    /// stated `reason` of its end: its exit reason, empty when it stated none.
     Exit {
         host: String,
         generation: u64,
-        code: Option<i32>,
+        status: String,
+        reason: String,
     },
 }
 
@@ -265,13 +267,16 @@ impl Processes {
         });
     }
 
-    /// One supervised process exited.
+    /// One supervised process exited. One the daemon did not stop failed, as its status and its
+    /// exit reason state.
     fn exited(&mut self, exit: Exit) {
         let generation = exit.generation;
         let state = if self.stopping.remove(&generation) {
             ProcessState::Stopped
-        } else {
+        } else if exit.reason.is_empty() {
             ProcessState::Failed(exit.status.clone())
+        } else {
+            ProcessState::Failed(format!("{}: {}", exit.status, exit.reason))
         };
         self.row(generation, state);
         if let Some(launch) = self.launches.get_mut(&generation) {
@@ -280,7 +285,8 @@ impl Processes {
         self.queued.push_back(Event::Exit {
             host: exit.host,
             generation,
-            code: exit.status.parse().ok(),
+            status: exit.status,
+            reason: exit.reason,
         });
     }
 
@@ -643,7 +649,8 @@ mod tests {
         assert!(events.contains(&Event::Exit {
             host: "n0".to_owned(),
             generation: 7,
-            code: None,
+            status: "exit status: 0".to_owned(),
+            reason: String::new(),
         }));
         let rows = epochs.processes();
         assert_eq!(rows[0].state, ProcessState::Stopped);

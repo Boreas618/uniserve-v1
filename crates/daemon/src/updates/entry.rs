@@ -148,35 +148,97 @@ fn serving_nodes_of(replicas: &[Arc<Replica>]) -> Result<Vec<Node>, UpdateError>
     Ok(nodes)
 }
 
-/// The indices of the replicas an epoch change to `targets`, the launch of each target replica,
-/// running `modules`, moves to a new epoch: every replica when the change gives the deployment
-/// another number of replicas, and otherwise each replica whose launch the change touches: one
-/// that serves no launch, runs another engine package, or whose build part
-/// ([`EngineConfig::build_part`]) the target's differs from. A change that touches none, a
-/// change of the module set's build alone, moves them all.
-fn moved_replicas(
-    replicas: &[Arc<Replica>],
-    targets: &[proto::config::EngineArgs],
-    modules: &crate::epoch::ModuleSet,
-) -> Vec<usize> {
-    let every = (0..targets.len()).collect();
-    if targets.len() != replicas.len() {
-        return every;
+/// One serving replica as an epoch change finds it: the launch its engines serve with (none for
+/// a replica whose engine serves no launch) and those engines, one node each.
+pub(crate) struct Serving {
+    pub(crate) launch: Option<proto::config::EngineArgs>,
+    pub(crate) nodes: Vec<Node>,
+}
+
+/// The two sides of an epoch change ([`Sides::of`]).
+///
+/// The serving replicas and the target replicas are two index spaces: they pair one for one only
+/// when the target has as many replicas as the deployment serves, and only then can a change
+/// move some replicas and leave the others serving.
+pub(crate) struct Sides {
+    /// The serving replicas the change moves, by index among the deployment's replicas.
+    pub(crate) moved: Vec<usize>,
+    /// The engines of the moved replicas: each drains once the targets serve, and stops at the
+    /// commit.
+    pub(crate) draining: Vec<Node>,
+    /// The engines of the replicas the change leaves as they are, which go on serving their
+    /// epochs through it ([`EpochSwitch::bystanders`]).
+    pub(crate) bystanders: Vec<Node>,
+    /// The target replicas that start, each with its index among the target's replicas, which
+    /// is the deployment's replica it serves under.
+    pub(crate) targets: Vec<(usize, proto::config::EngineArgs)>,
+}
+
+impl Sides {
+    /// The sides of an epoch change from the deployment's `serving` replicas to `targets`, the
+    /// launch of each target replica, running `modules`.
+    ///
+    /// A target of another number of replicas than the deployment serves, whatever their
+    /// engines' structure (an expert union is one replica of several schedulers), pairs with no
+    /// serving replica: every serving replica moves, its engines drain and its epoch retires at
+    /// the commit, and every target replica starts. A target of as many replicas pairs target
+    /// replica `i` with serving replica `i`, and the change moves each replica whose launch it
+    /// touches: one that serves no launch, runs another engine package, or whose build part
+    /// ([`EngineConfig::build_part`], which holds the replica's parallel configuration and its
+    /// model) the target's differs from. A change that touches none, a change of the module
+    /// set's build alone, moves them all.
+    pub(crate) fn of(
+        serving: Vec<Serving>,
+        targets: Vec<proto::config::EngineArgs>,
+        modules: &crate::epoch::ModuleSet,
+    ) -> Self {
+        let paired = serving.len() == targets.len();
+        let touched: Vec<usize> = if paired {
+            serving
+                .iter()
+                .zip(&targets)
+                .enumerate()
+                .filter(|(_, (replica, target))| {
+                    replica.launch.as_ref().is_none_or(|served| {
+                        served.modules.engine != modules.engine
+                            || served.engine_config.build_part()
+                                != target.engine_config.build_part()
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let moved: Vec<usize> = if touched.is_empty() {
+            (0..serving.len()).collect()
+        } else {
+            touched
+        };
+
+        // Paired, the targets of the moved replicas start, each replacing its replica; unpaired,
+        // every target starts.
+        let targets = targets
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !paired || moved.contains(index))
+            .collect();
+        let mut draining = Vec::new();
+        let mut bystanders = Vec::new();
+        for (index, replica) in serving.into_iter().enumerate() {
+            if moved.contains(&index) {
+                draining.extend(replica.nodes);
+            } else {
+                bystanders.extend(replica.nodes);
+            }
+        }
+        Self {
+            moved,
+            draining,
+            bystanders,
+            targets,
+        }
     }
-    let moved: Vec<usize> = replicas
-        .iter()
-        .zip(targets)
-        .enumerate()
-        .filter(|(_, (replica, target))| {
-            let served = service::lock(&replica.served);
-            served.as_ref().is_none_or(|served| {
-                served.modules.engine != modules.engine
-                    || served.engine_config.build_part() != target.engine_config.build_part()
-            })
-        })
-        .map(|(index, _)| index)
-        .collect();
-    if moved.is_empty() { every } else { moved }
 }
 
 /// Keeps an existing replica's assigned devices when an update changes its
@@ -624,37 +686,45 @@ impl Leader {
         let launches =
             crate::leader::epoch_launches(&engine, &next.modules, target_epoch, revision)
                 .map_err(refused)?;
-        // The update moves the replicas the change touches, and the others serve on in the
-        // epochs they serve.
-        let moved = moved_replicas(&replicas, &launches, &next.modules);
-        let (moving, staying): (Vec<_>, Vec<_>) = replicas
+        // The update moves every replica of a target of another number of replicas, and
+        // otherwise the replicas the change touches, the others serving on in their epochs.
+        let mut found = Vec::with_capacity(replicas.len());
+        for replica in &replicas {
+            found.push(Serving {
+                launch: service::lock(&replica.served).clone(),
+                nodes: serving_nodes_of(std::slice::from_ref(replica))?,
+            });
+        }
+        let target_count = launches.len();
+        let Sides {
+            moved,
+            draining: nodes,
+            bystanders,
+            targets: starting,
+        } = Sides::of(found, launches, &next.modules);
+        // A target replica succeeds the epoch the deployment's replica of its index serves, and
+        // the serving epoch where the deployment has fewer replicas.
+        let predecessors: Vec<u64> = starting
             .iter()
-            .enumerate()
-            .partition(|(index, _)| moved.contains(index));
-        let moving: Vec<Arc<Replica>> = moving.into_iter().map(|(_, r)| Arc::clone(r)).collect();
-        let staying: Vec<Arc<Replica>> = staying.into_iter().map(|(_, r)| Arc::clone(r)).collect();
-        let nodes = serving_nodes_of(&moving)?;
-        let bystanders = serving_nodes_of(&staying)?;
-        let predecessors: Vec<u64> = moved
-            .iter()
-            .map(|index| {
+            .map(|(index, _)| {
                 replicas
                     .get(*index)
                     .and_then(|replica| service::lock(&replica.served).as_ref().map(|s| s.epoch))
                     .unwrap_or(serving.number())
             })
             .collect();
-        let launches: Vec<_> = launches
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| moved.contains(index))
-            .map(|(_, args)| args)
-            .collect();
+        let launches: Vec<_> = starting.into_iter().map(|(_, args)| args).collect();
         if moved.len() < replicas.len() {
             info!(
                 moved = ?moved,
                 replicas = replicas.len(),
                 "the epoch change moves the replicas it touches, and the others serve on"
+            );
+        } else if target_count != replicas.len() {
+            info!(
+                serving = replicas.len(),
+                target = target_count,
+                "the target has another number of replicas: the epoch change moves every replica"
             );
         }
         let configs: Vec<_> = launches

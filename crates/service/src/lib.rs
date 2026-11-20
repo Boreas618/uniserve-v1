@@ -14,7 +14,7 @@
 //! record beside its socket, started detached from its starter when absent ([`host::start`]) and
 //! stopped by its `stop` request or SIGTERM ([`host::stop`]). A server logs to standard error in the one convention of every process ([`logging`])
 //! and stops on SIGTERM or SIGINT ([`stop_signals`]), the one stop mechanism every process waits
-//! on.
+//! on. A supervised process states the error it ends with to its supervisor ([`exit_reason`]).
 //!
 //! Every process interface runs on one [`Connection`] over a Unix or TCP
 //! socket, framed by [`frame`], whose messages each protocol encodes
@@ -31,6 +31,7 @@
 mod connection;
 mod directories;
 mod endpoint;
+pub mod exit_reason;
 pub mod frame;
 pub mod host;
 pub mod logging;

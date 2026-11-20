@@ -6,8 +6,11 @@
 //! leads a process group of its own, so the Storage Server's shoot-down of a previous writer ends
 //! the processes it started and never the daemon. The daemon reaps each child and reports its exit
 //! to the asker of its launch. A process writes its own log, to the standard error it inherits
-//! from the daemon; how it ended travels as its exit status, and a failure it observed as its
-//! report on the process interface.
+//! from the daemon; how it ended travels as its exit status, a failure it observed as its report
+//! on the process interface, and the error it ended with as its exit reason: every process
+//! inherits an exit reason file of its own (`service::exit_reason`), which the daemon reads when
+//! it reaps the process and carries in its exit report, so a process that fails before it can
+//! report anything (an engine that cannot read its launch) still says why.
 //!
 //! A process ends with its daemon through its lifeline: a pipe whose write
 //! end the daemon holds and whose read end every process inherits, at the
@@ -18,7 +21,7 @@
 //! and the write end with them, to the successor daemon
 //! (`Supervisor::hand_over`), which supervises them from then on through
 //! their pidfds (`Supervisor::adopt`): the pipe stays open across it, so no
-//! process ends.
+//! process ends. Each process's exit reason file goes with it.
 //!
 //! An engine starts from its launch, which the spawn carries (`Spawn::launch`): the daemon of the
 //! node it runs on states its own node's Build Server in it and passes it as a sealed memfd
@@ -130,9 +133,9 @@ struct Key {
 }
 
 impl Key {
-    /// The exit of the process of this key on `host`, which ended as `status` states, with the
-    /// asker of its launch.
-    fn exit(self, host: &str, status: String) -> (Asker, Exit) {
+    /// The exit of the process of this key on `host`, which ended as `status` states, having
+    /// stated `reason` of its end, with the asker of its launch.
+    fn exit(self, host: &str, status: String, reason: String) -> (Asker, Exit) {
         let Self {
             asker,
             group,
@@ -148,6 +151,7 @@ impl Key {
                 rank,
                 generation,
                 status,
+                reason,
             },
         )
     }
@@ -425,10 +429,14 @@ impl Supervisor {
         }
 
         // The process runs as the engine package its launch names, with the launch inherited, at
-        // this daemon's log level, and with its lifeline last on its command line.
+        // this daemon's log level, and with its lifeline last on its command line. It inherits an
+        // exit reason file of its own, which this daemon keeps to read when it reaps the process.
         let (executable, launch) = self.main_process(spawn)?;
+        let reason = ::service::exit_reason::create()
+            .map_err(|error| format!("creating the process's exit reason file: {error}"))?;
         let mut command = Command::new(&executable);
         crate::engine::launch::inherit(&mut command, launch);
+        ::service::exit_reason::inherit(&mut command, &reason);
         command.args(::service::logging::arguments());
         inherit_lifeline(&mut command, &self.lifeline.read);
         // A worker leads a process group of its own, with every process it
@@ -442,7 +450,7 @@ impl Supervisor {
             }
         }
 
-        let child = Child::spawn(&mut command)
+        let child = Child::spawn(&mut command, reason)
             .map_err(|error| format!("spawning {}: {error}", executable.display()))?;
         let pid = child.id();
         tracing::info!(group = %spawn.group, rank = spawn.rank, generation = spawn.generation, pid, "started a process");
@@ -528,8 +536,9 @@ impl Supervisor {
             .collect();
         let ended = self.terminate(stopped);
         let host = self.host.clone();
+        // A stopped process's end is the stop's, whatever it stated before.
         self.stopped.extend(ended.into_iter().map(|(key, status)| {
-            let (_, exit) = key.exit(&host, status);
+            let (_, exit) = key.exit(&host, status, String::new());
             (asker, exit)
         }));
         // A group's reservations serve every launch of it; they end with the
@@ -583,13 +592,14 @@ impl Supervisor {
                 Ok(None) => continue,
                 Err(error) => (format!("exit status unreadable: {error}"), false),
             };
-            exited.push((key.clone(), status, success));
+            // The process has exited, so its exit reason is final.
+            exited.push((key.clone(), status, success, child.reason()));
         }
         let mut reported = std::mem::take(&mut self.stopped);
-        for (key, status, success) in exited {
+        for (key, status, success, reason) in exited {
             self.children.remove(&key);
-            // The report names the owner the process was spawned for, its rank and how it
-            // ended; what the process explained of its end is in its own log.
+            // The report names the owner the process was spawned for, its rank, how it ended and
+            // the error it stated as it ended; the rest of its account is in its own log.
             let Key {
                 owner,
                 group,
@@ -600,9 +610,9 @@ impl Supervisor {
             if success {
                 tracing::info!(?owner, %group, rank, generation, "a process exited");
             } else {
-                tracing::warn!(?owner, %group, rank, generation, %status, "a process exited");
+                tracing::warn!(?owner, %group, rank, generation, %status, %reason, "a process exited");
             }
-            reported.push(key.exit(&self.host, status));
+            reported.push(key.exit(&self.host, status, reason));
         }
         reported
     }
@@ -657,8 +667,10 @@ impl Supervisor {
     /// Hands every process and reservation to this daemon's successor in a
     /// hot restart, which goes on with them ([`Supervisor::adopt`]): their
     /// keys, and a pidfd for each process followed by each reservation's
-    /// socket, then the lifeline's read and write ends, and last the GPU registration's, in
-    /// `descriptors`.
+    /// socket, then the lifeline's read and write ends, then the exit reason file of each process
+    /// that has one, in the processes' order, and last the GPU registration's, in `descriptors`.
+    /// A successor that predates the exit reason files takes the descriptors it knows by their
+    /// places from both ends and drops these.
     /// This daemon supervises nothing afterwards.
     ///
     /// # Errors
@@ -668,9 +680,15 @@ impl Supervisor {
     pub(crate) fn hand_over(&mut self) -> std::io::Result<(ProcessesHandoff, Vec<OwnedFd>)> {
         let mut processes = Vec::with_capacity(self.children.len());
         let mut descriptors = Vec::with_capacity(self.children.len() + self.reservations.len());
+        let mut reasons = Vec::new();
         for (key, child) in &self.children {
             descriptors.push(child.pidfd()?);
-            processes.push(ProcessHandoff::of(key, child.id()));
+            let mut process = ProcessHandoff::of(key, child.id());
+            if let Some(reason) = &child.reason {
+                reasons.push(reason.try_clone()?);
+                process.reason = true;
+            }
+            processes.push(process);
         }
         let mut reservations = Vec::with_capacity(self.reservations.len());
         for (id, reservation) in self.reservations.drain() {
@@ -683,6 +701,7 @@ impl Supervisor {
         }
         descriptors.push(self.lifeline.read.try_clone()?);
         descriptors.push(self.lifeline.write.try_clone()?);
+        descriptors.extend(reasons);
         let (gpus, registration) = self.gpus.hand_over()?;
         descriptors.push(registration);
         // The successor supervises them now; dropping a spawned child's
@@ -735,19 +754,10 @@ impl Supervisor {
             super::gpus::Gpus::adopt(handoff.gpus, registration),
         )?;
         supervisor.build_server = handoff.build_server;
+        let mut adopted = Vec::with_capacity(handoff.processes.len());
         for process in handoff.processes {
-            let child = Child::adopt(process.pid, next()?);
-            tracing::info!(group = %process.group, rank = process.rank, generation = process.generation, pid = process.pid, "adopted a process");
-            supervisor.children.insert(
-                Key {
-                    owner: process.owner,
-                    asker: process.asker,
-                    group: process.group,
-                    rank: process.rank,
-                    generation: process.generation,
-                },
-                child,
-            );
+            let pidfd = next()?;
+            adopted.push((process, pidfd));
         }
         for reservation in handoff.reservations {
             supervisor.reservations.insert(
@@ -763,6 +773,21 @@ impl Supervisor {
             read: next()?,
             write: next()?,
         };
+        for (process, pidfd) in adopted {
+            let reason = if process.reason { Some(next()?) } else { None };
+            let child = Child::adopt(process.pid, pidfd, reason);
+            tracing::info!(group = %process.group, rank = process.rank, generation = process.generation, pid = process.pid, "adopted a process");
+            supervisor.children.insert(
+                Key {
+                    owner: process.owner,
+                    asker: process.asker,
+                    group: process.group,
+                    rank: process.rank,
+                    generation: process.generation,
+                },
+                child,
+            );
+        }
         // The lifeline is the processes': a supervised process ends when every write
         // end of the pipe closes, so a successor that did not take these would let the
         // engine die the moment the predecessor exits.
@@ -806,6 +831,10 @@ pub(crate) struct ProcessHandoff {
     pub(crate) rank: u32,
     pub(crate) generation: u64,
     pub(crate) pid: u32,
+    /// Whether its exit reason file is among the handoff's descriptors: absent from a
+    /// predecessor that predates the files, whose processes state no reason.
+    #[serde(default)]
+    pub(crate) reason: bool,
 }
 
 impl ProcessHandoff {
@@ -817,6 +846,7 @@ impl ProcessHandoff {
             rank: key.rank,
             generation: key.generation,
             pid,
+            reason: false,
         }
     }
 }
@@ -888,6 +918,9 @@ pub(crate) struct Child {
     /// How the process ended, once it did; a reaped child's id may name
     /// another process from then on, so it is never waited on again.
     exited: Option<Exited>,
+    /// The exit reason file the process inherited (`service::exit_reason`): none for one a
+    /// predecessor that predates the files spawned.
+    reason: Option<OwnedFd>,
 }
 
 enum Process {
@@ -911,8 +944,9 @@ pub(crate) enum Exited {
 }
 
 impl Child {
-    /// Spawns the process `command` describes.
-    pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
+    /// Spawns the process `command` describes, which inherits the exit reason file `reason`
+    /// ([`::service::exit_reason::inherit`]).
+    pub(crate) fn spawn(command: &mut Command, reason: OwnedFd) -> std::io::Result<Self> {
         let mut child = command.spawn()?;
         // An unreaped child's id names it alone, so the pidfd is the child's.
         let pidfd = match pidfd_open(child.id()) {
@@ -926,7 +960,17 @@ impl Child {
         Ok(Self {
             process: Process::Spawned { child, pidfd },
             exited: None,
+            reason: Some(reason),
         })
+    }
+
+    /// What the process stated of its end in its exit reason file; empty when it stated nothing
+    /// or has no file.
+    fn reason(&self) -> String {
+        self.reason
+            .as_ref()
+            .map(::service::exit_reason::read)
+            .unwrap_or_default()
     }
 
     /// The descriptor that turns readable once the process exited.
@@ -937,11 +981,12 @@ impl Child {
     }
 
     /// Supervises process `pid`, which a daemon this one replaced spawned,
-    /// through its pidfd.
-    fn adopt(pid: u32, pidfd: OwnedFd) -> Self {
+    /// through its pidfd, with the exit reason file it inherited when the handoff holds it.
+    fn adopt(pid: u32, pidfd: OwnedFd, reason: Option<OwnedFd>) -> Self {
         Self {
             process: Process::Adopted { pid, pidfd },
             exited: None,
+            reason,
         }
     }
 
