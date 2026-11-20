@@ -23,6 +23,17 @@ exact and only the FP32 sums round: the operator's bound
 relative to the row's largest score because the weighted sum cancels) holds
 the scores, and a column of no visible group is ``-inf`` exactly.
 
+BF16 scores are DeepSeek's indexer's arithmetic::
+
+    s[t, c] = bf16(sum_h bf16(relu(bf16(q[t, h] . key[g])) * bf16(w[t, h])))
+
+each head's FP32 product, its weight, its weighted value and the FP32 sum of
+the heads rounded to BF16, nearest even. The reference rounds at the same
+points, from the FP64 values through FP32, and the operator's BF16 bound adds
+the format's roundings to the FP32 one: a BF16 spacing (``2u``,
+``u = 2^-8``) for each of a head's two roundings, ``sqrt(heads)`` times, a
+sum of ``heads`` terms, and a spacing for the score's own rounding.
+
 The cases, each a property a defect would break: BF16 keys over a scattered
 page table with rows of different visible counts; MXFP4 keys whose scales lie
 after the page's values, weighted by heads of both signs, against MXFP4
@@ -45,7 +56,8 @@ ROUNDOFF = 2.0**-24
 #: The cases: the keys' format, whether the heads are weighted, whether the
 #: queries are rounded to MXFP4, the candidate blocks' groups (zero for a
 #: dense row), the tokens, the index heads, the groups of a page, the pages a
-#: row's table holds, the program's column block and the seed.
+#: row's table holds, the program's column block, the scores' type and the
+#: seed.
 CASES = {
     "bf16 keys over a scattered table, rows of different visible counts": (
         "bf16",
@@ -57,6 +69,7 @@ CASES = {
         16,
         6,
         32,
+        "f32",
         1,
     ),
     "mxfp4 keys with the page's scales after its values, weighted heads": (
@@ -69,6 +82,7 @@ CASES = {
         16,
         5,
         32,
+        "f32",
         2,
     ),
     "bf16 keys against queries rounded to mxfp4": (
@@ -81,6 +95,7 @@ CASES = {
         8,
         4,
         16,
+        "f32",
         3,
     ),
     "candidate blocks, some unnamed and some past the visible groups": (
@@ -93,7 +108,34 @@ CASES = {
         16,
         6,
         16,
+        "f32",
         4,
+    ),
+    "bf16 scores of mxfp4 keys and queries, weighted heads": (
+        "mxfp4",
+        True,
+        True,
+        0,
+        4,
+        32,
+        16,
+        5,
+        32,
+        "bf16",
+        8,
+    ),
+    "bf16 scores inside candidate blocks": (
+        "mxfp4",
+        True,
+        True,
+        4,
+        4,
+        32,
+        16,
+        6,
+        16,
+        "bf16",
+        9,
     ),
     "four heads padded to the products' tile": (
         "bf16",
@@ -105,6 +147,7 @@ CASES = {
         16,
         3,
         16,
+        "f32",
         5,
     ),
 }
@@ -113,14 +156,40 @@ CASES = {
 WIDTH = 128
 
 
-def tolerance(heads, weighted):
+#: The unit roundoff of BF16, and the spacing of its values relative to them.
+BF16_ROUNDOFF = 2.0**-8
+BF16_SPACING = 2.0 * BF16_ROUNDOFF
+
+
+def gamma(reduction):
+    """``γₙ`` of an ``n``-term FP32 reduction."""
+    return reduction * ROUNDOFF / (1.0 - reduction * ROUNDOFF)
+
+
+def tolerance(heads, weighted, scores="f32"):
     """`IndexScores::tolerance`'s relative factor: a dot product of
-    ``heads · width`` terms, one rounding more per term when weighted.
+    ``heads · width`` terms, one rounding more per term when weighted; BF16
+    scores add a spacing for each of a head's two roundings, ``sqrt(heads)``
+    times, the heads' FP32 sum and a spacing for the score's rounding.
     """  # noqa: D205
     terms = heads * WIDTH
-    reduction = terms + int(weighted)
-    gamma = reduction * ROUNDOFF / (1.0 - reduction * ROUNDOFF)
-    return 2.0 * gamma * math.sqrt(terms) + ROUNDOFF
+    products = 2.0 * gamma(terms + int(weighted)) * math.sqrt(terms) + ROUNDOFF
+    if scores == "f32":
+        return products
+    spread = math.sqrt(heads)
+    return (
+        products
+        + 2.0 * BF16_SPACING * spread
+        + 2.0 * gamma(heads) * spread
+        + BF16_SPACING
+    )
+
+
+def bf16(values):
+    """FP64 ``values`` rounded through FP32 to BF16, nearest even, as FP64:
+    the program's FP32 result rounded to BF16.
+    """  # noqa: D205
+    return values.to(torch.float32).to(torch.bfloat16).to(torch.float64)
 
 
 def operands(case, generator):
@@ -128,9 +197,7 @@ def operands(case, generator):
     weights, the key plane and its decoded keys, the table, the rows, the
     visible counts and the candidate blocks.
     """  # noqa: D205
-    keys_format, weighted, _, block, tokens, heads, groups, max_pages, _, _ = (
-        case
-    )
+    keys_format, weighted, _, block, tokens, heads, groups, max_pages = case[:8]
     pages = max_pages + 3
     table_rows = tokens + 1
 
@@ -181,8 +248,12 @@ def operands(case, generator):
 
 
 def reference(case, query, weights, decoded, table, rows, visible, candidates):
-    """The scores the operator states, in FP64."""
-    _, _, rounded, block, tokens, _, groups, max_pages, _, _ = case
+    """The scores the operator states, in FP64, or rounded where BF16 scores
+    round.
+    """  # noqa: D205
+    _, _, rounded, block, tokens, _, groups, max_pages, _, scores_type, _ = case
+    round_bf16 = bf16 if scores_type == "bf16" else (lambda values: values)
+    weights = round_bf16(weights.to(torch.float64))
     q = query.to(torch.float32)
     if rounded:
         q = records.fake_quantize("mxfp4", q)
@@ -206,8 +277,9 @@ def reference(case, query, weights, decoded, table, rows, visible, candidates):
     for token in range(tokens):
         pages = table[rows[token]][group[token] // groups].long()
         token_keys = keys[pages, group[token] % groups]
-        products = (q[token] @ token_keys.T).clamp_min(0.0)
-        scores = (products * weights[token].unsqueeze(1)).sum(0)
+        products = round_bf16(q[token] @ token_keys.T).clamp_min(0.0)
+        weighted = round_bf16(products * weights[token].unsqueeze(1))
+        scores = round_bf16(weighted.sum(0))
         out[token] = torch.where(live[token], scores, float("-inf"))
     return out
 
@@ -241,7 +313,8 @@ def key(case):
     )
     text += "_weighted_true" if weighted else ""
     text += "_query_mxfp4" if rounded else ""
-    return text + (f"_candidates_{block}" if block else "")
+    text += f"_candidates_{block}" if block else ""
+    return text + ("_scores_bf16" if case[9] == "bf16" else "")
 
 
 def launch(kernels, case, operands, device, stated=None):
@@ -257,8 +330,9 @@ def launch(kernels, case, operands, device, stated=None):
     unread = torch.zeros(1, dtype=torch.int32, device=device)
     blocks = 0 if candidates is None else candidates.shape[1]
     columns = blocks * block if block else max_pages * groups
+    dtype = torch.bfloat16 if case[9] == "bf16" else torch.float32
     out = torch.full(
-        (tokens, columns), float("nan"), dtype=torch.float32, device=device
+        (tokens, columns), float("nan"), dtype=dtype, device=device
     )
     words = {
         "query": query.to(device),
@@ -283,6 +357,7 @@ def launch(kernels, case, operands, device, stated=None):
         "WEIGHTED": weighted,
         "QUERY_MXFP4": rounded,
         "CANDIDATES": block,
+        "SCORES_BF16": case[9] == "bf16",
     }
     if stated is None:
         kernel = kernels._index_scores_kernel
@@ -290,7 +365,7 @@ def launch(kernels, case, operands, device, stated=None):
         kernel, constants = stated.kernel, stated.constexprs
     grid = ((columns + column_block - 1) // column_block, tokens, 1)
     kernel[grid](*(words[name] for name in WORDS), **constants)
-    return out.cpu()
+    return out.cpu().to(torch.float32)
 
 
 def check(where, case, got, expected):
@@ -304,7 +379,7 @@ def check(where, case, got, expected):
     )
     seen = ~hidden
     peak = float(expected[seen].abs().max()) if seen.any() else 0.0
-    bound = 2.0**-126 + tolerance(case[5], case[1]) * peak
+    bound = 2.0**-126 + tolerance(case[5], case[1], case[9]) * peak
     error = (got.to(torch.float64) - expected).abs()[seen]
     worst = float(error.max()) if error.numel() else 0.0
     assert worst <= bound, (
@@ -351,10 +426,11 @@ def test_the_key_the_operator_prints_compiles_the_case(
 
 
 #: Decode rows at the model's shapes: 32 heads of 128 over MXFP4 keys of 64
-#: groups a page, weighted and rounded: the rows of a step against a short
-#: context, a few rows against a context of 2^20 groups, and rows restricted
-#: to 2048 candidate blocks of 8 groups, as the indexers after a candidate
-#: source score: `(tokens, max_pages, candidate block)`.
+#: groups a page, weighted and rounded, in the model's BF16 scores: the rows
+#: of a step against a short context, a few rows against a context of 2^20
+#: groups, and rows restricted to 2048 candidate blocks of 8 groups, as the
+#: indexers after a candidate source score: `(tokens, max_pages, candidate
+#: block)`.
 MODEL_ROWS = {
     "256 rows over 4096 groups": (256, 64, 0),
     "two rows over 2^20 groups": (2, 16384, 0),
@@ -368,7 +444,19 @@ def test_the_model_shapes_score_within_the_bound(
     name, torch_device, stated_launch, launch_target
 ):
     tokens, max_pages, block = MODEL_ROWS[name]
-    case = ("mxfp4", True, True, block, tokens, 32, 64, max_pages, 256, 6)
+    case = (
+        "mxfp4",
+        True,
+        True,
+        block,
+        tokens,
+        32,
+        64,
+        max_pages,
+        256,
+        "bf16",
+        6,
+    )
     stated = stated_launch("index_scores", key(case), launch_target)
     generator = torch.Generator().manual_seed(case[-1])
     built = operands(case, generator)

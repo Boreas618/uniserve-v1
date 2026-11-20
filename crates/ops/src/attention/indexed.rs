@@ -27,11 +27,15 @@
 //! Index keys are BF16 rows or packed records ([`crate::record`]), a packed page keeping all its
 //! records' values and then all their scales ([`crate::record::Layout::Page`], DeepGEMM's paged
 //! layout). The index queries may be rounded to MXFP4 as they are read, as the reference rounds
-//! them before it scores (`fp4_act_quant` of DeepSeek's `Indexer`). The index keys are selected
-//! between, so the scores are ranked and never rounded: FP32. The attention computes its scores, its softmax and
-//! its sum in FP32; with caches of a 16-bit type each probability is rounded into that type
-//! before it multiplies its value, as the reference casts them (`qsa.py:141-253`), and the
-//! output rounds once.
+//! them before it scores (`fp4_act_quant` of DeepSeek's `Indexer`). The scores are ranked, so
+//! where they round decides which entries a selection keeps: FP32 scores are the FP32 sums of
+//! the products, and BF16 scores are DeepSeek's indexer's own arithmetic, which rounds each
+//! head's product, its weighted value and the heads' sum to BF16 (`inference/model.py`,
+//! `Indexer.forward`: a BF16 `einsum`, a BF16 product with the weights and a BF16 `sum`), so a
+//! selection of them keeps the entries the reference ranks first, near ties included. The
+//! attention computes its scores, its softmax and its sum in FP32; with caches of a 16-bit type
+//! each probability is rounded into that type before it multiplies its value, as the reference
+//! casts them (`qsa.py:141-253`), and the output rounds once.
 
 use std::fmt;
 
@@ -100,6 +104,10 @@ pub struct IndexScoresDescriptor {
     /// Groups of one candidate block, when the scores are restricted to candidate blocks; zero
     /// scores every group of the request.
     pub candidates: u32,
+    /// The type the scores round into and are stored in: [`DType::F32`], each score the FP32 sum
+    /// of the weighted rectified products; or [`DType::BF16`], DeepSeek's indexer's arithmetic,
+    /// [`IndexScores`]'s rounded formula.
+    pub scores: DType,
 }
 
 /// The index keys one `index_scores` program scores.
@@ -120,6 +128,7 @@ impl IndexScoresDescriptor {
             weighted: false,
             query: Format::Bf16,
             candidates: 0,
+            scores: DType::F32,
         }
     }
 
@@ -142,8 +151,9 @@ impl fmt::Display for IndexScoresDescriptor {
             .field("width", self.width)
             .field("groups", self.groups)
             .field("block", self.block);
-        // The weighting, the query's rounding and the candidates are written after `block`, and
-        // only when they are not the unweighted dense scoring every earlier key states.
+        // The weighting, the query's rounding, the candidates and the scores' type are written
+        // after `block`, and only when they are not the unweighted dense FP32 scoring every
+        // earlier key states.
         let key = if self.weighted {
             key.field("weighted", true)
         } else {
@@ -158,6 +168,11 @@ impl fmt::Display for IndexScoresDescriptor {
             key
         } else {
             key.field("candidates", self.candidates)
+        };
+        let key = if self.scores == DType::F32 {
+            key
+        } else {
+            key.field("scores", abi::name(self.scores))
         };
         key.finish(formatter)
     }
@@ -182,15 +197,24 @@ pub struct IndexScoresArgs {
     /// `[tokens, blocks]` I32, contiguous: each row's candidate blocks, a negative one naming
     /// none, exactly when the descriptor restricts to candidates.
     pub candidates: Option<Operand>,
-    /// `[tokens, columns]` FP32, contiguous: receives the scores, `−inf` for a column of no
-    /// visible group ([`IndexScoresDescriptor::columns`]).
+    /// `[tokens, columns]` of the descriptor's score type, contiguous: receives the scores,
+    /// `−inf` for a column of no visible group ([`IndexScoresDescriptor::columns`]).
     pub out: Operand,
 }
 
 /// The scores of the index keys a query row may select among.
 ///
-/// One program scores [`IndexScoresDescriptor::block`] keys of one token: the products, the
-/// weighting and the sum over the heads are FP32.
+/// ```text
+/// FP32   s[t, g] = Σ_h relu(q[t, h] · key[g]) · w[t, h]
+/// BF16   s[t, g] = bf16(Σ_h bf16(relu(bf16(q[t, h] · key[g])) · bf16(w[t, h])))   Σ_h in FP32
+/// ```
+///
+/// Each head's product is FP32 either way (codes under power-of-two scales: the products are
+/// exact and only their sum rounds), its weighting one FP32 product. The BF16 scores round where
+/// DeepSeek's indexer rounds, whose head weights are BF16 values, so that their order is the
+/// reference's own, whose BF16 `topk` keeps the lower entry of a tie: equal BF16 scores are ties
+/// a selection breaks by its own rule. A weighted value is the product of two BF16 values, exact
+/// in FP32 before it rounds.
 pub struct IndexScores;
 
 impl Op for IndexScores {
@@ -206,13 +230,19 @@ impl Op for IndexScores {
             || d.groups == 0
             || d.block == 0
             || !matches!(d.query, Format::Bf16 | Format::Mxfp4)
+            || !matches!(d.scores, DType::F32 | DType::BF16)
         {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "{} index heads of {} elements over pages of {} keys, in blocks of {}, \
-                     queries read as {}",
-                    d.heads, d.width, d.groups, d.block, d.query
+                     queries read as {}, {} scores",
+                    d.heads,
+                    d.width,
+                    d.groups,
+                    d.block,
+                    d.query,
+                    abi::name(d.scores)
                 ),
             ));
         }
@@ -284,7 +314,7 @@ impl Op for IndexScores {
 
         let columns = d.columns(max_pages, blocks);
         args.out.require_shape(Self::NAME, &[tokens, columns])?;
-        args.out.require_row(Self::NAME, DType::F32, columns)?;
+        args.out.require_row(Self::NAME, d.scores, columns)?;
         for (name, view) in [("query", &args.query), ("out", &args.out)] {
             if !view.is_row_major() {
                 return Err(Error::argument(
@@ -337,16 +367,41 @@ impl Op for IndexScores {
         }
     }
 
+    /// FP32 scores: each sums `heads` rectified dot products of `width` terms in FP32, each
+    /// weighted by one FP32 product, and is stored as FP32: a dot product's bound over `heads ·
+    /// width` terms, one rounding more per term for the weight.
+    ///
+    /// BF16 scores add the format's roundings to that bound. Two implementations whose FP32 head
+    /// products differ by the dot product's bound may round a head's product, and then its
+    /// weighted value, to neighbouring BF16 values: each of the two roundings moves a head's term
+    /// by at most one BF16 spacing, `2u` of it (`u = 2⁻⁸`), and the `heads` terms' errors add
+    /// as a dot product's do, `√heads` times the largest. The FP32 sum of the heads is a sum of
+    /// `heads` terms (`2γ_heads √heads`), and its rounding to BF16 may again land on neighbours,
+    /// `2u` of the score. Like the FP32 bound it is relative to the row's largest score, which
+    /// the weights' signs let a score cancel below.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // Each score sums `heads` rectified dot products of `width` terms in FP32, each weighted
-        // by one FP32 product, and is stored as FP32: a dot product's bound over `heads · width`
-        // terms, one rounding more per term for the weight.
-        Tolerance::split_dot(
-            u64::from(descriptor.heads) * u64::from(descriptor.width),
+        let heads = u64::from(descriptor.heads);
+        let products = Tolerance::split_dot(
+            heads * u64::from(descriptor.width),
             u64::from(descriptor.weighted),
             DType::F32,
             DType::F32,
-        )
+        );
+        if descriptor.scores == DType::F32 {
+            return products;
+        }
+
+        let spacing = 2.0 * tolerance::unit_roundoff(DType::BF16);
+        let spread = (heads as f64).sqrt();
+        let rounded = f64::from(products.rtol)
+            + 2.0 * spacing * spread
+            + 2.0 * tolerance::gamma(heads, DType::F32) * spread
+            + spacing;
+        Tolerance {
+            atol: tolerance::underflow(DType::BF16) as f32,
+            rtol: rounded as f32,
+            cancels: true,
+        }
     }
 }
 
@@ -361,6 +416,8 @@ pub struct IndexSelectDescriptor {
     pub candidates: u32,
     /// Lanes one pass of the program reads.
     pub tile: u32,
+    /// Element type of the scores: [`DType::F32`] or [`DType::BF16`].
+    pub scores: DType,
 }
 
 /// The lanes one `index_select` pass reads: one chunk of a row's scores at a time, so the
@@ -368,31 +425,40 @@ pub struct IndexSelectDescriptor {
 const SELECT_TILE: u32 = 4096;
 
 impl IndexSelectDescriptor {
-    /// The compilation that ranks blocks of `pool` columns of scores restricted to candidate
-    /// blocks of `candidates` groups (zero for none).
+    /// The compilation that ranks blocks of `pool` columns of FP32 scores restricted to
+    /// candidate blocks of `candidates` groups (zero for none).
     pub fn new(pool: u32, candidates: u32) -> Self {
         Self {
             pool,
             candidates,
             tile: SELECT_TILE,
+            scores: DType::F32,
         }
     }
 }
 
 impl fmt::Display for IndexSelectDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("pool", self.pool)
             .field("candidates", self.candidates)
-            .field("tile", self.tile)
-            .finish(formatter)
+            .field("tile", self.tile);
+        // The scores' type is written only for scores other than the FP32 ones every earlier key
+        // ranks.
+        let key = if self.scores == DType::F32 {
+            key
+        } else {
+            key.field("scores", abi::name(self.scores))
+        };
+        key.finish(formatter)
     }
 }
 
 /// The arguments of `index_select`.
 #[derive(Clone)]
 pub struct IndexSelectArgs {
-    /// `[tokens, columns]` F32, contiguous: the scores ([`IndexScores`]).
+    /// `[tokens, columns]` of the descriptor's score type, contiguous: the scores
+    /// ([`IndexScores`]).
     pub scores: Operand,
     /// `[tokens]` U32: the groups each token sees, which bound the blocks a row of its request's
     /// own groups ranks and whose newest the block mode pins.
@@ -433,13 +499,20 @@ impl Op for IndexSelect {
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let d = descriptor;
-        if d.pool == 0 || d.tile == 0 || (d.pool > 1 && d.candidates > 0) {
+        if d.pool == 0
+            || d.tile == 0
+            || (d.pool > 1 && d.candidates > 0)
+            || !matches!(d.scores, DType::F32 | DType::BF16)
+        {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "blocks of {} columns over candidates of {}, in passes of {}: the block mode \
-                     ranks unrestricted scores",
-                    d.pool, d.candidates, d.tile
+                    "blocks of {} columns over candidates of {}, in passes of {}, of {} scores: \
+                     the block mode ranks unrestricted FP32 or BF16 scores",
+                    d.pool,
+                    d.candidates,
+                    d.tile,
+                    abi::name(d.scores)
                 ),
             ));
         }
@@ -447,7 +520,7 @@ impl Op for IndexSelect {
         args.scores.require_rank(Self::NAME, 2)?;
         let (tokens, columns) = (args.scores.dim(0), args.scores.dim(1));
         args.scores
-            .require_row(Self::NAME, DType::F32, columns)
+            .require_row(Self::NAME, d.scores, columns)
             .map_err(|error| Error::argument(Self::NAME, format!("scores: {error}")))?;
         args.visible
             .require_shape(Self::NAME, &[tokens])
@@ -514,6 +587,7 @@ impl Op for IndexSelect {
         stream: &Stream,
     ) -> Result<()> {
         let tokens = args.scores.dim(0);
+
         let unread = Operand::unread();
 
         let mut arguments = Arguments::new(Self::NAME);
@@ -748,6 +822,25 @@ mod tests {
         assert_eq!(
             IndexSelectDescriptor::new(8, 0).to_string(),
             "pool_8_candidates_0_tile_4096"
+        );
+
+        // DeepSeek's BF16 scores, and their selection.
+        let rounded = IndexScoresDescriptor {
+            scores: DType::BF16,
+            ..restricted
+        };
+        assert_eq!(
+            rounded.to_string(),
+            "dtype_bf16_keys_mxfp4_heads_32_width_128_groups_64_block_256_weighted_true_\
+             query_mxfp4_candidates_8_scores_bf16"
+        );
+        assert_eq!(
+            IndexSelectDescriptor {
+                scores: DType::BF16,
+                ..IndexSelectDescriptor::new(1, 8)
+            }
+            .to_string(),
+            "pool_1_candidates_8_tile_4096_scores_bf16"
         );
 
         let attention = IndexedAttentionDescriptor {

@@ -25,7 +25,8 @@ scores of a handful of values, where nearly everything ties; rows with
 fewer finite scores than are kept, whose surplus slots are ``-1``; the block
 mode over a column count no block divides, whose newest visible block is
 pinned whatever its scores; and scores of candidate blocks, some unnamed,
-mapped back to their groups. The device cases are the model's: decode rows
+mapped back to their groups; and BF16 scores, which are ranked by their FP32
+values and tie far more often. The device cases are the model's: decode rows
 over 2^20 scores keeping 512, and 131072 blocks of 8 keeping 2048.
 """
 
@@ -95,9 +96,12 @@ def reference(scores, visible, kept, pool=1, candidates=None, block=0):
 WORDS = ("scores", "visible", "candidates", "out", "columns", "kept")
 
 
-def key(pool, block, tile):
-    """The descriptor key `IndexSelectDescriptor` prints."""
-    return f"pool_{pool}_candidates_{block}_tile_{tile}"
+def key(pool, block, tile, scores="f32"):
+    """The descriptor key `IndexSelectDescriptor` prints: the scores' type
+    only for BF16 scores.
+    """  # noqa: D205
+    text = f"pool_{pool}_candidates_{block}_tile_{tile}"
+    return text + ("_scores_bf16" if scores == "bf16" else "")
 
 
 def launch(
@@ -241,6 +245,25 @@ def test_candidate_columns_map_back_to_their_groups(
         scores, visible, 50, candidates=candidates, block=block
     )
     assert_kept("candidates", got, expected)
+
+
+def test_bf16_scores_rank_by_their_values_and_ties_keep_the_lower_columns(
+    torch_device, stated_launch, launch_target
+):
+    stated = stated_launch(
+        "index_select", key(1, 0, TILE, "bf16"), launch_target
+    )
+    generator = torch.Generator().manual_seed(8)
+    # Scores of a few hundred BF16 values over 3000 columns: the kept
+    # count falls inside a tie, and a -inf tail past the second row's count.
+    scores = (torch.randn(2, 3000, generator=generator) * 3).to(torch.bfloat16)
+    visible = torch.tensor([3000, 2100], dtype=torch.int32)
+    scores[1, 2100:] = float("-inf")
+
+    got = launch(None, scores, visible, 300, torch_device, stated=stated)
+    assert_kept(
+        "bf16 scores", got, reference(scores.to(torch.float32), visible, 300)
+    )
 
 
 def test_the_key_the_operator_prints_compiles_the_block_mode(

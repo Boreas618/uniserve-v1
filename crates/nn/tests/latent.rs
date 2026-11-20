@@ -413,6 +413,7 @@ fn the_index_scores_weight_their_heads_and_keep_to_the_candidates() {
                     weights: Some(&tensor(&weights, (1, HEADS), DType::F32)),
                     query: Format::Bf16,
                     candidates,
+                    scores: DType::F32,
                 },
             )
             .unwrap(),
@@ -444,6 +445,58 @@ fn the_index_scores_weight_their_heads_and_keep_to_the_candidates() {
         f32::NEG_INFINITY,
     ];
     assert_scores(&restricted, &expected);
+}
+
+/// BF16 scores round where DeepSeek's indexer rounds: each head's product, its weighted value
+/// and the FP32 sum of the heads, each to BF16 by nearest even. The values are chosen so that
+/// each rounding meets a tie between two BF16 values and moves the score off the FP32 one.
+#[test]
+fn bf16_scores_round_each_head_its_weighting_and_their_sum() {
+    const WIDTH: usize = 32;
+    const HEADS: usize = 4;
+    let keys = tensor(&[1.0_f32; WIDTH], (1, 1, WIDTH), DType::BF16);
+    let table = int(vec![0_u32], (1, 1));
+    let plane = Plane {
+        records: &keys,
+        table: &table,
+        format: Format::Bf16,
+        layout: Layout::Page,
+    };
+    // Against keys of ones each head's product is the sum of its query: 1 + 2⁻⁸, 3, 2⁻⁶ and
+    // -1, the last rectified to nothing.
+    let mut query = vec![0.0_f32; HEADS * WIDTH];
+    query[0] = 1.0;
+    query[1] = 1.0 / 256.0;
+    query[WIDTH] = 3.0;
+    query[2 * WIDTH] = 1.0 / 64.0;
+    query[3 * WIDTH] = -1.0;
+    let weights = [1.0_f32, 1.0 + 1.0 / 128.0, -1.0, 5.0];
+    let call = |scores| {
+        values(
+            &functional::index_scores(
+                &tensor(&query, (1, HEADS, WIDTH), DType::BF16),
+                plane,
+                &int(vec![0_u32], 1),
+                &int(vec![1_u32], 1),
+                IndexScoring {
+                    weights: Some(&tensor(&weights, (1, HEADS), DType::F32)),
+                    query: Format::Bf16,
+                    candidates: None,
+                    scores,
+                },
+            )
+            .unwrap(),
+        )[0]
+    };
+
+    // FP32: every product and the sum exact.
+    let exact = (1.0 + 1.0 / 256.0) + 3.0 * (1.0 + 1.0 / 128.0) - 1.0 / 64.0;
+    assert_eq!(call(DType::F32), exact);
+    // BF16: head 0's 1 + 2⁻⁸ lies midway between 1 and 1 + 2⁻⁷ and keeps the even 1; head 1's
+    // weighted 3 + 3 · 2⁻⁷ lies midway between 3 + 2⁻⁶ and 3 + 2⁻⁵ and takes the even
+    // 3 + 2⁻⁵; their sum with head 2's -2⁻⁶, 4 + 2⁻⁶, lies midway between 4 and 4 + 2⁻⁵ and
+    // keeps the even 4.
+    assert_eq!(call(DType::BF16), 4.0);
 }
 
 #[test]
@@ -606,6 +659,7 @@ fn a_layer_states_its_kernels_at_the_models_shapes() {
                 weights: Some(&meta((TOKENS, 32), DType::F32)),
                 query: Format::Mxfp4,
                 candidates: None,
+                scores: DType::BF16,
             },
         )?;
         let selection = functional::index_select(&scores, &column(DType::U32), None, 1, 512)?;
@@ -649,10 +703,11 @@ fn a_layer_states_its_kernels_at_the_models_shapes() {
         ),
         (
             "index_scores",
-            "dtype_bf16_keys_mxfp4_heads_32_width_128_groups_32_block_256_weighted_true_query_mxfp4",
+            "dtype_bf16_keys_mxfp4_heads_32_width_128_groups_32_block_256_weighted_true_query_\
+             mxfp4_scores_bf16",
         ),
-        ("index_select", "pool_1_candidates_0_tile_4096"),
-        ("index_select", "pool_8_candidates_0_tile_4096"),
+        ("index_select", "pool_1_candidates_0_tile_4096_scores_bf16"),
+        ("index_select", "pool_8_candidates_0_tile_4096_scores_bf16"),
         (
             "rope_apply",
             "dtype_bf16_output_bf16_head_dim_512_heads_16_rotation_interleaved_rows_8_block_128_\
