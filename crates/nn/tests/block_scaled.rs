@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use nn::modules::{Linear, LinearConfig, Parallel};
+use nn::modules::{GroupedLinear, Linear, LinearConfig, Parallel};
 use nn::quantization::{Declaration, Mxfp8Part, Scheme};
 use nn::{Checkpoint, CpuWeights, DType, WeightLoader};
 use nn_testing::{tensor, values, write_checkpoint};
@@ -275,6 +275,67 @@ fn an_mxfp8_projection_is_the_product_its_codes_and_scales_state() {
                 assert!(
                     (got - exact).abs() <= exact.abs() * 2f64.powi(-8) + 1e-6,
                     "{case} [{row}, {output}]: {got} vs {exact}"
+                );
+            }
+        }
+    }
+}
+
+/// A grouped projection reads one block-scaled weight as the weights of its groups, each its block
+/// of rows, and computes each group's product of its slice of the encoded input, the groups'
+/// outputs side by side.
+#[test]
+fn a_grouped_projection_is_each_groups_product_of_its_codes_and_scales() {
+    let directory = tempfile::tempdir().unwrap();
+    export(directory.path(), deepseek());
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
+
+    // `proj.weight` [64, 256] as two groups of [32, 256]: an input row of two slices of 256.
+    let (n, k, groups) = (32_usize, 256_usize, 2_usize);
+    let codes = checkpoint.read("proj.weight").unwrap();
+    let blocks = checkpoint.read("proj.scale").unwrap();
+    let weight: Vec<f32> = (0..groups * n * k)
+        .map(|index| {
+            let (row, column) = (index / k, index % k);
+            e4m3_value(codes[index]) * scale(blocks[(row / 32) * (k / 32) + column / 32])
+        })
+        .collect();
+    let width = groups * k;
+    let x: Vec<f32> = (0..3 * width)
+        .map(|index| {
+            ((index * 7919 % 1000) as f32 / 125.0 - 4.0) * 2f32.powi((index / 32 % 9) as i32 - 4)
+        })
+        .collect();
+    let x = values(&tensor(&x, (3, width), DType::BF16));
+    let encoded = quantized(&x);
+
+    let projection =
+        GroupedLinear::load(k as u32, n as u32, groups as u32, loader.root().pp("proj")).unwrap();
+    let out = values(
+        &projection
+            .forward(&tensor(&x, (3, width), DType::BF16))
+            .unwrap(),
+    );
+
+    for row in 0..3 {
+        for group in 0..groups {
+            for channel in 0..n {
+                let exact: f64 = (0..k)
+                    .map(|column| {
+                        f64::from(encoded[row * width + group * k + column])
+                            * f64::from(weight[(group * n + channel) * k + column])
+                    })
+                    .sum();
+                let got = f64::from(out[row * groups * n + group * n + channel]);
+                // One rounding of the FP32 sum into BF16.
+                assert!(
+                    (got - exact).abs() <= exact.abs() * 2f64.powi(-8) + 1e-6,
+                    "[{row}, group {group}, {channel}]: {got} vs {exact}"
                 );
             }
         }

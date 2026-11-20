@@ -240,6 +240,17 @@ pub fn tf32x3(reduction: u64) -> u64 {
     21 + (3 * reduction).div_ceil(1024)
 }
 
+/// The roundings beyond an `n`-term FP32 dot product's that a single-pass TF32 product costs
+/// when one operand is exact in TF32 (a 16-bit value) and the other is an FP32 value the tensor
+/// cores read as TF32: `2¹⁴`, the `extra` of [`Tolerance::split_dot`].
+///
+/// tcgen05's `kind::tf32` product multiplies an FP32 operand's sign, exponent and ten leading
+/// significand bits (rounded to them by a TF32 tensor map, or truncated by the read), so the
+/// value it multiplies is within `2⁻¹⁰|b|` of `b`; the product of it and an exact operand is
+/// exact in FP32 and within `2⁻¹⁰·|ab| = 2¹⁴·u·|ab|` of `ab`, `u = 2⁻²⁴`, so the `n` products
+/// together lie within `2¹⁴·u·Σ|aᵢbᵢ|` of exact.
+pub const TF32_SINGLE: u64 = 1 << 14;
+
 /// An `f64` bound as the `f32` a tolerance is stored in.
 fn relative(value: f64) -> f32 {
     value as f32

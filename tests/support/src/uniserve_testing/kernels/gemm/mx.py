@@ -171,6 +171,7 @@ class GemmCall(ctypes.Structure):
         ("m", ctypes.c_int64),
         ("n", ctypes.c_int64),
         ("k", ctypes.c_int64),
+        ("groups", ctypes.c_int64),
         ("input_scale_stride", ctypes.c_int64),
         ("weight_scale_stride", ctypes.c_int64),
         ("multiprocessors", ctypes.c_int64),

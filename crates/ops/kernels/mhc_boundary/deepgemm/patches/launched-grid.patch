@@ -1,0 +1,118 @@
+--- a/deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh
+@@ -169,12 +169,12 @@
+     // Local initialization can overlap the preceding grid, but persistent split barriers cannot.
+     cudaGridDependencySynchronize();
+     if (warp_idx == kFirstPostWGIdx * kNumWarpsPerWG + 1 and cute::elect_one_sync()) {
+-        for (uint32_t m_block_idx = blockIdx.x; m_block_idx < num_m_blocks; m_block_idx += kNumSMs)
++        for (uint32_t m_block_idx = blockIdx.x; m_block_idx < num_m_blocks; m_block_idx += gridDim.x)
+             sched::mega_mhc::Mix::init(gmem_split_barriers, m_block_idx);
+     }
+     if constexpr (kIsShifted) {
+         if (warp_idx == kFirstPostWGIdx * kNumWarpsPerWG and cute::elect_one_sync()) {
+-            for (uint32_t m_block_idx = blockIdx.x; m_block_idx < num_m_blocks; m_block_idx += kNumSMs)
++            for (uint32_t m_block_idx = blockIdx.x; m_block_idx < num_m_blocks; m_block_idx += gridDim.x)
+                 sched::mega_mhc::Norm::init(gmem_split_barriers, m_block_idx);
+         }
+     }
+@@ -193,7 +193,7 @@
+             RingPipeline<kNumStages> pipeline;
+ 
+             if (cute::elect_one_sync()) {
+-                for (uint32_t task_idx = blockIdx.x; task_idx < num_tasks; task_idx += kNumSMs) {
++                for (uint32_t task_idx = blockIdx.x; task_idx < num_tasks; task_idx += gridDim.x) {
+                     const uint32_t split_idx = task_idx % kNumSplits;
+                     const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
+                     const uint32_t m_idx = task_idx / kNumSplits * BLOCK_M;
+@@ -241,7 +241,7 @@
+             RingPipeline<kNumAStages> a_pipeline;
+             RingPipeline<kNumAccumStages> accum_pipeline;
+ 
+-            for (uint32_t task_idx = blockIdx.x; task_idx < num_tasks; task_idx += kNumSMs) {
++            for (uint32_t task_idx = blockIdx.x; task_idx < num_tasks; task_idx += gridDim.x) {
+                 const uint32_t split_idx = task_idx % kNumSplits;
+                 const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
+ 
+@@ -315,7 +315,7 @@
+                 __syncwarp();
+             }
+ 
+-            for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += kNumSMs, task_phase ^= 1u) {
++            for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += gridDim.x, task_phase ^= 1u) {
+                 const uint32_t split_idx = task_idx % kNumSplits;
+                 const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
+                 const uint32_t m_block_idx = task_idx / kNumSplits;
+@@ -332,7 +332,7 @@
+                     const uint32_t k_idx = get_task_k_begin(split_idx) + k_block_idx * BLOCK_K;
+                     const uint32_t m_idx = m_block_idx * BLOCK_M;
+                     const bool should_prefetch_next_coeff =
+-                        k_block_idx == num_task_k_blocks - 1 and task_idx + kNumSMs < num_tasks;
++                        k_block_idx == num_task_k_blocks - 1 and task_idx + gridDim.x < num_tasks;
+ 
+                     // Wait for a reusable slot before entering the final store-drain overlap window.
+                     if (should_prefetch_next_coeff)
+@@ -352,7 +352,7 @@
+                         cute::tma_store_arrive();
+                         // Issue next-task coefficients here to avoid competing with the task's main TMA wave.
+                         if (should_prefetch_next_coeff)
+-                            issue_coeff_tma((task_idx + kNumSMs) / kNumSplits * BLOCK_M, next_coeff_stage_idx);
++                            issue_coeff_tma((task_idx + gridDim.x) / kNumSplits * BLOCK_M, next_coeff_stage_idx);
+ 
+                         // Complete the destination writes before releasing this IO stage.
+                         ptx::tma_store_wait<0>();
+@@ -414,7 +414,7 @@
+             // Each Post worker maps to one WG; offset them so their A stages interleave.
+             a_pipeline.advance(kPostWorkerIdx);
+ 
+-            for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += kNumSMs, task_phase ^= 1u) {
++            for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += gridDim.x, task_phase ^= 1u) {
+                 const uint32_t split_idx = task_idx % kNumSplits;
+                 const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
+ 
+@@ -577,7 +577,7 @@
+ 
+         RingPipeline<kNumAccumStages> accum_pipeline;
+ 
+-        for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += kNumSMs, task_phase ^= 1u) {
++        for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += gridDim.x, task_phase ^= 1u) {
+             const uint32_t m_block_idx = task_idx / kNumSplits;
+             if (warp_idx_in_wg == 0)
+                 sched::mega_mhc::Mix::wait_init<kNumSplits>(gmem_split_barriers, m_block_idx);
+@@ -659,7 +659,7 @@
+             cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
+             const uint32_t warp_idx_in_mix_wg = warp_idx - kMixWGIdx * kNumWarpsPerWG;
+             for (uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + warp_idx_in_mix_wg;
+-                 token_idx < norm_args.num_tokens; token_idx += kNumSMs * kNumWarpsPerWG)
++                 token_idx < norm_args.num_tokens; token_idx += gridDim.x * kNumWarpsPerWG)
+                 epilogue::mega_mhc::run_mix_task<kHidden, true>(
+                     workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
+         }
+--- a/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh
++++ b/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh
+@@ -165,7 +165,7 @@
+             if (cute::elect_one_sync())
+                 task_ticket = atomicAdd(&smem.next_norm_task_ticket, 1u);
+             task_ticket = ptx::exchange(task_ticket, 0);
+-            const uint32_t token_idx = blockIdx.x + task_ticket * kNumSMs;
++            const uint32_t token_idx = blockIdx.x + task_ticket * gridDim.x;
+             token_indices[wg_idx_in_cta] = token_idx;
+ 
+             // Mix is warp-sized; only its Pre coefficients must be broadcast.
+@@ -395,7 +395,7 @@
+                                             uint64_t* gmem_split_barriers,
+                                             const NormArgs& norm_args,
+                                             const uint32_t& lane_idx) {
+-    constexpr uint32_t kNumTasksPerGridWave = kNumSMs * kNumWarpsPerWG;
++    const uint32_t kNumTasksPerGridWave = gridDim.x * kNumWarpsPerWG;
+     constexpr uint32_t kNumHiddenPacks = kHidden / kHiddenPerNormPack;
+     const uint32_t num_token_pairs = math::ceil_div(norm_args.num_tokens, kNumTokensPerShiftedNormTask);
+     // Only subdivide underfilled FP8 grids when a token pair can span multiple CTAs.
+--- a/deep_gemm/include/deep_gemm/scheduler/mega_mhc.cuh
++++ b/deep_gemm/include/deep_gemm/scheduler/mega_mhc.cuh
+@@ -14,5 +14,5 @@
+ struct SplitBarrier {
+     static CUTLASS_DEVICE uint64_t* get_ptr(uint64_t* gmem_split_barriers, const uint32_t m_block_idx) {
+-        const auto line_idx = static_cast<uint64_t>(kBarrierIndex) * kNumMaxMBlocks + m_block_idx;
++        const auto line_idx = static_cast<uint64_t>(m_block_idx) * kNumSplitBarriers + kBarrierIndex;
+         return math::advance_ptr<uint64_t>(gmem_split_barriers, line_idx * kSplitBarrierLineBytes);
+     }

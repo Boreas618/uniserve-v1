@@ -11,7 +11,8 @@
 //! sel     = indexer(x, qr, c)                    an index source; any other reads the last one's
 //! store(c)                                       a source: rotated, encoded compressed entries
 //! o       = attention(q, kv, window ∪ sel)       the window written first, o rotated back
-//! out     = wo_b(‖_g wo_a[g](o[:, g]))           eight groups of 4096 → 1024 each, then 8192 → d
+//! out     = wo_b(‖_g wo_a[g](o[:, g]))           eight groups of 4096 → 1024 each, one launch,
+//!                                                then 8192 → d
 //! ```
 //!
 //! Every block-scaled projection is an MXFP8 [`Linear`]: its activation is encoded per 32 by the
@@ -22,8 +23,8 @@
 use nn::family::{INDEX_KEY, Record};
 use nn::functional::{self, Plane, Ring, Selected};
 use nn::modules::{
-    Candidates, Compressed, Compressor, CompressorConfig, Indexer, IndexerConfig, LatentAttention,
-    LatentAttentionConfig, LatentBatch, Linear, LinearConfig, Parallel,
+    Candidates, Compressed, Compressor, CompressorConfig, GroupedLinear, Indexer, IndexerConfig,
+    LatentAttention, LatentAttentionConfig, LatentBatch, Linear, LinearConfig, Parallel,
 };
 use nn::{DType, KvCache, Result, Split, Tensor, VarBuilder};
 
@@ -98,8 +99,9 @@ pub struct Attention {
     attention: LatentAttention,
     compressor: Option<Compressor>,
     indexer: Option<Indexer>,
-    /// `wo_a`'s groups: group `g` projects heads `g · heads / groups ..` to `o_lora`.
-    wo_a: Vec<Linear>,
+    /// `wo_a`, one grouped projection: group `g` projects heads `g · heads / groups ..` to
+    /// `o_lora`.
+    wo_a: GroupedLinear,
     wo_b: Linear,
 }
 
@@ -196,18 +198,14 @@ impl Attention {
         };
 
         // `wo_a` is `[groups · o_lora, heads · head_dim / groups]`: group `g`'s rows are its
-        // block of the output channels.
+        // block of the output channels, and its columns the outputs of its heads.
         let groups = attention.o_groups;
-        let wo_a = (0..groups)
-            .map(|group| {
-                linear(
-                    heads * head_dim / groups,
-                    groups * attention.o_lora_rank,
-                    Parallel::Column(Split::new(groups, group)?),
-                    vb.pp("wo_a"),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let wo_a = GroupedLinear::load(
+            heads * head_dim / groups,
+            attention.o_lora_rank,
+            groups,
+            vb.pp("wo_a"),
+        )?;
         let wo_b = linear(
             groups * attention.o_lora_rank,
             hidden,
@@ -360,18 +358,12 @@ impl Attention {
                 &inputs.window.workspace,
             )?;
 
-            // The grouped output projection: each group's heads to its rank, then together.
-            let groups = self.wo_a.len();
-            let grouped = attended.reshape((tokens, groups, heads * head_dim / groups))?;
+            // The grouped output projection: each group's heads to its rank, the groups'
+            // outputs side by side, then together.
             let projected = self
                 .wo_a
-                .iter()
-                .enumerate()
-                .map(|(group, projection)| {
-                    projection.forward(&grouped.narrow(1, group, 1)?.squeeze(1)?.contiguous()?)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            self.wo_b.forward(&Tensor::cat(&projected, 1)?)
+                .forward(&attended.reshape((tokens, heads * head_dim))?)?;
+            self.wo_b.forward(&projected)
         };
 
         nn::profiler::range(ATTENTION, &format!("layers.{}.attn", self.layer), forward)

@@ -578,7 +578,7 @@ fn a_profile_run_states_the_block_a_call_of_its_tokens_launches() {
                 "dtype_bf16_streams_4_hidden_5120_iterations_20_post_true_tokens_{block}_block_64"
             )
         );
-        // A split call clears its arrival counters first.
+        // A call clears its arrival words first.
         assert_eq!(recording.launches[0].0, "fill", "{tokens} tokens");
     }
 }

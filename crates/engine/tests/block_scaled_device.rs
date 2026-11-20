@@ -1,5 +1,5 @@
-//! A block-scaled release on a device: DeepSeek-V4.1-Flash's layer-3 projections and one of its
-//! routed experts, loaded through `nn::WeightLoader` over a GPU's weight store as a rank loads
+//! A block-scaled release on a device: DeepSeek-V4.1-Flash's layer-3 projections, its grouped
+//! output projection and one of its routed experts, loaded through `nn::WeightLoader` over a GPU's weight store as a rank loads
 //! them and computed by the MXFP8 and MXFP4 kernels, against the products of the checkpoint's
 //! values dequantized on the host.
 //!
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use engine::memory::client::{StorageClient, StorageLaunch};
 use engine::memory::weights::WeightStore;
 use nn::functional;
-use nn::modules::Linear;
+use nn::modules::{GroupedLinear, Linear};
 use nn::quantization::Declaration;
 use nn::{Checkpoint, MetaWeights, RetainedWeights, WeightLoader};
 use ops::Op;
@@ -55,6 +55,12 @@ const HIDDEN: usize = 5120;
 const QUERY_RANK: usize = 1280;
 const KEY_VALUE: usize = 512;
 const INTERMEDIATE: usize = 2304;
+
+/// The release's grouped output projection `wo_a`: eight groups, each of the outputs of eight
+/// heads of 512 (4096) to a rank of 1024.
+const OUTPUT_GROUPS: usize = 8;
+const GROUP_WIDTH: usize = 4096;
+const OUTPUT_RANK: usize = 1024;
 
 /// The layer the cases read, and the routed expert of it.
 const LAYER: &str = "layers.3";
@@ -408,6 +414,82 @@ fn a_released_fp8_projection_is_the_product_of_its_dequantized_weights() -> Outc
         TOKENS as u64,
         outputs as u32,
         HIDDEN as u32,
+        1,
+    ));
+    let peak = want
+        .iter()
+        .fold(0.0_f64, |peak, value| peak.max(value.abs())) as f32;
+    let outside: Vec<usize> = (0..want.len())
+        .filter(|&index| !tolerance.allows_within(peak, want[index] as f32, got[index] as f32))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "{} of {} outputs outside {tolerance:?} of the peak {peak}; first [{}, {}]: {} for {}",
+        outside.len(),
+        want.len(),
+        outside[0] / outputs,
+        outside[0] % outputs,
+        got[outside[0]],
+        want[outside[0]],
+    );
+    Ok(())
+}
+
+/// The release's grouped output projection (`wo_a`, eight groups of 4096 → 1024) is, group for
+/// group, the product of the group's rows of its block-scaled weight with the MXFP8 encoding of
+/// the group's slice of the attention's output, to the accumulation and output rounding of a
+/// 4096-term FP32 dot product, the groups' outputs side by side.
+#[test]
+#[ignore = "requires a GPU, a Build Server and the released checkpoint"]
+fn a_released_grouped_projection_is_each_groups_product_of_its_dequantized_weights() -> Outcome {
+    let width = OUTPUT_GROUPS * GROUP_WIDTH;
+    let (attended, bytes) = hidden_rows(TOKENS * width, 43);
+    let attention = format!("{LAYER}.attn");
+
+    let got = on_release(
+        |loader| {
+            GroupedLinear::load(
+                GROUP_WIDTH as u32,
+                OUTPUT_RANK as u32,
+                OUTPUT_GROUPS as u32,
+                loader.root().pp(&attention).pp("wo_a"),
+            )
+        },
+        &[(&bytes, &[TOKENS, width], DType::BF16)],
+        |projection, inputs| Ok(vec![projection.forward(&inputs[0])?]),
+        |stream, outputs| Ok(bf16_values(&host_bytes(stream, &outputs[0])?)),
+    )?;
+
+    let checkpoint = release();
+    let weight = fp8_weight(
+        &checkpoint,
+        &format!("{attention}.wo_a"),
+        OUTPUT_GROUPS * OUTPUT_RANK,
+        GROUP_WIDTH,
+    );
+    let outputs = OUTPUT_GROUPS * OUTPUT_RANK;
+    let want: Vec<f64> = attended
+        .chunks(width)
+        .flat_map(|row| {
+            // A row's groups are whole 32-element blocks of it, so their encoding is the row's.
+            let encoded = encoded(row);
+            (0..OUTPUT_GROUPS)
+                .flat_map(|group| {
+                    let rows =
+                        group * OUTPUT_RANK * GROUP_WIDTH..(group + 1) * OUTPUT_RANK * GROUP_WIDTH;
+                    let slice = &encoded[group * GROUP_WIDTH..(group + 1) * GROUP_WIDTH];
+                    products(&weight[rows], GROUP_WIDTH, slice).0
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // The product's own bound (`Mxfp8Gemm::tolerance`).
+    let tolerance = Mxfp8Gemm::tolerance(&GemmDescriptor::new(
+        TOKENS as u64,
+        OUTPUT_RANK as u32,
+        GROUP_WIDTH as u32,
+        OUTPUT_GROUPS as u32,
     ));
     let peak = want
         .iter()

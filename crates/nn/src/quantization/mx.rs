@@ -201,7 +201,9 @@ impl BlockScaled {
 pub struct Mxfp8Weight {
     /// `[rows, columns]` E4M3: the codes, as the checkpoint stores them.
     pub codes: Tensor,
-    /// The UE8M0 scales, one per 32 elements of each row, in [`Self::layout`].
+    /// The UE8M0 scales, one per 32 elements of each row, in [`Self::layout`]; a grouped
+    /// product's weight ([`WeightLoader::mxfp8_groups`]) holds them as the table of its groups'
+    /// rows side by side along the contraction.
     pub scales: Tensor,
     /// The layout the scales are published in.
     pub layout: ScaleLayout,
@@ -423,6 +425,105 @@ impl WeightLoader<'_> {
                 linear.extend(loader.row_scales(part, scale)?);
             }
             Ok(Cow::Owned(arranged(&linear, height, width, layout)))
+        })?;
+
+        Ok(Mxfp8Weight {
+            codes,
+            scales,
+            layout,
+        })
+    }
+
+    /// The block-scaled weight `weight`, `[groups · n, k]`, read as the weight of a grouped
+    /// product (`mxfp8_gemm` of `groups` groups, group `g` its rows `g · n ..`): its E4M3 codes
+    /// as stored, and its scales repeated over their rows and published in `layout` as the table
+    /// of the `[n, groups · k]` matrix whose column block `g` is group `g`'s rows, which is where
+    /// the grouped product reads each group's scales. `name` is the matrix's logical name.
+    ///
+    /// # Errors
+    ///
+    /// When `weight` is not an MXFP8 weight of the checkpoint, its rows are not `groups` whole
+    /// groups, its columns are not whole scale words, or its codes are all zero.
+    pub fn mxfp8_groups(
+        &self,
+        name: &str,
+        weight: &str,
+        groups: u64,
+        layout: ScaleLayout,
+    ) -> Result<Mxfp8Weight> {
+        if self.scheme(weight) != Scheme::Mxfp8 {
+            return Err(Error::weight(
+                weight,
+                "is read as an MXFP8 matrix, and the checkpoint does not store it as one"
+                    .to_owned(),
+            ));
+        }
+        let stored = self.checkpoint().locate(weight)?;
+        let (rows, columns) = (dim(&stored.shape, 0), dim(&stored.shape, 1));
+        if groups == 0
+            || !rows.is_multiple_of(groups)
+            || columns == 0
+            || !columns.is_multiple_of(WORD_ELEMENTS)
+        {
+            return Err(Error::weight(
+                weight,
+                format!(
+                    "a [{rows}, {columns}] weight read as {groups} groups of its rows: whole \
+                     groups, and columns in whole scale words of {WORD_ELEMENTS}"
+                ),
+            ));
+        }
+        let scale = self.block_scale_of(weight)?;
+
+        let codes_shape = extents(&[rows, columns]);
+        let codes = self.load(
+            name,
+            &WeightSource::Region {
+                tensor: weight.to_owned(),
+                start: 0,
+                shape: codes_shape.clone(),
+            },
+            WeightLayout::ROW_MAJOR,
+            &codes_shape,
+            Some(DType::F8E4M3),
+            true,
+        )?;
+
+        // The scales: the weight's rows of one scale per 32 elements, each group's row `j` laid
+        // beside the other groups' row `j`, then arranged.
+        let n = rows / groups;
+        let published = layout.shape(n, groups * columns);
+        let scales_shape = extents(&published);
+        let key = WeightKey {
+            files: self.identities(std::slice::from_ref(&scale))?,
+            dtype: layout.dtype(),
+            layout: scales_key(layout),
+            tensors: vec![
+                format!("{weight}[groups {groups}]__{PRODUCER}_scales"),
+                scale.clone(),
+            ],
+            start: 0,
+            shape: scales_shape.clone(),
+            stride: None,
+            provenance: None,
+        };
+        let part = Mxfp8Part {
+            weight: weight.to_owned(),
+            rows: 0..rows,
+            columns: 0..columns,
+        };
+        let scales = self.publish_computed(&key, &scales_shape, |loader| {
+            let linear = loader.row_scales(&part, &scale)?;
+            let blocks = (columns / u64::from(BLOCK)) as usize;
+            let mut beside = Vec::with_capacity(linear.len());
+            for row in 0..n {
+                for group in 0..groups {
+                    let stored_row = (group * n + row) as usize;
+                    beside
+                        .extend_from_slice(&linear[stored_row * blocks..(stored_row + 1) * blocks]);
+                }
+            }
+            Ok(Cow::Owned(arranged(&beside, n, groups * columns, layout)))
         })?;
 
         Ok(Mxfp8Weight {

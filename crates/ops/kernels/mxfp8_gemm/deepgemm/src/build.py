@@ -16,7 +16,9 @@ The steps:
    ``patches/launched-grid.patch`` applied: the persistent scheduler strides by
    the launched grid rather than the compiled multiprocessor count;
 2. choose the tile (:func:`choose`) for ``m`` the descriptor's row class, the
-   descriptor's ``n`` and ``k``, and the manifest's ``multiprocessors``;
+   descriptor's ``n``, ``k`` and ``groups`` (a grouped product is DeepGEMM's
+   batched form, whose blocks are every group's), and the manifest's
+   ``multiprocessors``;
 3. compile the entry unit with the tile as its definitions, against the staged
    headers and the CUTLASS of the ``flashinfer-python`` distribution, as
    DeepGEMM's run-time compiler compiles its kernels (the pin's
@@ -172,9 +174,15 @@ def _candidates(m: int, n: int, k: int, multiprocessors: int) -> list[Layout]:
     return found
 
 
-def _rank(m: int, n: int, multiprocessors: int, layout: Layout):
-    """DeepGEMM's comparison of two tiles, as a sort key (smaller is better)."""
-    blocks = math.ceil(m / layout.block_m) * math.ceil(n / layout.block_n)
+def _rank(m: int, n: int, groups: int, multiprocessors: int, layout: Layout):
+    """DeepGEMM's comparison of two tiles, as a sort key (smaller is better).
+
+    A grouped product's blocks are every group's (``get_layout_info`` counts
+    ``get_expected_num_groups``).
+    """
+    blocks = (
+        math.ceil(m / layout.block_m) * math.ceil(n / layout.block_n) * groups
+    )
     waves = math.ceil(blocks / multiprocessors)
     last = blocks % multiprocessors or multiprocessors
     return (
@@ -190,14 +198,17 @@ def _rank(m: int, n: int, multiprocessors: int, layout: Layout):
     )
 
 
-def choose(m: int, n: int, k: int, multiprocessors: int) -> Tile:
-    """The tile DeepGEMM's run-time heuristic picks for an ``[m, n, k]`` GEMM.
+def choose(m: int, n: int, k: int, groups: int, multiprocessors: int) -> Tile:
+    """The tile DeepGEMM's run-time heuristic picks for ``groups`` products.
 
-    The candidates are taken in DeepGEMM's enumeration order and the first of
+    Each product is ``[m, n, k]``: one, or the groups of a batched product. The
+    candidates are taken in DeepGEMM's enumeration order and the first of
     the best is kept, as its comparison keeps the incumbent on a tie.
     """
     candidates = _candidates(m, n, k, multiprocessors)
-    layout = min(candidates, key=lambda one: _rank(m, n, multiprocessors, one))
+    layout = min(
+        candidates, key=lambda one: _rank(m, n, groups, multiprocessors, one)
+    )
 
     load_block_m = layout.block_m // layout.cluster_n
     load_block_n = layout.block_n // layout.cluster_m
@@ -243,6 +254,7 @@ def definitions(request: Request, tile: Tile) -> dict[str, cuda.Definition]:
     return {
         "UNISERVE_N": request.field("n"),
         "UNISERVE_K": request.field("k"),
+        "UNISERVE_GROUPS": request.field("groups"),
         "UNISERVE_BLOCK_M": layout.block_m,
         "UNISERVE_BLOCK_N": layout.block_n,
         "UNISERVE_BLOCK_K": BLOCK_K,
@@ -275,6 +287,7 @@ def compile(request: Request) -> None:
         request.field("rows"),
         request.field("n"),
         request.field("k"),
+        request.field("groups"),
         request.parameters["multiprocessors"],
     )
     if tile.shared_memory > request.target.shared_memory:

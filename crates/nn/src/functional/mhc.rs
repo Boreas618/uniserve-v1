@@ -242,23 +242,17 @@ impl Fused for BoundaryCall<'_> {
             pending.is_some(),
             tokens as u64,
         );
-        // A split launch's partials and arrival counters; the counters start at zero, and the
-        // kernel leaves them there.
-        let splits = descriptor.splits(tokens as u64) as usize;
-        let (partials, counters) = if splits > 1 {
-            let counters = fresh(
-                &[descriptor.token_blocks(tokens as u64) as usize],
-                DType::I32,
-            )?;
-            counters.zero_set()?;
-            let partials = fresh(
-                &[splits, tokens, descriptor.partial_width() as usize],
-                DType::F32,
-            )?;
-            (Some(partials), Some(counters))
-        } else {
-            (None, None)
-        };
+        // The workspace of either form of program: the splits' partials, and the arrival words,
+        // which start at zero.
+        let partials = fresh(
+            &[descriptor.partial_floats(tokens as u64) as usize],
+            DType::F32,
+        )?;
+        let counters = fresh(
+            &[descriptor.counter_words(tokens as u64) as usize],
+            DType::I32,
+        )?;
+        counters.zero_set()?;
 
         let pending = match pending {
             Some((output, previous)) => Some(Pending {
@@ -283,8 +277,8 @@ impl Fused for BoundaryCall<'_> {
                 next_pre: ops::operand(&mixes.pre)?,
                 next_post: ops::operand(&mixes.post)?,
                 next_comb: ops::operand(&mixes.comb)?,
-                partials: partials.as_ref().map(ops::operand).transpose()?,
-                counters: counters.as_ref().map(ops::operand).transpose()?,
+                partials: ops::operand(&partials)?,
+                counters: ops::operand(&counters)?,
                 rms_eps: mixing.rms_eps,
                 eps: mixing.eps,
                 norm_eps,

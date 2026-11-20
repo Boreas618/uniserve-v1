@@ -5,7 +5,9 @@
 //! the config's split, so a tensor-parallel block reduces once, in its down projection. A
 //! checkpoint stores the two input projections either as two modules or as one module whose rows
 //! hold the value half and then the gate half ([`GateUp`]); the gated product reads them as two
-//! tensors or as the packed rows, at the [`Rounding`] the model's reference evaluates.
+//! tensors or as the packed rows, at the [`Rounding`] the model's reference evaluates. Two modules
+//! a rank holds whole may be read as one product of packed rows ([`GateUp::Merged`]), which
+//! computes both in one launch.
 
 use tensor::{D, Module, Tensor};
 
@@ -27,6 +29,16 @@ pub enum GateUp {
     },
     /// One module whose rows hold the value (up) half and then the gate half.
     ValueFirst(&'static str),
+    /// Two modules, the gate and the up projection, read as one product whose rows hold the up
+    /// module's and then the gate module's ([`Linear::load_merged`]): one launch where
+    /// [`GateUp::Split`] takes two, on a rank that holds the gated width whole. A split rank
+    /// reads them as two.
+    Merged {
+        /// The module whose output the activation applies to.
+        gate: &'static str,
+        /// The module whose output the activation multiplies.
+        up: &'static str,
+    },
 }
 
 /// The widths, checkpoint names and arithmetic of an [`Mlp`], and this rank's share of it.
@@ -114,6 +126,19 @@ impl Mlp {
 
         let inputs = match config.gate_up {
             GateUp::Split { gate, up } => Inputs::Split {
+                gate: input(gate, config.intermediate)?,
+                up: input(up, config.intermediate)?,
+            },
+            GateUp::Merged { gate, up } if config.split.size() == 1 => {
+                Inputs::ValueFirst(Linear::load_merged(
+                    vb.clone(),
+                    &[up, gate],
+                    config.hidden,
+                    &[config.intermediate, config.intermediate],
+                    config.bias,
+                )?)
+            }
+            GateUp::Merged { gate, up } => Inputs::Split {
                 gate: input(gate, config.intermediate)?,
                 up: input(up, config.intermediate)?,
             },

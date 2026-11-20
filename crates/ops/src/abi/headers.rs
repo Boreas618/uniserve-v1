@@ -19,7 +19,7 @@ use cbindgen::{Builder, Config, DocumentationStyle, ItemType, Language, RenameRu
 use expect_test::{ExpectFile, expect_file};
 
 use super::Layout;
-use crate::{attention, conv, fp4, frame, gemm, kernel, moe, mx};
+use crate::{attention, conv, fp4, frame, gemm, kernel, mhc, moe, mx};
 
 /// The committed header `$name`: a file of the kernel-source library in this crate's tree,
 /// named from the crate's directory so the comparison reads this tree's file wherever the
@@ -271,6 +271,12 @@ fn headers() -> Vec<Header> {
             "The call structure of `mxfp8_gemm`'s packages",
         )
         .structure::<mx::Call>("uniserve_mxfp8_gemm_call"),
+        Header::new(
+            committed!("uniserve_mhc_boundary.h"),
+            "src/mhc.rs",
+            "The call structure of `mhc_boundary`'s native packages",
+        )
+        .structure::<mhc::BoundaryCall>("uniserve_mhc_boundary_call"),
         Header::new(
             committed!("uniserve_frame_moments.h"),
             "src/frame.rs",

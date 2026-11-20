@@ -45,14 +45,15 @@
 //! The operators' constants are the method's: the post-mix's factor of two and the order of the
 //! Sinkhorn steps. The epsilons and the iteration count are the checkpoint's.
 
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::{Key, row_tile};
-use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
@@ -81,6 +82,28 @@ const BOUNDARY_COLUMNS: u32 = 64;
 /// device sizes the same workspace a launch on any GPU takes, and two devices compute the same
 /// partial sums in the same order.
 const BOUNDARY_PROGRAMS_PER_TOKEN: u64 = 16;
+
+/// Tokens one block of the fused form of [`MhcBoundary`] holds: the rows of its tensor-core
+/// product of the mixes (a native backend's, DeepGEMM's `sm100_mega_mhc`).
+pub const FUSED_TOKENS: u64 = 64;
+
+/// Columns of each stream one step of the fused form reads.
+const FUSED_COLUMNS: u32 = 64;
+
+/// The programs the fused form's split rule plans for: the fewest multiprocessors an SM100 part
+/// has. A property of the rule, not of the device, so the profile run on the meta device sizes
+/// the workspace a launch on any GPU takes ([`BoundaryDescriptor::fused_splits`]).
+const FUSED_PROGRAMS: u64 = 148;
+
+/// The fewest and the most column splits of a fused block.
+const FUSED_SPLITS: (u64, u64) = (16, 64);
+
+/// The bytes of one arrival word of the fused form: a line of its own, so two blocks' arrivals
+/// never share one.
+const FUSED_LINE: u64 = 128;
+
+/// The arrival lines of one fused block: its mixes' and its normalization's.
+const FUSED_BARRIERS: u64 = 2;
 
 /// Columns of each stream one program of [`MhcPost`] writes.
 const POST_COLUMNS: u32 = 1024;
@@ -207,8 +230,8 @@ impl BoundaryDescriptor {
     /// the token blocks alone fill the grid the kernel aims at, else as many as bring the grid to
     /// it, at most one per column block.
     ///
-    /// A launch of more than one split takes a workspace of `[splits, tokens, partial_width]`
-    /// FP32 partials and one zeroed I32 arrival counter per token block
+    /// A launch of more than one split publishes `[splits, tokens, partial_width]` FP32
+    /// partials and counts each token block's arrivals in one zeroed I32 word
     /// ([`BoundaryArgs::partials`]); the last split of a block to arrive sums the partials in
     /// split order and finishes the block, so the result does not depend on which arrives last.
     pub fn splits(&self, tokens: u64) -> u32 {
@@ -217,6 +240,55 @@ impl BoundaryDescriptor {
         let programs = BOUNDARY_PROGRAMS_PER_TOKEN * u64::from(self.tokens);
 
         programs.div_ceil(blocks).clamp(1, columns) as u32
+    }
+
+    /// The blocks of [`FUSED_TOKENS`] tokens of the fused form over `tokens` tokens.
+    pub fn fused_blocks(&self, tokens: u64) -> u64 {
+        tokens.div_ceil(FUSED_TOKENS)
+    }
+
+    /// The parts each fused block's column steps are split into, for `tokens` tokens: the
+    /// fewest equal shares of the steps that still bring the blocks' tasks to the programs the
+    /// rule plans for ([`FUSED_PROGRAMS`]), between 16 and 64 parts (DeepGEMM's
+    /// `get_num_splits`).
+    ///
+    /// Each split of a block publishes its partial mixes and its sums of the squares of the
+    /// streams and of the collapsed input, `[blocks, splits, 64, mixes + 2]` FP32, and arrives
+    /// on the block's two arrival lines; the block's mixes and its normalization sum the
+    /// partials in split order.
+    pub fn fused_splits(&self, tokens: u64) -> u32 {
+        let (fewest, most) = FUSED_SPLITS;
+        let steps = u64::from(self.hidden / FUSED_COLUMNS).max(1);
+        let blocks = self.fused_blocks(tokens).max(1);
+        let planned = (FUSED_PROGRAMS / blocks).clamp(fewest, most);
+
+        steps.div_ceil(steps.div_ceil(planned)) as u32
+    }
+
+    /// FP32 values the partials of a launch over `tokens` tokens hold: the larger of what the
+    /// split form ([`Self::splits`]) and the fused form ([`Self::fused_splits`]) publish.
+    pub fn partial_floats(&self, tokens: u64) -> u64 {
+        let split = u64::from(self.splits(tokens)) * tokens * u64::from(self.partial_width());
+        let fused = self.fused_blocks(tokens)
+            * u64::from(self.fused_splits(tokens))
+            * FUSED_TOKENS
+            * u64::from(self.mixes() + 2);
+
+        split.max(fused)
+    }
+
+    /// The first I32 word of the fused form's arrival lines in the arrival words of a launch
+    /// over `tokens` tokens: after the split form's one word per token block, at a whole line.
+    pub fn fused_counters(&self, tokens: u64) -> u64 {
+        let words = FUSED_LINE / 4;
+
+        self.token_blocks(tokens).div_ceil(words) * words
+    }
+
+    /// I32 words of the arrival words of a launch over `tokens` tokens, zero on entry: the split
+    /// form's one per token block, then the fused form's two lines per fused block.
+    pub fn counter_words(&self, tokens: u64) -> u64 {
+        self.fused_counters(tokens) + self.fused_blocks(tokens) * FUSED_BARRIERS * FUSED_LINE / 4
     }
 }
 
@@ -277,12 +349,15 @@ pub struct BoundaryArgs {
     pub next_post: Operand,
     /// `[tokens, streams, streams]` FP32, contiguous: receives its combination matrix.
     pub next_comb: Operand,
-    /// `[splits, tokens, partial_width]` FP32, contiguous: the partials of a split launch, which
-    /// is present exactly when the launch splits ([`BoundaryDescriptor::splits`]).
-    pub partials: Option<Operand>,
-    /// `[token_blocks]` I32, zero on entry: the arrival count of each token block's splits,
-    /// present exactly with the partials; the last split to arrive sets it back to zero.
-    pub counters: Option<Operand>,
+    /// `[partial_floats]` FP32, contiguous ([`BoundaryDescriptor::partial_floats`]): the
+    /// partials the kernel's splits publish, `[splits, tokens, partial_width]` of the split form
+    /// or `[blocks, splits, 64, mixes + 2]` of the fused form, from the first value.
+    pub partials: Operand,
+    /// `[counter_words]` I32, contiguous, zero on entry ([`BoundaryDescriptor::counter_words`]):
+    /// the split form's arrival count of each token block, which its last split sets back to
+    /// zero, then from [`BoundaryDescriptor::fused_counters`] the fused form's two 128-byte
+    /// arrival lines per block, which its launch tags with its grid's identity.
+    pub counters: Operand,
     /// `ε_rms`, added to the mean square of the flattened streams.
     pub rms_eps: f32,
     /// `ε` of the pre-mix and of every Sinkhorn step.
@@ -291,17 +366,153 @@ pub struct BoundaryArgs {
     pub norm_eps: f32,
 }
 
+/// The call structure the fused form's entry takes, declared to its package as
+/// `uniserve_mhc_boundary_call` (`uniserve_mhc_boundary.h`, generated with its layout asserted:
+/// [`abi`]).
+///
+/// The operands' device addresses as [`BoundaryArgs`] states them (the pending output's three
+/// and the written streams always present: the fused form writes an output back), the launch's
+/// extents, the split count [`BoundaryDescriptor::fused_splits`] states, the multiprocessors
+/// of the device its persistent grid covers, and the three epsilons.
+#[repr(C)]
+#[derive(abi::Layout)]
+pub struct BoundaryCall {
+    /// `[tokens, streams, hidden]` 16-bit: the streams the boundary reaches.
+    pub streams: *const c_void,
+    /// `[tokens, hidden]` 16-bit: the pending sub-layer output.
+    pub output: *const c_void,
+    /// `[tokens, streams]` FP32: its post-mix.
+    pub post: *const c_void,
+    /// `[tokens, streams, streams]` FP32: its combination matrix.
+    pub comb: *const c_void,
+    /// `[tokens, streams, hidden]` 16-bit: receives the written streams.
+    pub written: *mut c_void,
+    /// `[mixes, streams · hidden]` FP32: the connection's projection.
+    pub weight: *const c_void,
+    /// `[3]` FP32: the scales of the pre-mix, the post-mix and the combination logits.
+    pub scale: *const c_void,
+    /// `[mixes]` FP32: the mixes' biases.
+    pub base: *const c_void,
+    /// `[tokens, streams]` FP32: the carried pre-mix the input is read with.
+    pub pre: *const c_void,
+    /// `[hidden]` 16-bit: the input norm's gain.
+    pub norm: *const c_void,
+    /// `[tokens, hidden]` 16-bit: receives the normalized input.
+    pub input: *mut c_void,
+    /// `[tokens, streams]` FP32: receives the pre-mix.
+    pub next_pre: *mut c_void,
+    /// `[tokens, streams]` FP32: receives the post-mix.
+    pub next_post: *mut c_void,
+    /// `[tokens, streams, streams]` FP32: receives the combination matrix.
+    pub next_comb: *mut c_void,
+    /// `[blocks, splits, 64, mixes + 2]` FP32: the splits' partials.
+    pub partials: *mut c_void,
+    /// `[blocks, 2, 32]` I32, zero or tagged by an earlier grid: the blocks' arrival lines.
+    pub lines: *mut c_void,
+    pub tokens: i64,
+    /// Streams of the residual.
+    pub stream_count: i64,
+    /// Elements of one stream.
+    pub hidden: i64,
+    /// Sinkhorn iterations of the combination matrix.
+    pub iterations: i64,
+    /// Column splits of each block ([`BoundaryDescriptor::fused_splits`]).
+    pub splits: i64,
+    /// The multiprocessors of the device the launch runs on: the persistent grid's extent.
+    pub multiprocessors: i64,
+    /// `ε_rms` of the flattened streams' mean square.
+    pub rms_eps: f32,
+    /// `ε` of the pre-mix and of every Sinkhorn step.
+    pub eps: f32,
+    /// The epsilon of the input's RMS normalization.
+    pub norm_eps: f32,
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
+}
+
+impl NativeCall for BoundaryCall {
+    fn message(&self) -> Option<&str> {
+        abi::message(&self.error)
+    }
+}
+
 /// One boundary between two sub-layers of an mHC residual: the pending output written back, the
 /// next sub-layer's mixes, and its input read with the carried pre-mix and normalized (module
 /// documentation).
 ///
-/// A program holds a block of tokens. It walks its columns of every stream once: it writes the
-/// pending output back, adds the columns' products into the mixes (Triton's three-pass TF32
-/// product of the FP32 projection), their squares into the mixes' statistic, and stores the
-/// columns of the collapsed input with their squares summed. A block's columns are split across
-/// several programs when there are few tokens; the last to arrive finishes the block: it scales
-/// the mixes, splits them, runs the Sinkhorn iterations and normalizes the collapsed input.
+/// Two kinds of program serve it. A **split** program (a cubin, the Triton package) holds a block
+/// of tokens and walks its columns of every stream once: it writes the pending output back, adds
+/// the columns' products into the mixes (Triton's three-pass TF32 product of the FP32
+/// projection), their squares into the mixes' statistic, and stores the columns of the collapsed
+/// input with their squares summed. A block's columns are split across several programs when
+/// there are few tokens; the last to arrive finishes the block: it scales the mixes, splits
+/// them, runs the Sinkhorn iterations and normalizes the collapsed input. Its grid is the
+/// operator's, `(token blocks, splits)`.
+///
+/// A **fused** program (a native module, DeepGEMM's persistent `sm100_mega_mhc`) does the same
+/// over blocks of [`FUSED_TOKENS`] tokens whose column steps it splits into
+/// [`BoundaryDescriptor::fused_splits`] parts: warp-specialized roles load the streams, the
+/// pending output and the projection by TMA, write the output back, multiply the written
+/// streams with the projection on the tensor cores (one TF32 pass, the projection read truncated
+/// to TF32), and finish each block once its splits arrived. Its call is [`BoundaryCall`], which
+/// carries the multiprocessors its persistent grid covers. It computes the shifted boundary of
+/// four 16-bit streams that writes a pending output back.
 pub struct MhcBoundary;
+
+impl MhcBoundary {
+    /// Calls the fused form's native entry with `args`, which [`MhcBoundary::check`] accepted.
+    fn launch_fused(
+        kernel: &Kernel,
+        descriptor: &BoundaryDescriptor,
+        args: &BoundaryArgs,
+        stream: &Stream,
+    ) -> Result<()> {
+        let pending = args.pending.as_ref().ok_or_else(|| {
+            Error::argument(
+                Self::NAME,
+                "the fused form writes a pending output back, and none was given".to_owned(),
+            )
+        })?;
+        let tokens = args.streams.dim(0);
+        let address = |operand: &Operand| operand.ptr.address() as usize as *const c_void;
+        let target = |operand: &Operand| operand.ptr.address() as usize as *mut c_void;
+        // The fused form's lines follow the split form's words, at a whole line.
+        let lines = args.counters.ptr.address() + descriptor.fused_counters(tokens) * 4;
+
+        let mut call = BoundaryCall {
+            streams: address(&args.streams),
+            output: address(&pending.output),
+            post: address(&pending.post),
+            comb: address(&pending.comb),
+            written: target(&pending.streams),
+            weight: address(&args.weight),
+            scale: address(&args.scale),
+            base: address(&args.base),
+            pre: address(&args.pre),
+            norm: address(&args.norm),
+            input: target(&args.input),
+            next_pre: target(&args.next_pre),
+            next_post: target(&args.next_post),
+            next_comb: target(&args.next_comb),
+            partials: target(&args.partials),
+            lines: lines as usize as *mut c_void,
+            tokens: tokens as i64,
+            stream_count: i64::from(descriptor.streams),
+            hidden: i64::from(descriptor.hidden),
+            iterations: i64::from(descriptor.iterations),
+            splits: i64::from(descriptor.fused_splits(tokens)),
+            multiprocessors: i64::from(stream.device().multiprocessors()?),
+            rms_eps: args.rms_eps,
+            eps: args.eps,
+            norm_eps: args.norm_eps,
+            error: [0; MESSAGE],
+        };
+        // SAFETY: `BoundaryCall` is the structure this package's entry declares, generated from
+        // this definition with its layout asserted, and every address is an operand `check`
+        // accepted at the extents the call states.
+        unsafe { kernel.native(&mut call, stream) }
+    }
+}
 
 impl Op for MhcBoundary {
     const NAME: &'static str = proto::module::operator::MHC_BOUNDARY;
@@ -410,35 +621,20 @@ impl Op for MhcBoundary {
             &[tokens, n, n],
         )?;
 
-        let splits = u64::from(descriptor.splits(tokens));
-        match (&args.partials, &args.counters, splits > 1) {
-            (Some(partials), Some(counters), true) => {
-                contiguous(
-                    Self::NAME,
-                    "partials",
-                    partials,
-                    DType::F32,
-                    &[splits, tokens, u64::from(descriptor.partial_width())],
-                )?;
-                contiguous(
-                    Self::NAME,
-                    "arrival counters",
-                    counters,
-                    DType::I32,
-                    &[descriptor.token_blocks(tokens)],
-                )?;
-            }
-            (None, None, false) => {}
-            _ => {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!(
-                        "{tokens} tokens split into {splits} programs a block take partials and \
-                         arrival counters exactly when they split"
-                    ),
-                ));
-            }
-        }
+        contiguous(
+            Self::NAME,
+            "partials",
+            &args.partials,
+            DType::F32,
+            &[descriptor.partial_floats(tokens)],
+        )?;
+        contiguous(
+            Self::NAME,
+            "arrival words",
+            &args.counters,
+            DType::I32,
+            &[descriptor.counter_words(tokens)],
+        )?;
         Ok(())
     }
 
@@ -449,9 +645,15 @@ impl Op for MhcBoundary {
         stream: &Stream,
     ) -> Result<()> {
         let tokens = args.streams.dim(0);
+        // A native module is the fused form, with its call; a cubin the split form, with the
+        // operator's grid.
+        if !kernel.is_cubin() {
+            return Self::launch_fused(kernel, descriptor, &args, stream);
+        }
+
         let splits = descriptor.splits(tokens);
-        // An operand the descriptor or the split count leaves unread is passed as the streams,
-        // which the kernel never reads through it.
+        // An operand the descriptor leaves unread is passed as the streams, which the kernel
+        // never reads through it.
         let unread = &args.streams;
         let pending = args.pending.as_ref();
 
@@ -477,8 +679,8 @@ impl Op for MhcBoundary {
             .view("next_pre_ptr", &args.next_pre)
             .view("next_post_ptr", &args.next_post)
             .view("next_comb_ptr", &args.next_comb)
-            .view("partials_ptr", args.partials.as_ref().unwrap_or(unread))
-            .view("counters_ptr", args.counters.as_ref().unwrap_or(unread))
+            .view("partials_ptr", &args.partials)
+            .view("counters_ptr", &args.counters)
             .u64("tokens", tokens)
             .u32("splits", splits)
             .f32("rms_eps", args.rms_eps)
@@ -503,10 +705,11 @@ impl Op for MhcBoundary {
             next_pre: twins.shadow_of(args.next_pre),
             next_post: twins.shadow_of(args.next_post),
             next_comb: twins.shadow_of(args.next_comb),
-            partials: args.partials.map(|partials| twins.shadow_of(partials)),
-            // The counters are zero on entry and on exit: a twin starts from the real ones'
-            // zeros, so the paired launch finds them as the serving one does.
-            counters: args.counters.map(|counters| twins.in_place(counters)),
+            partials: twins.shadow_of(args.partials),
+            // The split form's words are zero on entry and on exit, and the fused form tags its
+            // lines with the identity of its grid, which no other launch's tags equal: a twin
+            // reads the real words as the serving launch does.
+            counters: twins.in_place(args.counters),
             ..args
         }
     }
@@ -521,15 +724,19 @@ impl Op for MhcBoundary {
 /// The written streams are a sum of `n + 1` FP32 terms of mixed signs rounded once. The input is
 /// the collapsed sum, rounded once (which two implementations may round to neighbouring values),
 /// then normalized by a `d`-term FP32 mean square and rounded again. The mixes are an `n·d`-term
-/// product of mixed signs in FP32, a three-pass TF32 product's excess counted
-/// ([`tolerance::tf32x3`]), which the scale, the sigmoids (1/4-Lipschitz) and the Sinkhorn
-/// normalizations (each divides by a sum of positive terms, which a relative error passes
-/// through) carry to values below two; the bound is the largest of the three.
+/// product of mixed signs in FP32 whose products cost the excess of the least exact product
+/// either form computes: the split form's three-pass TF32 product ([`tolerance::tf32x3`]) or
+/// the fused form's single pass, the 16-bit streams exact in TF32 and the projection read as
+/// TF32 ([`tolerance::TF32_SINGLE`]), the larger. The scale, the sigmoids
+/// (1/4-Lipschitz) and the Sinkhorn normalizations (each divides by a sum of positive terms,
+/// which a relative error passes through, an approximate reciprocal adding a few units of FP32
+/// to each) carry it to values below two; the bound is the largest of the three.
 fn boundary_tolerance(dtype: DType, streams: u32, hidden: u32) -> Tolerance {
     let width = u64::from(streams) * u64::from(hidden);
     let written = Tolerance::rounding(u64::from(streams) + 1, DType::F32, dtype);
     let input = Tolerance::rounding(u64::from(hidden), DType::F32, dtype);
-    let mixes = Tolerance::split_dot(width, tolerance::tf32x3(width), DType::F32, DType::F32);
+    let excess = tolerance::tf32x3(width).max(tolerance::TF32_SINGLE);
+    let mixes = Tolerance::split_dot(width, excess, DType::F32, DType::F32);
 
     Tolerance {
         atol: tolerance::underflow(dtype) as f32,
@@ -822,8 +1029,6 @@ mod tests {
 
     fn args(descriptor: &BoundaryDescriptor, tokens: u64) -> BoundaryArgs {
         let (n, d, m) = (4, 5120, u64::from(descriptor.mixes()));
-        let splits = u64::from(descriptor.splits(tokens));
-        let split = splits > 1;
 
         BoundaryArgs {
             streams: view(DType::BF16, &[tokens, n, d]),
@@ -842,13 +1047,8 @@ mod tests {
             next_pre: view(DType::F32, &[tokens, n]),
             next_post: view(DType::F32, &[tokens, n]),
             next_comb: view(DType::F32, &[tokens, n, n]),
-            partials: split.then(|| {
-                view(
-                    DType::F32,
-                    &[splits, tokens, u64::from(descriptor.partial_width())],
-                )
-            }),
-            counters: split.then(|| view(DType::I32, &[descriptor.token_blocks(tokens)])),
+            partials: view(DType::F32, &[descriptor.partial_floats(tokens)]),
+            counters: view(DType::I32, &[descriptor.counter_words(tokens)]),
             rms_eps: 1e-20,
             eps: 1e-6,
             norm_eps: 1e-20,
@@ -890,22 +1090,49 @@ mod tests {
         assert_eq!(splits(16384), 4);
     }
 
+    /// The fused form splits a block's 80 column steps into the fewest equal shares that bring
+    /// its blocks' tasks to 148 programs, between 16 and 64 (DeepGEMM's `get_num_splits`).
     #[test]
-    fn a_split_launch_takes_partials_and_counters_and_a_whole_one_none() {
+    fn the_fused_form_splits_few_blocks_more() {
+        let splits = |tokens| boundary(true, tokens).fused_splits(tokens);
+
+        // Up to three blocks: two shares of 40 steps.
+        assert_eq!(splits(1), 40);
+        assert_eq!(splits(192), 40);
+        // Four and five blocks: three shares; six and seven: four; then five shares of 16.
+        assert_eq!(splits(193), 27);
+        assert_eq!(splits(320), 27);
+        assert_eq!(splits(384), 20);
+        assert_eq!(splits(448), 20);
+        assert_eq!(splits(512), 16);
+        assert_eq!(splits(16384), 16);
+    }
+
+    /// The workspace holds either form's partials, and the fused form's arrival lines follow the
+    /// split form's words at a whole 128-byte line.
+    #[test]
+    fn the_workspace_holds_either_forms_partials_and_arrivals() {
+        let decode = boundary(true, 1);
+        // The fused form's 40 splits of a block of 64 tokens' 26 values, more than the split
+        // form's 80 splits of one token's 34.
+        assert_eq!(decode.partial_floats(1), 40 * 64 * 26);
+        assert_eq!(decode.fused_counters(1), 32);
+        assert_eq!(decode.counter_words(1), 32 + 2 * 32);
+
+        let prefill = boundary(true, 4096);
+        // The split form's 16 splits of every token's 34 values, more than the fused form's 16
+        // splits of 64 blocks of 64 tokens' 26.
+        assert_eq!(prefill.partial_floats(4096), 16 * 4096 * 34);
+        assert_eq!(prefill.fused_counters(4096), 64);
+        assert_eq!(prefill.counter_words(4096), 64 + 64 * 2 * 32);
+
         for tokens in [1, 16, 64, 4096] {
             let descriptor = boundary(true, tokens);
             MhcBoundary::check(&descriptor, &args(&descriptor, tokens)).unwrap();
         }
-
-        let descriptor = boundary(true, 1);
-        let mut missing = args(&descriptor, 1);
-        missing.counters = None;
-        assert!(MhcBoundary::check(&descriptor, &missing).is_err());
-
-        let mut whole = args(&descriptor, 1);
-        whole.partials = None;
-        whole.counters = None;
-        assert!(MhcBoundary::check(&descriptor, &whole).is_err());
+        let mut short = args(&decode, 1);
+        short.counters = view(DType::I32, &[decode.token_blocks(1)]);
+        assert!(MhcBoundary::check(&decode, &short).is_err());
     }
 
     #[test]

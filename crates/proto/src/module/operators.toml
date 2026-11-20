@@ -146,3 +146,9 @@ topk_softmax = 3
 # them as the call structure `uniserve_latent_attention_call`; an engine of the first version
 # launches every package as a Triton cubin.
 latent_attention = 2
+# The MXFP8 product computes groups of products in one launch: its descriptor states them and its
+# call carries their count after the contraction.
+mxfp8_gemm = 2
+# A boundary is served by a native fused program beside the split cubin: its call joins the cubin's
+# launch, and the workspace holds both forms' partials and arrival words.
+mhc_boundary = 2

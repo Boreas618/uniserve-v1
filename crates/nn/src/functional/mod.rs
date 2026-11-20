@@ -102,7 +102,7 @@ pub use moe::{
     moe_unpermute, route_gemm, route_gemm_mxfp4, route_gemm_nvfp4, sigmoid_gated_add_,
     topk_softmax,
 };
-pub use mx::{linear_mxfp8, mxfp8_quantize};
+pub use mx::{grouped_linear_mxfp8, linear_mxfp8, mxfp8_quantize};
 pub use ngram::{ngram_gate, ngram_hash};
 pub use noise::{philox_normal, philox_normal_like, philox_normal_rows};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};

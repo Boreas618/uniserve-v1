@@ -122,7 +122,8 @@ use crate::worker::completion::Waker;
 pub struct RunnerId(pub u32);
 
 /// What a runner computes, apart from how it serves: its buckets and the one forward that is run
-/// on the meta device, captured, rehearsed and run again before each replay, over its graphs.
+/// on the meta device, captured, rehearsed and, unless its host values are fixed, run again
+/// before each replay, over its graphs.
 ///
 /// A runner is one ([`Runner`]), and so is the second instance of its forward a runner makes for
 /// its worker's capture thread ([`Runner::capturer`]): the capture thread profiles, rehearses and
@@ -144,7 +145,7 @@ pub trait Forward: Send {
 
     /// The forward of one bucket over the runner's input tensors: the one function that is run
     /// on the meta device, rehearsed, captured, and run again by `prepare_inputs` before each
-    /// replay.
+    /// replay unless its host values are fixed ([`Forward::fixed_host_values`]).
     ///
     /// It computes under the context installed on the thread, reads the runner's input tensors
     /// at their fixed addresses and returns the forward's outputs in an order the runner fixes
@@ -155,6 +156,16 @@ pub trait Forward: Send {
     ///
     /// What the model refuses, or a bucket this runner does not state.
     fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>>;
+
+    /// Whether the host values the forward computes, which its host-to-device copies read,
+    /// follow from the bucket and the graph's kernels alone, as the copies themselves do: then a
+    /// replay's copies read the values its graph's capture computed, and `prepare_inputs` runs no
+    /// forward before the replay. A runner whose forward computes a host value from its own
+    /// state of the step (a bound, a timestep) answers `false`, the default, and its forward runs
+    /// again under the meta context before each replay.
+    fn fixed_host_values(&self) -> bool {
+        false
+    }
 
     /// Writes into `columns`, the bytes of the runner's input tensors in the layout of their
     /// device block, the inputs of an idle step of `bucket`: rows that address no slot, page,
