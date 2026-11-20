@@ -1481,17 +1481,36 @@ mod tests {
         while let Ok(request) = connection.recv_next::<wire::Request>() {
             let message = match request.request {
                 Some(Request::Cover(cover)) => cover_of(&service::lock(installed), &cover),
-                Some(Request::List(_)) => Message::Listing(wire::ListResponse {
-                    packages: service::lock(installed)
+                Some(Request::List(_)) => {
+                    let installed = service::lock(installed);
+                    // An engine revision launches every kernel operator installed here, at no
+                    // stated interface version (a vocabulary of the previous format).
+                    let mut operators: Vec<String> = installed
                         .iter()
-                        .map(|(op, backend, revision)| wire::PackageEntry {
-                            op: op.clone(),
-                            backend: backend.clone(),
-                            revision: *revision,
-                            ..Default::default()
+                        .filter(|(op, _, _)| {
+                            op != proto::module::ENGINE && op != proto::module::PROGRAM
                         })
-                        .collect(),
-                }),
+                        .map(|(op, _, _)| op.clone())
+                        .collect();
+                    operators.sort();
+                    operators.dedup();
+                    Message::Listing(wire::ListResponse {
+                        packages: installed
+                            .iter()
+                            .map(|(op, backend, revision)| wire::PackageEntry {
+                                op: op.clone(),
+                                backend: backend.clone(),
+                                revision: *revision,
+                                operators: if op == proto::module::ENGINE {
+                                    operators.clone()
+                                } else {
+                                    Vec::new()
+                                },
+                                ..Default::default()
+                            })
+                            .collect(),
+                    })
+                }
                 Some(Request::Prepare(prepare)) => {
                     let mut packages = Vec::new();
                     for requested in prepare.packages {

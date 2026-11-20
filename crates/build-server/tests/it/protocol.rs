@@ -163,6 +163,7 @@ fn rms_norm_cover() -> CoverRequest {
         keys: vec!["dtype_bf16".into()],
         pins: Default::default(),
         fixed: Vec::new(),
+        interface_version: None,
     }
 }
 

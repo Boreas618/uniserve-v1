@@ -1727,6 +1727,9 @@ fn selected(
             keys: unpinned,
             pins,
             fixed,
+            // The candidates are the set's own revisions, which its fixing held to the interface
+            // version its engine revision launches.
+            interface_version: None,
         })
         .with_context(|| format!("asking the Build Server which packages cover {op}'s keys"))?;
     for (package, keys) in coverage.covered {
