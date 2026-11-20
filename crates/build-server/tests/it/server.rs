@@ -808,6 +808,7 @@ fn a_module_set_resolves_from_a_shipped_store() {
                 keys: Vec::new(),
                 pins: Default::default(),
                 fixed: Vec::new(),
+                interface_version: None,
             })
             .unwrap()
             .candidates

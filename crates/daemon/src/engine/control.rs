@@ -1398,10 +1398,17 @@ pub(crate) fn prepare_node(
 /// deployment uses: the engine, the scheduling policy and every kernel operator the fixed engine
 /// revision launches, as the Build Server lists that revision's vocabulary ([`engine_operators`])
 /// rather than as this daemon's build knows operators, so the packages of an operator a later
-/// engine revision adds are fixed, pinned and moved by a newer revision like any other's.
-/// A package the deployment names, the engine, the policy or a pin of its `[kernels]` table,
-/// takes the revision it states, else its latest installed one; a pin of an operator the engine
-/// revision does not launch is refused. Every candidate of an operator is
+/// engine revision adds are fixed, pinned and moved by a newer revision like any other's. Each
+/// operator is asked at the version of its interface the vocabulary states, so only the package
+/// revisions that implement it are candidates: a revision of another version, installed for
+/// another engine revision, would be refused by this revision's engines when they load it, and
+/// is fixed for no epoch of this one. An engine revision whose vocabulary is of format 1
+/// (`build_server::manifest::VOCABULARY_FORMATS`) states no versions, and its operators are
+/// asked at none, so their candidates are each backend's latest revisions as that format's
+/// were. A package the deployment names, the engine, the policy or a
+/// pin of its `[kernels]` table, takes the revision it states, else its latest installed one (of
+/// the operator's version, for a pin); a pin of an operator the engine revision does not launch,
+/// or of a revision of another version, is refused. Every candidate of an operator is
 /// recorded as well, one slot per package with the package as its part, a pinned backend at its
 /// pinned revision: for each descriptor key the engine later asks `cover` to select among exactly
 /// these revisions, so a package or a revision installed after this call is run by nobody until
@@ -1413,7 +1420,8 @@ pub(crate) fn prepare_node(
 ///
 /// Fails when the Build Server cannot be reached, or holds no package, or not the revision, the
 /// deployment names for an interface, or refuses the pins of an operator, and when the
-/// deployment pins an operator the engine revision does not launch.
+/// deployment pins an operator the engine revision does not launch or a revision of another
+/// version of the operator's interface than the engine revision launches.
 pub fn with_store_modules(
     server: &BuildServer,
     filled: &crate::epoch::ModuleSet,
@@ -1427,21 +1435,48 @@ pub fn with_store_modules(
     })?;
 
     let mut complete = filled.clone();
-    fix_revision(&mut client, proto::module::ENGINE, &mut complete.engine)?;
+    // The engine and the programs state the versions of their interfaces in their modules, which
+    // their loaders check; their manifests state none to select by.
+    fix_revision(
+        &mut client,
+        proto::module::ENGINE,
+        None,
+        &mut complete.engine,
+    )?;
     let operators = engine_operators(&mut client, &complete.engine)?;
-    fix_revision(&mut client, proto::module::PROGRAM, &mut complete.policy)?;
+    fix_revision(
+        &mut client,
+        proto::module::PROGRAM,
+        None,
+        &mut complete.policy,
+    )?;
     if let Some(processing) = complete.processing.as_mut() {
-        fix_revision(&mut client, proto::module::PROGRAM, processing)?;
+        fix_revision(&mut client, proto::module::PROGRAM, None, processing)?;
     }
+    let engine = &complete.engine;
     for (slot, package) in &mut complete.kernels {
-        anyhow::ensure!(
-            operators.contains(&slot.op),
-            "`kernels.{}` names no operator engine {} revision {} launches",
-            slot.op,
-            complete.engine.backend,
-            complete.engine.revision
-        );
-        fix_revision(&mut client, &slot.op, package)?;
+        let operator = operators
+            .iter()
+            .find(|operator| operator.name == slot.op)
+            .with_context(|| {
+                format!(
+                    "`kernels.{}` names no operator engine {} revision {} launches",
+                    slot.op, engine.backend, engine.revision
+                )
+            })?;
+        fix_revision(&mut client, &slot.op, operator.interface_version, package).with_context(
+            || match operator.interface_version {
+                Some(version) => format!(
+                    "`kernels.{}` of engine {} revision {}, which launches version {version} of \
+                     the operator's interface",
+                    slot.op, engine.backend, engine.revision
+                ),
+                None => format!(
+                    "`kernels.{}` of engine {} revision {}",
+                    slot.op, engine.backend, engine.revision
+                ),
+            },
+        )?;
     }
     for operator in &operators {
         // The operator's pins, at their fixed revisions: a pinned backend is the operator's
@@ -1449,7 +1484,7 @@ pub fn with_store_modules(
         let pins = complete
             .kernels
             .iter()
-            .filter(|(slot, _)| slot.op == *operator)
+            .filter(|(slot, _)| slot.op == operator.name)
             .filter_map(|(slot, package)| {
                 let pin = proto::module::Pin {
                     backend: package.backend.clone(),
@@ -1458,7 +1493,14 @@ pub fn with_store_modules(
                 Some((slot.key.clone()?, pin))
             })
             .collect();
-        for candidate in candidates(&mut client, operator, pins, Vec::new())? {
+        let selected = candidates(
+            &mut client,
+            &operator.name,
+            operator.interface_version,
+            pins,
+            Vec::new(),
+        )?;
+        for candidate in selected {
             complete.kernels.insert(
                 proto::module::ModuleSlot {
                     op: candidate.op,
@@ -1476,10 +1518,11 @@ pub fn with_store_modules(
     Ok(complete)
 }
 
-/// The operators whose kernel packages the engine package revision `engine` launches, as the
-/// Build Server lists them with the revision: the vocabulary of the revision's own snapshot
-/// (`operators` of its manifest), which names every operator its executable was compiled with,
-/// whether or not this daemon's build knows it.
+/// The operators whose kernel packages the engine package revision `engine` launches, each with
+/// the version of its interface the revision launches, as the Build Server lists them with the
+/// revision: the vocabulary of the revision's own snapshot (`operators` of its manifest), which
+/// names every operator its executable was compiled with and the version it launches, whether
+/// or not this daemon's build knows the operator.
 ///
 /// # Errors
 ///
@@ -1487,7 +1530,7 @@ pub fn with_store_modules(
 fn engine_operators(
     client: &mut build_server::Client,
     engine: &proto::module::PackageRevision,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<build_server::manifest::Operator>> {
     client
         .list()
         .context("listing the Build Server's packages")?
@@ -1508,10 +1551,12 @@ fn engine_operators(
 
 /// The candidates the Build Server selects among for `op`: every installed package of the
 /// interface that `fixed` leaves a candidate, each at its latest revision, the revision `pins`
-/// state of a pinned backend, or the revision `fixed` states.
+/// state of a pinned backend, or the revision `fixed` states, of the interface version
+/// `interface_version` when it states one.
 fn candidates(
     client: &mut build_server::Client,
     op: &str,
+    interface_version: Option<u32>,
     pins: std::collections::BTreeMap<String, proto::module::Pin>,
     fixed: Vec<(String, u32)>,
 ) -> anyhow::Result<Vec<build_server::protocol::Package>> {
@@ -1524,23 +1569,39 @@ fn candidates(
             keys: Vec::new(),
             pins,
             fixed,
+            interface_version,
         })
         .with_context(|| format!("asking the Build Server for the packages of {op}"))?;
     Ok(coverage.candidates)
 }
 
 /// Fixes the revision of the package `package` names for `op`: the one it states, checked, or
-/// its latest installed one.
+/// its latest installed one; of the version `interface_version` of the operator's interface
+/// when it states one, so a stated revision of another version is refused.
 pub(crate) fn fix_revision(
     client: &mut build_server::Client,
     op: &str,
+    interface_version: Option<u32>,
     package: &mut proto::module::PackageRevision,
 ) -> anyhow::Result<()> {
     let stated = (package.revision != 0).then(|| (package.backend.clone(), package.revision));
-    let selected = candidates(client, op, Default::default(), stated.into_iter().collect())?
-        .into_iter()
-        .find(|candidate| candidate.backend == package.backend)
-        .with_context(|| format!("no {op} package {} is installed", package.backend))?;
+    let selected = candidates(
+        client,
+        op,
+        interface_version,
+        Default::default(),
+        stated.into_iter().collect(),
+    )?
+    .into_iter()
+    .find(|candidate| candidate.backend == package.backend)
+    .with_context(|| match interface_version {
+        Some(version) => format!(
+            "no {op} package {} implementing version {version} of the operator's interface is \
+             installed",
+            package.backend
+        ),
+        None => format!("no {op} package {} is installed", package.backend),
+    })?;
     package.revision = selected.revision;
     Ok(())
 }

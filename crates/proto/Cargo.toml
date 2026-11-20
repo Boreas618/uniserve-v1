@@ -39,7 +39,8 @@ toml.workspace = true
 prost-build.workspace = true
 protox.workspace = true
 sha2.workspace = true
-# The operator vocabulary the build compiles into `module::operator` (`src/module/operators.toml`).
+# The operator vocabulary and interface versions the build compiles into `module::operator`
+# (`src/module/operators.toml`).
 toml.workspace = true
 
 [lints]
