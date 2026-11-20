@@ -83,6 +83,12 @@ pub enum Event {
     Stepped { step: u64, duration: Duration },
     /// A page entered the cache, or its tier or whether a request holds it
     /// changed other than by a release or a hold: the page as it stands now.
+    ///
+    /// It also states a page the cache held when the instance started that
+    /// its snapshot did not carry (`Snapshot::pages`): such a page was last
+    /// used no later than every page the snapshot carried, and the instance's
+    /// first steps state those pages least recently used first, each before
+    /// any other event names it.
     Cached { page: PageView },
     /// A device page was used again by one more request; whether a request
     /// holds it did not change. The page is one the snapshot or a `Cached`

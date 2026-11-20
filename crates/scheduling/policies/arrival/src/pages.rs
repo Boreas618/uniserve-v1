@@ -7,6 +7,10 @@
 //! reads. Within each order the pages keep the order the whole cache's last uses give them: every
 //! event that moves a page to another order uses it now, so it joins its new order as the most
 //! recently used.
+//!
+//! The pages of the cache the policy learns after its snapshot, least recently used first
+//! (`scheduling::Event::Cached`), were used before every page it already knows: each kind of
+//! victim keeps them in an earlier order of its own, which a shortage reads first.
 
 use scheduling::{PageId, PageView};
 
@@ -19,6 +23,12 @@ const FREE: usize = 0;
 const HELD: usize = 1;
 /// The order of the pages on the host alone: what a host shortage takes.
 const HOST: usize = 2;
+/// The device pages no running request continues from that the policy learned after its
+/// snapshot, least recently used first: the first a device shortage takes.
+const FREE_EARLIER: usize = 3;
+/// The pages on the host alone that the policy learned after its snapshot, least recently used
+/// first: the first a host shortage takes.
+const HOST_EARLIER: usize = 4;
 
 /// The order a page belongs to by its view.
 fn order(view: &PageView) -> usize {
@@ -53,7 +63,7 @@ impl Page {
     /// Whether the page is one a step offloads: a device page no running request continues
     /// from.
     pub(crate) fn offloadable(&self) -> bool {
-        order(&self.view) == FREE
+        !self.view.on_host && self.view.evictable
     }
 }
 
@@ -66,7 +76,7 @@ pub(crate) struct Pages {
 impl Default for Pages {
     fn default() -> Self {
         Self {
-            orders: Lru::new(3),
+            orders: Lru::new(5),
         }
     }
 }
@@ -99,6 +109,18 @@ impl Pages {
         self.orders.insert(page.view.id, page, order);
     }
 
+    /// Records `page`, a page of the cache when the instance started that its snapshot did not
+    /// carry, as more recently used than the pages of its kind learned so, and less than every
+    /// other page: the policy learns them least recently used first.
+    pub(crate) fn earlier(&mut self, page: Page) {
+        let order = match order(&page.view) {
+            FREE => FREE_EARLIER,
+            HOST => HOST_EARLIER,
+            held => held,
+        };
+        self.orders.insert(page.view.id, page, order);
+    }
+
     /// Records `page` as used just now, with its view changed by `change` (a hit, a release, a
     /// hold): it is the most recently used of the order its view now names. `None`, and no
     /// change, for a page the cache does not hold.
@@ -121,11 +143,13 @@ impl Pages {
     /// The `need` least recently used device pages no running request continues from, or as
     /// many as there are.
     pub(crate) fn free_victims(&self, need: usize) -> impl Iterator<Item = PageId> + '_ {
-        self.orders.iter(FREE).take(need).map(|(page, _)| page)
+        let free = self.orders.iter(FREE_EARLIER).chain(self.orders.iter(FREE));
+        free.take(need).map(|(page, _)| page)
     }
 
     /// The `need` least recently used pages on the host alone, or as many as there are.
     pub(crate) fn host_victims(&self, need: usize) -> impl Iterator<Item = PageId> + '_ {
-        self.orders.iter(HOST).take(need).map(|(page, _)| page)
+        let host = self.orders.iter(HOST_EARLIER).chain(self.orders.iter(HOST));
+        host.take(need).map(|(page, _)| page)
     }
 }

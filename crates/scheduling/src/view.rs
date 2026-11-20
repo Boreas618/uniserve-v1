@@ -22,7 +22,11 @@ pub struct Snapshot {
     /// Every request the main process holds: queued, running, and those that
     /// finished with output events still retained.
     pub requests: Vec<RequestView>,
-    /// Every page of the device KV cache and of the host KV page pool.
+    /// The most recently used pages of the device KV cache and of the host KV
+    /// page pool, every page of a small cache: an instantiation decodes a
+    /// bounded share of a warm cache, and the instance's next steps state the
+    /// other pages as `Cached` events, least recently used first
+    /// ([`crate::Event::Cached`]).
     pub pages: Vec<PageView>,
     /// Every encoder cache entry.
     pub encodings: Vec<EncodingView>,

@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use scheduling::{
-    CallView, DispatchOutput, EncodingId, Event, Limits, PageId, PageView, Parameters, Phase,
-    PhaseClass, Policy, ReplicaView, RequestClass, RequestId, RequestStatus, RequestView, Room,
-    Shortage, Snapshot, Storage, Unstated, Victim, stated,
+    CallView, DispatchOutput, EncodingId, Event, Limits, Nanos, PageId, PageView, Parameters,
+    Phase, PhaseClass, Policy, ReplicaView, RequestClass, RequestId, RequestStatus, RequestView,
+    Room, Shortage, Snapshot, Storage, Unstated, Victim, stated,
 };
 
 use crate::budget::{Shares, Step, prefill_chunk, work_tokens};
@@ -79,6 +79,10 @@ pub struct Arrival {
     /// replaced is not offered again, since offering every page of a warm
     /// snapshot would cost the first steps what the cache holds.
     offers: VecDeque<PageId>,
+    /// The latest last use of the pages the snapshot carried: a page a `Cached` states that the
+    /// policy does not know, last used no later, is one the cache held when this instance
+    /// started (`Event::Cached`). `None` for a snapshot of no page.
+    horizon: Option<Nanos>,
     /// The encoder cache entries, least recently used first.
     encodings: Lru<EncodingId>,
     /// Whether the next step puts the media path's work first: the media path and the token path
@@ -113,6 +117,7 @@ impl TryFrom<Parameters> for Arrival {
             admission: Vec::new(),
             pages: Pages::default(),
             offers: VecDeque::new(),
+            horizon: None,
             encodings: Lru::new(1),
             media_first: false,
         })
@@ -306,8 +311,21 @@ impl Arrival {
 
     /// A page the mechanism states as it stands now (`Cached`): it is the most recently used,
     /// and it is offered to the host once it becomes a device page no request holds.
+    ///
+    /// A page the policy does not know that was last used no later than the snapshot's pages is
+    /// one of the cache when the instance started, which its snapshot did not carry: it was used
+    /// before every page the policy knows, and it waits for no offer, as a page the snapshot
+    /// states does not.
     fn state(&mut self, view: &PageView) {
         let known = self.pages.get(view.id);
+        if known.is_none()
+            && self
+                .horizon
+                .is_some_and(|horizon| view.last_used <= horizon)
+        {
+            self.pages.earlier(Page::stated(view));
+            return;
+        }
         let was = known.is_some_and(Page::offloadable);
         // A page that already waits keeps its place; restating it changes no offer.
         let queued = known.is_some_and(|known| known.queued);
@@ -396,6 +414,7 @@ impl Policy for Arrival {
         // The cache orders the snapshot states, least recently used first.
         let mut pages: Vec<&PageView> = state.pages.iter().collect();
         pages.sort_unstable_by_key(|page| (page.last_used.0, page.id.0));
+        self.horizon = pages.last().map(|page| page.last_used);
         self.pages = Pages::from_least_recent(pages);
         let mut encodings: Vec<(u64, EncodingId)> = state
             .encodings
@@ -1475,6 +1494,64 @@ mod tests {
             on_host: false,
             evictable,
         }
+    }
+
+    /// **A page the policy learns after its snapshot was used before every
+    /// page it knows.**
+    ///
+    /// The snapshot of a warm cache carries its most recently used pages, and
+    /// the instance's first steps state the others as `Cached`, least recently
+    /// used first: pages the policy does not know, last used no later than the
+    /// snapshot's (`Event::Cached`). Each is a shortage's victim before every
+    /// page the policy knew or used since, in the order it learned them, and
+    /// none waits for an offer, as no page the snapshot carried does. A page
+    /// given up since the snapshot, and one that enters the cache after it,
+    /// are the most recently used and are offered.
+    #[test]
+    fn a_page_learned_after_the_snapshot_was_used_before_every_page_known() {
+        let mut policy = instantiated(Instantiation {
+            parameters: arguments(QueueOrder::Arrival),
+            state: Snapshot {
+                pages: vec![page_view(10, 100, true), page_view(11, 110, true)],
+                ..Snapshot::default()
+            },
+        });
+        // A request takes page 10 and gives it up.
+        policy.observe(&[
+            Event::Held {
+                pages: vec![PageId(10)],
+            },
+            Event::Released {
+                pages: vec![PageId(10)],
+            },
+        ]);
+        // The cache's older pages, least recently used first, and a page that
+        // enters the cache now.
+        policy.observe(&[
+            Event::Cached {
+                page: page_view(1, 10, true),
+            },
+            Event::Cached {
+                page: page_view(2, 20, true),
+            },
+            Event::Cached {
+                page: page_view(20, 200, true),
+            },
+        ]);
+
+        let victims = policy.preempt(&Shortage {
+            kind: Storage::KvUnits,
+            need: 5,
+        });
+        let expected: Vec<Victim> = [1, 2, 11, 10, 20]
+            .into_iter()
+            .map(|id| Victim::Page(PageId(id)))
+            .collect();
+        assert_eq!(victims, expected);
+        assert_eq!(
+            policy.dispatch(&room(1024, 8)).offload,
+            vec![PageId(10), PageId(20)]
+        );
     }
 
     /// **A hold decides what restating each page as held decides.**
