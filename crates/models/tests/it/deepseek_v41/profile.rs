@@ -45,8 +45,11 @@ const FAMILIES: [Family; 1] = [models::deepseek_v41::family::FAMILY];
 /// Request slots of the recurrent state's buffers.
 const SLOTS: usize = 64;
 
-/// Members of the profiled expert union.
+/// Members of the profiled expert union of one host's four GPUs.
 const UNION: u32 = 4;
+
+/// Members of the profiled expert union of two hosts' eight GPUs.
+const UNION_OF_TWO_HOSTS: u32 = 8;
 
 /// The most tokens a rank's exchange carries in a step.
 const RANK_ROWS: u32 = 512;
@@ -61,13 +64,20 @@ const CONTEXT_PEAK: u64 = 4 << 30;
 /// The kernels a forward stated: `(operator, key)` pairs.
 type Keys = BTreeSet<(&'static str, String)>;
 
-/// The model of the release, meta-loaded for `placement`.
+/// The model of the release, meta-loaded for `placement`; prints the bytes of the weights the
+/// placement gives the rank.
 fn load(placement: &TextPlacement) -> Arc<dyn TextModel> {
     let checkpoint = DEEPSEEK_V41_FLASH.checkpoint();
     let store = MetaWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
-    text::load(&FAMILIES, &checkpoint, &mut loader, placement)
-        .unwrap_or_else(|error| panic!("{DEEPSEEK_V41_FLASH}: {error}"))
+    let model = text::load(&FAMILIES, &checkpoint, &mut loader, placement)
+        .unwrap_or_else(|error| panic!("{DEEPSEEK_V41_FLASH}: {error}"));
+    println!(
+        "experts {:?}: weights of {} bytes",
+        placement.experts,
+        store.bytes()
+    );
+    model
 }
 
 /// The meta group of the fields of `history` among `fields`, over `rows` rows of `row_pages`
@@ -101,15 +111,15 @@ fn group(
     group
 }
 
-/// The rows of an exchange over the union, `step_rows` rows a rank (a transport of at least
-/// `RANK_ROWS` rows a rank), as meta tensors.
-fn exchange(step_rows: u32) -> ExpertExchange {
+/// The rows of an exchange over a union of `ranks` members, `step_rows` rows a rank (a transport
+/// of at least `RANK_ROWS` rows a rank), as meta tensors.
+fn exchange(ranks: u32, step_rows: u32) -> ExpertExchange {
     let rank_rows = step_rows.max(RANK_ROWS);
-    let rows = (UNION * rank_rows) as usize;
+    let rows = (ranks * rank_rows) as usize;
     let hidden = 5120;
 
     ExpertExchange {
-        ranks: UNION,
+        ranks,
         attention: 0,
         rank_rows,
         step_rows,
@@ -145,7 +155,8 @@ fn step(
     union: Split,
 ) -> Recording {
     let row_pages = context.div_ceil(PAGE_TOKENS as usize).max(4);
-    let lent = (union.size() > 1).then(|| exchange(tokens.next_power_of_two() as u32));
+    let lent =
+        (union.size() > 1).then(|| exchange(union.size(), tokens.next_power_of_two() as u32));
 
     let (stepped, recording) = record(&axes(union), || {
         let batch = text::batch(
@@ -389,7 +400,7 @@ fn a_whole_rank_and_a_rank_of_an_expert_union_state_declared_kernels() {
 
     // A rank with no tokens of its own joins a step: every layer's experts, and the n-gram
     // lookups of layers 1 and 14 over the union.
-    let lent = exchange(8);
+    let lent = exchange(UNION, 8);
     let (joined, recording) = record(&axes(union), || member.join_expert_step(&lent));
     joined.expect("the join");
     let reads = recording
@@ -529,9 +540,42 @@ fn a_drafting_rank_states_declared_kernels_for_its_blocks() {
             );
         }
 
-        let lent = exchange(8);
+        let lent = exchange(UNION, 8);
         let (joined, recording) = record(&axes(experts), || drafter.join_expert_step(&lent));
         joined.expect("the drafter's join");
         assert!(recording.launches.is_empty(), "{:?}", recording.launches);
     }
+}
+
+/// A rank of the expert union of eight that two hosts of four GPUs form (DP8 attention): rank 5,
+/// the second host's second, holds 48 of every layer's 384 experts and three of each n-gram
+/// table's 24 hash heads. Its kernels are declared as the union of four's are, and a join runs
+/// every layer's exchange and the two n-gram lookups.
+#[test]
+#[ignore = "reads the release's headers through the Hugging Face cache"]
+fn a_rank_of_an_expert_union_of_two_hosts_states_declared_kernels() {
+    let union = Split::new(UNION_OF_TWO_HOSTS, 5).unwrap();
+    let member = load(&TextPlacement {
+        experts: union,
+        ..TextPlacement::WHOLE
+    });
+    assert_declarations(&*member);
+    assert!(member.expert_collectives());
+    buckets("union rank 5 of 8", &*member, union);
+
+    let lent = exchange(UNION_OF_TWO_HOSTS, 8);
+    let (joined, recording) = record(&axes(union), || member.join_expert_step(&lent));
+    joined.expect("the join");
+    let count = |name: &str| {
+        recording
+            .launches
+            .iter()
+            .filter(|(operator, _)| *operator == name)
+            .count()
+    };
+    assert_eq!(
+        (count("embedding_mxfp8"), count("expert_exchange")),
+        (2, 2 * 40)
+    );
+    assert_declared("the join", &recording.launches.iter().cloned().collect());
 }

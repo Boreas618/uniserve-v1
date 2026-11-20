@@ -449,12 +449,20 @@ impl StateMemory {
             ));
         }
 
+        // A state a forward from a block boundary reads nothing of keeps no checkpoint, and the
+        // cache no state group for it (`CacheLayout::with_state`); any other needs one.
+        let kept = layer_fields(&config.shapes)
+            .flatten()
+            .map(StateField::kept_bytes)
+            .sum::<nn::Result<u64>>()?;
         if layout.state_group().is_none() {
-            return Err(Error::Invalid(
-                "a model that keeps a recurrent state needs a state group".into(),
-            ));
-        }
-        if layout.state_bytes() == 0 || layout.checkpoints.len() != layers.len() {
+            if kept > 0 {
+                return Err(Error::Invalid(
+                    "a model that keeps a recurrent state a resume reads needs a state group"
+                        .into(),
+                ));
+            }
+        } else if layout.state_bytes() == 0 || layout.checkpoints.len() != layers.len() {
             return Err(Error::Invalid(format!(
                 "the cache's state units hold the checkpoints of {} recurrent layers, and the \
                  state keeps {}",
@@ -514,16 +522,22 @@ impl StateMemory {
         kernels: Arc<ops::Generation>,
     ) -> Result<Self> {
         let mut state = Self::meta(config, cache)?;
-        let snapshot =
-            allocator.allocate(PoolKind::Scratch, cache.layout.state_bytes() as usize)?;
+
+        // A state that keeps no checkpoint copies nothing, and takes no snapshot.
+        let bytes = cache.layout.state_bytes();
+        let snapshot = if bytes > 0 {
+            Some(allocator.allocate(PoolKind::Scratch, bytes as usize)?)
+        } else {
+            None
+        };
         state.device = Some(Self::buffers(
             &state.config,
             &cache.layout,
             allocator,
             (stream, kernels),
-            snapshot.address(),
+            snapshot.as_ref().map_or(0, Buffer::address),
         )?);
-        state.snapshot = Some(snapshot);
+        state.snapshot = snapshot;
         Ok(state)
     }
 
@@ -1138,7 +1152,12 @@ impl StateMemory {
         // keeps, its leading bytes, and the field's planes of the snapshot.
         let rows = |gather: bool| -> Result<()> {
             for (layer, fields) in self.planes.iter().enumerate() {
-                for (index, (first, bytes)) in fields.iter().enumerate() {
+                // A field a checkpoint keeps nothing of (a ring) moves nothing.
+                for (index, (first, bytes)) in fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, bytes))| *bytes > 0)
+                {
                     let part = snapshot(u64::from(*first) * self.plane_bytes, 1, *bytes)?;
                     let kept = buffers[layer][index].narrow(1, 0, *bytes as usize)?;
                     Self::launch_move(gather, &kept, slot, &part)?;
@@ -1174,6 +1193,11 @@ impl StateMemory {
     ///
     /// When a copy's descriptors refuse the state's tensors.
     pub fn keys(&self) -> Result<BTreeSet<(&'static str, String)>> {
+        // A state that keeps no checkpoint is never copied.
+        if self.page_planes == 0 {
+            return Ok(BTreeSet::new());
+        }
+
         // SAFETY: meta tensors have no data and their addresses are never read.
         let meta = |shape: &[usize], dtype| unsafe { lend(0, shape, dtype, None) };
 

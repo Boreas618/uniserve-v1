@@ -882,10 +882,11 @@ fn a_state_field_states_its_slot_bytes_or_refuses_a_sub_byte_element() {
     assert!(field(DType::F4).bytes().is_err());
 }
 
-/// A checkpoint keeps the rows a field holds at zero drafts: all of a field no draft count
-/// changes, a window's history before its draft rows, and a ring's first group.
+/// A checkpoint keeps the rows a forward from a block boundary reads, those a field holds at
+/// zero drafts: all of a field no draft count changes, a window's history before its draft
+/// rows, and nothing of a ring.
 #[test]
-fn a_checkpoint_keeps_the_rows_a_field_holds_at_zero_drafts() {
+fn a_checkpoint_keeps_the_rows_a_forward_from_a_block_boundary_reads() {
     let field = |dims: Vec<usize>, rows| StateField {
         name: "field",
         dtype: DType::BF16,
@@ -903,9 +904,11 @@ fn a_checkpoint_keeps_the_rows_a_field_holds_at_zero_drafts() {
     assert_eq!(window.row_bytes().unwrap(), 32 * 2);
     assert_eq!(window.kept_bytes().unwrap(), 3 * 32 * 2);
 
-    // A ring of two groups of four keeps one group.
+    // A ring of two groups of four keeps no row: every group is complete at a block boundary,
+    // where a forward that resumes from a checkpoint starts.
     let ring = field(vec![8, 16], StateRows::Ring { group: 4 });
-    assert_eq!(ring.kept_bytes().unwrap(), 4 * 16 * 2);
+    assert_eq!(ring.kept_rows(), 0);
+    assert_eq!(ring.kept_bytes().unwrap(), 0);
 }
 
 /// A checkpoint may store the rule's per-head `A_log` and the norm's gain in FP32 beside BF16

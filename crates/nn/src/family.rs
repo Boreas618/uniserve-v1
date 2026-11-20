@@ -327,8 +327,9 @@ pub struct TokenHistory {
 ///
 /// A layer's state after token `t` summarizes every token up to `t`, so a request that resumes
 /// from a cached prefix resumes from the state its prefix's last token left; the prefix cache
-/// keeps such checkpoints of every field
-/// ([`crate::capability::RecurrentState::checkpoints`]).
+/// keeps such checkpoints of what a forward from a block boundary reads of every field
+/// ([`crate::capability::RecurrentState::checkpoints`], [`StateField::kept_rows`]). A state of
+/// rings alone keeps no checkpoint: a request resumed at a block boundary reads none of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateShape {
     /// Layers that keep a recurrent state.
@@ -361,9 +362,10 @@ pub struct StateField {
 /// that starts at a block boundary reads, which no count of drafts changes, and where a slot's
 /// state lies among them.
 ///
-/// A block is a whole number of groups of every [`StateRows::Ring`], so the state a forward from
-/// a block boundary reads is what the field holds at zero drafts, its first
-/// [`StateField::kept_rows`] rows: a checkpoint keeps those, whatever the deployment drafts.
+/// A checkpoint keeps the rows a forward from a block boundary reads, which is what the field
+/// holds at zero drafts, its first [`StateField::kept_rows`] rows, whatever the deployment
+/// drafts. A block is a whole number of groups of every [`StateRows::Ring`], so a forward from a
+/// block boundary reads no row of a ring: a checkpoint keeps none of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateRows {
     /// Extents no count of drafts changes: the whole field is the slot's state.
@@ -378,8 +380,10 @@ pub enum StateRows {
     },
     /// A ring of a request's most recent rows, position `p` at row `p mod rows`, its rows a
     /// whole number of groups of `group` positions. A forward reads only the rows of the group
-    /// open at its first position, and rows past the last committed position are overwritten
-    /// when their positions are computed again.
+    /// open at its first position, the positions of that group before it, and rows past the
+    /// last committed position are overwritten when their positions are computed again. A
+    /// forward that starts at a group boundary, as every forward from a block boundary does,
+    /// reads none of them.
     Ring {
         /// The positions of one group, which divides the ring and every block.
         group: usize,
@@ -387,14 +391,15 @@ pub enum StateRows {
 }
 
 impl StateField {
-    /// The rows of the field's first extent a checkpoint keeps: every row of a
-    /// [`StateRows::Whole`] field, a window's history, and a ring's first group, the rows each
-    /// holds at zero drafts (one for a field of no extent).
+    /// The rows of the field's first extent a checkpoint keeps, those a forward from a block
+    /// boundary reads: every row of a [`StateRows::Whole`] field (one for a field of no extent),
+    /// a window's history, and no row of a ring, whose groups are all complete at a block
+    /// boundary.
     pub fn kept_rows(&self) -> usize {
         match self.rows {
             StateRows::Whole => self.dims.first().copied().unwrap_or(1),
             StateRows::Window { history } => history,
-            StateRows::Ring { group } => group,
+            StateRows::Ring { .. } => 0,
         }
     }
 

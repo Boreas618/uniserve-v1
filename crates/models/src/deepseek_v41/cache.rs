@@ -146,7 +146,8 @@ pub fn pooling(config: &Config) -> Vec<u32> {
 /// The compressor's remainder on each source that pools groups of tokens ([`pooling`]): a ring of
 /// [`RING`] FP32 rows of `2 · head_dim` (the values, then the gates) per request, position `p` at
 /// row `p mod 8`, in groups of the ratio. A request resumed at a page boundary reads none of it:
-/// every group of a page is complete there.
+/// every group of a page is complete there, so the prefix cache keeps no checkpoint of it and
+/// the ring lives in the request slots alone (`nn::family::StateRows::Ring`).
 pub fn remainder(config: &Config) -> Vec<StateShape> {
     let pooling = pooling(config);
     let Some(&first) = pooling.first() else {
