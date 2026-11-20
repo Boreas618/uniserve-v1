@@ -853,6 +853,7 @@ pub(crate) mod tests {
 
     use scheduling::End;
     use scheduling::Nanos;
+    use scheduling::decision::Storage;
     use scheduling::ids::{PageId, RequestId as GuestId, StageId};
     use scheduling::time::Duration;
     use scheduling::view::{
@@ -1496,6 +1497,73 @@ pub(crate) mod tests {
             dispatch(&mut policy).1.is_empty(),
             "nothing is left to offload"
         );
+    }
+
+    /// A device shortage beside a warm host tier: the cache holds a host tier as large as a
+    /// device plane of 47 segments of 16,384 units, every page on the host alone and used before
+    /// any device page, then the 65,536 device pages 16 running requests hold, then the device
+    /// pages no request holds. A device shortage's `preempt` names the least recently used device
+    /// pages no request holds, and a host shortage's the least recently used host pages, each
+    /// within half of the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]): a search that read
+    /// the pages it cannot take on its way would cost in proportion to the host tier, past a
+    /// call's fuel at about half a million pages, and the fault would end the policy at a
+    /// shortage. The cache is told in `Cached` events a step's worth at a time, as it warmed.
+    #[test]
+    fn a_shortage_beside_a_warm_host_tier_names_its_victims_within_a_calls_fuel() {
+        const HOST: u64 = 47 * 16_384;
+        const HELD: u64 = 16 * 4_096;
+        const FREE: u64 = 1_024;
+        const NEED: u64 = 64;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+
+        // Least recently used first: the host tier, the held pages, the free device pages.
+        let view = |number: u64| PageView {
+            id: spread(number),
+            tokens: 64,
+            last_used: Nanos(NOW + number),
+            on_host: number < HOST,
+            evictable: !(HOST..HOST + HELD).contains(&number),
+        };
+        let numbers: Vec<u64> = (0..HOST + HELD + FREE).collect();
+        for told in numbers.chunks(16_384) {
+            let events: Vec<Event> = told
+                .iter()
+                .map(|&number| Event::Cached { page: view(number) })
+                .collect();
+            policy.call(Call::Observe, wire::encode(&events)).unwrap();
+        }
+
+        let first = |numbers: std::ops::Range<u64>| -> Vec<Victim> {
+            numbers
+                .take(NEED as usize)
+                .map(|number| Victim::Page(spread(number)))
+                .collect()
+        };
+        for (kind, expected) in [
+            (Storage::KvUnits, first(HOST + HELD..HOST + HELD + FREE)),
+            (Storage::HostPages, first(0..HOST)),
+        ] {
+            let shortage = Shortage { kind, need: NEED };
+            let (fuel, reply) =
+                metered(&mut policy, Call::Preempt, wire::encode(&shortage).unwrap());
+            assert!(fuel <= LIMIT, "{kind:?}: preempt took {fuel} fuel");
+            let victims: Vec<Victim> = wire::decode(&reply.unwrap()).unwrap();
+            assert_eq!(victims, expected, "{kind:?}");
+        }
     }
 
     /// A steady step of a decode load of 256 running requests (a `max_running_requests` in the
