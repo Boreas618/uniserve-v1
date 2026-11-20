@@ -18,6 +18,9 @@ speculation, and stops it, before the module's speculating deployment starts):
   than a decode of one (vLLM's ``check_logprobs_close``,
   :func:`uniserve_testing.chat.assert_logprobs_close`). The case reports how
   many answers are equal token for token.
+- **A sampled prompt of several chunks.** A sampled request whose prompt
+  spans several prefill chunks is answered, and the deployment answers the
+  request after it: its chunks before the last sample nothing.
 - **Real acceptance length.** InferenceX's acceptance-length gate
   (``infx/bench/al_gate.py``): the 80 SPEED-Bench qualitative coding prompts
   of its golden DSpark curve (``speedbench_coding.jsonl``, its digest
@@ -114,6 +117,10 @@ PROMPTS = [
 ]
 ANSWER_TOKENS = 256
 TOP_LOGPROBS = 5
+
+#: The records of the sampled request's prompt (about 19 tokens each), which
+#: spans about three prefill chunks of ``max_num_batched_tokens``.
+LONG_RECORDS = 600
 
 #: InferenceX's golden DSpark curve of DeepSeek-V4.1-Flash, thinking on, five
 #: drafts (``infx/golden_al_distribution/``, the curve
@@ -268,6 +275,31 @@ def test_speculation_answers_as_greedy_decoding(
             {"answers": len(PROMPTS), "equal": equal, "verified": verified}
         )
     )
+
+
+def test_a_sampled_request_whose_prompt_spans_chunks_is_answered(
+    server: Server,
+):
+    request = chat.body(
+        SERVED_MODEL,
+        chat.long_prompt(LONG_RECORDS),
+        64,
+        chat_template_kwargs={"thinking": False},
+        temperature=1.0,
+        seed=7,
+    )
+    answer = chat.complete(
+        server.base_url, request, server.scaled(chat.COMPLETION_S)
+    )
+    usage = answer["usage"]
+    print(json.dumps({"sampled_long_prompt": usage}))
+    assert usage["prompt_tokens"] > 2 * OPTIONS["max_num_batched_tokens"], usage
+    assert usage["completion_tokens"] > 0, usage
+    assert answer["choices"][0]["finish_reason"] in ("stop", "length"), answer
+
+    # The engine serves on: a greedy request after it is answered whole.
+    after = _ask(server, PROMPTS[0], 16, 0)
+    assert after["usage"]["completion_tokens"] == 16, after
 
 
 def test_real_acceptance_length_against_the_golden_curve(server: Server):
