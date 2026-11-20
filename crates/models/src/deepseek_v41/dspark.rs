@@ -205,7 +205,15 @@ impl DraftAttention {
     /// The attention of the block rows `x`, `[tokens, hidden]` BF16, the layer's normalized
     /// input: `[tokens, hidden]` BF16. The block's own entries are written into `window` first;
     /// `batch.positions` is each token's block's last position, which anchors its window.
-    fn forward(&self, x: &Tensor, window: Plane<'_>, batch: &LatentBatch<'_>) -> Result<Tensor> {
+    /// `workspace` is the `[bytes]` U8 scratch of the window's cache group, which execution lends
+    /// the attention's programs as it lends the decoder layers theirs.
+    fn forward(
+        &self,
+        x: &Tensor,
+        window: Plane<'_>,
+        batch: &LatentBatch<'_>,
+        workspace: &Tensor,
+    ) -> Result<Tensor> {
         let tokens = x.dim(0)?;
         let (heads, head_dim) = (self.heads as usize, self.head_dim as usize);
 
@@ -216,7 +224,9 @@ impl DraftAttention {
             .forward(&qr)?
             .reshape((tokens, heads, head_dim))?
             .contiguous()?;
-        let attended = self.attention.forward((&query, &kv), window, None, batch)?;
+        let attended = self
+            .attention
+            .forward((&query, &kv), window, None, batch, workspace)?;
 
         // The grouped output projection: each group's heads to its rank, then together.
         let groups = self.wo_a.len();
@@ -275,17 +285,17 @@ impl DraftLayer {
         })
     }
 
-    /// The layer over the block's `residual`: its attention over `window`, then its experts, as
-    /// sub-layers of the residual.
+    /// The layer over the block's `residual`: its attention over `window` with the window group's
+    /// `workspace`, then its experts, as sub-layers of the residual.
     fn forward(
         &self,
         residual: &mut MhcResidual,
-        window: Plane<'_>,
+        (window, workspace): (Plane<'_>, &Tensor),
         batch: &LatentBatch<'_>,
         live_tokens: Option<&Tensor>,
     ) -> Result<()> {
         residual.sublayer(&self.attention_connection, |x| {
-            self.attention.forward(x, window, batch)
+            self.attention.forward(x, window, batch, workspace)
         })?;
         residual.sublayer(&self.ffn_connection, |x| {
             let routed = self.experts.forward(x, live_tokens, None)?;
@@ -545,7 +555,12 @@ impl BlockDrafter for Dspark {
             for layer in &self.layers {
                 let mut held = None;
                 let plane = window_plane(window, layer.layer, &mut held)?;
-                layer.forward(&mut residual, plane, &latent, batch.live_tokens.as_ref())?;
+                layer.forward(
+                    &mut residual,
+                    (plane, &window.workspace),
+                    &latent,
+                    batch.live_tokens.as_ref(),
+                )?;
             }
             residual.collapse(&self.norm, self.eps)
         };
