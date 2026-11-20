@@ -2539,6 +2539,106 @@ fn expert_parallelism_places_whole_experts_on_a_tensor_group_and_shares_them_in_
     );
 }
 
+/// The launch of host `host`'s main process of a deployment of four schedulers of one rank each
+/// whose ranks share the fixture's experts in one expert union, two ranks on each of the hosts
+/// `rank-0`, the scheduler node's, and `rank-1`: the process serves from the first rank its host
+/// holds, in a world of every rank.
+fn union_launch(host: &str) -> EngineArgs {
+    let mut launch = launch();
+    let scheduler = |index: u32| WorkerGroupConfig {
+        id: WorkerGroupId(format!("model-{index}")),
+        role: Default::default(),
+        copies: 1,
+        ranks: vec![WorkerRank {
+            host: format!("rank-{}", index / 2),
+            device: proto::config::RankDevice::cuda(index % 2),
+        }],
+        blocks: WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    let config = &mut launch.engine_config;
+    config.parallel.worker_groups = (0..4).map(scheduler).collect();
+    config.parallel.data_parallel_size = std::num::NonZeroUsize::new(4).unwrap();
+    config.parallel.engine_host = "rank-0".to_owned();
+    config.moe.expert_parallel = true;
+    launch.host = host.to_owned();
+    launch.rank = if host == "rank-0" { 0 } else { 2 };
+    launch.group = format!("model-{}", launch.rank);
+    launch.devices = vec![0, 1];
+    launch.world_size = 4;
+    launch
+}
+
+/// An expert union whose members two hosts' processes hold: each process places its ranks at
+/// their deployment ranks in the union and keeps its quarter of the experts, the two processes
+/// meet at one rendezvous, and every member's union host group holds all four members, as every
+/// exchange key the members' profile runs record states. A process that holds two of the four
+/// members and meets no other process is refused.
+#[test]
+fn the_members_of_an_expert_union_over_two_hosts_meet_across_their_processes() {
+    let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
+    let model_runner = |launch: &EngineArgs| {
+        let checkpoint = Path::new(&launch.engine_config.model.model);
+        let family = crate::process::catalogue::resolve(&registry, checkpoint).unwrap();
+        ModelRunner::of(launch, family).unwrap()
+    };
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let load = |host: &str, listener: Option<std::net::TcpListener>| {
+        let launch = union_launch(host);
+        let meeting = Meeting::World(crate::parallel::Rendezvous {
+            listener,
+            endpoint: address.clone(),
+            epoch: launch.epoch,
+            timeout: launch.engine_config.worker.join_timeout,
+        });
+        let ranks = model_runner(&launch).ranks().unwrap();
+        load_ranks(ranks, META, &launch, meeting).unwrap()
+    };
+    let (head, peer) = std::thread::scope(|scope| {
+        let peer = scope.spawn(|| load("rank-1", None));
+        let head = load("rank-0", Some(listener));
+        (head, peer.join().unwrap())
+    });
+
+    for (ranks, places) in [(&head, [0, 1]), (&peer, [2, 3])] {
+        let stated: Vec<usize> = ranks
+            .iter()
+            .map(|rank| {
+                let union = rank.text().unwrap().union.as_ref().unwrap();
+                assert_eq!(union.group.size(), 4);
+                assert_eq!(union.group.rank(), union.place);
+                assert_eq!(
+                    rank.model_runner.text_placement().unwrap().experts,
+                    nn::Split::new(4, union.place as u32).unwrap()
+                );
+                union.place
+            })
+            .collect();
+        assert_eq!(stated, places);
+        let exchanges: Vec<&String> = ranks
+            .iter()
+            .flat_map(|rank| rank.keys.iter())
+            .filter(|(operator, _)| *operator == proto::module::operator::EXPERT_EXCHANGE)
+            .map(|(_, key)| key)
+            .collect();
+        assert!(!exchanges.is_empty());
+        assert!(
+            exchanges.iter().all(|key| key.contains("_ranks_4_")),
+            "{exchanges:?}"
+        );
+    }
+
+    let alone = union_launch("rank-0");
+    let ranks = model_runner(&alone).ranks().unwrap();
+    let Err(refused) = load_ranks(ranks, META, &alone, Meeting::Local) else {
+        panic!("a process holding half the union started alone");
+    };
+    assert!(format!("{refused:#}").contains("rendezvous"), "{refused:#}");
+}
+
 /// Expert parallelism outside an expert union shards a group's experts over its tensor-parallel
 /// ranks, so a group split over pipeline stages or sequence members with the flag is refused at
 /// start rather than served with every expert on every rank.

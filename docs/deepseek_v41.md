@@ -29,6 +29,14 @@ The compressor rings keep no checkpoint, so the package keeps no state region ([
 
 An epoch update that brings the package onto GPUs another epoch of the deployment serves sizes it beside that epoch within one share of each GPU, the deployment's quota, rather than a share of its own ([Admin](admin.md)): each rank numbers its cache for the whole share, creates the segments the share holds beside the serving epoch's reservations and the GPU's free memory, and grows them as the serving epoch drains. Beside an epoch that holds 25 GB of a GPU, a rank starts with about 26 GB of latent cache, 27 segments or 28M tokens, enough for a prompt of 1M tokens (0.93 GB). What the share does not cover, the warm-up's growth past it until the give-back and the serving epoch's growth past its reservations, must fit in the GPU's memory the share leaves, 9.9 GB at 0.95.
 
+## Serving it on two hosts
+
+```bash
+uniserve serve configs/deepseek_v41/dp8-ep8   # on each of the two hosts the package's `hosts` names
+```
+
+The package (`configs/deepseek_v41/dp8-ep8/config.toml`) places eight data-parallel schedulers of one rank each on the four GPUs of each of two hosts whose GPUs form one NVLink domain, and their ranks share the routed experts in one expert union of eight: each rank holds the attention, the shared experts and the dense weights whole, 48 of every layer's 384 routed experts and three of each n-gram table's 24 hash heads, 73.0 GB of weights in all. The union's members on the two hosts meet across their engine processes, and its exchange maps every rank's window over the NVLink domain ([Expert parallelism](expert_parallelism.md#schedulers-sharing-their-experts)). It serves the release's context to 16 running requests a scheduler, 128 over the eight.
+
 The checkpoint publishes no chat template; its prompt format is its reference encoder (`encoding/encoding.py`), which the family's request side ports (`processing::deepseek_v41`): thinking mode by default, chat mode with `reasoning_effort` `none` or `chat_template_kwargs` `{"enable_thinking": false}`, reasoning between `<think>` and `</think>`, and DSML tool calls.
 
 ## Speculation

@@ -108,6 +108,9 @@ class Server:
         #: started (:class:`uniserve_testing.builds.BuildServer`), once the
         #: daemon serves; ``None`` for another server.
         self.build_server: Any = None
+        #: The runtime directory the server's deployment servers run under,
+        #: which ``Deployments.serve`` states.
+        self.runtime: Path | None = None
         self._records = records
         self._pending = b""
         self._address = address

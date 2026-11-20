@@ -22,7 +22,12 @@
 //! then connects once to every lower member another process holds, opening the connection with
 //! the two members it joins ([`Formation::Pair`]), and each process accepts the connections of
 //! the higher members on its listener. A process connects on a thread of its own while it
-//! accepts, so no two processes wait on each other's backlog. Every frame states the build and
+//! accepts, so no two processes wait on each other's backlog. One formation may form several
+//! groups of the same members (its **channels**): each pair of members of different processes then
+//! holds one connection per channel, each opened with its channel's number, and each channel's
+//! connections are a group of their own, whose collectives never wait behind another channel's.
+//! An expert union whose members span processes forms its own groups so, beside the deployment's
+//! (`crate::process::ranks::union`). Every frame states the build and
 //! the epoch: a frame of another build or epoch fails the formation by name. A connection whose
 //! first frame is no frame of the formation is closed, and it holds up nothing: the formation
 //! reads every connection as its bytes arrive.
@@ -104,18 +109,29 @@ impl HostGroup {
             .collect())
     }
 
-    /// The members `held` of a group of `size` members whose others are held by other processes,
-    /// in the order of `held`, formed at `rendezvous` (module documentation). Two members this
-    /// process holds are connected by a socket pair.
+    /// The members `held` of `channels` groups of the same `size` members, whose others are held
+    /// by other processes, formed at `rendezvous` in one formation (module documentation): by
+    /// channel, the members in the order of `held`. Two members this process holds are connected
+    /// by a socket pair of each channel.
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] when `held` names a member outside the group or twice, or the
-    /// rendezvous's listener is held by another process than member 0's; a transport error when
-    /// the rendezvous cannot be reached, a frame of another build or epoch arrives, the processes
-    /// state the members inconsistently, or the group does not form within the rendezvous's
-    /// timeout.
-    pub(crate) fn world(rendezvous: Rendezvous, held: &[usize], size: usize) -> Result<Vec<Self>> {
+    /// [`Error::Invalid`] when `held` names a member outside the group or twice, the formation
+    /// forms no channel, or the rendezvous's listener is held by another process than member 0's;
+    /// a transport error when the rendezvous cannot be reached, a frame of another build or epoch
+    /// arrives, the processes state the members inconsistently, or the groups do not form within
+    /// the rendezvous's timeout.
+    pub(crate) fn world(
+        rendezvous: Rendezvous,
+        held: &[usize],
+        size: usize,
+        channels: usize,
+    ) -> Result<Vec<Vec<Self>>> {
+        if channels == 0 {
+            return Err(Error::Invalid(
+                "a host group's formation forms at least one group".into(),
+            ));
+        }
         let mut seen = vec![false; size];
         for &member in held {
             if member >= size || std::mem::replace(&mut seen[member], true) {
@@ -156,42 +172,54 @@ impl HostGroup {
             None => join(&rendezvous.endpoint, &identity, held, size, deadline)?,
         };
 
-        // Each member's connections: socket pairs to the members held here, then the connections
-        // dialled to and accepted from the members of other processes.
-        let mut groups: Vec<Vec<Option<Connection>>> = Vec::with_capacity(held.len());
-        for locals in socket_pairs(held.len())? {
-            let mut peers: Vec<Option<Connection>> = (0..size).map(|_| None).collect();
-            for (place, connection) in locals.into_iter().enumerate() {
-                peers[held[place]] = connection;
+        // Each member's connections of each channel: socket pairs to the members held here, then
+        // the connections dialled to and accepted from the members of other processes.
+        let mut groups: Vec<Vec<Vec<Option<Connection>>>> = Vec::with_capacity(channels);
+        for _ in 0..channels {
+            let mut members = Vec::with_capacity(held.len());
+            for locals in socket_pairs(held.len())? {
+                let mut peers: Vec<Option<Connection>> = (0..size).map(|_| None).collect();
+                for (place, connection) in locals.into_iter().enumerate() {
+                    peers[held[place]] = connection;
+                }
+                members.push(peers);
             }
-            groups.push(peers);
+            groups.push(members);
         }
 
         let (dialled, accepted) = std::thread::scope(|scope| {
-            let dialling = scope.spawn(|| dial(&table, &identity, held));
-            let accepted = accept_pairs(&listener, &identity, held, size, deadline);
+            let dialling = scope.spawn(|| dial(&table, &identity, held, channels));
+            let accepted = accept_pairs(&listener, &identity, (held, size, channels), deadline);
             let dialled = dialling
                 .join()
                 .map_err(|_| Error::Invariant("the host group's dialling panicked".into()))?;
             Ok::<_, Error>((dialled?, accepted?))
         })?;
-        for (member, peer, connection) in dialled.into_iter().chain(accepted) {
+        for (pair, connection) in dialled.into_iter().chain(accepted) {
             let place = held
                 .iter()
-                .position(|&held| held == member)
+                .position(|&held| held == pair.member)
                 .ok_or_else(|| {
-                    Error::Invariant(format!("host group member {member} is not held here"))
+                    Error::Invariant(format!(
+                        "host group member {} is not held here",
+                        pair.member
+                    ))
                 })?;
-            groups[place][peer] = Some(connection);
+            groups[pair.channel][place][pair.peer] = Some(connection);
         }
 
         Ok(groups
             .into_iter()
-            .zip(held)
-            .map(|(peers, &rank)| Self {
-                rank,
-                size,
-                peers: Mutex::new(peers),
+            .map(|members| {
+                members
+                    .into_iter()
+                    .zip(held)
+                    .map(|(peers, &rank)| Self {
+                        rank,
+                        size,
+                        peers: Mutex::new(peers),
+                    })
+                    .collect()
             })
             .collect())
     }
@@ -204,6 +232,15 @@ impl HostGroup {
     /// How many members the group has.
     pub(crate) fn size(&self) -> usize {
         self.size
+    }
+
+    /// This member's connections, by member (`None` at its own index): what a link of frames of
+    /// its own takes over from a channel formed for it, instead of the group's collectives. The
+    /// group ends.
+    pub(crate) fn into_connections(self) -> Vec<Option<Connection>> {
+        self.peers
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Gathers `value` from every member and returns the values in member order.
@@ -431,12 +468,21 @@ enum Formation {
     /// member.
     Table { endpoints: Vec<String> },
     /// The first frame of a connection between members of two processes: member `from` dialled
-    /// member `to`, the lower of the two.
+    /// member `to`, the lower of the two, for the group of `channel`.
     Pair {
         identity: Identity,
         from: u32,
         to: u32,
+        channel: u32,
     },
+}
+
+/// One end of a connection of a formation across processes: the member held here, the member at
+/// the other end and the channel whose group the connection is of.
+struct Paired {
+    member: usize,
+    peer: usize,
+    channel: usize,
 }
 
 impl service::Message for Formation {
@@ -609,13 +655,14 @@ fn join(
 }
 
 /// Connects each member of `held` to every lower member of another process, at that process's
-/// endpoint in `table`, and opens each connection with its pair: `(member, peer, connection)`,
-/// the member held here first.
+/// endpoint in `table`, once for each of `channels`, and opens each connection with its pair and
+/// channel.
 fn dial(
     table: &[String],
     identity: &Identity,
     held: &[usize],
-) -> Result<Vec<(usize, usize, Connection)>> {
+    channels: usize,
+) -> Result<Vec<(Paired, Connection)>> {
     let mut dialled = Vec::new();
     for &from in held {
         for to in (0..from).filter(|to| !held.contains(to)) {
@@ -625,39 +672,47 @@ fn dial(
                     std::io::Error::from(error),
                 )
             })?;
-            let mut connection = Connection::connect(&endpoint).map_err(|error| {
-                Error::transport_source(format!("connecting to host group member {to}"), error)
-            })?;
-            connection
-                .send(&Formation::Pair {
-                    identity: identity.clone(),
-                    from: from as u32,
-                    to: to as u32,
-                })
-                .map_err(|error| {
-                    Error::transport_source(format!("joining host group member {to}"), error)
+            for channel in 0..channels {
+                let mut connection = Connection::connect(&endpoint).map_err(|error| {
+                    Error::transport_source(format!("connecting to host group member {to}"), error)
                 })?;
-            dialled.push((from, to, connection));
+                connection
+                    .send(&Formation::Pair {
+                        identity: identity.clone(),
+                        from: from as u32,
+                        to: to as u32,
+                        channel: channel as u32,
+                    })
+                    .map_err(|error| {
+                        Error::transport_source(format!("joining host group member {to}"), error)
+                    })?;
+                let pair = Paired {
+                    member: from,
+                    peer: to,
+                    channel,
+                };
+                dialled.push((pair, connection));
+            }
         }
     }
     Ok(dialled)
 }
 
 /// Accepts on `listener`, for each member of `held`, the connection of every higher member of a
-/// group of `size` that another process holds: `(member, peer, connection)`, the member held here
-/// first, as [`dial`] returns them.
+/// group of `size` that another process holds, once for each of `channels`, as [`dial`] opens
+/// them.
 fn accept_pairs(
     listener: &Listener,
     identity: &Identity,
-    held: &[usize],
-    size: usize,
+    (held, size, channels): (&[usize], usize, usize),
     deadline: Instant,
-) -> Result<Vec<(usize, usize, Connection)>> {
+) -> Result<Vec<(Paired, Connection)>> {
     let expected: usize = held
         .iter()
         .map(|&to| (to + 1..size).filter(|from| !held.contains(from)).count())
-        .sum();
-    let mut accepted: Vec<(usize, usize, Connection)> = Vec::with_capacity(expected);
+        .sum::<usize>()
+        * channels;
+    let mut accepted: Vec<(Paired, Connection)> = Vec::with_capacity(expected);
 
     gather(
         listener,
@@ -669,6 +724,7 @@ fn accept_pairs(
                 identity: theirs,
                 from,
                 to,
+                channel,
             } = frame
             else {
                 return Err(Error::transport(
@@ -676,22 +732,33 @@ fn accept_pairs(
                 ));
             };
             same_epoch(&theirs, identity)?;
-            let (from, to) = (from as usize, to as usize);
+            let (from, to, channel) = (from as usize, to as usize, channel as usize);
             if !held.contains(&to) || held.contains(&from) || from <= to || from >= size {
                 return Err(Error::transport(format!(
                     "host group member {from} connected to member {to}, which is not its pair \
                      here"
                 )));
             }
-            if accepted
-                .iter()
-                .any(|(member, peer, _)| (*member, *peer) == (to, from))
-            {
+            if channel >= channels {
                 return Err(Error::transport(format!(
-                    "host group member {from} connected to member {to} twice"
+                    "host group member {from} connected for group {channel} of a formation of \
+                     {channels}"
                 )));
             }
-            accepted.push((to, from, connection));
+            if accepted
+                .iter()
+                .any(|(pair, _)| (pair.member, pair.peer, pair.channel) == (to, from, channel))
+            {
+                return Err(Error::transport(format!(
+                    "host group member {from} connected to member {to} twice for group {channel}"
+                )));
+            }
+            let pair = Paired {
+                member: to,
+                peer: from,
+                channel,
+            };
+            accepted.push((pair, connection));
             Ok(accepted.len() == expected)
         },
     )?;
@@ -861,15 +928,15 @@ mod tests {
         }
     }
 
-    /// Forms a group of `size` members spread over processes at the rendezvous `listener` serves,
-    /// each process holding the members of one entry of `processes` (the first holds member 0),
-    /// one thread per process, and runs `body` on every member, one thread each; returns the
-    /// results by member.
+    /// Forms `channels` groups of `size` members spread over processes at the rendezvous
+    /// `listener` serves, each process holding the members of one entry of `processes` (the first
+    /// holds member 0), one thread per process, and runs `body` on every member with its member of
+    /// each group, one thread each; returns the results by member.
     fn world<T: Send>(
         listener: TcpListener,
         processes: &[&[usize]],
-        size: usize,
-        body: impl Fn(HostGroup) -> T + Sync,
+        (size, channels): (usize, usize),
+        body: impl Fn(Vec<HostGroup>) -> T + Sync,
     ) -> Vec<T> {
         let endpoint = listener.local_addr().unwrap().to_string();
         let mut listener = Some(listener);
@@ -880,11 +947,26 @@ mod tests {
                     let rendezvous = rendezvous(listener.take(), &endpoint);
                     let body = &body;
                     scope.spawn(move || {
-                        let members = HostGroup::world(rendezvous, held, size).unwrap();
+                        // By channel, then by member held: each member's groups, in channel order.
+                        let mut formed: Vec<_> = HostGroup::world(rendezvous, held, size, channels)
+                            .unwrap()
+                            .into_iter()
+                            .map(Vec::into_iter)
+                            .collect();
+                        let members: Vec<Vec<HostGroup>> = (0..held.len())
+                            .map(|_| {
+                                formed
+                                    .iter_mut()
+                                    .map(|groups| groups.next().unwrap())
+                                    .collect()
+                            })
+                            .collect();
                         std::thread::scope(|threads| {
                             let handles: Vec<_> = members
                                 .into_iter()
-                                .map(|member| threads.spawn(move || (member.rank(), body(member))))
+                                .map(|groups| {
+                                    threads.spawn(move || (groups[0].rank(), body(groups)))
+                                })
                                 .collect();
                             handles
                                 .into_iter()
@@ -995,12 +1077,18 @@ mod tests {
     #[test]
     fn members_of_several_processes_form_one_group() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let results = world(listener, &[&[0, 4], &[1, 2], &[3, 5]], 6, |group| {
-            let gathered = group.all_gather_bytes(&[group.rank() as u8]).unwrap();
-            let root = (group.rank() == 5).then_some(&b"id"[..]);
-            let broadcast = group.broadcast_bytes(root, 5).unwrap();
-            (gathered, broadcast)
-        });
+        let results = world(
+            listener,
+            &[&[0, 4], &[1, 2], &[3, 5]],
+            (6, 1),
+            |mut groups| {
+                let group = groups.remove(0);
+                let gathered = group.all_gather_bytes(&[group.rank() as u8]).unwrap();
+                let root = (group.rank() == 5).then_some(&b"id"[..]);
+                let broadcast = group.broadcast_bytes(root, 5).unwrap();
+                (gathered, broadcast)
+            },
+        );
         assert_eq!(results.len(), 6);
         for (gathered, broadcast) in results {
             assert_eq!(
@@ -1008,6 +1096,42 @@ mod tests {
                 (0..6u8).map(|rank| vec![rank]).collect::<Vec<_>>()
             );
             assert_eq!(broadcast, b"id");
+        }
+    }
+
+    /// One formation forms several groups of the same members over processes: each member holds
+    /// one member of each, numbered alike, and each group's collectives run on its own
+    /// connections, so a member that waits in one group's collective holds up no collective of
+    /// another.
+    #[test]
+    fn a_formation_forms_several_groups_of_the_same_members() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let results = world(listener, &[&[0, 2], &[1, 3]], (4, 2), |groups| {
+            let [first, second] = <[HostGroup; 2]>::try_from(groups).ok().unwrap();
+            assert_eq!((first.rank(), first.size()), (second.rank(), second.size()));
+
+            // Member 0 gathers over the second group while every other member is still in the
+            // first group's gather, which member 0 reaches only afterwards.
+            let rank = first.rank() as u8;
+            if rank == 0 {
+                let late = std::thread::scope(|scope| {
+                    let second = scope.spawn(|| second.all_gather_bytes(&[rank + 10]).unwrap());
+                    std::thread::sleep(Duration::from_millis(50));
+                    let first = first.all_gather_bytes(&[rank]).unwrap();
+                    (first, second.join().unwrap())
+                });
+                return late;
+            }
+            let first = first.all_gather_bytes(&[rank]).unwrap();
+            let second = second.all_gather_bytes(&[rank + 10]).unwrap();
+            (first, second)
+        });
+        for (first, second) in results {
+            assert_eq!(first, (0..4u8).map(|rank| vec![rank]).collect::<Vec<_>>());
+            assert_eq!(
+                second,
+                (10..14u8).map(|rank| vec![rank]).collect::<Vec<_>>()
+            );
         }
     }
 
@@ -1024,8 +1148,10 @@ mod tests {
             .unwrap();
         let silent = TcpStream::connect(&endpoint).unwrap();
 
-        let results = world(listener, &[&[0], &[1], &[2]], 3, |group| {
-            group.all_gather_bytes(&[group.rank() as u8]).unwrap()
+        let results = world(listener, &[&[0], &[1], &[2]], (3, 1), |groups| {
+            groups[0]
+                .all_gather_bytes(&[groups[0].rank() as u8])
+                .unwrap()
         });
         for values in results {
             assert_eq!(values, vec![vec![0], vec![1], vec![2]]);
@@ -1045,8 +1171,8 @@ mod tests {
         other.epoch = 8;
 
         let (served, joined) = std::thread::scope(|scope| {
-            let joining = scope.spawn(|| HostGroup::world(other, &[1], 2).map(drop));
-            let served = HostGroup::world(rendezvous(Some(listener), &endpoint), &[0], 2);
+            let joining = scope.spawn(|| HostGroup::world(other, &[1], 2, 1).map(drop));
+            let served = HostGroup::world(rendezvous(Some(listener), &endpoint), &[0], 2, 1);
             (served.map(drop), joining.join().unwrap())
         });
         let refused = served.unwrap_err().to_string();
@@ -1062,7 +1188,7 @@ mod tests {
         let mut alone = rendezvous(Some(listener), &endpoint);
         alone.timeout = Duration::from_millis(50);
 
-        let refused = HostGroup::world(alone, &[0], 2).map(drop).unwrap_err();
+        let refused = HostGroup::world(alone, &[0], 2, 1).map(drop).unwrap_err();
         assert!(refused.to_string().contains("in time"), "{refused}");
     }
 }

@@ -41,6 +41,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
+
+#include <unistd.h>
 
 namespace {
 
@@ -194,12 +197,25 @@ struct Shared {
   unsigned char bytes[64];
 };
 
+/// This process's word among the ranks of a group: drawn once, so two processes on any hosts
+/// state different words. A file descriptor names a window only in the process that exported it.
+int64_t process_word() {
+  static const int64_t word = [] {
+    std::random_device draw;
+    const uint64_t high = static_cast<uint64_t>(draw()) << 32;
+    return static_cast<int64_t>((high | draw()) ^ static_cast<uint64_t>(getpid()));
+  }();
+  return word;
+}
+
 /// Creates this rank's storage and maps every rank's at the transport's addresses.
 ///
 /// A fabric handle is the NVLink domain's own: it needs no process relationship,
-/// so it serves ranks on any host of the domain. Where the driver has no fabric, a
-/// file descriptor serves the ranks of one process, which is what a main process
-/// is. The ranks must all take the same kind, so each states what it could do.
+/// so it serves ranks on any host of the domain, in any process. Where the driver
+/// has no fabric, a file descriptor serves the ranks of one process alone: each
+/// rank states its process, and a descriptor of another process is refused, since
+/// its number would name a file of this one. The ranks must all take the same
+/// kind, so each states what it could do.
 int32_t map_storage(Transport& transport, const UniserveGroup* group, char* error) {
   const int ranks = transport.ranks;
   CUresult status = CUDA_SUCCESS;
@@ -245,8 +261,9 @@ int32_t map_storage(Transport& transport, const UniserveGroup* group, char* erro
   struct Record {
     Shared handle;
     int64_t kind;
+    int64_t process;
   };
-  Record record{mine, static_cast<int64_t>(kind)};
+  Record record{mine, static_cast<int64_t>(kind), process_word()};
   auto* records = static_cast<Record*>(std::calloc(ranks, sizeof(Record)));
   if (records == nullptr) {
     return refuse(error, "expert_exchange could not hold its peers' handles");
@@ -267,6 +284,12 @@ int32_t map_storage(Transport& transport, const UniserveGroup* group, char* erro
     if (records[rank].kind != static_cast<int64_t>(kind)) {
       std::free(records);
       return refuse(error, "expert_exchange's ranks share no handle kind");
+    }
+    if (kind != CU_MEM_HANDLE_TYPE_FABRIC && records[rank].process != record.process) {
+      std::free(records);
+      return refuse(error,
+                    "expert_exchange's ranks span processes, which map each other's storage "
+                    "only through fabric handles, and the driver grants none");
     }
     CUmemGenericAllocationHandle mapped = own;
     if (rank != transport.rank) {

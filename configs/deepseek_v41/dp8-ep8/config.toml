@@ -1,0 +1,86 @@
+# DeepSeek-V4.1-Flash on the eight GPUs of two hosts of four whose GPUs form one NVLink domain:
+# eight data-parallel schedulers whose ranks share their routed experts in one expert union, each
+# rank holding the attention, the shared experts and the dense weights whole, 48 of every layer's
+# 384 MXFP4 experts and three of each n-gram table's 24 hash heads (an eighth of the tables' rows)
+# (`docs/deepseek_v41.md`, `docs/expert_parallelism.md`). The union's members on the two hosts
+# meet across their engine processes, and its exchange maps every rank's window over the NVLink
+# domain. It serves the release's context of 1M tokens to 16 running requests a scheduler, 128 in
+# all, each prompt prefilled in chunks of 4096 tokens.
+#
+# `hosts` names the two hosts by their host names, the leader first; serve the package on each.
+
+model = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+hosts = ["node-0", "node-1"]
+data_parallel_size = 8
+max_model_len = 1048576
+max_running_requests = 16
+max_num_batched_tokens = 4096
+# The weights take 68 GiB of each GPU (73.0 GB), beside the graph pool, the expert transport and
+# the latent cache.
+mem_fraction_static = 0.95
+
+[moe_config]
+expert_parallel = true
+
+# A worker captures its largest decode batch (max_running_requests) beside these.
+[cuda_graph_config]
+decode_batch_sizes = [1, 2, 4, 8]
+prefill_token_sizes = [1024, 4096]
+
+# The eight schedulers' groups, one rank each, which form the expert union: its places 0-3 on the
+# first host's GPUs, 4-7 on the second's.
+[[worker_groups]]
+id = "model-0"
+ranks = ["node-0/cuda:0"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-1"
+ranks = ["node-0/cuda:1"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-2"
+ranks = ["node-0/cuda:2"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-3"
+ranks = ["node-0/cuda:3"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-4"
+ranks = ["node-1/cuda:0"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-5"
+ranks = ["node-1/cuda:1"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-6"
+ranks = ["node-1/cuda:2"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-7"
+ranks = ["node-1/cuda:3"]
+queue_depth = 2
+
+[worker_groups.blocks.model]

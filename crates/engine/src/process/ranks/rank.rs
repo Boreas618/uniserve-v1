@@ -136,8 +136,8 @@ pub(crate) struct ModelRunner {
     world_size: usize,
     /// This rank's part of the epoch's parallel shape, resolved with the model runner.
     mapping: Mapping,
-    /// The members of the expert union of this node's ranks, on a deployment whose experts are
-    /// split; `None` outside a union.
+    /// The members of the deployment's expert union, on a deployment whose experts are split;
+    /// `None` outside a union.
     union: Option<u32>,
     /// The media pipeline the checkpoint serves, as its family declares it (`nn::pipeline`),
     /// checked once against the deployment's blocks; `None` for a text deployment.
@@ -303,25 +303,30 @@ impl ModelRunner {
     /// on this process's host ([`placed_ranks`]).
     ///
     /// Each rank is a rank of the deployment's worker group that places it, or a member of the
-    /// node's expert union when the deployment's schedulers or dedicated expert workers share
-    /// their experts in one ([`proto::config::EngineConfig::expert_union`]). Expert parallelism
-    /// outside a union shards each group's experts over its tensor-parallel ranks
+    /// deployment's expert union when its schedulers or dedicated expert workers share their
+    /// experts in one ([`proto::config::EngineConfig::expert_union`]). Every rank of such a
+    /// deployment is a member, placed by its deployment rank, whichever host's process holds it:
+    /// the members of several processes meet across them (`crate::process::ranks::union`). Expert
+    /// parallelism outside a union shards each group's experts over its tensor-parallel ranks
     /// ([`Self::text_placement`]).
     pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
         let text = matches!(self.family.model, Model::Text(_));
         let attention = self.attention_ranks()?;
-        // Dedicated expert ranks hold the experts between them, whatever the schedulers number.
+        let groups = &self.engine_config().parallel.worker_groups;
+        let deployed: usize = groups.iter().map(|group| group.ranks.len()).sum();
+        let deployed = u32::try_from(deployed).context("more ranks than the exchange addresses")?;
+        // Dedicated expert ranks hold the experts between them, whatever the schedulers number:
+        // every rank of the deployment past its attention ranks, on any host.
         let expert_ranks = match attention {
             0 => self.mapping.expert_parallel,
-            _ => self.devices.len() as u32 - attention,
+            _ => deployed.saturating_sub(attention),
         };
         let union_ranks = expert_ranks + attention;
         let tensor = self.mapping.tensor_parallel;
         if text && tensor > 1 && union_ranks > 1 {
             bail!(
-                "a deployment of {tensor} tensor ranks and {union_ranks} expert ranks in one \
-                 process: a tensor group and an expert union of one process's devices are not \
-                 served together"
+                "a deployment of {tensor} tensor ranks and {union_ranks} expert ranks: a tensor \
+                 group and an expert union are not served together"
             );
         }
         if text {
@@ -354,18 +359,22 @@ impl ModelRunner {
         }
         // The schedulers of an expert-parallel deployment each hold one rank: its own cache and
         // attention, its share of the experts, and a member of the union that runs their steps. A
-        // deployment of dedicated expert ranks puts its attention ranks first in the union.
-        if count != union_ranks as usize {
+        // deployment of dedicated expert ranks puts its attention ranks first in the union. Every
+        // rank of the deployment is a member, one rank each, at the place of its deployment rank:
+        // this process holds the members its host's devices serve, every process alike.
+        if deployed != union_ranks {
             bail!(
-                "this node serves {count} devices and the deployment's experts are exchanged over \
-                 {union_ranks} ranks: an expert union lives on one node's devices, one rank each"
+                "the deployment places {deployed} ranks and exchanges its experts over \
+                 {union_ranks}: every rank of a deployment whose experts an expert union shares is \
+                 a member of it, one rank each"
             );
         }
-        let groups = &self.engine_config().parallel.worker_groups;
+        if count == 0 {
+            bail!("this process serves no member of the deployment's expert union");
+        }
         placed
             .into_iter()
-            .enumerate()
-            .map(|(index, (rank, group, _, device))| {
+            .map(|(rank, group, _, device)| {
                 let mut rank_runner = self.clone();
                 rank_runner.devices = vec![device];
                 rank_runner.rank = rank;
@@ -374,10 +383,10 @@ impl ModelRunner {
                 rank_runner.group.clone_from(&groups[group].id.0);
                 // An attention rank holds the first rank's window and computes nothing with
                 // it; `DispatchViews::source_only` keeps it out of its forward.
-                rank_runner.mapping.union_rank = index as u32;
+                rank_runner.mapping.union_rank = rank;
                 rank_runner.mapping.attention_ranks = attention;
                 rank_runner.mapping.expert_parallel = expert_ranks;
-                rank_runner.mapping.expert_rank = (index as u32).saturating_sub(attention);
+                rank_runner.mapping.expert_rank = rank.saturating_sub(attention);
                 rank_runner.union = Some(union_ranks);
                 Ok(rank_runner)
             })
@@ -634,7 +643,7 @@ impl ModelRunner {
             .context("more attention ranks than the exchange addresses")
     }
 
-    /// The member of the node's expert union this rank is on `device` of `multiprocessors`
+    /// The member of the deployment's expert union this rank is on `device` of `multiprocessors`
     /// multiprocessors, over the union's host group `group`, asking the other members to join
     /// its steps through `join`, its forwards' collectives along the union over `communicator`
     /// (`nn::family::EXPERT_AXIS`, `None` on the meta device and for a model that collects
