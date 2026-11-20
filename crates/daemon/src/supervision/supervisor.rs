@@ -40,6 +40,11 @@
 //! generation. A `Stop` ends one group of one engine, every generation of
 //! it; an engine whose connection closes takes its remaining processes with
 //! it.
+//!
+//! Only a process's parent reaps it, so a daemon that handed its processes
+//! over goes on reaping each it spawned once that exits, for as long as it
+//! lives (`reap`); once it exited, the host's init is the parent of those
+//! still running.
 
 use proto::process::{Exit, Reserve, Reserved, Spawn};
 use std::collections::HashMap;
@@ -659,6 +664,9 @@ impl Supervisor {
     /// places from both ends and drops these.
     /// This daemon supervises nothing afterwards.
     ///
+    /// It goes on reaping each process it spawned once that exits, for as long as it lives
+    /// ([`reap`]): only a process's parent reaps it.
+    ///
     /// # Errors
     ///
     /// Fails when a process's pidfd cannot be opened; the supervisor keeps
@@ -690,9 +698,18 @@ impl Supervisor {
         descriptors.extend(reasons);
         let (gpus, registration) = self.gpus.hand_over()?;
         descriptors.push(registration);
-        // The successor supervises them now; dropping a spawned child's
-        // handle neither kills nor waits for it.
-        self.children.clear();
+        // The successor supervises them now, through their pidfds, and cannot reap them: this
+        // process is their parent.
+        reap(
+            self.children
+                .drain()
+                .filter_map(|(_, child)| match child.process {
+                    Process::Spawned { child, pidfd } => Some((child, pidfd)),
+                    // A daemon this one replaced spawned it: its parent is another process.
+                    Process::Adopted { .. } => None,
+                })
+                .collect(),
+        );
         Ok((
             ProcessesHandoff {
                 runtime: self.runtime.clone(),
@@ -925,6 +942,47 @@ enum Process {
     Adopted { pid: u32, pidfd: OwnedFd },
 }
 
+/// Reaps each of `children`, processes this daemon spawned, with their pidfds, once it exits,
+/// on a thread of its own, for as long as this process lives: children a hot restart handed
+/// over, which the successor supervises through their pidfds but cannot reap, since only a
+/// parent can. One left unreaped stays a zombie of this process until it exits. The thread holds
+/// nothing but the children and ends once each is reaped, or with the process, which it never
+/// holds up.
+fn reap(mut children: Vec<(std::process::Child, OwnedFd)>) {
+    if children.is_empty() {
+        return;
+    }
+    let reaping = std::thread::Builder::new()
+        .name("reaper".into())
+        .spawn(move || {
+            while !children.is_empty() {
+                // A pidfd turns readable once its process exited, reaped or not.
+                let mut descriptors: Vec<libc::pollfd> = children
+                    .iter()
+                    .map(|(_, pidfd)| libc::pollfd {
+                        fd: pidfd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
+                    .collect();
+                if let Err(error) = ::service::wait_ready(&mut descriptors, None) {
+                    tracing::warn!(%error, "the processes handed over are reaped no more");
+                    return;
+                }
+                // Reaps every child that exited; one whose status cannot be read is not this
+                // process's to wait for any more.
+                children.retain_mut(|(child, _)| matches!(child.try_wait(), Ok(None)));
+            }
+        });
+    if let Err(error) = reaping {
+        tracing::warn!(
+            %error,
+            "no thread reaps the processes handed over: each that exits stays a zombie until \
+             this daemon exits"
+        );
+    }
+}
+
 /// How a supervised process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Exited {
@@ -1093,4 +1151,51 @@ pub(crate) fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
     }
     // SAFETY: the call returned a new descriptor this daemon owns.
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// Whether process `pid` is gone as this process's child: reaped, or never its child.
+    fn reaped(pid: u32) -> bool {
+        // The parent's id is the field after the state, which follows the parenthesized name.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        let parent = stat
+            .rsplit_once(") ")
+            .and_then(|(_, fields)| fields.split(' ').nth(1))
+            .and_then(|parent| parent.parse::<u32>().ok());
+        parent != Some(std::process::id())
+    }
+
+    /// A process this daemon spawned and handed over to a successor is reaped by this daemon once
+    /// it exits: the successor supervises it through its pidfd but cannot reap it, and one left
+    /// unreaped would stay a zombie of this process for as long as it lives.
+    #[test]
+    fn a_process_handed_over_is_reaped_once_it_exits() {
+        // A child that runs until its standard input, whose write end the test holds, ends.
+        let (input, holder) = std::io::pipe().unwrap();
+        let child = Command::new("cat")
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        reap(vec![(child, pidfd_open(pid).unwrap())]);
+
+        drop(holder);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !reaped(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the process handed over stayed a zombie of the daemon that spawned it"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }

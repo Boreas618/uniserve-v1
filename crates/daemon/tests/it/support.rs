@@ -336,6 +336,9 @@ pub(crate) struct BuildServerStandIn {
     socket: PathBuf,
     /// One token per `prepare` that arrived.
     asked: Receiver<()>,
+    /// One token per engine package resolved: a node resolves it while it serves a spawn,
+    /// before it starts the process and answers.
+    resolved: Receiver<()>,
     /// One token lets one held `prepare` answer.
     release: Sender<()>,
 }
@@ -371,6 +374,7 @@ impl BuildServerStandIn {
             ))
             .unwrap();
         let (asked_sender, asked) = std::sync::mpsc::channel();
+        let (resolved_sender, resolved) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let released = Arc::new(Mutex::new(released));
         std::thread::spawn(move || {
@@ -380,13 +384,14 @@ impl BuildServerStandIn {
                     return;
                 };
                 let asked = asked_sender.clone();
+                let resolved = resolved_sender.clone();
                 let released = Arc::clone(&released);
                 std::thread::spawn(move || {
                     answer(
                         Connection::new(stream).unwrap(),
                         held,
                         raise,
-                        &asked,
+                        (&asked, &resolved),
                         &released,
                     );
                 });
@@ -396,6 +401,7 @@ impl BuildServerStandIn {
             runtime,
             socket,
             asked,
+            resolved,
             release,
         }
     }
@@ -422,18 +428,24 @@ impl BuildServerStandIn {
             .expect("the Build Server was asked to prepare");
     }
 
+    /// Waits until an engine package was resolved, for at most `timeout`; whether one was.
+    pub(crate) fn resolved(&self, timeout: std::time::Duration) -> bool {
+        self.resolved.recv_timeout(timeout).is_ok()
+    }
+
     /// Lets one held `prepare` answer.
     pub(crate) fn release(&self) {
         self.release.send(()).unwrap();
     }
 }
 
-/// Answers the one request a client of the stand-in Build Server sends on `connection`.
+/// Answers the one request a client of the stand-in Build Server sends on `connection`, with a
+/// token on `asked` for a `prepare` and on `resolved` once an engine package is resolved.
 fn answer(
     mut connection: Connection,
     held: bool,
     raise: u32,
-    asked: &Sender<()>,
+    (asked, resolved): (&Sender<()>, &Sender<()>),
     released: &Mutex<Receiver<()>>,
 ) {
     use build_server::protocol::wire;
@@ -499,6 +511,7 @@ fn answer(
             use std::os::fd::AsFd as _;
             connection.send_with(&response, &[file.as_fd()]).unwrap();
             connection.flush().unwrap();
+            let _ = resolved.send(());
         }
         _ => {}
     }
