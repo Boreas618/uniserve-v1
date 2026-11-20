@@ -24,11 +24,13 @@
 //!   instantiated. A capture launches nothing: it only records, so it runs while the runner
 //!   serves.
 //! - **Replay.** [`Graphs::prepare_inputs`] takes a slot of the input buffer, lets the runner
-//!   write the bytes of its input tensors and, when the graph has input copies, runs the forward
-//!   under a meta context over the same region with the kernels of the graph it prepares for,
-//!   so the host values the model computes land in the slot at the offsets that graph's capture
-//!   recorded. [`Graphs::replay`] then issues the slot's copies as one batched copy and launches
-//!   the graph. Nothing is called back from the stream.
+//!   write the bytes of its input tensors and, when the graph has input copies, puts the host
+//!   values the copies read into the slot at the offsets that graph's capture recorded: the
+//!   values its capture computed, for a runner whose host values follow from the bucket and the
+//!   kernels alone ([`Forward::fixed_host_values`]), else the values of the forward run again
+//!   under a meta context over the same region with the kernels of the graph it prepares for.
+//!   [`Graphs::replay`] then issues the slot's copies as one batched copy and launches the
+//!   graph. Nothing is called back from the stream.
 //!
 //! ## Three kinds of graphs
 //!
@@ -287,10 +289,14 @@ pub struct Graph {
     table: Table,
     /// The input copies a replay issues before the launch.
     copies: Copies,
+    /// The host values the copies read as the capture's forward computed them: each copy's
+    /// bytes, in the order of `copies`. A replay of a runner whose host values are fixed
+    /// ([`Forward::fixed_host_values`]) copies these.
+    values: Arc<[u8]>,
     /// The forward's outputs, at the addresses the capture allocated.
     outputs: Vec<Tensor>,
     /// The kernels the graph was captured with: what the forward of `prepare_inputs` runs
-    /// under before its replay.
+    /// under before its replay, when the runner's host values are not fixed.
     kernels: Arc<Generation>,
     /// What a replay launches; `None` for graphs that hold no device.
     executable: Option<Executable>,
@@ -934,9 +940,10 @@ impl Graphs {
 
     /// Prepares the inputs of one step of `bucket`: takes the next slot of the input buffer,
     /// lets `fill` write the bytes of the runner's input tensors into it, and, when the graph
-    /// the step replays has input copies, runs the bucket's forward under the meta context, with
-    /// the kernels that graph was captured with, so the host values it computes land in the
-    /// slot where that graph's copies read them.
+    /// the step replays has input copies, puts the host values they read into the slot where
+    /// they read them: the values the graph's capture computed for a runner whose host values
+    /// are fixed ([`Forward::fixed_host_values`]), else those of the bucket's forward run under
+    /// the meta context with the kernels that graph was captured with.
     ///
     /// The graph is the bucket's newest at or below what the bucket switched to and the kernel
     /// stamp of the batch the step belongs to ([`Graphs::stamp`]). The step is
@@ -959,23 +966,30 @@ impl Graphs {
             state
                 .chosen(bucket, state.stamp)
                 .map(|(generation, graph)| {
-                    (
-                        generation,
-                        !graph.copies.is_empty(),
-                        Arc::clone(&graph.kernels),
-                    )
+                    let values = (!graph.copies.is_empty()).then(|| {
+                        (
+                            graph.copies.clone(),
+                            Arc::clone(&graph.values),
+                            Arc::clone(&graph.kernels),
+                        )
+                    });
+                    (generation, values)
                 })
         };
-        if let Some((_, true, kernels)) = &chosen {
-            self.preparing.set_kernels(Arc::clone(kernels));
-            self.lend_values(&self.preparing, slot)?;
-            self.meta_forward(&self.preparing, runner, bucket)?;
+        if let Some((_, Some((copies, values, kernels)))) = &chosen {
+            if runner.fixed_host_values() {
+                self.write_values(slot, copies, values)?;
+            } else {
+                self.preparing.set_kernels(Arc::clone(kernels));
+                self.lend_values(&self.preparing, slot)?;
+                self.meta_forward(&self.preparing, runner, bucket)?;
+            }
         }
 
         self.state.borrow_mut().prepared = Some(Prepared::Inputs(
             *bucket,
             slot,
-            chosen.map(|(generation, _, _)| generation),
+            chosen.map(|(generation, _)| generation),
         ));
         Ok(())
     }
@@ -1307,10 +1321,12 @@ impl Graphs {
         let Some(cuda) = &self.device else {
             let (table, copies, _) = self.meta_forward(&self.preparing, runner, bucket)?;
             self.check_profile(bucket, &table)?;
+            let values = self.copied_values(slot, &copies)?;
 
             return Ok(Graph {
                 table,
                 copies,
+                values,
                 outputs: Vec::new(),
                 kernels: Arc::clone(kernels),
                 executable: None,
@@ -1365,6 +1381,9 @@ impl Graphs {
             )));
         }
 
+        // The captured forward wrote its host values into the slot, where its copies read them.
+        let values = self.copied_values(slot, &copies)?;
+
         // The instantiation is the device memory a graph takes beside its region: what two
         // generations' graphs of a bucket hold together until the commit.
         let device = cuda.stream.device();
@@ -1384,6 +1403,7 @@ impl Graphs {
         Ok(Graph {
             table,
             copies,
+            values,
             outputs,
             kernels: Arc::clone(kernels),
             executable: Some(executable),
@@ -1934,6 +1954,49 @@ impl Graphs {
         // the stream has passed the copies that read it.
         unsafe { context.set_input_buffer(base, bytes) };
         Ok(())
+    }
+
+    /// The bytes each of `copies` reads from the values area of `slot`, in their order: the
+    /// host values a capture's forward wrote there.
+    fn copied_values(&self, slot: usize, copies: &Copies) -> Result<Arc<[u8]>> {
+        self.with_buffer(|buffer| {
+            let area = buffer.values_mut(slot);
+            let mut values = Vec::with_capacity(copies.iter().map(|copy| copy.2 as usize).sum());
+            for &(offset, _, bytes) in copies {
+                let read = area
+                    .get(offset as usize..(offset + bytes) as usize)
+                    .ok_or_else(|| {
+                        Error::Invariant(format!(
+                            "an input copy of {bytes} bytes at offset {offset} lies outside the {} \
+                         bytes of a slot's values",
+                            area.len()
+                        ))
+                    })?;
+                values.extend_from_slice(read);
+            }
+            Ok(values.into())
+        })
+    }
+
+    /// Writes `values`, the bytes [`Graphs::copied_values`] took of a capture, into the values
+    /// area of `slot` where each of `copies` reads its own.
+    fn write_values(&self, slot: usize, copies: &Copies, values: &[u8]) -> Result<()> {
+        self.with_buffer(|buffer| {
+            let area = buffer.values_mut(slot);
+            let mut read = 0;
+            for &(offset, _, bytes) in copies {
+                let (offset, bytes) = (offset as usize, bytes as usize);
+                let target = area.get_mut(offset..offset + bytes).ok_or_else(|| {
+                    Error::Invariant(format!(
+                        "an input copy of {bytes} bytes at offset {offset} lies outside the bytes \
+                         of a slot's values"
+                    ))
+                })?;
+                target.copy_from_slice(&values[read..read + bytes]);
+                read += bytes;
+            }
+            Ok(())
+        })
     }
 
     /// The slot holding the inputs prepared for `bucket`, which the caller now issues, and the

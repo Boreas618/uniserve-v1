@@ -108,6 +108,8 @@ struct TinyRunner {
     graphs: Graphs,
     /// The key bound of the step being prepared: the plain value the model's host value holds.
     bound: Cell<u32>,
+    /// Whether the runner states its host values fixed ([`Forward::fixed_host_values`]).
+    fixed: bool,
 }
 
 impl TinyRunner {
@@ -116,6 +118,7 @@ impl TinyRunner {
             model: Arc::new(Tiny::new()),
             graphs: Graphs::meta(kernels, INPUTS),
             bound: Cell::new(16),
+            fixed: false,
         }
     }
 
@@ -158,6 +161,10 @@ impl Forward for TinyRunner {
         Ok(vec![self.model.compute_logits(&hidden)?])
     }
 
+    fn fixed_host_values(&self) -> bool {
+        self.fixed
+    }
+
     fn idle_inputs(&self, _bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
         columns.fill(0);
         Ok(())
@@ -178,6 +185,7 @@ impl Runner for TinyRunner {
             model: Arc::clone(&self.model),
             graphs,
             bound: Cell::new(16),
+            fixed: self.fixed,
         }))
     }
 
@@ -307,13 +315,22 @@ fn captured_beside(
 
 /// A runner serving generation 1 with both buckets captured, and that generation.
 fn captured() -> (TinyRunner, Arc<Generation>) {
+    captured_stating(false)
+}
+
+/// [`captured`] of a runner that states its host values fixed or not, captured at its first
+/// bound (16).
+fn captured_stating(fixed: bool) -> (TinyRunner, Arc<Generation>) {
     // The keys come from a profile run, which needs no kernel: the first runner states them and
     // the second serves a generation that holds them.
     let profiled = TinyRunner::new(Arc::new(Generation::new(0, [])));
     profiled.graphs.profile_run(&profiled).unwrap();
     let serving = generation_of(&profiled, 1);
 
-    let runner = TinyRunner::new(Arc::clone(&serving));
+    let runner = TinyRunner {
+        fixed,
+        ..TinyRunner::new(Arc::clone(&serving))
+    };
     runner.graphs.profile_run(&runner).unwrap();
     captured_beside(&runner, &runner.buckets(), None, &serving);
     (runner, serving)
@@ -582,6 +599,40 @@ fn prepare_inputs_writes_each_replay_s_host_values_where_the_input_copies_read()
             .flat_map(f32::to_ne_bytes)
             .collect();
         assert_eq!(prepared_values(&runner.graphs, bytes as usize), expected);
+    }
+}
+
+#[test]
+fn a_replay_of_fixed_host_values_copies_the_values_its_capture_computed() {
+    let (mut runner, _) = captured_stating(true);
+    let bucket = Bucket::decode(4, Variant::DecodeGreedy);
+    let (offset, _, bytes) = runner.graphs.input_copies(&bucket).unwrap()[0];
+    assert_eq!(offset, 0);
+
+    // The capture's host value, the bound its forward read (16), once per token of the bucket,
+    // at the offset the capture's input copy reads; a runner that states its host values fixed
+    // computes them from the bucket alone, which this one's later bounds do not.
+    let captured: Vec<u8> = std::iter::repeat_n(16.0_f32, ROWS)
+        .flat_map(f32::to_ne_bytes)
+        .collect();
+    // No slot holds them before the replays put them there: the serving graphs make their
+    // input buffer at their first step.
+    runner
+        .prepare_inputs(&batch(&[5, 6, 7], 16), &tables())
+        .unwrap();
+    {
+        let mut state = runner.graphs.state.borrow_mut();
+        let buffer = state.buffer.as_mut().unwrap();
+        for slot in 0..runner.graphs.slots {
+            buffer.values_mut(slot).fill(0xab);
+        }
+    }
+    for bound in [32_u32, 48] {
+        let chosen = runner
+            .prepare_inputs(&batch(&[5, 6, 7], bound), &tables())
+            .unwrap();
+        assert_eq!(chosen, bucket);
+        assert_eq!(prepared_values(&runner.graphs, bytes as usize), captured);
     }
 }
 

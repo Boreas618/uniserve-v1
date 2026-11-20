@@ -124,6 +124,15 @@ impl InputBuffer {
         &mut self.bytes_mut()[start..end]
     }
 
+    /// The values area of `slot`, which a replay of fixed host values fills with the bytes its
+    /// graph's capture computed.
+    pub(crate) fn values_mut(&mut self, slot: usize) -> &mut [u8] {
+        let start = self.slot_offset(slot) + self.columns as usize;
+        let end = start + self.values as usize;
+
+        &mut self.bytes_mut()[start..end]
+    }
+
     /// The values area of `slot`: its first byte and its length, as a context's input buffer.
     pub(crate) fn values_ptr(&mut self, slot: usize) -> (*mut u8, u64) {
         let start = self.slot_offset(slot) + self.columns as usize;

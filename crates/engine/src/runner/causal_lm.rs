@@ -1607,8 +1607,8 @@ impl CausalLmRunner {
     /// Prepares the step of `bucket` over the staged columns: they are written into the input
     /// block, with the host values the bucket's forward computes.
     fn prepare_staged(&self, bucket: &Bucket) -> Result<()> {
-        // The meta forward that writes the host values computes over the serving cache: a
-        // forward's host values follow from the bucket alone.
+        // The step computes over the serving cache, an eager forward of it as well; its host
+        // values follow from the bucket alone, so a replay copies its capture's.
         self.paired.set(false);
 
         self.graphs.prepare_inputs(self, bucket, |block| {
@@ -1983,6 +1983,13 @@ impl CausalLmRunner {
 impl Forward for CausalLmRunner {
     fn buckets(&self) -> Vec<Bucket> {
         self.buckets.capture_order().copied().collect()
+    }
+
+    /// A causal forward's host values (the constants of its shapes: a scalar, a row's token
+    /// offsets) follow from the bucket alone: it reads the batch from the device and its bounds
+    /// from the runner's configuration, never from a step.
+    fn fixed_host_values(&self) -> bool {
+        true
     }
 
     fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
