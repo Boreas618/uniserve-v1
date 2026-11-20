@@ -19,7 +19,7 @@ use ::storage::protocol::{
 };
 use ::storage::runtime::{
     Cause, Class, Completion, Group, GroupId, Lender, Open, Opened, OwnerId, Region, Registers,
-    Request, RequestId, Tier, VERSION,
+    Request, RequestId, Tier, VERSIONS,
 };
 use ::storage::{
     Access, Claim, Claimant, Client, Interest, Key, Location, Mode, QueueDescriptors, QueuePair,
@@ -69,7 +69,8 @@ fn region(
 /// and a host region of four units of 32 bytes, two parts of 16.
 pub(crate) fn layout(epoch: u64) -> Open {
     Open {
-        version: VERSION,
+        oldest: VERSIONS.oldest(),
+        newest: Some(VERSIONS.newest()),
         epoch,
         trial: false,
         regions: vec![
@@ -457,19 +458,20 @@ fn a_session_is_refused_what_the_server_does_not_serve() {
     let server = Running::with_children(None);
     let mut engine = engine_head(&server.socket, 0);
 
-    // Another interface version than the server's, named, and another epoch
-    // than the head's.
-    for version in [VERSION - 1, VERSION + 1] {
+    // A window of the interface's versions that shares none with the server's, both named, and
+    // another epoch than the head's.
+    for version in [VERSIONS.oldest() - 1, VERSIONS.newest() + 1] {
         let mut other = layout(0);
-        other.version = version;
+        other.oldest = version;
+        other.newest = None;
         let refused = engine.open_pool(other).unwrap_err();
         let ::storage::Error::Server { kind, message } = refused else {
             panic!("{refused}");
         };
         assert_eq!(kind, ErrorKind::Invalid);
         assert!(
-            message.contains(&format!("serves version {VERSION}"))
-                && message.contains(&format!("not {version}")),
+            message.contains(&format!("speaks versions {version} "))
+                && message.contains(&format!("buffer pool {VERSIONS}")),
             "{message}"
         );
     }

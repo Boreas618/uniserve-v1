@@ -53,6 +53,11 @@ pub const COMMITTED: &str = ".committed";
 /// for.
 pub const INTERFACE_VERSION: &str = "interface_version";
 
+/// The key of a module's record that states the oldest version of its interface the module
+/// implements, beside [`INTERFACE_VERSION`], its newest; a record without it states its newest
+/// alone.
+pub const INTERFACE_OLDEST: &str = "interface_oldest";
+
 /// The prefix of a staging directory's name, and of its lock's.
 const STAGING: &str = ".staged-";
 
@@ -210,9 +215,9 @@ impl Store {
         })
     }
 
-    /// The interface version the committed module at `path` was built for, as
-    /// its record states it, from the first root that has the module.
-    pub fn interface_version(&self, path: &ModulePath) -> Option<u32> {
+    /// The interface versions the committed module at `path` was built for, as
+    /// its record states them, from the first root that has the module.
+    pub fn interface(&self, path: &ModulePath) -> Option<service::Versions> {
         let relative = path.relative();
         self.roots
             .iter()
@@ -234,7 +239,7 @@ impl Store {
     }
 
     /// Publishes the files a build wrote as the module at `path`, built for
-    /// `interface_version` of its package's interface.
+    /// the versions `interface` of its package's interface.
     ///
     /// `workspace` is the build's directory; `files` names the files in it
     /// that belong to the module, in the order they are stored. The files and
@@ -246,7 +251,7 @@ impl Store {
         path: &ModulePath,
         workspace: &Path,
         files: &[String],
-        interface_version: u32,
+        interface: service::Versions,
     ) -> Result<()> {
         for name in files {
             if !is_relative_name(name) {
@@ -280,7 +285,11 @@ impl Store {
         let mark = staged.join(COMMITTED);
         std::fs::write(
             &mark,
-            format!("{INTERFACE_VERSION} = {interface_version}\n"),
+            format!(
+                "{INTERFACE_VERSION} = {}\n{INTERFACE_OLDEST} = {}\n",
+                interface.newest(),
+                interface.oldest()
+            ),
         )?;
         File::open(&mark)?.sync_all()?;
         sync_directory(staged)?;
@@ -350,12 +359,15 @@ impl Store {
     }
 }
 
-/// The interface version the mark of the module directory `directory` records,
-/// or `None` when the directory is no committed module.
-fn recorded_version(directory: &Path) -> Option<u32> {
+/// The interface versions the mark of the module directory `directory` records,
+/// or `None` when the directory is no committed module. A mark that states no
+/// oldest version records its newest alone.
+fn recorded_version(directory: &Path) -> Option<service::Versions> {
     let record = std::fs::read_to_string(directory.join(COMMITTED)).ok()?;
     let record: toml::Table = toml::from_str(&record).ok()?;
-    u32::try_from(record.get(INTERFACE_VERSION)?.as_integer()?).ok()
+    let version = |key: &str| u32::try_from(record.get(key)?.as_integer()?).ok();
+    let newest = version(INTERFACE_VERSION)?;
+    service::Versions::stated(version(INTERFACE_OLDEST).unwrap_or(newest), newest)
 }
 
 /// Whether a build's file name is a path inside the module directory:

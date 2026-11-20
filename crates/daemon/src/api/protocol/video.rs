@@ -2,7 +2,7 @@
 //!
 //! The request is the same for every video model: a prompt, an output size and length, and
 //! reference media, each anchoring a generated frame or conditioning the generation as a whole.
-//! What a model makes of it is the model's (`processing::VideoProcessor`). A JSON body states it
+//! What a model makes of it is the model's (its video family in the epoch's processing program). A JSON body states it
 //! as [`VideoGenerationRequest`]; a multipart form states each field as a text part, which the
 //! schema's own field types read ([`from_form`]).
 

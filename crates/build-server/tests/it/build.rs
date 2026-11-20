@@ -67,7 +67,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
         .resolve(OP, &prepared[0].1, &arch(), PAGE_64, &mut |_| {})
         .unwrap();
     assert_eq!(resolved.form, ModuleForm::Cubin);
-    assert_eq!(resolved.interface_version, 1);
+    assert_eq!(resolved.interface, service::Versions::one(1));
     let names: Vec<&str> = resolved
         .files
         .iter()
@@ -155,7 +155,8 @@ fn an_executable_revision_is_installed_stored_and_resolved_as_it_is() {
     assert!(resolved.metadata.is_none());
     assert!(resolved.entries.is_empty());
     assert_eq!(
-        resolved.interface_version, 3,
+        resolved.interface,
+        service::Versions::one(3),
         "the module carries the interface version its package's manifest states"
     );
     assert_eq!(support::file_of(&resolved, "bin/sampler"), executable);
@@ -400,8 +401,9 @@ fn a_build_reports_the_keys_no_package_built_and_builds_the_rest() {
     assert_eq!(served(&store, &cache), [(1, vec![PAGE_64.to_owned()])]);
 }
 
-/// Every program of the release (`crates/scheduling/policies/<name>`, the
-/// packages the server installs from a source tree) is built by the server
+/// Every program of the release (`crates/scheduling/policies/<name>` and the
+/// processing program `crates/processing`, the packages the server installs
+/// from a source tree) is built by the server
 /// from the snapshot its installation took of its whole workspace, with the
 /// lockfile's sources vendored and nothing fetched, into a module that states
 /// its kind; a second server over the same roots resolves the committed
@@ -431,7 +433,8 @@ fn the_release_programs_are_built_from_their_installed_snapshots() {
             "expert-order",
             "layout",
             "role",
-            "ttft"
+            "ttft",
+            "processing"
         ]
     );
 

@@ -154,7 +154,8 @@ fn layouts(count: usize) -> (runtime::Open, runtime::Opened) {
         encoding: [0; 32],
     };
     let layout = runtime::Open {
-        version: runtime::VERSION,
+        oldest: runtime::VERSIONS.oldest(),
+        newest: Some(runtime::VERSIONS.newest()),
         epoch: 1,
         trial: false,
         regions: vec![
@@ -177,6 +178,7 @@ fn layouts(count: usize) -> (runtime::Open, runtime::Opened) {
             capacity: vec![(4, 2), (5, 5), (6, 8), (7, 11)],
         }],
         session: 0,
+        version: None,
     };
     (layout, opened)
 }

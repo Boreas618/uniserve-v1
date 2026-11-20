@@ -411,7 +411,7 @@ fn take_over(
             let stats = leader.stat_logger(&request_id, chat.engine_replica, started);
             let run = crate::api::openai::run::GenerationRun::resume_stream(
                 &chat,
-                leader.tokenizer(),
+                &leader.processor(),
                 Box::new(events),
                 Box::new(stats),
             )?;
@@ -434,7 +434,7 @@ fn take_over(
             let stats = leader.stat_logger(&request_id, chat.engine_replica, started);
             let run = crate::api::openai::run::GenerationRun::resume_collection(
                 &chat,
-                leader.tokenizer(),
+                &leader.processor(),
                 Box::new(events),
                 Box::new(stats),
             )?;

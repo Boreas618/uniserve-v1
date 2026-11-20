@@ -7,8 +7,9 @@
 //!   ([`crate::toolchain::Environment`]);
 //! - the serving packages of the tree's release ([`packages`]): every kernel
 //!   package of the operator tree (`crates/ops/kernels/<op>/<backend>`), every
-//!   program of the release (`crates/scheduling/policies/<name>`) and the
-//!   engine. The upstream server installs them when
+//!   program of the release (`crates/scheduling/policies/<name>`), the
+//!   processing program (`crates/processing`) and the engine, which an epoch
+//!   takes from one tree together. The upstream server installs them when
 //!   it starts ([`crate::server::BuildServer::install_tree`]), so a deployment
 //!   selects from the tree it was started with.
 
@@ -28,11 +29,15 @@ const KERNEL_TREE: &str = "crates/ops/kernels";
 /// package names as `uniserve:<name>`.
 const PROGRAM_TREE: &str = "crates/scheduling/policies";
 
+/// The processing program: the request side of the tree's model families.
+const PROCESSING_PACKAGE: &str = "crates/processing";
+
 /// The engine package.
 const ENGINE_PACKAGE: &str = "crates/engine";
 
 /// The serving packages of the tree at `source`, in a stable order: the kernel
-/// packages by operator and backend, then the programs by name and the engine.
+/// packages by operator and backend, then the programs by name, the processing
+/// program and the engine.
 ///
 /// # Errors
 ///
@@ -64,6 +69,7 @@ pub fn packages(source: &Path) -> Result<Vec<PathBuf>> {
 
     let mut packages = kernels;
     packages.extend(programs);
+    packages.push(source.join(PROCESSING_PACKAGE));
     packages.push(source.join(ENGINE_PACKAGE));
     Ok(packages)
 }

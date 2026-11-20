@@ -38,14 +38,20 @@ use super::Input;
 /// interface.
 const CLAIM: u64 = 1;
 
-/// Says hello on the request interface over `connection` as the engine `launch.engine`, reads
-/// the daemon's welcome, and states `Starting` before anything loads.
+/// Says hello on the request interface over `connection` as the engine `launch.engine`, in
+/// every version of the engine interface this build speaks (`proto::ENGINE_INTERFACE`), reads
+/// the daemon's welcome, and states `Starting` before anything loads. Returns the event window
+/// the daemon states and the version it agreed on, which the process speaks on every link from
+/// then on.
 ///
 /// # Errors
 ///
 /// When the daemon closes or refuses this engine.
-pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<NonZeroU32> {
-    let window = hello(connection, launch.engine)?;
+pub fn connect(
+    connection: &mut Connection,
+    launch: &EngineArgs,
+) -> Result<(NonZeroU32, proto::Agreed)> {
+    let (window, agreed) = hello(connection, launch.engine, proto::ENGINE_INTERFACE)?;
 
     // `Starting` goes out before the rank load, which takes minutes, so the daemon reads a
     // process that is alive rather than one that vanished after its hello.
@@ -59,11 +65,12 @@ pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<NonZe
         None,
     )
     .context("stating that this engine starts")?;
-    Ok(window)
+    Ok((window, agreed))
 }
 
-/// Says hello on the process interface over `process`, then asks this node's daemon for the
-/// node's Storage Server claim, before any storage is mapped.
+/// Says hello on the process interface over `process` in the version the request link agreed
+/// on, `agreed`, then asks this node's daemon for the node's Storage Server claim, before any
+/// storage is mapped.
 ///
 /// Returns the Storage Server launch this process's ranks open their storage with, and the
 /// commands the daemon sent while the claim was outstanding, in order.
@@ -75,6 +82,7 @@ pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<NonZe
 pub(crate) fn claim(
     process: &mut Connection,
     launch: &EngineArgs,
+    agreed: proto::Agreed,
 ) -> Result<(
     crate::memory::client::StorageLaunch,
     Vec<proto::process::Command>,
@@ -87,8 +95,10 @@ pub(crate) fn claim(
              addresses its commands by this number"
         );
     }
+    let offer = agreed.offer();
     process.deliver(&proto::process::Hello {
-        major: proto::ENGINE_INTERFACE_VERSION,
+        oldest: offer.oldest(),
+        newest: offer.newest(),
         build: proto::BUILD.to_owned(),
         peer: Some(proto::process::hello::Peer::Engine(
             proto::process::Engine {
@@ -104,6 +114,7 @@ pub(crate) fn claim(
         return Err(anyhow::Error::new(refusal)
             .context("the daemon refused this engine's process interface"));
     }
+    proto::agreed(offer, welcome.version).map_err(anyhow::Error::msg)?;
     // The nodes are what the claim and every later request are answered by: a welcome with none
     // admits the process to a deployment the daemon does not know it in.
     if welcome.nodes.is_empty() {
@@ -187,26 +198,37 @@ pub(crate) fn claim(
 }
 
 /// Connects to another daemon's request socket at `address`, as a hot restart's successor asks
-/// (`Attach`), says hello there as the engine `engine` and reads its welcome. The caller states
-/// the engine's state on the connection before anything else.
+/// (`Attach`), says hello there as the engine `engine` in the one version it speaks, `agreed`,
+/// and reads its welcome: a successor of another build serves the engine in that version or
+/// refuses it. The caller states the engine's state on the connection before anything else.
 ///
 /// # Errors
 ///
 /// When the connection cannot be made, or the daemon closes it or refuses this engine.
-pub(crate) fn attach(address: &str, engine: u64) -> Result<(Connection, NonZeroU32)> {
+pub(crate) fn attach(
+    address: &str,
+    engine: u64,
+    agreed: proto::Agreed,
+) -> Result<(Connection, NonZeroU32)> {
     let mut connection = address
         .parse()
         .map_err(std::io::Error::from)
         .and_then(|endpoint| Connection::connect(&endpoint))
         .with_context(|| format!("connecting to the attaching daemon at {address}"))?;
-    let window = hello(&mut connection, engine)?;
+    let (window, _) = hello(&mut connection, engine, agreed.offer())?;
     Ok((connection, window))
 }
 
-/// The hello of the request interface and the daemon's welcome.
-fn hello(connection: &mut Connection, engine: u64) -> Result<NonZeroU32> {
+/// The hello of the request interface in the versions `offer`, and the daemon's welcome: the
+/// event window it states and the version it agreed on.
+fn hello(
+    connection: &mut Connection,
+    engine: u64,
+    offer: service::Versions,
+) -> Result<(NonZeroU32, proto::Agreed)> {
     connection.deliver(&wire::Hello {
-        major: proto::ENGINE_INTERFACE_VERSION,
+        oldest: offer.oldest(),
+        newest: offer.newest(),
         build: proto::BUILD.to_owned(),
         engine,
         // The request link: the process link states `PROCESS` on its own socket, and both name
@@ -218,9 +240,11 @@ fn hello(connection: &mut Connection, engine: u64) -> Result<NonZeroU32> {
     if let Some(refusal) = welcome.refusal {
         return Err(anyhow::Error::new(refusal).context("the daemon refused this engine"));
     }
+    let agreed = proto::agreed(offer, welcome.version).map_err(anyhow::Error::msg)?;
     // The daemon states how far ahead of its reports it takes a request's events.
-    NonZeroU32::new(welcome.event_window)
-        .context("the daemon's welcome states no event window, which is positive")
+    let window = NonZeroU32::new(welcome.event_window)
+        .context("the daemon's welcome states no event window, which is positive")?;
+    Ok((window, proto::Agreed(agreed)))
 }
 
 /// The next message of `connection`, for as long as the daemon keeps it open.

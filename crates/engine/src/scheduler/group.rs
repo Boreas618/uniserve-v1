@@ -514,7 +514,8 @@ mod tests {
             .map(|index| GroupId(u8::try_from(index).unwrap()))
             .collect();
         let layout = runtime::Open {
-            version: runtime::VERSION,
+            oldest: runtime::VERSIONS.oldest(),
+            newest: Some(runtime::VERSIONS.newest()),
             epoch: 1,
             trial: false,
             regions: ids
@@ -556,6 +557,7 @@ mod tests {
                 capacity: Vec::new(),
             }],
             session: 0,
+            version: None,
         };
 
         let (output, _) = crossbeam_channel::unbounded();

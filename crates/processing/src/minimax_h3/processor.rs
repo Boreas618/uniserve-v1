@@ -8,7 +8,7 @@
 //! aligns up to the `17n + 5` frame rule, and a frame count must already be one of it. Every
 //! refusal names the public request parameter at fault.
 
-use proto::video::Canvas;
+use scheduling::processing::video::Canvas;
 use serde_json::{Value, json};
 
 use super::prompt::present;
@@ -428,7 +428,7 @@ mod tests {
         );
         assert_eq!(described.denoise_steps(), 8);
 
-        let mut message: proto::request::wire::VideoDenoiser =
+        let mut message: crate::minimax_h3::wire::VideoDenoiser =
             prost::Message::decode(described.encode().as_slice()).unwrap();
         message.tasks = vec!["t3va".to_owned()];
         assert_eq!(

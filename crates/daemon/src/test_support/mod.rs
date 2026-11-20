@@ -1,6 +1,7 @@
 //! Fixtures shared by the crate's tests, one each: the byte tokenizer, in-storage tokenizer
 //! loading, the engine over fakes below its schedulers, an engine a test plays itself, the video
-//! service, the server's router and the connection requests are served over.
+//! service, the server's router, the connection requests are served over, and the records a
+//! build of the engine interface's oldest version writes ([`oldest`]).
 //!
 //! Requests travel over an HTTP/1.1 connection the daemon's own connection code serves
 //! (`http::conn`) into the server's router (`http::router`) and a real `Leader`, whose client
@@ -15,7 +16,7 @@
 //! A test that states an engine's every answer itself plays the engine over a socket pair
 //! ([`scripted_client`]).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -32,21 +33,18 @@ use service::Connection;
 use testkit::{FakeExecutor, Fixture};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::input::chat::HfChatRenderer;
-use crate::api::input::{Processor, RequestRenderer};
-use crate::api::model::{ModelConfig, SamplingDefaults};
+use crate::api::input::Processor;
+use crate::api::model::{ChatFeatures, ModelConfig, SamplingDefaults};
 use crate::api::openai::video_jobs::VideoJobs;
 use crate::api::tokenizer::DynTokenizer;
-use crate::config::ChatTemplateContentFormat;
 use crate::config::{Config, LoggingConfig, ServerConfig, VideoJobConfig};
 use crate::engine::client::{EngineClient, EngineInfo, EngineState};
 use crate::leader::Leader;
 
+pub(crate) mod oldest;
+
 /// Served model name the test engines serve under.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
-
-/// The chat template of the test chat models: the first message's content, as the prompt.
-const FIRST_MESSAGE: &str = include_str!("first_message.jinja");
 
 /// The application crate's byte tokenizer, which the serving tests decode
 /// with (see `crate::api::test_support::configured_tokenizer`).
@@ -76,7 +74,7 @@ pub(crate) fn router_with(engine: impl Into<Arc<Leader>>, server: &ServerConfig)
 /// The tokenizer is [`configured_tokenizer`], whose `<|im_end|>` (ID 2) is the end-of-sequence
 /// token, and the chat template renders only the first message's content. A video family serves
 /// the longest output the family declares, as a deployment that states none does.
-pub(crate) fn served_engine(family: processing::Family) -> Leader {
+pub(crate) fn served_engine(family: &str) -> Leader {
     engine_of(family, testkit::args(SERVED_MODEL), Fixture::new(text_fake))
 }
 
@@ -103,11 +101,7 @@ pub(crate) fn letter_fake(fake: FakeExecutor) -> FakeExecutor {
 
 /// Builds an engine for a model of `family` over the engine of `launch` and
 /// `fixture` ([`fake_engine`]); see [`served_engine`].
-pub(crate) fn engine_of(
-    family: processing::Family,
-    launch: EngineArgs,
-    fixture: Fixture,
-) -> Leader {
+pub(crate) fn engine_of(family: &str, launch: EngineArgs, fixture: Fixture) -> Leader {
     engine_over(test_model(family), configured_tokenizer(), launch, fixture)
 }
 
@@ -370,14 +364,30 @@ pub(crate) fn scripted_client_with(
     )
 }
 
-/// The test model's facts.
-pub(crate) fn test_model(family: processing::Family) -> ModelConfig {
+/// The test model's facts: the tests' processing program's family `family`, with a 4096-token
+/// context and `<|im_end|>` (2) its end of sequence.
+pub(crate) fn test_model(family: &str) -> ModelConfig {
+    let declared = crate::api::test_support::program()
+        .families()
+        .iter()
+        .find(|declared| declared.id == family)
+        .cloned()
+        .expect("the tests' program serves the family");
+    let chat = matches!(
+        declared.serving,
+        scheduling::processing::Serving::Chat { .. }
+    );
     ModelConfig {
-        family,
+        family: declared,
         sampling_defaults: SamplingDefaults::default(),
         max_model_len: 4096,
         primary_eos_token_id: Some(2),
         eos_token_ids: BTreeSet::from([2]),
+        chat: chat.then_some(ChatFeatures {
+            tools: true,
+            reasoning: true,
+            images: false,
+        }),
     }
 }
 
@@ -403,23 +413,19 @@ pub(crate) fn leader_over(
     model_name: String,
     clients: Vec<Arc<EngineClient>>,
 ) -> Leader {
-    let renderer = match model.video() {
-        Some(_) => RequestRenderer::Video(test_video_service()),
-        None => RequestRenderer::Chat(
-            HfChatRenderer::new(
-                Some(FIRST_MESSAGE.to_owned()),
-                HashMap::new(),
-                Some(ChatTemplateContentFormat::String),
-            )
-            .unwrap(),
+    let (binding, video) = match model.video() {
+        Some(_) => (
+            crate::api::test_support::video_binding(),
+            Some(test_video_service()),
         ),
+        None => (crate::api::test_support::binding(model.id()), None),
     };
     let processor = Processor::new(
         model,
         tokenizer,
-        renderer,
+        binding,
+        video,
         clients[0].info().limits.clone(),
-        false,
     )
     .unwrap();
     let options = Config {
@@ -436,7 +442,6 @@ pub(crate) fn leader_over(
         &options.update_config,
     )));
     Leader::new(
-        processing::Registry::default(),
         clients,
         processor,
         &options,
@@ -575,7 +580,7 @@ pub(crate) struct Engines {
     /// The reports the engines send up, by launch generation.
     reports: std::sync::mpsc::Sender<(u64, proto::process::Report)>,
     exits: std::sync::mpsc::Sender<proto::process::Exit>,
-    greetings: std::sync::mpsc::Sender<(u64, String)>,
+    greetings: std::sync::mpsc::Sender<crate::supervision::Greeting>,
     /// The engines the leader's service started for the daemon's engine control.
     controlled: std::sync::mpsc::Sender<crate::supervision::processes::Started>,
     /// The fake engines by launch generation.
@@ -658,7 +663,11 @@ impl Engines {
                 pid: testkit::process::pid(generation),
             });
         let engine = testkit::process::Engine::serving(generation);
-        let _ = self.greetings.send((generation, build.to_owned()));
+        let _ = self.greetings.send(crate::supervision::Greeting {
+            engine: generation,
+            build: build.to_owned(),
+            version: proto::ENGINE_INTERFACE.newest(),
+        });
         let _ = self.reports.send((generation, engine.started()));
         self.engines.insert(generation, engine);
     }
@@ -677,7 +686,11 @@ impl Engines {
             } else {
                 testkit::process::Engine::serving(spawn.generation)
             };
-            let _ = self.greetings.send((spawn.generation, build.to_owned()));
+            let _ = self.greetings.send(crate::supervision::Greeting {
+                engine: spawn.generation,
+                build: build.to_owned(),
+                version: proto::ENGINE_INTERFACE.newest(),
+            });
             let _ = self.reports.send((spawn.generation, engine.started()));
             self.engines.insert(spawn.generation, engine);
         }

@@ -9,16 +9,29 @@
 //! the server refuses is responded with [`Response::Error`], the protocol's
 //! one error: an [`ErrorKind`] and a message.
 //!
-//! The protocol has one version per release ([`VERSION`]). The client states
-//! its version at `Hello`, and the server serves a client of its own version
-//! alone: a client of any other is refused with [`Refusal::Version`], which
-//! names both, before it sends a request. The `Hello` and the `Welcome` are
-//! the one part of the protocol that no release changes, so that a peer of
-//! any version reads its refusal. Every refusal of a `Hello` is typed
-//! ([`Refusal`]).
+//! The protocol is versioned ([`VERSIONS`]): a build speaks a window of
+//! versions, from its oldest to its newest (`service::Versions`). The client
+//! states its window at `Hello`, and the server serves it in the newest
+//! version both speak, which its `Welcome` states ([`Welcome::Accepted`] for
+//! the hello's oldest, [`Welcome::Agreed`] for a later one); a client whose
+//! window shares no version with the server's is refused with
+//! [`Refusal::Version`], which names both windows, before it sends a request.
+//! Every refusal of a `Hello` is typed ([`Refusal`]). The `Hello` and the
+//! `Welcome` change only by additions, so that a peer of any version reads
+//! its refusal: a hello that states no newest version speaks its oldest
+//! alone, as a peer of one version does.
 //!
-//! The encoding is MessagePack with named fields, and every field is
-//! required.
+//! The versions of a window are one schema: a version changes the messages
+//! only by additions (a field with a default, a variant, a value), so one set
+//! of types reads every version of the window, and a sender uses what a
+//! version added only on a connection whose agreed version has it. A change
+//! that is not an addition keeps the previous version's handling beside its
+//! own, selected by the connection's agreed version ([`Client::version`],
+//! the server's record of each client), until the window's oldest version
+//! passes it.
+//!
+//! The encoding is MessagePack with named fields; a field a version adds
+//! has a default, so a peer reads a message of a version before it.
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean. The
@@ -151,11 +164,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::{Open, Opened};
 
-/// The protocol version this build's clients state and its Storage Server
-/// speaks: the one version either accepts. Each process that talks to the
-/// server checks it at its own `Hello`, independently of the other
-/// interfaces it speaks.
-pub const VERSION: u32 = 33;
+/// The versions of the protocol this build's clients and its Storage Server
+/// speak. Each process that talks to the server agrees on its version at its
+/// own `Hello`, independently of the other interfaces it speaks; a successor
+/// of a server's hot restart goes on with every connection only when it speaks
+/// each connection's agreed version.
+pub const VERSIONS: service::Versions = service::Versions::one(33);
 
 /// How long a server of another host may take to answer a request it answers from what it holds
 /// (a hello, a borrow or return of a lend, a task's submission or cancellation, a connector's
@@ -285,32 +299,148 @@ pub enum Role {
     Operator,
 }
 
-/// The first message on a connection: the client's [`VERSION`] and its role.
+/// The first message on a connection: the window of versions the client
+/// speaks ([`VERSIONS`]) and its role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
-    pub version: u32,
+    /// The oldest version the client speaks, its one version when it states no
+    /// [`Hello::newest`].
+    #[serde(rename = "version")]
+    pub oldest: u32,
+    /// The newest version the client speaks; `None` for a client of one version.
+    #[serde(default)]
+    pub newest: Option<u32>,
     pub role: Role,
+}
+
+impl Hello {
+    /// The hello of a client that speaks `versions` as `role`.
+    pub fn new(versions: service::Versions, role: Role) -> Self {
+        Self {
+            oldest: versions.oldest(),
+            newest: Some(versions.newest()),
+            role,
+        }
+    }
+
+    /// The version a server of the window `spoken` serves this hello in: the newest both
+    /// speak.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Version`], naming both windows, when they share no version.
+    pub fn agree(&self, spoken: service::Versions) -> Result<u32, Refusal> {
+        service::Versions::stated(self.oldest, self.newest.unwrap_or(0))
+            .and_then(|offered| offered.agree(spoken))
+            .ok_or(Refusal::Version(VersionRefusal {
+                offered: self.oldest,
+                spoken: spoken.newest(),
+                offered_newest: self.newest,
+                spoken_oldest: Some(spoken.oldest()),
+            }))
+    }
 }
 
 /// The server's response to [`Hello`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Welcome {
-    /// The server serves the client in this build's [`VERSION`].
+    /// The server serves the client in the oldest version its hello states: the newest both
+    /// speak, or the one version of a server of one version.
     Accepted,
+    /// The server serves the client in `version`, a later version of its hello's window than
+    /// its oldest: the newest both speak.
+    Agreed { version: u32 },
     /// The server does not serve this client, for the reason stated.
     Refused { refusal: Refusal },
+}
+
+impl Welcome {
+    /// The welcome of a client whose hello is `hello`, served in `version`: the one that states
+    /// the version in the fewest words, which a client of one version reads too.
+    pub fn of_version(hello: &Hello, version: u32) -> Self {
+        if version == hello.oldest {
+            Self::Accepted
+        } else {
+            Self::Agreed { version }
+        }
+    }
+
+    /// The version this welcome serves a client in that offered `offered`; `None` for a refusal.
+    ///
+    /// # Errors
+    ///
+    /// When the welcome states a version the offer does not hold: the server broke the
+    /// agreement.
+    pub fn version(&self, offered: service::Versions) -> Result<Option<u32>, String> {
+        match self {
+            Self::Accepted => Ok(Some(offered.oldest())),
+            Self::Agreed { version } if offered.speaks(*version) => Ok(Some(*version)),
+            Self::Agreed { version } => Err(format!(
+                "the server serves version {version} of the storage protocol, which a client of \
+                 versions {offered} does not speak"
+            )),
+            Self::Refused { .. } => Ok(None),
+        }
+    }
+}
+
+/// The windows of a version refusal: the client's (`offered` to `offered_newest`) and the
+/// server's (`spoken_oldest` to `spoken`), which share no version. A field a peer of one version
+/// leaves out is that one version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionRefusal {
+    /// The oldest version the client's hello states.
+    pub offered: u32,
+    /// The newest version the server speaks.
+    pub spoken: u32,
+    /// The newest version the client's hello states.
+    #[serde(default)]
+    pub offered_newest: Option<u32>,
+    /// The oldest version the server speaks.
+    #[serde(default)]
+    pub spoken_oldest: Option<u32>,
+}
+
+impl VersionRefusal {
+    /// The client's window as the refusal states it.
+    pub fn offered(&self) -> String {
+        stated(self.offered, self.offered_newest.unwrap_or(self.offered))
+    }
+
+    /// The server's window as the refusal states it.
+    pub fn spoken(&self) -> String {
+        stated(self.spoken_oldest.unwrap_or(self.spoken), self.spoken)
+    }
+}
+
+/// A window of versions from `oldest` to `newest` as text, also one no peer speaks.
+fn stated(oldest: u32, newest: u32) -> String {
+    service::Versions::stated(oldest, newest).map_or_else(
+        || format!("{oldest} to {newest}"),
+        |window| window.to_string(),
+    )
+}
+
+impl std::fmt::Display for VersionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the client speaks versions {} of the storage protocol and the server {}, which share \
+             none",
+            self.offered(),
+            self.spoken()
+        )
+    }
 }
 
 /// Why a server refuses a client's [`Hello`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub enum Refusal {
-    /// The client states another version of the protocol than the server's:
-    /// `offered` is the client's, `spoken` the server's, the only one it
-    /// serves.
-    #[error("the client speaks version {offered} of the storage protocol, the server {spoken}")]
-    Version { offered: u32, spoken: u32 },
+    /// The client's window of the protocol's versions shares none with the server's.
+    #[error("{0}")]
+    Version(VersionRefusal),
     /// The connection said hello before.
     #[error("the connection already said hello")]
     Repeated,
@@ -2203,5 +2333,117 @@ impl service::Message for ServerMessage {
 
     fn decode(payload: &[u8]) -> std::io::Result<Self> {
         decode(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+    use service::Versions;
+
+    use super::*;
+
+    fn operator(versions: Versions) -> Hello {
+        Hello::new(versions, Role::Operator)
+    }
+
+    /// A server serves a client in the newest version both windows hold, and states it in the
+    /// fewest words: the hello's oldest as `Accepted`, a later one as `Agreed`.
+    #[test]
+    fn a_server_agrees_on_the_newest_version_both_speak() {
+        let server = Versions::new(33, 34);
+
+        let hello = operator(Versions::new(33, 34));
+        assert_eq!(hello.agree(server), Ok(34));
+        assert_eq!(
+            Welcome::of_version(&hello, 34),
+            Welcome::Agreed { version: 34 }
+        );
+
+        let hello = operator(Versions::new(34, 35));
+        assert_eq!(hello.agree(server), Ok(34));
+        assert_eq!(Welcome::of_version(&hello, 34), Welcome::Accepted);
+
+        let hello = operator(Versions::one(33));
+        assert_eq!(hello.agree(server), Ok(33));
+        assert_eq!(Welcome::of_version(&hello, 33), Welcome::Accepted);
+    }
+
+    /// A client outside the server's window is refused with the refusal that names both
+    /// windows.
+    #[test]
+    fn a_client_outside_the_window_is_refused_with_both_windows() {
+        let refusal = operator(Versions::new(35, 36))
+            .agree(Versions::new(33, 34))
+            .unwrap_err();
+        assert_eq!(
+            refusal,
+            Refusal::Version(VersionRefusal {
+                offered: 35,
+                spoken: 34,
+                offered_newest: Some(36),
+                spoken_oldest: Some(33),
+            })
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "the client speaks versions 35 to 36 of the storage protocol and the server 33 to \
+             34, which share none"
+        );
+    }
+
+    /// A client reads its welcome's version in its own window: `Accepted` is its oldest, and an
+    /// agreement outside its window breaks the protocol.
+    #[test]
+    fn a_client_speaks_the_version_its_welcome_states() {
+        let offered = Versions::new(33, 34);
+        assert_eq!(Welcome::Accepted.version(offered), Ok(Some(33)));
+        assert_eq!(
+            Welcome::Agreed { version: 34 }.version(offered),
+            Ok(Some(34))
+        );
+        assert!(Welcome::Agreed { version: 35 }.version(offered).is_err());
+    }
+
+    /// The hello and the refusal as a peer of one version writes and reads them: its hello
+    /// states one `version` and no newest, and it reads a refusal's `offered` and `spoken`.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SingleHello {
+        version: u32,
+        role: Role,
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum SingleRefusal {
+        Version { offered: u32, spoken: u32 },
+    }
+
+    /// A peer of one version and a server of a window read each other's hellos and refusals:
+    /// the hello of one version is a window of it alone, and the refusal of a window states the
+    /// fields a peer of one version reads.
+    #[test]
+    fn a_peer_of_one_version_reads_the_hello_and_its_refusal() {
+        let single = encode(&SingleHello {
+            version: 33,
+            role: Role::Operator,
+        })
+        .unwrap();
+        let hello: Hello = decode(&single).unwrap();
+        assert_eq!(hello.newest, None);
+        assert_eq!(hello.agree(Versions::new(33, 34)), Ok(33));
+        assert_eq!(Welcome::of_version(&hello, 33), Welcome::Accepted);
+
+        let refusal = operator(Versions::one(32))
+            .agree(Versions::new(33, 34))
+            .unwrap_err();
+        let read: SingleRefusal = decode(&encode(&refusal).unwrap()).unwrap();
+        assert_eq!(
+            read,
+            SingleRefusal::Version {
+                offered: 32,
+                spoken: 34
+            }
+        );
     }
 }

@@ -9,7 +9,8 @@
 //! a restart of the revision runs the same programs and never resolves `latest` again.
 //!
 //! A package runs any number of control programs and at most one scheduling, one routing and one
-//! KV program; a control or KV program states its `period`.
+//! KV program; a control or KV program states its `period`. A processing program is no package's:
+//! an epoch's module set fixes it beside its engine (`ModuleSet::processing`).
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -89,12 +90,12 @@ pub(crate) fn fix(
             .with_context(|| format!("resolving `programs.{name}` ({source})"))?;
         let (kind, version) = program::kind(&bytes)
             .map_err(|error| anyhow::anyhow!("`programs.{name}` ({source}): {error}"))?;
+        let runs = program::versions(kind);
         ensure!(
-            version == kind.interface_version(),
+            runs.speaks(version),
             "`programs.{name}` ({source}) is a {} program of interface version {version}, and \
-             this release runs version {}",
+             this release runs versions {runs}",
             kind.name(),
-            kind.interface_version()
         );
         let digest = format!("{:x}", Sha256::digest(&bytes));
         fixed.programs.insert(
@@ -138,6 +139,14 @@ fn check(loaded: &[Loaded]) -> anyhow::Result<()> {
         }
     }
     for program in loaded {
+        // A processing program is the request side of the engine's tree, which an epoch's
+        // module set takes beside its engine (`worker_config.processing`), not a package's.
+        ensure!(
+            program.kind != Kind::Processing,
+            "`programs.{}` is a processing program, which an epoch takes from its engine's tree \
+             (`worker_config.processing`): remove it from `programs`",
+            program.name
+        );
         if matches!(program.kind, Kind::Control | Kind::Kv) {
             ensure!(
                 program.entry.period.is_some(),

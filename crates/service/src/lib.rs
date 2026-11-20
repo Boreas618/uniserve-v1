@@ -23,6 +23,10 @@
 //!
 //! Every process records the stages its requests and batches pass through in rings of its
 //! own ([`span`]), which a reader turns into the spans of the deployment's request timelines.
+//!
+//! Every interface between a deployment's processes is spoken in a window of versions
+//! ([`Versions`]), and the two peers of a connection agree at its hello on the newest version
+//! both speak.
 
 mod connection;
 mod directories;
@@ -34,6 +38,7 @@ pub mod msgpack;
 mod readiness;
 mod runtime;
 pub mod span;
+mod versions;
 
 pub use connection::{
     Connection, Handed, Hangup, Listener, Liveness, Message, Socket, Wake, Waker,
@@ -43,6 +48,7 @@ pub use directories::{cache_directory, data_directory, deployment};
 pub use endpoint::{Endpoint, EndpointError};
 pub use readiness::{Endpoints, Readiness, ReadyFd, ReadyReader, State};
 pub use runtime::{Instance, RuntimeDirectory};
+pub use versions::Versions;
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

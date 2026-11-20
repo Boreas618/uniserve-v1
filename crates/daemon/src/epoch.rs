@@ -43,6 +43,9 @@ pub struct EpochRecord {
     pub kernels: BTreeMap<KernelKey, PackageRevision>,
     /// The scheduling policy package.
     pub policy: PackageRevision,
+    /// The processing program the leader daemon serves the epoch's requests through, at the
+    /// revision fixed when the epoch's configuration was applied.
+    pub processing: Option<PackageRevision>,
     /// The modules a generation's trial keeps as the previous generation: a
     /// rollback returns to them, and a commit drops them.
     pub previous: Option<Generation>,
@@ -192,6 +195,7 @@ impl Epochs {
                 engine: deployment.modules.engine.clone(),
                 kernels: deployment.modules.kernels.clone(),
                 policy: deployment.modules.policy.clone(),
+                processing: deployment.modules.processing.clone(),
                 previous: None,
                 status: EpochState::Serving,
                 generation: generations.first().copied(),
@@ -235,6 +239,7 @@ impl Epochs {
                 row.epoch = adopted.epoch;
                 row.build = adopted.build;
                 row.state = adopted.state;
+                row.interface = adopted.interface;
             }
             None => processes.push(adopted),
         }
@@ -288,8 +293,8 @@ pub fn kernel_packages(kernels: &BTreeMap<KernelKey, PackageRevision>) -> Vec<Ke
         .collect()
 }
 
-/// The module set `config` names: the engine package, the scheduling policy's
-/// and the kernel package its `[kernels]` table pins for each descriptor key it lists.
+/// The module set `config` names: the engine package, the scheduling policy's, the processing
+/// program and the kernel package its `[kernels]` table pins for each descriptor key it lists.
 ///
 /// The revisions are fixed when the configuration is applied, at the Build Server: a package's
 /// `revision` is zero until then, unless the configuration states one, and a pin of `latest`
@@ -327,6 +332,13 @@ pub fn modules_of(config: &Config) -> ModuleSet {
             arguments: policy_arguments(config),
         },
         programs: Default::default(),
+        // The request side of the engine's tree, whose revision the apply fixes beside the
+        // engine's.
+        processing: Some(PackageRevision {
+            backend: config.worker_config.processing.clone(),
+            revision: config.worker_config.processing_revision.unwrap_or(0),
+            arguments: toml::Table::new(),
+        }),
     }
 }
 
@@ -447,9 +459,10 @@ impl Epoch {
 /// What `next` changes of `previous`, by the effects its options declare
 /// ([`proto::reload`]) and the module sets both fix: the daemon's own options
 /// first, then an epoch (an option that builds the engine, a replaced Storage
-/// Server, or another engine package or revision), then the kernel and
-/// program modules and the kernel probes' placement. A change of options that
-/// take effect at the next step alone is `None`: no update moves it.
+/// Server, another engine package or revision, or another processing program,
+/// the request side of the engine's tree), then the kernel and program modules
+/// and the kernel probes' placement. A change of options that take effect at the
+/// next step alone is `None`: no update moves it.
 pub fn change(previous: &Epoch, next: &Epoch) -> Change {
     let effects = proto::reload::Effects::of(&proto::reload::changes(
         Some(&previous.config),
@@ -459,9 +472,12 @@ pub fn change(previous: &Epoch, next: &Epoch) -> Change {
         Change::Host
     } else if effects.has(proto::reload::Effect::Epoch)
         || previous.modules.engine != next.modules.engine
+        || previous.modules.processing != next.modules.processing
     {
         // Another engine package, or another revision of it, is another
-        // executable: its engines are started beside the serving ones.
+        // executable: its engines are started beside the serving ones. Another
+        // processing program is another tree's request side, which an epoch
+        // serves with its engine.
         Change::Epoch
     } else if effects.has(proto::reload::Effect::Generation)
         || previous.modules != next.modules
@@ -504,6 +520,7 @@ mod tests {
             engine: package("uniserve"),
             kernels: BTreeMap::from([(KernelKey::all("rms_norm"), package("base"))]),
             policy: package("fcfs"),
+            processing: Some(package("processing")),
             previous: None,
             status: EpochState::Serving,
             generation: None,
@@ -544,6 +561,7 @@ mod tests {
             build: "uniserve".to_owned(),
             generation: 4,
             state: proto::admin::ProcessState::Serving,
+            interface: None,
         }];
         assert_eq!(epochs.processes(), *service::lock(&table));
         service::lock(&table).clear();
@@ -563,6 +581,7 @@ mod tests {
             build: "uniserve".to_owned(),
             generation: 1,
             state: proto::admin::ProcessState::Serving,
+            interface: None,
         }]));
         let epochs = Epochs::new(std::sync::Arc::clone(&table));
 
@@ -574,6 +593,7 @@ mod tests {
             build: "engine".to_owned(),
             generation: 1,
             state: proto::admin::ProcessState::Serving,
+            interface: None,
         });
         let processes = epochs.processes();
         assert_eq!(processes.len(), 1, "{processes:?}");

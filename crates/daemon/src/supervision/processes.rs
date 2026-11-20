@@ -33,8 +33,8 @@ pub(crate) struct ProcessLink {
     /// Requests to the deployment's daemons, each with where its reply goes.
     pub(crate) requests: ToService<(Request, Sender<process::Reply>)>,
     /// Every engine whose process link greeted the leader, by its launch generation, with the
-    /// build its hello states.
-    pub(crate) greetings: Receiver<(u64, String)>,
+    /// build its hello states and the version of the engine interface it agreed on.
+    pub(crate) greetings: Receiver<crate::supervision::Greeting>,
     /// Every supervised process that exited.
     pub(crate) exits: Receiver<Exit>,
     /// Every engine the service started for another asker than the updater.
@@ -96,6 +96,9 @@ struct Launch {
     epoch: Option<u64>,
     /// Its process id, once the node started it.
     pid: Option<u32>,
+    /// The version of the engine interface its links agreed on, once its process link greeted
+    /// the leader.
+    interface: Option<u32>,
 }
 
 /// The engine processes of one deployment: their launches, and the link they are commanded
@@ -165,17 +168,21 @@ impl Processes {
             .map_err(|_| format!("the daemon's service ended before it replied to request {id}"))
     }
 
-    /// Raises the `Hello` of the engine of launch generation `generation`, which greeted with
-    /// `build`: an update checks the build of every engine it starts. An engine of no launch
-    /// known here (one the daemon neither started nor adopted) raises nothing.
-    fn greeted(&mut self, generation: u64, build: String) {
-        let Some(launch) = self.launches.get(&generation) else {
+    /// Raises the `Hello` of the engine whose process link greeted with `greeting` (its launch
+    /// generation, its build and the version of the engine interface it agreed on): an update
+    /// checks the build of every engine it starts, and the launch's row states the version from
+    /// its next state on. An engine of no launch known here (one the daemon neither started nor
+    /// adopted) raises nothing.
+    fn greeted(&mut self, greeting: crate::supervision::Greeting) {
+        let generation = greeting.engine;
+        let Some(launch) = self.launches.get_mut(&generation) else {
             return;
         };
+        launch.interface = Some(greeting.version);
         self.queued.push_back(Event::Hello {
             host: launch.host.clone(),
             generation,
-            build,
+            build: greeting.build,
         });
     }
 
@@ -188,14 +195,19 @@ impl Processes {
         };
         let mut processes = self.epochs.processes();
         let mut found = false;
+        // The version of the engine interface: the greeting's, or the row's of an engine this
+        // updater adopted, which a hot restart's successor states from the engine's attachment.
+        let mut interface = launch.interface;
         for process in &mut processes {
             let ours = process.group == launch.group
                 && process.rank == launch.rank
                 && process.generation == generation;
             if ours {
+                interface = interface.or(process.interface);
                 process.state = state.clone();
                 process.pid = launch.pid;
                 process.epoch = launch.epoch;
+                process.interface = interface;
                 found = true;
             }
         }
@@ -208,6 +220,7 @@ impl Processes {
                 build: String::new(),
                 generation,
                 state: state.clone(),
+                interface,
             });
         }
         self.epochs.set_processes(processes);
@@ -221,6 +234,7 @@ impl Processes {
                 build: String::new(),
                 generation,
                 state,
+                interface,
             },
         );
     }
@@ -351,6 +365,7 @@ impl Processes {
                 rank: u64::from(spawn.rank),
                 epoch: None,
                 pid: None,
+                interface: None,
             },
         );
 
@@ -415,6 +430,7 @@ impl Processes {
             rank: u64::from(rank),
             epoch: None,
             pid: None,
+            interface: None,
         });
     }
 
@@ -466,6 +482,7 @@ impl Processes {
                 rank: u64::from(started.rank),
                 epoch: None,
                 pid: Some(started.pid),
+                interface: None,
             },
         );
         self.row(started.generation, ProcessState::Starting);
@@ -481,8 +498,8 @@ impl Processes {
         while let Ok(started) = self.link.started.try_recv() {
             self.started(started);
         }
-        while let Ok((generation, build)) = self.link.greetings.try_recv() {
-            self.greeted(generation, build);
+        while let Ok(greeting) = self.link.greetings.try_recv() {
+            self.greeted(greeting);
         }
         while let Some((generation, report)) = self.link.commands.report(Duration::ZERO) {
             self.report(generation, report);
@@ -561,6 +578,7 @@ mod tests {
             build: "daemon".to_owned(),
             generation: 0,
             state: ProcessState::Serving,
+            interface: None,
         }]);
 
         let pid = processes
@@ -588,6 +606,11 @@ mod tests {
                 if matches!(report.kind, Some(report::Kind::Parked(_)))
         ));
         assert_eq!(epochs.processes()[1].state, ProcessState::Parked);
+        // Its row states the version of the engine interface its process link agreed on.
+        assert_eq!(
+            epochs.processes()[1].interface,
+            Some(proto::ENGINE_INTERFACE.newest())
+        );
 
         let promote = Command {
             kind: Some(command::Kind::Promote(process::Promote::default())),

@@ -367,7 +367,6 @@ async fn node(
         then: None,
     };
     let start = Start {
-        families: processing::Registry::new([]).unwrap(),
         options: config,
         deployment: "sim".to_owned(),
         revisions: Arc::clone(&revisions),

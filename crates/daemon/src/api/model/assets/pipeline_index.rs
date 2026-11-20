@@ -92,7 +92,10 @@ pub(super) fn within<'a>(file: &str, mut folders: impl Iterator<Item = &'a str>)
 /// # Errors
 ///
 /// Fails when a published index cannot be read.
-pub(super) fn index_text(directory: &Path, index: processing::RootFile) -> Result<Option<String>> {
+pub(super) fn index_text(
+    directory: &Path,
+    index: scheduling::processing::RootFile,
+) -> Result<Option<String>> {
     super::optional_text(directory, index.name())
 }
 
@@ -131,7 +134,7 @@ mod tests {
     #[test]
     fn a_checkpoint_is_a_pipeline_when_it_publishes_its_index() {
         let directory = tempfile::tempdir().unwrap();
-        let index = processing::RootFile::ModularIndex;
+        let index = scheduling::processing::RootFile::ModularIndex;
         std::fs::write(directory.path().join("model_index.json"), "classic").unwrap();
         assert_eq!(index_text(directory.path(), index).unwrap(), None);
 
