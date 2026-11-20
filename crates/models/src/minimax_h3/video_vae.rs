@@ -344,6 +344,7 @@ impl TransformerBlock {
                 intermediate: width * config.decoder_ffn_mult,
                 activation: Activation::Silu,
                 rounding: Rounding::ValueProduct,
+                limit: None,
                 gate_up: GateUp::ValueFirst(gate_up),
                 down,
                 bias: true,

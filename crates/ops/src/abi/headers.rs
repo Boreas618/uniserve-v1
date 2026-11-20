@@ -19,7 +19,7 @@ use cbindgen::{Builder, Config, DocumentationStyle, ItemType, Language, RenameRu
 use expect_test::{ExpectFile, expect_file};
 
 use super::Layout;
-use crate::{attention, conv, fp4, frame, gemm, kernel, moe};
+use crate::{attention, conv, fp4, frame, gemm, kernel, moe, mx};
 
 /// The committed header `$name`: a file of the kernel-source library in this crate's tree,
 /// named from the crate's directory so the comparison reads this tree's file wherever the
@@ -266,6 +266,12 @@ fn headers() -> Vec<Header> {
         )
         .structure::<fp4::Call>("uniserve_nvfp4_gemm_call"),
         Header::new(
+            committed!("uniserve_mxfp8_gemm.h"),
+            "src/mx.rs",
+            "The call structure of `mxfp8_gemm`'s packages",
+        )
+        .structure::<mx::Call>("uniserve_mxfp8_gemm_call"),
+        Header::new(
             committed!("uniserve_frame_moments.h"),
             "src/frame.rs",
             "The call structure of `frame_moments`'s packages",
@@ -299,6 +305,12 @@ fn headers() -> Vec<Header> {
             "The call structure of `sparse_attention`'s packages",
         )
         .structure::<attention::sparse::SparseCall>("uniserve_sparse_attention_call"),
+        Header::new(
+            committed!("uniserve_latent_attention.h"),
+            "src/attention/latent.rs",
+            "The call structure of `latent_attention`'s native packages",
+        )
+        .structure::<attention::latent::LatentAttentionCall>("uniserve_latent_attention_call"),
         Header::new(
             committed!("uniserve_moe_sort.h"),
             "src/moe/sort.rs",
@@ -348,6 +360,18 @@ fn headers() -> Vec<Header> {
             "The call structure of `route_gemm_nvfp4`'s packages",
         )
         .structure::<moe::grouped::RouteNvfp4Call>("uniserve_route_gemm_nvfp4_call"),
+        Header::new(
+            committed!("uniserve_gather_gemm_mxfp4.h"),
+            "src/moe/mxfp4.rs",
+            "The call structure of `gather_gemm_mxfp4`'s packages",
+        )
+        .structure::<moe::mxfp4::GatherMxfp4Call>("uniserve_gather_gemm_mxfp4_call"),
+        Header::new(
+            committed!("uniserve_route_gemm_mxfp4.h"),
+            "src/moe/mxfp4.rs",
+            "The call structure of `route_gemm_mxfp4`'s packages",
+        )
+        .structure::<moe::mxfp4::RouteMxfp4Call>("uniserve_route_gemm_mxfp4_call"),
     ]
 }
 

@@ -4,6 +4,7 @@
 
 #![cfg(test)]
 
+mod deepseek_v41;
 mod minimax_h3;
 mod qwen3;
 mod qwen4_exp;

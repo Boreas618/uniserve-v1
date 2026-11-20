@@ -1,0 +1,53 @@
+# The latent_attention operator's FlashMLA backend: production sparse latent attention on the
+# tensor-memory matrix instructions of Blackwell (`requires = ["tensor_memory"]`).
+#
+# One native module per descriptor: FlashMLA's SM100 sparse decoding kernel for DeepSeek-V4.1
+# (`head64`, the `flashmla` pin of the Build Server's pinned sources, whose provenance and
+# licence are the pin's) over the operator's call (`ops::attention::LatentAttentionCall`). The
+# kernel reads the entries of one query by their slot in a paged quantized plane, a block of 64
+# at a time, so this package owns the operator's side: the slots of each token's window and of
+# its selection, which its own program writes into the call's workspace, the extents and strides
+# of both planes, and the parameters of the vendor's launch.
+#
+# It serves every shape of the operator in one program — a decode row, a verification row of a
+# few tokens and a prefill chunk are all independent query tokens of one launch, each with its
+# own entries — and reads the whole context through the planes, so a call costs the entries its
+# queries attend and not the history behind them.
+#
+# Its `priority` puts it ahead of the Triton package, which declares the same keys and serves
+# every record format and every head count; wherever both cover a key, a deployment that pins
+# neither takes this one.
+
+op = "latent_attention"
+backend = "flashmla"
+interface_version = 2
+priority = 1
+
+# The CUTLASS the kernel includes is the one the `flashinfer-python` distribution installs, as
+# `mxfp8_gemm/deepgemm` does.
+[toolchain]
+packages = ["flashinfer-python"]
+
+[source]
+kind = "cuda"
+
+[kernel]
+requires = ["tensor_memory"]
+
+# `dtype_bf16_heads_64_head_dim_512_window_format_mxfp8_window_128_page_64_compressed_nvfp4_entries_32_columns_512_block_16`
+#
+# The kernel reads a 512-wide latent (`d_qk = d_v = 512`) of up to 64 query heads, which its MMA
+# holds in one block and TMA zero-fills past the call's head count, from MXFP8 window records
+# (its `V41` format, 528 B) beside NVFP4 compressed records (its `V41_FP4`, 288 B) or none. The
+# page of either plane, the window, the selection's columns and the token count are call extents
+# the module reads, so one compilation serves every context length and batch; `block` is the
+# Triton program's head tile and changes nothing here.
+#
+# No other record format is declared: the kernel's formats are the records the reference writes
+# (`crates/models/src/deepseek_v41/cache.rs`), and a BF16 or MXFP4 plane is the Triton package's
+# at selection rather than a build that cannot read it.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], heads = { min = 1, max = 64 }, head_dim = ["512"], window_format = ["mxfp8"], window = { min = 1 }, page = { min = 1 }, compressed = ["none"], block = { min = 1 } }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], heads = { min = 1, max = 64 }, head_dim = ["512"], window_format = ["mxfp8"], window = { min = 1 }, page = { min = 1 }, compressed = ["nvfp4"], entries = { min = 1 }, columns = { min = 1 }, block = { min = 1 } }

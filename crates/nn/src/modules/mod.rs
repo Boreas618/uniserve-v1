@@ -16,15 +16,22 @@ mod embedding;
 mod frame;
 mod gated_delta_net;
 mod head;
+mod hyper;
+mod latent;
 mod linear;
 mod mlp;
 mod moe;
+mod ngram;
 mod norm;
 mod rotary;
 
 pub use attention::{Attention, AttentionConfig, QkNorm};
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use gated_delta_net::{GatedDeltaNet, GatedDeltaNetConfig};
+pub use latent::{
+    Candidates, Compressed, Compressor, CompressorConfig, Indexer, IndexerConfig, LatentAttention,
+    LatentAttentionConfig, LatentBatch, Selection,
+};
 mod timestep;
 pub mod ulysses;
 mod vocoder;
@@ -34,9 +41,13 @@ pub use codec::{DacEncoder, DacEncoderConfig};
 pub use conv::{Conv1d, Conv3d, ConvConfig, ConvTranspose1d};
 pub use frame::{FrameNorm, FrameNormConfig, ResnetBlock3d, ResnetBlock3dConfig};
 pub use head::{LmHead, LmHeadConfig};
+pub use hyper::{MhcConfig, MhcConnection, MhcResidual};
 pub use linear::{Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearConfig, QkvNames};
 pub use mlp::{GateUp, Mlp, MlpConfig};
 pub use moe::{ExpertLayout, MoE, MoEConfig, SharedExpert, SharedExpertConfig};
+pub use ngram::{
+    NgramConfig, NgramHashing, NgramMemory, NgramTable, TableShard, Tokens, ngram_context,
+};
 pub use norm::{
     GatedRmsNorm, GatedRmsNormConfig, LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig,
 };

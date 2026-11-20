@@ -159,11 +159,65 @@ fn yarn_interpolates_the_slow_pairs_and_scales_the_scores() {
     let expected = (0.1 * 10.0_f32.ln() + 1.0).powi(2) / 128.0_f32.sqrt();
     assert!((scaled.score_scale(128).unwrap() - expected).abs() < 1e-6);
 
-    // The recipe is computed in f64 and needs a base above one for its correction range.
-    let narrow = config(1_000_000.0, 128, Spectrum::Yarn(yarn), Precision::F32);
-    assert!(narrow.inverse_frequencies().is_err());
+    // The recipe needs a base above one for its correction range.
     let flat = config(1.0, 128, Spectrum::Yarn(yarn), Precision::F64);
     assert!(flat.inverse_frequencies().is_err());
+}
+
+/// Under the f32 rule a YaRN table is the one DeepSeek's reference computes in f32
+/// (`precompute_freqs_cis`): its bits, from the reference evaluated by PyTorch, for a base of
+/// 160000 over 64 channels extended sixteen times from 65536 positions, β 32 and 1.
+#[test]
+fn a_yarn_table_under_the_f32_rule_is_the_references() {
+    const REFERENCE: [u32; 32] = [
+        0x3f80_0000,
+        0x3f30_0a3a,
+        0x3ef2_1c1f,
+        0x3ea6_7d01,
+        0x3e64_f92e,
+        0x3e1d_7475,
+        0x3dd8_8cb4,
+        0x3d94_e963,
+        0x3d4c_cccd,
+        0x3d0c_d4fb,
+        0x3cc1_b019,
+        0x3c85_30ce,
+        0x3c37_2dbf,
+        0x3bfb_ed88,
+        0x3bad_3d5e,
+        0x3b6e_4237,
+        0x3b14_7ae1,
+        0x3ab7_14e0,
+        0x3a5e_bdb6,
+        0x3a05_30ce,
+        0x399b_b3af,
+        0x3930_5978,
+        0x38be_904d,
+        0x383e_9b5f,
+        0x37a3_d70c,
+        0x36b4_43d0,
+        0x3677_eba6,
+        0x362a_7be8,
+        0x35ea_77ff,
+        0x35a1_3bdc,
+        0x355d_bf30,
+        0x3518_7c4d,
+    ];
+    let yarn = Yarn {
+        factor: 16.0,
+        original_max_position_embeddings: 65_536,
+        attention_factor: None,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        mscale: None,
+        mscale_all_dim: None,
+    };
+
+    let table = config(160_000.0, 64, Spectrum::Yarn(yarn), Precision::F32)
+        .inverse_frequencies()
+        .unwrap();
+    let bits: Vec<u32> = table.iter().map(|frequency| frequency.to_bits()).collect();
+    assert_eq!(bits, REFERENCE);
 }
 
 /// The softmax scale follows the configuration's precision: the two rules differ at 72

@@ -19,6 +19,11 @@ reduction, so ``roundings * u_out`` with three roundings for ``silu`` and
 subnormal unit, which the GELU's tail reaches past ``g = -13``; no tolerance
 of the check's own choosing. The element type is the fixture's, ``bf16``.
 
+A clamped module (``clamp``, DeepSeek's SwiGLU limit ``L``) computes
+``act(min(gate, L)) * clamp(value, -L, L)``; a clamp is exact, so it is held
+to the same bound, at the width of DeepSeek-V4.1-Flash's shared expert and its
+limit of 10, with gates and values that cross the limit on both sides.
+
 The exact GELU needs ``libdevice.erf``, which Triton's interpreter does not
 provide: it runs on a device only.
 """
@@ -69,6 +74,15 @@ CASES = {
         "zero_row": False,
         "seed": 3,
     },
+    "clamped at 10, DeepSeek's shared expert's halves": {
+        "rows": 5,
+        "width": 2304,
+        "gate_stride": 4608,
+        "value_stride": 4608,
+        "zero_row": False,
+        "seed": 4,
+        "limit": 10.0,
+    },
 }
 
 
@@ -91,12 +105,14 @@ def launch(kernels, gate, value, out, case, activation):
         elements,
         case["gate_stride"],
         case["value_stride"],
+        case.get("limit", 0.0),
         n_cols=case["width"],
         ACTIVATION=activation,
         BLOCK=BLOCK,
         WIDE=False,
         PDL=False,
         stepwise=False,
+        CLAMP="limit" in case,
         num_warps=8,
     )
 
@@ -117,8 +133,11 @@ def test_both_halves_match_torch_within_the_operators_bound(
     gate_flat = (
         torch.randn(rows * shape["gate_stride"], generator=generator) * 4.0
     ).to(DTYPE)
-    value_flat = torch.randn(
-        rows * shape["value_stride"], generator=generator
+    # A clamped case's values reach past its limit on both sides, as its gates
+    # do.
+    value_flat = (
+        torch.randn(rows * shape["value_stride"], generator=generator)
+        * (4.0 * shape.get("limit", 0.25))
     ).to(DTYPE)
     # The `[rows, width]` views whose rows are each half's stride apart.
     gate = gate_flat.to(torch_device).as_strided(
@@ -142,7 +161,12 @@ def test_both_halves_match_torch_within_the_operators_bound(
         activation,
     )
 
-    expected = activate(gate.cpu().double(), activation) * value.cpu().double()
+    reference_gate, reference_value = gate.cpu().double(), value.cpu().double()
+    if "limit" in shape:
+        limit = shape["limit"]
+        reference_gate = reference_gate.clamp(max=limit)
+        reference_value = reference_value.clamp(-limit, limit)
+    expected = activate(reference_gate, activation) * reference_value
     got = out.cpu().double()
     bound = ROUNDINGS[activation] * UNIT_ROUNDOFF
     difference = (got - expected).abs()

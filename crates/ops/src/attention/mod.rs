@@ -83,12 +83,17 @@
 
 pub mod dense;
 pub mod indexed;
+pub mod latent;
 pub mod sparse;
 
 pub use dense::{DenseArgs, DenseAttention, DenseCall, DenseDescriptor};
 pub use indexed::{
-    IndexScores, IndexScoresArgs, IndexScoresDescriptor, IndexedAttention, IndexedAttentionArgs,
-    IndexedAttentionDescriptor,
+    IndexScores, IndexScoresArgs, IndexScoresDescriptor, IndexSelect, IndexSelectArgs,
+    IndexSelectDescriptor, IndexedAttention, IndexedAttentionArgs, IndexedAttentionDescriptor,
+};
+pub use latent::{
+    Compressed, CompressedArgs, LatentAttention, LatentAttentionArgs, LatentAttentionCall,
+    LatentAttentionDescriptor, workspace_bytes as latent_attention_workspace_bytes,
 };
 pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
 

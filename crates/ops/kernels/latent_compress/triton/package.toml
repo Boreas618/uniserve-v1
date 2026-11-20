@@ -1,0 +1,52 @@
+# The latent_compress operator's Triton backend: design 5.2's package.
+#
+# One program handles one token: the token that completes a group of `ratio` positions pools the
+# group's projections, from the batch or from the request's ring, into a normalized BF16 latent,
+# and every token answers the entry it completes and the ring row it is kept in
+# (`ops::compress::LatentCompress`). The token and state-row counts, the projection's stride and
+# the epsilon are launch values; the key fixes the group, the latent's width, the ring and the
+# gain's element type.
+
+op = "latent_compress"
+backend = "triton"
+interface_version = 1
+
+[source]
+kind = "triton"
+
+# Every product and sum rounds once (`enable_fp_fusion = false`), as the pooling's formula
+# states them.
+[launch]
+kernel = "_latent_compress_kernel"
+warps = 4
+options = { enable_fp_fusion = false }
+
+# The slots, offsets and lengths are U32 columns read as I32: a request slot and a token count fit
+# one, and the padding slot `NO_SLOT` reads as -1.
+[launch.types]
+projected = "*fp32"
+weight = { pointer = "gain" }
+ring = "*fp32"
+slots = "*i32"
+query_offsets = "*i32"
+seq_lens = "*i32"
+positions = "*i32"
+latent = "*bf16"
+entries = "*i32"
+ring_rows = "*i32"
+tokens = "i64"
+rows = "i32"
+projected_stride = "i64"
+eps = "fp32"
+
+[launch.constants]
+RATIO = { field = "ratio" }
+WIDTH = { field = "width" }
+RING = { field = "ring" }
+
+# `ratio_2_width_512_ring_8_gain_bf16`.
+#
+# `width` is a `tl.arange` extent and so a power of two; a ratio of one is a normalization alone,
+# and the ring holds at least a group (`LatentCompress::check`).
+[[kernel.descriptors]]
+dimensions = { ratio = { min = 2 }, width = { power_of_two = true }, ring = { min = 2 }, gain = ["bf16", "f32"] }

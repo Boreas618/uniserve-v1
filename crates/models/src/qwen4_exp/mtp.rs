@@ -39,13 +39,13 @@
 //! The references run one multi-token-prediction layer per forward, and a forward here is not
 //! told its step, so a checkpoint of more than one layer is refused at load.
 
-use nn::family::{CacheShape, StateShape, TextPlacement};
+use nn::family::{CacheField, StateShape, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, RmsNormConfig, Rotary};
 use nn::{DType, Drafter, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder};
 
 use crate::qwen4_exp::ID;
 use crate::qwen4_exp::attention::IndexedAttention;
-use crate::qwen4_exp::causal_lm::{cache_shape, coordinates, token_columns};
+use crate::qwen4_exp::causal_lm::{cache_fields, coordinates, token_columns};
 use crate::qwen4_exp::config::Config;
 use crate::qwen4_exp::decoder::DecoderLayer;
 use crate::qwen4_exp::hyper_connection::HyperConnection;
@@ -66,7 +66,8 @@ pub struct Mtp {
     /// The width of one stream and the stream count.
     hidden: usize,
     streams: usize,
-    cache: CacheShape,
+    /// The draft cache's fields of the one layer: its keys, values and index keys.
+    cache: Vec<CacheField>,
     /// The ring its layer keeps per request slot.
     state: StateShape,
     /// The module's path in the checkpoint, which names its profiler range.
@@ -152,7 +153,7 @@ impl Mtp {
             )?,
             hidden: hidden as usize,
             streams: streams as usize,
-            cache: cache_shape(config, placement.tensor, 1),
+            cache: cache_fields(config, placement.tensor, 1, fc_embedding.weight().dtype()),
             state: StateShape {
                 layers: 1,
                 fields: IndexedAttention::state_fields(
@@ -168,8 +169,8 @@ impl Mtp {
 }
 
 impl Drafter for Mtp {
-    fn cache(&self) -> CacheShape {
-        self.cache
+    fn cache(&self) -> Vec<CacheField> {
+        self.cache.clone()
     }
 
     /// The layer's ring (module documentation): one run of one layer.

@@ -421,12 +421,15 @@ fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
 
     // An FP8 cache whose planes split into segments of whole granules.
     let layout = Arc::new(
-        CacheLayout::dense(64, 2, 2, 256, PrefixCacheDtype::Float8E4m3Fn)
-            .validated()
-            .unwrap(),
+        CacheLayout::of(
+            64,
+            &nn::family::CacheField::keys_and_values(2, 2, 256),
+            PrefixCacheDtype::Float8E4m3Fn,
+        )
+        .unwrap(),
     );
     let granularity = platform::DeviceAllocation::granularity(device).unwrap() as u64;
-    let units = segments::segmented_units(512, layout.plane_bytes, granularity);
+    let units = segments::segmented_units(512, layout.segment_plane(), granularity);
     let config = |segments| KvCacheConfig {
         layout: Arc::clone(&layout),
         units,
@@ -435,11 +438,12 @@ fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
         segments,
         workspace_bytes: 1 << 20,
         states: (0, None),
+        windows: Vec::new(),
     };
 
     // The serving epoch's rank creates the region's memory; the target's maps it from the
     // segment table the buffer pool keeps of it.
-    let made = segments::own(EPOCH, units, layout.plane_bytes, granularity);
+    let made = segments::own(EPOCH, units, layout.segment_plane(), granularity);
     assert!(made.is_some(), "the planes split");
     let first = KvCacheMemory::open(config(made), (device, &[]), &*serving, &stream).unwrap();
     let mut unit = 0;
@@ -473,12 +477,14 @@ fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
     // A flag and a scale of unit 6, written through the serving epoch's tensors, are what the
     // target's tensors read.
     let address = |cache: &KvCacheMemory| {
-        let layer = cache.planes(0).unwrap().remove(1);
-        let scale = layer.value_scale.expect("an FP8 cache states its scales");
+        // The keys of layers 0 and 1, then their values: layer 1's are planes 1 and 3.
+        let planes = cache.planes(0).unwrap();
+        let (key, value) = (&planes[1], &planes[3]);
+        let scale = value.scale.clone().expect("an FP8 cache states its scales");
         let start = |tensor: &Tensor| ops::operand(tensor).unwrap().ptr.address();
 
         // The cells of layer 1's column are `[units]`: a byte of flag, four of scale, per unit.
-        (start(&layer.key_initialized) + 6, start(&scale) + 6 * 4)
+        (start(&key.initialized) + 6, start(&scale) + 6 * 4)
     };
     let ((flag, scale), (their_flag, their_scale)) = (address(&first), address(&second));
     write_device(flag, &[1], &stream);

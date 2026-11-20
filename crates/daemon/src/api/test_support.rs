@@ -3,17 +3,23 @@
 //! `configured_tokenizer` builds the deterministic byte tokenizer the serving
 //! tests decode with: every printable ASCII character is one token whose ID is
 //! its code point, and the chat, vision and thinking special tokens encode
-//! atomically. [`CHAT`] and [`VIDEO`] are the families those tests serve, and
-//! [`TestProcessor`] processes the video family's requests. It is compiled for the
-//! daemon's tests alone.
+//! atomically. [`program`] is the processing program those tests serve, the
+//! test families' (`processing-testing`), built for wasm32 by the cargo that
+//! runs the tests and loaded as an epoch's program is: [`CHAT`] and [`VIDEO`]
+//! name the families of it the serving tests bind ([`binding`],
+//! [`test_video_service`]). It is compiled for the daemon's tests alone.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
+use proto::module::PackageRevision;
+use scheduling::processing::{Bind, ChatOptions, Open};
 use tokenizers::AddedToken;
 use tokenizers::Tokenizer as TokenizerBuilder;
 use tokenizers::models::bpe::{BPE, Vocab};
 
 use crate::api::input::video::VideoService;
+use crate::api::program::{Binding, Program, Session};
 use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
 /// Loads a `tokenizers` definition in storage, as the frontend loads a
@@ -71,159 +77,122 @@ pub fn configured_tokenizer() -> DynTokenizer {
     Arc::new(load_tokenizer(&tokenizer))
 }
 
-/// A chat family whose outputs are parsed as `<think>` reasoning and JSON tool calls.
-pub const CHAT: processing::Family = processing::Family {
-    id: "chat",
-    root: processing::RootFile::Config,
-    classes: &["ChatForCausalLM"],
-    serving: processing::Serving::Chat(processing::ChatProfile {
-        reasoning: Some(processing::ReasoningFormat {
-            open: "<think>",
-            close: "</think>",
-        }),
-        tool_calls: Some(processing::ToolCallFormat::Json),
-        images: None,
-        checkpoint: processing::ChatCheckpoint {
-            context_length: &["max_position_embeddings"],
-            chat_template: processing::ChatTemplate::TokenizerConfig,
-        },
-    }),
-};
+/// The test program's chat family: `<think>` reasoning and JSON tool calls, its template in its
+/// tokenizer configuration, its class `ChatForCausalLM`.
+pub const CHAT: &str = "chat";
 
-/// A video family whose processor is [`TestProcessor`].
-pub const VIDEO: processing::Family = processing::Family {
-    id: "video",
-    root: processing::RootFile::ModularIndex,
-    classes: &["TestVideoPipeline"],
-    serving: processing::Serving::Video(&TestVideo),
-};
+/// The test program's family that writes tool calls as function and parameter tags, typed by
+/// the request's tool schemas, and delimits no reasoning. Its class is `TagsForCausalLM`.
+pub const TAGS: &str = "tags";
 
-/// The video family [`VIDEO`] serves.
-struct TestVideo;
+/// The test program's video family, of one rule and plain inputs: a request shorter than a
+/// second is refused before its media is fetched, and every image reference is one condition
+/// whose rows are its height. Its class is `TestVideoPipeline`.
+pub const VIDEO: &str = "video";
 
-impl processing::VideoFamily for TestVideo {
-    fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
+/// The template the serving tests' chat checkpoints keep: the first message's content.
+pub const FIRST_MESSAGE: &str = "{{ messages[0].content }}";
 
-    fn default_sizes(&self) -> &'static [&'static str] {
-        &["768x768"]
-    }
+/// The processing program of the tests' families, loaded once per test process.
+pub fn program() -> Arc<Program> {
+    static PROGRAM: OnceLock<Arc<Program>> = OnceLock::new();
 
-    fn default_max_seconds(&self) -> f64 {
-        4.0
-    }
-
-    fn processing_parts(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn base_pin(&self) -> Option<processing::BasePin> {
-        None
-    }
-
-    fn bind(
-        &self,
-        _: processing::VideoBinding<'_>,
-    ) -> Result<Box<dyn processing::VideoProcessor>, String> {
-        Ok(Box::new(TestProcessor))
-    }
+    let program = PROGRAM.get_or_init(|| {
+        // The test executable is `<target>/<profile>/deps/<name>`: the module is built into a
+        // target directory beside the tests' own.
+        let target = std::env::current_exe()
+            .expect("the test executable")
+            .ancestors()
+            .nth(3)
+            .expect("the test's target directory")
+            .to_path_buf();
+        let bytes = program_testing::build(
+            std::path::Path::new(env!("CARGO")),
+            &target,
+            "processing-testing",
+        );
+        let revision = PackageRevision {
+            backend: "processing-testing".to_owned(),
+            revision: 1,
+            arguments: toml::Table::new(),
+        };
+        Program::load(&bytes, revision).expect("the tests' processing program loads")
+    });
+    Arc::clone(program)
 }
 
-/// A video model of one rule and plain inputs, for request processing's own behavior: a request shorter
-/// than a second is refused before its media is fetched, and every image reference is one
-/// condition whose rows are its height.
-pub struct TestProcessor;
+/// The files of a checkpoint of the chat family `family` (by its class): a 4096-token context
+/// and `template`, with `<|im_end|>` its end of sequence.
+pub fn chat_files(class: &str, template: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "config.json".to_owned(),
+            serde_json::json!({"architectures": [class], "max_position_embeddings": 4096})
+                .to_string(),
+        ),
+        (
+            "tokenizer_config.json".to_owned(),
+            serde_json::json!({"eos_token": "<|im_end|>", "chat_template": template}).to_string(),
+        ),
+    ])
+}
 
-impl processing::VideoProcessor for TestProcessor {
-    fn capabilities(&self) -> serde_json::Value {
-        serde_json::json!({"sizes": ["64x64"]})
-    }
+/// The test program's family `family` bound to a checkpoint whose template is
+/// [`FIRST_MESSAGE`] and whose tokenizer is [`configured_tokenizer`], answering no reasoning
+/// apart from content, as the serving tests' deployments do.
+pub fn binding(family: &str) -> Arc<Binding> {
+    let bind = Bind {
+        family: family.to_owned(),
+        files: chat_files("ChatForCausalLM", FIRST_MESSAGE),
+        chat: ChatOptions::default(),
+        ..Bind::default()
+    };
+    program()
+        .bind(bind, configured_tokenizer())
+        .expect("the test family binds")
+}
 
-    fn denoise_steps(&self) -> u32 {
-        4
-    }
+/// An instance of the [`CHAT`] binding for one response, its parser open for a prompt that
+/// leaves generation outside reasoning and lets the model call no tool: its text passes as
+/// content.
+pub fn session() -> Session {
+    session_of(CHAT, None)
+}
 
-    fn check(&self, request: &processing::VideoSpec) -> Result<(), processing::InputError> {
-        match request.length {
-            Some(processing::Length::Seconds(seconds)) if seconds < 1.0 => Err(
-                processing::InputError::invalid("seconds", "a video lasts at least a second"),
-            ),
-            _ => Ok(()),
-        }
-    }
-
-    fn process(
-        &self,
-        request: &processing::VideoSpec,
-        media: &[processing::MediaMetadata],
-        vocabulary: &dyn processing::Vocabulary,
-    ) -> Result<processing::VideoInput, processing::InputError> {
-        use proto::video::{Canvas, ConditionMedia, ConditionRole, ImageFit};
-
-        let conditions = request
-            .references
-            .iter()
-            .zip(media)
-            .map(|(reference, media)| {
-                let processing::MediaMetadata::Image(image) = media else {
-                    return Err(processing::InputError::Internal(
-                        "the test processor processes images".to_owned(),
-                    ));
-                };
-                let canvas = Canvas {
-                    width: image.width,
-                    height: image.height,
-                };
-                Ok(processing::ConditionInput {
-                    role: match reference.frame_index {
-                        Some(0) => ConditionRole::FirstFrame,
-                        Some(_) => ConditionRole::LastFrame,
-                        None => ConditionRole::Reference,
-                    },
-                    media: ConditionMedia::Image(ImageFit {
-                        resized: canvas,
-                        left: 0,
-                        top: 0,
-                        size: canvas,
-                    }),
-                    vision: None,
-                    latent_units: vec![image.height],
-                    audio_rows: 0,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let prompt_token_ids = vocabulary
-            .encode(&request.prompt)
-            .map_err(|error| processing::InputError::Internal(error.to_string()))?;
-        Ok(processing::VideoInput {
-            size: request.size.unwrap_or(Canvas {
-                width: 64,
-                height: 64,
-            }),
-            num_frames: 22,
-            fps: 24,
-            seed: request.seed,
-            prompt_token_ids,
-            vision_spans: Vec::new(),
-            condition_rows: conditions
-                .iter()
-                .flat_map(|condition| condition.latent_units.iter())
-                .sum(),
-            conditions,
-            video_units: 2,
+/// An instance of `family`'s binding ([`binding`]) for one response, its parser open for a
+/// prompt that leaves generation outside reasoning, against `tools`.
+pub fn session_of(family: &str, tools: Option<Vec<scheduling::processing::Tool>>) -> Session {
+    let mut session = binding(family).checkout().expect("an instance");
+    session
+        .open(&Open {
+            tools,
+            prompt: Vec::new(),
         })
-    }
+        .expect("the instance answers")
+        .expect("the parser opens");
+    session
 }
 
-/// The video service of [`TestProcessor`] under the default media policy.
+/// The [`VIDEO`] family bound to a placed denoiser, as a deployment's start binds it once its
+/// workers described it.
+pub fn video_binding() -> Arc<Binding> {
+    let bind = Bind {
+        family: VIDEO.to_owned(),
+        video: Some(scheduling::processing::video::Binding {
+            description: Vec::new(),
+            max_seconds: 4.0,
+        }),
+        ..Bind::default()
+    };
+    program()
+        .bind(bind, configured_tokenizer())
+        .expect("the test video family binds")
+}
+
+/// The video service of [`VIDEO`] under the default media policy.
 pub fn test_video_service() -> VideoService {
-    VideoService::new(
-        Box::new(TestProcessor),
-        &proto::config::MediaConfig::default(),
-        configured_tokenizer(),
-    )
-    .expect("the default media policy builds a video service")
+    VideoService::new(video_binding(), &proto::config::MediaConfig::default())
+        .expect("the default media policy builds a video service")
 }
 
 /// A request's engine events sent on a channel, as an engine that never
@@ -436,41 +405,5 @@ pub mod chat {
             content: MessageContent::Text(content.into()),
             tool_call_id: tool_call_id.into(),
         }
-    }
-}
-
-/// Drives tool parsers over text cut into chunks, as decoded text reaches them.
-pub mod tool_parsing {
-    use itertools::Itertools as _;
-
-    use crate::api::error::Result;
-    use crate::api::output::tools::{ToolParser, ToolParserOutput};
-
-    /// The output of `chunks` pushed through `parser` in order and the parser finished, with
-    /// each call's deltas merged.
-    pub fn parse_chunks<'a>(
-        parser: &mut dyn ToolParser,
-        chunks: impl IntoIterator<Item = &'a str>,
-    ) -> Result<ToolParserOutput> {
-        let mut output = ToolParserOutput::default();
-        for chunk in chunks {
-            parser.parse_into(chunk, &mut output)?;
-        }
-        output.append(parser.finish()?);
-        Ok(output.coalesce_calls())
-    }
-
-    /// The output of the whole of `text` pushed through `parser` as one chunk.
-    pub fn parse_whole(parser: &mut dyn ToolParser, text: &str) -> Result<ToolParserOutput> {
-        parse_chunks(parser, [text])
-    }
-
-    /// `text` cut into chunks of `size` characters, the last one shorter.
-    pub fn chunks_of(text: &str, size: usize) -> Vec<String> {
-        text.chars()
-            .chunks(size)
-            .into_iter()
-            .map(String::from_iter)
-            .collect()
     }
 }

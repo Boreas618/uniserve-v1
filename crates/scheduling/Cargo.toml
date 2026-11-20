@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "The program SDK: the Program trait and its exports, the inputs and outputs of the control, routing and KV programs, and the scheduling policy's interface, compiled into every program and every host."
+description = "The program SDK: the Program trait and its exports, the inputs and outputs of the control, routing and KV programs, the scheduling policy's interface and the processing interface, compiled into every program and every host."
 
 [dependencies]
 # The logging facade a program writes with, forwarded to the host's `uniserve.log`.
@@ -12,6 +12,8 @@ log.workspace = true
 # The wire between the mechanism and a policy module: JSON of this crate's types.
 serde.workspace = true
 serde_json.workspace = true
+# The errors of the processing interface's messages.
+thiserror.workspace = true
 
 [lints]
 workspace = true

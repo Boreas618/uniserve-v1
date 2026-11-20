@@ -1314,8 +1314,12 @@ pub fn prepare_epoch(
     });
     let pinned = pinned?;
     for (host, prepared) in remote {
-        let prepared =
+        let mut prepared =
             prepared.map_err(|_| anyhow::anyhow!("the preparation at {host} panicked"))??;
+        // The engines' wire form of the set leaves out what the leader daemon runs itself (its
+        // programs and its processing program), which no other host prepares.
+        prepared.programs.clone_from(&pinned.programs);
+        prepared.processing.clone_from(&pinned.processing);
         anyhow::ensure!(
             prepared == pinned,
             "the Build Server of {host} prepared other modules than the Build Server of {}",
@@ -1370,12 +1374,16 @@ pub(crate) fn prepare_node(
 
 /// `filled` as a fixed module set: every package it names at the revision `server`, the leader
 /// daemon's own host's Build Server, selects for it, and every installed kernel package of every
-/// operator at its selected revision.
+/// operator of the fixed engine revision at its selected revision.
 ///
 /// This is the one selection of an apply. The daemon asks `cover` for each interface the
-/// deployment uses: the engine, the scheduling policy and every kernel operator of this build.
+/// deployment uses: the engine, the scheduling policy and every kernel operator the fixed engine
+/// revision launches, as the Build Server lists that revision's vocabulary ([`engine_operators`])
+/// rather than as this daemon's build knows operators, so the packages of an operator a later
+/// engine revision adds are fixed, pinned and moved by a newer revision like any other's.
 /// A package the deployment names, the engine, the policy or a pin of its `[kernels]` table,
-/// takes the revision it states, else its latest installed one. Every candidate of an operator is
+/// takes the revision it states, else its latest installed one; a pin of an operator the engine
+/// revision does not launch is refused. Every candidate of an operator is
 /// recorded as well, one slot per package with the package as its part, a pinned backend at its
 /// pinned revision: for each descriptor key the engine later asks `cover` to select among exactly
 /// these revisions, so a package or a revision installed after this call is run by nobody until
@@ -1386,7 +1394,8 @@ pub(crate) fn prepare_node(
 /// # Errors
 ///
 /// Fails when the Build Server cannot be reached, or holds no package, or not the revision, the
-/// deployment names for an interface, or refuses the pins of an operator.
+/// deployment names for an interface, or refuses the pins of an operator, and when the
+/// deployment pins an operator the engine revision does not launch.
 pub fn with_store_modules(
     server: &BuildServer,
     filled: &crate::epoch::ModuleSet,
@@ -1401,11 +1410,22 @@ pub fn with_store_modules(
 
     let mut complete = filled.clone();
     fix_revision(&mut client, proto::module::ENGINE, &mut complete.engine)?;
+    let operators = engine_operators(&mut client, &complete.engine)?;
     fix_revision(&mut client, proto::module::PROGRAM, &mut complete.policy)?;
+    if let Some(processing) = complete.processing.as_mut() {
+        fix_revision(&mut client, proto::module::PROGRAM, processing)?;
+    }
     for (slot, package) in &mut complete.kernels {
+        anyhow::ensure!(
+            operators.contains(&slot.op),
+            "`kernels.{}` names no operator engine {} revision {} launches",
+            slot.op,
+            complete.engine.backend,
+            complete.engine.revision
+        );
         fix_revision(&mut client, &slot.op, package)?;
     }
-    for operator in proto::module::operator::ALL {
+    for operator in &operators {
         // The operator's pins, at their fixed revisions: a pinned backend is the operator's
         // candidate at the revision its pins state.
         let pins = complete
@@ -1436,6 +1456,36 @@ pub fn with_store_modules(
         }
     }
     Ok(complete)
+}
+
+/// The operators whose kernel packages the engine package revision `engine` launches, as the
+/// Build Server lists them with the revision: the vocabulary of the revision's own snapshot
+/// (`operators` of its manifest), which names every operator its executable was compiled with,
+/// whether or not this daemon's build knows it.
+///
+/// # Errors
+///
+/// Fails when the Build Server does not list its packages, or lists no such engine revision.
+fn engine_operators(
+    client: &mut build_server::Client,
+    engine: &proto::module::PackageRevision,
+) -> anyhow::Result<Vec<String>> {
+    client
+        .list()
+        .context("listing the Build Server's packages")?
+        .into_iter()
+        .find(|entry| {
+            entry.package.op == proto::module::ENGINE
+                && entry.package.backend == engine.backend
+                && entry.package.revision == engine.revision
+        })
+        .map(|entry| entry.operators)
+        .with_context(|| {
+            format!(
+                "the Build Server lists no engine package {} revision {}",
+                engine.backend, engine.revision
+            )
+        })
 }
 
 /// The candidates the Build Server selects among for `op`: every installed package of the
@@ -1598,8 +1648,10 @@ fn prepare_at(
         engine,
         kernels,
         policy,
-        // The programs were fixed before the set: the Build Servers prepare the engines' modules.
+        // The programs were fixed before the set: the Build Servers prepare the engines' modules,
+        // and the leader daemon resolves the processing program itself.
         programs: filled.programs.clone(),
+        processing: filled.processing.clone(),
     })
 }
 

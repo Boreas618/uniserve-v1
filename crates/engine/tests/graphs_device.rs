@@ -42,10 +42,9 @@ const ROWS: usize = 4;
 const COLUMN: u64 = 256;
 const IDS: u64 = 0;
 const POSITIONS: u64 = COLUMN;
-const SLOTS: u64 = 2 * COLUMN;
-const LENGTHS: u64 = 3 * COLUMN;
-const OFFSETS: u64 = 4 * COLUMN;
-const INPUTS: u64 = 5 * COLUMN;
+const LENGTHS: u64 = 2 * COLUMN;
+const OFFSETS: u64 = 3 * COLUMN;
+const INPUTS: u64 = 4 * COLUMN;
 
 /// The table's row `id` holds `id + column / HIDDEN`, the gain is one half everywhere, and the
 /// head's row `token` holds `(token % 5) / 4`: values a host computation reproduces exactly.
@@ -148,15 +147,14 @@ impl CausalLm for Tiny {
     }
 }
 
-/// The model's batch over five index columns of `rows` rows.
-fn token_batch(columns: [Tensor; 5], rows: usize, bound: u32) -> TokenBatch {
-    let [ids, positions, slot_mapping, seq_lens, query_offsets] = columns;
+/// The model's batch over four index columns of `rows` rows.
+fn token_batch(columns: [Tensor; 4], rows: usize, bound: u32) -> TokenBatch {
+    let [ids, positions, seq_lens, query_offsets] = columns;
 
     TokenBatch {
         token_ids: None,
         token_history: None,
         positions,
-        slot_mapping,
         seq_lens,
         query_offsets,
         logits_rows: ids,
@@ -183,7 +181,6 @@ fn host_logits(ids: &[u32], bound: u32) -> Outcome<Vec<Vec<f32>>> {
         [
             ids.clone(),
             column(DType::I32, rows)?,
-            column(DType::U32, rows)?,
             column(DType::U32, rows)?,
             column(DType::U32, rows + 1)?,
         ],
@@ -234,7 +231,6 @@ impl Forward for TinyRunner {
             [
                 ids.clone(),
                 self.column(POSITIONS, rows, DType::I32)?,
-                self.column(SLOTS, rows, DType::U32)?,
                 self.column(LENGTHS, rows, DType::U32)?,
                 self.column(OFFSETS, rows + 1, DType::U32)?,
             ],

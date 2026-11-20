@@ -79,6 +79,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
         policy: package("arrival"),
         kernels: Default::default(),
         programs: Default::default(),
+        processing: None,
     };
     let config = proto::config::EngineConfig {
         executable: proto::BUILD.to_owned(),
@@ -146,11 +147,21 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
     args
 }
 
-/// The cache a fake engine's ranks hold: one dense attention group of [`BLOCK_TOKENS`]-token
-/// blocks over one layer of one head. Its unit sizes are an accounting figure: no rank holds the
-/// memory.
+/// The cache a fake engine's ranks hold: the keys and values of one layer of one head of 64,
+/// one full-history group of [`BLOCK_TOKENS`]-token blocks. Its unit sizes are an accounting
+/// figure: no rank holds the memory.
+///
+/// # Panics
+///
+/// Never: the fields are a layout's.
 pub fn cache() -> CacheLayout {
-    CacheLayout::dense(BLOCK_TOKENS, 1, 1, 64, PrefixCacheDtype::BFloat16)
+    #[expect(clippy::expect_used, reason = "constant fields of one layout")]
+    CacheLayout::of(
+        BLOCK_TOKENS,
+        &nn::family::CacheField::keys_and_values(1, 1, 64),
+        PrefixCacheDtype::BFloat16,
+    )
+    .expect("the keys and values of one layer")
 }
 
 /// What each worker group of a fake engine of `launch` serves over `cache`, as a rank start

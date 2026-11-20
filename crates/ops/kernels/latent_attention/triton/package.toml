@@ -1,0 +1,73 @@
+# The latent_attention operator's Triton backend: the first program of the operator, written
+# against its formula (`ops::attention::LatentAttention`).
+#
+# One program attends one token's queries of one head block: it walks the token's window entries
+# and then the compressed entries its selection names, a tile of entries at a time, decodes each
+# tile's records into FP32 as it reads them, and keeps an online softmax whose maximum is floored
+# at -1e30, with the head's sink added to the denominator at the end. Both products run on the
+# tensor cores over BF16 operands: a decoded record is exactly a BF16 value in every format, and
+# each probability is rounded to BF16 before it multiplies its latent, as the operator states.
+
+op = "latent_attention"
+backend = "triton"
+interface_version = 2
+
+[source]
+kind = "triton"
+
+# The derivation gives the head tile (the block rounded up to a power of two of at least the
+# sixteen rows a tensor-core product needs), the entries one tile reads, the record codes and
+# bytes of both planes, the window-only program's placeholders for the compressed side, and the
+# warps: eight for a 512-wide latent, whose tiles a block of four warps holds in too few
+# registers, four below.
+[launch]
+kernel = "_latent_attention_kernel"
+warps = { field = "warps" }
+derive = "derive"
+
+# A packed plane is bytes and a BF16 plane BF16 elements; the window-only program is handed the
+# unread operand for each compressed view. The tables, rows, positions and selection are read as
+# signed 32-bit words: a page id, a table row and an entry are below 2^31.
+[launch.types]
+query = { pointer = "dtype" }
+window = { field = "window_format", values = { bf16 = "*bf16", mxfp8 = "*u8", nvfp4 = "*u8", mxfp4 = "*u8" } }
+window_table = "*i32"
+window_starts = "*i32"
+compressed = { field = "compressed", values = { none = "*u8", bf16 = "*bf16", mxfp8 = "*u8", nvfp4 = "*u8", mxfp4 = "*u8" } }
+compressed_table = "*i32"
+selection = "*i32"
+rows = "*i32"
+positions = "*i32"
+sink = "*fp32"
+out = { pointer = "dtype" }
+tokens = "i32"
+window_pages = "i32"
+compressed_pages = "i32"
+scale = "fp32"
+
+[launch.constants]
+HEADS = { field = "heads" }
+HEAD_DIM = { field = "head_dim" }
+BLOCK = { field = "block" }
+HEAD_TILE = { field = "head_tile" }
+TILE = { field = "tile" }
+WINDOW = { field = "window" }
+PAGE = { field = "page" }
+WINDOW_FORMAT = { field = "window_code" }
+WINDOW_RECORD = { field = "window_record" }
+COMPRESSED = { field = "compressed_side" }
+COMPRESSED_FORMAT = { field = "compressed_code" }
+COMPRESSED_RECORD = { field = "compressed_record" }
+ENTRIES = { field = "entries", absent = 1 }
+COLUMNS = { field = "columns", absent = 1 }
+
+# `dtype_bf16_heads_64_head_dim_512_window_format_mxfp8_window_128_page_64_compressed_nvfp4_entries_32_columns_512_block_16`
+#
+# `head_dim` is a `tl.arange` extent, and every format's scale block divides it; the page and the
+# compressed page are divisors of entry indices only, so any positive count. A window-only layer's
+# key names `compressed_none` and neither `entries` nor `columns`.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], heads = { min = 1 }, head_dim = { power_of_two = true, min = 32 }, window_format = ["bf16", "mxfp8", "nvfp4", "mxfp4"], window = { min = 1 }, page = { min = 1 }, compressed = ["none"], block = { min = 1 } }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], heads = { min = 1 }, head_dim = { power_of_two = true, min = 32 }, window_format = ["bf16", "mxfp8", "nvfp4", "mxfp4"], window = { min = 1 }, page = { min = 1 }, compressed = ["bf16", "mxfp8", "nvfp4", "mxfp4"], entries = { min = 1 }, columns = { min = 1 }, block = { min = 1 } }

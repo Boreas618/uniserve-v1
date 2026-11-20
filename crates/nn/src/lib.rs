@@ -87,7 +87,7 @@ pub mod weights;
 pub use adapter::{Adapter, Fusion};
 pub use capability::{
     AudioFormat, CausalLm, Clip, ConditionPiece, ConditionShape, Conditioning, Decoder, Denoiser,
-    Drafter, Encoder, EncoderLayout, ExpertExchange, KvCache, KvPlanes, MediaFormat, MediaInput,
+    Drafter, Encoder, EncoderLayout, ExpertExchange, KvCache, KvPlane, MediaFormat, MediaInput,
     NO_SLOT, PatchFormat, PixelNorm, RecurrentState, Splice, Splicer, Step, TokenBatch,
     VerifySlots, VideoRequest, Vision,
 };

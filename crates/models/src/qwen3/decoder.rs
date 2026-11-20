@@ -56,6 +56,7 @@ fn gated_mlp(text: &TextConfig, intermediate: u32, split: Split) -> MlpConfig {
         intermediate,
         activation: text.hidden_act,
         rounding: Rounding::Fused,
+        limit: None,
         gate_up: GateUp::Split {
             gate: "gate_proj",
             up: "up_proj",
@@ -181,7 +182,7 @@ impl DecoderLayer {
                     &SharedExpertConfig {
                         mlp: gated_mlp(text, intermediate, tensor),
                         module: "shared_expert",
-                        gate: "shared_expert_gate",
+                        gate: Some("shared_expert_gate"),
                     },
                     vb.pp("mlp"),
                 )?),

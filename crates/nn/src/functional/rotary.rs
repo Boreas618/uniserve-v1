@@ -346,6 +346,114 @@ impl Fused for RotaryCall<'_> {
     }
 }
 
+/// Turns each head's trailing `2 · pairs` channels of `x`, `[tokens, heads, head_dim]`, in
+/// adjacent pairs by the factors `cos` and `sin`, FP32 `[tokens, pairs]`, in place: the pair
+/// `(a, b)` becomes `(a·cos − b·sin, b·cos + a·sin)`, or by the negated angles when `inverse`,
+/// in FP32, rounded once into `x`'s element type. The leading channels stay as they are.
+///
+/// A latent attention rotates the trailing channels of its queries before it attends and
+/// rotates the attended values back by the inverse afterwards, so its cache keeps one rotated
+/// form of every entry.
+///
+/// # Errors
+///
+/// Tables that are not one FP32 row per token or are wider than half the head, a strided `x`,
+/// or the operator's refusal.
+pub fn rotary_trailing_(x: &Tensor, cos: &Tensor, sin: &Tensor, inverse: bool) -> Result<()> {
+    const OWNER: &str = TrailingCall::OWNER;
+
+    let (_, head_dim) = heads_of(OWNER, "the input", x)?;
+    let rotated = rotated(OWNER, cos, sin, head_dim)?;
+    per_token(OWNER, cos, x.dims()[0])?;
+    if !x.is_contiguous() {
+        return Err(Error::shape(
+            OWNER,
+            "a rotation in place needs a contiguous input".to_owned(),
+        ));
+    }
+
+    compute(TrailingCall {
+        x,
+        cos,
+        sin,
+        inverse,
+        first: (head_dim - rotated) as usize,
+    })
+}
+
+/// A checked call of [`rotary_trailing_`]: the rotation starts at channel `first`.
+struct TrailingCall<'t> {
+    x: &'t Tensor,
+    cos: &'t Tensor,
+    sin: &'t Tensor,
+    inverse: bool,
+    first: usize,
+}
+
+impl TrailingCall<'_> {
+    const OWNER: &'static str = "rotary_trailing";
+}
+
+impl Fused for TrailingCall<'_> {
+    type Output = ();
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<()> {
+        let Self {
+            x,
+            cos,
+            sin,
+            inverse,
+            first,
+        } = self;
+        let (tokens, heads, head_dim) = (x.dims()[0], x.dims()[1], x.dims()[2]);
+        let pairs = cos.dims()[1];
+
+        // `[tokens, heads, pairs, 2]`: each adjacent pair of the trailing channels.
+        let tail = x
+            .narrow(D::Minus1, first, head_dim - first)?
+            .to_dtype(ACCUMULATE)?
+            .reshape((tokens, heads, pairs, 2))?;
+        let (a, b) = (tail.narrow(3, 0, 1)?, tail.narrow(3, 1, 1)?);
+        let cos = cos.reshape((tokens, 1, pairs, 1))?;
+        let sin = if inverse {
+            sin.neg()?.reshape((tokens, 1, pairs, 1))?
+        } else {
+            sin.reshape((tokens, 1, pairs, 1))?
+        };
+        let turned_a = (a.broadcast_mul(&cos)? - b.broadcast_mul(&sin)?)?;
+        let turned_b = (b.broadcast_mul(&cos)? + a.broadcast_mul(&sin)?)?;
+        let turned = Tensor::cat(&[turned_a, turned_b], 3)?
+            .reshape((tokens, heads, head_dim - first))?
+            .to_dtype(x.dtype())?;
+
+        x.slice_set(&turned, 2, first)?;
+        Ok(())
+    }
+
+    fn launch(self) -> Result<()> {
+        let Self {
+            x,
+            cos,
+            sin,
+            inverse,
+            ..
+        } = self;
+        let args = RopeApplyArgs {
+            x: ops::operand(x)?,
+            cosine: ops::operand(cos)?,
+            sine: ops::operand(sin)?,
+            out: ops::operand(x)?,
+        };
+        let descriptor = RopeApplyDescriptor::of(&args, Rotation::Interleaved)?.trailing(inverse);
+        ops::launch::<RopeApply>(&descriptor, args)?;
+        Ok(())
+    }
+}
+
 /// The per-head RMS normalization of an attention's queries and keys fused with their rotation:
 /// `(query, key)`, each `rotate(x · rsqrt(mean(x²) + eps) · gain)` in its input's shape and
 /// element type.

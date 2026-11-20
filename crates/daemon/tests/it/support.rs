@@ -517,6 +517,7 @@ pub(crate) fn module_set() -> proto::module::ModuleSet {
         .into_iter()
         .collect(),
         programs: Default::default(),
+        processing: None,
     }
 }
 

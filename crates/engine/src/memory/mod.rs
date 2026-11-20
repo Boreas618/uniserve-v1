@@ -9,7 +9,7 @@
 //! | --- | --- |
 //! | [`allocation`] | [`Storage`](allocation::Storage): one allocation the rank owns or maps, and the tensor over a window of it that execution lends to a forward |
 //! | [`buffers`] | [`BufferMemory`](buffers::BufferMemory): a rank's media memory (its product buffer, its slots' trajectory rows and its parts of the host encoder and latent regions), lent by the runs of the rank's device block tables, and the copies between them |
-//! | [`cache`] | [`KvCacheMemory`](cache::KvCacheMemory): the KV cache's planes, pooled page tables, host tier and scratch pages, lent to a causal forward as `nn::KvPlanes` and page-table tensors |
+//! | [`cache`] | [`KvCacheMemory`](cache::KvCacheMemory): the KV cache's planes, pooled page tables, host tier and scratch pages, lent to a causal forward as `nn::KvCache` groups of `nn::KvPlane`s, page tables and slot mappings |
 //! | [`client`] | [`StorageClient`](client::StorageClient): the rank's connection to the Storage Server, the exclusive storages it takes there and its share of each GPU's quota |
 //! | [`exclusive`] | [`ExclusiveStorage`](exclusive::ExclusiveStorage): how an owner takes exclusive storage, at the server or local to the process |
 //! | [`host_pages`] | [`HostPart`](host_pages::HostPart): a rank's mapping of its part of one host region |

@@ -2,34 +2,49 @@
 //! of them, and the attention over the tokens a selection names.
 //!
 //! A sparse attention layer keeps one compressed index key per `ratio` consecutive tokens beside
-//! its pages of keys and values ([`KvPlanes::index_keys`](crate::KvPlanes::index_keys)). A query
-//! row scores the keys of the groups it may see ([`index_scores`]), keeps the best
-//! ([`super::top_k`]), and attends the tokens of those groups and of its own unfinished group
-//! ([`indexed_attention`]):
+//! its cache, the plane of its [`INDEX_KEY`](crate::family::INDEX_KEY) field
+//! ([`KvCache::plane`]). A query row scores the keys of the groups it may see
+//! ([`index_scores`]), keeps the best ([`index_select`]), and attends the tokens of those groups
+//! ([`indexed_attention`], or the compressed latents themselves, [`super::latent_attention`]):
 //!
 //! ```text
-//! index_scores        s[t, g] = Σ_h relu(q[t, h] · key[g])        g < visible[t], −inf otherwise
+//! index_scores        s[t, g] = Σ_h relu(q[t, h] · key[g]) · w[t, h]   g < visible[t], −inf otherwise
+//! index_select        sel[t]  = the k groups of the largest scores, −1 for a −inf one
 //! indexed_attention   o[t, i] = Σ_n softmax_n(q[t, i] · k[n, i / group] · scale) · v[n, i / group]
 //!                                                                  n ∈ selection[t], n ≥ 0
 //! ```
 //!
-//! The scoring and the attention read a request's pages through the cache's page table:
-//! `rows[t]` names the table row of token `t`, which is the token's own row in a batch of one
-//! token per row and its request's row in a prefill.
+//! The scoring and the attention read a request's pages through a page table: `rows[t]` names
+//! the table row of token `t`, which is the token's own row in a batch of one token per row and
+//! its request's row in a prefill. [`ops::attention::indexed`] states the candidate blocks the
+//! scores may be restricted to and the block mode of the selection.
 
 use ops::attention::{
-    IndexScores, IndexScoresArgs, IndexScoresDescriptor, IndexedAttention, IndexedAttentionArgs,
-    IndexedAttentionDescriptor,
+    IndexScores, IndexScoresArgs, IndexScoresDescriptor, IndexSelect, IndexSelectArgs,
+    IndexSelectDescriptor, IndexedAttention, IndexedAttentionArgs, IndexedAttentionDescriptor,
 };
+use ops::record::{Format, Layout};
 use tensor::{DType, Device, Tensor};
 
+use super::latent::Plane;
 use super::{ACCUMULATE, Fused, compute};
 use crate::capability::KvCache;
 use crate::error::{Error, Result};
+use crate::family::{KEY, VALUE};
 
 /// The values of `column`, a U32 index column of a CPU batch.
 fn column(column: &Tensor) -> Result<Vec<u32>> {
     Ok(column.flatten_all()?.to_vec1::<u32>()?)
+}
+
+/// The cache layer `layer` names, as a plane states its owner.
+fn cache_layer(layer: usize) -> Result<u32> {
+    u32::try_from(layer).map_err(|_| {
+        Error::shape(
+            "KvCache",
+            format!("layer {layer} is beyond the cache's layers"),
+        )
+    })
 }
 
 /// Checks `rows`, the `[tokens]` U32 table row of each token.
@@ -47,50 +62,103 @@ fn check_rows(owner: &'static str, rows: &Tensor, tokens: usize) -> Result<()> {
     Ok(())
 }
 
-/// The scores of the index keys each query row may select among: `[tokens, max_pages · groups]`
-/// FP32, entry `g` of a row the score of its request's group `g` and `−inf` from the row's
-/// visible count on.
+/// How [`index_scores`] scores beyond the plain sum of rectified products.
+#[derive(Clone, Copy)]
+pub struct IndexScoring<'t> {
+    /// `[tokens, heads]` F32: each row's head weights, when the heads are weighted.
+    pub weights: Option<&'t Tensor>,
+    /// How a query is read: as it is ([`Format::Bf16`]), or rounded to [`Format::Mxfp4`] blocks
+    /// as the reference rounds its index queries.
+    pub query: Format,
+    /// `[tokens, blocks]` I32 candidate blocks of the given number of groups each, when the
+    /// scores are restricted to them: column `c` then scores group `candidates[t, c / B] · B +
+    /// c mod B`, a negative block naming none.
+    pub candidates: Option<(&'t Tensor, u32)>,
+}
+
+impl Default for IndexScoring<'_> {
+    /// The unweighted sum over every visible group, each query read as it is.
+    fn default() -> Self {
+        Self {
+            weights: None,
+            query: Format::Bf16,
+            candidates: None,
+        }
+    }
+}
+
+/// The monotone key of an FP32 score, the order a radix selection ranks by: larger keys for
+/// larger scores, and `−0` below `+0`.
+fn monotone(value: f32) -> u32 {
+    let bits = value.to_bits();
+    if bits >> 31 == 1 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+}
+
+/// The scores of the index keys each query row may select among: `[tokens, columns]` FP32,
+/// `−inf` for a column of no visible group.
 ///
-/// `query` is `[tokens, heads, width]`, the rows' index queries. Layer `layer` of `cache` holds
-/// the index keys, `[pages, groups, width]`, and `rows`, `[tokens]` U32, names each token's row
-/// of the cache's page table. `visible`, `[tokens]` U32, is the number of leading groups of its
-/// request a token scores: the groups complete before it.
+/// `query` is `[tokens, heads, width]`, the rows' index queries. `keys` is the layer's index-key
+/// plane: `[pages, groups, width]` plain values for [`Format::Bf16`] (BF16, or F16/F32 on the CPU),
+/// or packed records whose pages keep their scales after every record's values
+/// ([`Layout::Page`]). `rows`, `[tokens]` U32, names each token's row of the plane's table, and
+/// `visible`, `[tokens]` U32, the number of leading groups of its request a token sees. Without
+/// candidates a row has `max_pages · groups` columns, column `g` the request's group `g`; with
+/// candidates of `B` groups it has `blocks · B`.
 ///
 /// # Errors
 ///
-/// A layer without index keys, queries of another width than the keys, columns that are not one
-/// entry per token, or the operator's refusal.
+/// A plane of another width than the queries or of another layout than a packed one's, columns
+/// that are not one entry per token, weights or candidates of other shapes, or the operator's
+/// refusal.
 pub fn index_scores(
     query: &Tensor,
-    cache: &KvCache,
-    layer: usize,
+    keys: Plane<'_>,
     rows: &Tensor,
     visible: &Tensor,
+    scoring: IndexScoring<'_>,
 ) -> Result<Tensor> {
     const OWNER: &str = IndexScoresCall::OWNER;
 
-    let keys =
-        cache.layer(layer)?.index_keys.as_ref().ok_or_else(|| {
-            Error::shape(OWNER, format!("cache layer {layer} holds no index keys"))
-        })?;
-    let (&[tokens, heads, width], &[_, groups, key_width], &[_, max_pages]) =
-        (query.dims(), keys.dims(), cache.block_tables.dims())
+    let (&[tokens, heads, width], &[_, groups, _], &[_, max_pages]) =
+        (query.dims(), keys.records.dims(), keys.table.dims())
     else {
         return Err(Error::shape(
             OWNER,
             format!(
                 "queries of {:?}, index keys of {:?} and a page table of {:?}: [tokens, heads, \
-                 width], [pages, groups, width] and [rows, max_pages] expected",
+                 width], [pages, groups, record] and [rows, max_pages] expected",
                 query.dims(),
-                keys.dims(),
-                cache.block_tables.dims()
+                keys.records.dims(),
+                keys.table.dims()
             ),
         ));
     };
-    if key_width != width || heads == 0 || width == 0 || groups == 0 {
+    let (_, last) = keys.format.plane(width as u64);
+    let plain = !keys.format.packed()
+        && matches!(keys.records.dtype(), DType::BF16 | DType::F16 | DType::F32);
+    let packed =
+        keys.format.packed() && keys.layout == Layout::Page && keys.records.dtype() == DType::U8;
+    if keys.records.dims()[2] as u64 != last
+        || !(plain || packed)
+        || heads == 0
+        || width == 0
+        || groups == 0
+        || keys.table.dtype() != DType::U32
+        || keys.format.check_width(OWNER, width as u64).is_err()
+    {
         return Err(Error::shape(
             OWNER,
-            format!("index queries of {width} elements against keys of {key_width}"),
+            format!(
+                "index queries of {width} elements against {} {} keys of {:?} in the {} layout",
+                keys.format,
+                ops::abi::name(keys.records.dtype()),
+                keys.records.dims(),
+                keys.layout
+            ),
         ));
     }
     check_rows(OWNER, rows, tokens)?;
@@ -103,14 +171,46 @@ pub fn index_scores(
             ),
         ));
     }
-    let columns = max_pages * groups;
+    if let Some(weights) = scoring.weights
+        && (weights.dims() != [tokens, heads] || weights.dtype() != DType::F32)
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "head weights of {:?}, [{tokens}, {heads}] f32 expected",
+                weights.dims()
+            ),
+        ));
+    }
+    let columns = match scoring.candidates {
+        Some((candidates, block)) => match *candidates.dims() {
+            [candidate_rows, blocks]
+                if candidate_rows == tokens
+                    && blocks > 0
+                    && block > 0
+                    && candidates.dtype() == DType::I32 =>
+            {
+                blocks * block as usize
+            }
+            _ => {
+                return Err(Error::shape(
+                    OWNER,
+                    format!(
+                        "candidate blocks of {:?} and {block} groups for {tokens} tokens",
+                        candidates.dims()
+                    ),
+                ));
+            }
+        },
+        None => max_pages * groups,
+    };
 
     compute(IndexScoresCall {
         query,
-        cache,
         keys,
         rows,
         visible,
+        scoring,
         tokens,
         heads,
         width,
@@ -119,13 +219,13 @@ pub fn index_scores(
     })
 }
 
-/// A checked call of [`index_scores`]: `keys` are the layer's index keys.
+/// A checked call of [`index_scores`].
 struct IndexScoresCall<'t> {
     query: &'t Tensor,
-    cache: &'t KvCache,
-    keys: &'t Tensor,
+    keys: Plane<'t>,
     rows: &'t Tensor,
     visible: &'t Tensor,
+    scoring: IndexScoring<'t>,
     tokens: usize,
     heads: usize,
     width: usize,
@@ -147,47 +247,101 @@ impl Fused for IndexScoresCall<'_> {
     fn cpu(self) -> Result<Self::Output> {
         let Self {
             query,
-            cache,
             keys,
             rows,
             visible,
+            scoring,
             tokens,
+            heads,
             width,
             groups,
             columns,
-            ..
         } = self;
-        let table = cache.block_tables.to_vec2::<u32>()?;
+        let table = keys.table.to_vec2::<u32>()?;
         let (rows, visible) = (column(rows)?, column(visible)?);
+        let decoded = if keys.format.packed() {
+            keys_decoded(&keys, width)?
+        } else {
+            let pages = keys.records.dims()[0];
+            keys.records
+                .reshape((pages * groups, width))?
+                .to_dtype(ACCUMULATE)?
+        };
+
+        // A query rounded to MXFP4 is each head's blocks encoded and decoded, as the reference
+        // rounds it in place before it scores.
         let queries = query.to_dtype(ACCUMULATE)?;
-        let keys = keys.to_dtype(ACCUMULATE)?;
+        let queries = if scoring.query == Format::Bf16 {
+            queries
+        } else {
+            let values = queries.flatten_all()?.to_vec1::<f32>()?;
+            let rounded: Vec<f32> = values
+                .chunks(width)
+                .flat_map(|head| {
+                    let (codes, scales) = ops::record::encode(scoring.query, head);
+                    ops::record::decode(scoring.query, width, &codes, &scales)
+                })
+                .collect();
+            Tensor::from_vec(rounded, (tokens, heads, width), &Device::Cpu)?
+        };
+        let weights = match scoring.weights {
+            Some(weights) => Some(weights.to_vec2::<f32>()?),
+            None => None,
+        };
+        let candidates = match scoring.candidates {
+            Some((candidates, block)) => Some((candidates.to_vec2::<i32>()?, block as usize)),
+            None => None,
+        };
 
         let mut scores = Vec::with_capacity(tokens);
         for token in 0..tokens {
+            let row = &table[rows[token] as usize];
             let seen = visible[token] as usize;
-            let hidden =
-                Tensor::full(f32::NEG_INFINITY, columns - seen.min(columns), &Device::Cpu)?;
-            if seen == 0 {
-                scores.push(hidden);
-                continue;
-            }
-            if seen > columns {
-                return Err(Error::shape(
-                    Self::OWNER,
-                    format!("token {token} sees {seen} groups of a table of {columns}"),
-                ));
-            }
 
-            // The leading groups of the token's request, page by page.
-            let pages = &table[rows[token] as usize][..seen.div_ceil(groups)];
-            let pages = Tensor::from_vec(pages.to_vec(), pages.len(), &Device::Cpu)?;
-            let seen_keys = keys
-                .index_select(&pages, 0)?
-                .reshape((pages.elem_count() * groups, width))?
-                .narrow(0, 0, seen)?;
+            // The group each column scores, `None` for a column of no visible group.
+            let named: Vec<Option<usize>> = (0..columns)
+                .map(|column| {
+                    let group = match &candidates {
+                        Some((candidates, block)) => {
+                            let candidate = candidates[token][column / block];
+                            usize::try_from(candidate).ok()? * block + column % block
+                        }
+                        None => column,
+                    };
+                    (group < seen && group / groups < row.len()).then_some(group)
+                })
+                .collect();
+            let slots: Vec<u32> = named
+                .iter()
+                .flatten()
+                .map(|group| row[group / groups] * groups as u32 + (group % groups) as u32)
+                .collect();
 
-            let products = queries.get(token)?.matmul(&seen_keys.t()?)?;
-            scores.push(Tensor::cat(&[products.relu()?.sum(0)?, hidden], 0)?);
+            let mut out = vec![f32::NEG_INFINITY; columns];
+            if !slots.is_empty() {
+                let seen_keys = decoded.index_select(
+                    &Tensor::from_vec(slots.clone(), slots.len(), &Device::Cpu)?,
+                    0,
+                )?;
+                // `[heads, n]` rectified products, weighted per head and summed over the heads.
+                let products = queries.get(token)?.matmul(&seen_keys.t()?)?.relu()?;
+                let products = match &weights {
+                    Some(weights) => products.broadcast_mul(&Tensor::from_vec(
+                        weights[token].clone(),
+                        (heads, 1),
+                        &Device::Cpu,
+                    )?)?,
+                    None => products,
+                };
+                let summed = products.sum(0)?.to_vec1::<f32>()?;
+                let mut next = summed.into_iter();
+                for (column, group) in named.iter().enumerate() {
+                    if group.is_some() {
+                        out[column] = next.next().unwrap_or(f32::NEG_INFINITY);
+                    }
+                }
+            }
+            scores.push(Tensor::from_vec(out, columns, &Device::Cpu)?);
         }
         Ok(Tensor::stack(&scores, 0)?)
     }
@@ -195,10 +349,10 @@ impl Fused for IndexScoresCall<'_> {
     fn launch(self) -> Result<Self::Output> {
         let Self {
             query,
-            cache,
             keys,
             rows,
             visible,
+            scoring,
             tokens,
             heads,
             width,
@@ -207,19 +361,265 @@ impl Fused for IndexScoresCall<'_> {
         } = self;
         let out = ops::empty((tokens, columns), DType::F32)?;
         ops::launch::<IndexScores>(
-            &IndexScoresDescriptor::new(
-                query.dtype(),
-                keys.dtype(),
-                heads as u32,
-                width as u32,
-                groups as u32,
-            ),
+            &IndexScoresDescriptor {
+                weighted: scoring.weights.is_some(),
+                query: scoring.query,
+                candidates: scoring.candidates.map_or(0, |(_, block)| block),
+                ..IndexScoresDescriptor::new(
+                    query.dtype(),
+                    keys.format,
+                    heads as u32,
+                    width as u32,
+                    groups as u32,
+                )
+            },
             IndexScoresArgs {
                 query: ops::operand(query)?,
-                keys: ops::operand(keys)?,
-                page_table: ops::operand(&cache.block_tables)?,
+                weights: scoring.weights.map(ops::operand).transpose()?,
+                keys: ops::operand(keys.records)?,
+                page_table: ops::operand(keys.table)?,
                 rows: ops::operand(rows)?,
                 visible: ops::operand(visible)?,
+                candidates: scoring
+                    .candidates
+                    .map(|(candidates, _)| ops::operand(candidates))
+                    .transpose()?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
+}
+
+/// The decoded index keys of a packed CPU plane, FP32 `[pages · groups, width]`.
+fn keys_decoded(keys: &Plane<'_>, width: usize) -> Result<Tensor> {
+    let (pages, groups) = (keys.records.dims()[0], keys.records.dims()[1]);
+    let bytes = keys.records.flatten_all()?.to_vec1::<u8>()?;
+    let page_bytes = bytes.len() / pages;
+    let (value_bytes, scale_bytes) = (
+        keys.format.value_bytes(width as u64) as usize,
+        keys.format.scale_bytes(width as u64) as usize,
+    );
+
+    let mut values = Vec::with_capacity(pages * groups * width);
+    for page in bytes.chunks(page_bytes) {
+        for slot in 0..groups {
+            let (at, scales_at) =
+                keys.layout
+                    .offsets(keys.format, groups as u64, width as u64, slot as u64);
+            let (at, scales_at) = (at as usize, scales_at as usize);
+            values.extend(ops::record::decode(
+                keys.format,
+                width,
+                &page[at..at + value_bytes],
+                &page[scales_at..scales_at + scale_bytes],
+            ));
+        }
+    }
+    Ok(Tensor::from_vec(
+        values,
+        (pages * groups, width),
+        &Device::Cpu,
+    )?)
+}
+
+/// The `kept` best groups (or blocks) of each row of `scores`, `[tokens, columns]` F32:
+/// `[tokens, kept]` I32, `-1` for a kept slot whose score is `−inf` ([`ops::attention::IndexSelect`]).
+///
+/// With `pool > 1` a block of `pool` columns ranks by its largest score, the block holding the
+/// row's newest visible group (`(visible − 1) / pool`) ranks first, and the kept entries are
+/// blocks: the candidates of a later [`index_scores`]. With `candidates` (`[tokens, blocks]` I32
+/// blocks of the given number of groups, the restriction the scores were computed under) a kept
+/// column maps back to its group. A tie keeps the lower column; the kept entries leave the
+/// strictly greater ones first, then the ties, each by column.
+///
+/// A row of the request's own groups ranks only the blocks its `visible` groups lie in, whose
+/// scores past them are `−inf` ([`index_scores`]): its cost is the request's length rather than
+/// the table's, and the slots past its ranked blocks are `-1`. A row of candidate columns ranks
+/// every column.
+///
+/// # Errors
+///
+/// A kept count of none or above the row's blocks, columns that are not one entry per token,
+/// candidates beside the block mode, or the operator's refusal.
+pub fn index_select(
+    scores: &Tensor,
+    visible: &Tensor,
+    candidates: Option<(&Tensor, u32)>,
+    pool: u32,
+    kept: usize,
+) -> Result<Tensor> {
+    const OWNER: &str = IndexSelectCall::OWNER;
+
+    let &[tokens, columns] = scores.dims() else {
+        return Err(Error::shape(
+            OWNER,
+            format!("scores of {:?}, [tokens, columns] expected", scores.dims()),
+        ));
+    };
+    let blocks = columns.div_ceil(pool.max(1) as usize);
+    if scores.dtype() != DType::F32
+        || pool == 0
+        || kept == 0
+        || kept > blocks
+        || (pool > 1 && candidates.is_some())
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "{kept} kept of {} scores of {:?} in blocks of {pool}{}",
+                ops::abi::name(scores.dtype()),
+                scores.dims(),
+                if candidates.is_some() {
+                    " restricted to candidates"
+                } else {
+                    ""
+                }
+            ),
+        ));
+    }
+    check_rows(OWNER, visible, tokens)?;
+    if let Some((candidates, block)) = candidates
+        && (candidates.dims().len() != 2
+            || candidates.dims()[0] != tokens
+            || candidates.dims()[1] * block as usize != columns
+            || candidates.dtype() != DType::I32)
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "candidate blocks of {:?} and {block} groups for scores of {:?}",
+                candidates.dims(),
+                scores.dims()
+            ),
+        ));
+    }
+
+    compute(IndexSelectCall {
+        scores,
+        visible,
+        candidates,
+        pool,
+        kept,
+    })
+}
+
+/// A checked call of [`index_select`].
+struct IndexSelectCall<'t> {
+    scores: &'t Tensor,
+    visible: &'t Tensor,
+    candidates: Option<(&'t Tensor, u32)>,
+    pool: u32,
+    kept: usize,
+}
+
+impl IndexSelectCall<'_> {
+    const OWNER: &'static str = "index_select";
+}
+
+impl Fused for IndexSelectCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.scores.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            scores,
+            visible,
+            candidates,
+            pool,
+            kept,
+        } = self;
+        let (scores, visible) = (scores.to_vec2::<f32>()?, column(visible)?);
+        let candidates = match candidates {
+            Some((candidates, block)) => Some((candidates.to_vec2::<i32>()?, block as usize)),
+            None => None,
+        };
+        let pool = pool as usize;
+
+        let mut out = Vec::with_capacity(scores.len() * kept);
+        for (token, row) in scores.iter().enumerate() {
+            // The pooled keys, a block's largest, the newest visible block pinned above all.
+            let mut keys: Vec<u32> = row
+                .chunks(pool)
+                .map(|block| {
+                    block
+                        .iter()
+                        .map(|score| monotone(*score))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .collect();
+            if pool > 1 && visible[token] > 0 {
+                let newest = (visible[token] as usize - 1) / pool;
+                if let Some(key) = keys.get_mut(newest) {
+                    *key = monotone(f32::INFINITY);
+                }
+            }
+            // A row of its request's own groups ranks the blocks its visible groups lie in.
+            if candidates.is_none() {
+                keys.truncate((visible[token] as usize).div_ceil(pool));
+            }
+
+            // The k-th largest key, then the strictly greater ones by column and the ties at
+            // it by column until the row is full. A row of fewer ranked blocks than slots keeps
+            // every block by column, below the k-th largest key the program reaches (the least
+            // key), and the slots past them name none.
+            let taken = kept.min(keys.len());
+            let mut ranked = keys.clone();
+            ranked.sort_unstable_by(|a, b| b.cmp(a));
+            let threshold = if keys.len() < kept {
+                0
+            } else {
+                ranked[kept - 1]
+            };
+            let above: Vec<usize> = (0..keys.len()).filter(|&b| keys[b] > threshold).collect();
+            let ties = (0..keys.len())
+                .filter(|&b| keys[b] == threshold)
+                .take(taken - above.len());
+            let none = monotone(f32::NEG_INFINITY);
+            for block in above.into_iter().chain(ties) {
+                let entry = if keys[block] == none {
+                    -1
+                } else {
+                    match &candidates {
+                        Some((candidates, size)) => {
+                            let candidate = candidates[token][block / size];
+                            if candidate < 0 {
+                                -1
+                            } else {
+                                candidate * *size as i32 + (block % size) as i32
+                            }
+                        }
+                        None => block as i32,
+                    }
+                };
+                out.push(entry);
+            }
+            out.extend(std::iter::repeat_n(-1, kept - taken));
+        }
+        Ok(Tensor::from_vec(out, (scores.len(), kept), &Device::Cpu)?)
+    }
+
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            scores,
+            visible,
+            candidates,
+            pool,
+            kept,
+        } = self;
+        let out = ops::empty((scores.dims()[0], kept), DType::I32)?;
+        ops::launch::<IndexSelect>(
+            &IndexSelectDescriptor::new(pool, candidates.map_or(0, |(_, block)| block)),
+            IndexSelectArgs {
+                scores: ops::operand(scores)?,
+                visible: ops::operand(visible)?,
+                candidates: candidates
+                    .map(|(candidates, _)| ops::operand(candidates))
+                    .transpose()?,
                 out: ops::operand(&out)?,
             },
         )?;
@@ -255,8 +655,11 @@ pub fn indexed_attention(
 ) -> Result<Tensor> {
     const OWNER: &str = IndexedAttentionCall::OWNER;
 
-    let planes = cache.layer(layer)?;
-    let (key, value) = (&planes.key, &planes.value);
+    let layer = cache_layer(layer)?;
+    let (key, value) = (
+        &cache.plane(KEY, layer)?.entries,
+        &cache.plane(VALUE, layer)?.entries,
+    );
     let (&[tokens, heads, head_dim], &[pages, page, kv_heads, key_dim]) =
         (query.dims(), key.dims())
     else {

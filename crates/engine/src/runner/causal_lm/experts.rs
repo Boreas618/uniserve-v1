@@ -181,6 +181,10 @@ pub(crate) struct Member {
     /// `group`'s value, which the member keeps, and the transport holds `link`'s address, so
     /// the box lives as long as the member.
     link: Box<ops::moe::exchange::HostGroup>,
+    /// The union's device communicator, which a model's collectives along the union run over
+    /// (`nn::family::EXPERT_AXIS`); `None` for a model that collects nothing along it, and on
+    /// the meta device, whose collectives issue nothing.
+    communicator: Option<Arc<ops::Group>>,
 }
 
 // SAFETY: a member moves once, with its runner, to its device's worker thread and is used
@@ -253,7 +257,28 @@ impl Member {
             beside,
             transport: None,
             link,
+            communicator: None,
         })
+    }
+
+    /// The member whose forwards' collectives along the union run over `communicator`.
+    #[must_use]
+    pub(crate) fn with_communicator(self, communicator: Option<Arc<ops::Group>>) -> Self {
+        Self {
+            communicator,
+            ..self
+        }
+    }
+
+    /// The union's axis of the member's forwards (`nn::family::EXPERT_AXIS`): its communicator
+    /// and the member's place among the union's members, as `ops::Context::set_axes` takes an
+    /// axis.
+    pub(crate) fn axis(&self) -> (Option<Arc<ops::Group>>, u64, u64) {
+        (
+            self.communicator.clone(),
+            u64::from(self.shape.rank),
+            u64::from(self.shape.ranks),
+        )
     }
 
     /// Creates the transport with the exchange kernel of `kernels`, collectively: every member

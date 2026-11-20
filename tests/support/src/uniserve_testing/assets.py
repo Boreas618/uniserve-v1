@@ -75,6 +75,12 @@ CHECKPOINTS: dict[str, Checkpoint] = {
     "qwen3": Checkpoint(
         "Qwen/Qwen3-30B-A3B", "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     ),
+    # Qwen3.6-35B-A3B in BF16, a checkpoint of the Qwen3.5-MoE family
+    # (`Qwen3_5MoeForConditionalGeneration`), which the processing program
+    # case serves after an epoch change brings its request side.
+    "qwen3.6": Checkpoint(
+        "Qwen/Qwen3.6-35B-A3B", "345d467b117d1fd5eda9b879a5988de9ae5f47a7"
+    ),
     # The same model's files with other weight values, which a weight
     # update moves a deployment to.
     "qwen3-other-weights": Checkpoint(
@@ -82,6 +88,12 @@ CHECKPOINTS: dict[str, Checkpoint] = {
         unpublished="no repository publishes a second Qwen3-30B-A3B "
         "checkpoint with other weight values (the weight-update cases' "
         "target): publish one, then name it here",
+    ),
+    # DeepSeek-V4.1-Flash, block-scaled FP8 with MXFP4 experts
+    # (`DeepseekV41ForCausalLM`), which its four-GPU case serves.
+    "deepseek-v41": Checkpoint(
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "1bae0e1088993b9b82de08f59de5be5a34e42170",
     ),
     # FastH3, the distilled MiniMax-H3 the video cases serve.
     "fasth3": Checkpoint(

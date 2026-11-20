@@ -33,12 +33,12 @@ use std::sync::Arc;
 
 use models::qwen3::config::VisionConfig;
 use models::qwen3::{Config, Qwen3VlModel, positions};
-use nn::family::{CacheShape, Family, TextModel, TextPlacement};
+use nn::family::{CacheField, Family, TextModel, TextPlacement};
 use nn::{
     CpuWeights, DType, Device, Encoder, KvCache, Phase, RecurrentState, Shape, Split, Tensor,
     TokenBatch, WeightLoader,
 };
-use nn_testing::text::{self, WORKSPACE_BYTES};
+use nn_testing::text::{self, WORKSPACE_BYTES, key_value_shape};
 use nn_testing::{Fixture, PAGE_TOKENS};
 
 /// The families the fixtures' checkpoints declare.
@@ -222,21 +222,11 @@ fn model(fixture: &Fixture, drafter: bool) -> (Arc<dyn TextModel>, Config) {
     )
 }
 
-/// The batch of a call in which row `r` presents its tokens at positions `ranges[r]`, their
-/// cache slots on the pages [`TABLES`] gives the row.
+/// The batch of a call in which row `r` presents its tokens at positions `ranges[r]`.
 fn batch(phase: Phase, ranges: &[Range<u32>]) -> TokenBatch {
     let positions: Vec<i32> = ranges
         .iter()
         .flat_map(|range| range.clone().map(|position| position as i32))
-        .collect();
-    let slots: Vec<u32> = ranges
-        .iter()
-        .zip(TABLES)
-        .flat_map(|(range, pages)| {
-            range.clone().map(move |position| {
-                pages[(position / PAGE_TOKENS) as usize] * PAGE_TOKENS + position % PAGE_TOKENS
-            })
-        })
         .collect();
     let seq_lens: Vec<u32> = ranges.iter().map(|range| range.end).collect();
 
@@ -250,7 +240,6 @@ fn batch(phase: Phase, ranges: &[Range<u32>]) -> TokenBatch {
         phase,
         [
             Tensor::new(positions.as_slice(), &Device::Cpu).expect("positions"),
-            column(&slots),
             column(&seq_lens),
             column(&offsets),
             column(&last),
@@ -261,22 +250,44 @@ fn batch(phase: Phase, ranges: &[Range<u32>]) -> TokenBatch {
     )
 }
 
-/// An empty cache group of `shape` for `rows` rows on the pages of [`TABLES`].
-fn cache(shape: CacheShape, rows: usize) -> KvCache {
+/// An empty cache group of `fields` for `rows` rows on the pages of [`TABLES`], lent to no
+/// forward yet ([`lent`]).
+fn cache(fields: &[CacheField], rows: usize) -> KvCache {
     let tables = column(&TABLES[..rows].concat())
         .reshape((rows, TABLES[0].len()))
         .expect("a block table");
 
-    KvCache::allocate(
-        shape,
+    text::cache(
+        fields,
         DType::F32,
-        PAGES,
-        PAGE_TOKENS,
-        tables,
-        zeros(Shape::from(WORKSPACE_BYTES), DType::U8),
+        (PAGES, PAGE_TOKENS),
+        (
+            tables,
+            column(&[]),
+            zeros(Shape::from(WORKSPACE_BYTES), DType::U8),
+        ),
         |shape, dtype| Ok(zeros(shape, dtype)),
     )
     .expect("a cache group")
+}
+
+/// `cache` as the call of [`batch`] over `ranges` is lent it: row `r`'s tokens write their cache
+/// slots on the pages [`TABLES`] gives the row, into the planes `cache` holds.
+fn lent(cache: &KvCache, ranges: &[Range<u32>]) -> KvCache {
+    let slots: Vec<u32> = ranges
+        .iter()
+        .zip(TABLES)
+        .flat_map(|(range, pages)| {
+            range.clone().map(move |position| {
+                pages[(position / PAGE_TOKENS) as usize] * PAGE_TOKENS + position % PAGE_TOKENS
+            })
+        })
+        .collect();
+
+    KvCache {
+        slot_mapping: column(&slots),
+        ..cache.clone()
+    }
 }
 
 /// The state buffers of `model`, zeroed, when it keeps a state.
@@ -327,7 +338,7 @@ fn forward(
     model
         .forward(
             &batch,
-            std::slice::from_ref(cache),
+            &[lent(cache, ranges)],
             state.as_ref(),
             None,
             &embedded,
@@ -413,7 +424,7 @@ fn check_causal_lm(name: &str, fixture: &Fixture) {
         Phase::Prefill,
         &ids,
         &whole,
-        &cache(model.cache(), 2),
+        &cache(&model.cache(), 2),
         state().as_ref(),
     );
     assert_close(
@@ -438,7 +449,7 @@ fn check_causal_lm(name: &str, fixture: &Fixture) {
     // 2. Each row's opening tokens in a prefill, then its last four tokens one decode step
     //    each, over one cache and one state.
     const STEPS: u32 = 4;
-    let (group, state) = (cache(model.cache(), 2), state());
+    let (group, state) = (cache(&model.cache(), 2), state());
     let opened: Vec<Range<u32>> = lengths.iter().map(|length| 0..length - STEPS).collect();
     let starts = [0, lengths[0]];
     let of_whole = |ranges: &[Range<u32>]| -> Tensor {
@@ -493,8 +504,8 @@ fn the_drafter_computes_the_references_hidden_states() {
     let reference = fixture.tensors("reference.safetensors");
     let drafter = model.drafter().expect("the drafter");
 
-    let shape = drafter.cache();
-    assert_eq!((shape.layers, shape.kv_heads, shape.head_dim), (1, 1, 16));
+    let fields = drafter.cache();
+    assert_eq!(key_value_shape(&fields), (1, 1, 16));
 
     for row in 0..2 {
         let ids = ids(&reference[&format!("rows.{row}.ids")]);
@@ -518,10 +529,11 @@ fn the_drafter_computes_the_references_hidden_states() {
             .expect("the model's hidden states");
         let draft = |phase, range: Range<u32>, cache: &KvCache| -> Tensor {
             let (first, count) = (range.start as usize, range.len());
+            let ranges = std::slice::from_ref(&range);
             drafter
                 .forward(
-                    &batch(phase, std::slice::from_ref(&range)),
-                    cache,
+                    &batch(phase, ranges),
+                    &lent(cache, ranges),
                     None,
                     &embedded.narrow(0, first, count).expect("the entries"),
                     &hidden.narrow(0, first, count).expect("the entries"),
@@ -529,7 +541,7 @@ fn the_drafter_computes_the_references_hidden_states() {
                 .unwrap_or_else(|error| panic!("the drafter's {phase:?} forward: {error}"))
         };
 
-        let drafted = draft(Phase::Prefill, 0..entries, &cache(shape, 1));
+        let drafted = draft(Phase::Prefill, 0..entries, &cache(&fields, 1));
         assert_close(
             &format!("row {row} drafted"),
             &drafted,
@@ -538,7 +550,7 @@ fn the_drafter_computes_the_references_hidden_states() {
         );
 
         // The first entries in a prefill and the rest one decode step each.
-        let group = cache(shape, 1);
+        let group = cache(&fields, 1);
         let opened = entries - 3;
         let prefilled = draft(Phase::Prefill, 0..opened, &group);
         assert_close(
@@ -645,7 +657,10 @@ fn a_prompt_with_an_image_computes_the_references_hidden_states() {
     let hidden = model
         .forward(
             &batch,
-            &[cache(model.cache(), 1)],
+            &[lent(
+                &cache(&model.cache(), 1),
+                std::slice::from_ref(&(0..tokens)),
+            )],
             state.as_ref(),
             None,
             &embedded,

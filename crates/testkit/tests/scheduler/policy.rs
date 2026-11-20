@@ -30,7 +30,7 @@ use storage::runtime::{Completion, GroupId, Request, Tier};
 use wasmtime::Module;
 
 use crate::harness::{A, B, BLOCK, Deployment, Harness, token};
-use crate::memory::{HYBRID, commits, host_stores, keys_of};
+use crate::memory::{commits, host_stores, keys_of};
 
 /// Where a script module keeps its data in its memory: its limits, the needle its probes look
 /// for, its dispatch replies, and from its second page on the messages the host writes into it
@@ -800,16 +800,12 @@ fn a_starting_instance_is_given_the_blocks_of_cache() {
 /// The blocks the policy's `offload` names are stored to the host as one `Store` per group whose
 /// memory holds them, with their keys in the policy's order; a page `cache` does not hold is
 /// skipped (SD §3.4 "The policy's `offload` and `prefetch`", §4.4 "The write policy"). The blocks
-/// it names are ones the write policy never offers, nor the scheduler again: the blocks of a
-/// sliding window of 8 tokens that left the window before the aligned boundary of a 21-token
-/// prompt, 20 tokens.
+/// it names are ones the write policy never offered, nor the scheduler again: the blocks of two
+/// 21-token prompts committed while the step's values switched the host tier off.
 #[test]
 fn the_policys_offload_is_stored_per_group_by_key() {
-    let mut harness = Deployment::tokens()
-        .cache(&HYBRID)
-        .copies(2)
-        .host(64)
-        .build();
+    let mut harness = Deployment::tokens().copies(2).host(64).build();
+    harness.tune(|tuning| tuning.host_tier = false);
     let serving = Script {
         alternate: true,
         ..Script::serving(&[1, 2])
@@ -823,13 +819,14 @@ fn the_policys_offload_is_stored_per_group_by_key() {
     harness.run(20);
     assert_eq!(harness.batches_of(first)[0].group, A);
     assert_eq!(harness.batches_of(second)[0].group, B);
+    harness.tune(|tuning| tuning.host_tier = true);
 
-    // The window's blocks of a request that were never offered to the host.
+    // The blocks of a request that were never offered to the host.
     let never = |id: RequestId, group: GroupId| -> Vec<Key> {
         let offered = host_stores(&harness);
         let cached = commits(&harness, harness.owner(id, group).unwrap());
-        let window = keys_of(&cached, 1).into_iter();
-        window.filter(|key| !offered.contains(key)).collect()
+        let blocks = keys_of(&cached, 0).into_iter();
+        blocks.filter(|key| !offered.contains(key)).collect()
     };
     let (on_a, on_b) = (never(first, A), never(second, B));
     assert!(on_a.len() >= 2 && on_b.len() >= 2, "{on_a:?} {on_b:?}");

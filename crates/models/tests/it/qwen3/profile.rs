@@ -22,12 +22,12 @@ use std::sync::Arc;
 
 use models::qwen3::{Config, Qwen3VlModel};
 use nn::config::Fields;
-use nn::family::{Family, Projection, SequenceSplit, TextModel, TextPlacement};
+use nn::family::{CacheField, Family, Projection, SequenceSplit, TextModel, TextPlacement};
 use nn::{
     DType, Encoder, ExpertExchange, KvCache, MetaWeights, Phase, RecurrentState, Shape, Split,
     WeightLoader,
 };
-use nn_testing::text::{self, WORKSPACE_BYTES};
+use nn_testing::text::{self, WORKSPACE_BYTES, key_value_shape};
 use nn_testing::{
     PAGE_TOKENS, Recording, Release, assert_generic, assert_operators, meta, record, report,
 };
@@ -71,7 +71,6 @@ fn batch(phase: Phase, rows: usize, tokens: usize, row_pages: usize) -> nn::Toke
         phase,
         [
             meta(tokens, DType::I32),
-            meta(tokens, DType::U32),
             meta(rows, DType::U32),
             meta(rows + 1, DType::U32),
             meta(rows, DType::U32),
@@ -82,15 +81,23 @@ fn batch(phase: Phase, rows: usize, tokens: usize, row_pages: usize) -> nn::Toke
     )
 }
 
-/// The meta cache group of `shape` in `dtype` over `rows` rows of `row_pages` pages each.
-fn cache(shape: nn::family::CacheShape, dtype: DType, rows: usize, row_pages: usize) -> KvCache {
-    KvCache::allocate(
-        shape,
+/// The meta cache group of `fields` in `dtype` over `rows` rows of `row_pages` pages each, lent
+/// to a forward of `tokens` tokens.
+fn cache(
+    fields: &[CacheField],
+    dtype: DType,
+    (rows, row_pages): (usize, usize),
+    tokens: usize,
+) -> KvCache {
+    text::cache(
+        fields,
         dtype,
-        rows * row_pages,
-        PAGE_TOKENS,
-        meta((rows, row_pages), DType::U32),
-        meta(WORKSPACE_BYTES, DType::U8),
+        (rows * row_pages, PAGE_TOKENS),
+        (
+            meta((rows, row_pages), DType::U32),
+            meta(tokens, DType::U32),
+            meta(WORKSPACE_BYTES, DType::U8),
+        ),
         |shape, dtype| Ok(meta(shape, dtype)),
     )
     .expect("a meta cache group")
@@ -109,7 +116,7 @@ fn step(
     let row_pages = (batch.max_kv_len / PAGE_TOKENS) as usize;
 
     let (stepped, recording) = record(group, || {
-        let cache = cache(model.cache(), model.dtype(), rows, row_pages);
+        let cache = cache(&model.cache(), model.dtype(), (rows, row_pages), tokens);
         let runs = model.state_layers();
         let state = (!runs.is_empty()).then(|| {
             let buffers = || {
@@ -211,8 +218,7 @@ const PACKED_EXPERTS: [&str; 2] = ["gather_gemm_nvfp4", "route_gemm_nvfp4"];
 fn qwen3_moe_profiles_a_decode_and_a_prefill_bucket() {
     let model = load(QWEN3_30B_A3B, &TextPlacement::WHOLE);
 
-    let cache = model.cache();
-    assert_eq!((cache.layers, cache.kv_heads, cache.head_dim), (48, 4, 128));
+    assert_eq!(key_value_shape(&model.cache()), (48, 4, 128));
     assert!(model.state_layers().is_empty());
     assert!(model.drafter().is_none() && model.vision().is_none());
     let experts = model.experts().expect("routed experts");
@@ -256,8 +262,8 @@ fn qwen3_moe_profiles_pipeline_stages_and_sequence_members() {
             ..TextPlacement::WHOLE
         };
         let model = load(QWEN3_30B_A3B, &placement);
-        let shape = model.cache();
-        assert_eq!((shape.layers, shape.kv_heads), (24, 4));
+        let (layers, kv_heads, _) = key_value_shape(&model.cache());
+        assert_eq!((layers, kv_heads), (24, 4));
 
         let name = format!("Qwen3-30B-A3B pipeline stage {rank} of 2");
         buckets(
@@ -278,8 +284,8 @@ fn qwen3_moe_profiles_pipeline_stages_and_sequence_members() {
                 ..TextPlacement::WHOLE
             };
             let model = load(QWEN3_30B_A3B, &placement);
-            let shape = model.cache();
-            assert_eq!((shape.layers, shape.kv_heads), (48, 2));
+            let (layers, kv_heads, _) = key_value_shape(&model.cache());
+            assert_eq!((layers, kv_heads), (48, 2));
 
             let group = [Split::new(2, rank).unwrap()];
             let name = format!("Qwen3-30B-A3B {projection:?} sequence member {rank} of 2");
@@ -300,7 +306,7 @@ fn qwen3_moe_profiles_tensor_and_expert_parallel_ranks() {
             ..TextPlacement::WHOLE
         };
         let model = load(QWEN3_30B_A3B, &placement);
-        assert_eq!(model.cache().kv_heads, 2);
+        assert_eq!(key_value_shape(&model.cache()).1, 2);
 
         let name = format!("Qwen3-30B-A3B tensor rank {rank} of 2");
         buckets(
@@ -430,8 +436,7 @@ fn qwen3_moe_takes_no_precision_policy() {
 fn qwen3_moe_nvfp4_profiles_a_decode_and_a_prefill_bucket() {
     let model = load(QWEN3_30B_A3B_NVFP4, &TextPlacement::WHOLE);
 
-    let cache = model.cache();
-    assert_eq!((cache.layers, cache.kv_heads, cache.head_dim), (48, 4, 128));
+    assert_eq!(key_value_shape(&model.cache()), (48, 4, 128));
     assert!(model.experts().expect("routed experts").encoded);
 
     for keys in buckets("Qwen3-30B-A3B-NVFP4", &*model, &[], &no_exchange) {
@@ -465,8 +470,7 @@ const HYBRID: [&str; 7] = [
 /// keep keys and values; thirty linear layers keep a convolution window of three inputs of
 /// 8192 channels and a 128 × 128 FP32 state per value head.
 fn assert_hybrid_shapes(model: &dyn TextModel) {
-    let cache = model.cache();
-    assert_eq!((cache.layers, cache.kv_heads, cache.head_dim), (10, 2, 256));
+    assert_eq!(key_value_shape(&model.cache()), (10, 2, 256));
 
     let [state] = <[_; 1]>::try_from(model.state_layers()).expect("one run of recurrent layers");
     assert_eq!(state.layers, 30);
@@ -532,12 +536,12 @@ fn qwen3_6_profiles_its_buckets_its_drafter_and_its_tower() {
     // attention and routed block, with no recurrent layer.
     let drafter = model.drafter().expect("the drafter");
     let draft = drafter.cache();
-    assert_eq!((draft.layers, draft.kv_heads, draft.head_dim), (1, 2, 256));
+    assert_eq!(key_value_shape(&draft), (1, 2, 256));
 
     for (phase, rows, tokens) in [(Phase::Decode, 8, 8), (Phase::Prefill, 2, 512)] {
         let row_pages = tokens / rows / PAGE_TOKENS as usize + 1;
         let (drafted, recording) = record(&[], || {
-            let cache = cache(draft, model.dtype(), rows, row_pages);
+            let cache = cache(&draft, model.dtype(), (rows, row_pages), tokens);
             let rows_of = || meta((tokens, model.hidden() as usize), model.dtype());
 
             drafter.forward(

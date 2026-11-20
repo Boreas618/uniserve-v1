@@ -257,11 +257,25 @@ pub(crate) struct TextRank {
     /// The serving vision runner of a rank that encodes images, from its opening until its worker
     /// takes it beside the causal runner.
     pub(crate) vision_runner: Option<VisionRunner>,
-    /// The node's expert union this rank is a member of: the union's host group, the members'
-    /// workers once [`spawn`] set them, the rank's place among them, and the multiprocessors of
-    /// the rank's device its exchange is compiled for, as its start's backing stated them
-    /// ([`Backing`]); `None` outside a union.
-    pub(crate) union: Option<(Arc<HostGroup>, Members, usize, u32)>,
+    /// The node's expert union this rank is a member of; `None` outside a union.
+    pub(crate) union: Option<UnionPlace>,
+}
+
+/// A rank's place in the node's expert union, as its start formed it.
+pub(crate) struct UnionPlace {
+    /// The union's host group: the step agreement's gathers and the transport package's own.
+    pub(crate) group: Arc<HostGroup>,
+    /// The members' workers, once [`spawn`] set them, which a member asks to join its steps.
+    pub(crate) targets: Members,
+    /// The rank's place among the members.
+    pub(crate) place: usize,
+    /// The multiprocessors of the rank's device its exchange is compiled for, as its start's
+    /// backing stated them ([`Backing`]).
+    pub(crate) multiprocessors: u32,
+    /// The union's device communicator, over every member in place order, when the model's
+    /// forwards collect along the union (`nn::family::EXPERT_AXIS`); `None` for a model that
+    /// meets the union only in its exchange, and on the meta device.
+    pub(crate) communicator: Option<Arc<ops::Group>>,
 }
 
 impl LoadedRank {
@@ -610,20 +624,41 @@ fn load_rank(
     // A member of the expert union takes its place in the union and the multiprocessors its
     // exchange is compiled for, which the backing states of its device; the profile run's
     // member records the exchange's keys for them, and the opening's member is shaped alike.
+    // A model whose forwards collect along the union beside its exchange
+    // (`nn::family::TextModel::expert_collectives`) has the union's communicator formed here, one
+    // group of every member in place order, before any device measurement as the worker group's
+    // is; the profile run's member states the axis without it.
     let union = match union {
         Some((group, targets)) => {
             let multiprocessors = backing.multiprocessors(device)?;
             let place = group.rank();
-            Some((Arc::new(group), targets, place, multiprocessors))
+            let communicator = if meta.expert_collectives() {
+                let collective = Collective {
+                    groups: vec![(0..group.size()).collect()],
+                    member: Some((0, place)),
+                };
+                group_over(&group, device, &collective, client.is_some(), None)
+                    .context("forming the expert union's communicator")?
+            } else {
+                None
+            };
+            Some(UnionPlace {
+                group: Arc::new(group),
+                targets,
+                place,
+                multiprocessors,
+                communicator,
+            })
         }
         None => None,
     };
     let meta_member = match &union {
-        Some((group, targets, place, multiprocessors)) => model_runner.union_member(
-            (device, *multiprocessors),
+        Some(union) => model_runner.union_member(
+            (device, union.multiprocessors),
             meta.as_ref(),
-            Arc::clone(group),
-            join_hook(Arc::clone(targets), *place),
+            Arc::clone(&union.group),
+            join_hook(Arc::clone(&union.targets), union.place),
+            None,
         )?,
         None => None,
     };
@@ -706,8 +741,8 @@ fn load_rank(
             // fewest checkpoints.
             let units = crate::memory::cache::segments::segmented_units_above(
                 least,
-                layout.plane_bytes,
-                layout.plane_bytes,
+                layout.segment_plane(),
+                layout.segment_plane(),
             );
             let states = fewest_states(&layout);
             return Ok(LoadedRank {
@@ -771,9 +806,11 @@ fn load_rank(
     }
     // Only a member of the expert union holds a transport.
     let transport = match &union {
-        Some((.., multiprocessors)) => {
-            model_runner.transport_bytes((device, *multiprocessors), model.as_ref(), &kernels)?
-        }
+        Some(union) => model_runner.transport_bytes(
+            (device, union.multiprocessors),
+            model.as_ref(),
+            &kernels,
+        )?,
         None => 0,
     };
     regions.push(("expert transport", transport));
@@ -1288,6 +1325,11 @@ fn media_memory(groups: &[WorkerGroupConfig], host: &str) -> String {
     devices.join(",")
 }
 
+/// The leading words of the name of a worker group's region of a sliding window's pool: memory
+/// of the group's ranks' own processes, which no segment backs and no sleep or grow changes, as
+/// the process's regions are told apart from those of segments (`epoch::kv_regions`).
+pub(crate) const WINDOW_REGION: &str = "window ";
+
 /// The name of the device region of scheduler `scheduler`'s KV units of `layout`, for an epoch of
 /// `config`: two epochs of one layout name one region, and any other layout another, whose memory
 /// space is its own (`specs/buffer-pool.md` §14.1). The layout is the epoch's
@@ -1316,9 +1358,9 @@ fn units_region(
         digest.bytes(&shape.layout.0);
     }
     digest.numbers(&[
-        layout.unit_bytes,
-        layout.plane_bytes,
-        u64::from(layout.columns),
+        layout.unit_bytes(),
+        layout.plane_bytes(),
+        u64::from(layout.columns()),
     ]);
     let digest = digest.finish();
     Ok(format!("kv {scheduler} {}", short(&digest)))
@@ -1340,7 +1382,7 @@ fn states_region(
     let mut digest = storage::key::Digest::new(b"uniserve.states-region");
     digest.text(&config.layout().identity());
     digest.bytes(&host::page_shape(layout, group)?.layout.0);
-    digest.numbers(&[layout.state_bytes(), layout.plane_bytes]);
+    digest.numbers(&[layout.state_bytes(), layout.plane_bytes()]);
     let digest = digest.finish();
     Ok(Some(format!("state {scheduler} {}", short(&digest))))
 }
@@ -1370,7 +1412,10 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
     let first = ranks.first().context("this process loaded no rank")?;
     match &first.loaded {
         Loaded::Text(text) => {
-            let cache = Arc::clone(service::lock(&text.cache).layout());
+            let (cache, windows) = {
+                let held = service::lock(&text.cache);
+                (Arc::clone(held.layout()), held.config().windows.clone())
+            };
             let tensor = u32::try_from(first.model_runner.world_size())
                 .context("a worker group wider than a session states")?;
             let slots = first.model_runner.slots();
@@ -1381,7 +1426,7 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
             text_layout(
                 launch,
                 &cache,
-                (text.units, text.states.0),
+                (text.units, text.states.0, &windows),
                 tensor,
                 (slots, slot_bytes),
                 vision,
@@ -1394,7 +1439,8 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 /// The layout of a text deployment's session ([`layout`]), for ranks of the deployment's one
 /// configuration whose caches are laid out as `cache` with `units` units, the padding unit
 /// included, and, for a model that keeps a recurrent state, `states` units of the state region
-/// (zero for one that keeps none), whose worker groups are `tensor` ranks wide, whose groups each hold `slots`
+/// (zero for one that keeps none), with `windows` units in each sliding window's pool (the
+/// padding unit included), whose worker groups are `tensor` ranks wide, whose groups each hold `slots`
 /// request slots, each taking `slot_bytes` of one rank's device memory, and, when the engine
 /// admits images, whose model with a vision tower and the most rows of an image it encodes are
 /// `vision` (`ModelRunner::image_rows`; `None` otherwise):
@@ -1413,7 +1459,10 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   per scheduler the device region of its state units beside its KV region, one checkpoint a
 ///   unit, named by the layout alone (`states_region`) and numbered `states`, with no reserved
 ///   unit, which asks for no unit at `Open` as the KV region does; and the host region of the
-///   state class, one checkpoint a unit (`specs/engine-worker-port.md` §1.6).
+///   state class, one checkpoint a unit (`specs/engine-worker-port.md` §1.6). Per worker
+///   group and sliding window of the model's cache, the region of the window's pool, memory of
+///   the group's ranks' own processes sized by the request slots, every unit in it from the
+///   open on; a window's pages are never cached, so it has no host region.
 /// - **Encoder outputs.** When a group encodes images (a group that prefills, of a model with a
 ///   vision tower, [`encodes`]): per such group, the region of its encoder outputs, the engine's
 ///   own memory of its ranks, the same units on every rank of it (the tower is whole on each,
@@ -1441,7 +1490,7 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 pub fn text_layout(
     launch: &EngineArgs,
     cache: &CacheLayout,
-    (units, states): (u32, u32),
+    (units, states, windows): (u32, u32, &[u32]),
     tensor: u32,
     (slots, slot_bytes): (u32, u64),
     vision: Option<(&dyn TextModel, u32)>,
@@ -1499,8 +1548,9 @@ pub fn text_layout(
             u32::try_from(pages.max(1)).unwrap_or(u32::MAX)
         };
         for (index, group) in cache.groups.iter().enumerate() {
-            // A draft page is given up first under pressure and never stored.
-            if group.draft() {
+            // A draft page is given up first under pressure and never stored, and a sliding
+            // window's is never cached: a hit recomputes its window.
+            if group.draft() || group.window() {
                 continue;
             }
             let shape = host::page_shape(cache, index)?;
@@ -1547,8 +1597,8 @@ pub fn text_layout(
             space: name.clone(),
             name,
             tier: Tier::Device,
-            unit_bytes: cache.unit_bytes * tensor,
-            part_bytes: cache.unit_bytes,
+            unit_bytes: cache.unit_bytes() * tensor,
+            part_bytes: cache.unit_bytes(),
             // Unit 0 is the padding unit a pooled table names where a row holds no page.
             reserved: 1,
             // No unit enters the region before the segments behind it exist (`Resize` after the
@@ -1630,13 +1680,41 @@ pub fn text_layout(
             }
             parts.push(Vec::new());
 
-            // Every cache group's class takes its blocks from the KV region but the state group's,
-            // which takes them from the state region.
+            // The pools of the group's sliding windows: memory of its ranks' own processes,
+            // sized by the request slots, every unit there from the open on.
+            let mut window_regions = Vec::new();
+            for (pool, units) in cache.pools.iter().skip(1).zip(windows) {
+                let name = format!(
+                    "{WINDOW_REGION}{} {} {}",
+                    session_engine(launch),
+                    id.0,
+                    window_regions.len()
+                );
+                window_regions.push(region_index(&regions)?);
+                regions.push(Region {
+                    space: name.clone(),
+                    name,
+                    tier: Tier::Device,
+                    unit_bytes: pool.unit_bytes() * tensor,
+                    part_bytes: pool.unit_bytes(),
+                    // Unit 0 is the padding unit a pooled table names where a row holds no page.
+                    reserved: 1,
+                    units: units.saturating_sub(1),
+                    limit: *units,
+                    segments: Vec::new(),
+                    memory: String::new(),
+                });
+            }
+
+            // Every cache group's class takes its blocks from the KV region but the state
+            // group's, which takes them from the state region, and a sliding window's, which
+            // takes them from its pool.
             let mut per_class: Vec<Vec<u8>> = cache
                 .groups
                 .iter()
                 .map(|group| match state_region.filter(|_| group.state()) {
                     Some(region) => vec![region],
+                    None if group.window() => vec![window_regions[group.pool - 1]],
                     None => vec![kv_region],
                 })
                 .collect();
@@ -2582,7 +2660,7 @@ pub(crate) fn open_ranks(
     // ranks go to their threads; none for a rank of a group the session does not state.
     let mut regions = Vec::with_capacity(ranks.len());
     for rank in ranks.iter() {
-        let Some((_, (kv, states), _)) = stated_regions(rank, layout)? else {
+        let Some((_, (kv, states, _), _)) = stated_regions(rank, layout)? else {
             regions.push(None);
             continue;
         };
@@ -2709,11 +2787,12 @@ fn open_rank(
     let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
     let inputs = CausalLmRunner::input_bytes(&config, rank.model.as_ref())?;
     let member = match &rank.union {
-        Some((group, targets, place, multiprocessors)) => model_runner.union_member(
-            (device, *multiprocessors),
+        Some(union) => model_runner.union_member(
+            (device, union.multiprocessors),
             rank.model.as_ref(),
-            Arc::clone(group),
-            join_hook(Arc::clone(targets), *place),
+            Arc::clone(&union.group),
+            join_hook(Arc::clone(&union.targets), union.place),
+            union.communicator.clone(),
         )?,
         None => None,
     };
@@ -2735,11 +2814,16 @@ fn open_rank(
         Some(((_, table), _)) => {
             let granularity = match client {
                 Some(_) => granularity(device)?,
-                None => layout.plane_bytes,
+                None => layout.segment_plane(),
             };
             let held = if standing_by { 0 } else { rank.first };
-            let (segments, created) =
-                plane_segments(epoch, (units, held), layout.plane_bytes, granularity, table)?;
+            let (segments, created) = plane_segments(
+                epoch,
+                (units, held),
+                layout.segment_plane(),
+                granularity,
+                table,
+            )?;
             (Some(segments), created)
         }
         None => (None, Segments::new()),
@@ -3548,7 +3632,8 @@ pub(crate) fn bind(
             }
             continue;
         };
-        let Some((group, (kv, states), host_regions)) = stated_regions(rank, layout)? else {
+        let Some((group, (kv, states, windows), host_regions)) = stated_regions(rank, layout)?
+        else {
             continue;
         };
         let host_named = &host_regions;
@@ -3559,12 +3644,18 @@ pub(crate) fn bind(
         let region = layout.regions[usize::from(kv)].name.clone();
         let (runs, unit) = {
             let cache = service::lock(&text.cache);
-            (
-                unit_runs(&cache.info().plane_runs),
-                cache.layout().unit_layout(),
-            )
+            // A cache a handoff does not carry states no unit layout, and an import of its
+            // pages is refused for want of one.
+            let unit = match cache.layout().unit_layout() {
+                Ok(unit) => Some(unit),
+                Err(why) => {
+                    tracing::info!(%why, "the rank's cache states no unit layout for handoffs");
+                    None
+                }
+            };
+            (unit_runs(&cache.info().plane_runs), unit)
         };
-        stated((region, group.memory.clone(), part, runs, Some(unit)))?;
+        stated((region, group.memory.clone(), part, runs, unit))?;
         if let Some(states) = states {
             let region = layout.regions[usize::from(states)].name.clone();
             let runs = unit_runs(service::lock(&text.cache).state_plane_runs());
@@ -3595,21 +3686,21 @@ pub(crate) fn bind(
                 stated((name.to_owned(), host.clone(), part, Vec::new(), None))?;
             }
         }
-        set_regions(rank, ((kv, states), host_regions), opened)?;
+        set_regions(rank, ((kv, states, windows), host_regions), opened)?;
     }
     Ok(places)
 }
 
 /// Tells the cache of text rank `rank` the numbers of the regions its copies name, its KV region
-/// `kv`, its state region `states` and per cache group its host region, by the session's answer
-/// `opened`.
+/// `kv`, its state region `states`, its sliding windows' regions `windows` and per cache group its
+/// host region, by the session's answer `opened`.
 ///
 /// # Errors
 ///
 /// A region the answer does not number, or a text rank's cache's refusal.
 fn set_regions(
     rank: &mut LoadedRank,
-    ((kv, states), host): ((u8, Option<u8>), HostRegions),
+    ((kv, states, windows), host): ((u8, Option<u8>, Vec<u8>), HostRegions),
     opened: &Opened,
 ) -> Result<()> {
     let number = |index: u8| -> Result<u8> {
@@ -3630,6 +3721,7 @@ fn set_regions(
         units: number(kv)?,
         states: states.map(number).transpose()?,
         host: numbered(host)?,
+        windows: windows.into_iter().map(number).collect::<Result<_>>()?,
     })?;
     drop(cache);
     Ok(())
@@ -3675,8 +3767,9 @@ fn rank_host(rank: &LoadedRank) -> Result<String> {
     Ok(groups[index].ranks[position].host.clone())
 }
 
-/// The session's statement of `rank`'s group, the index of its KV region and of its state region
-/// (`None` for a model that keeps no recurrent state), and per cache group the index of its host
+/// The session's statement of `rank`'s group, the index of its KV region, of its state region
+/// (`None` for a model that keeps no recurrent state) and of each sliding window's region, and
+/// per cache group the index of its host
 /// region; `None` for a rank of a group the session does
 /// not state, a dedicated expert group's, which serves no request and maps no region
 /// ([`session_group`]).
@@ -3687,7 +3780,7 @@ fn rank_host(rank: &LoadedRank) -> Result<String> {
 fn stated_regions<'a>(
     rank: &LoadedRank,
     layout: &'a Open,
-) -> Result<Option<(&'a Group, (u8, Option<u8>), HostRegions)>> {
+) -> Result<Option<(&'a Group, (u8, Option<u8>, Vec<u8>), HostRegions)>> {
     let id = session_group(rank, layout)?;
     let Some(group) = layout.groups.iter().find(|group| group.id == id) else {
         return Ok(None);
@@ -3698,10 +3791,27 @@ fn stated_regions<'a>(
         .and_then(|regions| regions.first())
         .copied()
         .context("the session states no KV region of the rank's group")?;
-    let (groups, state) = {
+    let (groups, state, window_groups) = {
         let cache = service::lock(&rank.text()?.cache);
-        (cache.layout().groups.len(), cache.layout().state_group())
+        let layout = cache.layout();
+        (
+            layout.groups.len(),
+            layout.state_group(),
+            layout.window_groups(),
+        )
     };
+    // Each sliding window's class takes its blocks from its pool's region.
+    let windows = window_groups
+        .into_iter()
+        .map(|(class, _)| {
+            group
+                .regions
+                .get(class)
+                .and_then(|regions| regions.first())
+                .copied()
+                .context("the session states no window region of the rank's group")
+        })
+        .collect::<Result<Vec<u8>>>()?;
     // The state group's class takes its blocks from the state region.
     let states = match state {
         Some(class) => Some(
@@ -3718,7 +3828,7 @@ fn stated_regions<'a>(
     let host = classes
         .map(|class| class.host.map(|(region, _)| region))
         .collect();
-    Ok(Some((group, (kv, states), host)))
+    Ok(Some((group, (kv, states, windows), host)))
 }
 
 /// Per cache group, the index of its host region in a session's layout, `None` where it has
@@ -3877,7 +3987,7 @@ pub(crate) fn spawn(
         Loaded::Text(text) => text.union.as_ref(),
         Loaded::Video(_) => None,
     });
-    if let Some((_, targets, ..)) = union {
+    if let Some(UnionPlace { targets, .. }) = union {
         targets
             .set(workers.iter().map(Arc::downgrade).collect())
             .map_err(|_| anyhow::anyhow!("the expert union's workers were set already"))?;

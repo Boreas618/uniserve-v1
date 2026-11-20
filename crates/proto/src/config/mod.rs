@@ -211,11 +211,6 @@ pub struct KvCacheConfig {
     /// prefetch long hits back. Applies with `host_tier`; none when unset.
     #[reload(epoch)]
     pub mooncake: Option<storage::connector::Settings>,
-    /// The pages of the largest block size between the aligned boundaries
-    /// a long prompt offloads its sliding windows before
-    /// ([`DEFAULT_BOUNDARY_INTERVAL`] unless stated).
-    #[reload(epoch)]
-    pub boundary_interval: NonZeroU32,
     /// The decoded tokens between two checkpoints of the state a model
     /// keeps per request slot, a recurrent state ([`DEFAULT_STATE_INTERVAL`]
     /// unless stated).
@@ -278,7 +273,6 @@ impl Default for KvCacheConfig {
             host_ratio: DEFAULT_HOST_RATIO,
             host_gib: None,
             mooncake: None,
-            boundary_interval: DEFAULT_BOUNDARY_INTERVAL,
             state_interval: DEFAULT_STATE_INTERVAL,
             state_ratio: DEFAULT_STATE_RATIO,
             prefetch_timeout_base: DEFAULT_PREFETCH_TIMEOUT_BASE,
@@ -294,12 +288,6 @@ impl KvCacheConfig {
         self.block_size.map_or(DEFAULT_BLOCK_SIZE, NonZeroU32::get)
     }
 }
-
-/// The pages of the largest block size between two aligned boundaries a long prompt offloads its
-/// sliding windows before, when the deployment states none (`kv_cache_config.boundary_interval`):
-/// 64, a policy between the windows a long prompt stores to the host (one per interval) and the
-/// part of an offloaded prompt a continuation of it reuses (whole intervals).
-pub const DEFAULT_BOUNDARY_INTERVAL: NonZeroU32 = nonzero(64);
 
 /// The decoded tokens between two checkpoints of a request's recurrent state, when the deployment
 /// states none (`kv_cache_config.state_interval`): 256, as SGLang's `--mamba-track-interval`, a
@@ -1123,6 +1111,16 @@ pub struct WorkerConfig {
     /// configuration is applied, when unset.
     #[reload(epoch)]
     pub engine_revision: Option<u32>,
+    /// The processing program the leader daemon serves the epoch's requests through: the name
+    /// of a program package installed at the Build Server, which a source tree installs beside
+    /// its engine (`crates/processing/package.toml`).
+    #[reload(epoch)]
+    pub processing: String,
+    /// The revision of the processing program to run; the latest installed one, fixed when the
+    /// configuration is applied, when unset. A tree installs its processing program and its
+    /// engine together, so the latest revisions of both are one tree's.
+    #[reload(epoch)]
+    pub processing_revision: Option<u32>,
     /// Time a job of a rank's worker may stay in flight before it is reported `Stalled`, which
     /// fails the epoch: its worker group is replaced, and an update on trial rolls back. Every
     /// main process's watchdog takes a change at its engine's next step values ([`Tuning`]).
@@ -1208,6 +1206,8 @@ impl Default for WorkerConfig {
         Self {
             engine: DEFAULT_ENGINE.to_owned(),
             engine_revision: None,
+            processing: DEFAULT_PROCESSING.to_owned(),
+            processing_revision: None,
             watchdog_timeout: DEFAULT_WATCHDOG_TIMEOUT,
             join_timeout: DEFAULT_JOIN_TIMEOUT,
             compare_timeout: DEFAULT_COMPARE_TIMEOUT,
@@ -1264,6 +1264,10 @@ pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// The engine package a deployment runs when its configuration names none: the implementation
 /// of the engine interface this tree holds (`crates/engine/package.toml`).
 pub const DEFAULT_ENGINE: &str = "uniserve";
+
+/// The processing program a deployment serves its requests through when its configuration names
+/// none: the one this tree holds (`crates/processing/package.toml`).
+pub const DEFAULT_PROCESSING: &str = "processing";
 
 /// What the server logs about its serving (`logging_config`). A process's
 /// log levels are options of the binary that runs it.
@@ -2143,6 +2147,9 @@ impl EngineConfig {
         let WorkerConfig {
             engine,
             engine_revision,
+            // The leader daemon's, not the engines': the epoch's module set fixes it.
+            processing: _,
+            processing_revision: _,
             watchdog_timeout: _,
             join_timeout: _,
             compare_timeout: _,

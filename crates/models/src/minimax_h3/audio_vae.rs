@@ -336,6 +336,7 @@ impl AttnProjection {
                     intermediate: 2 * channels,
                     activation: Activation::GeluTanh,
                     rounding: Rounding::Fused,
+                    limit: None,
                     gate_up: GateUp::Split {
                         gate: "w0",
                         up: "w1",

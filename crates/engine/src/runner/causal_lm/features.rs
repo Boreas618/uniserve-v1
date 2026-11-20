@@ -378,7 +378,7 @@ mod tests {
         let call = |slot: u32, row: u32| Row {
             slot,
             kind: Phase::Prefill,
-            cache_group: 0,
+            replay: 0..0,
             rows: row..row + 1,
         };
 

@@ -526,13 +526,15 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             if json {
                 let packages: Vec<ListedPackage<'_>> = listing
                     .iter()
-                    .map(|(package, origin, modules)| ListedPackage {
-                        op: &package.op,
-                        backend: &package.backend,
-                        revision: package.revision,
-                        commit: origin.commit.as_deref(),
-                        clean: origin.clean,
-                        modules: modules
+                    .map(|entry| ListedPackage {
+                        op: &entry.package.op,
+                        backend: &entry.package.backend,
+                        revision: entry.package.revision,
+                        commit: entry.origin.commit.as_deref(),
+                        clean: entry.origin.clean,
+                        operators: &entry.operators,
+                        modules: entry
+                            .modules
                             .iter()
                             .map(|module| ListedModule {
                                 target: module.target.to_string(),
@@ -546,7 +548,8 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
                 write_line(&mut std::io::stdout().lock(), &packages)?;
                 return Ok(());
             }
-            for (package, origin, modules) in listing {
+            for entry in listing {
+                let (package, origin) = (&entry.package, &entry.origin);
                 // The commit the revision was installed from, marked when its tree was not clean.
                 let commit = match (&origin.commit, origin.clean) {
                     (Some(commit), true) => format!(" commit {commit}"),
@@ -557,7 +560,7 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
                     "{} {} revision {}{commit}",
                     package.op, package.backend, package.revision
                 );
-                for module in modules {
+                for module in entry.modules {
                     println!(
                         "    {} {} {:?}",
                         module.target, module.descriptor, module.form
@@ -844,7 +847,8 @@ pub struct InstalledPackage<'a> {
 }
 
 /// One element of what `list --json` prints: an installed package revision, the commit of the
-/// tree it was installed from and whether that tree was clean, and the modules its store holds.
+/// tree it was installed from and whether that tree was clean, the operators an engine revision
+/// launches, and the modules its store holds.
 #[derive(Serialize)]
 pub struct ListedPackage<'a> {
     pub op: &'a str,
@@ -852,6 +856,8 @@ pub struct ListedPackage<'a> {
     pub revision: u32,
     pub commit: Option<&'a str>,
     pub clean: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub operators: &'a [String],
     pub modules: Vec<ListedModule<'a>>,
 }
 

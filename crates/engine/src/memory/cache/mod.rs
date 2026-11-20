@@ -4,11 +4,12 @@
 //! KV pool); the scheduler's side allocates its pages and indexes them by prefix, and this
 //! module is the rank's side. [`KvCacheMemory`] owns:
 //!
-//! - the **planes** ([`planes`]): the unit pool's exclusive storage at the host's Storage
-//!   Server, the memory of the cache's buffer pool region, with each plane's initialization
-//!   flag and, for an FP8 cache, its scale, and the index keys of a model whose attention reads
-//!   the tokens an indexer selects;
-//! - the **pooled page tables** ([`tables`]): one per attention group, the device copy of the
+//! - the **planes** ([`planes`]): the KV pool's exclusive storage at the host's Storage
+//!   Server, the memory of the cache's buffer pool region, every field's planes with each
+//!   plane's initialization flag and, for a field in the deployment's FP8 type, its scale;
+//! - the **window planes**: each sliding-window group's pool, memory of the rank's own process
+//!   sized by its request slots ([`KvCacheConfig::windows`]);
+//! - the **pooled page tables** ([`tables`]): one per field group, the device copy of the
 //!   group's entries of the rank's device block table, which a forward gathers its rows from;
 //! - the **attention workspace**, which the paged-attention kernel uses during a forward;
 //! - the **host tier** ([`host`]): the rank's parts of the host regions of the cache groups'
@@ -19,7 +20,7 @@
 //!   tier read and write.
 //!
 //! A model reads and writes none of this directly: the runner that holds the cache lends it for
-//! a forward as `nn::KvPlanes` and page-table tensors, external tensors over this memory.
+//! a forward as `nn::KvPlane`s and page-table tensors, external tensors over this memory.
 //!
 //! ## Two forms
 //!
@@ -46,7 +47,8 @@
 //!
 //! The class of cache group `g` is class `g` of the buffer pool, and the classes past the
 //! cache groups are no cache's. The state group's class takes its blocks from the state region,
-//! whose runs name state units; every other cache group's from the pool.
+//! whose runs name state units; a sliding-window group's from its own region of window units;
+//! every other cache group's from the KV pool.
 //!
 //! ## Two epochs of one region
 //!
@@ -76,13 +78,13 @@ mod tables;
 use std::sync::Arc;
 
 use self::info::PrefixCacheInfo;
-use nn::{KvCache, KvPlanes};
+use nn::{KvCache, KvPlane};
 use platform::{DeviceId, Event, Stream};
 use storage::runtime::Run;
 use tensor::{DType, Tensor};
 
 use self::host::{HostPage, HostTier};
-pub use self::layout::{CacheLayout, Checkpoint, GroupLayout};
+pub use self::layout::{CacheLayout, Checkpoint, FieldLayout, GroupLayout, PoolLayout};
 use self::planes::Planes;
 use self::scratch::ScratchPages;
 pub(crate) use self::segments::PlaneSegment;
@@ -120,21 +122,68 @@ pub struct KvCacheConfig {
     /// the segments they are made of on a device, `None` for units that are not split; zero
     /// units and `None` for a layout without one.
     pub states: (u32, Option<Vec<PlaneSegment>>),
+    /// The units of each sliding-window group's pool, the padding unit included, in the order of
+    /// the layout's pools after the KV pool ([`window_units`]); empty for a layout of no window.
+    pub windows: Vec<u32>,
+}
+
+/// The units of the pool of a sliding window of `window` tokens over pages of `page` tokens for
+/// `slots` request slots whose steps hold `tokens` tokens at most, the padding unit included:
+/// every running request's window pages at once, beside the pages of a step's tokens.
+///
+/// A request holds the pages of the window before its next token and of the tokens it computes,
+/// which the scheduler retires behind the window as it goes, and asks for a few pages ahead
+/// (`crate::scheduler::LOW_WATERMARK`): at most `⌈window / page⌉ + 2` pages of the window and
+/// of its partial pages, beside the watermark, and the step's tokens take their own pages,
+/// `⌈tokens / page⌉` beyond that over every request of the step. Nothing in the pool outlives a
+/// request, so it is sized for the slots alone and never grows with the KV pool.
+pub(crate) fn window_units(window: u32, page: u32, slots: u32, tokens: u32) -> u32 {
+    let page = page.max(1);
+    let per_request = window.div_ceil(page) + 2 + crate::scheduler::LOW_WATERMARK;
+
+    1 + slots.saturating_mul(per_request) + tokens.div_ceil(page)
 }
 
 impl KvCacheConfig {
-    /// The device bytes the cache holds beside its planes: the pooled page tables and the
-    /// attention workspace.
+    /// The device bytes the cache holds beside its KV planes and state units: the pooled page
+    /// tables, the attention workspace and the sliding windows' pools, all of which the request
+    /// slots size.
     pub(crate) fn fixed_bytes(&self) -> u64 {
-        PageTables::device_bytes(&self.layout, self.slots, self.width) + self.workspace_bytes
+        let windows: u64 = self
+            .layout
+            .pools
+            .iter()
+            .skip(1)
+            .zip(&self.windows)
+            .map(|(pool, units)| u64::from(*units) * pool.unit_bytes())
+            .sum();
+
+        PageTables::device_bytes(&self.layout, self.slots, self.width)
+            + self.workspace_bytes
+            + windows
     }
 
-    /// Checks what the cache's tensors rely on: a workspace, at least one attention group, each
-    /// of pages of one unit that fill a plane, and state units exactly when the layout keeps a
-    /// state group.
+    /// The units of each pool, the padding unit included, in the layout's pool order: the KV
+    /// pool's, then each window's.
+    pub(crate) fn pool_units(&self) -> Vec<u32> {
+        std::iter::once(self.units)
+            .chain(self.windows.iter().copied())
+            .collect()
+    }
+
+    /// Checks what the cache's tensors rely on: a workspace, at least one attention group, a
+    /// unit count of each window pool, and state units exactly when the layout keeps a state
+    /// group.
     fn check(&self) -> Result<()> {
         if self.layout.attention_groups() == 0 {
             return Err(Error::Invalid("a KV cache needs an attention group".into()));
+        }
+        if self.windows.len() + 1 != self.layout.pools.len() {
+            return Err(Error::Invalid(format!(
+                "a cache of {} pools states the units of {} sliding windows",
+                self.layout.pools.len(),
+                self.windows.len()
+            )));
         }
         if self.layout.state_group().is_some() != (self.states.0 > 0) {
             return Err(Error::Invalid(format!(
@@ -168,15 +217,6 @@ impl KvCacheConfig {
                     group.units_per_page
                 )));
             }
-            if u64::from(group.block_size) * group.row_bytes() != self.layout.plane_bytes {
-                return Err(Error::Invalid(format!(
-                    "attention group {index}'s page of {} tokens of {} bytes does not fill a \
-                     plane of {} bytes",
-                    group.block_size,
-                    group.row_bytes(),
-                    self.layout.plane_bytes
-                )));
-            }
         }
         Ok(())
     }
@@ -195,12 +235,18 @@ pub(crate) struct CacheRegions {
     /// Per cache group, the host region of the group's pages: unit `u` of it is the group's host
     /// page `u`. `None` for a group whose pages have no host copy.
     pub host: Vec<Option<u8>>,
+    /// The region of each sliding window's pool, in the layout's pool order after the KV pool:
+    /// unit `u` of it is the pool's unit `u`.
+    pub windows: Vec<u8>,
 }
 
 /// The KV cache of one rank: its planes, page tables, workspace, host tier and scratch pages.
 pub struct KvCacheMemory {
     config: KvCacheConfig,
+    /// The KV pool's planes.
     planes: Planes,
+    /// Each sliding window's pool's planes, in the layout's pool order after the KV pool.
+    windows: Vec<Planes>,
     tables: PageTables,
     /// The regions of the cache's memory, once the buffer pool numbered them
     /// ([`Self::set_regions`]).
@@ -231,13 +277,22 @@ impl KvCacheMemory {
             Some(_) => Some(StateUnits::meta(&config.layout, config.states.0)?),
             None => None,
         };
+        let windows = config
+            .layout
+            .pools
+            .iter()
+            .skip(1)
+            .zip(&config.windows)
+            .map(|(pool, units)| Planes::meta(pool.clone(), *units))
+            .collect::<Result<_>>()?;
         Ok(Self {
-            planes: Planes::meta(Arc::clone(&config.layout), config.units)?,
+            planes: Planes::meta(config.layout.kv().clone(), config.units)?,
+            windows,
             tables: PageTables::meta(
                 Arc::clone(&config.layout),
                 config.slots,
                 config.width,
-                config.units,
+                config.pool_units(),
             )?,
             workspace: None,
             regions: None,
@@ -248,11 +303,11 @@ impl KvCacheMemory {
         })
     }
 
-    /// Opens the cache of `config` on `device`: takes its planes and its state units from
+    /// Opens the cache of `config` on `device`: takes its KV planes and its state units from
     /// `owner` (the rank's Storage Server client, or storage local to the process), addressed by
-    /// `device` and each of `peers` (`Storage::peers`), allocates its page tables and workspace,
-    /// and resets what was created of the planes for this rank on `stream`, which is synchronized
-    /// before returning.
+    /// `device` and each of `peers` (`Storage::peers`), its window planes from the process,
+    /// allocates its page tables and workspace, and resets what was created of the planes for
+    /// this rank on `stream`, which is synchronized before returning.
     ///
     /// # Errors
     ///
@@ -267,18 +322,26 @@ impl KvCacheMemory {
         config.check()?;
 
         let planes = Planes::open(
-            Arc::clone(&config.layout),
+            config.layout.kv().clone(),
             config.units,
             config.segments.as_deref(),
             (device, peers),
             owner,
             stream,
         )?;
+        let windows = config
+            .layout
+            .pools
+            .iter()
+            .skip(1)
+            .zip(&config.windows)
+            .map(|(pool, units)| Planes::open_local(pool.clone(), *units, (device, peers), stream))
+            .collect::<Result<_>>()?;
         let tables = PageTables::open(
             Arc::clone(&config.layout),
             config.slots,
             config.width,
-            config.units,
+            config.pool_units(),
             device,
             stream,
         )?;
@@ -297,6 +360,7 @@ impl KvCacheMemory {
         Ok(Self {
             config,
             planes,
+            windows,
             tables,
             workspace: Some(workspace),
             regions: None,
@@ -337,23 +401,33 @@ impl KvCacheMemory {
             .ok_or_else(|| Error::Invalid("the cache keeps no draft group".into()))
     }
 
-    /// The planes of attention group `group`'s layers, in model order: each layer's keys and
-    /// values `[units, block_size, kv_heads, head_dim]` in the group's stored type, its flags
-    /// `[units, 1, 1, 1]` U8, for an FP8 cache its scales `[units, 1, 1, 1]` F32, and for a
-    /// cache that keeps index keys its index keys `[units, block_size / ratio, width]` in the
-    /// group's compute type. A page id of the group is a unit id.
+    /// The planes of pool `pool`: the KV pool's, or a sliding window's.
+    fn pool(&self, pool: usize) -> Result<&Planes> {
+        match pool {
+            0 => Ok(&self.planes),
+            window => self.windows.get(window - 1).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "the cache holds {} pools, not pool {pool}",
+                    self.windows.len() + 1
+                ))
+            }),
+        }
+    }
+
+    /// The planes of attention group `group`: every owner of every field of its pool, fields in
+    /// the model's order and owners ascending, each its entries `[units, block_size / ratio,
+    /// heads, width]` in the field's stored type, its flags `[units, 1, 1, 1]` U8 and, for a
+    /// field in the deployment's FP8 type, its scales `[units, 1, 1, 1]` F32 ([`Planes::planes`]).
+    /// A page id of the group is a unit id of its pool.
     ///
     /// The tensors are over the cache's memory: they are used only while the cache lives.
     ///
     /// # Errors
     ///
     /// A group that is no attention group of the cache.
-    pub fn planes(&self, group: usize) -> Result<Vec<KvPlanes>> {
+    pub fn planes(&self, group: usize) -> Result<Vec<KvPlane>> {
         let layout = self.attention(group)?;
-
-        (0..layout.layers.len())
-            .map(|layer| self.planes.layer(layout, layer))
-            .collect()
+        self.pool(layout.pool)?.planes(layout)
     }
 
     /// The planes of the draft group's layers, in the drafter's order, as its attention reads
@@ -363,12 +437,9 @@ impl KvCacheMemory {
     /// # Errors
     ///
     /// A cache that keeps no draft group.
-    pub(crate) fn draft_planes(&self) -> Result<Vec<KvPlanes>> {
+    pub(crate) fn draft_planes(&self) -> Result<Vec<KvPlane>> {
         let (layout, span) = self.draft()?;
-
-        (0..layout.layers.len())
-            .map(|layer| self.planes.draft_layer(layout, layer, span))
-            .collect()
+        self.planes.draft_planes(layout, span)
     }
 
     /// The pooled page table of attention group `group`, `[slots + 1, width]` U32: row `s - 1`
@@ -413,34 +484,59 @@ impl KvCacheMemory {
     }
 
     /// Attention group `group` as a forward is lent it: `block_tables` is the batch's rows
-    /// gathered from [`Self::page_table`], `[rows, width]` U32.
+    /// gathered from [`Self::page_table`], `[rows, width]` U32, `slot_mapping` the slots its
+    /// tokens write in the group, `[tokens]` U32, and `starts` each row's first position a
+    /// sliding-window group holds, `[rows]` U32, present exactly for such a group.
     ///
     /// # Errors
     ///
-    /// A group that is no attention group of the cache.
-    pub(crate) fn lend(&self, group: usize, block_tables: Tensor) -> Result<KvCache> {
+    /// A group that is no attention group of the cache, or starts stated for a full-history
+    /// group or the reverse.
+    pub(crate) fn lend(
+        &self,
+        group: usize,
+        (block_tables, slot_mapping, starts): (Tensor, Tensor, Option<Tensor>),
+    ) -> Result<KvCache> {
+        let layout = self.attention(group)?;
+        if layout.window() != starts.is_some() {
+            return Err(Error::Invalid(format!(
+                "attention group {group} is lent {} starts, and its readers read {}",
+                if starts.is_some() { "its" } else { "no" },
+                if layout.window() {
+                    "a sliding window from each row's start"
+                } else {
+                    "every position"
+                }
+            )));
+        }
+
         Ok(KvCache {
             block_tables,
-            page_size: self.attention(group)?.block_size,
-            layers: self.planes(group)?,
+            slot_mapping,
+            starts,
+            page_size: layout.block_size,
+            planes: self.planes(group)?,
             workspace: self.workspace()?,
         })
     }
 
     /// The draft cache as a drafter's forward is lent it: `block_tables` names, per row, the
     /// drafter's pages ([`Self::draft_planes`]), which a speculative step states from the
-    /// draft group's entries of the rank's device block table.
+    /// draft group's entries of the rank's device block table, and `slot_mapping` the draft
+    /// slots each token writes.
     ///
     /// # Errors
     ///
     /// A cache that keeps no draft group.
-    pub(crate) fn lend_draft(&self, block_tables: Tensor) -> Result<KvCache> {
+    pub(crate) fn lend_draft(&self, block_tables: Tensor, slot_mapping: Tensor) -> Result<KvCache> {
         let (layout, span) = self.draft()?;
 
         Ok(KvCache {
             block_tables,
+            slot_mapping,
+            starts: None,
             page_size: layout.block_size / span,
-            layers: self.draft_planes()?,
+            planes: self.draft_planes()?,
             workspace: self.workspace()?,
         })
     }
@@ -466,10 +562,12 @@ impl KvCacheMemory {
         self.planes.segments()
     }
 
-    /// The bytes the planes and the state units map on the device; a sleeping rank's segments
-    /// are not in it.
+    /// The bytes the planes, the window planes and the state units map on the device; a
+    /// sleeping rank's segments are not in it.
     pub(crate) fn mapped_bytes(&self) -> u64 {
-        self.planes.mapped_bytes() + self.states.as_ref().map_or(0, StateUnits::mapped_bytes)
+        self.planes.mapped_bytes()
+            + self.windows.iter().map(Planes::mapped_bytes).sum::<u64>()
+            + self.states.as_ref().map_or(0, StateUnits::mapped_bytes)
     }
 
     /// Whether `region` is the state region, as [`Self::set_regions`] stated it.
@@ -563,6 +661,24 @@ impl KvCacheMemory {
                 regions.host.len()
             )));
         }
+        if regions.windows.len() != self.windows.len() {
+            return Err(Error::Invalid(format!(
+                "window regions stated for {} sliding windows of a cache of {}",
+                regions.windows.len(),
+                self.windows.len()
+            )));
+        }
+        let windowed = regions
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| regions.host.contains(&Some(**window)));
+        if let Some((window, region)) = windowed.into_iter().next() {
+            return Err(Error::Invalid(format!(
+                "region {region} is the pool of sliding window {window} and a group's host \
+                 region"
+            )));
+        }
         if regions.states.is_some() != self.states.is_some() {
             return Err(Error::Invalid(format!(
                 "a state region is {} for a cache {} a state group",
@@ -591,6 +707,7 @@ impl KvCacheMemory {
             regions.units == region
                 || regions.states == Some(region)
                 || regions.host.contains(&Some(region))
+                || regions.windows.contains(&region)
         })
     }
 
@@ -617,36 +734,39 @@ impl KvCacheMemory {
             ));
         }
 
-        let groups = self.config.layout.groups.len();
-        let state = self.config.layout.state_group();
+        let groups = &self.config.layout.groups;
         let mut resets = Vec::new();
         for change in changes {
             let Some((_, first, count)) = change.run.filter(|_| change.reset) else {
                 continue;
             };
-            if usize::from(change.class) >= groups || Some(usize::from(change.class)) == state {
+            let Some(group) = groups
+                .get(usize::from(change.class))
+                .filter(|group| !group.state())
+            else {
                 continue;
-            }
-            if first == 0 || u64::from(first) + u64::from(count) > u64::from(self.config.units) {
+            };
+            // A group's units are its pool's: the KV pool's, or its window's.
+            let units = self.pool(group.pool)?.units();
+            if first == 0 || u64::from(first) + u64::from(count) > u64::from(units) {
                 return Err(Error::Invalid(format!(
                     "the block at position {} of class {} of request slot {} takes units \
-                     {first}..{} of a pool of units 1..{}",
+                     {first}..{} of a pool of units 1..{units}",
                     change.position,
                     change.class,
                     change.slot,
                     u64::from(first) + u64::from(count),
-                    self.config.units
                 )));
             }
-            resets.push((first, count));
+            resets.push((group.pool, first, count));
         }
 
         // The pooled tables check every change before they write a row.
         self.tables.apply(changes, stream)?;
 
         if let Some(stream) = stream {
-            for (first, count) in resets {
-                self.planes.reset_units(first, count, false, stream)?;
+            for (pool, first, count) in resets {
+                self.pool(pool)?.reset_units(first, count, false, stream)?;
             }
         }
         Ok(())
@@ -1034,13 +1154,9 @@ impl KvCacheMemory {
     /// # Errors
     ///
     /// A cache whose scratch pages are not open, or a group that is no attention group.
-    pub(crate) fn scratch_planes(&self, group: usize) -> Result<Vec<KvPlanes>> {
+    pub(crate) fn scratch_planes(&self, group: usize) -> Result<Vec<KvPlane>> {
         let layout = self.attention(group)?;
-        let scratch = self.scratch()?;
-
-        (0..layout.layers.len())
-            .map(|layer| scratch.layer(layout, layer))
-            .collect()
+        self.scratch()?.planes(layout)
     }
 
     /// The scratch set's page table, `[pages, width]` U32, for every attention group: row `i`
@@ -1107,7 +1223,7 @@ impl KvCacheMemory {
             history.push((*first, units.to_vec()));
         }
 
-        scratch.copy_history(&self.planes, layout, &history, stream)
+        scratch.copy_history(&self.planes, &history, stream)
     }
 
     /// The state units as `[units · checkpoint_planes, plane_bytes]` U8, plane `p` of unit `u`
@@ -1145,16 +1261,17 @@ impl KvCacheMemory {
 
 #[cfg(test)]
 mod tests {
-    use nn::family::{StateField, StateShape};
+    use nn::family::{CacheField, History, KEY, StateField, StateShape, VALUE};
     use proto::request::PrefixCacheDtype;
 
     use super::*;
 
-    /// The regions the tests number the cache's memory by: its units, its state units, and the
-    /// host pages of each of up to three groups.
+    /// The regions the tests number the cache's memory by: its units, its state units, the
+    /// host pages of each of up to three groups, and a sliding window's units.
     const UNITS: u8 = 0;
     const STATES: u8 = 1;
     const HOST: [u8; 3] = [4, 5, 6];
+    const WINDOW: u8 = 7;
 
     /// A model of two attention layers of 4-token pages of one 4-wide head, a recurrent state
     /// of two layers and a drafter of one layer, over sixteen units, a state region of eight
@@ -1170,9 +1287,14 @@ mod tests {
                 rows: nn::family::StateRows::Whole,
             }],
         };
-        let layout = CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::Float8E4m3Fn, &[state])
-            .and_then(|layout| layout.with_draft(1, 1, 4))
-            .expect("a hybrid layout with a draft group");
+        let layout = CacheLayout::of(
+            4,
+            &CacheField::keys_and_values(2, 1, 4),
+            PrefixCacheDtype::Float8E4m3Fn,
+        )
+        .and_then(|layout| layout.with_state(&[state]))
+        .and_then(|layout| layout.with_draft(&CacheField::keys_and_values(1, 1, 4)))
+        .expect("a hybrid layout with a draft group");
 
         KvCacheConfig {
             layout: Arc::new(layout),
@@ -1182,26 +1304,35 @@ mod tests {
             segments: None,
             workspace_bytes: 1 << 10,
             states: (8, None),
+            windows: Vec::new(),
         }
     }
 
-    /// A model of two attention groups of two layers each: full attention and a sliding
-    /// window.
+    /// A model of two attention groups of two layers each: full attention over layers 0 and 1,
+    /// and a sliding window of eight tokens over layers 2 and 3, whose pool holds six units.
     fn two_groups() -> KvCacheConfig {
-        let mut layout = CacheLayout::dense(4, 2, 1, 4, PrefixCacheDtype::BFloat16);
-        let mut window = layout.groups[0].clone();
-        window.kind = crate::batch::cache::CacheGroupKind::SlidingWindow { window: 8 };
-        window.layer_ids = vec![2, 3];
-        layout.groups.push(window);
+        let window = |name| CacheField {
+            history: History::Window { tokens: 8 },
+            ..CacheField::attention(name, 4, 1, 4)
+        };
+        let mut fields = CacheField::keys_and_values(2, 1, 4);
+        for name in [KEY, VALUE] {
+            let mut field = window(name);
+            field.owners.drain(..2);
+            fields.push(field);
+        }
+        let layout = CacheLayout::of(4, &fields, PrefixCacheDtype::BFloat16)
+            .expect("two groups of two layers");
 
         KvCacheConfig {
-            layout: Arc::new(layout.validated().expect("two groups of two layers")),
+            layout: Arc::new(layout),
             units: 16,
             slots: 2,
             width: 4,
             segments: None,
             workspace_bytes: 1 << 10,
             states: (0, None),
+            windows: vec![6],
         }
     }
 
@@ -1221,13 +1352,23 @@ mod tests {
             .collect()
     }
 
-    /// The regions of a cache of `groups` cache groups whose pages have host copies: the hybrid
-    /// layout of [`config`] for three, with its state region, and [`two_groups`] for two.
+    /// The regions of a cache of `groups` cache groups: the hybrid layout of [`config`] for
+    /// three, with its state region and host pages of every group, and [`two_groups`] for two,
+    /// whose window has its own region and no host copy.
     fn regions(groups: usize) -> CacheRegions {
-        CacheRegions {
-            units: UNITS,
-            states: (groups == 3).then_some(STATES),
-            host: HOST[..groups].iter().copied().map(Some).collect(),
+        match groups {
+            3 => CacheRegions {
+                units: UNITS,
+                states: Some(STATES),
+                host: HOST.iter().copied().map(Some).collect(),
+                windows: Vec::new(),
+            },
+            _ => CacheRegions {
+                units: UNITS,
+                states: None,
+                host: vec![Some(HOST[0]), None],
+                windows: vec![WINDOW],
+            },
         }
     }
 
@@ -1241,19 +1382,16 @@ mod tests {
             ops::meta().location()
         );
 
-        // The attention group: one column per layer, FP8 with a scale and a flag per unit.
+        // The attention group: the keys and the values of each layer, a column each, FP8
+        // with a scale and a flag per unit.
         let planes = cache.planes(0)?;
-        assert_eq!(planes.len(), 2);
-        for layer in &planes {
-            assert_eq!(layer.key.dims(), [16, 4, 1, 4]);
-            assert_eq!(layer.value.dims(), [16, 4, 1, 4]);
-            assert_eq!(layer.key.dtype(), DType::F8E4M3);
-            assert_eq!(layer.key_initialized.dims(), [16, 1, 1, 1]);
-            assert_eq!(layer.key_initialized.dtype(), DType::U8);
-            let scale = layer
-                .value_scale
-                .as_ref()
-                .expect("an FP8 cache states scales");
+        assert_eq!(planes.len(), 4);
+        for plane in &planes {
+            assert_eq!(plane.entries.dims(), [16, 4, 1, 4]);
+            assert_eq!(plane.entries.dtype(), DType::F8E4M3);
+            assert_eq!(plane.initialized.dims(), [16, 1, 1, 1]);
+            assert_eq!(plane.initialized.dtype(), DType::U8);
+            let scale = plane.scale.as_ref().expect("an FP8 cache states scales");
             assert_eq!(
                 (scale.dims(), scale.dtype()),
                 (&[16, 1, 1, 1][..], DType::F32)
@@ -1263,9 +1401,9 @@ mod tests {
         // The draft group: one layer over the two columns of a unit, pages of an attention
         // page's tokens.
         let draft = cache.draft_planes()?;
-        assert_eq!(draft.len(), 1);
-        assert_eq!(draft[0].key.dims(), [2 * 16, 4, 1, 4]);
-        assert_eq!(draft[0].key_initialized.dims(), [2 * 16, 1, 1, 1]);
+        assert_eq!(draft.len(), 2);
+        assert_eq!(draft[0].entries.dims(), [2 * 16, 4, 1, 4]);
+        assert_eq!(draft[1].initialized.dims(), [2 * 16, 1, 1, 1]);
 
         // The pooled table and the workspace.
         let table = cache.page_table(0)?;
@@ -1280,10 +1418,53 @@ mod tests {
         assert!(cache.page_table(1).is_err());
         assert!(cache.planes(2).is_err());
 
-        // What a forward is lent.
-        let lent = cache.lend(0, cache.page_table(0)?)?;
-        assert_eq!((lent.page_size, lent.layers.len()), (4, 2));
-        assert_eq!(cache.lend_draft(cache.page_table(0)?)?.page_size, 4);
+        // What a forward is lent: a full-history group reads no start.
+        let slots = || Tensor::zeros(2, DType::U32, &tensor::Device::Cpu).unwrap();
+        let lent = cache.lend(0, (cache.page_table(0)?, slots(), None))?;
+        assert_eq!((lent.page_size, lent.planes.len()), (4, 4));
+        assert!(
+            cache
+                .lend(0, (cache.page_table(0)?, slots(), Some(slots())))
+                .is_err()
+        );
+        assert_eq!(
+            cache.lend_draft(cache.page_table(0)?, slots())?.page_size,
+            4
+        );
+        Ok(())
+    }
+
+    /// A sliding window's group lends the planes of its own pool, whose units the window
+    /// sizes, over its own pooled table, with each row's start.
+    #[test]
+    fn a_window_group_lends_its_own_pool() -> Result<()> {
+        let cache = KvCacheMemory::meta(two_groups())?;
+
+        let planes = cache.planes(1)?;
+        let owners: Vec<(&str, u32)> = planes
+            .iter()
+            .map(|plane| (plane.field, plane.layer))
+            .collect();
+        assert_eq!(owners, [(KEY, 2), (KEY, 3), (VALUE, 2), (VALUE, 3)]);
+        assert!(
+            planes
+                .iter()
+                .all(|plane| plane.entries.dims() == [6, 4, 1, 4])
+        );
+        assert_eq!(cache.planes(0)?[0].entries.dims(), [16, 4, 1, 4]);
+
+        let column = || Tensor::zeros(2, DType::U32, &tensor::Device::Cpu).unwrap();
+        let lent = cache.lend(1, (cache.page_table(1)?, column(), Some(column())))?;
+        assert!(lent.starts.is_some());
+        assert!(
+            cache
+                .lend(1, (cache.page_table(1)?, column(), None))
+                .is_err()
+        );
+
+        // A window of eight tokens over pages of four: four pages a request beside the
+        // watermark, and the pages of a step's tokens.
+        assert_eq!(window_units(8, 4, 2, 16), 1 + 2 * (2 + 2 + 1) + 4);
         Ok(())
     }
 
@@ -1292,17 +1473,32 @@ mod tests {
     fn each_attention_group_has_its_planes_and_its_table() -> Result<()> {
         let mut cache = KvCacheMemory::meta(two_groups())?;
 
+        // The keys and the values of each group's two layers.
         for group in 0..2 {
-            assert_eq!(cache.planes(group)?.len(), 2);
+            assert_eq!(cache.planes(group)?.len(), 4);
             assert_eq!(cache.page_table(group)?.dims(), [3, 4]);
         }
         assert!(cache.draft_planes().is_err());
 
-        // The groups' rows are apart: slot 1 holds other units in each.
-        let changes = [allocated(1, 0, &[3, 4]), allocated(1, 1, &[9])].concat();
+        // The groups' rows are apart: slot 1 holds other units in each, the window's units of
+        // its own pool, which a unit past it is not.
+        let window = |units: &[u32]| -> Vec<Change> {
+            allocated(1, 1, units)
+                .into_iter()
+                .map(|change| Change {
+                    run: change.run.map(|(_, unit, count)| (WINDOW, unit, count)),
+                    ..change
+                })
+                .collect()
+        };
+        let changes = [allocated(1, 0, &[3, 4]), window(&[5])].concat();
         cache.apply(&changes, None)?;
         assert_eq!(cache.host_table(0)?[..4], [3, 4, 0, 0]);
-        assert_eq!(cache.host_table(1)?[..4], [9, 0, 0, 0]);
+        assert_eq!(cache.host_table(1)?[..4], [5, 0, 0, 0]);
+        let past = cache
+            .apply(&window(&[9]), None)
+            .expect_err("a unit past the window's pool");
+        assert!(past.to_string().contains("units 1..6"), "{past}");
         Ok(())
     }
 
@@ -1452,10 +1648,20 @@ mod tests {
     }
 
     /// The scratch page set of a cache with no device is a set of meta tensors in the cache's
-    /// page shape.
+    /// page shape; a cache with a sliding window keeps none.
     #[test]
     fn scratch_pages_have_the_caches_page_shape() -> Result<()> {
-        let mut cache = KvCacheMemory::meta(two_groups())?;
+        let mut windowed = KvCacheMemory::meta(two_groups())?;
+        assert!(windowed.open_scratch(12, None).is_err());
+
+        let mut config = config();
+        config.layout = Arc::new(CacheLayout::of(
+            4,
+            &CacheField::keys_and_values(2, 1, 4),
+            PrefixCacheDtype::BFloat16,
+        )?);
+        config.states = (0, None);
+        let mut cache = KvCacheMemory::meta(config)?;
         assert_eq!(cache.scratch_capacity(), 0);
         assert!(cache.scratch_planes(0).is_err());
 
@@ -1463,9 +1669,9 @@ mod tests {
         assert_eq!(cache.scratch_capacity(), 12);
         assert!(cache.open_scratch(12, None).is_err());
 
-        let planes = cache.scratch_planes(1)?;
-        assert_eq!(planes.len(), 2);
-        assert_eq!(planes[0].key.dims(), [12, 4, 1, 4]);
+        let planes = cache.scratch_planes(0)?;
+        assert_eq!(planes.len(), 4);
+        assert_eq!(planes[0].entries.dims(), [12, 4, 1, 4]);
 
         // A table row for every page of the set, as wide as the set or the pooled tables.
         let width = cache.config().width.min(12) as usize;
@@ -1512,11 +1718,15 @@ mod tests {
         assert!(KvCacheMemory::meta(config).is_err());
     }
 
-    /// The fixed bytes are the tables and the workspace.
+    /// The fixed bytes are the tables, the workspace and the window's pool: six units of the
+    /// keys and values of two layers, a 32-byte plane and a flag each.
     #[test]
-    fn the_fixed_bytes_are_the_tables_and_the_workspace() {
+    fn the_fixed_bytes_are_the_tables_the_workspace_and_the_windows() {
         let config = two_groups();
-        assert_eq!(config.fixed_bytes(), 2 * 3 * 4 * 4 + (1 << 10));
+        assert_eq!(
+            config.fixed_bytes(),
+            2 * 3 * 4 * 4 + (1 << 10) + 6 * 2 * 2 * (32 + 1)
+        );
     }
 
     /// A cache on a device takes its planes from the owner, lends tensors on its GPU, copies a
@@ -1538,7 +1748,7 @@ mod tests {
             ops::meta().location()
         );
         assert!(cache.mapped_bytes() > 0);
-        assert_eq!(cache.planes(0)?[1].key.dims(), [16, 4, 1, 4]);
+        assert_eq!(cache.planes(0)?[1].entries.dims(), [16, 4, 1, 4]);
 
         cache.set_regions(regions(2))?;
         cache.apply(&allocated(1, 0, &[3, 4]), Some(&stream))?;
@@ -1546,7 +1756,7 @@ mod tests {
         // A clone moves a unit's bytes into the unit its copy names. A column's planes lie unit
         // after unit, so the key plane of unit 1 in column 0 is the layout's plane bytes (four
         // tokens of one 4-wide BF16 head, 32 bytes) and the next unit's plane follows it.
-        let plane = cache.layout().plane_bytes as usize;
+        let plane = cache.layout().plane_bytes() as usize;
         let pattern: Vec<u8> = (0..plane as u8).collect();
         let (source, destination) = (
             cache.planes.plane_address(0, 0, 1)?,
@@ -1583,7 +1793,7 @@ mod tests {
         assert_eq!(device_row, cache.host_table(0)?[..4]);
 
         // A unit a forward initialized is reset when the buffer pool gives it again.
-        let flags = cache.planes(0)?[0].key_initialized.clone();
+        let flags = cache.planes(0)?[0].initialized.clone();
         let unit = |unit: u64| -> Result<u8> {
             let mut flag = [0_u8; 1];
             // SAFETY: the flag of `unit` in column 0 is one byte of the cache's flag storage,
@@ -1615,24 +1825,29 @@ mod tests {
         let stream = Stream::new(device)?;
         let local = crate::memory::exclusive::LocalStorage;
 
-        let layout =
-            Arc::new(CacheLayout::dense(64, 2, 2, 256, PrefixCacheDtype::BFloat16).validated()?);
+        let layout = Arc::new(CacheLayout::of(
+            64,
+            &CacheField::keys_and_values(2, 2, 256),
+            PrefixCacheDtype::BFloat16,
+        )?);
         let granularity = platform::DeviceAllocation::granularity(device)? as u64;
-        let units = segments::segmented_units(4096, layout.plane_bytes, granularity);
+        let units = segments::segmented_units(4096, layout.segment_plane(), granularity);
         let config = KvCacheConfig {
-            segments: segments::own(1, units, layout.plane_bytes, granularity),
+            segments: segments::own(1, units, layout.segment_plane(), granularity),
             layout,
             units,
             slots: 2,
             width: 4,
             workspace_bytes: 1 << 20,
             states: (0, None),
+            windows: Vec::new(),
         };
         let mut cache = KvCacheMemory::open(config, (device, &[]), &local, &stream)?;
         cache.set_regions(CacheRegions {
             units: UNITS,
             states: None,
             host: vec![None],
+            windows: Vec::new(),
         })?;
         let held_of = |cache: &KvCacheMemory| {
             cache

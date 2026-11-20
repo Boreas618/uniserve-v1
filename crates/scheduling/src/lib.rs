@@ -14,6 +14,12 @@
 //! [`routing::Route`] out) and [`kv`] (the Storage Servers' KV program: handoff paths and
 //! tiering moves).
 //!
+//! # Request processing
+//!
+//! An epoch's request processing is a program too, with an interface of its own
+//! ([`processing`]): the leader daemon asks it for the epoch's model families, binds one to a
+//! checkpoint, renders chat requests, parses completions and applies a video family's rules.
+//!
 //! # The scheduling policy
 //!
 //! A scheduler's program is the scheduling policy, which keeps its own interface: the policy
@@ -54,6 +60,7 @@ pub mod kv;
 pub mod limits;
 pub mod policy;
 pub mod prelude;
+pub mod processing;
 pub mod program;
 pub mod routing;
 pub mod time;

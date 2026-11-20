@@ -1,17 +1,18 @@
 # The topk_softmax operator's CUDA backend: design 5.2's package.
 #
-# The module is a cubin. The descriptor's expert count and top-k width are
-# compiled in, and the kernel derives from them the scores a lane walks (the
-# expert count in whole warps) and the renormalizing butterfly's width (the
-# top-k width rounded up to a power of two); one warp routes one token, so a
+# The module is a cubin. The descriptor's expert count, top-k width and scoring
+# are compiled in, and the kernel derives from the first two the scores a lane
+# walks (the expert count in whole warps) and the renormalizing butterfly's width
+# (the top-k width rounded up to a power of two); one warp routes one token, so a
 # block of `warps` warps routes as many, which the operator reads from the
-# module's metadata for its grid. The scores' and the optional scale's storage
-# kinds are launch values, and so are the live count and the expert load a
-# serving forward counts its routes into, null pointers without them.
+# module's metadata for its grid. The logits' and the optional scale's storage
+# kinds are launch values, and so are the selection bias, the live count and the
+# expert load a serving forward counts its routes into, null pointers without
+# them.
 
 op = "topk_softmax"
 backend = "nvcc"
-interface_version = 2
+interface_version = 3
 
 [module]
 form = "cubin"
@@ -26,12 +27,13 @@ standard = "c++20"
 [compile.definitions]
 UNISERVE_EXPERTS = { field = "experts" }
 UNISERVE_TOP = { field = "top" }
+UNISERVE_SQRTSOFTPLUS = { field = "scoring", values = { softmax = 0, sqrtsoftplus = 1 } }
 UNISERVE_WARPS = { parameter = "warps" }
 
 # The parameters in the operator's packed order. The scale is a pointer even when the call has
 # none: the operator passes a null one, and a pointer slot filled with a scalar is what `ops`
-# refuses by name. The map, the live count and the expert load are pointers the operator passes
-# null without them.
+# refuses by name. The selection bias, the map, the live count and the expert load are pointers
+# the operator passes null without them.
 [compile.kernel]
 name = "uniserve_topk_softmax"
 warps = { parameter = "warps" }
@@ -45,6 +47,7 @@ signature = [
     ["renormalize", "i32"],
     ["scale", { field = "scale", values = { none = "*fp32", bf16 = "*bf16", f16 = "*fp16", f32 = "*fp32" } }],
     ["scale_kind", "i32"],
+    ["bias", "*fp32"],
     ["ids", "*i32"],
     ["weights", "*fp32"],
     ["map", "*i32"],
@@ -52,12 +55,12 @@ signature = [
     ["load", "*i64"],
 ]
 
-# `scores_bf16_experts_128_top_8_renormalize_true_scale_none`.
+# `scores_bf16_experts_128_top_8_scoring_softmax_renormalize_true_bias_false_scale_none`.
 # The kernel compiles for any expert count and top-k width within what a warp holds: a lane walks
 # at most 32 scores, one bit each of its taken mask, so 1024 experts, and the first `top` lanes
 # store one pick each, so 32 picks. These bounds are the router's (`ops::moe::routing`).
 [[kernel.descriptors]]
-dimensions = { scores = ["bf16", "f16", "f32"], experts = { min = 1, max = 1024 }, top = { min = 1, max = 32 }, renormalize = ["true", "false"], scale = ["none", "bf16", "f16", "f32"] }
+dimensions = { scores = ["bf16", "f16", "f32"], experts = { min = 1, max = 1024 }, top = { min = 1, max = 32 }, scoring = ["softmax", "sqrtsoftplus"], renormalize = ["true", "false"], bias = ["true", "false"], scale = ["none", "bf16", "f16", "f32"] }
 
 [parameters]
 # The warps of one block, each routing one token.
