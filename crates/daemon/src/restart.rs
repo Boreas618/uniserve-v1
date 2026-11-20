@@ -634,7 +634,8 @@ const RUNNING_IMAGE: &str = "/proc/self/exe";
 
 /// Starts the successor, `serve --predecessor FD` of the base executable `image`, inheriting
 /// `socket` at the descriptor `FD` names; returns its process id. The successor is not this
-/// daemon's to stop: it outlives it.
+/// daemon's to stop: it outlives it. It is this daemon's child, though, which this daemon reaps
+/// should it exit first ([`reap_successor`]).
 fn spawn(socket: UnixStream, image: &std::path::Path) -> anyhow::Result<u32> {
     let descriptor = socket.as_raw_fd();
     let mut command = std::process::Command::new(image);
@@ -654,7 +655,32 @@ fn spawn(socket: UnixStream, image: &std::path::Path) -> anyhow::Result<u32> {
         .spawn()
         .with_context(|| format!("starting the successor daemon from {}", image.display()))?;
     drop(socket);
-    Ok(child.id())
+    let pid = child.id();
+    reap_successor(child);
+    Ok(pid)
+}
+
+/// Reaps the successor `successor` once it exits, on a thread of its own, for as long as this
+/// daemon lives: one that gives up exits while this daemon serves on, and would otherwise stay a
+/// zombie of this process until it exits. A successor that took the deployment over outlives
+/// this daemon, whose exit ends the thread, and the host's init reaps it in turn.
+fn reap_successor(mut successor: std::process::Child) {
+    let pid = successor.id();
+    let reap = move || match successor.wait() {
+        Ok(status) => info!(pid, %status, "the successor daemon exited"),
+        Err(error) => warn!(pid, %error, "the successor daemon's exit could not be read"),
+    };
+    let reaping = std::thread::Builder::new()
+        .name("successor".into())
+        .spawn(reap);
+    if let Err(error) = reaping {
+        warn!(
+            pid,
+            %error,
+            "no thread reaps the successor daemon: should it exit first, it stays a zombie \
+             until this daemon exits"
+        );
+    }
 }
 
 /// The relay of video job changes over the handoff socket `stream`: each
