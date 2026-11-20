@@ -3,8 +3,10 @@
 //! slots a prefill, a replay of a prefix hit and a decode write in each group.
 //!
 //! The cache keeps the full history's group (the compressed latent and the index keys of four
-//! owners) over the KV pool, the sliding window's group (the window latent of 43 layers) over a
-//! pool of its own, and the compressor's remainder in the state region.
+//! owners) over the KV pool and the sliding window's group (the window latent of 43 layers) over
+//! a pool of its own. The compressor's remainder, a ring of whole pairs that a forward from a
+//! page boundary reads nothing of, lives in the request slots alone: the cache keeps no state
+//! group and no checkpoint of it.
 
 use std::sync::Arc;
 
@@ -29,11 +31,9 @@ use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
 use crate::runner::{Forward, Runner};
 
-/// The regions the tests number the cache's memory by: the KV pool's units, the window's and
-/// the state units.
+/// The regions the tests number the cache's memory by: the KV pool's units and the window's.
 const UNITS: u8 = 0;
 const WINDOWS: u8 = 1;
-const STATES: u8 = 2;
 
 /// The runner's request slots, the pages a slot's table row names and the KV pool's units.
 const SLOTS: u32 = 4;
@@ -56,7 +56,7 @@ fn runner() -> (Arc<LatentModel>, CausalLmRunner, KvCacheMemory) {
         width: WIDTH,
         segments: None,
         workspace_bytes: 1 << 16,
-        states: (8, None),
+        states: (0, None),
         windows: vec![window_units(WINDOW, PAGE, SLOTS, TOKENS)],
     })
     .unwrap();
@@ -91,7 +91,7 @@ fn runner() -> (Arc<LatentModel>, CausalLmRunner, KvCacheMemory) {
 
 /// The device block table of a rank of the regions the tests number.
 fn tables() -> BlockTables {
-    BlockTables::new(GroupId(0), &[UNITS, WINDOWS, STATES], &[])
+    BlockTables::new(GroupId(0), &[UNITS, WINDOWS], &[])
 }
 
 /// Attaches the owner of `slot` to `tables`.
@@ -328,6 +328,12 @@ fn a_forward_is_lent_a_group_per_history_with_a_plane_per_owner() {
     let rows = window.block_tables[0];
     assert_eq!(window.starts.as_deref(), Some(&[rows][..]));
     assert_eq!(full.slot_mapping, window.slot_mapping);
+
+    // The compressors' rings are lent to every forward from the request slots (the stub refuses
+    // a forward without them), and the cache keeps no checkpoint of them.
+    let layout = &cache.config().layout;
+    assert!(layout.state_group().is_none());
+    assert_eq!(layout.state_bytes(), 0);
 }
 
 /// A prefill writes every group at its token's page of the group's table: the full history's
