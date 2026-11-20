@@ -389,10 +389,15 @@ class Deployments:
             server.package = package
             owned.callback(server.stop)
             server.wait("serving" if serving else "listening", timeout_s)
-            # The deployment's Build Server, which its daemon started before
+            # The deployment's Build Server, which its daemon starts before
             # its engines: where a case installs a revision the deployment
-            # selects next.
-            server.build_server = BuildServer.of(self.uniserve, runtime, name)
+            # selects next. A leader that awaits its other nodes starts it
+            # once they joined, so :meth:`follower` reads it then.
+            if serving:
+                server.build_server = BuildServer.of(
+                    self.uniserve, runtime, name
+                )
+            server.runtime = runtime
             yield server
 
     def calibration(self, *, reads: bool = False) -> Path:
@@ -504,6 +509,9 @@ class Deployments:
             )
             try:
                 leader.wait("serving", timeout_s)
+                leader.build_server = BuildServer.of(
+                    self.uniserve, leader.runtime, leader.package.name
+                )
                 yield Follower(runtime=runtime)
             finally:
                 leader.stop()
