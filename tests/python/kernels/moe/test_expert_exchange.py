@@ -14,11 +14,20 @@ count is below its extent (whose rows past the count must come back zero), and
 a suspend and restore that must keep the views' addresses, since a captured
 graph holds them.
 
+The same lifecycle also runs with each rank in a process of its own, their
+host collectives over a socket between the processes, as the members of an
+expert union on two hosts meet: the transport then maps the other process's
+window by its fabric handle, since a file descriptor names a window in its own
+process alone.
+
 It needs two CUDA devices. The call structures' mirrors are held to the
 operator crate's generated header, which needs none.
 """
 
 import ctypes
+import socket
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -55,6 +64,10 @@ TRIALS = ((CAPACITY, CAPACITY), (CAPACITY // 2, CAPACITY // 4), (4, 3))
 
 #: The combine's allowance: 2% of the largest expected value, plus `1e-3`.
 RELATIVE, ABSOLUTE = 0.02, 1e-3
+
+#: How long a rank's process may take, in seconds: a lifecycle takes a few
+#: seconds, and a rank whose peer never arrives waits on its device unbounded.
+PROCESS_S = 300.0
 
 
 class Lifecycle(ctypes.Structure):
@@ -186,6 +199,48 @@ class Channel:
     def barrier(self):
         """Wait for every rank."""
         self.meeting.wait()
+        return 0
+
+
+class PeerChannel:
+    """The host collectives of a group of two ranks, each in a process of its
+    own, over the socket `peer` between the processes: what an expert union's
+    host group carries between the engine processes of two hosts.
+    """  # noqa: D205
+
+    def __init__(self, peer):
+        """The collectives over `peer`, this process's end of the socket."""
+        self.peer = peer
+
+    def _read(self, size):
+        """`size` bytes from the other process."""
+        data = bytearray()
+        while len(data) < size:
+            chunk = self.peer.recv(size - len(data))
+            if not chunk:
+                raise ConnectionError("the other rank's process ended")
+            data += chunk
+        return bytes(data)
+
+    def _exchange(self, value):
+        """Send `value` and return the other rank's: both send first, and a
+        value this small fits the socket's buffer.
+        """  # noqa: D205
+        self.peer.sendall(len(value).to_bytes(8, "little") + value)
+        return self._read(int.from_bytes(self._read(8), "little"))
+
+    def gather(self, rank, mine, peers, count):
+        """Both ranks' `count` bytes at `mine`, in rank order at `peers`."""
+        value = ctypes.string_at(mine, count)
+        theirs = self._exchange(value)
+        ordered = (value, theirs) if rank == 0 else (theirs, value)
+        for index, item in enumerate(ordered):
+            ctypes.memmove(peers + index * count, item, count)
+        return 0
+
+    def barrier(self):
+        """Wait for the other rank."""
+        self._exchange(b"")
         return 0
 
 
@@ -355,20 +410,31 @@ def run_rank(library, channel, rank, device):
     entered(library, "release", life)
 
 
-@pytest.mark.gpu
-def test_two_ranks_dispatch_combine_suspend_and_restore(kernel_module):
+def load(path):
+    """The module at `path`, its entries typed."""
+    library = ctypes.CDLL(str(path))
+    for name in ENTRIES:
+        function = getattr(library, f"uniserve_expert_exchange_{name}")
+        function.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        function.restype = ctypes.c_int32
+    return library
+
+
+def needs_devices():
+    """Skip a case on a host of fewer than `RANKS` devices."""
     if torch.cuda.device_count() < RANKS:
         pytest.skip(
             f"needs {RANKS} CUDA devices, this host shows "
             f"{torch.cuda.device_count()}"
         )
-    library = ctypes.CDLL(
-        str(kernel_module("expert_exchange", "alltoall", KEY) / "module.so")
+
+
+@pytest.mark.gpu
+def test_two_ranks_dispatch_combine_suspend_and_restore(kernel_module):
+    needs_devices()
+    library = load(
+        kernel_module("expert_exchange", "alltoall", KEY) / "module.so"
     )
-    for name in ENTRIES:
-        function = getattr(library, f"uniserve_expert_exchange_{name}")
-        function.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        function.restype = ctypes.c_int32
     channel = Channel(RANKS)
     failures = []
 
@@ -390,3 +456,54 @@ def test_two_ranks_dispatch_combine_suspend_and_restore(kernel_module):
         thread.join()
 
     assert not failures, "; ".join(failures)
+
+
+@pytest.mark.gpu
+def test_ranks_of_two_processes_dispatch_and_combine_over_fabric_handles(
+    kernel_module,
+):
+    """Each rank runs the lifecycle in a process of its own (this file run as
+    a script), their host collectives over a socket pair between the
+    processes: every trial's combine matches, which needs each rank to map
+    the other process's window.
+    """  # noqa: D205
+    needs_devices()
+    module = kernel_module("expert_exchange", "alltoall", KEY) / "module.so"
+    ends = socket.socketpair()
+    processes = []
+    for rank, end in enumerate(ends):
+        argv = [sys.executable, __file__, str(module), str(rank)]
+        processes.append(
+            subprocess.Popen(
+                [*argv, str(end.fileno())],
+                pass_fds=(end.fileno(),),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        )
+    for end in ends:
+        end.close()
+
+    outputs = []
+    for process in processes:
+        try:
+            outputs.append(process.communicate(timeout=PROCESS_S)[0])
+        except subprocess.TimeoutExpired:
+            for other in processes:
+                other.kill()
+            outputs.append(process.communicate()[0])
+    failed = [
+        f"rank {rank}: {output}"
+        for rank, (process, output) in enumerate(zip(processes, outputs))
+        if process.returncode != 0
+    ]
+    assert not failed, "\n".join(failed)
+
+
+if __name__ == "__main__":
+    # One rank of the two-process case: the module, the rank (its device too)
+    # and the descriptor of this process's end of the socket to the other.
+    path, rank, descriptor = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+    peer = socket.socket(fileno=descriptor)
+    run_rank(load(path), PeerChannel(peer), rank, rank)
