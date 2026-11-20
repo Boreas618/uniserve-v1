@@ -263,6 +263,12 @@ pub mod operator {
         // load, two pointers after the map; its descriptor states its scoring and whether it reads
         // a selection bias, a pointer after the scale's kind.
         (TOPK_SOFTMAX, 3),
+        // The scores' type is a descriptor field (FP32, or DeepSeek's BF16 arithmetic), a call
+        // passes a workspace, and a native package takes the operator's call structure.
+        (INDEX_SCORES, 2),
+        // The scores' type is a descriptor field, and a native package takes the operator's call
+        // structure.
+        (INDEX_SELECT, 2),
     ];
 
     /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.

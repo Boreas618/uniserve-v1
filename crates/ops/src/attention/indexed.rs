@@ -36,15 +36,19 @@
 //! attention computes its scores, its softmax and its sum in FP32; with caches of a 16-bit type
 //! each probability is rounded into that type before it multiplies its value, as the reference
 //! casts them (`qsa.py:141-253`), and the output rounds once.
+//!
+//! Each operator is served by Triton programs and by native modules; a native module takes the
+//! operator's call structure ([`ScoresCall`], [`SelectCall`]).
 
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::{Float, Key};
-use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::operand::Operand;
 use crate::record::Format;
 use crate::tolerance::{self, Tolerance};
@@ -200,6 +204,79 @@ pub struct IndexScoresArgs {
     /// `[tokens, columns]` of the descriptor's score type, contiguous: receives the scores,
     /// `−inf` for a column of no visible group ([`IndexScoresDescriptor::columns`]).
     pub out: Operand,
+    /// `[bytes]` U8, at least [`IndexScores::workspace_bytes`]: the call's transient workspace,
+    /// whatever it held before. A native module keeps there the operands it derives for its
+    /// kernels (the rounded queries, the weights in the kernels' type, its schedule); a Triton
+    /// program reads none of it.
+    pub workspace: Operand,
+}
+
+/// The multiprocessors an `index_scores` workspace holds a schedule for
+/// ([`IndexScores::workspace_bytes`]): more than any device the operator launches on has.
+const SCHEDULED_MULTIPROCESSORS: u64 = 1024;
+
+/// The alignment of each region a native module carves from an `index_scores` workspace: a
+/// tensor map's base address.
+const WORKSPACE_ALIGNMENT: u64 = 16;
+
+/// The call structure `index_scores`'s native entry takes, declared to the package as
+/// `uniserve_index_scores_call` (`uniserve_index_scores.h`, generated with its layout asserted:
+/// [`abi`]).
+///
+/// The operands' device addresses, the launch's extents, the descriptor's values the module is
+/// compiled for (which the entry holds the call to), and the multiprocessors of the device the
+/// launch runs on. An unweighted or unrestricted call passes a null `weights` or `candidates`.
+#[repr(C)]
+#[derive(abi::Layout)]
+pub struct ScoresCall {
+    /// `[tokens, heads, width]` queries of the descriptor's element type.
+    pub query: *const c_void,
+    /// `[tokens, heads]` F32 head weights, or null.
+    pub weights: *const c_void,
+    /// `[pages, groups, record]`: the index-key plane.
+    pub keys: *const c_void,
+    /// `[table_rows, max_pages]` U32: each row's pages.
+    pub page_table: *const c_void,
+    /// `[tokens]` U32: each token's row of the page table.
+    pub rows: *const c_void,
+    /// `[tokens]` U32: the groups each token sees.
+    pub visible: *const c_void,
+    /// `[tokens, blocks]` I32 candidate blocks, or null.
+    pub candidates: *const c_void,
+    /// `[tokens, columns]` scores of the descriptor's score type.
+    pub out: *mut c_void,
+    /// The call's transient workspace and its bytes ([`IndexScoresArgs::workspace`]).
+    pub workspace: *mut c_void,
+    pub workspace_bytes: i64,
+    pub tokens: i64,
+    /// Pages of the key plane.
+    pub pages: i64,
+    /// Rows of the page table.
+    pub table_rows: i64,
+    /// Pages of one table row.
+    pub max_pages: i64,
+    /// Candidate blocks of one row; zero for a dense call.
+    pub blocks: i64,
+    /// Columns of a score row ([`IndexScoresDescriptor::columns`]).
+    pub columns: i64,
+    /// The descriptor's index heads, elements of a head, groups of a page and groups of a
+    /// candidate block.
+    pub heads: i64,
+    pub width: i64,
+    pub groups: i64,
+    pub candidate_block: i64,
+    /// The descriptor's score type (`uniserve_dtype`).
+    pub scores_dtype: i64,
+    /// The multiprocessors of the device the launch runs on.
+    pub multiprocessors: i64,
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
+}
+
+impl NativeCall for ScoresCall {
+    fn message(&self) -> Option<&str> {
+        abi::message(&self.error)
+    }
 }
 
 /// The scores of the index keys a query row may select among.
@@ -216,6 +293,23 @@ pub struct IndexScoresArgs {
 /// a selection breaks by its own rule. A weighted value is the product of two BF16 values, exact
 /// in FP32 before it rounds.
 pub struct IndexScores;
+
+impl IndexScores {
+    /// The bytes of the workspace a call of `tokens` query rows passes
+    /// ([`IndexScoresArgs::workspace`]): room for each row's queries as MXFP4 records (`width / 2`
+    /// value bytes and `width / 32` scale bytes a head), its weights as a BF16 row padded to 16
+    /// bytes, four 32-bit words of it (its table row, its visible count, and the first row and
+    /// the end of the run of rows it is scheduled with), a schedule of two 32-bit words for each
+    /// of up to 1024 multiprocessors and one more, and the alignment of each of those eight
+    /// regions to 16 bytes.
+    pub fn workspace_bytes(descriptor: &IndexScoresDescriptor, tokens: u64) -> u64 {
+        let (heads, width) = (u64::from(descriptor.heads), u64::from(descriptor.width));
+        let records = heads * (width / 2 + width.div_ceil(32));
+        let weights = (2 * heads).next_multiple_of(WORKSPACE_ALIGNMENT);
+        let schedule = 8 * (SCHEDULED_MULTIPROCESSORS + 1);
+        tokens * (records + weights + 4 * 4) + schedule + 8 * WORKSPACE_ALIGNMENT
+    }
+}
 
 impl Op for IndexScores {
     const NAME: &'static str = proto::module::operator::INDEX_SCORES;
@@ -315,6 +409,20 @@ impl Op for IndexScores {
         let columns = d.columns(max_pages, blocks);
         args.out.require_shape(Self::NAME, &[tokens, columns])?;
         args.out.require_row(Self::NAME, d.scores, columns)?;
+        let needed = Self::workspace_bytes(d, tokens);
+        if args.workspace.dtype != DType::U8
+            || args.workspace.rank() != 1
+            || args.workspace.numel() < needed
+            || !args.workspace.is_row_major()
+        {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the workspace is a contiguous u8 vector of at least {needed} bytes for \
+                     {tokens} rows"
+                ),
+            ));
+        }
         for (name, view) in [("query", &args.query), ("out", &args.out)] {
             if !view.is_row_major() {
                 return Err(Error::argument(
@@ -336,6 +444,42 @@ impl Op for IndexScores {
         let max_pages = args.page_table.dim(1);
         let blocks = args.candidates.as_ref().map_or(0, |view| view.dim(1));
         let columns = descriptor.columns(max_pages, blocks);
+
+        // A native module keeps the call structure; a Triton program takes the arguments its
+        // package declares. The descriptor names no backend: the store decides.
+        if !kernel.is_cubin() {
+            let address = |operand: &Operand| operand.ptr.address() as usize as *const c_void;
+            let optional =
+                |operand: &Option<Operand>| operand.as_ref().map_or(std::ptr::null(), address);
+            let mut call = ScoresCall {
+                query: address(&args.query),
+                weights: optional(&args.weights),
+                keys: address(&args.keys),
+                page_table: address(&args.page_table),
+                rows: address(&args.rows),
+                visible: address(&args.visible),
+                candidates: optional(&args.candidates),
+                out: args.out.ptr.address() as usize as *mut c_void,
+                workspace: args.workspace.ptr.address() as usize as *mut c_void,
+                workspace_bytes: args.workspace.numel() as i64,
+                tokens: tokens as i64,
+                pages: args.keys.dim(0) as i64,
+                table_rows: args.page_table.dim(0) as i64,
+                max_pages: max_pages as i64,
+                blocks: blocks as i64,
+                columns: columns as i64,
+                heads: i64::from(descriptor.heads),
+                width: i64::from(descriptor.width),
+                groups: i64::from(descriptor.groups),
+                candidate_block: i64::from(descriptor.candidates),
+                scores_dtype: abi::code(descriptor.scores)?,
+                multiprocessors: i64::from(stream.device().multiprocessors()?),
+                error: [0; MESSAGE],
+            };
+            // SAFETY: `ScoresCall` is the structure this package's entry declares, generated
+            // from this definition with its layout asserted.
+            return unsafe { kernel.native(&mut call, stream) };
+        }
 
         // An unweighted or unrestricted call passes the unread operand, which its program,
         // compiled without it, never dereferences.
@@ -471,6 +615,40 @@ pub struct IndexSelectArgs {
     pub out: Operand,
 }
 
+/// The call structure `index_select`'s native entry takes, declared to the package as
+/// `uniserve_index_select_call` (`uniserve_index_select.h`, generated with its layout asserted:
+/// [`abi`]). A selection of the request's own groups passes a null `candidates`.
+#[repr(C)]
+#[derive(abi::Layout)]
+pub struct SelectCall {
+    /// `[tokens, columns]` scores of the descriptor's score type.
+    pub scores: *const c_void,
+    /// `[tokens]` U32: the groups each token sees.
+    pub visible: *const c_void,
+    /// `[tokens, columns / candidate_block]` I32 candidate blocks, or null.
+    pub candidates: *const c_void,
+    /// `[tokens, kept]` I32: the kept entries.
+    pub out: *mut c_void,
+    pub tokens: i64,
+    pub columns: i64,
+    pub kept: i64,
+    /// The descriptor's pool and candidate block, which the module is compiled for.
+    pub pool: i64,
+    pub candidate_block: i64,
+    /// The descriptor's score type (`uniserve_dtype`).
+    pub scores_dtype: i64,
+    /// The multiprocessors of the device the launch runs on.
+    pub multiprocessors: i64,
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
+}
+
+impl NativeCall for SelectCall {
+    fn message(&self) -> Option<&str> {
+        abi::message(&self.error)
+    }
+}
+
 /// The `k` best groups (or blocks) of each score row.
 ///
 /// ```text
@@ -582,11 +760,34 @@ impl Op for IndexSelect {
 
     fn launch(
         kernel: &Kernel,
-        _descriptor: &Self::Descriptor,
+        descriptor: &Self::Descriptor,
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
         let tokens = args.scores.dim(0);
+
+        // A native module keeps the call structure; a Triton program takes its package's
+        // arguments.
+        if !kernel.is_cubin() {
+            let address = |operand: &Operand| operand.ptr.address() as usize as *const c_void;
+            let mut call = SelectCall {
+                scores: address(&args.scores),
+                visible: address(&args.visible),
+                candidates: args.candidates.as_ref().map_or(std::ptr::null(), address),
+                out: args.out.ptr.address() as usize as *mut c_void,
+                tokens: tokens as i64,
+                columns: args.scores.dim(1) as i64,
+                kept: args.out.dim(1) as i64,
+                pool: i64::from(descriptor.pool),
+                candidate_block: i64::from(descriptor.candidates),
+                scores_dtype: abi::code(descriptor.scores)?,
+                multiprocessors: i64::from(stream.device().multiprocessors()?),
+                error: [0; MESSAGE],
+            };
+            // SAFETY: `SelectCall` is the structure this package's entry declares, generated
+            // from this definition with its layout asserted.
+            return unsafe { kernel.native(&mut call, stream) };
+        }
 
         let unread = Operand::unread();
 

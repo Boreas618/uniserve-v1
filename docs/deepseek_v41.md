@@ -37,7 +37,7 @@ Every layer keeps a sliding window of its last 128 latents; four layers (2, 8 an
 
 ## Long contexts
 
-Eight layers index their compressed entries (2, 8, 14 and 20 over every visible entry, up to 512K and 1M of them; 24, 28, 32 and 36 inside the 2048 blocks of 8 entries layer 20 ranks best) and keep 512 entries a query. An indexer scores and selects its queries a block at a time, each block's BF16 scores within 1 GiB, so a prefill chunk of 4096 tokens over a table of 1M entries holds 512 queries' scores at once rather than 8 GiB; a decode batch is one block. The scoring and the selection of a query cost the entries its request holds, not the table its page table could address: a short request in a deployment of 1M tokens scores and ranks as it would in a short one.
+Eight layers index their compressed entries (2, 8, 14 and 20 over every visible entry, up to 512K and 1M of them; 24, 28, 32 and 36 inside the 2048 blocks of 8 entries layer 20 ranks best) and keep 512 entries a query. An indexer scores and selects its queries a block at a time, each block's BF16 scores within 1 GiB, so a prefill chunk of 4096 tokens over a table of 1M entries holds 512 queries' scores at once rather than 8 GiB; a decode batch is one block. The scoring and the selection of a query cost the entries its request holds, not the table its page table could address: a short request in a deployment of 1M tokens scores and ranks as it would in a short one. The dense scores run on DeepGEMM's paged MQA logits over the index keys in place (`index_scores/deepgemm`), the scores inside candidate blocks on a Triton program, and the selection on a CUDA radix select whose rows of a small batch spread over the device as thread-block clusters (`index_select/cuda`).
 
 ## Numerics
 
@@ -47,6 +47,6 @@ Open question: the served distributions move by about 0.02 KL with where a reque
 
 ## Limits
 
-- The attention, the indexer and the routed experts run correct-first Triton and trtllm-gen kernels: on GB200 a cold prefill of a 575K-token prompt takes about 9 minutes, and AgentX's longest prompt (990K tokens) about 23 minutes beside three shorter ones. A prefix hit computes only the prompt past it and the window's pages before its end.
+- The attention and the routed experts run correct-first Triton and trtllm-gen kernels, which bound the cold prefill of a long prompt. A prefix hit computes only the prompt past it and the window's pages before its end.
 - A tensor-parallel split of the attention, pipeline and sequence splits, and speculative decoding are refused.
 - Prefill/decode handoffs and the host KV tier do not hold the window.

@@ -405,6 +405,11 @@ impl Fused for IndexScoresCall<'_> {
             )
         };
         let out = ops::empty((tokens, columns), scoring.scores)?;
+        // The call's transient workspace, which the package serving the descriptor may use.
+        let workspace = ops::empty(
+            IndexScores::workspace_bytes(&descriptor, tokens as u64) as usize,
+            DType::U8,
+        )?;
         ops::launch::<IndexScores>(
             &descriptor,
             IndexScoresArgs {
@@ -419,6 +424,7 @@ impl Fused for IndexScoresCall<'_> {
                     .map(|(candidates, _)| ops::operand(candidates))
                     .transpose()?,
                 out: ops::operand(&out)?,
+                workspace: ops::operand(&workspace)?,
             },
         )?;
         Ok(out)

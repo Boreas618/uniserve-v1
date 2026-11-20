@@ -1,0 +1,48 @@
+# The index_select operator's CUDA backend.
+#
+# One native module per descriptor: the `kept` best pooled scores of each row,
+# exactly as the operator states them (`ops::attention::IndexSelect`), by a
+# radix select of three levels over the scores' monotone 32-bit keys. A row is
+# one thread-block cluster whose CTAs each own a contiguous slice of the row and
+# sum their histograms through distributed shared memory, so a long row of a
+# small decode batch spreads over the device while the rows of a large batch
+# take one CTA each; a slice that fits shared memory is read once. The kept
+# entries leave in the operator's order, the strictly greater ones by column and
+# then the ties at the kept-th score by column, so the module's output equals
+# the Triton program's slot for slot.
+#
+# The pool and the candidate block are compiled in; the scores' type (FP32 or
+# BF16), the row count, the column count and the kept count are the call's, so
+# one module serves rows of any length. The module allocates nothing and does
+# not synchronize with the host, so a CUDA graph captures a launch.
+
+op = "index_select"
+backend = "cuda"
+interface_version = 2
+# Selected over the Triton program for every key both cover.
+priority = 1
+
+[source]
+kind = "cuda"
+
+# A CTA keeps a slice of 45056 keys, or half as many keys with their blocks, and
+# three levels of histograms in 229 KB of shared memory, which an SM100 block
+# opts into; its rows' CTAs form clusters and read each other's histograms.
+[kernel]
+requires = ["sm_100f"]
+
+[compile]
+units = ["src/index_select.cu"]
+standard = "c++17"
+
+[compile.definitions]
+UNISERVE_POOL = { field = "pool" }
+UNISERVE_CANDIDATES = { field = "candidates" }
+
+# `pool_8_candidates_0_tile_4096_scores_bf16`.
+#
+# The key is the operator's: `tile`, the Triton program's chunk, compiles
+# nothing here, and `scores` appears only for BF16 scores. The block mode ranks
+# unrestricted scores, which the module refuses otherwise.
+[[kernel.descriptors]]
+dimensions = { pool = { power_of_two = true }, candidates = { min = 0 }, tile = { power_of_two = true }, scores = ["f32", "bf16"] }

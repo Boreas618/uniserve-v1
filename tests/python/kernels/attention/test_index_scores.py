@@ -40,13 +40,23 @@ after the page's values, weighted by heads of both signs, against MXFP4
 queries; the rounding of the queries alone; candidate blocks among which some
 are unnamed and some reach past the visible groups; and a head count below
 the products' tile.
+
+The DeepGEMM module (``index_scores/deepgemm``, resolved at the session's
+Build Server) is called with the operator's call structure
+(``uniserve_index_scores_call``) at the model's shapes, BF16 scores of MXFP4
+queries and keys over pages of 32 and 64 keys: decode rows of their own
+requests, a prefill's rows of one request whose visible groups grow, and rows
+over 2^20 groups. It is held to the same reference and bound, and its columns
+past each row's visible groups are ``-inf`` exactly.
 """
 
+import ctypes
 import math
 
 import pytest
 import torch
 from uniserve_testing.kernels import records
+from uniserve_testing.kernels.packages import abi_enumerator, assert_abi_layout
 
 pytestmark = pytest.mark.unit
 
@@ -467,3 +477,198 @@ def test_the_model_shapes_score_within_the_bound(
         case, query, weights, decoded, table, rows, visible, candidates
     )
     check(name, case, got, expected)
+
+
+class ScoresCall(ctypes.Structure):
+    """``uniserve_index_scores_call`` (``ops::attention::ScoresCall``), field
+    for field.
+    """  # noqa: D205
+
+    _fields_ = [
+        ("query", ctypes.c_void_p),
+        ("weights", ctypes.c_void_p),
+        ("keys", ctypes.c_void_p),
+        ("page_table", ctypes.c_void_p),
+        ("rows", ctypes.c_void_p),
+        ("visible", ctypes.c_void_p),
+        ("candidates", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("workspace", ctypes.c_void_p),
+        ("workspace_bytes", ctypes.c_int64),
+        ("tokens", ctypes.c_int64),
+        ("pages", ctypes.c_int64),
+        ("table_rows", ctypes.c_int64),
+        ("max_pages", ctypes.c_int64),
+        ("blocks", ctypes.c_int64),
+        ("columns", ctypes.c_int64),
+        ("heads", ctypes.c_int64),
+        ("width", ctypes.c_int64),
+        ("groups", ctypes.c_int64),
+        ("candidate_block", ctypes.c_int64),
+        ("scores_dtype", ctypes.c_int64),
+        ("multiprocessors", ctypes.c_int64),
+        ("error", ctypes.c_char * 512),
+    ]
+
+
+def workspace_bytes(tokens, heads):
+    """`IndexScores::workspace_bytes`: each row's MXFP4 query records and
+    BF16 weight row padded to 16 bytes, four words of it, a schedule of 1025
+    pairs of words, and eight regions' alignment.
+    """  # noqa: D205
+    records_bytes = heads * (WIDTH // 2 + WIDTH // 32)
+    weights = (2 * heads + 15) // 16 * 16
+    return tokens * (records_bytes + weights + 16) + 8 * 1025 + 8 * 16
+
+
+def entry(kernel_module, case):
+    """The DeepGEMM module's entry for ``case``'s key."""
+    library = ctypes.CDLL(
+        str(kernel_module("index_scores", "deepgemm", key(case)) / "module.so")
+    )
+    function = library.uniserve_index_scores
+    function.argtypes = [ctypes.POINTER(ScoresCall), ctypes.c_void_p]
+    function.restype = ctypes.c_int32
+    return function
+
+
+def call_module(function, case, built, device):
+    """One call of the module over ``built``, the scores it wrote as FP32."""
+    _, _, _, _, tokens, heads, groups, max_pages = case[:8]
+    query, weights, plane, _, table, rows, visible, _ = built
+    columns = max_pages * groups
+    operands = {
+        "query": query.to(device),
+        "weights": weights.to(torch.float32).to(device),
+        "keys": plane.to(device),
+        "page_table": table.to(device),
+        "rows": rows.to(device),
+        "visible": visible.to(device),
+    }
+    out = torch.full(
+        (tokens, columns), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    workspace = torch.empty(
+        workspace_bytes(tokens, heads), dtype=torch.uint8, device=device
+    )
+    call = ScoresCall(
+        **{name: tensor.data_ptr() for name, tensor in operands.items()},
+        candidates=None,
+        out=out.data_ptr(),
+        workspace=workspace.data_ptr(),
+        workspace_bytes=workspace.numel(),
+        tokens=tokens,
+        pages=plane.shape[0],
+        table_rows=table.shape[0],
+        max_pages=max_pages,
+        blocks=0,
+        columns=columns,
+        heads=heads,
+        width=WIDTH,
+        groups=groups,
+        candidate_block=0,
+        scores_dtype=abi_enumerator("UNISERVE_DTYPE_BF16"),
+        multiprocessors=torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count,
+    )
+    stream = torch.cuda.current_stream(device).cuda_stream
+    status = function(ctypes.byref(call), ctypes.c_void_p(stream))
+    torch.cuda.synchronize(device)
+    assert status == 0, (
+        f"the module refused: {call.error.decode(errors='replace')}"
+    )
+    return out.cpu().to(torch.float32)
+
+
+def test_the_call_mirror_is_the_headers_call_structure():
+    """The generated header asserts the size and every offset it holds."""
+    assert_abi_layout(ScoresCall, "uniserve_index_scores_call")
+
+
+#: The DeepGEMM module's cases at the model's shapes: `(tokens, groups of a
+#: page, pages of a row's table, one prefill request)`. Decode rows each read
+#: their own table row and see their own count; a prefill's rows read one row
+#: and see a count that grows from one to every group.
+DEEPGEMM_ROWS = {
+    "256 decode rows over 4096 groups, pages of 64": (256, 64, 64, False),
+    "37 decode rows, pages of 32": (37, 32, 20, False),
+    "a prefill of 1000 rows, pages of 32": (1000, 32, 32, True),
+    "a prefill of 4096 rows, pages of 64": (4096, 64, 64, True),
+    "two rows over 2^20 groups": (2, 64, 16384, False),
+}
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("name", DEEPGEMM_ROWS)
+def test_the_deepgemm_module_scores_within_the_bound(
+    name, kernel_module, torch_device
+):
+    tokens, groups, max_pages, prefill = DEEPGEMM_ROWS[name]
+    case = (
+        "mxfp4",
+        True,
+        True,
+        0,
+        tokens,
+        32,
+        groups,
+        max_pages,
+        256,
+        "bf16",
+        11,
+    )
+    generator = torch.Generator().manual_seed(case[-1])
+    built = list(operands(case, generator))
+    if prefill:
+        built[5] = torch.zeros(tokens, dtype=torch.int32)
+        built[6] = (
+            torch.linspace(1, max_pages * groups, tokens)
+            .round()
+            .to(torch.int32)
+        )
+    query, weights, _, decoded, table, rows, visible, _ = built
+
+    got = call_module(entry(kernel_module, case), case, built, torch_device)
+    expected = reference(
+        case, query, weights, decoded, table, rows, visible, None
+    )
+    check(name, case, got, expected)
+
+
+@pytest.mark.gpu
+def test_the_deepgemm_entry_refuses_a_restricted_call(kernel_module):
+    """Candidate blocks are the Triton package's: the module refuses a call
+    restricted to them on the host, naming what it is compiled for.
+    """  # noqa: D205
+    case = ("mxfp4", True, True, 0, 1, 32, 64, 1, 256, "bf16", 0)
+    address = 0x1000
+    call = ScoresCall(
+        query=address,
+        weights=address,
+        keys=address,
+        page_table=address,
+        rows=address,
+        visible=address,
+        candidates=address,
+        out=address,
+        workspace=address,
+        workspace_bytes=1 << 20,
+        tokens=1,
+        pages=1,
+        table_rows=1,
+        max_pages=1,
+        blocks=4,
+        columns=32,
+        heads=32,
+        width=WIDTH,
+        groups=64,
+        candidate_block=8,
+        scores_dtype=abi_enumerator("UNISERVE_DTYPE_BF16"),
+        multiprocessors=148,
+    )
+
+    status = entry(kernel_module, case)(ctypes.byref(call), None)
+
+    message = call.error.decode(errors="replace")
+    assert status != 0 and "dense" in message, message

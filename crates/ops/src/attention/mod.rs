@@ -90,6 +90,7 @@ pub use dense::{DenseArgs, DenseAttention, DenseCall, DenseDescriptor};
 pub use indexed::{
     IndexScores, IndexScoresArgs, IndexScoresDescriptor, IndexSelect, IndexSelectArgs,
     IndexSelectDescriptor, IndexedAttention, IndexedAttentionArgs, IndexedAttentionDescriptor,
+    ScoresCall, SelectCall,
 };
 pub use latent::{
     Compressed, CompressedArgs, LatentAttention, LatentAttentionArgs, LatentAttentionDescriptor,
