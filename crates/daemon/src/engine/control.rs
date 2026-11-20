@@ -2076,6 +2076,51 @@ mod tests {
         );
     }
 
+    /// The published deployment of eight schedulers over two hosts' GPUs
+    /// (`configs/deepseek_v41/dp8-ep8`) shares its experts in one expert union, so it is one
+    /// replica, which runs one engine on each host: the leader's is the scheduler node, from rank
+    /// 0, and the second host's from rank 4, each on its host's four GPUs, in a world of all eight
+    /// ranks, every one a member of the union.
+    #[test]
+    fn an_expert_union_over_two_hosts_is_one_replica_of_one_engine_per_host() {
+        let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs/deepseek_v41/dp8-ep8/config.toml");
+        let (options, _) =
+            crate::config::parse(&std::fs::read_to_string(package).unwrap()).unwrap();
+        let config = options.engine_config().expect("the configuration resolves");
+        assert!(config.expert_union());
+
+        let replicas = crate::leader::replica_configs(&config).unwrap();
+        let [replica] = <[_; 1]>::try_from(replicas).expect("an expert union is one replica");
+        let interfaces = Interfaces {
+            deployment: "",
+            requests: "",
+            processes: "",
+            build_server: Path::new(""),
+        };
+        let launches: Vec<(String, u32, Vec<u32>, u32, bool)> =
+            place_world(EngineArgs::new(replica, modules()), &[1, 2], &interfaces)
+                .expect("the world places")
+                .into_iter()
+                .map(|launch| {
+                    (
+                        launch.host,
+                        launch.rank,
+                        launch.devices,
+                        launch.world_size,
+                        launch.scheduler_node,
+                    )
+                })
+                .collect();
+        assert_eq!(
+            launches,
+            vec![
+                ("node-0".to_owned(), 0, vec![0, 1, 2, 3], 8, true),
+                ("node-1".to_owned(), 4, vec![0, 1, 2, 3], 8, false),
+            ]
+        );
+    }
+
     /// An epoch update's target starts from a launch that states its own launch generation, the
     /// epoch, the daemon's interfaces and the epoch's module set; one that names the engine it
     /// succeeds starts parked, and one that names none serves.

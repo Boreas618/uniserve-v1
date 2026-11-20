@@ -20,11 +20,13 @@ CUDA_VISIBLE_DEVICES=0,1 uniserve serve qwen3-moe
 
 Every scheduler keeps its own KV cache and attention, and its worker holds `1 / N` of each layer's routed experts. The schedulers run every expert layer together: before each forward, their workers agree over a host connection on which scheduler's batch runs and on the step's per-scheduler token capacity, and every other worker joins the step without tokens of its own, so its experts serve the tokens routed to them. A worker that is idle keeps joining. Schedulers sharing their experts each run one one-rank worker group.
 
+The schedulers' ranks may lie on several hosts whose GPUs form one NVLink domain, as `configs/deepseek_v41/dp8-ep8` places eight on two hosts of four ([DeepSeek-V4.1-Flash](deepseek_v41.md#serving-it-on-two-hosts)). Every rank of the deployment is a member of the union, at the place of its deployment rank, and each host's engine process holds the members its GPUs serve ([Architecture](architecture.md#the-channel)). The members of all processes meet at the epoch's rendezvous, where the formation that connects the deployment's ranks also connects the union's members twice more: once for the step agreement and the exchange's startup, and once for the joins, which a process's relay thread hands to the workers of its own members. A member asks the members of its own process to join directly and those of other processes over these connections, so a step agreed over two hosts takes the same course as one within a process. The exchange packages map every rank's window by a fabric handle, which the driver resolves on any host of the NVLink domain; a package that can share its windows only by file descriptors, which serve the ranks of one process, refuses a union whose ranks span processes.
+
 The token transport is the package that fills the `expert_exchange` operator's descriptor key: the installed package that covers the key with the highest manifest priority, `alltoall` among the tree's packages of equal priority, unless the deployment's `[kernels]` table pins the key to another (`docs/configuration.md`, the `[kernels]` table):
 
 | Exchange | Transport | Requirements |
 | --- | --- | --- |
-| `alltoall` | FlashInfer's NVLink all-to-all around each rank's grouped experts | NVLink peers (MNNVL fabric or peer storage); no attention ranks |
+| `alltoall` | FlashInfer's NVLink all-to-all around each rank's grouped experts | NVLink peers (MNNVL fabric, which ranks of several processes need, or peer storage within one process); no attention ranks |
 | `megamoe` | The fused MegaMoE kernel: one launch exchanges, runs the experts and combines | NVFP4 expert weights, Blackwell GPUs |
 | `deepep` | DeepEP elastic dispatch and combine | Dedicated expert workers |
 
