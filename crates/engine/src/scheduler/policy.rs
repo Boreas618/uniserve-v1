@@ -7,7 +7,13 @@
 //! allocated, packed as `ptr << 32 | len` (`0` for none), or for `place` the chosen index
 //! itself (`scheduling::wire`). Every export the host enters, the two buffer exports
 //! included, starts with a fuel budget of its own, so a policy that loops ends its call instead
-//! of the step; a call's budget grows with the message it decodes.
+//! of the step; a call's budget, and the budget of the allocation that holds its message, grow
+//! with the message.
+//!
+//! An instance starts from a snapshot of the scheduler's state. Of a warm cache the
+//! instantiation carries the most recently used pages, and the instance's next steps tell it the
+//! others, least recently used first ([`Untold`]), so a switch, a rollback or a recovery holds
+//! the scheduler's thread for a bounded share of the cache whatever the cache holds.
 //!
 //! The policy holds the view, and the scheduler tells it what changed as events (§5.2); the host
 //! keeps the view of each request the policy holds as those events leave it, so that a request
@@ -22,7 +28,8 @@
 //! of the limits it declares) is the deployment's `scheduler_config.policy_budget`
 //! ([`PolicyBudget`]).
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -31,11 +38,13 @@ use proto::config::PolicyBudget;
 use proto::request::RequestId;
 use scheduling::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling::event::Event;
-use scheduling::ids::RequestId as PolicyRequestId;
+use scheduling::ids::{PageId, RequestId as PolicyRequestId};
 use scheduling::limits::{Limits, Parameters};
 use scheduling::policy::Instantiation;
 use scheduling::time::Nanos;
-use scheduling::view::{CallView, ReplicaView, RequestStatus as Standing, RequestView, Snapshot};
+use scheduling::view::{
+    CallView, PageView, ReplicaView, RequestStatus as Standing, RequestView, Snapshot,
+};
 use scheduling::wire::{self, Call};
 use wasmtime::{Config, Memory, Module, OptLevel, Store, Trap, TypedFunc, WasmParams, WasmResults};
 
@@ -125,6 +134,10 @@ pub(crate) struct Policy {
     /// (SD §5.2): the view its snapshot or the last `Arrived` or `Updated` stated, running once
     /// `Admitted`, and advanced by every `Emitted` as the policy advances it.
     told: HashMap<RequestId, RequestView>,
+    /// The pages of the cache the serving instance's snapshot did not carry and it has not been
+    /// told yet ([`Untold`]): each `dispatch` tells it [`STEP_PAGES`] of them, and any one an
+    /// event names before that event.
+    untold: Untold,
     /// The calls of the interface that reached a module, over every instance of this policy.
     pub calls: u64,
     /// The fuel those calls consumed.
@@ -197,7 +210,7 @@ impl Policy {
     ) -> Result<Self, PolicyError> {
         let (mut calls, mut fuel) = (0, 0);
         let told = told_by(&snapshot);
-        let (instance, limits) = start(
+        let (instance, limits, untold) = start(
             &module,
             &parameters,
             snapshot,
@@ -218,6 +231,7 @@ impl Policy {
             events: Vec::new(),
             dirty: Vec::new(),
             told,
+            untold,
             calls,
             fuel,
         })
@@ -238,7 +252,7 @@ impl Policy {
         ceilings: &Limits,
     ) -> Result<(), Error> {
         let told = told_by(&snapshot);
-        let (instance, limits) = start(
+        let (instance, limits, untold) = start(
             &module,
             &parameters,
             snapshot,
@@ -251,7 +265,7 @@ impl Policy {
         let module = std::mem::replace(&mut self.module, module);
         let parameters = std::mem::replace(&mut self.parameters, parameters);
         self.previous = Some((module, parameters));
-        self.install(instance, limits, *ceilings, told);
+        self.install(instance, limits, *ceilings, (told, untold));
         Ok(())
     }
 
@@ -356,9 +370,18 @@ impl Policy {
             self.events.push(Event::Updated { request: view });
         }
 
-        // `observe` replies nothing a host reads.
+        // The pages the snapshot did not carry are told a step's share at a time, least recently
+        // used first, and any one an event of the step names right before that event, so every
+        // page an event names is one the instance was told. `observe` replies nothing a host
+        // reads.
         let events = std::mem::take(&mut self.events);
-        self.call(Call::Observe, wire::encode(&events))?;
+        let mut stated = Vec::with_capacity(events.len());
+        self.untold.tell(STEP_PAGES, &mut stated);
+        for event in events {
+            self.untold.named(&event, &mut stated);
+            stated.push(event);
+        }
+        self.call(Call::Observe, wire::encode(&stated))?;
 
         let reply = self
             .call(Call::Dispatch, wire::encode(room))?
@@ -404,7 +427,7 @@ impl Policy {
     ) -> Result<(), PolicyError> {
         let ceilings = self.ceilings;
         let told = told_by(&snapshot);
-        let (instance, limits) = start(
+        let (instance, limits, untold) = start(
             &module,
             &parameters,
             snapshot,
@@ -415,21 +438,22 @@ impl Policy {
 
         self.module = module;
         self.parameters = parameters;
-        self.install(instance, limits, ceilings, told);
+        self.install(instance, limits, ceilings, (told, untold));
         Ok(())
     }
 
     /// Makes `instance` the serving one, with its limits and the ceilings they were checked
-    /// against, and `told`, the views of the snapshot it started from, as what it holds. The
-    /// events gathered for the instance it replaces are dropped, since the snapshot states what
-    /// they told; marked requests stay marked, and their views are told to it at its first
-    /// `dispatch` where they differ from the snapshot's.
+    /// against, `told`, the views of the snapshot it started from, as what it holds, and
+    /// `untold`, the pages of the cache its snapshot did not carry. The events gathered for the
+    /// instance it replaces are dropped, since the snapshot states what they told; marked
+    /// requests stay marked, and their views are told to it at its first `dispatch` where they
+    /// differ from the snapshot's.
     fn install(
         &mut self,
         instance: Instance,
         limits: Limits,
         ceilings: Limits,
-        told: HashMap<RequestId, RequestView>,
+        (told, untold): (HashMap<RequestId, RequestView>, Untold),
     ) {
         self.instance = instance;
         self.limits = limits;
@@ -437,6 +461,7 @@ impl Policy {
         self.recovering = false;
         self.events.clear();
         self.told = told;
+        self.untold = untold;
     }
 
     /// One call that takes an encoded message and replies with a buffer: the reply's bytes, or
@@ -540,7 +565,11 @@ impl Instance {
         let len = u32::try_from(message.len())
             .map_err(|_| malformed(call, "the message is larger than wasm32 addresses"))?;
         let call_fuel = self.budget.call_fuel.get();
-        let ptr = enter(&mut self.store, call, &self.alloc, len, call_fuel, fuel)?;
+        // The buffer that holds the message costs as the message's bytes do (a module's allocator
+        // zeroes it at about a fuel a byte), so its allocation is given the message's share as
+        // the decoding is; a call fuel alone would refuse every message longer than it in bytes.
+        let budget = message_fuel(&self.budget, len);
+        let ptr = enter(&mut self.store, call, &self.alloc, len, budget, fuel)?;
         if ptr == 0 && len != 0 {
             return Err(malformed(call, "the module could not hold the message"));
         }
@@ -549,7 +578,6 @@ impl Instance {
             .map_err(|error| malformed(call, format!("cannot write the message: {error}")))?;
 
         let buffer = (ptr, len);
-        let budget = message_fuel(&self.budget, len);
         let store = &mut self.store;
         let result = match call {
             Call::Init => enter(store, call, &self.init, buffer, budget, fuel)?,
@@ -609,6 +637,97 @@ impl Instance {
     }
 }
 
+/// The pages of a snapshot an instantiation carries: the cache's most recently used ones.
+///
+/// Decoding a page costs `init` about 8,100 fuel, 0.82 µs on one core of the deployment's
+/// hosts: a policy instantiated on a whole snapshot of 2,375,678 pages (a host tier of 1,605,630
+/// pages beside a device plane of 770,048) held the scheduler's thread for 1.95 s, and every
+/// policy switch or recovery on such a cache would stall serving that long. 16,384 pages cost an
+/// instantiation about 13 ms whatever the cache holds.
+const SNAPSHOT_PAGES: usize = 16_384;
+
+/// The pages of the cache beyond its snapshot's that each `dispatch` tells an instance: about
+/// 1.7 ms of a step until it knows them all, a cache of 2.4 M pages in about 1,150 steps.
+const STEP_PAGES: usize = 2_048;
+
+/// The pages of the cache an instance's snapshot did not carry, until it has been told them
+/// (`scheduling::Event::Cached`): every one was last used no later than the pages the snapshot
+/// carried, so the instance places each before every page it knows, and they are told least
+/// recently used first, so a shortage's first victims are among the first told.
+#[derive(Debug, Default)]
+struct Untold {
+    /// The untold pages, least recently used first, by last use and page; an entry whose page
+    /// is not in `views` any more was told out of turn.
+    order: BinaryHeap<Reverse<(u64, u64)>>,
+    /// The view of each untold page as the snapshot stated it. Every change of a page since is
+    /// an event that names it (`Kv::tell`), which tells or removes it here, so a view still here
+    /// is the page as it stands.
+    views: HashMap<u64, PageView>,
+}
+
+impl Untold {
+    /// Keeps in `snapshot` its [`SNAPSHOT_PAGES`] most recently used pages and returns the
+    /// others, untold.
+    fn split(snapshot: &mut Snapshot) -> Self {
+        let older = snapshot.pages.len().saturating_sub(SNAPSHOT_PAGES);
+        if older == 0 {
+            return Self::default();
+        }
+
+        // The pages before `older` once it is in place are the least recently used.
+        let key = |page: &PageView| (page.last_used.0, page.id.0);
+        snapshot.pages.select_nth_unstable_by_key(older, key);
+        let untold: Vec<PageView> = snapshot.pages.drain(..older).collect();
+        Self {
+            order: untold.iter().map(|page| Reverse(key(page))).collect(),
+            views: untold.into_iter().map(|page| (page.id.0, page)).collect(),
+        }
+    }
+
+    /// Appends to `stated` the next `count` untold pages as `Cached`, least recently used first.
+    fn tell(&mut self, count: usize, stated: &mut Vec<Event>) {
+        let mut told = 0;
+        while told < count && !self.views.is_empty() {
+            let Some(Reverse((_, id))) = self.order.pop() else {
+                break;
+            };
+            if let Some(page) = self.views.remove(&id) {
+                stated.push(Event::Cached { page });
+                told += 1;
+            }
+        }
+        if self.views.is_empty() {
+            self.order = BinaryHeap::new();
+        }
+    }
+
+    /// Appends to `stated`, as `Cached`, each untold page `event` touches (a hit, a release, a
+    /// hold), for the instance to know the page before the event names it. A page the event
+    /// states or frees leaves the untold pages: the event tells the instance what it is.
+    fn named(&mut self, event: &Event, stated: &mut Vec<Event>) {
+        if self.views.is_empty() {
+            return;
+        }
+
+        let mut tell = |page: &PageId| {
+            if let Some(page) = self.views.remove(&page.0) {
+                stated.push(Event::Cached { page });
+            }
+        };
+        match event {
+            Event::Hit { page } => tell(page),
+            Event::Released { pages } | Event::Held { pages } => pages.iter().for_each(tell),
+            Event::Cached { page } => {
+                self.views.remove(&page.id.0);
+            }
+            Event::Freed { page } => {
+                self.views.remove(&page.0);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The views an instance started from `snapshot` holds: those of the requests it states.
 fn told_by(snapshot: &Snapshot) -> HashMap<RequestId, RequestView> {
     snapshot
@@ -650,15 +769,18 @@ fn follow(told: &mut HashMap<RequestId, RequestView>, event: &Event) {
 
 /// Instantiates `module` from `parameters` and `snapshot` (`init`) with the fuel `budget` states
 /// for each call, reads its limits once (`limits`) and checks them against `ceilings`. `calls`
-/// and `fuel` gather the two calls.
+/// and `fuel` gather the two calls. The instantiation carries the snapshot's
+/// [`SNAPSHOT_PAGES`] most recently used pages, and the others are returned untold
+/// ([`Untold::split`]).
 fn start(
     module: &Module,
     parameters: &Parameters,
-    snapshot: Snapshot,
+    mut snapshot: Snapshot,
     (ceilings, budget): (&Limits, &PolicyBudget),
     calls: &mut u64,
     fuel: &mut u64,
-) -> Result<(Instance, Limits), PolicyError> {
+) -> Result<(Instance, Limits, Untold), PolicyError> {
+    let untold = Untold::split(&mut snapshot);
     let mut instance = Instance::new(module, budget)?;
 
     let instantiation = Instantiation {
@@ -677,7 +799,7 @@ fn start(
     let limits: Limits = decoded(Call::Limits, wire::decode(&reply))?;
     check(&limits, ceilings)?;
 
-    Ok((instance, limits))
+    Ok((instance, limits, untold))
 }
 
 /// The fuel an export is entered with for a message of `len` bytes: the budget's call fuel, and
@@ -853,6 +975,7 @@ pub(crate) mod tests {
 
     use scheduling::End;
     use scheduling::Nanos;
+    use scheduling::decision::Storage;
     use scheduling::ids::{PageId, RequestId as GuestId, StageId};
     use scheduling::time::Duration;
     use scheduling::view::{
@@ -1377,6 +1500,346 @@ pub(crate) mod tests {
         }
     }
 
+    /// The end of a request of a long context: a 433,272-token prompt holds 6,770 blocks of 64
+    /// tokens beside 15 running requests of 16 blocks each, and gives them all up in one step.
+    /// That step's `observe` decodes the release within its message's share of fuel, and every
+    /// `dispatch` from it on consumes at most half of the default call fuel
+    /// ([`DEFAULT_POLICY_CALL_FUEL`]), as a step of many ending requests does: a `dispatch` that
+    /// named every block in one step would cost in proportion to the context, past a call's fuel
+    /// at a few thousand blocks, and the policy's fault would drop the step and the offload. Over
+    /// the steps that follow the policy offloads each block given up once, in the order they
+    /// were given up, and then nothing.
+    #[test]
+    fn the_end_of_a_long_context_is_offloaded_within_a_calls_fuel() {
+        const PROMPT_TOKENS: u64 = 433_272;
+        const PAGE_TOKENS: u64 = 64;
+        const PAGES: u64 = PROMPT_TOKENS.div_ceil(PAGE_TOKENS);
+        const OTHERS: u64 = 15;
+        const BLOCKS: u64 = 16;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+        assert_eq!(PAGES, 6_770);
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+        let room = Room {
+            token_budget: 4096,
+            call_budget: 16,
+            page_tokens: PAGE_TOKENS as u32,
+            ..Room::default()
+        };
+        let observe = |policy: &mut Policy, events: &[Event]| {
+            metered(policy, Call::Observe, wire::encode(&events).unwrap()).0
+        };
+        let dispatch = |policy: &mut Policy| {
+            let (fuel, reply) = metered(policy, Call::Dispatch, wire::encode(&room).unwrap());
+            let output: DispatchOutput = wire::decode(&reply.unwrap()).unwrap();
+            (fuel, output.offload)
+        };
+
+        // Request 1 is the long context's, and the others decode beside it; each block is
+        // cached held, as a step's calls fill it.
+        let running = 1 + OTHERS;
+        let arrivals: Vec<Event> = (1..=running)
+            .map(|id| Event::Arrived {
+                request: decoding(id, GuestStatus::Waiting, 0, 0),
+            })
+            .chain((1..=running).map(|id| Event::Admitted {
+                request: GuestId(id),
+            }))
+            .collect();
+        observe(&mut policy, &arrivals);
+        let mut used = 0;
+        let mut cached = |pages: &[PageId]| -> Vec<Event> {
+            pages
+                .iter()
+                .map(|&page| {
+                    used += 1;
+                    Event::Cached {
+                        page: block(page, used, false),
+                    }
+                })
+                .collect()
+        };
+        for id in 2..=running {
+            let held: Vec<PageId> = (0..BLOCKS).map(|index| spread(id << 32 | index)).collect();
+            observe(&mut policy, &cached(&held));
+        }
+
+        // The prompt is prefilled a step's tokens at a time, and its blocks cached as it is.
+        let long: Vec<PageId> = (0..PAGES).map(|index| spread(1 << 32 | index)).collect();
+        let step_pages = (u64::from(room.token_budget) / PAGE_TOKENS) as usize;
+        for filled in long.chunks(step_pages) {
+            observe(&mut policy, &cached(filled));
+            assert!(
+                dispatch(&mut policy).1.is_empty(),
+                "a held block is offloaded"
+            );
+        }
+
+        // The request ends and gives up every block it held.
+        observe(
+            &mut policy,
+            &[
+                Event::Finished {
+                    request: GuestId(1),
+                    end: End::Completed,
+                },
+                Event::Released {
+                    pages: long.clone(),
+                },
+            ],
+        );
+        // Every block given up is still a device block no request holds, so each step offloads
+        // some until none is left: the release takes at most a step a block.
+        let mut offloaded = Vec::new();
+        for step in 0..=PAGES {
+            let (fuel, offload) = dispatch(&mut policy);
+            assert!(fuel <= LIMIT, "dispatch {step} took {fuel} fuel");
+            if offload.is_empty() {
+                break;
+            }
+            offloaded.extend(offload);
+        }
+        assert_eq!(
+            offloaded, long,
+            "each block given up is offloaded once, in order"
+        );
+        assert!(
+            dispatch(&mut policy).1.is_empty(),
+            "nothing is left to offload"
+        );
+    }
+
+    /// A device shortage beside a warm host tier: the cache holds a host tier as large as a
+    /// device plane of 47 segments of 16,384 units, every page on the host alone and used before
+    /// any device page, then the 65,536 device pages 16 running requests hold, then the device
+    /// pages no request holds. A device shortage's `preempt` names the least recently used device
+    /// pages no request holds, and a host shortage's the least recently used host pages, each
+    /// within half of the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]): a search that read
+    /// the pages it cannot take on its way would cost in proportion to the host tier, past a
+    /// call's fuel at about half a million pages, and the fault would end the policy at a
+    /// shortage. The cache is told in `Cached` events a step's worth at a time, as it warmed.
+    #[test]
+    fn a_shortage_beside_a_warm_host_tier_names_its_victims_within_a_calls_fuel() {
+        const HOST: u64 = 47 * 16_384;
+        const HELD: u64 = 16 * 4_096;
+        const FREE: u64 = 1_024;
+        const NEED: u64 = 64;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+
+        // Least recently used first: the host tier, the held pages, the free device pages.
+        let view = |number: u64| PageView {
+            id: spread(number),
+            tokens: 64,
+            last_used: Nanos(NOW + number),
+            on_host: number < HOST,
+            evictable: !(HOST..HOST + HELD).contains(&number),
+        };
+        let numbers: Vec<u64> = (0..HOST + HELD + FREE).collect();
+        for told in numbers.chunks(16_384) {
+            let events: Vec<Event> = told
+                .iter()
+                .map(|&number| Event::Cached { page: view(number) })
+                .collect();
+            policy.call(Call::Observe, wire::encode(&events)).unwrap();
+        }
+
+        let first = |numbers: std::ops::Range<u64>| -> Vec<Victim> {
+            numbers
+                .take(NEED as usize)
+                .map(|number| Victim::Page(spread(number)))
+                .collect()
+        };
+        for (kind, expected) in [
+            (Storage::KvUnits, first(HOST + HELD..HOST + HELD + FREE)),
+            (Storage::HostPages, first(0..HOST)),
+        ] {
+            let shortage = Shortage { kind, need: NEED };
+            let (fuel, reply) =
+                metered(&mut policy, Call::Preempt, wire::encode(&shortage).unwrap());
+            assert!(fuel <= LIMIT, "{kind:?}: preempt took {fuel} fuel");
+            let victims: Vec<Victim> = wire::decode(&reply.unwrap()).unwrap();
+            assert_eq!(victims, expected, "{kind:?}");
+        }
+    }
+
+    /// A cache that grows a page a step: the step that caches one page costs `observe` what
+    /// that page does, whatever the size of the cache. The cache grows to 262,146 blocks, told a
+    /// step's worth at a time and, across each power of two from 4,096 blocks on, one block a
+    /// step; each of those steps' `observe` consumes at most half of the default call fuel
+    /// ([`DEFAULT_POLICY_CALL_FUEL`]). A record of the pages that copied every page it held
+    /// when it grew would cost the step that crossed 262,144 blocks about 12.6 M fuel, past a
+    /// call's.
+    #[test]
+    fn a_cache_that_grows_a_page_a_step_costs_each_step_its_page() {
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+
+        // Blocks a running request holds, so no offer to the host accumulates beside them.
+        let cached = |number: u64| Event::Cached {
+            page: block(spread(number), number, false),
+        };
+        let mut size = 0;
+        for power in 12..=18 {
+            let crossing = 1u64 << power;
+            while size < crossing - 2 {
+                let end = (size + 16_384).min(crossing - 2);
+                let events: Vec<Event> = (size..end).map(cached).collect();
+                policy.call(Call::Observe, wire::encode(&events)).unwrap();
+                size = end;
+            }
+            for _ in 0..4 {
+                let events = [cached(size)];
+                let (fuel, _) = metered(&mut policy, Call::Observe, wire::encode(&events).unwrap());
+                size += 1;
+                assert!(
+                    fuel <= LIMIT,
+                    "the step that cached block {size} took {fuel} fuel"
+                );
+            }
+        }
+        assert_eq!(size, (1 << 18) + 2);
+    }
+
+    /// An instance starts on a bounded share of a warm cache and learns the rest over its next
+    /// steps. The cache holds 30,000 device blocks no request holds, block `n` used `n`-th. The
+    /// instantiation decodes no more for a cache twice as large; it carries the most recently
+    /// used blocks, and each step tells the instance others, least recently used first, so a
+    /// shortage in its first step already names the least recently used blocks of the whole
+    /// cache. A block a request takes and gives up before its turn is told before that event
+    /// names it, and is then the most recently used. Once every block is told, shortages take
+    /// them all in the cache's order, and none of the blocks the cache held when the instance
+    /// started is offloaded, as none the snapshot carried is.
+    #[test]
+    fn an_instance_starts_on_a_bounded_share_of_a_warm_cache_and_learns_the_rest() {
+        const BLOCKS: u64 = 30_000;
+
+        let (parameters, ceilings) = limited(30);
+        let instantiated = |blocks: u64| {
+            let snapshot = Snapshot {
+                pages: (0..blocks)
+                    .map(|number| block(spread(number), number, true))
+                    .collect(),
+                phases: text_phases(),
+                ..Snapshot::default()
+            };
+            Policy::new(
+                packaged("arrival"),
+                parameters.clone(),
+                snapshot,
+                &ceilings,
+                &PolicyBudget::default(),
+            )
+            .unwrap()
+        };
+        let twice = instantiated(2 * BLOCKS).fuel;
+        let mut policy = instantiated(BLOCKS);
+        assert!(
+            twice < policy.fuel + policy.fuel / 20,
+            "a cache twice as large cost the instantiation {twice} fuel, {} for this one",
+            policy.fuel
+        );
+
+        let room = Room {
+            token_budget: 8192,
+            call_budget: 128,
+            page_tokens: 64,
+            ..Room::default()
+        };
+        let shortage = |policy: &mut Policy, need: u64| -> Vec<PageId> {
+            let shortage = Shortage {
+                kind: Storage::KvUnits,
+                need,
+            };
+            policy
+                .preempt(&shortage)
+                .unwrap()
+                .into_iter()
+                .map(|victim| match victim {
+                    Victim::Page(page) => page,
+                    other => panic!("a shortage of free blocks named {other:?}"),
+                })
+                .collect()
+        };
+
+        // The least recently used block the instance has not been told is taken and given up.
+        let taken = spread(BLOCKS - SNAPSHOT_PAGES as u64 - 1);
+        policy.events.push(Event::Held { pages: vec![taken] });
+        policy.events.push(Event::Released { pages: vec![taken] });
+        let mut offloaded = policy
+            .dispatch(&room, &mut HashMap::new(), &[])
+            .unwrap()
+            .offload;
+        let oldest: Vec<PageId> = (0..64).map(spread).collect();
+        assert_eq!(shortage(&mut policy, 64), oldest);
+
+        let steps = (BLOCKS as usize - SNAPSHOT_PAGES).div_ceil(STEP_PAGES);
+        for _ in 1..steps {
+            let output = policy.dispatch(&room, &mut HashMap::new(), &[]).unwrap();
+            offloaded.extend(output.offload);
+        }
+        // The blocks in the order shortages take them, as the mechanism frees each shortage's
+        // victims and tells the frees in the next step.
+        let mut taken_in_order = Vec::new();
+        loop {
+            let victims = shortage(&mut policy, 1_024);
+            if victims.is_empty() {
+                break;
+            }
+            for &page in &victims {
+                policy.events.push(Event::Freed { page });
+            }
+            taken_in_order.extend(victims);
+            let output = policy.dispatch(&room, &mut HashMap::new(), &[]).unwrap();
+            offloaded.extend(output.offload);
+        }
+        let in_order: Vec<PageId> = (0..BLOCKS)
+            .map(spread)
+            .filter(|page| *page != taken)
+            .chain([taken])
+            .collect();
+        assert_eq!(taken_in_order, in_order);
+        assert_eq!(offloaded, [taken]);
+    }
+
     /// A steady step of a decode load of 256 running requests (a `max_running_requests` in the
     /// hundreds): each request's decode was scheduled and applied, so the scheduler marked it
     /// and told its advance and its emission, and nothing else of its view moved. The policy is
@@ -1534,5 +1997,50 @@ pub(crate) mod tests {
             assert!(spent <= LIMIT, "observe and dispatch took {spent} fuel");
             assert_eq!(output.offload, released);
         }
+    }
+
+    /// A message longer in bytes than a call's fuel is received whole: a step tells 100,000
+    /// blocks as `Cached`, as a scheduler that starts beside a warm cache does, in a message of
+    /// more bytes than the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]). The buffer that
+    /// holds the message and its decoding are both given fuel for every byte of it, so `observe`
+    /// takes the whole step, and a shortage then takes the least recently used of those blocks.
+    #[test]
+    fn a_message_longer_in_bytes_than_a_calls_fuel_is_received_whole() {
+        const BLOCKS: u64 = 100_000;
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+
+        let events: Vec<Event> = (0..BLOCKS)
+            .map(|number| Event::Cached {
+                page: block(spread(number), number, true),
+            })
+            .collect();
+        let message = wire::encode(&events).unwrap();
+        assert!(
+            message.len() as u64 > DEFAULT_POLICY_CALL_FUEL.get(),
+            "the message is longer in bytes than a call's fuel"
+        );
+        policy.call(Call::Observe, Ok(message)).unwrap();
+
+        let shortage = Shortage {
+            kind: Storage::KvUnits,
+            need: 4,
+        };
+        let reply = policy.call(Call::Preempt, wire::encode(&shortage)).unwrap();
+        let victims: Vec<Victim> = wire::decode(&reply.unwrap()).unwrap();
+        let oldest: Vec<Victim> = (0..4).map(|number| Victim::Page(spread(number))).collect();
+        assert_eq!(victims, oldest);
     }
 }
