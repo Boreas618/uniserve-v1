@@ -717,6 +717,27 @@ fn admits_bits(bits: u32, text: &str) -> bool {
         && (digits == "0" || !digits.starts_with('0'))
 }
 
+/// The formats of the operator vocabulary this build reads ([`read_operators`]), of which the
+/// tree's own vocabulary (`crates/proto/src/module/operators.toml`) is in the newest.
+///
+/// Format 1 names the operators alone. Format 2 adds `interface_versions`, the version of each
+/// operator's interface the engine revision launches; a vocabulary that states that table is of
+/// format 2, and one that does not is of format 1. The window keeps format 1 readable, so a
+/// deployment's Build Server moves to this build over a package root whose engine revisions
+/// were installed by the previous release: such a revision states no versions, and its
+/// operators' packages are selected as format 1 selected them, at each backend's latest
+/// revision whatever version it implements.
+///
+/// Format 1 leaves the window (`docs/architecture.md`, Interface versions) no earlier than the
+/// release after the first that reads format 2, and only once no deployment's epoch runs an
+/// engine revision of format 1. The change that raises the oldest format to 2 deletes the
+/// reading of format 1 and that unversioned selection ([`Operator::interface_version`] becomes
+/// required) with their tests. A package root keeps every revision installed into it, and a
+/// server reads each engine revision's vocabulary whenever it starts, so that change keeps a
+/// server starting over a root that still holds revisions of format 1, refusing to fix an epoch
+/// from one rather than refusing to start.
+pub const VOCABULARY_FORMATS: service::Versions = service::Versions::new(1, 2);
+
 /// One operator an engine revision launches, as its vocabulary states it ([`read_operators`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Operator {
@@ -724,25 +745,30 @@ pub struct Operator {
     pub name: String,
     /// The version of the operator's interface the engine revision launches, at least 1: the
     /// only version of its packages' `interface_version` whose modules the revision loads.
-    pub interface_version: u32,
+    /// `None` for a vocabulary of format 1 ([`VOCABULARY_FORMATS`]), which states no versions:
+    /// the operator's packages are then selected whatever version they implement, as that
+    /// format's revisions were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_version: Option<u32>,
 }
 
 /// The operators the vocabulary at `path` names, in its order, each with the version of its
 /// interface the vocabulary states ([`Manifest::operators`]).
 ///
-/// The vocabulary is a TOML table of two keys: `operators`, an array of names, and
-/// `interface_versions`, a table of the version of each operator's interface past its first, by
-/// name; an operator it does not name launches version 1. A name is a lowercase ASCII letter
-/// followed by lowercase letters, digits and `_`, so it is one path segment of the module store,
-/// and each name is listed once; a version names a listed operator and is positive. The table is
-/// required, empty or not: a vocabulary without it states no versions, and reading its operators
-/// at version 1 would fix packages of the wrong version for every operator past its first. The
-/// engine's build compiles the same file by the same rules (`crates/proto/build.rs`).
+/// The vocabulary is a TOML table of `operators`, an array of names, and, in format 2
+/// ([`VOCABULARY_FORMATS`]), `interface_versions`, a table of the version of each operator's
+/// interface past its first, by name, which states every other operator at version 1. A name is
+/// a lowercase ASCII letter followed by lowercase letters, digits and `_`, so it is one path
+/// segment of the module store, and each name is listed once; a version names a listed operator
+/// and is positive. A vocabulary without the table is of format 1 and states no version of any
+/// operator. The engine's build compiles the tree's own file, which is of the newest format, by
+/// the same rules (`crates/proto/build.rs`).
 ///
 /// # Errors
 ///
-/// Fails when the file cannot be read, is no such table, states no `interface_versions`, names an
-/// operator by no such name or twice, or states a version of 0 or of an operator it does not list.
+/// Fails when the file cannot be read, is no such table, is of a format this build does not
+/// read, names an operator by no such name or twice, or states a version of 0 or of an operator
+/// it does not list.
 pub fn read_operators(path: &Path) -> Result<Vec<Operator>, ManifestError> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -759,6 +785,20 @@ pub fn read_operators(path: &Path) -> Result<Vec<Operator>, ManifestError> {
         path: path.to_path_buf(),
         source,
     })?;
+
+    let format = if vocabulary.interface_versions.is_some() {
+        2
+    } else {
+        1
+    };
+    if !VOCABULARY_FORMATS.speaks(format) {
+        return Err(ManifestError::Invalid(format!(
+            "{}: the vocabulary is of format {format} and this build reads formats \
+             {VOCABULARY_FORMATS}: state the version of each operator's interface past its \
+             first in `interface_versions`",
+            path.display()
+        )));
+    }
 
     let mut listed = std::collections::BTreeSet::new();
     for name in &vocabulary.operators {
@@ -781,13 +821,17 @@ pub fn read_operators(path: &Path) -> Result<Vec<Operator>, ManifestError> {
         }
     }
 
-    let versions = vocabulary.interface_versions.ok_or_else(|| {
-        ManifestError::Invalid(format!(
-            "{}: the vocabulary states no `interface_versions`, the version of each operator's \
-             interface past its first that the engine launches",
-            path.display()
-        ))
-    })?;
+    // Format 1 states no versions: every operator is read without one.
+    let Some(versions) = vocabulary.interface_versions else {
+        return Ok(vocabulary
+            .operators
+            .into_iter()
+            .map(|name| Operator {
+                name,
+                interface_version: None,
+            })
+            .collect());
+    };
     for (name, version) in &versions {
         if !listed.contains(name.as_str()) {
             return Err(ManifestError::Invalid(format!(
@@ -806,7 +850,7 @@ pub fn read_operators(path: &Path) -> Result<Vec<Operator>, ManifestError> {
         .operators
         .into_iter()
         .map(|name| Operator {
-            interface_version: versions.get(&name).copied().unwrap_or(1),
+            interface_version: Some(versions.get(&name).copied().unwrap_or(1)),
             name,
         })
         .collect())

@@ -1402,7 +1402,10 @@ pub(crate) fn prepare_node(
 /// operator is asked at the version of its interface the vocabulary states, so only the package
 /// revisions that implement it are candidates: a revision of another version, installed for
 /// another engine revision, would be refused by this revision's engines when they load it, and
-/// is fixed for no epoch of this one. A package the deployment names, the engine, the policy or a
+/// is fixed for no epoch of this one. An engine revision whose vocabulary is of format 1
+/// (`build_server::manifest::VOCABULARY_FORMATS`) states no versions, and its operators are
+/// asked at none, so their candidates are each backend's latest revisions as that format's
+/// were. A package the deployment names, the engine, the policy or a
 /// pin of its `[kernels]` table, takes the revision it states, else its latest installed one (of
 /// the operator's version, for a pin); a pin of an operator the engine revision does not launch,
 /// or of a revision of another version, is refused. Every candidate of an operator is
@@ -1461,19 +1464,19 @@ pub fn with_store_modules(
                     slot.op, engine.backend, engine.revision
                 )
             })?;
-        fix_revision(
-            &mut client,
-            &slot.op,
-            Some(operator.interface_version),
-            package,
-        )
-        .with_context(|| {
-            format!(
-                "`kernels.{}` of engine {} revision {}, which launches version {} of the \
-                 operator's interface",
-                slot.op, engine.backend, engine.revision, operator.interface_version
-            )
-        })?;
+        fix_revision(&mut client, &slot.op, operator.interface_version, package).with_context(
+            || match operator.interface_version {
+                Some(version) => format!(
+                    "`kernels.{}` of engine {} revision {}, which launches version {version} of \
+                     the operator's interface",
+                    slot.op, engine.backend, engine.revision
+                ),
+                None => format!(
+                    "`kernels.{}` of engine {} revision {}",
+                    slot.op, engine.backend, engine.revision
+                ),
+            },
+        )?;
     }
     for operator in &operators {
         // The operator's pins, at their fixed revisions: a pinned backend is the operator's
@@ -1493,7 +1496,7 @@ pub fn with_store_modules(
         let selected = candidates(
             &mut client,
             &operator.name,
-            Some(operator.interface_version),
+            operator.interface_version,
             pins,
             Vec::new(),
         )?;

@@ -114,7 +114,10 @@ operators = [
 # which the engine refuses a module of another version, and the Build Server lists it with each
 # installed engine revision, so the daemon fixes an epoch's kernel packages among the revisions of
 # the versions its engine revision launches, never one a later engine revision's interface needs.
-# The table is stated even when it names no operator: a vocabulary without it is refused.
+# The table is stated even when it names no operator, and the build refuses a vocabulary without
+# it: such a vocabulary is of the previous format (`build_server::manifest::VOCABULARY_FORMATS`),
+# which the Build Server still reads from the engine revisions installed in it, selecting their
+# kernel packages whatever version they implement.
 [interface_versions]
 # The product reads an activation `fp8_quantize` encoded, and its factor from device memory, where
 # a measured scale is written by a launch before it.

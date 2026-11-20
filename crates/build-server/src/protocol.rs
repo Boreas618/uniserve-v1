@@ -666,24 +666,23 @@ impl Client {
                             )?,
                         });
                     }
-                    // A Build Server lists the interface version of every operator it lists.
-                    // One that lists none (a build whose vocabularies state no versions) leaves
-                    // the versions unknown, and none is assumed: reading 1 would select the
-                    // packages of the wrong version for every operator past its first.
+                    // A revision lists the interface version of every operator it names, or of
+                    // none: an engine revision whose vocabulary is of format 1, or any revision a
+                    // Build Server of a build before format 2 lists, states no versions
+                    // (`manifest::VOCABULARY_FORMATS`), and none is assumed for it.
+                    let versioned = !package.interface_versions.is_empty();
                     let mut operators = Vec::with_capacity(package.operators.len());
                     for name in package.operators {
-                        let interface_version = package
-                            .interface_versions
-                            .get(&name)
-                            .copied()
-                            .filter(|version| *version != 0)
-                            .ok_or_else(|| {
-                                Error::Protocol(format!(
-                                    "the listing of {} {} revision {} names operator {name} \
-                                     without the version of its interface",
+                        let interface_version = match package.interface_versions.get(&name) {
+                            Some(0) | None if versioned => {
+                                return Err(Error::Protocol(format!(
+                                    "the listing of {} {} revision {} states the interface \
+                                     versions of its operators but not a positive one of {name}",
                                     package.op, package.backend, package.revision
-                                ))
-                            })?;
+                                )));
+                            }
+                            version => version.copied(),
+                        };
                         operators.push(crate::manifest::Operator {
                             name,
                             interface_version,

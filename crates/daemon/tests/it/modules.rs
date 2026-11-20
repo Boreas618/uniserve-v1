@@ -3,7 +3,9 @@
 //! a newer installed package however old the daemon's own build is, and an operator the engine
 //! revision does not state is neither, whatever the daemon's build knows. Each operator's packages
 //! are fixed among the revisions of the interface version the engine revision launches, so a
-//! revision installed for another engine revision's version is fixed for that revision alone.
+//! revision installed for another engine revision's version is fixed for that revision alone,
+//! and an engine revision of the previous vocabulary format, which states no versions, keeps the
+//! selection that format had, across a restart of the Build Server into this build.
 
 use std::io::Write as _;
 use std::os::unix::net::UnixStream;
@@ -111,15 +113,17 @@ impl Tree {
     }
 
     /// States the engine's vocabulary as [`LATER`] alone, launched at version `interface` of its
-    /// interface: installing the engine package after a change of it installs a new revision.
-    fn launch_later_at(&self, interface: u32) {
+    /// interface, or, for `None`, in the previous vocabulary format, which states no versions:
+    /// installing the engine package after a change of it installs a new revision.
+    fn launch_later(&self, interface: Option<u32>) {
+        let versions = interface.map_or_else(String::new, |interface| {
+            format!("\n[interface_versions]\n{LATER} = {interface}\n")
+        });
         write(
             &self.root,
             &[(
                 "engine/operators.toml",
-                &format!(
-                    "operators = [\"{LATER}\"]\n\n[interface_versions]\n{LATER} = {interface}\n"
-                ),
+                &format!("operators = [\"{LATER}\"]\n{versions}"),
             )],
         );
     }
@@ -347,7 +351,7 @@ fn running(revision: u32) -> Config {
 fn an_engine_revision_s_kernels_are_fixed_at_its_interface_versions() {
     let directory = tempfile::tempdir().unwrap();
     let tree = Tree::write(&directory.path().join("tree"));
-    tree.launch_later_at(2);
+    tree.launch_later(Some(2));
     let packages = directory.path().join("later");
     let serving_kernel = kernel_package(&packages, LATER, 2, "first");
     let serving = Serving::start(
@@ -371,7 +375,7 @@ fn an_engine_revision_s_kernels_are_fixed_at_its_interface_versions() {
     assert_eq!(held(&fixed, &candidate), Some(("vendor".to_owned(), 1)));
 
     // The later tree's engine and its package of the operator, installed beside the serving ones.
-    tree.launch_later_at(3);
+    tree.launch_later(Some(3));
     let mut client = build_server::Client::connect(&serving.socket).unwrap();
     assert_eq!(client.install(&tree.engine).unwrap().revision, 2);
     let later_kernel = kernel_package(&packages, LATER, 3, "second");
@@ -414,4 +418,51 @@ fn an_engine_revision_s_kernels_are_fixed_at_its_interface_versions() {
         refused.contains("implements version 3") && refused.contains("launches version 2"),
         "{refused}"
     );
+}
+
+/// A Build Server moves to this build over a package root whose engine revision 1 was installed
+/// in the previous vocabulary format, which states no interface versions, beside engine revision
+/// 2, which launches [`LATER`] at version 2. Restarted over the same roots, as a daemon's hot
+/// restart into this build restarts it, the server serves both: engine revision 1's operator is
+/// fixed as that format fixed it, at the backend's latest revision whatever version it implements,
+/// and engine revision 2's at the latest revision of version 2.
+#[test]
+fn an_engine_revision_without_interface_versions_keeps_its_selection_across_a_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let tree = Tree::write(&directory.path().join("tree"));
+    tree.launch_later(None);
+    let packages = directory.path().join("later");
+    let older_kernel = kernel_package(&packages, LATER, 2, "first");
+    let roots = directory.path().join("server");
+    let serving = Serving::start(
+        &roots,
+        &[&tree.engine, &tree.policy, &tree.processing, &older_kernel],
+    );
+
+    tree.launch_later(Some(2));
+    let mut client = build_server::Client::connect(&serving.socket).unwrap();
+    assert_eq!(client.install(&tree.engine).unwrap().revision, 2);
+    let newer_kernel = kernel_package(&packages, LATER, 3, "second");
+    assert_eq!(client.install(&newer_kernel).unwrap().revision, 2);
+    drop(client);
+    drop(serving);
+
+    // The restarted server loads both engine revisions from the package root.
+    let serving = Serving::start(&roots, &[]);
+    let candidate = ModuleSlot {
+        op: LATER.to_owned(),
+        key: None,
+        part: Some("vendor".to_owned()),
+    };
+    let versionless =
+        with_store_modules(&serving.local(), &daemon::epoch::modules_of(&running(1))).unwrap();
+    assert_eq!(versionless.engine.revision, 1);
+    assert_eq!(
+        held(&versionless, &candidate),
+        Some(("vendor".to_owned(), 2))
+    );
+    let versioned =
+        with_store_modules(&serving.local(), &daemon::epoch::modules_of(&running(2))).unwrap();
+    assert_eq!(versioned.engine.revision, 2);
+    assert_eq!(held(&versioned, &candidate), Some(("vendor".to_owned(), 1)));
 }

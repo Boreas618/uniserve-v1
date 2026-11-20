@@ -148,7 +148,10 @@ fn emit_source_digest() -> io::Result<()> {
 /// case one Rust identifier, and each name is listed once; a version names a
 /// listed operator and is a positive integer. Anything else fails the build,
 /// naming the file. The Build Server reads the same file of an engine revision
-/// by the same rules (`build_server::manifest::read_operators`).
+/// by the same rules (`build_server::manifest::read_operators`), and also an
+/// installed revision's vocabulary of the previous format, without
+/// `interface_versions`, which this build never compiles
+/// (`build_server::manifest::VOCABULARY_FORMATS`).
 fn emit_operators(manifest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let path = manifest.join(OPERATORS);
     println!("cargo:rerun-if-changed={}", path.display());

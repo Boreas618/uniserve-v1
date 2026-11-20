@@ -970,7 +970,7 @@ fn the_tree_s_engine_packages_name_the_vocabulary_the_engine_is_compiled_with() 
         .iter()
         .map(|name| build_server::manifest::Operator {
             name: (*name).to_owned(),
-            interface_version: proto::module::operator::version(name),
+            interface_version: Some(proto::module::operator::version(name)),
         })
         .collect();
 
@@ -993,8 +993,9 @@ fn the_tree_s_engine_packages_name_the_vocabulary_the_engine_is_compiled_with() 
 
 /// A vocabulary names each operator once, by a name that is one store path segment, with the
 /// version of its interface: the operators come back in the order it lists them, each at the
-/// version `interface_versions` states, else 1. A vocabulary that states no versions is refused
-/// rather than read at version 1, as is a version of 0 or of an operator it does not list.
+/// version `interface_versions` states, else 1. A vocabulary without the table is of the
+/// previous format and states no version of any operator, rather than version 1; a version of 0
+/// or of an operator the vocabulary does not list is refused.
 #[test]
 fn a_vocabulary_names_each_operator_once_by_a_store_name_and_its_interface_version() {
     let directory = tempfile::tempdir().unwrap();
@@ -1003,7 +1004,7 @@ fn a_vocabulary_names_each_operator_once_by_a_store_name_and_its_interface_versi
         fs::write(&path, text).unwrap();
         build_server::manifest::read_operators(&path).map_err(|error| error.to_string())
     };
-    let operator = |name: &str, interface_version: u32| build_server::manifest::Operator {
+    let operator = |name: &str, interface_version: Option<u32>| build_server::manifest::Operator {
         name: name.to_owned(),
         interface_version,
     };
@@ -1015,10 +1016,14 @@ fn a_vocabulary_names_each_operator_once_by_a_store_name_and_its_interface_versi
         )
         .unwrap(),
         [
-            operator("rms_norm", 1),
-            operator("gemm", 3),
-            operator("activation1d", 1)
+            operator("rms_norm", Some(1)),
+            operator("gemm", Some(3)),
+            operator("activation1d", Some(1))
         ]
+    );
+    assert_eq!(
+        read("operators = [\"rms_norm\", \"gemm\"]\n").unwrap(),
+        [operator("rms_norm", None), operator("gemm", None)]
     );
     for (text, refused) in [
         (
@@ -1037,7 +1042,6 @@ fn a_vocabulary_names_each_operator_once_by_a_store_name_and_its_interface_versi
             "operators = []\nversion = 2\n[interface_versions]\n",
             "version",
         ),
-        ("operators = [\"gemm\"]\n", "no `interface_versions`"),
         (
             "operators = [\"gemm\"]\n[interface_versions]\nrms_norm = 2\n",
             "does not list",

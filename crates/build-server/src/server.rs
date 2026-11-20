@@ -509,10 +509,13 @@ impl BuildServer {
                             revision: entry.package.revision,
                             commit: entry.origin.commit,
                             clean: entry.origin.clean,
+                            // A vocabulary of format 1 states no versions, and lists none.
                             interface_versions: entry
                                 .operators
                                 .iter()
-                                .map(|operator| (operator.name.clone(), operator.interface_version))
+                                .filter_map(|operator| {
+                                    Some((operator.name.clone(), operator.interface_version?))
+                                })
                                 .collect(),
                             operators: entry
                                 .operators

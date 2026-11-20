@@ -305,7 +305,9 @@ message PackageEntry {
   repeated string operators = 7;
   // The version of each of `operators`' interfaces the revision launches, by
   // operator, at least 1: an entry for every operator listed, among whose
-  // packages the daemon fixes the revisions of that version alone.
+  // packages the daemon fixes the revisions of that version alone, or none for
+  // an engine revision whose vocabulary is of format 1, which states no
+  // versions (`manifest::VOCABULARY_FORMATS`).
   map<string, uint32> interface_versions = 8;
 }
 
