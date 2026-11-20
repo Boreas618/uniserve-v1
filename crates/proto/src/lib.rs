@@ -92,7 +92,10 @@ pub mod handoff {
 ///   synthetic acceptance length (`speculative_config.synthetic_acceptance_length`,
 ///   [`config::SYNTHETIC_ACCEPTANCE`]).
 /// - 16: an epoch update's target may ask for room in its GPUs' quotas ([`ROOM`]).
-pub const ENGINE_INTERFACE: service::Versions = service::Versions::new(14, ROOM);
+/// - 17: an engine's launch and a hot restart's handoff may state that an expert union runs its
+///   MXFP4 expert layers in the exchange's fused launch (`moe_config.fused_exchange`,
+///   [`config::FUSED_EXCHANGE`]).
+pub const ENGINE_INTERFACE: service::Versions = service::Versions::new(14, config::FUSED_EXCHANGE);
 
 /// The version of the engine interface that added a target's ask for room in its GPUs' quotas
 /// (`process::RoomWanted`, answered by `process::Command`'s `Room`): an epoch update's target asks

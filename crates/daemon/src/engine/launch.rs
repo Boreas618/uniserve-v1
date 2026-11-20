@@ -211,6 +211,39 @@ mod tests {
         );
     }
 
+    /// The fused expert exchange, which version [`proto::config::FUSED_EXCHANGE`] of the engine
+    /// interface added, is written only when it is set, and a launch that sets it names it for an
+    /// engine of an earlier agreed version, whose spawn the node's daemon refuses (as a hot
+    /// restart its handover to such a successor).
+    #[test]
+    fn a_launch_states_the_fused_exchange_only_to_a_peer_that_has_it() {
+        let earlier = proto::config::FUSED_EXCHANGE - 1;
+        let mut launch = launch();
+        let written = serde_json::to_value(&launch).unwrap();
+        assert!(
+            written["engine_config"]["moe"]
+                .get("fused_exchange")
+                .is_none()
+        );
+
+        launch.engine_config.moe.fused_exchange = true;
+        assert_eq!(
+            launch.engine_config.unspoken(earlier),
+            ["moe_config.fused_exchange"]
+        );
+        assert!(
+            launch
+                .engine_config
+                .unspoken(proto::config::FUSED_EXCHANGE)
+                .is_empty()
+        );
+        let written = serde_json::to_value(&launch).unwrap();
+        assert_eq!(
+            written["engine_config"]["moe"]["fused_exchange"],
+            json!(true)
+        );
+    }
+
     /// The synthetic acceptance length, which a later version of the engine interface added,
     /// is stated only to a peer of that version: a launch that sets it names it for an engine of
     /// an earlier agreed version, whose spawn the node's daemon refuses (as a hot restart its

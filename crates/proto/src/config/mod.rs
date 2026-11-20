@@ -778,6 +778,13 @@ fn unspoken_synthetic_acceptance(length: Option<f64>, version: u32) -> Vec<&'sta
     }
 }
 
+/// The version of the engine interface that added the fused expert exchange
+/// (`moe_config.fused_exchange`) to an engine's launch and a hot restart's handoff. A peer of an
+/// earlier agreed version refuses a launch or a handoff that states it, its configuration
+/// sections refusing a field they do not know; the option is no step value, so no `Tune` carries
+/// it.
+pub const FUSED_EXCHANGE: u32 = 17;
+
 /// The kind of device the command line's shorthand places every rank on (`device_config.device`).
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -980,8 +987,11 @@ pub struct MoeConfig {
     /// Whether an expert union runs each MXFP4 expert layer in its exchange's one fused launch
     /// (the routes' exchange, both expert products, the shared expert and the combine), rather
     /// than between the exchange's dispatch and combine. The experts load in the arrangement of
-    /// the composition and the transport is laid out for it, so a change is an epoch.
+    /// the composition and the transport is laid out for it, so a change is an epoch. Version
+    /// [`FUSED_EXCHANGE`] of the engine interface added it, so a record states it only when it
+    /// is set, and only to a peer of that version or a later one ([`EngineConfig::unspoken`]).
     #[reload(epoch)]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fused_exchange: bool,
     /// The experts' order: for each routed expert layer, by its module path, the logical expert
     /// ids in the order of the physical slots that hold them, across the layer's expert ranks; a
@@ -2149,7 +2159,12 @@ impl EngineConfig {
     /// lacks, by their paths: a peer of that agreed version refuses a launch or a hot restart's
     /// handoff that states them, so they are sent only to a peer of a version that has them.
     pub fn unspoken(&self, version: u32) -> Vec<&'static str> {
-        unspoken_synthetic_acceptance(self.speculative.synthetic_acceptance_length, version)
+        let mut unspoken =
+            unspoken_synthetic_acceptance(self.speculative.synthetic_acceptance_length, version);
+        if self.moe.fused_exchange && version < FUSED_EXCHANGE {
+            unspoken.push("moe_config.fused_exchange");
+        }
+        unspoken
     }
 
     /// Whether `moe_config.expert_parallel` shards the routed experts over an expert union,
