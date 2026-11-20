@@ -102,6 +102,9 @@ def test_an_expert_union_over_two_hosts_serves_every_scheduler(
                 {"id": f"model-{index}", **group, "blocks": {"model": {}}}
                 for index, group in enumerate(groups)
             ],
+            # A small share of each GPU: a rank's quarter of the experts and the
+            # dense weights take about 16 GB, beside a cache of 64K tokens.
+            "mem_fraction_static": 0.18,
             "kv_cache_config": {"max_tokens": 65536},
             "chat_config": {"reasoning_parser": "none"},
             "cuda_graph_config": {
