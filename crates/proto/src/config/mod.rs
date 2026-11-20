@@ -429,11 +429,13 @@ pub use scheduling::routing::Role;
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyBudget {
     /// The fuel one call into the module may consume, and each export the host enters for that
-    /// call (the message buffer's allocation and release), before the message's own share.
+    /// call (the allocation of its message buffer, and the release of that buffer and of its
+    /// reply), before the message's own share.
     pub call_fuel: NonZeroU64,
-    /// The fuel a call is given beyond `call_fuel` for every byte of its message, so that
-    /// decoding a message that grows with the cache (an instantiation's snapshot of every cached
-    /// block, the events of a scheduler that starts beside a warm cache) is not cut short.
+    /// The fuel a call, and the allocation of the buffer its message is written into, are given
+    /// beyond `call_fuel` for every byte of the message, so that receiving and decoding a message
+    /// that grows with the cache (an instantiation's snapshot of every cached block, the events of
+    /// a scheduler that starts beside a warm cache) is not cut short.
     pub message_fuel_per_byte: u64,
     /// The longest starvation timeout a policy may declare (its limits' `timeout`).
     #[serde(with = "values::duration")]

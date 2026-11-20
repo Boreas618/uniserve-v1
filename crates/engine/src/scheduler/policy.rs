@@ -7,7 +7,8 @@
 //! allocated, packed as `ptr << 32 | len` (`0` for none), or for `place` the chosen index
 //! itself (`scheduling::wire`). Every export the host enters, the two buffer exports
 //! included, starts with a fuel budget of its own, so a policy that loops ends its call instead
-//! of the step; a call's budget grows with the message it decodes.
+//! of the step; a call's budget, and the budget of the allocation that holds its message, grow
+//! with the message.
 //!
 //! The policy holds the view, and the scheduler tells it what changed as events (§5.2); the host
 //! keeps the view of each request the policy holds as those events leave it, so that a request
@@ -540,7 +541,11 @@ impl Instance {
         let len = u32::try_from(message.len())
             .map_err(|_| malformed(call, "the message is larger than wasm32 addresses"))?;
         let call_fuel = self.budget.call_fuel.get();
-        let ptr = enter(&mut self.store, call, &self.alloc, len, call_fuel, fuel)?;
+        // The buffer that holds the message costs as the message's bytes do (a module's allocator
+        // zeroes it at about a fuel a byte), so its allocation is given the message's share as
+        // the decoding is; a call fuel alone would refuse every message longer than it in bytes.
+        let budget = message_fuel(&self.budget, len);
+        let ptr = enter(&mut self.store, call, &self.alloc, len, budget, fuel)?;
         if ptr == 0 && len != 0 {
             return Err(malformed(call, "the module could not hold the message"));
         }
@@ -549,7 +554,6 @@ impl Instance {
             .map_err(|error| malformed(call, format!("cannot write the message: {error}")))?;
 
         let buffer = (ptr, len);
-        let budget = message_fuel(&self.budget, len);
         let store = &mut self.store;
         let result = match call {
             Call::Init => enter(store, call, &self.init, buffer, budget, fuel)?,
@@ -1719,27 +1723,33 @@ pub(crate) mod tests {
         assert_eq!(decoded(&output), (2..=RUNNING).collect::<Vec<_>>());
     }
 
-    /// A policy instantiates on the snapshot of a warm cache: 128 running requests and the 4096
-    /// blocks of 64 tokens a cache of 262144 tokens holds, none of them held. Its `init` decodes
-    /// far more than the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]) allows a step's call, and is given fuel for every byte
-    /// of the snapshot. A step costs `dispatch` what the step changed, not what the cache holds:
-    /// the blocks the snapshot states were the instance before's to offload, and a block given
-    /// up since is offloaded once.
+    /// A policy instantiates on the snapshot of a warm cache: 128 running requests and the
+    /// 120,000 blocks of 64 tokens a cache of 7,680,000 tokens holds, none of them held, a
+    /// snapshot of more bytes than the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]). Its
+    /// `init` decodes far more than that fuel allows a step's call, and both the buffer that holds
+    /// the snapshot and its decoding are given fuel for every byte of it. A step costs `dispatch`
+    /// what the step changed, not what the cache holds: the blocks the snapshot states were the
+    /// instance before's to offload, and a block given up since is offloaded once.
     #[test]
     fn a_policy_instantiates_on_the_snapshot_of_a_warm_cache() {
+        const BLOCKS: u64 = 120_000;
         const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
         let (parameters, ceilings) = limited(30);
         let snapshot = Snapshot {
             requests: (1..=128)
                 .map(|id| decoding(id, GuestStatus::Running, 500, 16))
                 .collect(),
-            pages: (0..4096)
+            pages: (0..BLOCKS)
                 .map(|number| block(spread(number), number, true))
                 .collect(),
             phases: text_phases(),
             ..Snapshot::default()
         };
 
+        assert!(
+            wire::encode(&snapshot).unwrap().len() as u64 > DEFAULT_POLICY_CALL_FUEL.get(),
+            "the snapshot is longer in bytes than a call's fuel"
+        );
         let mut policy = Policy::new(
             packaged("arrival"),
             parameters,
@@ -1758,9 +1768,9 @@ pub(crate) mod tests {
             page_tokens: 64,
             ..Room::default()
         };
-        for released in [Vec::new(), vec![spread(5000)], Vec::new()] {
+        for released in [Vec::new(), vec![spread(BLOCKS)], Vec::new()] {
             // A block cached since the snapshot, which a request held and gave up.
-            for (number, &page) in (5000..).zip(&released) {
+            for (number, &page) in (BLOCKS..).zip(&released) {
                 policy.events.push(Event::Cached {
                     page: block(page, number, false),
                 });
