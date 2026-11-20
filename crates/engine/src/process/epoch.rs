@@ -225,7 +225,9 @@ pub(crate) fn grow(
 /// request can run on few KV units but on no checkpoint. A start creates its regions' segments before its warm-up, as
 /// far as its quotas held them then, and gives back once warm what no longer fits beside the warm
 /// processes ([`keep_warm_segments`]), so what it creates here is what a predecessor's drain
-/// freed meanwhile (`specs/engine-worker-port.md` §1, "The process a division counts").
+/// freed meanwhile (`specs/engine-worker-port.md` §1, "The process a division counts"); a
+/// relaunch, which created none past the memory its lost predecessor left, creates here what its
+/// quota holds past it once its warm process has taken that predecessor's reservation over.
 ///
 /// `capacity` is the tokens a deployment states its cache holds (`kv_cache_config.max_tokens`)
 /// when a start creates its regions: such a region is created whole, and refused, naming the
