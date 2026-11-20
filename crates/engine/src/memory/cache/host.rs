@@ -245,6 +245,26 @@ impl HostTier {
         Ok(Self { parts, stream })
     }
 
+    /// The host tier of `layout` over parts of `pages` pages in this process's own memory,
+    /// registered with `device` ([`HostPart::local`]), whose copies run on `stream`: what a test
+    /// of the host tier's copies copies through.
+    #[cfg(test)]
+    pub(crate) fn local(
+        layout: &CacheLayout,
+        device: DeviceId,
+        pages: u32,
+        stream: Stream,
+    ) -> Result<Self> {
+        let mut parts = BTreeMap::new();
+        for (index, group) in layout.groups.iter().enumerate() {
+            let shape = page_shape(layout, index)?;
+            let part = HostPart::local(device, pages, shape.page_bytes)?;
+            parts.insert(index as u32, (part, layout.page_planes(group) as u32));
+        }
+
+        Ok(Self { parts, stream })
+    }
+
     /// Issues the copies a batch runs between the host tier and the units on the copy stream:
     /// `loads` from their host pages into their units, and `stores` from their units into their
     /// host pages; a page of the state
@@ -425,9 +445,12 @@ impl HostTier {
             "loading pages from the host KV tier"
         );
 
+        // One copy per plane: a load of a long prompt's pages is thousands of scattered
+        // host-to-device copies, on which one `cuMemcpyBatchAsync_v2` faults inside the driver
+        // and corrupts the device's command stream (`CopyBatch::submit_each`).
         // SAFETY: the buffer pool holds the host pages and gives the units to this copy alone
         // until it is reported done, which is after the batch that runs it has ended.
-        unsafe { batch.submit(stream) }?;
+        unsafe { batch.submit_each(stream) }?;
 
         // The flags are the pool's: a state unit has none.
         if layout.quantized {
@@ -469,9 +492,11 @@ impl HostTier {
             "storing pages to the host KV tier"
         );
 
+        // One copy per plane, as a load's: a store of a long prompt's pages is as many scattered
+        // copies, and the batched form's fault on loads leaves no batch of this shape safe.
         // SAFETY: the buffer pool gives the host pages to this copy alone until it is reported
         // done, and the units hold a shared block, which no batch writes.
-        unsafe { batch.submit(stream) }?;
+        unsafe { batch.submit_each(stream) }?;
         Ok(())
     }
 }
@@ -539,5 +564,90 @@ mod tests {
 
         let wider = CacheLayout::dense(128, 4, 2, 128, PrefixCacheDtype::BFloat16);
         assert_ne!(bf16, page_identities(&wider, "weights-a"));
+    }
+
+    /// A long prompt's pages go to the host tier and come back whole: thousands of pages of
+    /// eight planes each, scattered over the units and the host pages as a 433,272-token
+    /// prompt's 5,934 pages were when they were loaded back (two runs of units, the host pages
+    /// taken from the top down). Every plane of every page lands where the page encoding puts
+    /// it, load after load, and a store of the loaded units gives the pages back byte for byte.
+    /// A load of this shape issued as one `cuMemcpyBatchAsync_v2` faults inside the driver
+    /// (libcuda 580.82.07) and leaves the device's command stream corrupt.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn a_long_prompt_s_pages_go_to_the_host_tier_and_come_back_whole() -> Result<()> {
+        use std::sync::Arc;
+
+        use crate::memory::cache::segments;
+        use crate::memory::exclusive::LocalStorage;
+
+        const LOADS: usize = 10;
+        let device = DeviceId(0);
+        let stream = Stream::new(device)?;
+
+        // 64-token pages of four layers of one 72-wide BF16 head: eight planes of 9,216 bytes a
+        // page, in segments of whole granules as a device cache's planes are.
+        let layout =
+            Arc::new(CacheLayout::dense(64, 4, 1, 72, PrefixCacheDtype::BFloat16).validated()?);
+        let granularity = platform::DeviceAllocation::granularity(device)? as u64;
+        let units = segments::segmented_units_above(16_384, layout.plane_bytes, granularity);
+        let parts = segments::own(1, units, layout.plane_bytes, granularity)
+            .expect("a cache of whole segments");
+        let planes = Planes::open(
+            Arc::clone(&layout),
+            units,
+            Some(&parts),
+            (device, &[]),
+            &LocalStorage,
+            &stream,
+        )?;
+
+        // The captured load's units, and host pages from the top of the first half down; the
+        // stores go to the second half.
+        let loaded: Vec<u32> = (6_928..7_952).chain(7_956..12_866).collect();
+        let count = loaded.len() as u64;
+        let tier = HostTier::local(&layout, device, 2 * count as u32, Stream::new(device)?)?;
+        let pages = |first: u64| -> Vec<HostPage> {
+            loaded
+                .iter()
+                .enumerate()
+                .map(|(index, &unit)| (0, first + count - 1 - index as u64, unit..unit + 1))
+                .collect()
+        };
+        let (loads, stores) = (pages(0), pages(count));
+
+        // Every byte of a source page states its page and offset.
+        let page_bytes = page_shape(&layout, 0)?.page_bytes as usize;
+        let part = &tier.parts[&0].0;
+        let page = |index: u64| -> Result<&mut [u8]> {
+            let address = part.address(index)?;
+            // SAFETY: one page of the part, a mapping the tier holds for as long as the test;
+            // no copy reads or writes it while the slice lives.
+            Ok(unsafe { std::slice::from_raw_parts_mut(address as *mut u8, page_bytes) })
+        };
+        for index in 0..count {
+            for (offset, byte) in page(index)?.iter_mut().enumerate() {
+                *byte = (index as usize * 131 + offset * 7 + offset / 251) as u8;
+            }
+        }
+
+        for _ in 0..LOADS {
+            if let Some(copied) = tier.copy(&layout, (&planes, None), &loads, &[])? {
+                copied.synchronize()?;
+            }
+        }
+        if let Some(copied) = tier.copy(&layout, (&planes, None), &[], &stores)? {
+            copied.synchronize()?;
+        }
+
+        // The page loaded into a unit is the page stored from it.
+        for ((_, from, _), (_, to, _)) in loads.iter().zip(&stores) {
+            let source = page(*from)?.to_vec();
+            assert!(
+                page(*to)? == source.as_slice(),
+                "host page {from} came back as page {to} otherwise"
+            );
+        }
+        Ok(())
     }
 }
