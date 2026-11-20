@@ -403,7 +403,10 @@ impl Daemon {
 
     /// Goes on with the service a predecessor handed over in a hot restart
     /// ([`Daemon::hand_over`]), on host `host`; `address` is the leader's process socket, `None`
-    /// on a member.
+    /// on a member. The service starts the node's processes at the deployment's Build Server
+    /// with `build_server`, the settings of the daemon that resumes it, from then on: a hot
+    /// restart may change them, and the settings the predecessor served with are no longer the
+    /// deployment's.
     ///
     /// # Errors
     ///
@@ -411,9 +414,11 @@ impl Daemon {
     pub(crate) fn resume(
         host: String,
         address: Option<String>,
-        service: ServiceHandoff,
+        build_server: build_server::command::Settings,
+        mut service: ServiceHandoff,
         descriptors: Vec<OwnedFd>,
     ) -> anyhow::Result<Self> {
+        service.serve_build_server(build_server);
         let waker = Waker::new().context("creating the daemon's waker")?;
         let wake = waker.wake();
         let requested = Arc::new(AtomicBool::new(false));
@@ -831,8 +836,14 @@ mod tests {
         // The daemon that handed over ends nothing and leaves its socket.
         drop(daemon);
         assert_eq!(socket.exists(), !network);
-        let mut successor =
-            Daemon::resume("localhost".to_owned(), Some(address), handoff, descriptors).unwrap();
+        let mut successor = Daemon::resume(
+            "localhost".to_owned(),
+            Some(address),
+            build_server::command::Settings::default(),
+            handoff,
+            descriptors,
+        )
+        .unwrap();
 
         let nodes = ask(&mut client, 2, request::Kind::Nodes(NodesQuery {}));
         assert!(
@@ -863,6 +874,105 @@ mod tests {
             }),
         );
         assert!(refused.error.contains("no reservation"), "{refused:?}");
+        successor.stop().unwrap();
+    }
+
+    /// The service a hot restart's successor resumes starts the node's processes at the
+    /// deployment's Build Server with the successor's settings, not with the settings its
+    /// predecessor served with: once the deployment's Build Server serves with the successor's
+    /// settings, the service prepares an epoch's modules there and leaves that server serving
+    /// as it is, rather than replacing it with one of the predecessor's settings.
+    #[test]
+    fn a_resumed_service_keeps_the_build_server_of_its_daemons_settings() {
+        use crate::test_support::build_server::BuildServerStandIn;
+
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ::service::RuntimeDirectory::within(directory.path()).unwrap();
+        let socket = directory.path().join("process.sock");
+        let settings = |max_jobs| build_server::command::Settings {
+            max_jobs: Some(max_jobs),
+            ..build_server::command::Settings::default()
+        };
+        let mut server = BuildServerStandIn::serve(&runtime, "model", settings(5));
+        let mut daemon = Daemon::start(
+            DaemonOptions {
+                deployment: "model".to_owned(),
+                runtime,
+                gpus: directory.path().join(gpus::NODE),
+                nnodes: 1,
+                node_rank: 0,
+                host: "localhost".to_owned(),
+                dist_init_addr: None,
+                socket,
+                join_timeout: JOIN_TIMEOUT,
+                build_server: settings(3),
+                storage: storage::Settings::default(),
+            },
+            None,
+        )
+        .unwrap();
+        let address = daemon.address().unwrap().to_owned();
+        let mut client = Connection::connect(&address.parse().unwrap()).unwrap();
+        client
+            .deliver(&Hello {
+                oldest: proto::ENGINE_INTERFACE.oldest(),
+                newest: proto::ENGINE_INTERFACE.newest(),
+                build: proto::BUILD.to_owned(),
+                peer: Some(hello::Peer::Engine(Engine {
+                    deployment: "model".to_owned(),
+                    engine: 0,
+                    interface: 0,
+                })),
+            })
+            .unwrap();
+        let welcome: Welcome = client.recv_next().unwrap();
+        assert_eq!(welcome.refusal, None);
+
+        let (handoff, descriptors) = daemon.hand_over().unwrap();
+        drop(daemon);
+        let mut successor = Daemon::resume(
+            "localhost".to_owned(),
+            Some(address),
+            settings(5),
+            handoff,
+            descriptors,
+        )
+        .unwrap();
+
+        let package = |backend: &str, revision| proto::module::PackageRevision {
+            backend: backend.to_owned(),
+            revision,
+            arguments: toml::Table::new(),
+        };
+        let modules = proto::module::ModuleSet {
+            engine: package("uniserve", 3),
+            policy: package("fcfs", 2),
+            kernels: [(
+                proto::module::ModuleSlot::all("rms_norm"),
+                package("triton", 4),
+            )]
+            .into_iter()
+            .collect(),
+            programs: Default::default(),
+            processing: None,
+        };
+        let prepared = ask(
+            &mut client,
+            1,
+            request::Kind::PrepareModules(proto::process::PrepareModules {
+                host: "localhost".to_owned(),
+                modules: Some((&modules).into()),
+            }),
+        );
+        assert!(prepared.error.is_empty(), "{}", prepared.error);
+        assert!(
+            matches!(prepared.kind, Some(reply::Kind::ModulesPrepared(_))),
+            "{prepared:?}"
+        );
+        assert!(
+            server.serves_as_started(),
+            "the resumed service replaced the Build Server of its daemon's settings"
+        );
         successor.stop().unwrap();
     }
 }

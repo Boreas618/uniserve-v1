@@ -17,9 +17,11 @@
 //!    written in, the newest both speak. The options carry the records of every replica the
 //!    takeover hands over (the arguments its engine serves with and its configuration), which
 //!    the successor reads and resolves here, so a record of another build it cannot read ends
-//!    the restart before anything crossed. The successor loads the model's files and binds a
-//!    request socket of its own, which it responds with, with the agreed version (`Prepared`).
-//!    Whatever it gives up on, the options it cannot read included, it states (`Failed`).
+//!    the restart before anything crossed. The successor loads the model's files, with the
+//!    serving epoch's processing program from the Build Server that serves the deployment, and
+//!    binds a request socket of its own, which it responds with, with the agreed version
+//!    (`Prepared`). Whatever it gives up on, the options it cannot read included, it states
+//!    (`Failed`).
 //! 2. The daemon stops its service thread between two rounds and sends what
 //!    the thread served, its HTTP listener and the connection its engine's
 //!    process lives under, with the arguments the engine serves with and the video jobs
@@ -50,6 +52,14 @@
 //! serves, a failure leaves the daemon serving as before, except after the service thread
 //! stopped, which then fails the restart and the daemon with it: every check a successor of
 //! another build may fail runs before it.
+//!
+//! The deployment's Build Server is part of what the daemon serves: until the handover, it is
+//! the server the predecessor serves with, which the successor only reads from and never
+//! starts, stops or replaces, so a restart the successor gives up leaves it as it was, the same
+//! process with the same settings and no revision of another source tree installed. The
+//! successor's own settings (`build_config`) take effect with the handover: its service starts
+//! the node's processes at a server of those settings, and once it serves, its node has the
+//! server serve with them before it converges the rest of the change (`Node::resume`).
 
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -850,19 +860,23 @@ async fn prepared_successor(
     } else {
         None
     };
+    // The deployment's Build Server is the predecessor's until the handover: the successor
+    // reaches it at its socket as it serves, whatever settings it serves with, and starts,
+    // stops or replaces none, so giving up from here on leaves it as it was. This daemon's
+    // settings take effect once the handover committed.
     let control = EngineControl::new(
         &config.request_socket(&prepare.instance),
         prepare.processes.clone(),
         config.leader_host(),
         prepare.deployment.clone(),
-        crate::engine::control::ensure_build_server(
-            &service::RuntimeDirectory::of_user()?,
-            &prepare.deployment,
-            &config.build_config,
-        )?,
+        build_server::socket(&service::RuntimeDirectory::of_user()?, &prepare.deployment)
+            .with_context(|| {
+                format!("finding the Build Server socket of {}", prepare.deployment)
+            })?,
     )?;
     // The successor processes requests through the serving epoch's processing program, which
-    // the deployment's Build Server holds at the revision the predecessor names.
+    // the deployment's Build Server holds at the revision the predecessor names; a deployment
+    // whose Build Server does not serve has none to read it from, and the restart ends here.
     let socket = control.build_server().to_owned();
     let revision = prepare.processing.clone();
     let program =
@@ -952,9 +966,12 @@ async fn prepared_successor(
             Some((replica.engine, pid))
         })
         .collect();
+    // The node's service is this daemon's from here, and starts the node's processes at a Build
+    // Server of this daemon's settings, not of the predecessor's it handed over.
     let daemon = Daemon::resume(
         config.leader_host(),
         Some(prepare.processes.clone()),
+        config.build_config.clone(),
         service,
         service_fds,
     )
@@ -1054,9 +1071,15 @@ async fn prepared_successor(
     *service::lock(&first.config) = options;
     first.adopt_pause(handoff.paused, handoff.asleep, handoff.sleep_paused);
     leader.updates.adopt_unavailable(handoff.unavailable);
-    // The successor adopts the engines and then keeps a standby of its own,
-    // or the deployment would serve without one until the next restart.
-    first.start_standby();
+    // The successor adopts the engines and then keeps a standby of its own, or the deployment
+    // would serve without one until the next restart. Its engine resolves at the deployment's
+    // Build Server, which serves with this daemon's settings only once the node had it serve
+    // with them, after the handover: the node starts the standby then, before it converges the
+    // change that restarted the daemon (`Node::resume`). Without such a change the options are
+    // the predecessor's own, whose Build Server serves already.
+    if then.is_none() {
+        first.start_standby();
+    }
     for (index, (handoff, options, served, observer, client)) in adopted.enumerate() {
         let interface = client.interface();
         let replica = crate::leader::Replica::new(
@@ -1857,5 +1880,59 @@ mod tests {
             );
             assert!(taken.is_err());
         }
+    }
+
+    /// A successor that gives up before the handover leaves the deployment's Build Server as
+    /// it was, although its options state other Build Server settings (another source tree and
+    /// other build limits, as a change of `build_config` does): the same process serves on the
+    /// same socket with the predecessor's settings. Here the successor gives up after it
+    /// reached that server, on the serving epoch's processing program, which the server does
+    /// not hold.
+    #[tokio::test]
+    async fn a_successor_that_gives_up_leaves_the_build_server_as_it_was() {
+        use crate::test_support::build_server::BuildServerStandIn;
+        use crate::test_support::oldest;
+
+        // A deployment of this process's own in the user's runtime directory, where a successor
+        // finds the deployment's servers; no Storage Server serves it.
+        let deployment = format!("restart-build-server-{}", std::process::id());
+        let runtime = service::RuntimeDirectory::of_user().unwrap();
+        let serving = build_server::command::Settings {
+            max_jobs: Some(3),
+            ..build_server::command::Settings::default()
+        };
+        let mut server = BuildServerStandIn::serve(&runtime, &deployment, serving);
+
+        let Message::Prepare(mut options) =
+            <Message as service::Message>::decode(oldest::PREPARE).unwrap()
+        else {
+            panic!("the fixture holds options");
+        };
+        let instance = tempfile::tempdir().unwrap();
+        options.deployment.clone_from(&deployment);
+        options.instance = instance.path().to_owned();
+        options.rebind = false;
+        let (mut config, _) = crate::config::parse(&options.config).unwrap();
+        config.build_config = build_server::command::Settings {
+            source: Some("/another/source/tree".into()),
+            max_jobs: Some(24),
+            ..build_server::command::Settings::default()
+        };
+        options.config = crate::config::printed(&config).unwrap();
+
+        let (answer, taken) =
+            answer(service::Message::encode(&Message::Prepare(options)).unwrap()).await;
+        let Message::Failed { reason } = answer else {
+            panic!("the successor answered {answer:?}");
+        };
+        assert!(reason.contains("processing program"), "{reason}");
+        assert!(taken.is_err());
+        assert!(
+            server.serves_as_started(),
+            "the successor that gave up changed the deployment's Build Server"
+        );
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(runtime.deployment(&deployment).unwrap().path());
     }
 }

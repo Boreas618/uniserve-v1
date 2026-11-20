@@ -36,6 +36,13 @@ pub(crate) const ENGINE_GROUP: &str = "engine";
 /// builds' compiler processes, which end at once.
 const BUILD_SERVER_STOP: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Held by this process while it makes sure its deployment's Build Server serves
+/// ([`ensure_build_server`]): the check reads the server's record and may stop the server and
+/// start another, and two of them interleaved could stop the server the other one just started.
+/// The service thread's spawns, the node's programs and module preparations and a hot restart's
+/// successor all make sure of it, each with the settings of the daemon that serves the node.
+static ENSURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Makes sure the Build Server of `deployment` serves on this node with `settings`, and returns
 /// its socket in the node's runtime directory `runtime` ([`build_server::socket`]): when none
 /// serves, the deployment's daemon starts it with
@@ -43,7 +50,13 @@ const BUILD_SERVER_STOP: std::time::Duration = std::time::Duration::from_secs(30
 /// `service::host::start`), and it outlives this daemon. A server of the deployment that serves
 /// with other settings, which an earlier daemon of the deployment started, is the deployment's
 /// own: it is stopped and started again with `settings`. The start ends with the server's
-/// readiness record, or with the server's end before it served.
+/// readiness record, or with the server's end before it served; the calls of one process run
+/// one after another.
+///
+/// `settings` are those of the daemon that serves the node: its options' `build_config`. A
+/// package's `build_config` becomes them only once a daemon serves with it, at its start or
+/// once a hot restart's handover committed, so a change that has not converged replaces no
+/// server.
 ///
 /// # Errors
 ///
@@ -53,6 +66,7 @@ pub fn ensure_build_server(
     deployment: &str,
     settings: &build_server::command::Settings,
 ) -> anyhow::Result<PathBuf> {
+    let _ensuring = service::lock(&ENSURING);
     let socket = build_server::socket(runtime, deployment)
         .with_context(|| format!("finding the Build Server socket of {deployment}"))?;
     let mut arguments = vec!["--deployment".to_owned(), deployment.to_owned()];
