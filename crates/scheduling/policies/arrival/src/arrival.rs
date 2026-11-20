@@ -1,6 +1,6 @@
 //! The policy: what it decides, from its arguments and what the mechanism tells it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, VecDeque};
 
 use scheduling::{
     CallView, DispatchOutput, EncodingId, Event, Limits, PageId, PageView, Parameters, Phase,
@@ -19,6 +19,36 @@ fn offloadable(view: &PageView) -> bool {
     !view.on_host && view.evictable
 }
 
+/// The most offers one step's `dispatch` examines, and so the most pages it offloads.
+///
+/// Each page a step names costs its `dispatch` about 1,200 fuel (the offer's lookup and the
+/// page's id in the reply), so a step that named every page a request gave up would cost a call
+/// in proportion to the request's context: the 16,384 pages of 64 tokens a 1M-token context
+/// holds would cost about 20 M, twice the engine's default call fuel of 10 M, and a fault drops
+/// the step. 1,024 offers cost a step about 1.2 M, an eighth of that fuel, which leaves the
+/// step's assembly the rest, and offer such a context's pages over 16 steps.
+const OFFERS_PER_STEP: usize = 1024;
+
+/// What the policy keeps of a cached page.
+#[derive(Clone, Debug)]
+struct Page {
+    /// The page as the mechanism last stated it: whether it sits in host memory and whether no
+    /// running request continues from it.
+    view: PageView,
+    /// Whether the page waits in the policy's offers to be offered to the host.
+    queued: bool,
+}
+
+impl Page {
+    /// A page as the mechanism states it, waiting for no offer.
+    fn stated(view: &PageView) -> Self {
+        Self {
+            view: view.clone(),
+            queued: false,
+        }
+    }
+}
+
 /// What a draft-cache refill costs and saves, as the deployment states it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Refill {
@@ -35,7 +65,7 @@ struct Refill {
 /// | `admit` | the waiting queue in its order; the mechanism admits until the first request it cannot place |
 /// | `work` | requests in `(path, phase class, admission order)`, at most one call each, charged against the step's tokens and calls; a prefill chunk is `prefill_chunk` of the prompt left; a context-class call runs only in a prefill step, and a step is a prefill step while fewer than `prefill_window` batches with prefill work are in flight |
 /// | `reject` | a waiting request whose worst-case reservation is more than the device cache's whole capacity |
-/// | `offload` | each device page no running request continues from, once: in the step after it became one, in the order it did (least recently used first) |
+/// | `offload` | each device page no running request continues from, once each time it becomes one: in the order the pages did (least recently used first), at most `OFFERS_PER_STEP` a step, so the pages a long context gives up leave over the steps after it |
 /// | `prefetch` | the requests whose host hit deepens by at least `Limits::prefetch_min_tokens` |
 /// | `refill` | the requests whose draft cache has a gap, when the refill is worth its cost (`Arrival::refill_due`) |
 /// | `preempt` | the least recently used page of the short storage, then the lowest-priority last-admitted request |
@@ -59,14 +89,18 @@ pub struct Arrival {
     /// The running requests, in the order the mechanism admitted them.
     admission: Vec<RequestId>,
     /// The pages of the device and host caches, least recently used first,
-    /// each with its view as the mechanism last stated it: whether it sits in
-    /// host memory and whether no running request continues from it.
-    pages: Lru<PageId, PageView>,
-    /// The pages that became device pages no request holds since the last
-    /// `dispatch`, in the order they did: what the next step offloads, each
-    /// once. A page the snapshot states is not one, since the instance before
-    /// this one had its own step to name it.
-    offers: Vec<PageId>,
+    /// each with its view as the mechanism last stated it and whether it waits
+    /// in `offers`.
+    pages: Lru<PageId, Page>,
+    /// The pages that became device pages no request holds and wait to be
+    /// offered to the host, in the order they did, each once (a page that
+    /// becomes one again before its turn keeps its first place, `Page::queued`):
+    /// what the next steps offload, at most `OFFERS_PER_STEP` a step. A page
+    /// the snapshot states waits for none: it was the instance before this
+    /// one's to offer, and one that instance had not reached when it was
+    /// replaced is not offered again, since offering every page of a warm
+    /// snapshot would cost the first steps what the cache holds.
+    offers: VecDeque<PageId>,
     /// The encoder cache entries, least recently used first.
     encodings: Lru<EncodingId>,
     /// Whether the next step puts the media path's work first: the media path and the token path
@@ -100,7 +134,7 @@ impl TryFrom<Parameters> for Arrival {
             views: BTreeMap::new(),
             admission: Vec::new(),
             pages: Lru::new(),
-            offers: Vec::new(),
+            offers: VecDeque::new(),
             encodings: Lru::new(),
             media_first: false,
         })
@@ -247,25 +281,34 @@ impl Arrival {
         view.prefetch_tokens >= self.limits.prefetch_min_tokens
     }
 
-    /// The device pages a step offloads to the host KV cache: each page no running request
-    /// continues from, once. A page is named in the step after it became one,
-    /// in the order the pages did (least recently used first); one that a
-    /// request holds again, that went to the host alone or that left the
-    /// cache meanwhile is not, and one that became one twice is named once.
-    /// A page named before is not named again: the mechanism offered it, so
-    /// a warm cache costs a step nothing.
+    /// The device pages a step offloads to the host KV cache: the waiting
+    /// offers in the order the pages became ones no running request continues
+    /// from (least recently used first), at most `OFFERS_PER_STEP` of them,
+    /// so the step's work is bounded however many pages a request gave up;
+    /// the rest wait for the next steps. An offer whose page a request holds
+    /// again, that went to the host alone or that left the cache before its
+    /// turn is dropped unnamed, and so is an offer of a page an earlier offer
+    /// named or dropped. A page named before is not named again until it
+    /// becomes one again: the mechanism offered it, so a warm cache costs a
+    /// step nothing.
     fn offload_pages(&mut self) -> Vec<PageId> {
-        let mut named = BTreeSet::new();
-        let offers = std::mem::take(&mut self.offers);
-        offers
-            .into_iter()
-            .filter(|page| self.pages.get(*page).is_some_and(offloadable))
-            .filter(|page| named.insert(*page))
-            .collect()
+        let mut named = Vec::new();
+        for _ in 0..OFFERS_PER_STEP {
+            let Some(id) = self.offers.pop_front() else {
+                break;
+            };
+            let Some(page) = self.pages.get_mut(id) else {
+                continue;
+            };
+            if std::mem::take(&mut page.queued) && offloadable(&page.view) {
+                named.push(id);
+            }
+        }
+        named
     }
 
-    /// The view of `page`, which an event of kind `event` names as used just now: it moves to the
-    /// most recent end of the order.
+    /// What the policy keeps of `page`, which an event of kind `event` names as used just now: it
+    /// moves to the most recent end of the order.
     ///
     /// # Panics
     ///
@@ -276,7 +319,7 @@ impl Arrival {
     /// mechanism or of this policy, so the policy fails (a trap, which the mechanism handles as
     /// it handles every fault of a policy) instead of inventing a view the mechanism never
     /// stated.
-    fn used(&mut self, page: PageId, event: &str) -> &mut PageView {
+    fn used(&mut self, page: PageId, event: &str) -> &mut Page {
         self.pages
             .touch(page)
             .unwrap_or_else(|| panic!("the mechanism {event} page {} it never stated", page.0))
@@ -285,11 +328,21 @@ impl Arrival {
     /// A page the mechanism states as it stands now (`Cached`): it is the most recently used,
     /// and it is offered to the host once it becomes a device page no request holds.
     fn state(&mut self, page: &PageView) {
-        let was = self.pages.get(page.id).is_some_and(offloadable);
-        if offloadable(page) && !was {
-            self.offers.push(page.id);
+        let known = self.pages.get(page.id);
+        let was = known.is_some_and(|known| offloadable(&known.view));
+        // A page that already waits keeps its place; restating it changes no offer.
+        let queued = known.is_some_and(|known| known.queued);
+        let offered = offloadable(page) && !was && !queued;
+        if offered {
+            self.offers.push_back(page.id);
         }
-        self.pages.insert(page.id, page.clone());
+        self.pages.insert(
+            page.id,
+            Page {
+                view: page.clone(),
+                queued: queued || offered,
+            },
+        );
     }
 
     /// The pages a shortage of `kind` may take, least recently used first.
@@ -301,7 +354,7 @@ impl Arrival {
     fn page_victims(&self, want_host: bool, need: u64) -> Vec<Victim> {
         let mut victims = Vec::new();
         let mut taken = 0u64;
-        for (page, view) in self.pages.iter() {
+        for (page, Page { view, .. }) in self.pages.iter() {
             if taken >= need {
                 break;
             }
@@ -374,7 +427,8 @@ impl Policy for Arrival {
         // The cache orders the snapshot states, least recently used first.
         let mut pages: Vec<&PageView> = state.pages.iter().collect();
         pages.sort_unstable_by_key(|page| (page.last_used.0, page.id.0));
-        self.pages = Lru::from_least_recent(pages.into_iter().map(|page| (page.id, page.clone())));
+        self.pages =
+            Lru::from_least_recent(pages.into_iter().map(|page| (page.id, Page::stated(page))));
         let mut encodings: Vec<(u64, EncodingId)> = state
             .encodings
             .iter()
@@ -453,18 +507,20 @@ impl Policy for Arrival {
                     self.used(*page, "hit");
                 }
                 Event::Released { pages } => {
-                    for page in pages {
-                        let view = self.used(*page, "released");
-                        view.evictable = true;
-                        // A device page no request holds is offered to the host at the next step.
-                        if !view.on_host {
-                            self.offers.push(*page);
+                    for &id in pages {
+                        let page = self.used(id, "released");
+                        page.view.evictable = true;
+                        // A device page no request holds is offered to the host in its turn,
+                        // once however often it is given up before then.
+                        if !page.view.on_host && !page.queued {
+                            page.queued = true;
+                            self.offers.push_back(id);
                         }
                     }
                 }
                 Event::Held { pages } => {
                     for page in pages {
-                        self.used(*page, "held").evictable = false;
+                        self.used(*page, "held").view.evictable = false;
                     }
                 }
                 Event::Freed { page } => {
@@ -503,7 +559,8 @@ impl Policy for Arrival {
                 .collect(),
             reject,
             // The device pages no running request continues from go to the
-            // host KV cache, each once, least recently used first.
+            // host KV cache, each once, least recently used first, a bounded
+            // number a step.
             offload,
             // Requests whose host hit deepens enough to be worth fetching, in
             // admission order.
