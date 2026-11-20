@@ -244,6 +244,14 @@ pub struct KvCacheConfig {
     #[serde(with = "values::duration")]
     #[reload(epoch)]
     pub lease: Duration,
+    /// Retired: the pages between the aligned boundaries a long prompt offloaded its sliding
+    /// windows before. A model now states its windows as cache fields, whose pages are never
+    /// offloaded. Version 14 of the engine interface writes it in every launch and handoff
+    /// (and a package of that release may state it), so it is read and dropped while the
+    /// interface's oldest version is 14, and never written.
+    #[serde(skip_serializing)]
+    #[reload(epoch)]
+    pub boundary_interval: values::Retired,
 }
 
 /// How a switch of a capability the epoch lays out storage for takes effect: switched off at the
@@ -278,6 +286,7 @@ impl Default for KvCacheConfig {
             prefetch_timeout_base: DEFAULT_PREFETCH_TIMEOUT_BASE,
             prefetch_timeout_per_ki_token: DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN,
             lease: DEFAULT_LEASE,
+            boundary_interval: values::Retired,
         }
     }
 }

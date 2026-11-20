@@ -65,6 +65,24 @@ pub fn parse_bytes(text: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// A retired option: an option an earlier release stated in its configuration sections, and
+/// so in the launches and hot-restart handoffs its builds write, which this build reads whatever
+/// it states and drops, and never writes.
+///
+/// The sections refuse every key they do not know (`deny_unknown_fields`), so a removed option
+/// would make this build refuse each record of an earlier build that states it: a field of
+/// this type, `#[serde(skip_serializing)]`, keeps such records readable. Every value is equal to
+/// every other, so a configuration change never names it. The field goes with the change that
+/// raises the engine interface's oldest version past the last version whose records state it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Retired;
+
+impl<'de> Deserialize<'de> for Retired {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        de::IgnoredAny::deserialize(deserializer).map(|_| Self)
+    }
+}
+
 /// Byte units, the binary ones largest first so printing picks the largest
 /// that divides a size.
 const BYTE_UNITS: [(&str, u64); 9] = [

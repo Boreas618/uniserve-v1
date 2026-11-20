@@ -396,6 +396,7 @@ The Transfer Server copies by its host's calibration, which `uniserve storage-se
 | `prefetch_timeout_base` | `"1s"` | The time a copy of cached blocks the scheduler asks for may take whatever its size before it gives the copy up and the request computes those tokens, starts from noise or leaves with no stored step instead (as SGLang's `prefetch_timeout_base`): a prefetch from Mooncake, a load from or store to the host KV cache, and a stored trajectory's restore |
 | `lease` | `"30s"` | How long a prefill replica keeps the KV of a request it handed off for the decode replica to import, at most ([Replicas](#replicas)): the decode replica's import returns it earlier, and a lease that passes releases the pages and leaves the continuation to compute its prompt again |
 | `prefetch_timeout_per_ki_token` | `"250ms"` | The time such a copy may take beyond `prefetch_timeout_base` for every 1024 tokens it moves (as SGLang's `prefetch_timeout_per_ki_token`) |
+| `boundary_interval` | Retired | Read and ignored, never written: a model states the sliding windows of its cache as fields of their own, whose pages are never offloaded. Packages, engine launches and hot-restart handoffs of the releases of engine interface version 14 state the key, which a build reads while that version is in its window |
 
 ### `scheduler_config`
 
