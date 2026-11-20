@@ -86,7 +86,12 @@ pub mod handoff {
 /// The engine's other interfaces have windows of their own, each agreed at that interface's
 /// hello: the Storage Server's protocol (`storage::protocol::VERSIONS`) at the Storage Server,
 /// the buffer pool's runtime interface (`storage::runtime::VERSIONS`) when a session opens.
-pub const ENGINE_INTERFACE: service::Versions = service::Versions::one(14);
+///
+/// - 14: the previous release's version.
+/// - 15: an engine's launch, a hot restart's handoff and the `Tune` command may state a
+///   synthetic acceptance length (`speculative_config.synthetic_acceptance_length`,
+///   [`config::SYNTHETIC_ACCEPTANCE`]).
+pub const ENGINE_INTERFACE: service::Versions = service::Versions::new(14, 15);
 
 /// The version of the engine interface a peer of the window `spoken` agrees on with a peer
 /// whose hello states `oldest` and `newest` ([`process::Hello`], [`request::wire::Hello`]): the

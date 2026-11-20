@@ -601,6 +601,13 @@ pub struct Tuning {
 }
 
 impl Tuning {
+    /// The step values these state that version `version` of the engine interface lacks, by
+    /// their options' paths: a `Tune` of them to an engine of that agreed version would drop
+    /// them, so they are sent only to an engine of a version that has them.
+    pub fn unspoken(&self, version: u32) -> Vec<&'static str> {
+        unspoken_synthetic_acceptance(self.synthetic_acceptance_length, version)
+    }
+
     /// The role of the engine's scheduler `scheduler`: mixed unless the values state another.
     pub fn role(&self, scheduler: usize) -> Role {
         self.roles.get(scheduler).copied().unwrap_or(Role::Mixed)
@@ -748,9 +755,30 @@ pub struct SpeculativeConfig {
     /// "synthetic"` with `synthetic_acceptance_length`). Unset, a
     /// verification accepts the drafts the model's selections agree with.
     /// Each scheduler reads it at its next step and every batch carries it
-    /// to its ranks; no graph depends on it.
+    /// to its ranks; no graph depends on it. Version
+    /// [`SYNTHETIC_ACCEPTANCE`] of the engine interface added it, so a record
+    /// states it only when it is set, and only to a peer of that version or
+    /// a later one ([`EngineConfig::unspoken`]).
     #[reload(step)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub synthetic_acceptance_length: Option<f64>,
+}
+
+/// The version of the engine interface that added the synthetic acceptance length
+/// (`speculative_config.synthetic_acceptance_length`) to an engine's launch, a hot restart's
+/// handoff and the `Tune` command. A peer of an earlier agreed version refuses a launch or a
+/// handoff that states it, its configuration sections refusing a field they do not know, and
+/// would drop it from a `Tune` unread.
+pub const SYNTHETIC_ACCEPTANCE: u32 = 15;
+
+/// The path of the synthetic acceptance length when a record states one (`length`) and version
+/// `version` of the engine interface lacks it; none otherwise.
+fn unspoken_synthetic_acceptance(length: Option<f64>, version: u32) -> Vec<&'static str> {
+    if length.is_some() && version < SYNTHETIC_ACCEPTANCE {
+        vec!["speculative_config.synthetic_acceptance_length"]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The kind of device the command line's shorthand places every rank on (`device_config.device`).
@@ -2110,6 +2138,13 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    /// The options this configuration states that version `version` of the engine interface
+    /// lacks, by their paths: a peer of that agreed version refuses a launch or a hot restart's
+    /// handoff that states them, so they are sent only to a peer of a version that has them.
+    pub fn unspoken(&self, version: u32) -> Vec<&'static str> {
+        unspoken_synthetic_acceptance(self.speculative.synthetic_acceptance_length, version)
+    }
+
     /// Whether `moe_config.expert_parallel` shards the routed experts over an expert union,
     /// whose ranks exchange tokens at every expert layer and so run in one engine: the
     /// deployment's dedicated expert workers (a group of role `experts`) and the ranks that

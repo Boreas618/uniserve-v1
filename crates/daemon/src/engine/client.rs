@@ -895,8 +895,20 @@ impl EngineClient {
     ///
     /// # Errors
     ///
-    /// Fails with the reason the engine refused them, or when the engine ends first.
+    /// Fails with the reason the engine refused them, or when the engine ends first. Values a
+    /// later version of the engine interface than the one the engine agreed on added are
+    /// refused before anything is sent, naming them: the engine would drop them from the
+    /// command unread.
     pub async fn tune(&self, tuning: &proto::config::Tuning) -> Result<(), String> {
+        if let Some(version) = self.interface {
+            let unspoken = tuning.unspoken(version);
+            if !unspoken.is_empty() {
+                return Err(format!(
+                    "the engine speaks version {version} of the engine interface, which has no {}",
+                    unspoken.join(", ")
+                ));
+            }
+        }
         match self
             .ask(|id| wire::engine_command::Kind::Tune(tuning.command(id)))
             .await?
@@ -1677,6 +1689,30 @@ mod tests {
             }
             Arrival::Submitted(Request::Diffusion(_)) | Arrival::TakenOver(_) => Vec::new(),
         })
+    }
+
+    /// A step value a later version of the engine interface added does not reach an engine
+    /// that agreed on an earlier version, which would drop it from the command unread: the
+    /// change is refused before it is sent, naming the option. (This engine answers no engine
+    /// command, so a `Tune` sent to it would never end.)
+    #[tokio::test]
+    async fn a_step_value_of_a_later_version_does_not_reach_an_earlier_engine() {
+        let (client, _engine) = generating();
+        let client = client.speaking(proto::config::SYNTHETIC_ACCEPTANCE - 1);
+        let mut config = crate::config::Config::default();
+        config.speculative_config.num_draft_tokens = 3;
+        config.speculative_config.synthetic_acceptance_length = Some(2.5);
+        let tuning = proto::config::Tuning::of(&config.engine_config().unwrap(), 2);
+
+        let refused =
+            tokio::time::timeout(std::time::Duration::from_secs(30), client.tune(&tuning))
+                .await
+                .expect("the change is refused before it is sent")
+                .unwrap_err();
+        assert!(
+            refused.contains("speculative_config.synthetic_acceptance_length"),
+            "{refused}"
+        );
     }
 
     /// The positions the engine was told, in order.

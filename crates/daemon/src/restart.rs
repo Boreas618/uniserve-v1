@@ -439,6 +439,29 @@ impl Restarter {
                      this daemon (versions {}) does not speak",
                     proto::ENGINE_INTERFACE
                 );
+                // The takeover is written in that version: an option a later version added,
+                // which a successor of this one would refuse after the handover, ends the
+                // restart here, while this daemon serves, and the successor is told why.
+                let unspoken = handoff.iter().enumerate().find_map(|(index, replica)| {
+                    let unspoken = replica.served.engine_config.unspoken(version);
+                    (!unspoken.is_empty()).then(|| {
+                        format!(
+                            "the successor agreed on version {version} of the engine interface, \
+                             which has no {}, which replica {index} serves with",
+                            unspoken.join(", ")
+                        )
+                    })
+                });
+                if let Some(reason) = unspoken {
+                    let _ = send(
+                        &mut channel,
+                        &Message::Failed {
+                            reason: reason.clone(),
+                        },
+                        &[],
+                    );
+                    anyhow::bail!(reason);
+                }
                 info!(version, "the successor agreed on the handoff's version");
                 requests
             }
