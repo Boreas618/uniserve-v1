@@ -8,10 +8,16 @@
 //!
 //! The file holds one slot of [`SLOT`] bytes per GPU, at the GPU's node ordinal: a claim is an
 //! open file description lock (`F_OFD_SETLK`) on the GPU's slot, and the slot's bytes name the
-//! holder. The kernel releases a lock when the last descriptor of its open file description
-//! closes, so a claim ends with the process that holds it, however it ends, and a slot's bytes
-//! name a holder only while its lock is held. A hot restart hands the file's descriptor to the
-//! daemon's successor, which goes on holding the claims ([`Gpus::hand_over`], [`Gpus::adopt`]).
+//! holder, which they do only while its lock is held. A daemon that stops releases its claims
+//! itself once its processes ended (dropping its [`Gpus`] unlocks each slot it holds), so the
+//! GPUs are free when its stop returns, and a daemon started next in the same process (the
+//! current revision a failed start rolls back to) claims them again. Closing the descriptor
+//! would not do: a child that any thread of the process forks holds a duplicate of every
+//! descriptor of the process until its exec closes them, and the open file description and its
+//! locks last until the last duplicate closes. The kernel releases the locks when the process
+//! ends, however it ends, so a claim never outlives its daemon's process. A hot restart hands
+//! the file's descriptor to the daemon's successor, which goes on holding the claims
+//! ([`Gpus::hand_over`], [`Gpus::adopt`]) and releases them at its own stop.
 //!
 //! A GPU is named by its ordinal among the node's GPUs: the CUDA ordinal a launch states, read
 //! through `CUDA_VISIBLE_DEVICES` when the daemon's environment narrows the devices it sees, so
@@ -39,14 +45,14 @@ pub(crate) fn node() -> PathBuf {
     std::env::temp_dir().join(NODE)
 }
 
-/// A daemon's claims of its node's GPUs for its deployment.
+/// A daemon's claims of its node's GPUs for its deployment, which end when it is dropped.
 #[derive(Debug)]
 pub(crate) struct Gpus {
     /// The registration file, opened once: its open file description holds the claims.
     file: File,
     /// How a slot this daemon holds names it.
     holder: String,
-    /// The GPUs this daemon holds, by node ordinal.
+    /// The GPUs this daemon holds, by node ordinal: those its drop releases.
     held: BTreeSet<u32>,
 }
 
@@ -145,28 +151,48 @@ impl Gpus {
     }
 
     /// The claims for a successor to go on holding ([`Gpus::adopt`]), and the file's descriptor,
-    /// whose open file description holds the locks.
+    /// whose open file description holds the locks. The claims are the successor's from here on:
+    /// this daemon holds none of them, so its drop leaves them held.
     ///
     /// # Errors
     ///
-    /// Fails when the descriptor cannot be duplicated.
-    pub(crate) fn hand_over(&self) -> io::Result<(Handoff, OwnedFd)> {
+    /// Fails when the descriptor cannot be duplicated; this daemon keeps its claims then.
+    pub(crate) fn hand_over(&mut self) -> io::Result<(Handoff, OwnedFd)> {
+        let descriptor = OwnedFd::from(self.file.try_clone()?);
         Ok((
             Handoff {
                 holder: self.holder.clone(),
-                held: self.held.clone(),
+                held: std::mem::take(&mut self.held),
             },
-            OwnedFd::from(self.file.try_clone()?),
+            descriptor,
         ))
     }
 
     /// Goes on with the claims a predecessor handed over, held by the open file description of
-    /// `descriptor`.
+    /// `descriptor`, which this daemon's drop releases.
     pub(crate) fn adopt(handoff: Handoff, descriptor: OwnedFd) -> Self {
         Self {
             file: File::from(descriptor),
             holder: handoff.holder,
             held: handoff.held,
+        }
+    }
+}
+
+impl Drop for Gpus {
+    /// Releases every GPU this daemon holds. The supervisor that owns the claims ends its
+    /// processes before its fields drop, so no engine of the deployment runs on a GPU it
+    /// releases. The unlock acts on the open file description itself, which a descriptor that a
+    /// child forked meanwhile duplicated shares, so the GPUs are free once this returns. A slot's
+    /// bytes are left: they name a holder only while its lock is held, and the next holder
+    /// writes its own.
+    fn drop(&mut self) {
+        for &gpu in &self.held {
+            match unlock(&self.file, gpu) {
+                Ok(()) => tracing::info!(gpu, "released a GPU of the deployment"),
+                // The lock then ends with this process.
+                Err(error) => tracing::warn!(gpu, %error, "a GPU's claim could not be released"),
+            }
         }
     }
 }
@@ -188,9 +214,22 @@ fn offset(gpu: u32) -> u64 {
 /// Takes the open file description lock of `gpu`'s slot in `file` without waiting; whether it
 /// was taken, `false` when another open file description holds it.
 fn lock(file: &File, gpu: u32) -> io::Result<bool> {
+    set_lock(file, gpu, libc::F_WRLCK)
+}
+
+/// Releases the open file description lock of `gpu`'s slot in `file`, which another open file
+/// description never refuses.
+fn unlock(file: &File, gpu: u32) -> io::Result<()> {
+    set_lock(file, gpu, libc::F_UNLCK).map(drop)
+}
+
+/// Sets the open file description lock of `gpu`'s slot in `file` to `kind` (`F_WRLCK` or
+/// `F_UNLCK`) without waiting; whether it was set, `false` when another open file description
+/// holds a lock that conflicts with it.
+fn set_lock(file: &File, gpu: u32, kind: libc::c_int) -> io::Result<bool> {
     // SAFETY: `flock` is a plain C struct of integers, for which all zero bytes are a value.
     let mut range: libc::flock = unsafe { std::mem::zeroed() };
-    range.l_type = libc::F_WRLCK as libc::c_short;
+    range.l_type = kind as libc::c_short;
     range.l_whence = libc::SEEK_SET as libc::c_short;
     range.l_start = libc::off_t::try_from(offset(gpu)).map_err(io::Error::other)?;
     range.l_len = SLOT as libc::off_t;
@@ -303,11 +342,55 @@ mod tests {
         claims.claim(&[0]).unwrap();
     }
 
+    /// A daemon's claims end when it drops them, while a child forked by another thread of its
+    /// process still holds a duplicate of the registration's descriptor: the child holds every
+    /// descriptor of the process from its fork until its exec closes them.
+    #[test]
+    fn a_dropped_claim_ends_while_a_forked_child_holds_the_descriptor() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(NODE);
+        let mut first = Gpus::open(&path, "first").unwrap();
+        first.claim(&[0]).unwrap();
+
+        // The child reports its fork on `forked` and waits on `release` before it executes, so it
+        // holds the registration's descriptor across the drop below.
+        let (mut forked, forked_end) = std::io::pipe().unwrap();
+        let (release_end, mut release) = std::io::pipe().unwrap();
+        let (forked_end, release_end) = (forked_end.as_raw_fd(), release_end.as_raw_fd());
+        let mut command = std::process::Command::new("true");
+        // SAFETY: the closure runs in the forked child between fork and exec and calls only
+        // `write` and `read`, which are async-signal-safe, on descriptors this test holds open
+        // until the child exited.
+        unsafe {
+            command.pre_exec(move || {
+                let mut byte = 0_u8;
+                if libc::write(forked_end, std::ptr::from_ref(&byte).cast(), 1) != 1
+                    || libc::read(release_end, std::ptr::from_mut(&mut byte).cast(), 1) != 1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // A spawn returns once its child executed, so it runs on a thread of its own.
+        let child = std::thread::spawn(move || command.spawn().unwrap().wait().unwrap());
+        forked.read_exact(&mut [0]).unwrap();
+
+        drop(first);
+        let mut second = Gpus::open(&path, "second").unwrap();
+        let claimed = second.claim(&[0]);
+
+        release.write_all(&[1]).unwrap();
+        assert!(child.join().unwrap().success());
+        claimed.expect("the dropped claim of GPU 0 ended");
+    }
+
     /// A hot restart's successor holds the claims of the descriptor it was handed: the claims
-    /// outlive the predecessor's own descriptor. (They end with the successor's process, as
-    /// every claim ends with its holder's exit; a descriptor closed inside a process that forks
-    /// may still be held by a child between its fork and its exec, so a release is observed at a
-    /// process's exit, not at a drop.)
+    /// outlive the predecessor, and end with the successor.
     #[test]
     fn a_successor_goes_on_with_the_claims() {
         let directory = tempfile::tempdir().unwrap();
@@ -321,6 +404,9 @@ mod tests {
 
         let mut other = Gpus::open(&path, "second").unwrap();
         assert!(other.claim(&[0]).is_err());
+
+        drop(successor);
+        other.claim(&[0]).unwrap();
     }
 
     /// A launch's ordinal names the device the daemon's visible devices list at it.
