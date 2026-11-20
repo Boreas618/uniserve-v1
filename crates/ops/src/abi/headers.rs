@@ -298,6 +298,18 @@ fn headers() -> Vec<Header> {
         .structure::<attention::Call>("uniserve_paged_attention_call")
         .item("Phase", "uniserve_phase"),
         Header::new(
+            committed!("uniserve_index_scores.h"),
+            "src/attention/indexed.rs",
+            "The call structure of `index_scores`'s packages",
+        )
+        .structure::<attention::ScoresCall>("uniserve_index_scores_call"),
+        Header::new(
+            committed!("uniserve_index_select.h"),
+            "src/attention/indexed.rs",
+            "The call structure of `index_select`'s packages",
+        )
+        .structure::<attention::SelectCall>("uniserve_index_select_call"),
+        Header::new(
             committed!("uniserve_dense_attention.h"),
             "src/attention/mod.rs",
             "The call structure of `dense_attention`'s packages, and the masks a module is \

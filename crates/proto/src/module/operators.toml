@@ -157,3 +157,8 @@ mhc_boundary = 2
 # rows, the fused layer the shared experts' operands, and the lifecycle call what the transport is
 # laid out for.
 expert_exchange = 2
+# The scores' type is a descriptor field (FP32, or DeepSeek's BF16 arithmetic), a call passes a
+# workspace, and a native package takes the operator's call structure.
+index_scores = 2
+# The scores' type is a descriptor field, and a native package takes the operator's call structure.
+index_select = 2

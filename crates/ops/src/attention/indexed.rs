@@ -27,20 +27,28 @@
 //! Index keys are BF16 rows or packed records ([`crate::record`]), a packed page keeping all its
 //! records' values and then all their scales ([`crate::record::Layout::Page`], DeepGEMM's paged
 //! layout). The index queries may be rounded to MXFP4 as they are read, as the reference rounds
-//! them before it scores (`fp4_act_quant` of DeepSeek's `Indexer`). The index keys are selected
-//! between, so the scores are ranked and never rounded: FP32. The attention computes its scores, its softmax and
-//! its sum in FP32; with caches of a 16-bit type each probability is rounded into that type
-//! before it multiplies its value, as the reference casts them (`qsa.py:141-253`), and the
-//! output rounds once.
+//! them before it scores (`fp4_act_quant` of DeepSeek's `Indexer`). The scores are ranked, so
+//! where they round decides which entries a selection keeps: FP32 scores are the FP32 sums of
+//! the products, and BF16 scores are DeepSeek's indexer's own arithmetic, which rounds each
+//! head's product, its weighted value and the heads' sum to BF16 (`inference/model.py`,
+//! `Indexer.forward`: a BF16 `einsum`, a BF16 product with the weights and a BF16 `sum`), so a
+//! selection of them keeps the entries the reference ranks first, near ties included. The
+//! attention computes its scores, its softmax and its sum in FP32; with caches of a 16-bit type
+//! each probability is rounded into that type before it multiplies its value, as the reference
+//! casts them (`qsa.py:141-253`), and the output rounds once.
+//!
+//! Each operator is served by Triton programs and by native modules; a native module takes the
+//! operator's call structure ([`ScoresCall`], [`SelectCall`]).
 
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::{Float, Key};
-use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::operand::Operand;
 use crate::record::Format;
 use crate::tolerance::{self, Tolerance};
@@ -100,6 +108,10 @@ pub struct IndexScoresDescriptor {
     /// Groups of one candidate block, when the scores are restricted to candidate blocks; zero
     /// scores every group of the request.
     pub candidates: u32,
+    /// The type the scores round into and are stored in: [`DType::F32`], each score the FP32 sum
+    /// of the weighted rectified products; or [`DType::BF16`], DeepSeek's indexer's arithmetic,
+    /// [`IndexScores`]'s rounded formula.
+    pub scores: DType,
 }
 
 /// The index keys one `index_scores` program scores.
@@ -120,6 +132,7 @@ impl IndexScoresDescriptor {
             weighted: false,
             query: Format::Bf16,
             candidates: 0,
+            scores: DType::F32,
         }
     }
 
@@ -142,8 +155,9 @@ impl fmt::Display for IndexScoresDescriptor {
             .field("width", self.width)
             .field("groups", self.groups)
             .field("block", self.block);
-        // The weighting, the query's rounding and the candidates are written after `block`, and
-        // only when they are not the unweighted dense scoring every earlier key states.
+        // The weighting, the query's rounding, the candidates and the scores' type are written
+        // after `block`, and only when they are not the unweighted dense FP32 scoring every
+        // earlier key states.
         let key = if self.weighted {
             key.field("weighted", true)
         } else {
@@ -158,6 +172,11 @@ impl fmt::Display for IndexScoresDescriptor {
             key
         } else {
             key.field("candidates", self.candidates)
+        };
+        let key = if self.scores == DType::F32 {
+            key
+        } else {
+            key.field("scores", abi::name(self.scores))
         };
         key.finish(formatter)
     }
@@ -182,16 +201,115 @@ pub struct IndexScoresArgs {
     /// `[tokens, blocks]` I32, contiguous: each row's candidate blocks, a negative one naming
     /// none, exactly when the descriptor restricts to candidates.
     pub candidates: Option<Operand>,
-    /// `[tokens, columns]` FP32, contiguous: receives the scores, `−inf` for a column of no
-    /// visible group ([`IndexScoresDescriptor::columns`]).
+    /// `[tokens, columns]` of the descriptor's score type, contiguous: receives the scores,
+    /// `−inf` for a column of no visible group ([`IndexScoresDescriptor::columns`]).
     pub out: Operand,
+    /// `[bytes]` U8, at least [`IndexScores::workspace_bytes`]: the call's transient workspace,
+    /// whatever it held before. A native module keeps there the operands it derives for its
+    /// kernels (the rounded queries, the weights in the kernels' type, its schedule); a Triton
+    /// program reads none of it.
+    pub workspace: Operand,
+}
+
+/// The multiprocessors an `index_scores` workspace holds a schedule for
+/// ([`IndexScores::workspace_bytes`]): more than any device the operator launches on has.
+const SCHEDULED_MULTIPROCESSORS: u64 = 1024;
+
+/// The alignment of each region a native module carves from an `index_scores` workspace: a
+/// tensor map's base address.
+const WORKSPACE_ALIGNMENT: u64 = 16;
+
+/// The call structure `index_scores`'s native entry takes, declared to the package as
+/// `uniserve_index_scores_call` (`uniserve_index_scores.h`, generated with its layout asserted:
+/// [`abi`]).
+///
+/// The operands' device addresses, the launch's extents, the descriptor's values the module is
+/// compiled for (which the entry holds the call to), and the multiprocessors of the device the
+/// launch runs on. An unweighted or unrestricted call passes a null `weights` or `candidates`.
+#[repr(C)]
+#[derive(abi::Layout)]
+pub struct ScoresCall {
+    /// `[tokens, heads, width]` queries of the descriptor's element type.
+    pub query: *const c_void,
+    /// `[tokens, heads]` F32 head weights, or null.
+    pub weights: *const c_void,
+    /// `[pages, groups, record]`: the index-key plane.
+    pub keys: *const c_void,
+    /// `[table_rows, max_pages]` U32: each row's pages.
+    pub page_table: *const c_void,
+    /// `[tokens]` U32: each token's row of the page table.
+    pub rows: *const c_void,
+    /// `[tokens]` U32: the groups each token sees.
+    pub visible: *const c_void,
+    /// `[tokens, blocks]` I32 candidate blocks, or null.
+    pub candidates: *const c_void,
+    /// `[tokens, columns]` scores of the descriptor's score type.
+    pub out: *mut c_void,
+    /// The call's transient workspace and its bytes ([`IndexScoresArgs::workspace`]).
+    pub workspace: *mut c_void,
+    pub workspace_bytes: i64,
+    pub tokens: i64,
+    /// Pages of the key plane.
+    pub pages: i64,
+    /// Rows of the page table.
+    pub table_rows: i64,
+    /// Pages of one table row.
+    pub max_pages: i64,
+    /// Candidate blocks of one row; zero for a dense call.
+    pub blocks: i64,
+    /// Columns of a score row ([`IndexScoresDescriptor::columns`]).
+    pub columns: i64,
+    /// The descriptor's index heads, elements of a head, groups of a page and groups of a
+    /// candidate block.
+    pub heads: i64,
+    pub width: i64,
+    pub groups: i64,
+    pub candidate_block: i64,
+    /// The descriptor's score type (`uniserve_dtype`).
+    pub scores_dtype: i64,
+    /// The multiprocessors of the device the launch runs on.
+    pub multiprocessors: i64,
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
+}
+
+impl NativeCall for ScoresCall {
+    fn message(&self) -> Option<&str> {
+        abi::message(&self.error)
+    }
 }
 
 /// The scores of the index keys a query row may select among.
 ///
-/// One program scores [`IndexScoresDescriptor::block`] keys of one token: the products, the
-/// weighting and the sum over the heads are FP32.
+/// ```text
+/// FP32   s[t, g] = Σ_h relu(q[t, h] · key[g]) · w[t, h]
+/// BF16   s[t, g] = bf16(Σ_h bf16(relu(bf16(q[t, h] · key[g])) · bf16(w[t, h])))   Σ_h in FP32
+/// ```
+///
+/// Each head's product is FP32 either way (codes under power-of-two scales: the products are
+/// exact and only their sum rounds), its weighting one FP32 product. The BF16 scores round where
+/// DeepSeek's indexer rounds, whose head weights are BF16 values, so that their order is the
+/// reference's own, whose BF16 `topk` keeps the lower entry of a tie: equal BF16 scores are ties
+/// a selection breaks by its own rule. A weighted value is the product of two BF16 values, exact
+/// in FP32 before it rounds.
 pub struct IndexScores;
+
+impl IndexScores {
+    /// The bytes of the workspace a call of `tokens` query rows passes
+    /// ([`IndexScoresArgs::workspace`]): room for each row's queries as MXFP4 records (`width / 2`
+    /// value bytes and `width / 32` scale bytes a head), its weights as a BF16 row padded to 16
+    /// bytes, four 32-bit words of it (its table row, its visible count, and the first row and
+    /// the end of the run of rows it is scheduled with), a schedule of two 32-bit words for each
+    /// of up to 1024 multiprocessors and one more, and the alignment of each of those eight
+    /// regions to 16 bytes.
+    pub fn workspace_bytes(descriptor: &IndexScoresDescriptor, tokens: u64) -> u64 {
+        let (heads, width) = (u64::from(descriptor.heads), u64::from(descriptor.width));
+        let records = heads * (width / 2 + width.div_ceil(32));
+        let weights = (2 * heads).next_multiple_of(WORKSPACE_ALIGNMENT);
+        let schedule = 8 * (SCHEDULED_MULTIPROCESSORS + 1);
+        tokens * (records + weights + 4 * 4) + schedule + 8 * WORKSPACE_ALIGNMENT
+    }
+}
 
 impl Op for IndexScores {
     const NAME: &'static str = proto::module::operator::INDEX_SCORES;
@@ -206,13 +324,19 @@ impl Op for IndexScores {
             || d.groups == 0
             || d.block == 0
             || !matches!(d.query, Format::Bf16 | Format::Mxfp4)
+            || !matches!(d.scores, DType::F32 | DType::BF16)
         {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "{} index heads of {} elements over pages of {} keys, in blocks of {}, \
-                     queries read as {}",
-                    d.heads, d.width, d.groups, d.block, d.query
+                     queries read as {}, {} scores",
+                    d.heads,
+                    d.width,
+                    d.groups,
+                    d.block,
+                    d.query,
+                    abi::name(d.scores)
                 ),
             ));
         }
@@ -284,7 +408,21 @@ impl Op for IndexScores {
 
         let columns = d.columns(max_pages, blocks);
         args.out.require_shape(Self::NAME, &[tokens, columns])?;
-        args.out.require_row(Self::NAME, DType::F32, columns)?;
+        args.out.require_row(Self::NAME, d.scores, columns)?;
+        let needed = Self::workspace_bytes(d, tokens);
+        if args.workspace.dtype != DType::U8
+            || args.workspace.rank() != 1
+            || args.workspace.numel() < needed
+            || !args.workspace.is_row_major()
+        {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the workspace is a contiguous u8 vector of at least {needed} bytes for \
+                     {tokens} rows"
+                ),
+            ));
+        }
         for (name, view) in [("query", &args.query), ("out", &args.out)] {
             if !view.is_row_major() {
                 return Err(Error::argument(
@@ -306,6 +444,42 @@ impl Op for IndexScores {
         let max_pages = args.page_table.dim(1);
         let blocks = args.candidates.as_ref().map_or(0, |view| view.dim(1));
         let columns = descriptor.columns(max_pages, blocks);
+
+        // A native module keeps the call structure; a Triton program takes the arguments its
+        // package declares. The descriptor names no backend: the store decides.
+        if !kernel.is_cubin() {
+            let address = |operand: &Operand| operand.ptr.address() as usize as *const c_void;
+            let optional =
+                |operand: &Option<Operand>| operand.as_ref().map_or(std::ptr::null(), address);
+            let mut call = ScoresCall {
+                query: address(&args.query),
+                weights: optional(&args.weights),
+                keys: address(&args.keys),
+                page_table: address(&args.page_table),
+                rows: address(&args.rows),
+                visible: address(&args.visible),
+                candidates: optional(&args.candidates),
+                out: args.out.ptr.address() as usize as *mut c_void,
+                workspace: args.workspace.ptr.address() as usize as *mut c_void,
+                workspace_bytes: args.workspace.numel() as i64,
+                tokens: tokens as i64,
+                pages: args.keys.dim(0) as i64,
+                table_rows: args.page_table.dim(0) as i64,
+                max_pages: max_pages as i64,
+                blocks: blocks as i64,
+                columns: columns as i64,
+                heads: i64::from(descriptor.heads),
+                width: i64::from(descriptor.width),
+                groups: i64::from(descriptor.groups),
+                candidate_block: i64::from(descriptor.candidates),
+                scores_dtype: abi::code(descriptor.scores)?,
+                multiprocessors: i64::from(stream.device().multiprocessors()?),
+                error: [0; MESSAGE],
+            };
+            // SAFETY: `ScoresCall` is the structure this package's entry declares, generated
+            // from this definition with its layout asserted.
+            return unsafe { kernel.native(&mut call, stream) };
+        }
 
         // An unweighted or unrestricted call passes the unread operand, which its program,
         // compiled without it, never dereferences.
@@ -337,16 +511,41 @@ impl Op for IndexScores {
         }
     }
 
+    /// FP32 scores: each sums `heads` rectified dot products of `width` terms in FP32, each
+    /// weighted by one FP32 product, and is stored as FP32: a dot product's bound over `heads ·
+    /// width` terms, one rounding more per term for the weight.
+    ///
+    /// BF16 scores add the format's roundings to that bound. Two implementations whose FP32 head
+    /// products differ by the dot product's bound may round a head's product, and then its
+    /// weighted value, to neighbouring BF16 values: each of the two roundings moves a head's term
+    /// by at most one BF16 spacing, `2u` of it (`u = 2⁻⁸`), and the `heads` terms' errors add
+    /// as a dot product's do, `√heads` times the largest. The FP32 sum of the heads is a sum of
+    /// `heads` terms (`2γ_heads √heads`), and its rounding to BF16 may again land on neighbours,
+    /// `2u` of the score. Like the FP32 bound it is relative to the row's largest score, which
+    /// the weights' signs let a score cancel below.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // Each score sums `heads` rectified dot products of `width` terms in FP32, each weighted
-        // by one FP32 product, and is stored as FP32: a dot product's bound over `heads · width`
-        // terms, one rounding more per term for the weight.
-        Tolerance::split_dot(
-            u64::from(descriptor.heads) * u64::from(descriptor.width),
+        let heads = u64::from(descriptor.heads);
+        let products = Tolerance::split_dot(
+            heads * u64::from(descriptor.width),
             u64::from(descriptor.weighted),
             DType::F32,
             DType::F32,
-        )
+        );
+        if descriptor.scores == DType::F32 {
+            return products;
+        }
+
+        let spacing = 2.0 * tolerance::unit_roundoff(DType::BF16);
+        let spread = (heads as f64).sqrt();
+        let rounded = f64::from(products.rtol)
+            + 2.0 * spacing * spread
+            + 2.0 * tolerance::gamma(heads, DType::F32) * spread
+            + spacing;
+        Tolerance {
+            atol: tolerance::underflow(DType::BF16) as f32,
+            rtol: rounded as f32,
+            cancels: true,
+        }
     }
 }
 
@@ -361,6 +560,8 @@ pub struct IndexSelectDescriptor {
     pub candidates: u32,
     /// Lanes one pass of the program reads.
     pub tile: u32,
+    /// Element type of the scores: [`DType::F32`] or [`DType::BF16`].
+    pub scores: DType,
 }
 
 /// The lanes one `index_select` pass reads: one chunk of a row's scores at a time, so the
@@ -368,31 +569,40 @@ pub struct IndexSelectDescriptor {
 const SELECT_TILE: u32 = 4096;
 
 impl IndexSelectDescriptor {
-    /// The compilation that ranks blocks of `pool` columns of scores restricted to candidate
-    /// blocks of `candidates` groups (zero for none).
+    /// The compilation that ranks blocks of `pool` columns of FP32 scores restricted to
+    /// candidate blocks of `candidates` groups (zero for none).
     pub fn new(pool: u32, candidates: u32) -> Self {
         Self {
             pool,
             candidates,
             tile: SELECT_TILE,
+            scores: DType::F32,
         }
     }
 }
 
 impl fmt::Display for IndexSelectDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("pool", self.pool)
             .field("candidates", self.candidates)
-            .field("tile", self.tile)
-            .finish(formatter)
+            .field("tile", self.tile);
+        // The scores' type is written only for scores other than the FP32 ones every earlier key
+        // ranks.
+        let key = if self.scores == DType::F32 {
+            key
+        } else {
+            key.field("scores", abi::name(self.scores))
+        };
+        key.finish(formatter)
     }
 }
 
 /// The arguments of `index_select`.
 #[derive(Clone)]
 pub struct IndexSelectArgs {
-    /// `[tokens, columns]` F32, contiguous: the scores ([`IndexScores`]).
+    /// `[tokens, columns]` of the descriptor's score type, contiguous: the scores
+    /// ([`IndexScores`]).
     pub scores: Operand,
     /// `[tokens]` U32: the groups each token sees, which bound the blocks a row of its request's
     /// own groups ranks and whose newest the block mode pins.
@@ -403,6 +613,40 @@ pub struct IndexSelectArgs {
     /// `[tokens, k]` I32, contiguous: receives the kept groups (or blocks), `-1` for a slot whose
     /// score is `−inf`.
     pub out: Operand,
+}
+
+/// The call structure `index_select`'s native entry takes, declared to the package as
+/// `uniserve_index_select_call` (`uniserve_index_select.h`, generated with its layout asserted:
+/// [`abi`]). A selection of the request's own groups passes a null `candidates`.
+#[repr(C)]
+#[derive(abi::Layout)]
+pub struct SelectCall {
+    /// `[tokens, columns]` scores of the descriptor's score type.
+    pub scores: *const c_void,
+    /// `[tokens]` U32: the groups each token sees.
+    pub visible: *const c_void,
+    /// `[tokens, columns / candidate_block]` I32 candidate blocks, or null.
+    pub candidates: *const c_void,
+    /// `[tokens, kept]` I32: the kept entries.
+    pub out: *mut c_void,
+    pub tokens: i64,
+    pub columns: i64,
+    pub kept: i64,
+    /// The descriptor's pool and candidate block, which the module is compiled for.
+    pub pool: i64,
+    pub candidate_block: i64,
+    /// The descriptor's score type (`uniserve_dtype`).
+    pub scores_dtype: i64,
+    /// The multiprocessors of the device the launch runs on.
+    pub multiprocessors: i64,
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
+}
+
+impl NativeCall for SelectCall {
+    fn message(&self) -> Option<&str> {
+        abi::message(&self.error)
+    }
 }
 
 /// The `k` best groups (or blocks) of each score row.
@@ -433,13 +677,20 @@ impl Op for IndexSelect {
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let d = descriptor;
-        if d.pool == 0 || d.tile == 0 || (d.pool > 1 && d.candidates > 0) {
+        if d.pool == 0
+            || d.tile == 0
+            || (d.pool > 1 && d.candidates > 0)
+            || !matches!(d.scores, DType::F32 | DType::BF16)
+        {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "blocks of {} columns over candidates of {}, in passes of {}: the block mode \
-                     ranks unrestricted scores",
-                    d.pool, d.candidates, d.tile
+                    "blocks of {} columns over candidates of {}, in passes of {}, of {} scores: \
+                     the block mode ranks unrestricted FP32 or BF16 scores",
+                    d.pool,
+                    d.candidates,
+                    d.tile,
+                    abi::name(d.scores)
                 ),
             ));
         }
@@ -447,7 +698,7 @@ impl Op for IndexSelect {
         args.scores.require_rank(Self::NAME, 2)?;
         let (tokens, columns) = (args.scores.dim(0), args.scores.dim(1));
         args.scores
-            .require_row(Self::NAME, DType::F32, columns)
+            .require_row(Self::NAME, d.scores, columns)
             .map_err(|error| Error::argument(Self::NAME, format!("scores: {error}")))?;
         args.visible
             .require_shape(Self::NAME, &[tokens])
@@ -509,11 +760,35 @@ impl Op for IndexSelect {
 
     fn launch(
         kernel: &Kernel,
-        _descriptor: &Self::Descriptor,
+        descriptor: &Self::Descriptor,
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
         let tokens = args.scores.dim(0);
+
+        // A native module keeps the call structure; a Triton program takes its package's
+        // arguments.
+        if !kernel.is_cubin() {
+            let address = |operand: &Operand| operand.ptr.address() as usize as *const c_void;
+            let mut call = SelectCall {
+                scores: address(&args.scores),
+                visible: address(&args.visible),
+                candidates: args.candidates.as_ref().map_or(std::ptr::null(), address),
+                out: args.out.ptr.address() as usize as *mut c_void,
+                tokens: tokens as i64,
+                columns: args.scores.dim(1) as i64,
+                kept: args.out.dim(1) as i64,
+                pool: i64::from(descriptor.pool),
+                candidate_block: i64::from(descriptor.candidates),
+                scores_dtype: abi::code(descriptor.scores)?,
+                multiprocessors: i64::from(stream.device().multiprocessors()?),
+                error: [0; MESSAGE],
+            };
+            // SAFETY: `SelectCall` is the structure this package's entry declares, generated
+            // from this definition with its layout asserted.
+            return unsafe { kernel.native(&mut call, stream) };
+        }
+
         let unread = Operand::unread();
 
         let mut arguments = Arguments::new(Self::NAME);
@@ -748,6 +1023,25 @@ mod tests {
         assert_eq!(
             IndexSelectDescriptor::new(8, 0).to_string(),
             "pool_8_candidates_0_tile_4096"
+        );
+
+        // DeepSeek's BF16 scores, and their selection.
+        let rounded = IndexScoresDescriptor {
+            scores: DType::BF16,
+            ..restricted
+        };
+        assert_eq!(
+            rounded.to_string(),
+            "dtype_bf16_keys_mxfp4_heads_32_width_128_groups_64_block_256_weighted_true_\
+             query_mxfp4_candidates_8_scores_bf16"
+        );
+        assert_eq!(
+            IndexSelectDescriptor {
+                scores: DType::BF16,
+                ..IndexSelectDescriptor::new(1, 8)
+            }
+            .to_string(),
+            "pool_1_candidates_8_tile_4096_scores_bf16"
         );
 
         let attention = IndexedAttentionDescriptor {

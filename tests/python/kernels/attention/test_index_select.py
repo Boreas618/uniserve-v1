@@ -25,12 +25,23 @@ scores of a handful of values, where nearly everything ties; rows with
 fewer finite scores than are kept, whose surplus slots are ``-1``; the block
 mode over a column count no block divides, whose newest visible block is
 pinned whatever its scores; and scores of candidate blocks, some unnamed,
-mapped back to their groups. The device cases are the model's: decode rows
+mapped back to their groups; and BF16 scores, which are ranked by their FP32
+values and tie far more often. The device cases are the model's: decode rows
 over 2^20 scores keeping 512, and 131072 blocks of 8 keeping 2048.
+
+The CUDA module (``index_select/cuda``, resolved at the session's Build
+Server) is called with the operator's call structure
+(``uniserve_index_select_call``) over the same rule: the cases above, rows a
+cluster splits (2^20 scores, one row and many), a row whose threshold lies
+in a run of keys too long for the module's shared memory, and the model's
+selections, each in FP32 and BF16 scores.
 """
+
+import ctypes
 
 import pytest
 import torch
+from uniserve_testing.kernels.packages import abi_enumerator, assert_abi_layout
 
 pytestmark = pytest.mark.unit
 
@@ -95,9 +106,12 @@ def reference(scores, visible, kept, pool=1, candidates=None, block=0):
 WORDS = ("scores", "visible", "candidates", "out", "columns", "kept")
 
 
-def key(pool, block, tile):
-    """The descriptor key `IndexSelectDescriptor` prints."""
-    return f"pool_{pool}_candidates_{block}_tile_{tile}"
+def key(pool, block, tile, scores="f32"):
+    """The descriptor key `IndexSelectDescriptor` prints: the scores' type
+    only for BF16 scores.
+    """  # noqa: D205
+    text = f"pool_{pool}_candidates_{block}_tile_{tile}"
+    return text + ("_scores_bf16" if scores == "bf16" else "")
 
 
 def launch(
@@ -243,6 +257,25 @@ def test_candidate_columns_map_back_to_their_groups(
     assert_kept("candidates", got, expected)
 
 
+def test_bf16_scores_rank_by_their_values_and_ties_keep_the_lower_columns(
+    torch_device, stated_launch, launch_target
+):
+    stated = stated_launch(
+        "index_select", key(1, 0, TILE, "bf16"), launch_target
+    )
+    generator = torch.Generator().manual_seed(8)
+    # Scores of a few hundred BF16 values over 3000 columns: the kept
+    # count falls inside a tie, and a -inf tail past the second row's count.
+    scores = (torch.randn(2, 3000, generator=generator) * 3).to(torch.bfloat16)
+    visible = torch.tensor([3000, 2100], dtype=torch.int32)
+    scores[1, 2100:] = float("-inf")
+
+    got = launch(None, scores, visible, 300, torch_device, stated=stated)
+    assert_kept(
+        "bf16 scores", got, reference(scores.to(torch.float32), visible, 300)
+    )
+
+
 def test_the_key_the_operator_prints_compiles_the_block_mode(
     torch_device, stated_launch, launch_target
 ):
@@ -287,3 +320,184 @@ def test_the_model_selections(name, torch_device, stated_launch, launch_target):
         None, scores, visible, kept, torch_device, pool=pool, stated=stated
     )
     assert_kept(name, got, reference(scores, visible, kept, pool=pool))
+
+
+class SelectCall(ctypes.Structure):
+    """``uniserve_index_select_call`` (``ops::attention::SelectCall``), field
+    for field.
+    """  # noqa: D205
+
+    _fields_ = [
+        ("scores", ctypes.c_void_p),
+        ("visible", ctypes.c_void_p),
+        ("candidates", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("tokens", ctypes.c_int64),
+        ("columns", ctypes.c_int64),
+        ("kept", ctypes.c_int64),
+        ("pool", ctypes.c_int64),
+        ("candidate_block", ctypes.c_int64),
+        ("scores_dtype", ctypes.c_int64),
+        ("multiprocessors", ctypes.c_int64),
+        ("error", ctypes.c_char * 512),
+    ]
+
+
+def test_the_call_mirror_is_the_headers_call_structure():
+    """The generated header asserts the size and every offset it holds."""
+    assert_abi_layout(SelectCall, "uniserve_index_select_call")
+
+
+def select_module(
+    kernel_module, scores, visible, kept, pool=1, candidates=None, block=0
+):
+    """One call of the CUDA module of the call's key: the kept entries."""
+    device = torch.device("cuda")
+    dtype = "bf16" if scores.dtype == torch.bfloat16 else "f32"
+    library = ctypes.CDLL(
+        str(
+            kernel_module("index_select", "cuda", key(pool, block, 4096, dtype))
+            / "module.so"
+        )
+    )
+    function = library.uniserve_index_select
+    function.argtypes = [ctypes.POINTER(SelectCall), ctypes.c_void_p]
+    function.restype = ctypes.c_int32
+
+    rows, columns = scores.shape
+    scores, visible = scores.to(device), visible.to(device)
+    named = None if candidates is None else candidates.to(device)
+    out = torch.full((rows, kept), SENTINEL, dtype=torch.int32, device=device)
+    call = SelectCall(
+        scores=scores.data_ptr(),
+        visible=visible.data_ptr(),
+        candidates=None if named is None else named.data_ptr(),
+        out=out.data_ptr(),
+        tokens=rows,
+        columns=columns,
+        kept=kept,
+        pool=pool,
+        candidate_block=block,
+        scores_dtype=abi_enumerator(f"UNISERVE_DTYPE_{dtype.upper()}"),
+        multiprocessors=torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count,
+    )
+    stream = torch.cuda.current_stream(device).cuda_stream
+    status = function(ctypes.byref(call), ctypes.c_void_p(stream))
+    torch.cuda.synchronize(device)
+    assert status == 0, (
+        f"the module refused: {call.error.decode(errors='replace')}"
+    )
+    return out.cpu()
+
+
+def long_rows(rows, columns, seed, spread=1.0):
+    """Rows of ``columns`` scores around one of ``spread`` and visible counts
+    of at least half of them, the first row's every column.
+    """  # noqa: D205
+    generator = torch.Generator().manual_seed(seed)
+    scores = 1.0 + torch.randn(rows, columns, generator=generator) * spread
+    visible = torch.randint(
+        columns // 2, columns + 1, (rows,), generator=generator
+    ).to(torch.int32)
+    visible[0] = columns
+    return scores, visible
+
+
+def ties(seed):
+    generator = torch.Generator().manual_seed(seed)
+    scores = torch.randint(0, 4, (2, 1500), generator=generator).float()
+    return scores, torch.full((2,), 1500, dtype=torch.int32), 37, {}
+
+
+def fewer_finite(seed):
+    generator = torch.Generator().manual_seed(seed)
+    scores = torch.full((2, 700), float("-inf"))
+    scores[0, :10] = torch.randn(10, generator=generator)
+    return scores, torch.tensor([10, 0], dtype=torch.int32), 64, {}
+
+
+def blocks(seed):
+    generator = torch.Generator().manual_seed(seed)
+    scores = torch.randn(3, 1003, generator=generator)
+    visible = torch.tensor([1003, 517, 9], dtype=torch.int32)
+    for row in range(3):
+        seen = int(visible[row])
+        scores[row, seen:] = float("-inf")
+        scores[row, (seen - 1) // 8 * 8 : seen] = -10.0
+    return scores, visible, 20, {"pool": 8}
+
+
+def candidate_blocks(seed):
+    generator = torch.Generator().manual_seed(seed)
+    candidates = torch.randint(0, 5000, (2, 100), generator=generator).to(
+        torch.int32
+    )
+    candidates[:, ::7] = -1
+    scores = torch.randn(2, 800, generator=generator)
+    scores[(candidates < 0).repeat_interleave(8, dim=1)] = float("-inf")
+    visible = torch.full((2,), 40000, dtype=torch.int32)
+    return scores, visible, 50, {"candidates": candidates, "block": 8}
+
+
+def split_rows(seed):
+    scores, visible = long_rows(8, 1 << 20, seed)
+    return scores, visible, 512, {}
+
+
+def one_split_row(seed):
+    scores, visible = long_rows(1, 1 << 20, seed)
+    return scores, visible, 512, {}
+
+
+def a_long_tie_run(seed):
+    # Scores within a few thousandths of one: the run of keys around the
+    # threshold outgrows what a CTA keeps, so the module reads the row again.
+    scores, visible = long_rows(1, 1 << 20, seed, spread=1e-3)
+    return scores, visible, 512, {}
+
+
+def candidate_source(seed):
+    scores, visible = long_rows(4, 1 << 20, seed)
+    for row in range(4):
+        scores[row, int(visible[row]) :] = float("-inf")
+    return scores, visible, 2048, {"pool": 8}
+
+
+def prefill_rows(seed):
+    generator = torch.Generator().manual_seed(seed)
+    scores = torch.randn(512, 8192, generator=generator)
+    visible = (torch.arange(512, dtype=torch.int32) * 16 + 1).to(torch.int32)
+    for row in range(512):
+        scores[row, int(visible[row]) :] = float("-inf")
+    return scores, visible, 512, {}
+
+
+#: The CUDA module's cases: each builds FP32 scores, the visible counts, the
+#: kept count and the call's pool and candidates.
+MODULE_CASES = {
+    "ties keep the lower columns": ties,
+    "fewer finite scores than kept": fewer_finite,
+    "blocks of 8 pin the newest": blocks,
+    "candidate columns map back to their groups": candidate_blocks,
+    "8 rows of 2^20 scores, split over clusters": split_rows,
+    "one row of 2^20 scores": one_split_row,
+    "a long run of keys around the threshold": a_long_tie_run,
+    "the candidate source's 131072 blocks of 8 keeping 2048": candidate_source,
+    "512 prefill rows of growing visible counts": prefill_rows,
+}
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16], ids=["f32", "bf16"]
+)
+@pytest.mark.parametrize("name", MODULE_CASES)
+def test_the_cuda_module_keeps_what_the_rule_keeps(name, dtype, kernel_module):
+    scores, visible, kept, options = MODULE_CASES[name](9)
+    scores = scores.to(dtype)
+
+    got = select_module(kernel_module, scores, visible, kept, **options)
+    expected = reference(scores.to(torch.float32), visible, kept, **options)
+    assert_kept(name, got, expected)

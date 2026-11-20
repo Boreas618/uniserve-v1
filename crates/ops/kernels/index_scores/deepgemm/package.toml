@@ -1,0 +1,51 @@
+# The index_scores operator's DeepGEMM backend.
+#
+# DeepGEMM's SM100 paged MQA logits (`sm100_paged_mqa_logits`, the `deepgemm` pin
+# of `uniserve_build_server.fetch`) over MXFP4 queries and MXFP4 index keys in the
+# page layout, compiled ahead of time: the build instantiates the kernel for the
+# descriptor's heads, head width and page size with DeepGEMM's own geometry and
+# compiles it with the package's entry `src/scores.cu` into one native module per
+# descriptor. A serving host compiles nothing.
+#
+# The entry rounds each row's queries to MXFP4 and its weights to BF16 into the
+# call's workspace, stores −inf past each row's visible groups, schedules the
+# rows' requests over the device's multiprocessors and launches the kernel, which
+# reads the key plane in place: a page's records' E2M1 values, then their UE8M0
+# scale words, is DeepGEMM's paged layout. The build compiles a staged copy of the
+# pin with `patches/paged-logits.patch`: the epilogue rounds where DeepSeek's
+# indexer rounds (each head's product and its weighted value to BF16, the heads
+# summed in FP32, the score rounded to BF16 once), a request's tokens read the
+# page-table row their row names, a request's end is read from the schedule
+# rather than scanned, and the schedule balances over the launched
+# multiprocessors. The CUTLASS the kernel includes is the one the
+# `flashinfer-python` distribution installs.
+#
+# The package serves the model's dense scoring: weighted heads, queries rounded
+# to MXFP4, BF16 scores. Scores restricted to candidate blocks, FP32 scores and
+# BF16 keys stay with the Triton package.
+
+op = "index_scores"
+backend = "deepgemm"
+interface_version = 2
+# Selected over the Triton program for every key both cover.
+priority = 1
+
+[toolchain]
+packages = ["flashinfer-python"]
+
+[source]
+kind = "cuda"
+
+[kernel]
+requires = ["tensor_memory"]
+
+# `dtype_bf16_keys_mxfp4_heads_32_width_128_groups_64_block_256_weighted_true_query_mxfp4_scores_bf16`.
+#
+# The model's index heads: 32 of 128 elements, four (row, head) query tiles of
+# 32 heads making DeepGEMM's tile of 128 pairs, a head one word of four UE8M0
+# scales; its pages of 64 tokens hold 32 keys of a ratio-2 source and 64 of a
+# ratio-1 source, whole pages of a split of 384. `block` is the Triton
+# program's column block and compiles nothing here; a key without `candidates`
+# scores every visible group.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], keys = ["mxfp4"], heads = ["32"], width = ["128"], groups = ["32", "64"], block = { power_of_two = true, min = 16 }, weighted = ["true"], query = ["mxfp4"], scores = ["bf16"] }

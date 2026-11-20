@@ -16,6 +16,15 @@ A program of a dense row whose columns all lie past the token's visible
 groups stores ``-inf`` alone, so a row's products cost what its request holds
 rather than the whole table its page table could address.
 
+With ``SCORES_BF16`` the score rounds where DeepSeek's indexer rounds::
+
+    s[t, c] = bf16(sum_h bf16(relu(bf16(q[t, h] . key[g])) * bf16(w[t, h])))
+
+each head's product, its weight, its weighted value and the FP32 sum of the
+heads rounded to BF16, nearest even, and stored as BF16 (``out`` is then a
+BF16 row); the rounding is written on the bits, so the interpreter, which
+truncates a store into BF16, stores the same values.
+
 The keys are BF16 rows ``[pages, GROUPS, WIDTH]``, or MXFP4 records whose page
 holds every record's ``WIDTH / 2`` value bytes and then every record's
 ``WIDTH / 32`` UE8M0 scale bytes (``crates/ops/src/record.rs``, the page
@@ -71,6 +80,19 @@ def _e2m1_round(x):
 
 
 @triton.jit
+def _bf16_round(x):
+    """``x`` (FP32, finite or infinite) rounded to BF16 to nearest even, as
+    the FP32 value of the BF16 result.
+    """  # noqa: D205
+    bits = x.to(tl.uint32, bitcast=True)
+    # Adding half a BF16 spacing less one, plus the kept part's lowest bit,
+    # carries into the kept bits exactly when the dropped ones round up; an
+    # infinity's dropped bits are zero, so it stays one.
+    rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+    return rounded.to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _mxfp4_round(x, ROWS: tl.constexpr, WIDTH: tl.constexpr):
     """``x``, ``[ROWS, WIDTH]`` FP32, rounded to MXFP4 blocks of 32: the
     values a record of each block holds.
@@ -108,6 +130,7 @@ def _index_scores_kernel(
     WEIGHTED: tl.constexpr,
     QUERY_MXFP4: tl.constexpr,
     CANDIDATES: tl.constexpr,
+    SCORES_BF16: tl.constexpr,
 ):
     """Score ``BLOCK`` columns of one token's row. Grid: (column blocks,
     tokens).
@@ -115,7 +138,8 @@ def _index_scores_kernel(
     ``query`` is ``[tokens, HEADS, WIDTH]``, ``weights`` ``[tokens, HEADS]``
     FP32 (read when ``WEIGHTED``), ``candidates`` ``[tokens, blocks]`` I32
     (read when ``CANDIDATES`` is not zero) and ``out`` ``[tokens, columns]``
-    FP32, ``columns`` being ``max_pages * GROUPS`` or ``blocks * CANDIDATES``.
+    FP32, or BF16 with ``SCORES_BF16``, ``columns`` being ``max_pages *
+    GROUPS`` or ``blocks * CANDIDATES``.
     """
     token = tl.program_id(1).to(tl.int64)
     column = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -203,11 +227,19 @@ def _index_scores_kernel(
         # rounds. (TF32 rather than BF16 operands: the interpreter multiplies a
         # BF16 tile by its bit patterns, and FP32 operands read the same on both.)
         products = tl.dot(q, tl.trans(key), input_precision="tf32", out_dtype=tl.float32)
+        if SCORES_BF16:
+            products = _bf16_round(products)
         rectified = tl.maximum(products, 0.0)
         if WEIGHTED:
             weight = tl.load(weights + token * HEADS + head, mask=heads_live, other=0.0)
+            if SCORES_BF16:
+                weight = _bf16_round(weight)
             rectified = rectified * weight[:, None]
+            if SCORES_BF16:
+                rectified = _bf16_round(rectified)
         score = tl.sum(rectified, axis=0)
+        if SCORES_BF16:
+            score = _bf16_round(score)
 
         tl.store(
             out + token * columns + column,
@@ -219,10 +251,10 @@ def _index_scores_kernel(
 def derive(fields, parameters, target):
     """The variants a key prints only when they are set, and the heads' tile.
 
-    A key states ``weighted``, ``query`` and ``candidates`` only when they are
-    not the unweighted, unrounded, dense scoring; the products need a tile of
-    at least sixteen rows, so the heads are padded to a power of two of at
-    least sixteen.
+    A key states ``weighted``, ``query``, ``candidates`` and ``scores`` only
+    when they are not the unweighted, unrounded, dense FP32 scoring; the
+    products need a tile of at least sixteen rows, so the heads are padded to
+    a power of two of at least sixteen.
 
     Raises:
         SystemExit: When a rounded query's or a packed key's width is no
@@ -237,5 +269,6 @@ def derive(fields, parameters, target):
         "weighted": fields.get("weighted", False),
         "query": query,
         "candidates": fields.get("candidates", 0),
+        "scores": fields.get("scores", "f32"),
         "heads_tile": max(16, triton.next_power_of_2(fields["heads"])),
     }

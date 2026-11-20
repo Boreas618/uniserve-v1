@@ -480,8 +480,17 @@ impl Indexer {
             None => keys.table.dims()[1] * keys.records.dims()[1],
         };
         let kept = (config.top as usize).min(columns);
-        // An FP32 score is four bytes.
-        let rows_per_block = (SCORE_BYTES / (columns.max(1) * 4)).max(1);
+        // The scores are the reference's own BF16 values (`IndexScoring::scores`), two bytes
+        // each, so the selection ranks them, near ties included, as the reference does. The
+        // heads of a split are summed across its ranks, so each rank's share of a score stays
+        // FP32 until the sum.
+        let score = if config.split.size() > 1 {
+            DType::F32
+        } else {
+            SCORE
+        };
+        let score_bytes = score.size_in_bytes().unwrap_or(4);
+        let rows_per_block = (SCORE_BYTES / (columns.max(1) * score_bytes)).max(1);
         let mut selected = Vec::new();
         let mut ranked = Vec::new();
         for first in (0..tokens).step_by(rows_per_block) {
@@ -509,6 +518,7 @@ impl Indexer {
                     weights: Some(&weights),
                     query: Format::Mxfp4,
                     candidates: restricted,
+                    scores: score,
                 },
             )?;
             if config.split.size() > 1 {
@@ -548,9 +558,13 @@ impl Indexer {
     }
 }
 
-/// The FP32 scores one block of an [`Indexer`]'s query rows holds at most, in bytes: 256 query
-/// rows over a million entries, the whole of a decode batch's rows.
+/// The scores one block of an [`Indexer`]'s query rows holds at most, in bytes: 512 query rows
+/// over a million entries, the whole of a decode batch's rows.
 const SCORE_BYTES: usize = 1 << 30;
+
+/// The type an [`Indexer`] scores in: DeepSeek's indexer's BF16 arithmetic, whose order its BF16
+/// `topk` ranks.
+const SCORE: DType = DType::BF16;
 
 /// The rows of `blocks` in order, one block taken as it is.
 fn joined(mut blocks: Vec<Tensor>) -> Result<Tensor> {

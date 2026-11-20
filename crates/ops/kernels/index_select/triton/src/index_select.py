@@ -17,6 +17,9 @@ row's passes read what its request holds rather than the whole table, and the
 slots past the ranked blocks are ``-1``. A row of candidate columns ranks
 every column.
 
+The scores are FP32 or BF16; a BF16 score is read as its FP32 value, which
+keeps its order, so both are ranked by the same keys.
+
 The selection is ``top_k``'s radix select without its ordering: four passes
 of eight bits over the row's monotone 32-bit keys, most significant first,
 each counting the keys of the prefix fixed so far by their next byte and
@@ -56,10 +59,11 @@ def _pooled(scores, base, lanes, columns, pin, POOL: tl.constexpr):
     """  # noqa: D205
     if POOL == 1:
         value = tl.load(scores + base + lanes, mask=lanes < columns, other=float("-inf"))
+        value = value.to(tl.float32)
     else:
         column = lanes[:, None] * POOL + tl.arange(0, POOL)[None, :]
         block = tl.load(scores + base + column, mask=column < columns, other=float("-inf"))
-        value = tl.max(block, axis=1)
+        value = tl.max(block.to(tl.float32), axis=1)
         value = tl.where(lanes == pin, float("inf"), value)
     return value
 
@@ -78,7 +82,7 @@ def _index_select_kernel(
 ):
     """Keep the ``kept`` best pooled scores of one row. Grid: (rows,).
 
-    ``scores`` is ``[rows, columns]`` FP32, ``visible`` ``[rows]`` U32,
+    ``scores`` is ``[rows, columns]`` FP32 or BF16, ``visible`` ``[rows]`` U32,
     ``candidates`` ``[rows, columns / CANDIDATES]`` I32 (read when
     ``CANDIDATES`` is not zero) and ``out`` ``[rows, kept]`` I32. A chunk is
     ``LANES`` pooled entries: ``TILE / POOL`` blocks, so one pass reads
@@ -187,7 +191,7 @@ def _index_select_kernel(
 
 def derive(fields, parameters, target):
     """The pooled entries one chunk holds: ``tile`` scores, ``tile / pool``
-    blocks.
+    blocks, and the scores' type, FP32 unless the key states it.
 
     Raises:
         SystemExit: When the pool does not divide the tile into a power of
@@ -198,4 +202,4 @@ def derive(fields, parameters, target):
         raise SystemExit(f"blocks of {pool} do not divide a tile of {tile}")
     if pool > 1 and fields["candidates"]:
         raise SystemExit("the block mode ranks unrestricted scores")
-    return {"lanes": tile // pool}
+    return {"lanes": tile // pool, "scores": fields.get("scores", "f32")}

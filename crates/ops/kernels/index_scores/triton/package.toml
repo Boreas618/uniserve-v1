@@ -6,18 +6,19 @@
 # visible group. The keys are BF16 rows or MXFP4 records in the page layout
 # (`crates/ops/src/record.rs`); a query is read as it is or rounded to MXFP4
 # blocks; the columns are the request's groups or the groups of its candidate
-# blocks.
+# blocks; the scores are FP32 sums, or DeepSeek's indexer's BF16 rounding of
+# each head's product, its weighted value and the sum.
 
 op = "index_scores"
 backend = "triton"
-interface_version = 1
+interface_version = 2
 
 [source]
 kind = "triton"
 
 # The derivation gives the variants a key prints only when they are set (an
-# unweighted, unrounded, dense scoring names none of them) and the heads' tile
-# of the products, padded to at least sixteen rows.
+# unweighted, unrounded, dense FP32 scoring names none of them) and the heads'
+# tile of the products, padded to at least sixteen rows.
 [launch]
 kernel = "_index_scores_kernel"
 warps = 8
@@ -34,7 +35,7 @@ page_table = "*i32"
 rows = "*i32"
 visible = "*i32"
 candidates = "*i32"
-out = "*fp32"
+out = { field = "scores", values = { f32 = "*fp32", bf16 = "*bf16" } }
 tokens = "i64"
 max_pages = "i64"
 blocks = "i64"
@@ -49,10 +50,12 @@ KEYS_MXFP4 = { field = "keys", values = { bf16 = false, mxfp4 = true } }
 WEIGHTED = { field = "weighted" }
 QUERY_MXFP4 = { field = "query", values = { bf16 = false, mxfp4 = true } }
 CANDIDATES = { field = "candidates" }
+SCORES_BF16 = { field = "scores", values = { f32 = false, bf16 = true } }
 
-# `dtype_bf16_keys_mxfp4_heads_32_width_128_groups_64_block_256_weighted_true_query_mxfp4_candidates_8`.
+# `dtype_bf16_keys_mxfp4_heads_32_width_128_groups_64_block_256_weighted_true_query_mxfp4_candidates_8_scores_bf16`.
 #
 # `width` and `block` are `tl.arange` extents; the products need a width of at
-# least sixteen. `weighted`, `query` and `candidates` appear only when set.
+# least sixteen. `weighted`, `query`, `candidates` and `scores` appear only
+# when set.
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16"], keys = ["bf16", "mxfp4"], heads = { min = 1 }, width = { power_of_two = true, min = 16 }, groups = { min = 1 }, block = { power_of_two = true, min = 16 }, weighted = ["true", "false"], query = ["bf16", "mxfp4"], candidates = { min = 1 } }
+dimensions = { dtype = ["bf16"], keys = ["bf16", "mxfp4"], heads = { min = 1 }, width = { power_of_two = true, min = 16 }, groups = { min = 1 }, block = { power_of_two = true, min = 16 }, weighted = ["true", "false"], query = ["bf16", "mxfp4"], candidates = { min = 1 }, scores = ["f32", "bf16"] }

@@ -62,7 +62,7 @@ fn check_rows(owner: &'static str, rows: &Tensor, tokens: usize) -> Result<()> {
     Ok(())
 }
 
-/// How [`index_scores`] scores beyond the plain sum of rectified products.
+/// How [`index_scores`] scores beyond the plain FP32 sum of rectified products.
 #[derive(Clone, Copy)]
 pub struct IndexScoring<'t> {
     /// `[tokens, heads]` F32: each row's head weights, when the heads are weighted.
@@ -74,15 +74,21 @@ pub struct IndexScoring<'t> {
     /// scores are restricted to them: column `c` then scores group `candidates[t, c / B] · B +
     /// c mod B`, a negative block naming none.
     pub candidates: Option<(&'t Tensor, u32)>,
+    /// The type the scores round into and are returned in: [`DType::F32`], the FP32 sum of the
+    /// weighted rectified products; or [`DType::BF16`], DeepSeek's indexer's arithmetic, which
+    /// rounds each head's product, its weight and its weighted value to BF16, sums the heads in
+    /// FP32 and rounds the sum to BF16 ([`ops::attention::IndexScores`]).
+    pub scores: DType,
 }
 
 impl Default for IndexScoring<'_> {
-    /// The unweighted sum over every visible group, each query read as it is.
+    /// The unweighted FP32 sum over every visible group, each query read as it is.
     fn default() -> Self {
         Self {
             weights: None,
             query: Format::Bf16,
             candidates: None,
+            scores: DType::F32,
         }
     }
 }
@@ -98,8 +104,8 @@ fn monotone(value: f32) -> u32 {
     }
 }
 
-/// The scores of the index keys each query row may select among: `[tokens, columns]` FP32,
-/// `−inf` for a column of no visible group.
+/// The scores of the index keys each query row may select among: `[tokens, columns]` of the
+/// scoring's type, `−inf` for a column of no visible group.
 ///
 /// `query` is `[tokens, heads, width]`, the rows' index queries. `keys` is the layer's index-key
 /// plane: `[pages, groups, width]` plain values for [`Format::Bf16`] (BF16, or F16/F32 on the CPU),
@@ -112,8 +118,8 @@ fn monotone(value: f32) -> u32 {
 /// # Errors
 ///
 /// A plane of another width than the queries or of another layout than a packed one's, columns
-/// that are not one entry per token, weights or candidates of other shapes, or the operator's
-/// refusal.
+/// that are not one entry per token, weights or candidates of other shapes, scores of another
+/// type than FP32 or BF16, or the operator's refusal.
 pub fn index_scores(
     query: &Tensor,
     keys: Plane<'_>,
@@ -168,6 +174,15 @@ pub fn index_scores(
             format!(
                 "the visible counts are {:?}, [{tokens}] u32 expected",
                 visible.dims()
+            ),
+        ));
+    }
+    if !matches!(scoring.scores, DType::F32 | DType::BF16) {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "{} scores: FP32 or BF16 expected",
+                ops::abi::name(scoring.scores)
             ),
         ));
     }
@@ -284,7 +299,14 @@ impl Fused for IndexScoresCall<'_> {
                 .collect();
             Tensor::from_vec(rounded, (tokens, heads, width), &Device::Cpu)?
         };
+        // BF16 scores weight by the weights' BF16 values, as the reference's weights are.
         let weights = match scoring.weights {
+            Some(weights) if scoring.scores == DType::BF16 => Some(
+                weights
+                    .to_dtype(DType::BF16)?
+                    .to_dtype(DType::F32)?
+                    .to_vec2::<f32>()?,
+            ),
             Some(weights) => Some(weights.to_vec2::<f32>()?),
             None => None,
         };
@@ -323,17 +345,26 @@ impl Fused for IndexScoresCall<'_> {
                     &Tensor::from_vec(slots.clone(), slots.len(), &Device::Cpu)?,
                     0,
                 )?;
-                // `[heads, n]` rectified products, weighted per head and summed over the heads.
-                let products = queries.get(token)?.matmul(&seen_keys.t()?)?.relu()?;
+                // `[heads, n]` rectified products, weighted per head and summed over the heads in
+                // FP32. BF16 scores round where DeepSeek's indexer rounds: each head's product,
+                // its weighted value and the sum.
+                let rounded = |tensor: Tensor| -> Result<Tensor> {
+                    Ok(if scoring.scores == DType::BF16 {
+                        tensor.to_dtype(DType::BF16)?.to_dtype(ACCUMULATE)?
+                    } else {
+                        tensor
+                    })
+                };
+                let products = rounded(queries.get(token)?.matmul(&seen_keys.t()?)?)?.relu()?;
                 let products = match &weights {
-                    Some(weights) => products.broadcast_mul(&Tensor::from_vec(
+                    Some(weights) => rounded(products.broadcast_mul(&Tensor::from_vec(
                         weights[token].clone(),
                         (heads, 1),
                         &Device::Cpu,
-                    )?)?,
+                    )?)?)?,
                     None => products,
                 };
-                let summed = products.sum(0)?.to_vec1::<f32>()?;
+                let summed = rounded(products.sum(0)?)?.to_vec1::<f32>()?;
                 let mut next = summed.into_iter();
                 for (column, group) in named.iter().enumerate() {
                     if group.is_some() {
@@ -343,7 +374,8 @@ impl Fused for IndexScoresCall<'_> {
             }
             scores.push(Tensor::from_vec(out, columns, &Device::Cpu)?);
         }
-        Ok(Tensor::stack(&scores, 0)?)
+        // A BF16 score is a BF16 value already: the conversion is exact.
+        Ok(Tensor::stack(&scores, 0)?.to_dtype(scoring.scores)?)
     }
 
     fn launch(self) -> Result<Self::Output> {
@@ -359,20 +391,27 @@ impl Fused for IndexScoresCall<'_> {
             groups,
             columns,
         } = self;
-        let out = ops::empty((tokens, columns), DType::F32)?;
+        let descriptor = IndexScoresDescriptor {
+            weighted: scoring.weights.is_some(),
+            query: scoring.query,
+            candidates: scoring.candidates.map_or(0, |(_, block)| block),
+            scores: scoring.scores,
+            ..IndexScoresDescriptor::new(
+                query.dtype(),
+                keys.format,
+                heads as u32,
+                width as u32,
+                groups as u32,
+            )
+        };
+        let out = ops::empty((tokens, columns), scoring.scores)?;
+        // The call's transient workspace, which the package serving the descriptor may use.
+        let workspace = ops::empty(
+            IndexScores::workspace_bytes(&descriptor, tokens as u64) as usize,
+            DType::U8,
+        )?;
         ops::launch::<IndexScores>(
-            &IndexScoresDescriptor {
-                weighted: scoring.weights.is_some(),
-                query: scoring.query,
-                candidates: scoring.candidates.map_or(0, |(_, block)| block),
-                ..IndexScoresDescriptor::new(
-                    query.dtype(),
-                    keys.format,
-                    heads as u32,
-                    width as u32,
-                    groups as u32,
-                )
-            },
+            &descriptor,
             IndexScoresArgs {
                 query: ops::operand(query)?,
                 weights: scoring.weights.map(ops::operand).transpose()?,
@@ -385,6 +424,7 @@ impl Fused for IndexScoresCall<'_> {
                     .map(|(candidates, _)| ops::operand(candidates))
                     .transpose()?,
                 out: ops::operand(&out)?,
+                workspace: ops::operand(&workspace)?,
             },
         )?;
         Ok(out)
@@ -423,7 +463,7 @@ fn keys_decoded(keys: &Plane<'_>, width: usize) -> Result<Tensor> {
     )?)
 }
 
-/// The `kept` best groups (or blocks) of each row of `scores`, `[tokens, columns]` F32:
+/// The `kept` best groups (or blocks) of each row of `scores`, `[tokens, columns]` FP32 or BF16:
 /// `[tokens, kept]` I32, `-1` for a kept slot whose score is `−inf` ([`ops::attention::IndexSelect`]).
 ///
 /// With `pool > 1` a block of `pool` columns ranks by its largest score, the block holding the
@@ -458,7 +498,7 @@ pub fn index_select(
         ));
     };
     let blocks = columns.div_ceil(pool.max(1) as usize);
-    if scores.dtype() != DType::F32
+    if !matches!(scores.dtype(), DType::F32 | DType::BF16)
         || pool == 0
         || kept == 0
         || kept > blocks
@@ -532,7 +572,11 @@ impl Fused for IndexSelectCall<'_> {
             pool,
             kept,
         } = self;
-        let (scores, visible) = (scores.to_vec2::<f32>()?, column(visible)?);
+        // A BF16 score converts to FP32 exactly, in the same order.
+        let (scores, visible) = (
+            scores.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            column(visible)?,
+        );
         let candidates = match candidates {
             Some((candidates, block)) => Some((candidates.to_vec2::<i32>()?, block as usize)),
             None => None,
@@ -613,7 +657,10 @@ impl Fused for IndexSelectCall<'_> {
         } = self;
         let out = ops::empty((scores.dims()[0], kept), DType::I32)?;
         ops::launch::<IndexSelect>(
-            &IndexSelectDescriptor::new(pool, candidates.map_or(0, |(_, block)| block)),
+            &IndexSelectDescriptor {
+                scores: scores.dtype(),
+                ..IndexSelectDescriptor::new(pool, candidates.map_or(0, |(_, block)| block))
+            },
             IndexSelectArgs {
                 scores: ops::operand(scores)?,
                 visible: ops::operand(visible)?,
