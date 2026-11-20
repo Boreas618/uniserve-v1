@@ -142,3 +142,7 @@ act_and_mul = 2
 # pointers after the map; its descriptor states its scoring and whether it reads a selection bias,
 # a pointer after the scale's kind.
 topk_softmax = 3
+# The attention's arguments hold the workspace its cache group lends, and a native package receives
+# them as the call structure `uniserve_latent_attention_call`; an engine of the first version
+# launches every package as a Triton cubin.
+latent_attention = 2

@@ -642,7 +642,9 @@ impl LatentAttention {
     /// `query` is the `[tokens, heads, head_dim]` BF16 queries before their rotation, which the
     /// forward rotates in place; `kv` the `[tokens, head_dim]` latent projection before its
     /// normalization, written into `window` at each token's position; `compressed` the
-    /// compressed plane and the queries' selection, for a layer that reads compressed entries.
+    /// compressed plane and the queries' selection, for a layer that reads compressed entries;
+    /// `workspace` the `[bytes]` U8 scratch the attention's programs are lent, which execution
+    /// reserves with the cache group the window comes from.
     ///
     /// # Errors
     ///
@@ -653,6 +655,7 @@ impl LatentAttention {
         window: Plane<'_>,
         compressed: Option<Selected<'_>>,
         batch: &LatentBatch<'_>,
+        workspace: &Tensor,
     ) -> Result<Tensor> {
         let config = &self.config;
         let rotated = config.rotated > 0;
@@ -684,6 +687,7 @@ impl LatentAttention {
             (batch.rows, batch.positions),
             &self.sink,
             config.scale,
+            workspace,
         )?;
         if rotated {
             functional::rotary_trailing_(&attended, batch.cos, batch.sin, true)?;

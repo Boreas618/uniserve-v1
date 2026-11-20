@@ -30,15 +30,30 @@
 //! multiplies its latent, as the reference's tensor-core product does, and the output rounds
 //! once. The queries arrive rotated and the output leaves as attended: the rotation and its
 //! inverse are [`crate::rope::RopeApply`]'s.
+//!
+//! # The packages
+//!
+//! A Triton program walks each token's entries itself, from the tables, the positions and the
+//! selection above, and takes the arguments its package declares. A native module instead
+//! receives [`LatentAttentionCall`] and owns its whole host side: the `flashmla` package reads
+//! the entries by their slot in the planes, which it materializes from the same tables into the
+//! call's workspace before its attention. One operator is served by two kinds of program, which
+//! is why the descriptor names no backend and the store decides.
+//!
+//! The workspace is transient scratch the caller lends, as paged attention's is:
+//! [`workspace_bytes`] is what a call of a descriptor needs at most, and a module refuses a
+//! shorter one. A Triton launch reads none of it.
 
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use super::{address, to_i64};
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
-use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::operand::Operand;
 use crate::record::Format;
 use crate::tolerance::{self, Tolerance};
@@ -51,6 +66,48 @@ const LATENT_ENVELOPE: f32 = 64.0;
 
 /// The query heads one program attends: the rows of its products.
 const HEAD_BLOCK: u32 = 16;
+
+/// The entries a native module reads as one block, which its workspace holds whole rows of:
+/// FlashMLA's `B_TOPK`, the entries one of its tile loads gathers.
+const SLOT_BLOCK: u64 = 64;
+
+/// The bytes a package may carve its workspace into, and the alignment of each region it holds
+/// ([`crate::allocator::ALIGNMENT`], the alignment every operand has).
+const WORKSPACE_ALIGNMENT: u64 = 256;
+
+/// `value` rounded up to a whole multiple of `granule`.
+const fn aligned(value: u64, granule: u64) -> u64 {
+    value.div_ceil(granule) * granule
+}
+
+/// The workspace bytes a call of `descriptor` over `tokens` query tokens needs at most: what a
+/// native module carves out of it, each region aligned to [`WORKSPACE_ALIGNMENT`].
+///
+/// A module reads the entries of a token by their slot in the planes, so the regions are, in
+/// order: one row of `SLOT_BLOCK`-aligned window slots per token and one window length per
+/// token, then, for a compilation with a compressed side, the same two over the selection's
+/// columns, and last one FP32 normalizer per query head of a token. A Triton launch reads none
+/// of them, and a module that needs fewer bytes refuses nothing.
+pub fn workspace_bytes(descriptor: &LatentAttentionDescriptor, tokens: u64) -> u64 {
+    const WORD: u64 = 4;
+
+    let slots = |columns: u64| {
+        aligned(
+            tokens * aligned(columns, SLOT_BLOCK) * WORD,
+            WORKSPACE_ALIGNMENT,
+        ) + aligned(tokens * WORD, WORKSPACE_ALIGNMENT)
+    };
+    let compressed = descriptor
+        .compressed
+        .map_or(0, |side| slots(u64::from(side.columns)));
+
+    slots(u64::from(descriptor.window))
+        + compressed
+        + aligned(
+            tokens * u64::from(descriptor.heads) * WORD,
+            WORKSPACE_ALIGNMENT,
+        )
+}
 
 /// The compressed side of a `latent_attention` compilation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -165,8 +222,89 @@ pub struct LatentAttentionArgs {
     pub sink: Operand,
     /// `[tokens, heads, head_dim]`, contiguous: receives the attended latents.
     pub out: Operand,
+    /// `[bytes]` U8: transient scratch a native module carves ([`workspace_bytes`]), which it
+    /// refuses when it is short; a Triton launch reads none of it.
+    pub workspace: Operand,
     /// The factor the scores are multiplied by.
     pub scale: f32,
+}
+
+/// The call structure a native package's entry receives, declared to the packages as
+/// `uniserve_latent_attention_call` (`uniserve_latent_attention.h`, generated with its layout
+/// asserted: [`abi`]).
+///
+/// The planes are `[pages, entries, record]` bytes of the descriptor's formats, the tables
+/// `[rows, pages]` page ids, and the module addresses an entry as the operator states it: page
+/// `table[row, (e / entries) mod pages]`, slot `e mod entries`. A window-only compilation is
+/// handed null for every compressed operand and zero widths.
+#[repr(C)]
+#[derive(Debug, abi::Layout)]
+pub struct LatentAttentionCall {
+    /// `[tokens, heads, head_dim]`, contiguous: the rotated queries.
+    pub query: *const c_void,
+    /// `[tokens, heads, head_dim]`, contiguous: receives the attended latents.
+    pub out: *mut c_void,
+    /// `[pages, page, window_record]` bytes: the window entries' records.
+    pub window: *const c_void,
+    /// `[rows, window_pages]` u32: each row's window pages.
+    pub window_table: *const c_void,
+    /// `[rows]` u32: the first position whose window entry each row holds.
+    pub window_starts: *const c_void,
+    /// `[pages, entries, compressed_record]` bytes, or null for a window-only compilation.
+    pub compressed: *const c_void,
+    /// `[rows, compressed_pages]` u32, or null.
+    pub compressed_table: *const c_void,
+    /// `[tokens, columns]` i32: the compressed entries each query attends, a negative one none;
+    /// null for a window-only compilation.
+    pub selection: *const c_void,
+    /// `[tokens]` u32: each token's row of the tables.
+    pub rows: *const c_void,
+    /// `[tokens]` i32: each token's position, the newest window entry it attends.
+    pub positions: *const c_void,
+    /// `[heads]` f32: each head's sink logit.
+    pub sink: *const c_void,
+    /// The scratch the module carves, and its bytes; the entry refuses a short one.
+    pub workspace: *mut c_void,
+    /// Bytes of `workspace`.
+    pub workspace_bytes: i64,
+    /// Query tokens of the call.
+    pub tokens: i64,
+    /// Query heads of a token.
+    pub heads: i64,
+    /// Elements of a head and of a latent.
+    pub head_dim: i64,
+    /// Window entries a query attends: its own position and the ones before it.
+    pub window_size: i64,
+    /// Window entries per page.
+    pub page: i64,
+    /// Columns of the window table: a ring of pages when it is narrower than the request.
+    pub window_pages: i64,
+    /// Bytes of one window record.
+    pub window_record: i64,
+    /// Pages of the window plane.
+    pub window_plane_pages: i64,
+    /// Compressed entries per page; zero for a window-only compilation.
+    pub entries: i64,
+    /// Columns of a selection row; zero for a window-only compilation.
+    pub columns: i64,
+    /// Columns of the compressed table; zero for a window-only compilation.
+    pub compressed_pages: i64,
+    /// Bytes of one compressed record; zero for a window-only compilation.
+    pub compressed_record: i64,
+    /// Pages of the compressed plane; zero for a window-only compilation.
+    pub compressed_plane_pages: i64,
+    /// The multiprocessors of the device the call runs on.
+    pub multiprocessors: i64,
+    /// The factor the scores are multiplied by.
+    pub scale: f32,
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
+}
+
+impl NativeCall for LatentAttentionCall {
+    fn message(&self) -> Option<&str> {
+        abi::message(&self.error)
+    }
 }
 
 /// Checks a `[rows, max_pages]` U32 page table and answers its width.
@@ -332,6 +470,13 @@ impl Op for LatentAttention {
             .require_shape(Self::NAME, &[heads])
             .and_then(|()| args.sink.require_row(Self::NAME, DType::F32, heads))
             .map_err(|error| Error::argument(Self::NAME, format!("the sink: {error}")))?;
+        args.workspace
+            .require_rank(Self::NAME, 1)
+            .and_then(|()| {
+                args.workspace
+                    .require_row(Self::NAME, DType::U8, args.workspace.dim(0))
+            })
+            .map_err(|error| Error::argument(Self::NAME, format!("the workspace: {error}")))?;
         Ok(())
     }
 
@@ -350,6 +495,13 @@ impl Op for LatentAttention {
             Some(side) => (&side.plane, &side.table, &side.selection),
             None => (&null, &null, &null),
         };
+
+        // A native module keeps the `LatentAttentionCall` structure and owns its own grid and
+        // its workspace; a Triton program is this crate's own kernel over the arguments its
+        // package declares, one program per head block of a token.
+        if !kernel.is_cubin() {
+            return Self::launch_module(kernel, descriptor, &args, stream);
+        }
 
         let mut arguments = Arguments::new(Self::NAME);
         arguments
@@ -397,6 +549,75 @@ impl Op for LatentAttention {
 
         Tolerance::rounding(reduction, DType::F32, descriptor.dtype)
             .with_atol((value_term * f64::from(LATENT_ENVELOPE)) as f32)
+    }
+}
+
+impl LatentAttention {
+    /// Calls a native module's entry with [`LatentAttentionCall`], the call `check` passed.
+    ///
+    /// The module reads the extents of the planes and the tables from the call, so one module
+    /// serves every page count, table width and token count of its descriptor; the widths the
+    /// descriptor fixes travel with it, and the entry refuses a call that disagrees with the
+    /// compilation.
+    fn launch_module(
+        kernel: &Kernel,
+        descriptor: &LatentAttentionDescriptor,
+        args: &LatentAttentionArgs,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = Self::NAME;
+        let head_dim = u64::from(descriptor.head_dim);
+        let tokens = args.query.dim(0);
+        let null = Operand::unread();
+        let (plane, table, selection) = match &args.compressed {
+            Some(side) => (&side.plane, &side.table, &side.selection),
+            None => (&null, &null, &null),
+        };
+        let side = descriptor.compressed;
+
+        let mut call = LatentAttentionCall {
+            query: address(args.query.ptr) as usize as *const c_void,
+            out: address(args.out.ptr) as usize as *mut c_void,
+            window: address(args.window.ptr) as usize as *const c_void,
+            window_table: address(args.window_table.ptr) as usize as *const c_void,
+            window_starts: address(args.window_starts.ptr) as usize as *const c_void,
+            compressed: address(plane.ptr) as usize as *const c_void,
+            compressed_table: address(table.ptr) as usize as *const c_void,
+            selection: address(selection.ptr) as usize as *const c_void,
+            rows: address(args.rows.ptr) as usize as *const c_void,
+            positions: address(args.positions.ptr) as usize as *const c_void,
+            sink: address(args.sink.ptr) as usize as *const c_void,
+            workspace: address(args.workspace.ptr) as usize as *mut c_void,
+            workspace_bytes: to_i64(name, args.workspace.numel())?,
+            tokens: to_i64(name, tokens)?,
+            heads: i64::from(descriptor.heads),
+            head_dim: i64::from(descriptor.head_dim),
+            window_size: i64::from(descriptor.window),
+            page: i64::from(descriptor.page),
+            window_pages: to_i64(name, args.window_table.dim(1))?,
+            window_record: to_i64(name, descriptor.window_format.record_bytes(head_dim))?,
+            window_plane_pages: to_i64(name, args.window.dim(0))?,
+            entries: side.map_or(0, |side| i64::from(side.entries)),
+            columns: side.map_or(0, |side| i64::from(side.columns)),
+            compressed_pages: match side {
+                Some(_) => to_i64(name, table.dim(1))?,
+                None => 0,
+            },
+            compressed_record: match side {
+                Some(side) => to_i64(name, side.format.record_bytes(head_dim))?,
+                None => 0,
+            },
+            compressed_plane_pages: match side {
+                Some(_) => to_i64(name, plane.dim(0))?,
+                None => 0,
+            },
+            multiprocessors: i64::from(stream.device().multiprocessors()?),
+            scale: args.scale,
+            error: [0; MESSAGE],
+        };
+        // SAFETY: `LatentAttentionCall` is the call structure this package's entry declares: the
+        // declaration is generated from this definition, with its layout asserted.
+        unsafe { kernel.native(&mut call, stream) }
     }
 }
 

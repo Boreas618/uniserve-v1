@@ -315,6 +315,8 @@ fn check_layer(layer: usize, ratio: u32, candidates: Candidates) {
         )
         .unwrap();
     compressor.store_(&completed, compressed, &batch).unwrap();
+    // The CPU formula reads no scratch; a device program carves the workspace the group lends.
+    let workspace = Tensor::zeros(1, DType::U8, &Device::Cpu).unwrap();
     let attend = |chosen: &Tensor| {
         let query = vectors.get("q").copy().unwrap();
         attention
@@ -326,6 +328,7 @@ fn check_layer(layer: usize, ratio: u32, candidates: Candidates) {
                     selection: chosen,
                 }),
                 &batch,
+                &workspace,
             )
             .unwrap()
     };

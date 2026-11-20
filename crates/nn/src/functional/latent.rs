@@ -730,10 +730,14 @@ pub struct Selected<'t> {
 /// `positions` (`[tokens]` I32) its position and `sink` the `[heads]` F32 sink logits. Answers
 /// `[tokens, heads, head_dim]` BF16.
 ///
+/// `workspace` is the `[bytes]` U8 scratch the operator's native programs read the entries by
+/// their slot through ([`ops::attention::latent_attention_workspace_bytes`] is what a call of
+/// these shapes needs); execution lends it with the cache group the planes come from.
+///
 /// # Errors
 ///
-/// Operands of other shapes than these, planes of another width than the heads, or the
-/// operator's refusal.
+/// Operands of other shapes than these, planes of another width than the heads, a plane whose
+/// records do not keep their own scales, or the operator's refusal.
 pub fn latent_attention(
     query: &Tensor,
     window: Window<'_>,
@@ -741,6 +745,7 @@ pub fn latent_attention(
     (rows, positions): (&Tensor, &Tensor),
     sink: &Tensor,
     scale: f32,
+    workspace: &Tensor,
 ) -> Result<Tensor> {
     const OWNER: &str = LatentAttentionCall::OWNER;
 
@@ -800,6 +805,31 @@ pub fn latent_attention(
     check_column(OWNER, "rows", rows, DType::U32, tokens)?;
     check_column(OWNER, "positions", positions, DType::I32, tokens)?;
 
+    // Every program reads a record's scales after its own values: the attention gathers entries
+    // of many pages at once, where a page-laid record's scales lie far from them.
+    let laid = [
+        Some(window.plane.layout),
+        compressed.map(|side| side.plane.layout),
+    ];
+    if laid.iter().flatten().any(|layout| *layout != Layout::Entry) {
+        return Err(Error::shape(
+            OWNER,
+            "the attention reads records whose scales follow their own values; the window or the \
+             compressed plane keeps its scales per page"
+                .to_owned(),
+        ));
+    }
+    if workspace.dims().len() != 1 || workspace.dtype() != DType::U8 {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "the workspace is {} {:?}, [bytes] u8 expected",
+                ops::abi::name(workspace.dtype()),
+                workspace.dims()
+            ),
+        ));
+    }
+
     compute(LatentAttentionCall {
         query,
         window,
@@ -808,6 +838,7 @@ pub fn latent_attention(
         positions,
         sink,
         scale,
+        workspace,
         tokens,
         heads,
         head_dim,
@@ -823,6 +854,7 @@ struct LatentAttentionCall<'t> {
     positions: &'t Tensor,
     sink: &'t Tensor,
     scale: f32,
+    workspace: &'t Tensor,
     tokens: usize,
     heads: usize,
     head_dim: usize,
@@ -848,6 +880,7 @@ impl Fused for LatentAttentionCall<'_> {
             positions,
             sink,
             scale,
+            workspace: _,
             tokens,
             heads,
             head_dim,
@@ -941,6 +974,7 @@ impl Fused for LatentAttentionCall<'_> {
             positions,
             sink,
             scale,
+            workspace,
             tokens,
             heads,
             head_dim,
@@ -981,6 +1015,7 @@ impl Fused for LatentAttentionCall<'_> {
                 positions: ops::operand(positions)?,
                 sink: ops::operand(sink)?,
                 out: ops::operand(&out)?,
+                workspace: ops::operand(workspace)?,
                 scale,
             },
         )?;

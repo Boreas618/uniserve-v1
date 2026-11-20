@@ -306,6 +306,12 @@ fn headers() -> Vec<Header> {
         )
         .structure::<attention::sparse::SparseCall>("uniserve_sparse_attention_call"),
         Header::new(
+            committed!("uniserve_latent_attention.h"),
+            "src/attention/latent.rs",
+            "The call structure of `latent_attention`'s native packages",
+        )
+        .structure::<attention::latent::LatentAttentionCall>("uniserve_latent_attention_call"),
+        Header::new(
             committed!("uniserve_moe_sort.h"),
             "src/moe/sort.rs",
             "The call structure of `moe_sort`'s packages",

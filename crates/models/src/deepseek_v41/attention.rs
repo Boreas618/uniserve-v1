@@ -352,9 +352,13 @@ impl Attention {
                 self.layer,
                 &mut held.2,
             )?;
-            let attended = self
-                .attention
-                .forward((&query, &kv), window, selected, batch)?;
+            let attended = self.attention.forward(
+                (&query, &kv),
+                window,
+                selected,
+                batch,
+                &inputs.window.workspace,
+            )?;
 
             // The grouped output projection: each group's heads to its rank, then together.
             let groups = self.wo_a.len();
