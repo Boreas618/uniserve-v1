@@ -582,17 +582,51 @@ pub(crate) fn post_json(path: &str, body: &serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+/// What the leader did through its process link, as the fakes saw it: a request it made of a
+/// node (boxed, as a request is far larger than a command), or a command it sent the engine of a
+/// launch generation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Seen {
+    Request(Box<proto::process::request::Kind>),
+    Command(u64, proto::process::command::Kind),
+}
+
+/// The commands the leader sent the engines, by launch generation: shared by the fake nodes,
+/// which take the ones sent before each request they answer, and the fake engines' delivery.
+type Sent = Arc<std::sync::Mutex<Receiver<(u64, proto::process::Command)>>>;
+
+/// The commands taken from `sent` and not yet delivered, oldest first.
+type Taken = Arc<std::sync::Mutex<std::collections::VecDeque<(u64, proto::process::Command)>>>;
+
+/// Moves every command waiting in `sent` to `taken`, writing each into `timeline`.
+fn take_sent(sent: &Sent, taken: &Taken, timeline: &std::sync::Mutex<Vec<Seen>>) {
+    let sent = service::lock(sent);
+    let mut taken = service::lock(taken);
+    let mut timeline = service::lock(timeline);
+    while let Ok((engine, command)) = sent.try_recv() {
+        if let Some(kind) = &command.kind {
+            timeline.push(Seen::Command(engine, kind.clone()));
+        }
+        taken.push_back((engine, command));
+    }
+}
+
 /// The engines' and the node daemons' ends of a process link, played by
 /// `testkit::process`: every request the leader makes of a node gets the reply
 /// a node gives it, every engine the leader spawns is a fake engine that
 /// reports as the process interface states, and a test reads what each was
-/// sent. An engine's process link is filed under the launch generation it was
-/// launched under, as the leader's service files it.
+/// sent, and in what order the leader asked the nodes and commanded the engines. An engine's
+/// process link is filed under the launch generation it was launched under, as the leader's
+/// service files it.
 pub(crate) struct Engines {
-    /// Every request the leader made of the nodes, in arrival order.
-    requests: Arc<std::sync::Mutex<Vec<proto::process::request::Kind>>>,
+    /// Every request the leader made of the nodes and every command it sent the engines, in the
+    /// order the leader made them.
+    timeline: Arc<std::sync::Mutex<Vec<Seen>>>,
     /// The commands the daemon sent, by launch generation.
-    commands: std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
+    commands: Sent,
+    /// The commands taken from `commands` for the timeline, which the next delivery delivers
+    /// first.
+    taken: Taken,
     /// The reports the engines send up, by launch generation.
     reports: std::sync::mpsc::Sender<(u64, proto::process::Report)>,
     exits: std::sync::mpsc::Sender<proto::process::Exit>,
@@ -618,19 +652,24 @@ impl Engines {
         let (exits, exited) = std::sync::mpsc::channel();
         let (greetings, greeted) = std::sync::mpsc::channel();
         let (controlled, started) = std::sync::mpsc::channel();
-        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&log);
-        // The leader waits for each reply, so a request is recorded before the
-        // call that made it returns.
+        let (commands, sent) = std::sync::mpsc::channel();
+        let sent: Sent = Arc::new(std::sync::Mutex::new(sent));
+        let taken: Taken = Arc::default();
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (node_sent, node_taken, recorded) =
+            (Arc::clone(&sent), Arc::clone(&taken), Arc::clone(&timeline));
+        // The leader waits for each reply, so a request is recorded before the call that made
+        // it returns; and it sent every command it sent before the request by then, so those
+        // are recorded ahead of it.
         std::thread::spawn(move || {
             while let Ok((request, reply)) = asked.recv() {
+                take_sent(&node_sent, &node_taken, &recorded);
                 if let Some(kind) = &request.kind {
-                    service::lock(&recorded).push(kind.clone());
+                    service::lock(&recorded).push(Seen::Request(Box::new(kind.clone())));
                 }
                 let _ = reply.send(testkit::process::node_reply(&request, &refusals));
             }
         });
-        let (commands, sent) = std::sync::mpsc::channel();
         let (reports, reported) = std::sync::mpsc::channel();
         let waker = service::Waker::new().expect("a waker");
         let link = crate::supervision::processes::ProcessLink {
@@ -644,8 +683,9 @@ impl Engines {
             },
         };
         let engines = Self {
-            requests: log,
+            timeline,
             commands: sent,
+            taken,
             reports,
             exits,
             greetings,
@@ -719,7 +759,9 @@ impl Engines {
     /// sends the engines' reports up. Returns whether one was delivered.
     pub(crate) fn deliver(&mut self) -> bool {
         let mut delivered = false;
-        while let Ok((peer, command)) = self.commands.try_recv() {
+        take_sent(&self.commands, &self.taken, &self.timeline);
+        let taken = std::mem::take(&mut *service::lock(&self.taken));
+        for (peer, command) in taken {
             delivered = true;
             let Some(engine) = self.engines.get_mut(&peer) else {
                 continue;
@@ -782,7 +824,20 @@ impl Engines {
 
     /// Every request the leader made of the nodes, in arrival order.
     pub(crate) fn requests(&self) -> Vec<proto::process::request::Kind> {
-        service::lock(&self.requests).clone()
+        self.timeline()
+            .into_iter()
+            .filter_map(|seen| match seen {
+                Seen::Request(kind) => Some(*kind),
+                Seen::Command(..) => None,
+            })
+            .collect()
+    }
+
+    /// Every request the leader made of the nodes and every command it sent the engines, in
+    /// the order it made them.
+    pub(crate) fn timeline(&self) -> Vec<Seen> {
+        take_sent(&self.commands, &self.taken, &self.timeline);
+        service::lock(&self.timeline).clone()
     }
 
     /// The spawns among them.
