@@ -26,10 +26,15 @@
 //!   `routed_scaling_factor`, SwiGLU clamped at `swiglu_limit`, beside one shared expert;
 //! - the n-gram memories of the layers `engram_layer_ids` ([`EngramConfig`]), which hash the 2- to
 //!   `engram_max_ngram_size`-grams of the normalized vocabulary into `engram_n_heads` heads each
-//!   (`inference/engram.py`).
+//!   (`inference/engram.py`);
+//! - the DSpark drafter ([`DsparkConfig`]): `num_nextn_predict_layers` window-only layers after
+//!   the decoder's (`compress_ratios` states them zero), each a hyper-connected layer of the
+//!   decoder's attention shape over `dspark_n_routed_experts` experts, `dspark_num_experts_per_tok`
+//!   a token; blocks of `dspark_block_size` tokens filled with `dspark_noise_token_id`; the
+//!   residual entering the layers `dspark_target_layer_ids` as its input; a Markov term of rank
+//!   `dspark_markov_rank` (`model.py:1023-1160`).
 //!
-//! The DSpark drafter's layers (`num_nextn_predict_layers`, `dspark_*`) and the vision tower
-//! (`vision_config`) are read by no module here.
+//! The vision tower (`vision_config`) is read by no module here.
 
 use nn::config::Fields;
 use nn::modules::{Candidates, MhcConfig, NgramConfig, Precision, RotaryConfig, Spectrum, Yarn};
@@ -112,6 +117,26 @@ pub struct ExpertConfig {
     pub limit: f32,
 }
 
+/// The DSpark drafter (`model.py:1023-1160`): draft layers after the decoder's that draft a
+/// block of tokens in one forward from the decoder's residual.
+#[derive(Clone, PartialEq, Debug)]
+pub struct DsparkConfig {
+    /// Draft layers: layer `num_hidden_layers + i` is the checkpoint's `mtp.<i>`.
+    pub layers: u32,
+    /// Tokens of a block: the anchor and its fills, the drafts one forward proposes.
+    pub block: u32,
+    /// The token id every position of a block after its anchor embeds.
+    pub noise_token_id: u32,
+    /// The decoder layers whose input residual, averaged over its streams, the drafter reads,
+    /// in the order its projection concatenates them.
+    pub target_layer_ids: Vec<u32>,
+    /// The width of the Markov term's token embedding.
+    pub markov_rank: u32,
+    /// The draft layers' routed experts, beside each layer's shared expert of the decoder's
+    /// width.
+    pub experts: ExpertConfig,
+}
+
 /// Which cache entries and selection one layer's attention reads (`model.py:640-660`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LayerSources {
@@ -164,6 +189,8 @@ pub struct Config {
     pub layers: Vec<LayerSources>,
     /// The n-gram memories, when the model has any.
     pub engram: Option<EngramConfig>,
+    /// The DSpark drafter, when the checkpoint carries one.
+    pub dspark: Option<DsparkConfig>,
     /// What the checkpoint's export declares of its weights' representation.
     pub quantization: Declaration,
 }
@@ -292,9 +319,11 @@ impl Config {
         };
 
         let num_hidden_layers = text.count("num_hidden_layers")?;
+        let ratios = text.indices("compress_ratios")?;
+        let dspark = dspark(&text, num_hidden_layers, &ratios, &experts)?;
         let layers = sources(
             num_hidden_layers,
-            &text.indices("compress_ratios")?,
+            &ratios,
             &text.indices("kv_source_layer_ids")?,
             &text.indices("index_source_layer_ids")?,
             text.optional_index("candidate_source_layer_id")?,
@@ -315,6 +344,7 @@ impl Config {
             experts,
             layers,
             engram,
+            dspark,
             quantization,
         })
     }
@@ -352,12 +382,72 @@ impl Config {
             .collect()
     }
 
+    /// The draft layers' indices, after the decoder's: the layers whose window the DSpark
+    /// drafter keeps, empty for a checkpoint that carries none.
+    pub fn draft_layers(&self) -> std::ops::Range<u32> {
+        let layers = self.dspark.as_ref().map_or(0, |dspark| dspark.layers);
+        self.num_hidden_layers..self.num_hidden_layers + layers
+    }
+
     /// Whether layer `layer` adds an n-gram memory into its streams.
     pub fn has_engram(&self, layer: u32) -> bool {
         self.engram
             .as_ref()
             .is_some_and(|engram| engram.layer_ids.contains(&layer))
     }
+}
+
+/// The DSpark drafter `text` states after the decoder's `layers` layers, whose routed experts
+/// beside the drafter's are `experts`: `None` for a checkpoint of no draft layer or no block.
+///
+/// # Errors
+///
+/// A field missing or of another type, draft layers that `ratios` does not state window-only
+/// (the reference's draft attention reads its window alone), target layers outside the decoder,
+/// or a block of fewer than two tokens.
+fn dspark(
+    text: &Fields<'_>,
+    layers: u32,
+    ratios: &[u32],
+    experts: &ExpertConfig,
+) -> Result<Option<DsparkConfig>> {
+    let draft_layers = text
+        .optional_count("num_nextn_predict_layers")?
+        .unwrap_or(0);
+    let block = text.optional_count("dspark_block_size")?.unwrap_or(0);
+    if draft_layers == 0 || block == 0 {
+        return Ok(None);
+    }
+
+    let window_only =
+        (layers..layers + draft_layers).all(|layer| ratios.get(layer as usize).copied() == Some(0));
+    let target_layer_ids = text.indices("dspark_target_layer_ids")?;
+    if !window_only
+        || block < 2
+        || target_layer_ids.is_empty()
+        || target_layer_ids.iter().any(|&layer| layer >= layers)
+    {
+        return Err(ID.config(format!(
+            "DSpark layers {layers}..{} of compression ratios {:?}, blocks of {block} and target \
+             layers {target_layer_ids:?}: the draft layers attend their window alone, a block \
+             holds an anchor and a fill, and the targets are decoder layers",
+            layers + draft_layers,
+            ratios.get(layers as usize..)
+        )));
+    }
+
+    Ok(Some(DsparkConfig {
+        layers: draft_layers,
+        block,
+        noise_token_id: text.index("dspark_noise_token_id")?,
+        target_layer_ids,
+        markov_rank: text.count("dspark_markov_rank")?,
+        experts: ExpertConfig {
+            experts: text.count("dspark_n_routed_experts")?,
+            top: text.count("dspark_num_experts_per_tok")?,
+            ..*experts
+        },
+    }))
 }
 
 /// Each of `layers` layers' sources (`model.py:640-660`): layer `l` compresses by `ratios[l]`,

@@ -1381,11 +1381,9 @@ impl Fused for GatherGemmMxfp4Call<'_> {
         let x = decoded_mxfp8(&encoded, &scales, ScaleLayout::Linear)?.index_select(&token, 0)?;
 
         // The stack's rows in their own order, read back out of the arrangement the product
-        // declares.
-        let stored = decoded_mxfp4(&up_gate.codes, &up_gate.scales, up_gate.layout)?;
+        // declares, one expert at a time.
         let order = stored_order(up_gate.values, 2 * intermediate)?;
-        let weight = stored.index_select(&order, 1)?.index_select(&expert, 0)?;
-        let projected = weight.matmul(&x.unsqueeze(2)?)?.squeeze(2)?;
+        let projected = expert_products(up_gate, &order, &x, (&live, &expert))?;
 
         // DeepSeek's clamped SwiGLU, each row at its expert's limit.
         let bound = limit.index_select(&expert, 0)?.unsqueeze(1)?;
@@ -1580,10 +1578,8 @@ impl Fused for RouteGemmMxfp4Call<'_> {
         let expert = row_experts(maps, &live, rows)?;
 
         let x = decoded_mxfp8(codes, scales, GATED_SCALE_LAYOUT)?;
-        let stored = decoded_mxfp4(&down.codes, &down.scales, down.layout)?;
         let order = stored_order(down.values, width)?;
-        let weight = stored.index_select(&order, 1)?.index_select(&expert, 0)?;
-        let product = weight.matmul(&x.unsqueeze(2)?)?.squeeze(2)?;
+        let product = expert_products(down, &order, &x, (&live, &expert))?;
 
         Ok(zero_padding(&product, &live)?.to_dtype(DType::BF16)?)
     }
@@ -2159,6 +2155,45 @@ fn row_experts(maps: &Tensor, live: &Tensor, rows: usize) -> Result<Tensor> {
     let expert = map(maps, TILE_TO_EXPERT, rows / TILE.0 as usize)?.index_select(&tile, 0)?;
 
     Ok(live.where_cond(&expert, &expert.zeros_like()?)?)
+}
+
+/// Each permuted row of `x` (`[rows, k]` FP32, on the CPU) times the matrix of its expert in
+/// `stack`, that matrix's rows taken in `order` (`[n]`, their own order out of the stack's
+/// arrangement): `[rows, n]` FP32, zero on the rows that are not `live`.
+///
+/// The live rows are grouped by the expert `experts` names for each, and each expert a live row
+/// names is decoded alone and multiplies its rows at once. So the formula holds one expert's FP32
+/// matrix at a time, whatever the experts and the sort's padded rows: a buffer of mostly padding
+/// (a tile of 128 rows for each of a few routes over many experts) holds no copy of a matrix per
+/// row.
+fn expert_products(
+    stack: &Mxfp4Stack,
+    order: &Tensor,
+    x: &Tensor,
+    (live, experts): (&Tensor, &Tensor),
+) -> Result<Tensor> {
+    let (rows, width) = (x.dim(0)?, order.dim(0)?);
+    let live: Vec<u8> = live.to_dtype(DType::U8)?.to_vec1()?;
+    let experts: Vec<u32> = experts.to_vec1()?;
+
+    let mut members: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+    for (row, (&held, &expert)) in live.iter().zip(&experts).enumerate() {
+        if held != 0 {
+            members.entry(expert).or_default().push(row as u32);
+        }
+    }
+
+    let mut product = Tensor::zeros((rows, width), ACCUMULATE, &Device::Cpu)?;
+    for (expert, rows) in members {
+        let one = |tensor: &Tensor| tensor.narrow(0, expert as usize, 1)?.contiguous();
+        let matrix = decoded_mxfp4(&one(&stack.codes)?, &one(&stack.scales)?, stack.layout)?
+            .squeeze(0)?
+            .index_select(order, 0)?;
+        let rows = Tensor::new(rows.as_slice(), &Device::Cpu)?;
+        let rows_product = x.index_select(&rows, 0)?.matmul(&matrix.t()?)?;
+        product = product.index_add(&rows, &rows_product, 0)?;
+    }
+    Ok(product)
 }
 
 /// `product`, `[rows, width]` FP32, with the rows that are not `live` zero.

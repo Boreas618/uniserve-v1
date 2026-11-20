@@ -141,7 +141,7 @@ use std::sync::Arc;
 
 use crate::batch::philox::{self, DrawAddress};
 use crate::batch::{Batch, CallOutput, CallStatus, Columns, DraftWork, Phase, Row, Rows};
-use nn::{KvCache, NO_SLOT, RecurrentState, TokenBatch, functional};
+use nn::{DraftBlock, DraftContext, KvCache, NO_SLOT, RecurrentState, TokenBatch, functional};
 use platform::Stream;
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::PARAMETER_COLUMNS;
@@ -151,6 +151,7 @@ use super::columns::{self, Column, Layout, slot_row};
 use super::{CausalLmRunner, StateBuffers, history_ids, write_rows};
 use crate::memory::allocation::Storage;
 use crate::memory::cache::CacheLayout;
+use crate::memory::state::keeps_trail;
 use crate::memory::tables::BlockTables;
 use crate::runner::buckets::Bucket;
 use crate::runner::sampler::{self, Sampler};
@@ -504,8 +505,9 @@ impl Kept {
 pub(crate) struct Speculation {
     /// The drafts a verification holds at most.
     pub(crate) drafts: u32,
-    /// How the draft cache lies in the unit pool.
-    pub(crate) pool: DraftPool,
+    /// How the draft cache lies in the unit pool; `None` for a drafter of the block form, whose
+    /// entries lie in the model's own cache fields.
+    pub(crate) pool: Option<DraftPool>,
     /// What the target forwards keep.
     pub(crate) kept: Kept,
     /// The selection of a verification: the runner's sampler over the same two tables, whose
@@ -1225,6 +1227,201 @@ pub(crate) fn fill_drafter(
     layout.put(block, Column::LiveRows, &[sequences as u32])
 }
 
+/// The cache slots of a block drafter's positions in the groups of a batch: the rank's device
+/// block table, which group is a sliding window's, and the tokens of a page; `None` for an idle
+/// step, which writes no entry.
+pub(crate) type BlockSlots<'t> = Option<(&'t BlockTables, &'t [bool], u32)>;
+
+/// Writes into `block` the columns of the block drafter's forward behind `columns`, padded to the
+/// rows of `bucket` (`columns` documents each): the context, which is the batch's tokens, and one
+/// block of `D` tokens per drafter row that proposes, `D` being the layout's drafts.
+///
+/// A verification's drafter rows are its calls: its tokens are written up to the length each
+/// call agreed, which the device bounds, and its block lies after the last accepted token,
+/// anchored at the token the verification installs there. A prompt batch's drafter rows are its
+/// rows: every token is written, and a row that samples and proposes drafts the block after its
+/// last token, anchored at its sample. A block's positions and slots are stated from the
+/// position after the row's first token (a verification's) or its last (a prompt's), in
+/// `2 D` cells of each group, of which the device reads the `D` from the length the row agreed.
+/// A position whose page the row's table holds no writable unit of, and every position of a
+/// full-history group, writes no entry.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for a batch the bucket does not hold, a position that is none, or a slot
+/// the runner does not hold.
+pub(crate) fn fill_block(
+    layout: &Layout,
+    (slots, vocabulary, fill): (u32, u32, u32),
+    columns: &Columns,
+    cache: BlockSlots<'_>,
+    bucket: &Bucket,
+    block: &mut [u8],
+) -> Result<()> {
+    let drafts = layout.drafts();
+    let groups = layout.groups();
+    let rows = &columns.rows;
+    let verify = rows.calls.iter().any(verifying);
+    let (bucket_rows, bucket_tokens) = (bucket.rows as usize, bucket.tokens as usize);
+    let (sequences, tokens) = (rows.rows(), rows.tokens());
+
+    if sequences > bucket_rows || tokens > bucket_tokens || bucket_rows > layout.rows() {
+        return Err(Error::Invalid(format!(
+            "a batch of {sequences} rows and {tokens} tokens does not fit the drafter's bucket \
+             {bucket}"
+        )));
+    }
+    let position = |token: usize| -> Result<u32> {
+        let stated = rows.positions.get(token).copied().unwrap_or(0);
+
+        u32::try_from(stated).map_err(|_| {
+            Error::Invalid(format!(
+                "token {token} states the position {stated}, which the drafter writes no entry at"
+            ))
+        })
+    };
+    let offset = |index: usize| {
+        rows.query_offsets
+            .get(index)
+            .map_or(0, |at| (*at).max(0) as usize)
+    };
+
+    // ---- The context: every token the batch holds, a verification's bounded on the device ----
+
+    let mut entry_rows = vec![NO_SLOT; bucket_tokens];
+    let mut entry_steps = vec![1_u32; bucket_tokens];
+    let mut state_offsets = vec![tokens as u32; bucket_rows + 1];
+    let mut lens = vec![0_u32; bucket_rows];
+    let mut table_rows = vec![slots; bucket_rows];
+    let mut starts = vec![0_u32; bucket_rows];
+    let mut proposal_rows = vec![NO_SLOT; bucket_rows];
+
+    // ---- The blocks: `D` tokens a row, from the position after the row's last entry ----
+
+    let cells = 2 * drafts;
+    let width = bucket_rows * drafts;
+    let mut block_rows = vec![NO_SLOT; width];
+    let steps: Vec<u32> = (0..width).map(|token| (token % drafts) as u32).collect();
+    let mut positions = vec![0_i32; width];
+    let mut anchors = vec![0_u32; bucket_rows];
+    let mut block_lens = vec![0_u32; bucket_rows];
+    let offsets: Vec<u32> = (0..=bucket_rows).map(|row| (row * drafts) as u32).collect();
+    let mut index = vec![0_u32; groups * width];
+    let mut slot_cells = vec![NO_SLOT; groups * bucket_rows * cells];
+
+    // A token that drafts nothing reads a cell that holds no slot: its own row's, which none of
+    // its row's cells does.
+    for group in 0..groups {
+        for token in 0..width {
+            index[group * width + token] =
+                (group * bucket_rows * cells + (token / drafts) * cells + token % drafts) as u32;
+        }
+    }
+
+    for row in 0..sequences {
+        let (first, last) = (offset(row), offset(row + 1).min(tokens));
+        let call = rows
+            .calls
+            .iter()
+            .find(|call| call.rows.contains(&(row as u32)));
+        let work = row_work(columns, row);
+
+        state_offsets[row] = first as u32;
+        if last > first {
+            lens[row] = position(last - 1)? + 1;
+        }
+        if let Some(call) = call {
+            starts[row] = call.replay.start;
+        }
+        for (ahead, token) in (first..last).enumerate() {
+            if verify {
+                entry_rows[token] = row as u32;
+                entry_steps[token] = ahead as u32;
+            } else {
+                entry_steps[token] = 0;
+            }
+        }
+
+        let Some(Ok(slot)) = columns.slots.get(row).copied().map(u32::try_from) else {
+            continue;
+        };
+        table_rows[row] = slot_row(slot, slots)?;
+
+        // A verification's block follows its accepted tokens, which follow its first; a prompt
+        // row's follows its last token, whose sample anchors it.
+        let sampled = rows.logits_rows.get(row).is_some_and(|logits| *logits >= 0);
+        let (base, anchor) = match (verify, last > first) {
+            (true, true) => (position(first)? + 1, first as u32),
+            (false, true) if sampled => (position(last - 1)? + 1, row as u32),
+            _ => continue,
+        };
+        if work.proposals == 0 {
+            continue;
+        }
+        if verify {
+            proposal_rows[row] = row as u32;
+        }
+        anchors[row] = anchor;
+        block_lens[row] = base + drafts as u32;
+        for step in 0..drafts {
+            block_rows[row * drafts + step] = row as u32;
+            positions[row * drafts + step] = (base + step as u32) as i32;
+        }
+
+        let Some((tables, windows, page)) = cache else {
+            continue;
+        };
+        let Some(call) = call else {
+            continue;
+        };
+        for (group, &window) in windows.iter().enumerate().take(groups) {
+            if !window {
+                continue;
+            }
+            let class = group as u8;
+            for cell in 0..cells {
+                let at = base + cell as u32;
+                let entry = at / page.max(1);
+                if let Some((_, unit, 1)) = tables.run(call.slot, class, entry)
+                    && tables.writable(call.slot, class, entry)
+                {
+                    let held = u64::from(unit) * u64::from(page) + u64::from(at % page);
+                    if let Ok(held) = u32::try_from(held)
+                        && held != NO_SLOT
+                    {
+                        slot_cells[(group * bucket_rows + row) * cells + cell] = held;
+                    }
+                }
+            }
+        }
+    }
+    state_offsets[sequences..].fill(tokens as u32);
+
+    layout.put(block, Column::EntryRows, &entry_rows)?;
+    layout.put(block, Column::EntrySteps, &entry_steps)?;
+    layout.put(block, Column::NoSlots, &vec![NO_SLOT; bucket_tokens])?;
+    layout.put(
+        block,
+        Column::TokenCap,
+        &vec![vocabulary - 1; bucket_tokens],
+    )?;
+    layout.put(block, Column::StateOffsets, &state_offsets)?;
+    layout.put(block, Column::DraftLens, &lens)?;
+    layout.put(block, Column::ProposalRows, &proposal_rows)?;
+    layout.put(block, Column::BlockRows, &block_rows)?;
+    layout.put(block, Column::BlockSteps, &steps)?;
+    layout.put(block, Column::BlockPositions, &positions)?;
+    layout.put(block, Column::BlockIds, &vec![fill; width])?;
+    layout.put(block, Column::BlockAnchors, &anchors)?;
+    layout.put(block, Column::BlockTableRows, &table_rows)?;
+    layout.put(block, Column::BlockStarts, &starts)?;
+    layout.put(block, Column::BlockLens, &block_lens)?;
+    layout.put(block, Column::BlockOffsets, &offsets)?;
+    layout.put(block, Column::BlockIndex, &index)?;
+    layout.put(block, Column::BlockCells, &slot_cells)?;
+    layout.put(block, Column::BlockLive, &[(sequences * drafts) as u32])
+}
+
 /// Gives each call of `batch` the drafts its row proposed: `proposals` are the drafter's
 /// outputs, one `[rows]` U32 tensor per chained step, read under the installed context.
 ///
@@ -1336,11 +1533,16 @@ impl CausalLmRunner {
         let state = match &self.state {
             Some((live, checkpoint)) => {
                 // The state after each token is kept in the trail or in the request's verify
-                // slots, whichever the runner was lent.
-                if speculation.trail.is_some() == verify.is_some() {
+                // slots, whichever the runner was lent; a state of rings alone advances in place
+                // and keeps neither.
+                let kept = u8::from(speculation.trail.is_some()) + u8::from(verify.is_some());
+                let rings = !keeps_trail(&self.model.state_layers(), speculation.drafts + 1)
+                    && verify.is_none();
+                if kept != u8::from(!rings) {
                     return Err(Error::State(
                         "a verification of a model that keeps a recurrent state keeps the state \
-                         after each token in a trail or in verify slots, one of the two",
+                         after each token in a trail or in verify slots, one of the two, unless \
+                         its every field is a ring",
                     ));
                 }
 
@@ -1531,6 +1733,150 @@ impl CausalLmRunner {
         Ok(outputs)
     }
 
+    /// The forward of the drafter's bucket for a drafter of the block form (module
+    /// documentation, block drafting): `drafts` outputs, each row's draft at each offset of its
+    /// block, `[rows]` U32.
+    pub(super) fn forward_block(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        let speculation = self.speculating()?;
+        let drafter = self.model.block_drafter().ok_or(Error::State(
+            "a runner that drafts blocks has a model that carries a block drafter",
+        ))?;
+        let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+        let drafts = speculation.drafts as usize;
+        let width = rows * drafts;
+        let kept = &speculation.kept;
+        let groups = &self.cache;
+
+        // ---- The context: the batch's tokens, a verification's up to the length it agreed ----
+
+        let bound = kept
+            .tensor(Entry::Agreed)
+            .index_select(&self.column(Column::EntryRows, tokens)?, 0)?;
+        let written = self.column(Column::EntrySteps, tokens)?.le(&bound)?;
+        let none = self.column(Column::NoSlots, tokens)?;
+        let mapping = self
+            .column(Column::SlotMapping, groups.len().max(1) * tokens)?
+            .reshape((groups.len().max(1), tokens))?;
+
+        let table_rows = self.column(Column::BlockTableRows, rows)?;
+        let starts = self.column(Column::BlockStarts, rows)?;
+        let lens = self.column(Column::DraftLens, rows)?;
+        let context_batch = TokenBatch {
+            token_ids: None,
+            token_history: None,
+            positions: self.column(Column::Positions, tokens)?,
+            seq_lens: lens.clone(),
+            query_offsets: self.column(Column::StateOffsets, rows + 1)?,
+            logits_rows: lens,
+            phase: Phase::Prefill,
+            page_size: self.config.page_size,
+            num_tokens: bucket.tokens,
+            max_kv_len: self.config.max_kv_len,
+            draft_lens: None,
+            rope_positions: None,
+            live_tokens: Some(self.column(Column::LiveTokens, 1)?),
+        };
+        context_batch.check()?;
+        let context_cache = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                Ok(KvCache {
+                    block_tables: group.block_tables.index_select(&table_rows, 0)?,
+                    slot_mapping: written.where_cond(&mapping.get(index)?, &none)?,
+                    starts: group.starts.as_ref().map(|_| starts.clone()),
+                    ..group.clone()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // ---- The blocks: each after its row's accepted tokens, anchored at the token there ----
+
+        // A verification's row reads the length it agreed; a prompt's, and a padding row, read
+        // through no row, which is zero.
+        let ahead = kept
+            .tensor(Entry::Agreed)
+            .index_select(&self.column(Column::ProposalRows, rows)?, 0)?;
+        let block_rows = self.column(Column::BlockRows, width)?;
+        let token_ahead = ahead.index_select(&block_rows, 0)?;
+
+        let cap = self.column(Column::TokenCap, rows)?;
+        let anchors = kept
+            .tensor(Entry::Chosen)
+            .index_select(&self.column(Column::BlockAnchors, rows)?.add(&ahead)?, 0)?
+            .minimum(&cap)?;
+        let leads = self.column(Column::BlockSteps, width)?.eq(0.0)?;
+        let ids = leads.where_cond(
+            &anchors.index_select(&block_rows, 0)?,
+            &self.column(Column::BlockIds, width)?,
+        )?;
+
+        // Each group's slots lie in its cells of the bucket's rows, from the row's own cell of
+        // the length it agreed on (`fill_block`).
+        let cells = self.column(Column::BlockCells, groups.len().max(1) * rows * 2 * drafts)?;
+        let index = self.column(Column::BlockIndex, groups.len().max(1) * width)?;
+        let block_cache = groups
+            .iter()
+            .enumerate()
+            .map(|(group, held)| {
+                let at = index.narrow(0, group * width, width)?.add(&token_ahead)?;
+                Ok(KvCache {
+                    block_tables: held.block_tables.index_select(&table_rows, 0)?,
+                    slot_mapping: cells.index_select(&at, 0)?,
+                    starts: held.starts.as_ref().map(|_| starts.clone()),
+                    ..held.clone()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let block_lens = self.column(Column::BlockLens, rows)?.add(&ahead)?;
+        let block_batch = TokenBatch {
+            token_ids: None,
+            token_history: None,
+            positions: self
+                .column(Column::BlockPositions, width)?
+                .add(&token_ahead.view(DType::I32)?)?,
+            seq_lens: block_lens.clone(),
+            query_offsets: self.column(Column::BlockOffsets, rows + 1)?,
+            logits_rows: block_lens,
+            phase: Phase::Prefill,
+            page_size: self.config.page_size,
+            num_tokens: width as u32,
+            max_kv_len: self.config.max_kv_len,
+            draft_lens: None,
+            rope_positions: None,
+            live_tokens: Some(self.column(Column::BlockLive, 1)?),
+        };
+        block_batch.check()?;
+
+        // ---- The drafter, then its proposals ----
+
+        // A member of an expert union lends the drafter the exchange of the bucket's capacity
+        // class, as it lends the model's forward.
+        let exchange = self.expert_exchange(bucket)?;
+        let embedded = self.model.embed_input_ids(&ids)?;
+        let hidden = kept.tensor(Entry::Hidden).narrow(0, 0, tokens)?;
+        let drafted = drafter.forward(
+            &DraftContext {
+                batch: &context_batch,
+                cache: &context_cache,
+                hidden: &hidden,
+            },
+            &DraftBlock {
+                batch: &block_batch,
+                cache: &block_cache,
+                embedded: &embedded,
+            },
+            exchange.as_ref(),
+        )?;
+
+        let logits = self.model.compute_logits(&drafted)?;
+        let proposed = drafter.propose(&logits, &anchors)?;
+        (0..drafts)
+            .map(|step| Ok(proposed.narrow(1, step, 1)?.squeeze(1)?.contiguous()?))
+            .collect()
+    }
+
     /// The forward of the drafter's bucket (module documentation): `drafts` outputs, the
     /// proposal of each chained step for every row, `[rows]` U32.
     pub(super) fn forward_drafter(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
@@ -1542,6 +1888,9 @@ impl CausalLmRunner {
             .draft
             .as_ref()
             .ok_or(Error::State("a speculating runner was lent no draft cache"))?;
+        let pool = speculation.pool.ok_or(Error::State(
+            "a chained drafter's runner states its draft pool",
+        ))?;
 
         let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
         let drafts = speculation.drafts as usize;
@@ -1584,7 +1933,7 @@ impl CausalLmRunner {
             query_offsets: self.column(Column::StateOffsets, rows + 1)?,
             logits_rows: lens,
             phase: Phase::Prefill,
-            page_size: speculation.pool.page,
+            page_size: pool.page,
             num_tokens: bucket.tokens,
             max_kv_len: self.config.max_kv_len,
             draft_lens: None,
@@ -1683,7 +2032,7 @@ impl CausalLmRunner {
                     query_offsets: self.column(Column::ChainOffsets, rows + 1)?,
                     logits_rows: lens,
                     phase: Phase::Decode,
-                    page_size: speculation.pool.page,
+                    page_size: pool.page,
                     num_tokens: bucket.rows,
                     max_kv_len: self.config.max_kv_len,
                     draft_lens: None,

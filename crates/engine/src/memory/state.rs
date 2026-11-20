@@ -150,6 +150,37 @@ pub(crate) fn layer_fields(runs: &[StateShape]) -> impl Iterator<Item = &[StateF
         .flat_map(|run| (0..run.layers).map(move |_| run.fields.as_slice()))
 }
 
+/// Whether a speculating deployment of a model whose state is `runs`, whose verifications hold
+/// `tokens` tokens a row at most, keeps a trail of the state after each token of a
+/// verification: a model with a state none of whose fields keeps a slot per verified token, and
+/// one of whose fields a verification cannot advance in place.
+///
+/// A ring (`StateRows::Ring`) of `R` rows in groups of `g` positions advances in place when
+/// `R ≥ tokens + g − 2` (`R ≥ tokens` for `g = 1`). A verification from position `V` writes the
+/// rows of `V .. V + tokens`, each its own; after `a` accepted drafts the next forward starts at
+/// `V + a + 1` and reads only the rows of the group open there, positions from `V + a + 2 − g`
+/// on (`StateRows::Ring`). Those rows are the accepted tokens' own, or rows before `V` that no
+/// row the verification wrote shares, so the rows of its rejected tokens are never read and are
+/// overwritten when their positions are computed again: the live rows stand after any
+/// acceptance.
+pub(crate) fn keeps_trail(runs: &[StateShape], tokens: u32) -> bool {
+    let mut fields = layer_fields(runs).flatten().peekable();
+    if fields.peek().is_none() {
+        return false;
+    }
+
+    let fields: Vec<&StateField> = fields.collect();
+    let stepwise = fields.iter().any(|field| field.stepwise);
+    let in_place = fields.iter().all(|field| match field.rows {
+        StateRows::Ring { group } => {
+            let rows = field.dims.first().copied().unwrap_or(0);
+            rows >= tokens as usize + group.max(2) - 2
+        }
+        _ => false,
+    });
+    !stepwise && !in_place
+}
+
 impl StateConfig {
     /// The recurrent state of `model` for a runner of `slots` request slots over `buckets`, the
     /// catalog with its verifications (`Buckets::with_drafts`) when the deployment drafts `drafts`
@@ -158,8 +189,10 @@ impl StateConfig {
     /// them.
     ///
     /// A request owns `drafts + 1` slots of a stepwise field when the deployment speculates, and
-    /// its verifications are then lent verify slots and keep no trail; any other speculating
-    /// deployment keeps a trail of the tokens of its largest verification.
+    /// its verifications are then lent verify slots and keep no trail; a speculating deployment
+    /// whose every field is a ring keeps none either, its verifications advancing the rings in
+    /// place ([`keeps_trail`]); any other keeps a trail of the tokens of its largest
+    /// verification.
     pub fn of(model: &dyn TextModel, slots: u32, buckets: &Buckets, drafts: u32) -> Option<Self> {
         let shapes = model.state_layers();
         if shapes.is_empty() {
@@ -172,7 +205,7 @@ impl StateConfig {
         } else {
             1
         };
-        let trail = if drafts > 0 && !stepwise {
+        let trail = if drafts > 0 && keeps_trail(&shapes, drafts + 1) {
             buckets
                 .iter()
                 .filter(|bucket| {
@@ -1586,6 +1619,43 @@ mod tests {
         );
         assert_eq!(layout.state_bytes(), 4 * 64);
         Ok(())
+    }
+
+    /// A verification advances a state of rings in place when each ring holds the verification's
+    /// tokens beside the rows of the group open before them, `rows ≥ tokens + group − 2`, and
+    /// keeps a trail otherwise; a state with any field that is no ring keeps a trail, unless a
+    /// field keeps a slot per verified token, and a model of no state keeps none.
+    #[test]
+    fn a_ring_that_holds_a_verification_advances_in_place() {
+        let field = |rows: usize, kind: nn::family::StateRows, stepwise: bool| StateField {
+            name: "remainder",
+            dtype: DType::F32,
+            dims: vec![rows, 16],
+            stepwise,
+            rows: kind,
+        };
+        let state = |fields: Vec<StateField>| vec![StateShape { layers: 3, fields }];
+        let ring = |rows, group| field(rows, nn::family::StateRows::Ring { group }, false);
+
+        // DeepSeek-V4.1's compressor remainder, eight rows in pairs: a verification of six
+        // tokens (five drafts) advances it in place, as one of eight does; one of nine would
+        // rewrite the row of its own first token.
+        assert!(!keeps_trail(&state(vec![ring(8, 2)]), 6));
+        assert!(!keeps_trail(&state(vec![ring(8, 2)]), 8));
+        assert!(keeps_trail(&state(vec![ring(8, 2)]), 9));
+
+        // In groups of four the next forward may read the two rows before the verification's
+        // first token, which a verification of seven tokens rewrites.
+        assert!(!keeps_trail(&state(vec![ring(8, 4)]), 6));
+        assert!(keeps_trail(&state(vec![ring(8, 4)]), 7));
+
+        // A field beside the ring that is none keeps a trail, a stepwise one keeps verify slots
+        // instead, and no state keeps nothing.
+        let whole = field(4, nn::family::StateRows::Whole, false);
+        assert!(keeps_trail(&state(vec![ring(8, 2), whole]), 2));
+        let stepwise = field(4, nn::family::StateRows::Whole, true);
+        assert!(!keeps_trail(&state(vec![ring(8, 2), stepwise]), 2));
+        assert!(!keeps_trail(&[], 6));
     }
 
     /// A deployment that does not speculate keeps no trail.

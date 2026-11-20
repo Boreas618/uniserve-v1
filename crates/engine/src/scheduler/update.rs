@@ -526,6 +526,10 @@ impl Scheduler {
     /// neither samples nor knows the token after it; a decode or a verification one per token it
     /// committed. The draft cache counts entries from its start, so a write past a gap, or past
     /// the draft blocks the request holds, counts nothing.
+    ///
+    /// A drafter of the block form keeps its entries in the model's own cache, and an entry is
+    /// its evaluation of the target's hidden state alone: a request whose cache keeps no draft
+    /// class writes an entry at every position a call computes, a prefill chunk's every token.
     fn record_drafts(
         &mut self,
         id: RequestId,
@@ -549,7 +553,12 @@ impl Scheduler {
         };
 
         let tokens = len32(span.len());
+        let in_place = self
+            .requests
+            .get(&id)
+            .is_some_and(|request| kv::draft_class(request, &self.groups).is_none());
         let written = match batch.phase {
+            Phase::Prefill if in_place => tokens,
             Phase::Prefill => {
                 let images = batch
                     .columns
@@ -1087,10 +1096,10 @@ impl Scheduler {
     /// admission may name none (SD §5.2).
     pub(super) fn admitted(&mut self, id: RequestId) {
         let now = Instant::now();
-        let drafted = self
-            .requests
-            .get(&id)
-            .map_or(0, |request| kv::draft_tokens(request, &self.groups));
+        let drafted = self.requests.get(&id).map(|request| {
+            let in_place = kv::draft_class(request, &self.groups).is_none();
+            (kv::draft_tokens(request, &self.groups), in_place)
+        });
         let request_shapes = self
             .requests
             .get(&id)
@@ -1108,7 +1117,14 @@ impl Scheduler {
         } else {
             0..0
         };
-        request.num_draft_tokens = drafted;
+        // A drafter of the block form keeps its entries in the model's own cache fields, which
+        // the hit holds or the replay before it recomputes with the target's entries: they reach
+        // where the request computes on. A draft cache reaches what its hit pinned.
+        request.num_draft_tokens = match drafted {
+            Some((_, true)) => resume,
+            Some((drafted, false)) => drafted,
+            None => 0,
+        };
         request.status = RequestStatus::Running;
         request.queued = false;
         request.last_progress = now;

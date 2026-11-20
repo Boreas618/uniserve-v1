@@ -13,6 +13,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use engine::batch::cache::CacheGroupKind;
 use engine::batch::philox::DrawAddress;
 use engine::batch::{Batch, Phase};
 use engine::scheduler::{Message, policy};
@@ -22,7 +23,7 @@ use storage::runtime::Request;
 use testkit::executor::output_of;
 use testkit::text::scored;
 
-use crate::harness::{Deployment, Harness, prompt, row_span, token};
+use crate::harness::{BLOCK, Deployment, Harness, prompt, row_span, token};
 
 /// The drafts a verification carries in these cases' deployments.
 const DRAFTS: u32 = 2;
@@ -448,4 +449,92 @@ fn a_refill_that_does_not_pay_is_never_run() {
         "{verifications:?}"
     );
     assert_eq!(harness.tokens(id).len(), 8);
+}
+
+/// The deployment of the block drafter's cases: a drafter of the block form
+/// (`nn::BlockDrafter`) keeps its entries in the model's own cache, here a full-attention class
+/// and a sliding window as DeepSeek-V4.1's, in chunks and steps of eight tokens.
+fn drafting_blocks() -> Deployment {
+    let window = CacheGroupKind::SlidingWindow { window: 8 };
+    Deployment::tokens()
+        .batch(8, 8)
+        .chunk(8)
+        .cache(&[(CacheGroupKind::Full, BLOCK), (window, BLOCK)])
+        .drafting_blocks(DRAFTS)
+}
+
+/// A drafter of the block form writes its entries with the target's: a prompt's chunks write
+/// them, its last chunk proposes after the token it samples and the others propose nothing, so
+/// the first verification carries the drafts of the prefill, with no draft cache and no refill;
+/// each verification's proposals are the next one's drafts (SD §7.2 "Speculation").
+#[test]
+fn a_block_drafter_proposes_after_a_prompt_s_last_chunk_and_after_every_verification() {
+    let mut harness = drafting_blocks().build();
+    drafter(&harness, 2);
+    let id = harness.submit(token(1, 20, 12));
+    harness.settle(300);
+
+    let key = stream(&harness, id);
+    let prefills = harness.batches_of_phase(id, Phase::Prefill);
+    let proposed: Vec<u32> = prefills
+        .iter()
+        .map(|batch| {
+            // A batch none of whose calls does work for the drafter states none.
+            let row = batch.requests.iter().position(|of| *of == id).unwrap();
+            batch
+                .columns
+                .drafts
+                .get(row)
+                .map_or(0, |work| work.proposals)
+        })
+        .collect();
+    assert_eq!(proposed, [0, 0, DRAFTS], "chunks of 8, 8 and 4 tokens");
+
+    let verifications = verifications(&harness, id);
+    assert_eq!(
+        verifications.first(),
+        Some(&(20, vec![sample(key, 21), sample(key, 22)]))
+    );
+    assert!(
+        verifications[..verifications.len() - 1]
+            .iter()
+            .all(|(_, drafts)| drafts.len() == DRAFTS as usize),
+        "{verifications:?}"
+    );
+    rolled_back(&verifications, 2);
+    assert!(refills(&harness, id).is_empty());
+    assert_eq!(harness.tokens(id), model(key, 20, 12));
+}
+
+/// A request whose prompt continues a cached prefix runs from its hit, and its block drafter's
+/// entries reach there with the target's, which the hit holds or the replay recomputes: its
+/// prefill proposes and its first verification carries the drafts, where a chained drafter's
+/// draft cache without the hit's draft blocks would need a refill first (SD §4.4 "Bounded
+/// replay", §7.2 "Speculation").
+#[test]
+fn a_block_drafter_s_request_speculates_from_a_cached_prefix_without_a_refill() {
+    let mut harness = drafting_blocks().build();
+    drafter(&harness, 2);
+    harness.submit(token(1, 13, 1));
+    harness.settle(100);
+
+    let mut continuing = token(2, 20, 8);
+    continuing.prompt_token_ids = prompt(1, 13).into_iter().chain(prompt(2, 7)).collect();
+    let id = harness.submit(continuing);
+    harness.settle(300);
+
+    let prefill = harness.batches_of(id).remove(0);
+    assert_eq!(prefill.phase, Phase::Prefill);
+    assert!(
+        prefill.columns.rows.cache_positions[0] > 0,
+        "it runs from its hit"
+    );
+    let key = stream(&harness, id);
+    let verifications = verifications(&harness, id);
+    assert_eq!(
+        verifications.first(),
+        Some(&(20, vec![sample(key, 21), sample(key, 22)]))
+    );
+    assert!(refills(&harness, id).is_empty());
+    assert_eq!(harness.tokens(id), model(key, 20, 8));
 }

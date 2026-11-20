@@ -6,10 +6,13 @@
 //!   reference formulas;
 //! - [`attention`]: the shared sparse latent attention modules over the checkpoint's parameters
 //!   against its reference formulas (`generate_attention.py`);
-//! - [`profile`]: the family's profile runs over the release's headers, whose kernel keys the
-//!   tree's packages declare.
+//! - [`dspark`]: the DSpark drafter over the release's `mtp.*` parameters against the
+//!   checkpoint's reference code (`generate_dspark.py`);
+//! - [`profile`]: the family's profile runs over the release's headers, with and without the
+//!   drafter, whose kernel keys the tree's packages declare.
 
 mod attention;
+mod dspark;
 mod profile;
 mod reference;
 mod shards;

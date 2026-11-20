@@ -1586,6 +1586,106 @@ pub trait Drafter: Send + Sync {
     }
 }
 
+/// The context a [`BlockDrafter`] forward writes: the tokens whose rows the model's forward
+/// of the step computed, as that forward addressed them.
+#[derive(Clone, Copy)]
+pub struct DraftContext<'t> {
+    /// The tokens, laid out as the model's forward took them: their positions and their rows of
+    /// the cache groups' tables.
+    pub batch: &'t TokenBatch,
+    /// The model's cache groups ([`crate::family::TextModel::cache`]) over the batch's rows. A
+    /// group's slot mapping names [`NO_SLOT`] for a token whose entry the drafter does not
+    /// write: a padding token, and a verification's draft that its row did not accept.
+    pub cache: &'t [KvCache],
+    /// `[tokens, stream_width]`: the rows the model's forward returned for the tokens
+    /// ([`crate::family::TextModel::stream_width`]).
+    pub hidden: &'t Tensor,
+}
+
+/// The blocks a [`BlockDrafter`] forward drafts: one block of [`BlockDrafter::block`] tokens per
+/// row, the row's anchor (the token the step committed last, at the position after its last
+/// context entry) and then the fill token at each later position.
+#[derive(Clone, Copy)]
+pub struct DraftBlock<'t> {
+    /// The blocks' tokens, row-major: row `r`'s token `j` is token `r · block + j`, at its
+    /// anchor's position plus `j`. A row's `seq_lens` entry is the position after its block; a
+    /// padding row's tokens write no entry, which its slot mappings state.
+    pub batch: &'t TokenBatch,
+    /// The model's cache groups over the blocks' rows: each row's tables, its window starts, and
+    /// the slot each of its tokens writes.
+    pub cache: &'t [KvCache],
+    /// `[rows · block, hidden]`: the embeddings of the blocks' tokens, by the model's
+    /// [`CausalLm::embed_input_ids`].
+    pub embedded: &'t Tensor,
+}
+
+/// A causal language model's own drafter that drafts a whole block in one forward (DSpark, the
+/// semi-autoregressive drafter of DeepSeek-V4.1, vLLM's `DSparkSpeculator`): the block form of a
+/// drafter, beside the chained form of [`Drafter`].
+///
+/// The drafter's layers keep their entries in the model's cache, in fields the model declares
+/// among its own ([`crate::family::TextModel::cache`]). A forward first writes the **context**,
+/// each layer's entries of the tokens whose rows the model's forward of the step computed
+/// ([`DraftContext`]), and then runs its layers over one **block** per row: the anchor and
+/// `block − 1` fill tokens at the positions after the row's context, which attend the block as
+/// a whole rather than causally ([`DraftBlock`]). The model's head projects the block's rows
+/// ([`CausalLm::compute_logits`]), and [`Self::propose`] turns those logits into the block's
+/// drafts, one for each of its tokens.
+///
+/// Which tokens a step writes the context of, where a row's block lies and how a verification
+/// accepts the drafts are execution's: the drafter computes one forward over what it is given.
+///
+/// A drafter whose layers route experts the model's expert union splits across ranks runs them
+/// through the exchange its forward is lent and joins the union's steps it holds no tokens of
+/// ([`Self::join_expert_step`]); one forward is one expert step of its layers.
+pub trait BlockDrafter: Send + Sync {
+    /// The tokens of a block, which is the drafts one forward proposes per row.
+    fn block(&self) -> u32;
+
+    /// The token id every position of a block after its anchor embeds.
+    fn fill(&self) -> u32;
+
+    /// Writes the context, then runs the drafter's layers over the blocks: the blocks' rows,
+    /// `[rows · block, hidden]`, which the model's head projects. `exchange` is lent when the
+    /// model's routed experts are split across ranks, as to [`CausalLm::forward`], and is
+    /// `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Tensors a module refuses, or a cache that lacks the drafter's fields.
+    fn forward(
+        &self,
+        context: &DraftContext<'_>,
+        block: &DraftBlock<'_>,
+        exchange: Option<&ExpertExchange>,
+    ) -> Result<Tensor>;
+
+    /// The drafts of the blocks whose head logits are `logits`, `[rows · block, vocabulary]`
+    /// F32 ([`CausalLm::compute_logits`] of [`Self::forward`]'s rows), each row's block led by
+    /// its anchor in `anchors` (`[rows]` U32): `[rows, block]` U32, draft `j` of a row being the
+    /// token it proposes at the position after its block's token `j`.
+    ///
+    /// # Errors
+    ///
+    /// Logits or anchors of other extents, or what a module refuses.
+    fn propose(&self, logits: &Tensor, anchors: &Tensor) -> Result<Tensor>;
+
+    /// Runs every expert layer of one forward with no tokens of this rank's own: what
+    /// [`CausalLm::join_expert_step`] is for the model's layers. A drafter whose layers route
+    /// no experts across ranks launches nothing.
+    ///
+    /// # Errors
+    ///
+    /// A drafter that does not state how its layers join a step refuses, so execution serves
+    /// no expert union with it.
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> Result<()> {
+        let _ = exchange;
+        Err(Error::Unsupported(
+            "this drafter states no expert step of its layers to join".to_owned(),
+        ))
+    }
+}
+
 /// The vision tower of a causal language model: images to rows of the model's hidden width,
 /// which a prefill writes into the request's context in place of the image's placeholder.
 ///

@@ -22,11 +22,72 @@ use nn::modules::{
 use nn::{DType, ExpertExchange, Result, Split, Tensor, VarBuilder};
 
 use crate::deepseek_v41::attention::{Attention, Carried, Inputs};
-use crate::deepseek_v41::config::Config;
+use crate::deepseek_v41::config::{Config, ExpertConfig};
 
 /// The module path an expert order and the expert load name layer `layer`'s routed experts by.
 pub fn expert_module(layer: u32) -> String {
     format!("layers.{layer}.ffn.experts")
+}
+
+/// The routed experts `experts` of a layer whose expert load and order name them `name`, in
+/// the slots `order` states (the checkpoint's own where it states none), split as `splits`
+/// states: the tensor split, whether a tensor-parallel group holds the experts whole, and the
+/// expert union of ranks that share them (`model.py:794-906`).
+pub(crate) fn routed(
+    config: &Config,
+    experts: &ExpertConfig,
+    name: String,
+    order: Option<Vec<u32>>,
+    (split, tensor_experts, exchange): (Split, bool, Split),
+) -> MoEConfig {
+    MoEConfig {
+        hidden: config.hidden_size,
+        intermediate: experts.intermediate,
+        experts: experts.experts,
+        top: experts.top,
+        activation: Activation::Silu,
+        renormalize: true,
+        scoring: Scoring::SqrtSoftplus,
+        selection_bias: Some("bias"),
+        routed_scale: Some(experts.routed_scale),
+        limit: Some(experts.limit),
+        router: "gate",
+        // The reference scores in FP32: `linear(x.float(), weight.float())`.
+        router_dtype: Some(DType::F32),
+        list: "experts",
+        up: "w3",
+        gate: "w1",
+        down: "w2",
+        layout: ExpertLayout::Modules,
+        order: order.unwrap_or_else(|| (0..experts.experts).collect()),
+        split,
+        tensor_experts,
+        exchange,
+        name: Some(name),
+    }
+}
+
+/// The shared expert beside the routed experts `experts`, of their width (`model.py:832-854`).
+pub(crate) fn shared(config: &Config, experts: &ExpertConfig) -> SharedExpertConfig {
+    SharedExpertConfig {
+        mlp: MlpConfig {
+            hidden: config.hidden_size,
+            intermediate: experts.intermediate,
+            activation: Activation::Silu,
+            // The reference's `Expert`: the clamped SwiGLU in FP32, rounded once.
+            rounding: Rounding::Fused,
+            limit: Some(experts.limit),
+            gate_up: GateUp::Split {
+                gate: "w1",
+                up: "w3",
+            },
+            down: "w2",
+            bias: false,
+            split: Split::WHOLE,
+        },
+        module: "shared_experts",
+        gate: None,
+    }
 }
 
 /// One decoder layer (module documentation).
@@ -55,55 +116,19 @@ impl DecoderLayer {
         order: &ExpertOrder,
     ) -> Result<Self> {
         let mhc = config.mhc();
-        let experts = &config.experts;
         let name = expert_module(layer);
-        let routed = MoEConfig {
-            hidden: config.hidden_size,
-            intermediate: experts.intermediate,
-            experts: experts.experts,
-            top: experts.top,
-            activation: Activation::Silu,
-            renormalize: true,
-            scoring: Scoring::SqrtSoftplus,
-            selection_bias: Some("bias"),
-            routed_scale: Some(experts.routed_scale),
-            limit: Some(experts.limit),
-            router: "gate",
-            // The reference scores in FP32: `linear(x.float(), weight.float())`.
-            router_dtype: Some(DType::F32),
-            list: "experts",
-            up: "w3",
-            gate: "w1",
-            down: "w2",
-            layout: ExpertLayout::Modules,
-            order: order
-                .get(&name)
-                .cloned()
-                .unwrap_or_else(|| (0..experts.experts).collect()),
-            split: placement.tensor,
-            tensor_experts: placement.tensor_experts,
-            exchange: placement.experts,
-            name: Some(name),
-        };
-        let shared = SharedExpertConfig {
-            mlp: MlpConfig {
-                hidden: config.hidden_size,
-                intermediate: experts.intermediate,
-                activation: Activation::Silu,
-                // The reference's `Expert`: the clamped SwiGLU in FP32, rounded once.
-                rounding: Rounding::Fused,
-                limit: Some(experts.limit),
-                gate_up: GateUp::Split {
-                    gate: "w1",
-                    up: "w3",
-                },
-                down: "w2",
-                bias: false,
-                split: Split::WHOLE,
-            },
-            module: "shared_experts",
-            gate: None,
-        };
+        let routed = routed(
+            config,
+            &config.experts,
+            name.clone(),
+            order.get(&name).cloned(),
+            (
+                placement.tensor,
+                placement.tensor_experts,
+                placement.experts,
+            ),
+        );
+        let shared = shared(config, &config.experts);
 
         Ok(Self {
             engram,

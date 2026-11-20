@@ -582,12 +582,31 @@ fn proposals(request: &Request, config: &SchedulerConfig) -> u32 {
     if complete { drafts } else { 0 }
 }
 
+/// The positions after a prompt chunk ending at `end` that its drafter writes, in the request's
+/// own cache classes: a drafter of the block form, whose request keeps no draft class, drafts
+/// the block after the prompt's last token in the model's own cache, the proposals of a
+/// verification; any other chunk, and any chained drafter's, writes none there.
+fn prompt_proposals(
+    request: &Request,
+    end: u32,
+    groups: &[WorkerGroup],
+    config: &SchedulerConfig,
+) -> u32 {
+    let in_place = draft_class(request, groups).is_none();
+    if in_place && end >= request.num_prompt_tokens {
+        proposals(request, config)
+    } else {
+        0
+    }
+}
+
 /// Whether the blocks a call of `phase` of `tokens` tokens writes are ones the request holds and
-/// may write (SD §3.4, §4.4): its end lies within `allocated` (a verification's proposals
-/// included), a refill's within `allocated_draft`; every block it writes lies at or after its
-/// class's `shared`; the first row on a slot that continues a cached prefix finds the checkpoint
-/// it restores; and a call that keeps a recurrent-state checkpoint holds that one writable. A
-/// media call's blocks are held from its admission.
+/// may write (SD §3.4, §4.4): its writes end within `allocated` (a verification's proposals
+/// included, and the block drafter's proposals after a prompt, [`prompt_proposals`]), a refill's
+/// within `allocated_draft`; every block it writes lies at or after its class's `shared`; the
+/// first row on a slot that continues a cached prefix finds the checkpoint it restores; and a
+/// call that keeps a recurrent-state checkpoint, which its own tokens decide, holds that one
+/// writable. A media call's blocks are held from its admission.
 pub(crate) fn holds_blocks_for(
     request: &Request,
     (phase, tokens): (Phase, u32),
@@ -595,19 +614,28 @@ pub(crate) fn holds_blocks_for(
     config: &SchedulerConfig,
 ) -> bool {
     let computed = request.num_computed_tokens;
-    let (start, end, draft) = match phase {
-        Phase::Prefill | Phase::Decode => (computed, computed.saturating_add(tokens), false),
+    // `end` is where the call's tokens end, and `reach` where its writes do: a verification's
+    // proposals and the block drafter's after a prompt lie in the attention classes past its
+    // tokens, and the recurrent state the call keeps is its tokens' alone.
+    let (start, end, reach, draft) = match phase {
+        Phase::Prefill => {
+            let end = computed.saturating_add(tokens);
+            let reach = end.saturating_add(prompt_proposals(request, end, groups, config));
+            (computed, end, reach, false)
+        }
+        Phase::Decode => {
+            let end = computed.saturating_add(tokens);
+            (computed, end, end, false)
+        }
         Phase::Verify => {
             let end = computed.saturating_add(tokens);
-            (
-                computed,
-                end.saturating_add(proposals(request, config)),
-                false,
-            )
+            let reach = end.saturating_add(proposals(request, config));
+            (computed, end, reach, false)
         }
         Phase::Refill => {
             let start = request.num_draft_tokens;
-            (start, start.saturating_add(tokens), true)
+            let end = start.saturating_add(tokens);
+            (start, end, end, true)
         }
         _ => return true,
     };
@@ -616,7 +644,7 @@ pub(crate) fn holds_blocks_for(
     } else {
         allocated(request, groups)
     };
-    if end > limit {
+    if reach > limit {
         return false;
     }
 
@@ -758,6 +786,14 @@ pub(crate) fn ahead(request: &Request, step: &Step) -> Vec<(u8, u32, u32, u32)> 
     let Some((phase, start, end)) = next_call(request, step) else {
         return asks;
     };
+    // The block a prompt's last chunk drafts after it lies in the request's own cache classes,
+    // beyond the tokens whose recurrent state the chunk keeps.
+    let written_end = match phase {
+        Phase::Prefill => {
+            end.saturating_add(prompt_proposals(request, end, step.groups, step.config))
+        }
+        _ => end,
+    };
     let groups = step.groups;
     let longest = longest(request, groups);
     let drafts = step.config.draft_tokens;
@@ -813,7 +849,7 @@ pub(crate) fn ahead(request: &Request, step: &Step) -> Vec<(u8, u32, u32, u32)> 
             continue;
         }
         let (end, required) = match (kind.is_draft(), refilled) {
-            (false, _) => (end, true),
+            (false, _) => (written_end, true),
             (true, None) => (end, false),
             (true, Some(end)) => (end, false),
         };
@@ -4187,6 +4223,85 @@ mod tests {
             "four full blocks and the checkpoint: {committed:?}"
         );
         assert_eq!(committed[4], commit(OwnerId(1), 1, 3, state, 4));
+    }
+
+    /// A prompt chunk of a block drafter writes the block after its last token in the attention
+    /// classes, and keeps the recurrent state of its own tokens alone: a chunk whose block, but
+    /// not whose tokens, crosses a block boundary needs the attention blocks past it and no
+    /// checkpoint there, which the request is not asked for either.
+    #[test]
+    fn a_prompt_whose_drafted_block_crosses_a_boundary_keeps_no_checkpoint_there() {
+        let mut session = serving(
+            &[full(4), (CacheGroupKind::State, 4)],
+            KvCacheConfig::default(),
+        );
+        session.scheduler.config.draft_tokens = 2;
+        let id = session.request(1, (1..=3).collect());
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        let table = |end| Blocks {
+            first: 0,
+            shared: 0,
+            end,
+            asked: end,
+        };
+
+        // Its 3 tokens and the 2 drafted after them reach position 5, in the second block; the
+        // state table holds no checkpoint, which the chunk, ending at 3, keeps none of.
+        request.blocks = vec![table(1), table(0)];
+        assert!(!holds_blocks_for(
+            session.row(id),
+            (Phase::Prefill, 3),
+            &session.scheduler.groups,
+            &session.scheduler.config
+        ));
+        session.row_mut(id).blocks[0] = table(2);
+        assert!(holds_blocks_for(
+            session.row(id),
+            (Phase::Prefill, 3),
+            &session.scheduler.groups,
+            &session.scheduler.config
+        ));
+        assert!(
+            ahead(session.row(id), &session.scheduler.kv_step())
+                .iter()
+                .all(|&(class, ..)| class != 1)
+        );
+    }
+
+    /// A verification keeps the checkpoint its own tokens reach, not one the positions of its
+    /// proposals would: a verification whose tokens end short of a kept boundary and whose
+    /// proposals cross it runs without a checkpoint there.
+    #[test]
+    fn a_verification_whose_proposals_cross_a_boundary_keeps_no_checkpoint_there() {
+        let kv = KvCacheConfig {
+            state_interval: std::num::NonZeroU32::new(8).unwrap(),
+            ..KvCacheConfig::default()
+        };
+        let mut session = serving(&[full(4), (CacheGroupKind::State, 4)], kv);
+        session.scheduler.config.draft_tokens = 2;
+        let id = session.request(1, (1..=5).collect());
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        request.placement[Phase::Verify.index()] = Some(A);
+        request.token_ids.push(6);
+        request.num_computed_tokens = 5;
+        request.num_draft_tokens = 5;
+        let table = |end| Blocks {
+            first: 0,
+            shared: 0,
+            end,
+            asked: end,
+        };
+        // Its 2 tokens end at 7 and the 2 proposals after them reach 9, past the kept boundary
+        // at 8; the state table holds its base at 4 alone.
+        request.blocks = vec![table(3), table(1)];
+        assert!(holds_blocks_for(
+            session.row(id),
+            (Phase::Verify, 2),
+            &session.scheduler.groups,
+            &session.scheduler.config
+        ));
     }
 
     /// A verification keeps its checkpoint before it learns which drafts are accepted. When it

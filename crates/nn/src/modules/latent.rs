@@ -661,17 +661,7 @@ impl LatentAttention {
         let rotated = config.rotated > 0;
 
         // The window entries of the batch's tokens, before any query reads them.
-        functional::record_write_(
-            kv,
-            RecordRow {
-                norm: Some((&self.kv_norm, config.eps)),
-                inv_freq: rotated.then_some(batch.inv_freq),
-                ratio: 1,
-            },
-            window,
-            batch.written,
-            batch.rows,
-        )?;
+        self.write_(kv, window, batch)?;
 
         if rotated {
             functional::rotary_trailing_(query, batch.cos, batch.sin, false)?;
@@ -693,5 +683,30 @@ impl LatentAttention {
             functional::rotary_trailing_(&attended, batch.cos, batch.sin, true)?;
         }
         Ok(attended)
+    }
+
+    /// Writes the window entries of `kv`, `[tokens, head_dim]` latent projections before their
+    /// normalization, into `window`: each token's `kv_norm` of its row, rotated at its position
+    /// and encoded in the window's format, at the entry `batch.written` names (none for `-1`).
+    /// What [`Self::forward`] writes before its queries read, for a layer whose window also
+    /// holds entries of rows it attends none of (a drafter's context).
+    ///
+    /// # Errors
+    ///
+    /// Operands of other shapes, or the operator's refusal.
+    pub fn write_(&self, kv: &Tensor, window: Plane<'_>, batch: &LatentBatch<'_>) -> Result<()> {
+        let config = &self.config;
+
+        functional::record_write_(
+            kv,
+            RecordRow {
+                norm: Some((&self.kv_norm, config.eps)),
+                inv_freq: (config.rotated > 0).then_some(batch.inv_freq),
+                ratio: 1,
+            },
+            window,
+            batch.written,
+            batch.rows,
+        )
     }
 }

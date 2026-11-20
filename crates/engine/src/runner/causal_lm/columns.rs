@@ -79,6 +79,27 @@
 //! | [`Column::LiveRows`] | U32 `[1]` | the rows the batch itself holds | |
 //! | [`Column::TokenContext`] | U32 `[T, w]` | where the `w` token ids before each token lie in the id history | the token's own context |
 //!
+//! A drafter of the block form (`nn::BlockDrafter`) drafts a block of `D` tokens a row in one
+//! forward: the anchor at the position after the row's last accepted entry, then the fill
+//! token. Its forward reads [`Column::EntryRows`], [`Column::EntrySteps`],
+//! [`Column::StateOffsets`], [`Column::DraftLens`], [`Column::ProposalRows`],
+//! [`Column::NoSlots`] and [`Column::TokenCap`] as the chained form does, and these:
+//!
+//! | Column | Type and extent | Holds | Padding entry |
+//! | --- | --- | --- | --- |
+//! | [`Column::BlockRows`] | U32 `[R, D]` | the drafter row of each block token | [`NO_SLOT`] |
+//! | [`Column::BlockSteps`] | U32 `[R, D]` | each block token's offset in its block | the offset |
+//! | [`Column::BlockPositions`] | I32 `[R, D]` | each block token's position before the drafts its row accepted | `0` |
+//! | [`Column::BlockIds`] | U32 `[R, D]` | the fill token, which a block token after the anchor embeds | the same |
+//! | [`Column::BlockAnchors`] | U32 `[R]` | where each row's anchor lies among the kept tokens before the drafts it accepted | `0` |
+//! | [`Column::BlockTableRows`] | U32 `[R]` | each drafter row's row of the page tables | the padding row |
+//! | [`Column::BlockStarts`] | U32 `[R]` | the first position each drafter row's sliding windows hold | `0` |
+//! | [`Column::BlockLens`] | U32 `[R]` | the position after each row's block, before the drafts it accepted | `0` |
+//! | [`Column::BlockOffsets`] | U32 `[R + 1]` | the packed offsets of the blocks: `D` tokens a row | the bucket's block tokens |
+//! | [`Column::BlockIndex`] | U32 `[G, R, D]` | where each block token's slot of each group lies in [`Column::BlockCells`], before the drafts its row accepted | a [`NO_SLOT`] cell |
+//! | [`Column::BlockCells`] | U32 `[G, R, 2 D]` | each group's cache slots of the positions after a row's last entry, [`NO_SLOT`] where the drafter writes none | [`NO_SLOT`] |
+//! | [`Column::BlockLive`] | U32 `[1]` | the block tokens of the batch's own rows | |
+//!
 //! ## Token ids
 //!
 //! A model whose layers read token ids (`nn::family::TextModel::token_history`) reads the `w`
@@ -235,6 +256,18 @@ pub(crate) enum Column {
     NextContext,
     StateIndices,
     TokenContext,
+    BlockRows,
+    BlockSteps,
+    BlockPositions,
+    BlockIds,
+    BlockAnchors,
+    BlockTableRows,
+    BlockStarts,
+    BlockLens,
+    BlockOffsets,
+    BlockIndex,
+    BlockCells,
+    BlockLive,
 }
 
 impl Column {
@@ -246,7 +279,8 @@ impl Column {
             | Self::Valid
             | Self::Active
             | Self::Points
-            | Self::ChainPositions => DType::I32,
+            | Self::ChainPositions
+            | Self::BlockPositions => DType::I32,
             Self::Parameters | Self::Draws => DType::F32,
             Self::Continuation => DType::U8,
             _ => DType::U32,
@@ -288,21 +322,29 @@ impl Column {
             | Self::DraftSlots
             | Self::NoSlots
             | Self::TokenCap => tokens,
-            Self::QueryOffsets | Self::StateOffsets | Self::ChainOffsets => rows + 1,
+            Self::QueryOffsets | Self::StateOffsets | Self::ChainOffsets | Self::BlockOffsets => {
+                rows + 1
+            }
             Self::Parameters => rows * PARAMETER_COLUMNS as usize,
             Self::Adjustments => rows * 2,
             Self::NextContext => rows * history,
             Self::TokenContext => tokens * history,
             Self::Commit => rows * COMMIT_FIELDS,
-            Self::LiveTokens | Self::LiveRows => 1,
+            Self::LiveTokens | Self::LiveRows | Self::BlockLive => 1,
             Self::Extras => tokens * drafts,
             Self::Windows | Self::StateIndices => rows * (drafts + 1),
             Self::DraftTokens
             | Self::DraftSteps
             | Self::ChainPositions
             | Self::ChainLens
-            | Self::ChainIndex => rows * drafts,
+            | Self::ChainIndex
+            | Self::BlockRows
+            | Self::BlockSteps
+            | Self::BlockPositions
+            | Self::BlockIds => rows * drafts,
             Self::ChainSlots => rows * 3 * drafts,
+            Self::BlockIndex => groups * rows * drafts,
+            Self::BlockCells => groups * rows * 2 * drafts,
             Self::DraftTables => rows * pages,
             _ => rows,
         }

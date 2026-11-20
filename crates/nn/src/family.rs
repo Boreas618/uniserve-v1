@@ -42,7 +42,8 @@ use proto::config::Quantization;
 use tensor::DType;
 
 use crate::capability::{
-    CausalLm, ConditionShape, Decoder, Denoiser, Drafter, Encoder, MediaFormat, Splicer, Vision,
+    BlockDrafter, CausalLm, ConditionShape, Decoder, Denoiser, Drafter, Encoder, MediaFormat,
+    Splicer, Vision,
 };
 use crate::collective::Split;
 use crate::vae::Tiling;
@@ -265,9 +266,17 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// Its routed experts, when it has any.
     fn experts(&self) -> Option<ExpertShape>;
 
-    /// The drafter its checkpoint carries for speculative decoding (multi-token prediction
-    /// layers), when the model loaded one; `None` for a model that drafts nothing.
+    /// The drafter its checkpoint carries for speculative decoding in the chained form
+    /// (multi-token prediction layers, one forward per draft), when the model loaded one; `None`
+    /// for a model that drafts nothing or drafts in the block form ([`Self::block_drafter`]).
     fn drafter(&self) -> Option<&dyn Drafter>;
+
+    /// The drafter its checkpoint carries in the block form (one forward drafts a whole block),
+    /// when the model loaded one; `None` otherwise. A model states at most one of
+    /// [`Self::drafter`] and this.
+    fn block_drafter(&self) -> Option<&dyn BlockDrafter> {
+        None
+    }
 
     /// Its vision tower, when the checkpoint declares one and the placement serves it
     /// ([`TextPlacement::vision`]): the model then takes image rows in a prefill

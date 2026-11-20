@@ -27,6 +27,9 @@ use nn_testing::{
 const HIDDEN: usize = 128;
 const INTERMEDIATE: usize = 128;
 const EXPERTS: usize = 4;
+/// The experts of a block whose sort's buffer is mostly padding: a tile of 128 permuted rows for
+/// each of its few routes.
+const MANY_EXPERTS: usize = 256;
 const TOP: usize = 2;
 const TOKENS: usize = 3;
 
@@ -149,11 +152,19 @@ struct Parts {
     shared: [Vec<f64>; 3],
 }
 
-/// Writes the block's export under `ffn` and answers the values its weights state.
-fn export(directory: &Path) -> Parts {
+/// The router's selection bias of `experts` experts: the first four's, repeated.
+fn bias(experts: usize) -> Vec<f32> {
+    (0..experts)
+        .map(|expert| [0.0_f32, 0.75, -0.5, 0.25][expert % 4])
+        .collect()
+}
+
+/// Writes the export of a block of `count` experts under `ffn` and answers the values its
+/// weights state.
+fn export(directory: &Path, count: usize) -> Parts {
     let mut tensors = Vec::new();
     let mut experts = Vec::new();
-    for expert in 0..EXPERTS {
+    for expert in 0..count {
         let mut parts = Vec::new();
         for (index, (name, rows, columns)) in [
             ("w1", INTERMEDIATE, HIDDEN),
@@ -206,21 +217,21 @@ fn export(directory: &Path) -> Parts {
         ));
         shared.push(values);
     }
-    let router = sequence(EXPERTS * HIDDEN, 41)
+    let router = sequence(count * HIDDEN, 41)
         .iter()
         .map(|value| value * 0.25)
         .collect::<Vec<_>>();
     tensors.push((
         "ffn.gate.weight".to_owned(),
         DType::BF16,
-        vec![EXPERTS, HIDDEN],
+        vec![count, HIDDEN],
         encode(DType::BF16, &router),
     ));
     tensors.push((
         "ffn.gate.bias".to_owned(),
         DType::F32,
-        vec![EXPERTS],
-        encode(DType::F32, &[0.0, 0.75, -0.5, 0.25]),
+        vec![count],
+        encode(DType::F32, &bias(count)),
     ));
 
     write_checkpoint(directory, &[&tensors]);
@@ -242,12 +253,12 @@ fn export(directory: &Path) -> Parts {
     }
 }
 
-/// DeepSeek's routed block at the test's widths.
-fn config() -> MoEConfig {
+/// DeepSeek's routed block of `experts` experts at the test's widths.
+fn config(experts: usize) -> MoEConfig {
     MoEConfig {
         hidden: HIDDEN as u32,
         intermediate: INTERMEDIATE as u32,
-        experts: EXPERTS as u32,
+        experts: experts as u32,
         top: TOP as u32,
         activation: Activation::Silu,
         renormalize: true,
@@ -262,7 +273,7 @@ fn config() -> MoEConfig {
         gate: "w1",
         down: "w2",
         layout: ExpertLayout::Modules,
-        order: (0..EXPERTS as u32).collect(),
+        order: (0..experts as u32).collect(),
         split: Split::WHOLE,
         tensor_experts: false,
         exchange: Split::WHOLE,
@@ -351,15 +362,29 @@ fn a_sqrt_softplus_router_selects_by_the_bias_and_weighs_without_it() {
 /// ungated shared expert's MXFP8 projections add their own output.
 #[test]
 fn an_mxfp4_block_and_its_shared_expert_compute_the_references_experts() {
+    check_block(EXPERTS);
+}
+
+/// A block of many experts and few routes, whose sort's buffer holds a tile of 128 permuted rows
+/// for each route, nearly all of them padding, computes each route over its own expert alone, as
+/// the reference does.
+#[test]
+fn an_mxfp4_block_of_many_experts_and_few_routes_computes_the_references_experts() {
+    check_block(MANY_EXPERTS);
+}
+
+/// Holds a block of `count` experts and its shared expert to the reference's arithmetic over
+/// [`TOKENS`] tokens (module documentation).
+fn check_block(count: usize) {
     let directory = tempfile::tempdir().unwrap();
-    let parts = export(directory.path());
+    let parts = export(directory.path(), count);
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
-    let block = MoE::load(&config(), loader.root().pp("ffn")).unwrap();
+    let block = MoE::load(&config(count), loader.root().pp("ffn")).unwrap();
     let shared = SharedExpert::load(
         &SharedExpertConfig {
             mlp: MlpConfig {
@@ -397,10 +422,10 @@ fn an_mxfp4_block_and_its_shared_expert_compute_the_references_experts() {
     let router = loader
         .root()
         .pp("ffn.gate")
-        .get((EXPERTS, HIDDEN), "weight")
+        .get((count, HIDDEN), "weight")
         .unwrap();
     let logits = values(&functional::linear(&input, &router, None, WeightOrder::NxK).unwrap());
-    let bias = [0.0_f32, 0.75, -0.5, 0.25];
+    let bias = bias(count);
 
     let mut want_routed = vec![0.0_f64; TOKENS * HIDDEN];
     let mut want_shared = vec![0.0_f64; TOKENS * HIDDEN];
@@ -417,7 +442,7 @@ fn an_mxfp4_block_and_its_shared_expert_compute_the_references_experts() {
             .map(|v| f64::from(*v))
             .collect();
         let encoded = quantized(&row);
-        let (experts, weights) = route(&logits[token * EXPERTS..][..EXPERTS], &bias);
+        let (experts, weights) = route(&logits[token * count..][..count], &bias);
         for (expert, weight) in experts.into_iter().zip(weights) {
             let [gate, up, down] = &parts.experts[expert];
             let gate = product(gate, HIDDEN, &encoded);
@@ -513,7 +538,7 @@ fn exchange(ranks: u32, rank_rows: u32) -> ExpertExchange {
 #[test]
 fn an_mxfp4_block_over_an_expert_group_runs_its_window_between_dispatch_and_combine() {
     let directory = tempfile::tempdir().unwrap();
-    export(directory.path());
+    export(directory.path(), EXPERTS);
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = MetaWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
@@ -524,7 +549,7 @@ fn an_mxfp4_block_over_an_expert_group_runs_its_window_between_dispatch_and_comb
     let block = MoE::load(
         &MoEConfig {
             exchange: group,
-            ..config()
+            ..config(EXPERTS)
         },
         loader.root().pp("ffn"),
     )

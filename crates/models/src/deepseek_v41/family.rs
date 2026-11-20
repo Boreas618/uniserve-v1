@@ -43,6 +43,11 @@ impl CausalLmConfig for Config {
         self.num_hidden_layers
     }
 
+    /// The DSpark layers (`mtp.*`), which a placement that drafts loads.
+    fn drafter(&self) -> bool {
+        self.dspark.is_some()
+    }
+
     /// The routed experts are DeepSeek's (`ffn.experts`), not transformers' sparse MoE block:
     /// the layers that route are stated by [`Self::expert_layers`].
     fn experts(&self) -> Option<&MoeConfig> {

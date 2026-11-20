@@ -1,0 +1,59 @@
+# DeepSeek-V4.1-Flash on the four GPUs of one host with its DSpark drafter: the layout of
+# `dp4-ep4` (four data-parallel schedulers whose ranks share their routed experts, at the
+# release's context of 1M tokens), each rank also holding the three DSpark layers (`mtp.*`,
+# 7.4 GiB) whole (`docs/deepseek_v41.md`). A step verifies six tokens a request: the token it
+# committed last and the five drafts of the block the drafter wrote after it in one forward.
+
+model = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+data_parallel_size = 4
+max_model_len = 1048576
+max_running_requests = 16
+max_num_batched_tokens = 4096
+# The weights take 132 GiB of each GPU: the default share of 0.7 does not hold them beside the
+# graph pool and the KV cache.
+mem_fraction_static = 0.95
+
+[moe_config]
+expert_parallel = true
+
+# The drafter's block of five drafts. Verifications accept them by the synthetic acceptance
+# length of InferenceX's golden DSpark curve of the model (five drafts, thinking on: 3.51), at
+# which throughput benchmarks compare systems; it is a step value, and without it a
+# verification accepts the drafts its model's own selection confirms.
+[speculative_config]
+num_draft_tokens = 5
+synthetic_acceptance_length = 3.51
+
+# A worker captures its largest decode batch (max_running_requests) beside these.
+[cuda_graph_config]
+decode_batch_sizes = [1, 2, 4, 8]
+prefill_token_sizes = [1024, 4096]
+
+# The four schedulers' groups, one rank each, which form the expert union.
+[[worker_groups]]
+id = "model-0"
+ranks = ["cuda:0"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-1"
+ranks = ["cuda:1"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-2"
+ranks = ["cuda:2"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-3"
+ranks = ["cuda:3"]
+queue_depth = 2
+
+[worker_groups.blocks.model]

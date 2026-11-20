@@ -30,7 +30,10 @@ use std::sync::Arc;
 use build_server::manifest::Manifest;
 use models::deepseek_v41::cache::{COMPRESSED, WINDOW};
 use nn::family::{CacheField, Family, History, INDEX_KEY, Layout, TextModel, TextPlacement};
-use nn::{DType, ExpertExchange, KvCache, MetaWeights, Phase, RecurrentState, Split, WeightLoader};
+use nn::{
+    DType, DraftBlock, DraftContext, ExpertExchange, KvCache, MetaWeights, Phase, RecurrentState,
+    Split, WeightLoader,
+};
 use nn_testing::text::{self, WORKSPACE_BYTES};
 use nn_testing::{Launch, PAGE_TOKENS, Recording, assert_generic, meta, record, report};
 
@@ -320,14 +323,16 @@ fn buckets(name: &str, model: &dyn TextModel, union: Split) -> Keys {
     every
 }
 
-/// What the model declares of its cache, state and experts: the window latent of every layer,
-/// the compressed latents and page-laid index keys of the four sources and their readers, the
-/// rings of the three ratio-2 sources, and 384 routed experts of 2304, six a token.
+/// What the model declares of its cache, state and experts: the window latent of every layer
+/// and of the three DSpark layers after them, the compressed latents and page-laid index keys
+/// of the four sources and their readers, the rings of the three ratio-2 sources, and 384 routed
+/// experts of 2304, six a token.
 fn assert_declarations(model: &dyn TextModel) {
     let fields = model.cache();
     let names: Vec<&str> = fields.iter().map(|field| field.name).collect();
     assert_eq!(names, [WINDOW, COMPRESSED, INDEX_KEY]);
-    assert_eq!(fields[0].owners.len(), 40);
+    let window_owners: Vec<u32> = fields[0].owners.iter().map(|owner| owner.layer).collect();
+    assert_eq!(window_owners, (0..43).collect::<Vec<u32>>());
     assert_eq!(fields[0].history, History::Window { tokens: 128 });
     let owners: Vec<(u32, u32)> = fields[1]
         .owners
@@ -411,6 +416,135 @@ fn a_whole_rank_and_a_rank_of_an_expert_union_state_declared_kernels() {
         .count();
     assert_eq!(exchanges, 2 * 40);
     assert_declared("the join", &recording.launches.iter().cloned().collect());
+}
+
+/// One forward of `model`'s DSpark drafter over the context of `rows` rows of `tokens` tokens in
+/// all and a block of five tokens a row, over page tables of `context` tokens, and the head and
+/// the Markov chain over its rows: what it recorded, each launch checked ([`assert_generic`]).
+fn draft(model: &dyn TextModel, (rows, tokens, context): (usize, usize, usize)) -> Recording {
+    let drafter = model.block_drafter().expect("the drafter is loaded");
+    let size = drafter.block() as usize;
+    let blocks = rows * size;
+    let row_pages = context.div_ceil(PAGE_TOKENS as usize).max(4);
+    let batch = |tokens: usize| {
+        text::batch(
+            Phase::Prefill,
+            [
+                meta(tokens, DType::I32),
+                meta(rows, DType::U32),
+                meta(rows + 1, DType::U32),
+                meta(rows, DType::U32),
+            ],
+            None,
+            PAGE_TOKENS,
+            PAGE_TOKENS * row_pages as u32,
+        )
+    };
+
+    let (drafted, recording) = record(&[], || {
+        let fields = model.cache();
+        let groups = |tokens: usize| {
+            [
+                group(&fields, History::Full, (rows, row_pages), tokens),
+                group(
+                    &fields,
+                    History::Window { tokens: 128 },
+                    (rows, row_pages),
+                    tokens,
+                ),
+            ]
+        };
+        let (context_batch, block_batch) = (batch(tokens), batch(blocks));
+        let (context_cache, block_cache) = (groups(tokens), groups(blocks));
+        let hidden = meta((tokens, model.stream_width() as usize), DType::BF16);
+        let embedded = model
+            .embed_input_ids(&meta(blocks, DType::U32))
+            .expect("the embeddings");
+
+        let drafted = drafter
+            .forward(
+                &DraftContext {
+                    batch: &context_batch,
+                    cache: &context_cache,
+                    hidden: &hidden,
+                },
+                &DraftBlock {
+                    batch: &block_batch,
+                    cache: &block_cache,
+                    embedded: &embedded,
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("the drafter's forward: {error}"));
+        assert_eq!(drafted.dims(), [blocks, 5120]);
+
+        let logits = model.compute_logits(&drafted).expect("the logits");
+        let proposed = drafter
+            .propose(&logits, &meta(rows, DType::U32))
+            .expect("the proposals");
+        assert_eq!(proposed.dims(), [rows, size]);
+        assert_eq!(proposed.dtype(), DType::U32);
+        Ok(())
+    });
+    drafted.unwrap_or_else(|error: nn::Error| panic!("the drafter's step: {error}"));
+
+    assert_generic("a drafter's forward", &recording.launches);
+    recording
+}
+
+/// A rank that drafts loads the DSpark drafter (`mtp.*`): the model's forward returns beside each
+/// read-out row the residual entering each of the three target layers, and one forward of the
+/// drafter writes a verification's or a prompt's context and drafts a block of five tokens a row,
+/// every kernel key one the tree declares, its routed experts whole on each rank of an expert
+/// union, so that a member that joins a step runs none of them.
+#[test]
+#[ignore = "reads the release's headers through the Hugging Face cache"]
+fn a_drafting_rank_states_declared_kernels_for_its_blocks() {
+    let union = Split::new(UNION, 1).unwrap();
+    for (name, experts) in [("whole", Split::WHOLE), ("union rank 1 of 4", union)] {
+        let model = load(&TextPlacement {
+            experts,
+            drafter: true,
+            ..TextPlacement::WHOLE
+        });
+        assert_declarations(&*model);
+        assert_eq!(model.stream_width(), 4 * 5120);
+        let drafter = model.block_drafter().expect("the drafter is loaded");
+        assert_eq!((drafter.block(), drafter.fill()), (5, 128_799));
+
+        // The target's rows of a decode bucket carry the drafter's context.
+        let recording = step(&*model, Phase::Decode, (8, 8, 1), experts);
+        assert_declared(
+            &format!("{name} drafting decode"),
+            &recording.launches.iter().cloned().collect(),
+        );
+
+        // A verification of eight rows of six tokens, and a prompt of 512 tokens.
+        for bucket in [(8, 48, 4096), (1, 512, 512)] {
+            let recording = draft(&*model, bucket);
+            let again = draft(&*model, bucket);
+            let keys: Keys = recording.launches.iter().cloned().collect();
+            assert_eq!(
+                (&keys, recording.peak),
+                (&again.launches.iter().cloned().collect(), again.peak),
+                "two runs of one drafter bucket differ"
+            );
+            let run = format!("{name} drafter {} rows, {} tokens", bucket.0, bucket.1);
+            report(&run, &recording);
+            assert_declared(&run, &keys);
+            assert!(
+                !keys
+                    .iter()
+                    .any(|(operator, _)| *operator == "expert_exchange"),
+                "{run}: the drafter's experts are whole on the rank"
+            );
+        }
+
+        let lent = exchange(UNION, 8);
+        let (joined, recording) = record(&axes(experts), || drafter.join_expert_step(&lent));
+        joined.expect("the drafter's join");
+        assert!(recording.launches.is_empty(), "{:?}", recording.launches);
+    }
 }
 
 /// A rank of the expert union of eight that two hosts of four GPUs form (DP8 attention): rank 5,
