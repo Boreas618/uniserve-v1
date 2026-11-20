@@ -622,7 +622,7 @@ The leader pushes the deployment's observation store to an OpenTelemetry Collect
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `template` | The checkpoint's | The chat template, read exactly as written: `{ file = "/path/chat.jinja" }` names a file of Jinja source, `{ inline = "..." }` states the source itself. Unset, the checkpoint's own template renders: its standalone template file, else the `chat_template` of its `tokenizer_config.json` |
+| `template` | The checkpoint's | The chat template, read exactly as written: `{ file = "/path/chat.jinja" }` names a file of Jinja source, `{ inline = "..." }` states the source itself. Unset, the checkpoint's own template renders, read where its family's checkpoints keep it: its standalone `chat_template.jinja`, else the `chat_template` of its `tokenizer_config.json`, for Qwen3-MoE, whose releases keep it in the field and later exports in the file alone; the file alone for Qwen3.6 and Qwen3.8 Flash Next, whose checkpoints all publish it |
 | `template_kwargs` | Unset | Keyword arguments bound into every chat-template render |
 | `template_content_format` | `"auto"` | How message content renders: `string` or `openai`; `auto` detects it from the template, keeping each message's own shape for a template that reads both |
 | `reasoning_parser` | `"auto"` | `auto` splits `reasoning` from `content`; `none` streams reasoning delimiters as content |

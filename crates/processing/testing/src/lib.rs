@@ -2,7 +2,8 @@
 //! machinery ([`processing::program::Program`]):
 //!
 //! - [`CHAT`] (`ChatForCausalLM` in `config.json`): `<think>` reasoning and JSON tool calls,
-//!   its template in `tokenizer_config.json`, its context length at `max_position_embeddings`;
+//!   its template in `chat_template.jinja`, else in `tokenizer_config.json`, its context length
+//!   at `max_position_embeddings`;
 //! - [`PLAIN`] (`PlainForCausalLM`): a chat family that declares neither format;
 //! - [`TAGS`] (`TagsForCausalLM`): tool calls as function and parameter tags, no reasoning;
 //! - [`VISION`] (`VisionForCausalLM`): [`CHAT`]'s formats, taking images as blocks of one merged
@@ -36,7 +37,7 @@ pub const CHAT: Family = Family {
         images: None,
         checkpoint: ChatCheckpoint {
             context_length: &["max_position_embeddings"],
-            chat_template: ChatTemplate::TokenizerConfig,
+            chat_template: ChatTemplate::FileOrTokenizerConfig("chat_template.jinja"),
         },
     }),
 };
@@ -52,7 +53,7 @@ pub const PLAIN: Family = Family {
         images: None,
         checkpoint: ChatCheckpoint {
             context_length: &["max_position_embeddings"],
-            chat_template: ChatTemplate::TokenizerConfig,
+            chat_template: ChatTemplate::FileOrTokenizerConfig("chat_template.jinja"),
         },
     }),
 };

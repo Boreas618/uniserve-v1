@@ -48,13 +48,23 @@ pub struct ChatCheckpoint {
 }
 
 /// Where a chat family's checkpoints keep their chat template.
+///
+/// `transformers` stored a tokenizer's template as the `chat_template` field of
+/// `tokenizer_config.json` until it saved templates as files of Jinja source of their own
+/// (`chat_template.jinja`), and it loads a checkpoint's template from that file when the
+/// checkpoint publishes it, else from the field. A family states the places its published
+/// checkpoints keep it in, which request processing reads by that precedence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatTemplate {
-    /// The `chat_template` field of `tokenizer_config.json`, where `transformers` stored a
-    /// template before it saved templates as files of their own.
-    TokenizerConfig,
-    /// A file of Jinja source at the checkpoint's root, such as `chat_template.jinja`.
+    /// A file of Jinja source at the checkpoint's root, such as `chat_template.jinja`, which
+    /// every checkpoint of the family publishes: the family's checkpoints were all saved since
+    /// `transformers` saves templates as files.
     File(&'static str),
+    /// The file of Jinja source at the checkpoint's root when the checkpoint publishes it, else
+    /// the `chat_template` field of `tokenizer_config.json`: the family's checkpoints were saved
+    /// both before and since, so one keeps its template in the field and another, such as a
+    /// later quantized export, in the file alone.
+    FileOrTokenizerConfig(&'static str),
 }
 
 impl std::fmt::Debug for ChatProfile {
