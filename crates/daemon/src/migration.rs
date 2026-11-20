@@ -23,6 +23,17 @@
 //! trajectory from the stored step, and the daemon's detokenizer,
 //! stop-string matcher and response assembly keep their state.
 //!
+//! A token request that scores its prompt (`prompt_logprobs`) and leaves
+//! before its first token, in the middle of its prefill, received the scores
+//! of the chunks its engine computed and no others. Its continuation asks
+//! for the scores again: the next engine computes such a prompt from its
+//! start, since a request that scores its prompt reads no cached prefix, and
+//! scores every position again, in order; the stream passes on only the
+//! positions after those the consumer received, so the consumer receives
+//! each position once. A request that generated a token received every
+//! position before it (an engine sends a chunk's scores before the token it
+//! samples), and its continuation scores none.
+//!
 //! A request a prefill replica computed the prompt of migrates by a handoff
 //! (`MigrationCause::Handoff`): the migratable event carries the KV the
 //! replica lent (`Lend`), and the continuation, which names the lend, goes
@@ -165,6 +176,8 @@ impl Migrator {
             pending: None,
             resumed: false,
             scheduled: false,
+            prompt_positions: 0,
+            repeated_positions: 0,
             migrated_at: None,
             open: true,
         };
@@ -213,9 +226,14 @@ impl Resumable {
         let cause = migration.cause;
         match self {
             Self::Generation(request) => {
-                // Its prompt's log-probabilities were reported where it began.
-                request.sampling.return_prompt_logprobs = false;
-                request.sampling.n_prompt_logprobs = 0;
+                // A request that generated a token received its prompt's every score before it.
+                // One that generated none keeps asking for them: it may have left in the
+                // middle of its prefill, and `RequestEvents` passes on only the positions its
+                // consumer did not receive.
+                if !request.generated_token_ids.is_empty() {
+                    request.sampling.return_prompt_logprobs = false;
+                    request.sampling.n_prompt_logprobs = 0;
+                }
                 // A handoff's continuation imports what the prefill replica lent and hands
                 // nothing off again; a later migration finds no lend, which its import ended.
                 if cause == MigrationCause::Handoff {
@@ -368,6 +386,13 @@ pub struct RequestEvents {
     /// migration skips is decided from this, because it is a fact about what
     /// the consumer read, not about which engine sent it.
     scheduled: bool,
+    /// The prompt positions whose scores the consumer received, from every
+    /// engine that served the request.
+    prompt_positions: usize,
+    /// The positions the engine serving now scores that the consumer received
+    /// from one before it: an engine scores a continuation's prompt from its
+    /// first scored position again, and the stream drops these first ones.
+    repeated_positions: usize,
     /// When the request's last migration began, until the engine that serves
     /// it next delivers its first token.
     migrated_at: Option<Instant>,
@@ -393,6 +418,8 @@ impl RequestEvents {
             pending: None,
             resumed: consumed > 0,
             scheduled: consumed > 0,
+            prompt_positions: 0,
+            repeated_positions: 0,
             migrated_at: None,
             open: true,
         }
@@ -420,7 +447,7 @@ impl RequestEvents {
     }
 
     /// Takes `event` as a migration or a refusal to route again when it is one, and returns
-    /// what the consumer receives of it otherwise: nothing for a scheduling it received before.
+    /// what the consumer receives of it otherwise ([`Self::unrepeated`]).
     fn pends(&mut self, event: Event) -> Option<Event> {
         match event {
             Event::Migratable {
@@ -444,8 +471,7 @@ impl RequestEvents {
                 self.pending = Some(Pending::Reroute(message));
                 None
             }
-            event if self.skips(&event) => None,
-            event => Some(event),
+            event => self.unrepeated(event),
         }
     }
 
@@ -510,22 +536,38 @@ impl RequestEvents {
             .map_err(|error| Event::Error {
                 message: format!("the request could not be routed again: {error}"),
             })?;
-        self.stream = stream;
+        self.continue_on(stream);
         self.hold = Some(target.first.hold);
         self.decode = target.decode;
         Ok(())
     }
 
-    /// Whether `event` repeats what the consumer received from an engine
-    /// before: the scheduling of a resumed request.
-    fn skips(&mut self, event: &Event) -> bool {
+    /// What the consumer receives of `event`, less what it received from an
+    /// engine before: nothing of a resumed request's scheduling it read, and of
+    /// a continuation's prompt scores the positions after those it received,
+    /// nothing when it received all of the event's.
+    fn unrepeated(&mut self, event: Event) -> Option<Event> {
         match event {
             Event::Scheduled { .. } if self.resumed && self.scheduled => {
                 self.resumed = false;
-                true
+                None
             }
-            _ => false,
+            Event::PromptLogprobs { mut positions } if self.repeated_positions > 0 => {
+                let repeated = self.repeated_positions.min(positions.len());
+                self.repeated_positions -= repeated;
+                positions.drain(..repeated);
+                (!positions.is_empty()).then_some(Event::PromptLogprobs { positions })
+            }
+            event => Some(event),
         }
+    }
+
+    /// Goes on with `stream`, the events of the engine that serves the
+    /// request from here on, which scores again every prompt position the
+    /// consumer received (`repeated_positions`).
+    fn continue_on(&mut self, stream: EventStream) {
+        self.stream = stream;
+        self.repeated_positions = self.prompt_positions;
     }
 
     /// Hands `event` to the consumer, keeping the tokens it carries.
@@ -537,10 +579,12 @@ impl RequestEvents {
         event
     }
 
-    /// Keeps the tokens of `event`, and finishes on a terminal event.
+    /// Keeps the tokens of `event` and counts the prompt positions it scores,
+    /// and finishes on a terminal event.
     fn observe(&mut self, event: &Event) {
         match event {
             Event::Scheduled { .. } => self.scheduled = true,
+            Event::PromptLogprobs { positions } => self.prompt_positions += positions.len(),
             Event::TextToken { id, .. } => self.keep(&[*id]),
             event if event.is_terminal() => self.finish(),
             _ => {}
@@ -644,11 +688,11 @@ impl RequestEvents {
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         // The previous engine's stream ended with its migratable event.
-        self.stream = stream;
+        self.continue_on(stream);
         // Whether the next engine's scheduling repeats one the consumer read
         // is not knowable here — an engine lost before it scheduled anything
         // leaves the next engine's first scheduling the only one the consumer
-        // will ever see — so `skips` answers it from what the consumer read.
+        // will ever see — so `unrepeated` answers it from what the consumer read.
         self.resumed = true;
         self.migrated_at = Some(started);
         Ok(())
@@ -741,9 +785,12 @@ impl Events for RequestEvents {
 mod tests {
     use std::time::Duration;
 
-    use proto::request::{DiffusionSamplingParams, SamplingParams};
+    use proto::handoff::TextDecode;
+    use proto::request::{DiffusionSamplingParams, PositionLogprobs, SamplingParams, TokenLogprob};
 
     use super::*;
+    use crate::api::output::text::{DecodeStream, DecodedTextEvent};
+    use crate::api::test_support::configured_tokenizer;
     use crate::engine::client::EngineClient;
     use crate::test_support::{Arrival, SERVED_MODEL, letter_fake, scripted_client};
 
@@ -896,6 +943,199 @@ mod tests {
             ),
             "{finished:?}"
         );
+    }
+
+    /// The scores an engine sends for the prompt positions `positions` (indices into `prompt`),
+    /// each led by the token it scores.
+    fn scores(prompt: &[u32], positions: std::ops::Range<usize>) -> Event {
+        let scored = prompt[positions].iter().map(|&token_id| PositionLogprobs {
+            entries: vec![TokenLogprob {
+                token_id,
+                logprob: -1.0,
+                rank: 1,
+            }],
+        });
+        Event::PromptLogprobs {
+            positions: scored.collect(),
+        }
+    }
+
+    /// The scheduling of a request that found nothing cached.
+    fn scheduling() -> Event {
+        Event::Scheduled {
+            queued_at: 1.0,
+            scheduled_at: 2.0,
+            cached_tokens: 0,
+        }
+    }
+
+    /// The token request the scripted engine `engine` was submitted.
+    fn submitted(engine: &crate::test_support::ScriptedEngine) -> Box<GenerationRequest> {
+        match engine.submitted.try_recv() {
+            Ok(Request::Generation(request)) => request,
+            other => panic!("the engine took no token request: {other:?}"),
+        }
+    }
+
+    /// A request that scores its prompt and leaves its engine in the middle of its prefill, as
+    /// a drain's deadline or a preemption ends it, keeps asking for the scores: the next engine
+    /// scores the prompt from its start again, in chunks of its own, and the consumer receives
+    /// each position once and in order, so its decoder starts the response and finishes it.
+    #[tokio::test]
+    async fn a_request_that_leaves_in_its_prefill_receives_every_prompt_score_once() {
+        let prompt: Vec<u32> = b"abcdefgh".iter().copied().map(u32::from).collect();
+
+        // The first engine sends the scores of its first chunk, positions 1 to 4, and drains.
+        let hold = Arc::new(RequestHold::new());
+        let sent = prompt.clone();
+        let (first, _) = scripted_client(1, move |_| {
+            vec![
+                scheduling(),
+                scores(&sent, 1..3),
+                scores(&sent, 3..5),
+                migratable(MigrationCause::Drain, 0, &[]),
+            ]
+        });
+        hold.serve(Arc::new(first));
+        let mut asking = request(1);
+        asking.prompt_token_ids = prompt.clone();
+        asking.sampling.return_prompt_logprobs = true;
+        asking.sampling.n_prompt_logprobs = 2;
+        let migrator = Migrator::new(Arc::clone(&hold), 0, None);
+        let (mut events, _) = migrator
+            .submit(Request::Generation(Box::new(asking)), None, None)
+            .await
+            .unwrap();
+
+        // The next engine scores every position again, three at a time, when the continuation
+        // asks for the scores, as an engine does.
+        let sent = prompt.clone();
+        let (next, next_engine) = scripted_client(2, move |arrival| {
+            let asks = matches!(
+                arrival,
+                Arrival::Submitted(Request::Generation(request))
+                    if request.sampling.prompt_logprobs_requested()
+            );
+            let mut events = vec![scheduling()];
+            if asks {
+                events.extend([
+                    scores(&sent, 1..4),
+                    scores(&sent, 4..7),
+                    scores(&sent, 7..8),
+                ]);
+            }
+            events.push(Event::TextToken {
+                id: u32::from(b'z'),
+                logprob: None,
+            });
+            events.push(finished(1));
+            events
+        });
+        hold.serve(Arc::new(next));
+
+        let mut decode = DecodeStream::new(
+            "migrated".to_owned(),
+            configured_tokenizer(),
+            prompt.clone(),
+            true,
+            false,
+            TextDecode::default(),
+        )
+        .unwrap();
+        let (mut received, mut decoded) = (Vec::new(), Vec::new());
+        while let Some(event) = events.recv().await {
+            if let Event::PromptLogprobs { positions } = &event {
+                let leading = positions
+                    .iter()
+                    .map(|position| position.entries[0].token_id);
+                received.extend(leading);
+            }
+            let terminal = event.is_terminal();
+            match decode.push(event, &mut events) {
+                Ok(events) => decoded.extend(events),
+                Err(error) => panic!("the response failed: {error}"),
+            }
+            if terminal {
+                break;
+            }
+        }
+
+        assert_eq!(received, prompt[1..], "every position once, in order");
+        let continued = submitted(&next_engine);
+        assert!(continued.generated_token_ids.is_empty());
+        assert_eq!(continued.sampling.n_prompt_logprobs, 2);
+        assert!(continued.sampling.return_prompt_logprobs);
+        let started = decoded.iter().find_map(|event| match event {
+            DecodedTextEvent::Start { prompt, .. } => prompt.logprobs.as_ref(),
+            _ => None,
+        });
+        assert_eq!(
+            started.map(|logprobs| logprobs.scored_positions.len()),
+            Some(prompt.len() - 1)
+        );
+        assert!(
+            matches!(
+                decoded.last(),
+                Some(DecodedTextEvent::Done {
+                    reason: proto::request::FinishReason::MaxTokens,
+                    ..
+                })
+            ),
+            "{decoded:?}"
+        );
+    }
+
+    /// A request that generated a token before it left received its prompt's every score
+    /// before that token, and its continuation, which resumes from the token, asks for none.
+    #[tokio::test]
+    async fn a_request_that_generated_a_token_asks_no_prompt_scores_again() {
+        let prompt: Vec<u32> = b"abcd".iter().copied().map(u32::from).collect();
+        let hold = Arc::new(RequestHold::new());
+        let sent = prompt.clone();
+        let (first, _) = scripted_client(1, move |_| {
+            vec![
+                scheduling(),
+                scores(&sent, 1..4),
+                Event::TextToken {
+                    id: u32::from(b'y'),
+                    logprob: None,
+                },
+                migratable(MigrationCause::Drain, 0, &[]),
+            ]
+        });
+        hold.serve(Arc::new(first));
+        let mut asking = request(2);
+        asking.prompt_token_ids = prompt;
+        asking.sampling.return_prompt_logprobs = true;
+        let migrator = Migrator::new(Arc::clone(&hold), 0, None);
+        let (mut events, _) = migrator
+            .submit(Request::Generation(Box::new(asking)), None, None)
+            .await
+            .unwrap();
+        let (next, next_engine) = scripted_client(2, |_| {
+            vec![
+                Event::TextToken {
+                    id: u32::from(b'z'),
+                    logprob: None,
+                },
+                finished(2),
+            ]
+        });
+        hold.serve(Arc::new(next));
+
+        let mut scored = 0;
+        loop {
+            match events.recv().await {
+                Some(Event::PromptLogprobs { positions }) => scored += positions.len(),
+                Some(event) if event.is_terminal() => break,
+                Some(_) => {}
+                None => panic!("the request ended without a finish"),
+            }
+        }
+        assert_eq!(scored, 3);
+        let continued = submitted(&next_engine);
+        assert_eq!(continued.generated_token_ids, [u32::from(b'y')]);
+        assert!(!continued.sampling.prompt_logprobs_requested());
     }
 
     /// A request whose engine was lost before it sent any scheduling reads
