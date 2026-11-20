@@ -159,6 +159,7 @@ impl Regions {
             packed,
             packed_scales,
             fused: self.fused,
+            fused_experts: self.shape.fused,
             source_only: self.shape.rank < self.shape.attention_ranks,
         };
 

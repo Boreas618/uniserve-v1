@@ -987,7 +987,7 @@ fn dense_config() -> MoEConfig {
         routed_scale: None,
         limit: None,
         router: "gate",
-        router_dtype: None,
+        router_logits: None,
         list: "experts",
         up: "up_proj",
         gate: "gate_proj",
@@ -998,6 +998,8 @@ fn dense_config() -> MoEConfig {
         tensor_experts: false,
         exchange: Split::WHOLE,
         name: None,
+        shared: None,
+        fused_exchange: false,
     }
 }
 
@@ -1652,6 +1654,7 @@ fn exchange(ranks: u32, rank_rows: u32, hidden: usize, top: usize) -> ExpertExch
         packed: meta((rank_rows as usize, hidden / 2), DType::U8),
         packed_scales: meta((rank_rows as usize, hidden / 16), DType::F8E4M3),
         fused: false,
+        fused_experts: nn::family::FusedExperts::NONE,
         source_only: false,
     }
 }
@@ -1660,7 +1663,7 @@ fn exchange(ranks: u32, rank_rows: u32, hidden: usize, top: usize) -> ExpertExch
 fn exchange_key(mode: &str) -> String {
     format!(
         "mode_{mode}_hidden_8_intermediate_6_top_2_experts_4_max_tokens_4_ranks_2_attention_0_\
-         multiprocessors_148_dtype_bf16"
+         multiprocessors_148_dtype_bf16_weights_none_shared_0_limit_0x0"
     )
 }
 
@@ -1805,6 +1808,7 @@ fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
 
     let fused = ExpertExchange {
         fused: true,
+        fused_experts: nn::family::FusedExperts::NVFP4,
         ..exchange(2, 4, 32, 2)
     };
     let (output, Recording { launches, .. }) = record(&[], || {
@@ -1821,7 +1825,7 @@ fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
             (
                 "expert_exchange",
                 "mode_fused_hidden_32_intermediate_16_top_2_experts_2_max_tokens_4_ranks_2_\
-                 attention_0_multiprocessors_148_dtype_bf16"
+                 attention_0_multiprocessors_148_dtype_bf16_weights_nvfp4_shared_0_limit_0x0"
             ),
         ]
         .map(|(operator, key)| (operator, key.to_owned()))

@@ -175,6 +175,22 @@ pub enum ScaleLayout {
     /// row before the next group's (MN-major), the rows padded to [`WORD_ROWS`]:
     /// `[columns / 128, rows padded to 4]` `U32`.
     PackedMnMajor,
+    /// [`Self::PackedMnMajor`] with the rows of each 128-row group stored in the order the
+    /// tensor-core scale copy of DeepGEMM's MegaMoE reads them (`SM100_UTCCP_4x32dp128bit`): row
+    /// `128b + 32i + j` at `128b + 4j + i`. The rows are whole groups of 128.
+    PackedMnMajorUtccp,
+}
+
+/// Where row `row` of a scale table lies in `layout`'s row order: itself, except in the UTCCP
+/// order of [`ScaleLayout::PackedMnMajorUtccp`].
+const fn stored_row(row: u64, layout: ScaleLayout) -> u64 {
+    match layout {
+        ScaleLayout::PackedMnMajorUtccp => {
+            let within = row % 128;
+            row - within + (within % 32) * 4 + within / 32
+        }
+        _ => row,
+    }
 }
 
 impl fmt::Display for ScaleLayout {
@@ -183,6 +199,7 @@ impl fmt::Display for ScaleLayout {
             Self::Linear => "linear",
             Self::Swizzled128X4 => "swizzled_128x4",
             Self::PackedMnMajor => "packed_mn_major",
+            Self::PackedMnMajorUtccp => "packed_mn_major_utccp",
         })
     }
 }
@@ -192,7 +209,7 @@ impl ScaleLayout {
     pub const fn dtype(self) -> DType {
         match self {
             Self::Linear | Self::Swizzled128X4 => DType::U8,
-            Self::PackedMnMajor => DType::U32,
+            Self::PackedMnMajor | Self::PackedMnMajorUtccp => DType::U32,
         }
     }
 
@@ -208,6 +225,7 @@ impl ScaleLayout {
                 columns.div_ceil(WORD_ELEMENTS),
                 rows.div_ceil(WORD_ROWS) * WORD_ROWS,
             ],
+            Self::PackedMnMajorUtccp => [columns.div_ceil(WORD_ELEMENTS), rows.div_ceil(128) * 128],
         }
     }
 }
@@ -248,13 +266,14 @@ pub fn arranged(linear: &[u8], rows: u64, columns: u64, layout: ScaleLayout) -> 
             }
             swizzled
         }
-        ScaleLayout::PackedMnMajor => {
+        ScaleLayout::PackedMnMajor | ScaleLayout::PackedMnMajorUtccp => {
             let [groups, padded_rows] = layout.shape(rows, columns);
             let mut packed = vec![0_u8; (groups * padded_rows * WORD_SCALES) as usize];
             for row in 0..rows {
                 for block in 0..blocks {
-                    // Word `(group, row)` holds the row's blocks `4 · group ..`, byte by byte.
-                    let word = (block / WORD_SCALES) * padded_rows + row;
+                    // Word `(group, row)` holds the row's blocks `4 · group ..`, byte by byte,
+                    // the row where the layout's row order puts it.
+                    let word = (block / WORD_SCALES) * padded_rows + stored_row(row, layout);
                     let index = word * WORD_SCALES + block % WORD_SCALES;
                     packed[index as usize] = linear[(row * blocks + block) as usize];
                 }
@@ -273,13 +292,7 @@ pub fn arranged(linear: &[u8], rows: u64, columns: u64, layout: ScaleLayout) -> 
 pub fn linear(published: &[u8], rows: u64, columns: u64, layout: ScaleLayout) -> Vec<u8> {
     let blocks = columns.div_ceil(u64::from(BLOCK));
     let [first, second] = layout.shape(rows, columns);
-    let bytes = first
-        * second
-        * if layout == ScaleLayout::PackedMnMajor {
-            4
-        } else {
-            1
-        };
+    let bytes = first * second * if layout.dtype() == DType::U32 { 4 } else { 1 };
     assert!(
         published.len() as u64 >= bytes,
         "a {layout} table of {bytes} bytes"
@@ -297,8 +310,9 @@ pub fn linear(published: &[u8], rows: u64, columns: u64, layout: ScaleLayout) ->
                         + ((row % 128) / 32) * 4
                         + (row / 128) * (128 * second)
                 }
-                ScaleLayout::PackedMnMajor => {
-                    ((block / WORD_SCALES) * second + row) * WORD_SCALES + block % WORD_SCALES
+                ScaleLayout::PackedMnMajor | ScaleLayout::PackedMnMajorUtccp => {
+                    ((block / WORD_SCALES) * second + stored_row(row, layout)) * WORD_SCALES
+                        + block % WORD_SCALES
                 }
             };
             table.push(published[index as usize]);
@@ -819,6 +833,7 @@ mod tests {
             ScaleLayout::Linear,
             ScaleLayout::Swizzled128X4,
             ScaleLayout::PackedMnMajor,
+            ScaleLayout::PackedMnMajorUtccp,
         ] {
             let published = arranged(&linear, rows, columns, layout);
             assert_eq!(
@@ -827,6 +842,28 @@ mod tests {
                 "{layout}"
             );
         }
+    }
+
+    /// DeepGEMM's MegaMoE copies a 128-row group's scales into tensor memory as four 32-row
+    /// lanes side by side, so row `32i + j` of a group is stored at `4j + i`
+    /// (`_transpose_sf_for_utccp`).
+    #[test]
+    fn the_utccp_order_stores_a_groups_lanes_side_by_side() {
+        let (rows, columns) = (256_u64, 128_u64);
+        let linear: Vec<u8> = (0..rows * 4).map(|index| (index / 4) as u8).collect();
+        let packed = arranged(&linear, rows, columns, ScaleLayout::PackedMnMajorUtccp);
+        assert_eq!(
+            ScaleLayout::PackedMnMajorUtccp.shape(rows, columns),
+            [1, 256]
+        );
+
+        // The word of row r holds four bytes of value r.
+        let row_at = |position: usize| packed[position * 4];
+        assert_eq!(row_at(0), 0);
+        assert_eq!(row_at(1), 32);
+        assert_eq!(row_at(4), 1);
+        assert_eq!(row_at(4 * 31 + 3), 127);
+        assert_eq!(row_at(128 + 5), 128 + 32 + 1);
     }
 
     #[test]

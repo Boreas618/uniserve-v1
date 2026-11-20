@@ -205,6 +205,10 @@ pub struct TextPlacement {
     /// experts contributing nothing. No exchange moves a token, so the expert group's split
     /// is then whole. A tensor split of one rank holds every expert whole either way.
     pub tensor_experts: bool,
+    /// Whether an expert group runs each MXFP4 expert layer in its exchange's one fused launch
+    /// (`moe_config.fused_exchange`), so the experts load in the arrangement that launch reads;
+    /// a placement no expert group divides reads nothing of it.
+    pub fused_exchange: bool,
     /// Whether the deployment speculates with the checkpoint's own drafter, so its layers load
     /// beside the model's ([`TextModel::drafter`]); a deployment that does not leaves them unread.
     pub drafter: bool,
@@ -228,6 +232,7 @@ impl TextPlacement {
         sequence: SequenceSplit::WHOLE,
         experts: Split::WHOLE,
         tensor_experts: false,
+        fused_exchange: false,
         drafter: false,
         vision: false,
         draft_tokens: 0,
@@ -839,6 +844,9 @@ impl CacheField {
     }
 }
 
+/// What an exchange's one fused launch runs beside the routes ([`ExpertShape::fused`]).
+pub use ops::moe::exchange::{ExpertWeights, FusedExperts};
+
 /// The routed experts of a causal language model, as an expert exchange carries them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpertShape {
@@ -848,8 +856,11 @@ pub struct ExpertShape {
     pub intermediate: u32,
     /// Experts each row is routed to.
     pub top: u32,
-    /// Whether the experts are read packed, so a step encodes its activations before the exchange.
-    pub encoded: bool,
+    /// What the exchange's one fused launch runs of each layer, as the model loaded its experts
+    /// for it: the routed experts' representation, the shared experts and the gated
+    /// activation's clamp; [`ops::moe::exchange::FusedExperts::NONE`] for a model whose layers
+    /// run between an exchange's dispatch and combine.
+    pub fused: ops::moe::exchange::FusedExperts,
 }
 
 /// A video generation pipeline family.

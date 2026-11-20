@@ -161,9 +161,13 @@ pub enum ValueLayout {
         /// Rows one MMA tile of the product covers, as [`Self::Shuffled`] states it.
         epilogue_tile_m: u32,
     },
-    /// A fused gated product's row order: thirty-two-row block `b` holds rows `[16b, 16b + 16)`
-    /// of the matrix's second half, then the same rows of its first half.
-    GateFirst,
+    /// A fused gated product's row order: block `b` of `2 · rows` rows holds rows
+    /// `[rows · b, rows · (b + 1))` of the matrix's second half, then the same rows of its first
+    /// half. FlashInfer's MegaMoE reads blocks of sixteen, DeepGEMM's of eight.
+    GateFirst {
+        /// The rows of each half one block holds.
+        rows: u32,
+    },
 }
 
 impl ValueLayout {
@@ -171,7 +175,7 @@ impl ValueLayout {
     pub const fn block(self) -> Option<u64> {
         match self {
             Self::Plain => None,
-            Self::GateFirst => Some(32),
+            Self::GateFirst { rows } => Some(2 * rows as u64),
             Self::Shuffled { epilogue_tile_m } | Self::InterleavedShuffled { epilogue_tile_m } => {
                 Some(if epilogue_tile_m % 128 == 0 { 32 } else { 16 })
             }
@@ -187,13 +191,14 @@ impl ValueLayout {
 
         match self {
             Self::Plain => row,
-            Self::GateFirst => {
-                // A second-half row leads its block's sixteen; a first-half row follows them.
+            Self::GateFirst { rows: group } => {
+                // A second-half row leads its block's `group`; a first-half row follows them.
+                let group = group as u64;
                 if row >= half {
                     let row = row - half;
-                    (row / 16) * 32 + row % 16
+                    (row / group) * 2 * group + row % group
                 } else {
-                    (row / 16) * 32 + 16 + row % 16
+                    (row / group) * 2 * group + group + row % group
                 }
             }
             Self::Shuffled { .. } | Self::InterleavedShuffled { .. } => {
@@ -225,7 +230,7 @@ impl fmt::Display for ValueLayout {
             Self::InterleavedShuffled { epilogue_tile_m } => {
                 write!(formatter, "interleaved_shuffled_{epilogue_tile_m}")
             }
-            Self::GateFirst => formatter.write_str("gate_first"),
+            Self::GateFirst { rows } => write!(formatter, "gate_first_{rows}"),
         }
     }
 }
@@ -772,14 +777,23 @@ mod tests {
     #[test]
     fn a_gate_first_stack_leads_each_block_with_the_second_half() {
         let rows = 64_u64;
-        assert_eq!(ValueLayout::GateFirst.destination(32, rows), 0);
-        assert_eq!(ValueLayout::GateFirst.destination(47, rows), 15);
-        assert_eq!(ValueLayout::GateFirst.destination(0, rows), 16);
-        assert_eq!(ValueLayout::GateFirst.destination(16, rows), 48);
+        let sixteen = ValueLayout::GateFirst { rows: 16 };
+        assert_eq!(sixteen.destination(32, rows), 0);
+        assert_eq!(sixteen.destination(47, rows), 15);
+        assert_eq!(sixteen.destination(0, rows), 16);
+        assert_eq!(sixteen.destination(16, rows), 48);
+
+        // DeepGEMM's: eight gate rows, then the same eight up rows.
+        let eight = ValueLayout::GateFirst { rows: 8 };
+        assert_eq!(eight.destination(32, rows), 0);
+        assert_eq!(eight.destination(40, rows), 16);
+        assert_eq!(eight.destination(0, rows), 8);
+        assert_eq!(eight.destination(9, rows), 25);
 
         for layout in [
             ValueLayout::Plain,
-            ValueLayout::GateFirst,
+            sixteen,
+            eight,
             ValueLayout::Shuffled {
                 epilogue_tile_m: 64,
             },

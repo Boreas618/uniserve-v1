@@ -659,7 +659,8 @@ impl ModelRunner {
 
     /// The shape of the transport a member of an expert union creates on `device`, whose
     /// `multiprocessors` its exchange is compiled for, and the mode of the module that creates
-    /// it: an encoded block runs in the exchange's one fused launch.
+    /// it: a model whose layers run in the exchange's one fused launch states what it runs
+    /// ([`nn::family::ExpertShape::fused`]).
     ///
     /// The count is the start's statement of the rank's device (`crate::process::ranks::Backing`):
     /// the device's own on a start that holds it, what a meta start states of the device the rank
@@ -685,11 +686,12 @@ impl ModelRunner {
             device: device.0,
             multiprocessors,
             attention_ranks: self.mapping.attention_ranks,
+            fused: experts.fused,
         };
-        let mode = if experts.encoded {
-            ops::moe::exchange::Mode::Fused
-        } else {
+        let mode = if experts.fused.weights == ops::moe::exchange::ExpertWeights::None {
             ops::moe::exchange::Mode::Dispatch
+        } else {
+            ops::moe::exchange::Mode::Fused
         };
         Ok((shape, mode))
     }

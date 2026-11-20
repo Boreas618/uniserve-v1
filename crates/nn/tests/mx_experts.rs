@@ -267,7 +267,7 @@ fn config(experts: usize) -> MoEConfig {
         routed_scale: Some(ROUTED_SCALE),
         limit: Some(LIMIT),
         router: "gate",
-        router_dtype: None,
+        router_logits: None,
         list: "experts",
         up: "w3",
         gate: "w1",
@@ -278,6 +278,8 @@ fn config(experts: usize) -> MoEConfig {
         tensor_experts: false,
         exchange: Split::WHOLE,
         name: None,
+        shared: None,
+        fused_exchange: false,
     }
 }
 
@@ -527,6 +529,7 @@ fn exchange(ranks: u32, rank_rows: u32) -> ExpertExchange {
         packed: meta((rank_rows as usize, HIDDEN / 2), DType::U8),
         packed_scales: meta((rank_rows as usize, HIDDEN / 16), DType::F8E4M3),
         fused: false,
+        fused_experts: nn::family::FusedExperts::NONE,
         source_only: false,
     }
 }
@@ -585,4 +588,244 @@ fn an_mxfp4_block_over_an_expert_group_runs_its_window_between_dispatch_and_comb
     let (joined, Recording { launches, .. }) = record(&[group], || block.join_expert_step(&lent));
     joined.unwrap();
     assert_eq!(operators(&launches), mxfp4_products);
+}
+
+/// DeepSeek's shared expert at the test's widths, as a block owns it.
+fn shared_config() -> SharedExpertConfig {
+    SharedExpertConfig {
+        mlp: MlpConfig {
+            hidden: HIDDEN as u32,
+            intermediate: INTERMEDIATE as u32,
+            activation: Activation::Silu,
+            rounding: Rounding::Fused,
+            limit: Some(LIMIT),
+            gate_up: GateUp::Split {
+                gate: "w1",
+                up: "w3",
+            },
+            down: "w2",
+            bias: false,
+            split: Split::WHOLE,
+        },
+        module: "shared_experts",
+        gate: None,
+    }
+}
+
+/// Where row `row` of a 128-row scale group lies in the order the fused launch's tensor-core
+/// scale copy reads (`ops::mx::ScaleLayout::PackedMnMajorUtccp`): row `32i + j` at `4j + i`.
+fn utccp(row: usize) -> usize {
+    let within = row % 128;
+    row - within + (within % 32) * 4 + within / 32
+}
+
+/// The checkpoint row behind row `row` of a gated stack in the fused launch's arrangement
+/// (`ops::moe::exchange::Descriptor::MXFP4_UP_GATE_VALUES`): each block of sixteen rows holds
+/// eight gate rows, then the same eight up rows, of an `[up; gate]` stack of `half` rows a half.
+fn gate_first(row: usize, half: usize) -> usize {
+    let (block, within) = (row / 16, row % 16);
+    if within < 8 {
+        half + 8 * block + within
+    } else {
+        8 * block + within - 8
+    }
+}
+
+/// The bytes of a loaded CPU tensor of one-byte elements or `u32` words, in memory order.
+fn bytes(tensor: &nn::Tensor) -> Vec<u8> {
+    let flat = tensor.flatten_all().unwrap();
+    if flat.dtype() == DType::U32 {
+        return flat
+            .to_vec1::<u32>()
+            .unwrap()
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+    }
+    flat.view(DType::U8).unwrap().to_vec1::<u8>().unwrap()
+}
+
+/// The fused exchange reads its rank's MXFP4 stacks and the shared expert's MXFP8 matrices in its
+/// own arrangement: each gated stack's gate and up rows interleaved by eight, gate first, and
+/// every scale as MN-major packed words, each 128-row group's rows in the scale copy's order. The
+/// loader lays both out from the checkpoint's rows, the MXFP8 matrices' 32 × 32 block scales
+/// repeated over their rows.
+#[test]
+fn the_fused_exchange_reads_its_stacks_in_its_own_arrangement() {
+    use ops::moe::exchange::Descriptor;
+
+    let directory = tempfile::tempdir().unwrap();
+    export(directory.path(), EXPERTS);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
+    let raw = |name: &str| checkpoint.read(name).unwrap().to_vec();
+
+    // The routed stack of slots 2 and 3, `[up; gate]` of each expert.
+    let stack = loader
+        .mxfp4_stack(
+            "ffn.experts.up_gate",
+            "ffn.experts",
+            &["w3", "w1"],
+            &[2, 3],
+            (Descriptor::MXFP4_UP_GATE_VALUES, Descriptor::MXFP4_SCALES),
+        )
+        .unwrap();
+    let (rows, row_bytes, blocks) = (2 * INTERMEDIATE, HIDDEN / 2, HIDDEN / 32);
+    let (codes, scales) = (bytes(&stack.codes), bytes(&stack.scales));
+    assert_eq!(scales.len(), 2 * (HIDDEN / 128) * rows * 4);
+    for (index, expert) in [2, 3].into_iter().enumerate() {
+        let projection = |name: &str| {
+            (
+                raw(&format!("ffn.experts.{expert}.{name}.weight")),
+                raw(&format!("ffn.experts.{expert}.{name}.scale")),
+            )
+        };
+        let ((up, up_scales), (gate, gate_scales)) = (projection("w3"), projection("w1"));
+        for row in 0..rows {
+            let from = gate_first(row, INTERMEDIATE);
+            let (values, row_scales, at) = if from < INTERMEDIATE {
+                (&up, &up_scales, from)
+            } else {
+                (&gate, &gate_scales, from - INTERMEDIATE)
+            };
+            let arranged = &codes[(index * rows + row) * row_bytes..][..row_bytes];
+            assert_eq!(
+                arranged,
+                &values[at * row_bytes..][..row_bytes],
+                "codes of row {row}"
+            );
+            for block in 0..blocks {
+                let word = (index * (HIDDEN / 128) + block / 4) * rows + utccp(row);
+                assert_eq!(
+                    scales[word * 4 + block % 4],
+                    row_scales[at * blocks + block],
+                    "scale {block} of row {row} of expert {expert}"
+                );
+            }
+        }
+    }
+
+    // The shared expert's gated matrix, its block scales repeated over their rows.
+    let shared = loader
+        .mxfp8_stack(
+            "ffn.shared.up_gate",
+            &[
+                "ffn.shared_experts.w3.weight",
+                "ffn.shared_experts.w1.weight",
+            ],
+            (Descriptor::MXFP4_UP_GATE_VALUES, Descriptor::MXFP4_SCALES),
+        )
+        .unwrap();
+    let (codes, scales) = (bytes(&shared.codes), bytes(&shared.scales));
+    let matrix = |name: &str| {
+        (
+            raw(&format!("ffn.shared_experts.{name}.weight")),
+            raw(&format!("ffn.shared_experts.{name}.scale")),
+        )
+    };
+    let ((up, up_blocks), (gate, gate_blocks)) = (matrix("w3"), matrix("w1"));
+    for row in 0..rows {
+        let from = gate_first(row, INTERMEDIATE);
+        let (values, row_blocks, at) = if from < INTERMEDIATE {
+            (&up, &up_blocks, from)
+        } else {
+            (&gate, &gate_blocks, from - INTERMEDIATE)
+        };
+        assert_eq!(
+            &codes[row * HIDDEN..][..HIDDEN],
+            &values[at * HIDDEN..][..HIDDEN],
+            "shared codes of row {row}"
+        );
+        for block in 0..blocks {
+            let word = (block / 4) * rows + utccp(row);
+            assert_eq!(
+                scales[word * 4 + block % 4],
+                row_blocks[(at / 32) * blocks + block],
+                "shared scale {block} of row {row}"
+            );
+        }
+    }
+}
+
+/// A block loaded for the fused exchange states what its launch runs (MXFP4 experts, one shared
+/// expert, the clamp) and runs the whole layer, shared expert included, in that one launch; a
+/// rank with no tokens joins with it alone. An exchange laid out for two launches, or for other
+/// experts, is refused.
+#[test]
+fn a_block_loaded_for_the_fused_exchange_runs_the_layer_in_one_launch() {
+    use nn::family::{ExpertWeights, FusedExperts};
+
+    let directory = tempfile::tempdir().unwrap();
+    export(directory.path(), EXPERTS);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
+    let group = Split::new(2, 1).unwrap();
+    let block = MoE::load(
+        &MoEConfig {
+            exchange: group,
+            fused_exchange: true,
+            shared: Some(shared_config()),
+            ..config(EXPERTS)
+        },
+        loader.root().pp("ffn"),
+    )
+    .unwrap();
+    let fused = FusedExperts {
+        weights: ExpertWeights::Mxfp4,
+        shared: 1,
+        limit: LIMIT.into(),
+    };
+    assert_eq!(block.fused_experts(), fused);
+
+    let lent = ExpertExchange {
+        fused: true,
+        fused_experts: fused,
+        ..exchange(2, 4)
+    };
+    let key = "mode_fused_hidden_128_intermediate_128_top_2_experts_4_max_tokens_4_ranks_2_\
+               attention_0_multiprocessors_148_dtype_bf16_weights_mxfp4_shared_1_limit_0x41200000";
+    let (output, Recording { launches, .. }) = record(&[group], || {
+        block.forward(&meta((3, HIDDEN), DType::BF16), None, Some(&lent))
+    });
+    assert_eq!(output.unwrap().dims(), [3, HIDDEN]);
+    let exchanged: Vec<_> = launches
+        .iter()
+        .filter(|(operator, _)| *operator == "expert_exchange")
+        .map(|(_, stated)| stated.as_str())
+        .collect();
+    assert_eq!(exchanged, [key]);
+    assert_eq!(operators(&launches).last(), Some(&"expert_exchange"));
+    for product in ["gather_gemm_mxfp4", "route_gemm_mxfp4", "mxfp8_gemm"] {
+        assert!(!operators(&launches).contains(&product), "{launches:?}");
+    }
+
+    let (joined, Recording { launches, .. }) = record(&[group], || block.join_expert_step(&lent));
+    joined.unwrap();
+    assert_eq!(operators(&launches), ["expert_exchange"]);
+
+    for refused in [
+        exchange(2, 4),
+        ExpertExchange {
+            fused: true,
+            fused_experts: FusedExperts::NVFP4,
+            ..exchange(2, 4)
+        },
+    ] {
+        let (outcome, _) = record(&[group], || {
+            block.forward(&meta((3, HIDDEN), DType::BF16), None, Some(&refused))
+        });
+        assert!(
+            outcome.is_err(),
+            "an exchange of {:?}",
+            refused.fused_experts
+        );
+    }
 }

@@ -17,7 +17,7 @@ use nn::family::{EXPERT_AXIS, ExpertOrder, TextPlacement};
 use nn::functional::{Activation, Rounding, Scoring};
 use nn::modules::{
     ExpertLayout, GateUp, MhcConnection, MhcResidual, MlpConfig, MoE, MoEConfig, NgramMemory,
-    SharedExpert, SharedExpertConfig, Tokens,
+    SharedExpertConfig, Tokens,
 };
 use nn::{DType, ExpertExchange, Result, Split, Tensor, VarBuilder};
 
@@ -29,16 +29,17 @@ pub fn expert_module(layer: u32) -> String {
     format!("layers.{layer}.ffn.experts")
 }
 
-/// The routed experts `experts` of a layer whose expert load and order name them `name`, in
-/// the slots `order` states (the checkpoint's own where it states none), split as `splits`
-/// states: the tensor split, whether a tensor-parallel group holds the experts whole, and the
-/// expert union of ranks that share them (`model.py:794-906`).
+/// The routed experts `experts` of a layer whose expert load and order name them `name`, with
+/// the block's shared expert of their width ([`shared`]), in the slots `order` states (the
+/// checkpoint's own where it states none), split as `splits` states: the tensor split, whether a
+/// tensor-parallel group holds the experts whole, the expert union of ranks that share them, and
+/// whether that union runs them in its exchange's fused launch (`model.py:794-906`).
 pub(crate) fn routed(
     config: &Config,
     experts: &ExpertConfig,
     name: String,
     order: Option<Vec<u32>>,
-    (split, tensor_experts, exchange): (Split, bool, Split),
+    (split, tensor_experts, exchange, fused_exchange): (Split, bool, Split, bool),
 ) -> MoEConfig {
     MoEConfig {
         hidden: config.hidden_size,
@@ -52,8 +53,10 @@ pub(crate) fn routed(
         routed_scale: Some(experts.routed_scale),
         limit: Some(experts.limit),
         router: "gate",
-        // The reference scores in FP32: `linear(x.float(), weight.float())`.
-        router_dtype: Some(DType::F32),
+        // The reference scores in FP32, `linear(x.float(), weight.float())`: the BF16 rows'
+        // and weight's products are exact in FP32, so a BF16 product accumulated in FP32
+        // states the same logits up to the order of the sum.
+        router_logits: Some(DType::F32),
         list: "experts",
         up: "w3",
         gate: "w1",
@@ -64,11 +67,13 @@ pub(crate) fn routed(
         tensor_experts,
         exchange,
         name: Some(name),
+        shared: Some(shared(config, experts)),
+        fused_exchange,
     }
 }
 
 /// The shared expert beside the routed experts `experts`, of their width (`model.py:832-854`).
-pub(crate) fn shared(config: &Config, experts: &ExpertConfig) -> SharedExpertConfig {
+fn shared(config: &Config, experts: &ExpertConfig) -> SharedExpertConfig {
     SharedExpertConfig {
         mlp: MlpConfig {
             hidden: config.hidden_size,
@@ -97,8 +102,8 @@ pub struct DecoderLayer {
     attention_connection: MhcConnection,
     attention: Attention,
     ffn_connection: MhcConnection,
+    /// The routed experts and the shared expert beside them.
     experts: MoE,
-    shared: SharedExpert,
 }
 
 impl DecoderLayer {
@@ -127,9 +132,9 @@ impl DecoderLayer {
                 placement.tensor,
                 placement.tensor_experts,
                 placement.experts,
+                placement.fused_exchange,
             ),
         );
-        let shared = shared(config, &config.experts);
 
         Ok(Self {
             engram,
@@ -137,11 +142,10 @@ impl DecoderLayer {
             attention: Attention::load(config, layer, vb.pp("attn"))?,
             ffn_connection: MhcConnection::load(&mhc, &vb, "hc_ffn", vb.pp("ffn_norm"))?,
             experts: MoE::load(&routed, vb.pp("ffn"))?,
-            shared: SharedExpert::load(&shared, vb.pp("ffn"))?,
         })
     }
 
-    /// The layer's routed experts.
+    /// The layer's routed experts and the shared expert beside them.
     pub fn experts(&self) -> &MoE {
         &self.experts
     }
@@ -185,8 +189,7 @@ impl DecoderLayer {
             self.attention.forward(x, inputs, carried)
         })?;
         residual.sublayer(&self.ffn_connection, |x| {
-            let routed = self.experts.forward(x, live_tokens, exchange)?;
-            self.shared.forward(x, routed)
+            self.experts.forward(x, live_tokens, exchange)
         })
     }
 }

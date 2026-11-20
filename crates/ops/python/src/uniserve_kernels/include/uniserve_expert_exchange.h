@@ -29,12 +29,35 @@ enum uniserve_exchange : int32_t {
   UNISERVE_EXCHANGE_FUSED = 2,
 };
 
+/// The representation of the routed experts a fused launch runs ([`Descriptor::weights`]).
+///
+/// The lifecycle call carries its number (`uniserve_exchange_weights` in
+/// `uniserve_expert_exchange.h`).
+enum uniserve_exchange_weights : int32_t {
+  /// The launch runs no experts: a dispatch or a combine, whatever the layer's experts are.
+  UNISERVE_EXCHANGE_WEIGHTS_NONE = 0,
+  /// Calibrated NVFP4 stacks and their FP32 tables, over rows the layer encoded.
+  UNISERVE_EXCHANGE_WEIGHTS_NVFP4 = 1,
+  /// MXFP4 stacks under UE8M0 scales, over BF16 rows the launch encodes into MXFP8.
+  UNISERVE_EXCHANGE_WEIGHTS_MXFP4 = 2,
+};
+
 /// What a fused launch reads of one layer: its experts, as the loader laid them out, declared to
 /// the packages as `uniserve_fused_layer`.
 ///
-/// Each weight is `[local experts, rows, columns / 2]` packed values, read K-major, with its block
-/// scales in a table of `scale_bytes` per expert. Every address is a device address the layer's
-/// weights hold for the life of the model.
+/// Each routed weight is `[local experts, rows, columns / 2]` packed values, read K-major, with its
+/// block scales in a table of `scale_bytes` per expert. Every address is a device address the
+/// layer's weights hold for the life of the model.
+///
+/// - NVFP4 ([`ExpertWeights::Nvfp4`]): the stacks in [`Descriptor::FUSED_UP_GATE_VALUES`] and
+///   [`Descriptor::FUSED_DOWN_VALUES`], E4M3 block scales in [`Descriptor::FUSED_SCALES`], the
+///   three tables; no shared expert.
+/// - MXFP4 ([`ExpertWeights::Mxfp4`]): the stacks in [`Descriptor::MXFP4_UP_GATE_VALUES`] and
+///   [`Descriptor::MXFP4_DOWN_VALUES`], their UE8M0 scales in [`Descriptor::MXFP4_SCALES`]
+///   (`[local, columns / 128, rows]` words), no table; and the [`Descriptor::shared`] shared
+///   experts as one MXFP8 matrix pair: `[2 · shared · intermediate, hidden]` and
+///   `[hidden, shared · intermediate]` E4M3 codes, row-major, in the same row arrangements, with
+///   their scales in the same layout.
 struct uniserve_fused_layer {
   /// `[local, 2 * intermediate, hidden / 2]` packed values.
   const void *up_gate;
@@ -54,6 +77,14 @@ struct uniserve_fused_layer {
   int64_t up_gate_scale_bytes;
   /// Bytes of one expert's block scales, second projection.
   int64_t down_scale_bytes;
+  /// MXFP4: the shared experts' `[up; gate]` E4M3 codes, or null without one.
+  const void *shared_up_gate;
+  /// MXFP4: their scales.
+  const void *shared_up_gate_scales;
+  /// MXFP4: the shared experts' down E4M3 codes, or null without one.
+  const void *shared_down;
+  /// MXFP4: their scales.
+  const void *shared_down_scales;
 };
 
 /// One launch of the exchange, declared to the packages as `uniserve_exchange_call`.
@@ -65,7 +96,7 @@ struct uniserve_fused_layer {
 /// it wrote into the transport's `combined` view, and sums each token's partial results into `out`.
 struct uniserve_exchange_call {
   void *transport;
-  /// Dispatch: `[tokens, hidden]` rows to send.
+  /// Dispatch, and a fused MXFP4 launch: `[tokens, hidden]` rows to send.
   const void *states;
   /// Dispatch: `[tokens, top]` expert ids.
   const int32_t *ids;
@@ -81,6 +112,8 @@ struct uniserve_exchange_call {
   int64_t mode;
   /// Rows of this launch's extent, the captured bucket's.
   int64_t tokens;
+  /// Rows per rank the launch's step is shaped for ([`ExchangeArgs::capacity`]).
+  int64_t capacity;
   int64_t top;
   int64_t hidden;
   int64_t experts;
@@ -141,6 +174,12 @@ struct uniserve_exchange_lifecycle {
   int64_t capacity;
   /// Leading ranks that hold no experts; zero when every rank holds some.
   int64_t attention_ranks;
+  /// What the layer's fused launch runs ([`TransportShape::fused`]): the routed experts'
+  /// representation by its [`ExpertWeights`] number, the shared experts and the clamp (zero
+  /// for none), which a fused package lays its transport out for.
+  int64_t weights;
+  int64_t shared;
+  float limit;
   /// The entry's message on a nonzero return.
   char error[UNISERVE_MESSAGE];
 };
@@ -176,7 +215,7 @@ struct uniserve_exchange_info {
   char error[UNISERVE_MESSAGE];
 };
 
-static_assert(sizeof(uniserve_fused_layer) == 72, "the operator crate's layout of uniserve_fused_layer");
+static_assert(sizeof(uniserve_fused_layer) == 104, "the operator crate's layout of uniserve_fused_layer");
 static_assert(offsetof(uniserve_fused_layer, up_gate) == 0, "the operator crate's layout of uniserve_fused_layer");
 static_assert(offsetof(uniserve_fused_layer, up_gate_scales) == 8, "the operator crate's layout of uniserve_fused_layer");
 static_assert(offsetof(uniserve_fused_layer, down) == 16, "the operator crate's layout of uniserve_fused_layer");
@@ -186,7 +225,11 @@ static_assert(offsetof(uniserve_fused_layer, down_alpha) == 40, "the operator cr
 static_assert(offsetof(uniserve_fused_layer, gated_scale) == 48, "the operator crate's layout of uniserve_fused_layer");
 static_assert(offsetof(uniserve_fused_layer, up_gate_scale_bytes) == 56, "the operator crate's layout of uniserve_fused_layer");
 static_assert(offsetof(uniserve_fused_layer, down_scale_bytes) == 64, "the operator crate's layout of uniserve_fused_layer");
-static_assert(sizeof(uniserve_exchange_call) == 632, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_fused_layer, shared_up_gate) == 72, "the operator crate's layout of uniserve_fused_layer");
+static_assert(offsetof(uniserve_fused_layer, shared_up_gate_scales) == 80, "the operator crate's layout of uniserve_fused_layer");
+static_assert(offsetof(uniserve_fused_layer, shared_down) == 88, "the operator crate's layout of uniserve_fused_layer");
+static_assert(offsetof(uniserve_fused_layer, shared_down_scales) == 96, "the operator crate's layout of uniserve_fused_layer");
+static_assert(sizeof(uniserve_exchange_call) == 640, "the operator crate's layout of uniserve_exchange_call");
 static_assert(offsetof(uniserve_exchange_call, transport) == 0, "the operator crate's layout of uniserve_exchange_call");
 static_assert(offsetof(uniserve_exchange_call, states) == 8, "the operator crate's layout of uniserve_exchange_call");
 static_assert(offsetof(uniserve_exchange_call, ids) == 16, "the operator crate's layout of uniserve_exchange_call");
@@ -196,13 +239,14 @@ static_assert(offsetof(uniserve_exchange_call, out) == 40, "the operator crate's
 static_assert(offsetof(uniserve_exchange_call, layer) == 48, "the operator crate's layout of uniserve_exchange_call");
 static_assert(offsetof(uniserve_exchange_call, mode) == 56, "the operator crate's layout of uniserve_exchange_call");
 static_assert(offsetof(uniserve_exchange_call, tokens) == 64, "the operator crate's layout of uniserve_exchange_call");
-static_assert(offsetof(uniserve_exchange_call, top) == 72, "the operator crate's layout of uniserve_exchange_call");
-static_assert(offsetof(uniserve_exchange_call, hidden) == 80, "the operator crate's layout of uniserve_exchange_call");
-static_assert(offsetof(uniserve_exchange_call, experts) == 88, "the operator crate's layout of uniserve_exchange_call");
-static_assert(offsetof(uniserve_exchange_call, max_tokens) == 96, "the operator crate's layout of uniserve_exchange_call");
-static_assert(offsetof(uniserve_exchange_call, ranks) == 104, "the operator crate's layout of uniserve_exchange_call");
-static_assert(offsetof(uniserve_exchange_call, dtype) == 112, "the operator crate's layout of uniserve_exchange_call");
-static_assert(offsetof(uniserve_exchange_call, error) == 120, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_exchange_call, capacity) == 72, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_exchange_call, top) == 80, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_exchange_call, hidden) == 88, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_exchange_call, experts) == 96, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_exchange_call, max_tokens) == 104, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_exchange_call, ranks) == 112, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_exchange_call, dtype) == 120, "the operator crate's layout of uniserve_exchange_call");
+static_assert(offsetof(uniserve_exchange_call, error) == 128, "the operator crate's layout of uniserve_exchange_call");
 static_assert(sizeof(UniserveGroup) == 568, "the operator crate's layout of UniserveGroup");
 static_assert(offsetof(UniserveGroup, handle) == 0, "the operator crate's layout of UniserveGroup");
 static_assert(offsetof(UniserveGroup, communicator) == 8, "the operator crate's layout of UniserveGroup");
@@ -212,7 +256,7 @@ static_assert(offsetof(UniserveGroup, device) == 32, "the operator crate's layou
 static_assert(offsetof(UniserveGroup, all_gather) == 40, "the operator crate's layout of UniserveGroup");
 static_assert(offsetof(UniserveGroup, barrier) == 48, "the operator crate's layout of UniserveGroup");
 static_assert(offsetof(UniserveGroup, error) == 56, "the operator crate's layout of UniserveGroup");
-static_assert(sizeof(uniserve_exchange_lifecycle) == 616, "the operator crate's layout of uniserve_exchange_lifecycle");
+static_assert(sizeof(uniserve_exchange_lifecycle) == 640, "the operator crate's layout of uniserve_exchange_lifecycle");
 static_assert(offsetof(uniserve_exchange_lifecycle, transport) == 0, "the operator crate's layout of uniserve_exchange_lifecycle");
 static_assert(offsetof(uniserve_exchange_lifecycle, group) == 8, "the operator crate's layout of uniserve_exchange_lifecycle");
 static_assert(offsetof(uniserve_exchange_lifecycle, ranks) == 16, "the operator crate's layout of uniserve_exchange_lifecycle");
@@ -226,7 +270,10 @@ static_assert(offsetof(uniserve_exchange_lifecycle, device) == 72, "the operator
 static_assert(offsetof(uniserve_exchange_lifecycle, intermediate) == 80, "the operator crate's layout of uniserve_exchange_lifecycle");
 static_assert(offsetof(uniserve_exchange_lifecycle, capacity) == 88, "the operator crate's layout of uniserve_exchange_lifecycle");
 static_assert(offsetof(uniserve_exchange_lifecycle, attention_ranks) == 96, "the operator crate's layout of uniserve_exchange_lifecycle");
-static_assert(offsetof(uniserve_exchange_lifecycle, error) == 104, "the operator crate's layout of uniserve_exchange_lifecycle");
+static_assert(offsetof(uniserve_exchange_lifecycle, weights) == 104, "the operator crate's layout of uniserve_exchange_lifecycle");
+static_assert(offsetof(uniserve_exchange_lifecycle, shared) == 112, "the operator crate's layout of uniserve_exchange_lifecycle");
+static_assert(offsetof(uniserve_exchange_lifecycle, limit) == 120, "the operator crate's layout of uniserve_exchange_lifecycle");
+static_assert(offsetof(uniserve_exchange_lifecycle, error) == 124, "the operator crate's layout of uniserve_exchange_lifecycle");
 static_assert(sizeof(uniserve_exchange_info) == 640, "the operator crate's layout of uniserve_exchange_info");
 static_assert(offsetof(uniserve_exchange_info, transport) == 0, "the operator crate's layout of uniserve_exchange_info");
 static_assert(offsetof(uniserve_exchange_info, states) == 8, "the operator crate's layout of uniserve_exchange_info");

@@ -70,7 +70,9 @@ fn values_key(layout: ValueLayout) -> WeightLayout {
         ValueLayout::Plain => WeightLayout::NVFP4_VALUES,
         ValueLayout::Shuffled { .. } => WeightLayout::NVFP4_VALUES_SHUFFLED,
         ValueLayout::InterleavedShuffled { .. } => WeightLayout::NVFP4_VALUES_INTERLEAVED_SHUFFLED,
-        ValueLayout::GateFirst => WeightLayout::NVFP4_VALUES_GATE_FIRST,
+        // NVFP4 stacks are read gate first by FlashInfer's MegaMoE alone, in blocks of sixteen
+        // rows of each half (`ops::moe::exchange::Descriptor::FUSED_UP_GATE_VALUES`).
+        ValueLayout::GateFirst { .. } => WeightLayout::NVFP4_VALUES_GATE_FIRST,
     }
 }
 

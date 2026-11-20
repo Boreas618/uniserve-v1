@@ -65,11 +65,21 @@
 //! Over an expert group ([`MoEConfig::exchange`]) a rank holds a window of the slots and
 //! the block runs through the group's exchange, whose rows execution lends
 //! ([`ExpertExchange`]): the routes travel to the ranks that hold their experts, and each
-//! token's sums come back.
+//! token's sums come back. Calibrated NVFP4 experts run in the exchange's one fused launch;
+//! MXFP4 experts run either between its dispatch and combine or, when the placement states it
+//! ([`MoEConfig::fused_exchange`]), in its fused launch, which also runs the block's shared
+//! expert and sums both in FP32 (`ops::moe::exchange`'s module documentation states the formula).
+//!
+//! ## Shared expert
+//!
+//! A block may own an ungated shared expert every token passes through ([`MoEConfig::shared`],
+//! DeepSeek's): its output is added to the routed output after the block's reduction, or the
+//! fused launch computes it beside the routes. A shared expert with a gate, or one beside a
+//! block that does not own it, is a [`SharedExpert`] of the model's own.
 
 use std::ops::Range;
 
-use ops::moe::exchange;
+use ops::moe::exchange::{self, Descriptor as ExchangeDescriptor, ExpertWeights};
 use ops::moe::grouped::{
     GatherGemmNvfp4Descriptor, RouteGemmNvfp4Descriptor, WEIGHT_SCALE_LAYOUT, packed_width,
 };
@@ -81,8 +91,8 @@ use crate::collective::{self, Split};
 use crate::error::{Error, Result};
 use crate::functional::{self, Activation, Routing, Scoring, WeightOrder};
 use crate::modules::linear::{Linear, LinearConfig, Parallel};
-use crate::modules::mlp::{Mlp, MlpConfig};
-use crate::quantization::{Mxfp4Stack, Nvfp4Share, Nvfp4Stack, Scheme};
+use crate::modules::mlp::{GateUp, Mlp, MlpConfig};
+use crate::quantization::{Mxfp4Stack, Mxfp8Weight, Nvfp4Share, Nvfp4Stack, Scheme};
 use crate::var_builder::VarBuilder;
 use crate::weights::{PartBlock, WeightLayout, WeightSource, extents};
 
@@ -119,10 +129,12 @@ pub struct MoEConfig {
     pub limit: Option<f32>,
     /// The router's module name.
     pub router: &'static str,
-    /// The element type the router's product reads its weight and the rows in and states its
-    /// logits in: the activations' when `None`, or a wider one (F32) for a model whose reference
-    /// routes in it, so near ties select as the reference's do.
-    pub router_dtype: Option<DType>,
+    /// The element type the router states its logits in: the activations' when `None`, or a
+    /// wider one (F32) for a model whose reference routes on FP32 logits. The product reads the
+    /// rows and its weight in the activations' type and accumulates in FP32, so FP32 logits of
+    /// BF16 rows are the reference's FP32 product of the widened values up to the order of its
+    /// sum: the products of BF16 values are exact in FP32.
+    pub router_logits: Option<DType>,
     /// The name of the module list that holds the experts: expert `e`'s projections are
     /// `<list>.<e>.<up|gate|down>`.
     pub list: &'static str,
@@ -154,6 +166,15 @@ pub struct MoEConfig {
     /// execution's expert load state the layer by. `None` for a block outside the model's own
     /// decoder stack, such as a drafter's, which neither names.
     pub name: Option<String>,
+    /// The ungated shared expert the block owns and runs beside its routed experts, when it owns
+    /// one: added after the routed output, or computed by the fused launch of an exchange that
+    /// runs the block in one ([`Self::fused_exchange`]). Its MLP is held whole on every rank.
+    pub shared: Option<SharedExpertConfig>,
+    /// Whether MXFP4 experts over an expert group run in the exchange's one fused launch
+    /// (`TextPlacement::fused_exchange`), so they and the shared expert load in the arrangement
+    /// that launch reads; otherwise they run between the exchange's dispatch and combine. A
+    /// block of other experts, or one no expert group divides, reads no such arrangement.
+    pub fused_exchange: bool,
 }
 
 /// How a checkpoint's architecture stores a block's dense experts, as its schema declares it.
@@ -192,7 +213,7 @@ enum Experts {
     /// Calibrated NVFP4 stacks in the arrangement an expert group's fused exchange reads (each
     /// gate block before its up block), with the three `[local]` FP32 tables its kernel
     /// multiplies in.
-    Fused {
+    FusedNvfp4 {
         up_gate: Nvfp4Stack,
         down: Nvfp4Stack,
         /// Dequantizes the first product: the weight's tensor scale times its rows' scale.
@@ -201,6 +222,27 @@ enum Experts {
         down_alpha: Tensor,
         /// The global scale the gated rows are encoded with.
         gated_scale: Tensor,
+    },
+    /// MXFP4 stacks in the arrangement an expert group's fused MXFP4 exchange reads
+    /// (`ExchangeDescriptor::MXFP4_UP_GATE_VALUES`, `MXFP4_DOWN_VALUES`, `MXFP4_SCALES`), with
+    /// the gated activation's clamp the launch is compiled for.
+    FusedMxfp4 {
+        up_gate: Mxfp4Stack,
+        down: Mxfp4Stack,
+        limit: Option<f32>,
+    },
+}
+
+/// The shared expert a block owns ([`MoEConfig::shared`]).
+enum Shared {
+    /// Its own MLP, whose output is added after the routed block's (boxed: an MLP's projections
+    /// are larger than the fused launch's two matrices).
+    Module(Box<SharedExpert>),
+    /// Its gated stack and down projection as one MXFP8 matrix each, in the arrangement the
+    /// fused MXFP4 exchange reads, which computes it.
+    Fused {
+        up_gate: Mxfp8Weight,
+        down: Mxfp8Weight,
     },
 }
 
@@ -234,6 +276,11 @@ pub struct MoE {
     /// The layer's name among the model's routed layers, by which its forwards find the
     /// expert load execution lends ([`MoEConfig::name`]).
     name: Option<String>,
+    /// The router's logits' element type, the activations' when `None`
+    /// ([`MoEConfig::router_logits`]).
+    logits: Option<DType>,
+    /// The shared expert the block owns.
+    shared: Option<Shared>,
 }
 
 impl MoE {
@@ -314,12 +361,9 @@ impl MoE {
         let window = &config.order[local.start as usize..local.end as usize];
         let intermediate = config.intermediate / split.size();
 
-        let router_vb = match config.router_dtype {
-            Some(dtype) => vb.pp(config.router).to_dtype(dtype),
-            None => vb.pp(config.router),
-        };
         let router = Linear::new(
-            router_vb.get((experts as usize, config.hidden as usize), "weight")?,
+            vb.pp(config.router)
+                .get((experts as usize, config.hidden as usize), "weight")?,
             None,
             WeightOrder::NxK,
         )?;
@@ -378,7 +422,8 @@ impl MoE {
                     config.activation
                 )));
             }
-            (Self::load_mxfp4(config, &vb, window)?, intermediate)
+            let fused = config.fused_exchange && exchange.size() > 1;
+            (Self::load_mxfp4(config, &vb, window, fused)?, intermediate)
         } else if packed {
             // A rank's block of packed experts: whole bytes and block scales of every row,
             // padded to the width the products compute over.
@@ -410,6 +455,12 @@ impl MoE {
             (Experts::Dense { up_gate, down }, intermediate)
         };
 
+        let shared = config
+            .shared
+            .as_ref()
+            .map(|shared| Self::load_shared(config, shared, &vb, &stacks))
+            .transpose()?;
+
         Ok(Self {
             router,
             experts: stacks,
@@ -428,7 +479,81 @@ impl MoE {
             // or the slots.
             reduce: config.split.size(),
             name: config.name.clone(),
+            logits: config.router_logits,
+            shared,
         })
+    }
+
+    /// The shared expert `shared` states, in the representation the block's `stacks` run it in:
+    /// in the fused MXFP4 launch's arrangement beside fused MXFP4 experts, its own module
+    /// otherwise.
+    fn load_shared(
+        config: &MoEConfig,
+        shared: &SharedExpertConfig,
+        vb: &VarBuilder<'_, '_>,
+        stacks: &Experts,
+    ) -> Result<Shared> {
+        let refuse = |problem: String| Error::weight(vb.path(), problem);
+        if shared.gate.is_some() {
+            return Err(refuse(
+                "a block owns an ungated shared expert alone; a gated one is a model's own                  SharedExpert"
+                    .to_owned(),
+            ));
+        }
+        if !matches!(stacks, Experts::FusedMxfp4 { .. }) {
+            return Ok(Shared::Module(Box::new(SharedExpert::load(
+                shared,
+                vb.clone(),
+            )?)));
+        }
+
+        // The launch runs shared experts of the routed width under the routed experts' clamp
+        // and gating, its weights whole.
+        let mlp = &shared.mlp;
+        // The launch reads the gate and up modules as two checkpoint weights of its own
+        // arrangement, whether the expert's MLP would read them as two products or as one
+        // (`GateUp::Merged`); a packed value-first module is not two weights.
+        let (GateUp::Split { gate, up } | GateUp::Merged { gate, up }) = mlp.gate_up else {
+            return Err(refuse(
+                "the fused exchange reads a shared expert's gate and up projections as two \
+                 weights"
+                    .to_owned(),
+            ));
+        };
+        if mlp.hidden != config.hidden
+            || !mlp.intermediate.is_multiple_of(config.intermediate)
+            || mlp.activation != config.activation
+            || mlp.limit != config.limit
+            || mlp.bias
+            || mlp.split.size() > 1
+        {
+            return Err(refuse(format!(
+                "the fused exchange runs shared experts of the routed width under the routed                  gating and clamp, whole and without bias; this one is {} wide over rows of {},                  {} gated, clamped at {:?}",
+                mlp.intermediate, mlp.hidden, mlp.activation, mlp.limit
+            )));
+        }
+
+        let module = vb.pp(shared.module);
+        let weight = |name: &str| module.pp(name).name("weight");
+        let loader = vb.loader();
+        // The gated stack is `[up; gate]`, which the launch's arrangement leads with the gate.
+        let up_gate = loader.mxfp8_stack(
+            &vb.name("shared.up_gate"),
+            &[&weight(up), &weight(gate)],
+            (
+                ExchangeDescriptor::MXFP4_UP_GATE_VALUES,
+                ExchangeDescriptor::MXFP4_SCALES,
+            ),
+        )?;
+        let down = loader.mxfp8_stack(
+            &vb.name("shared.down"),
+            &[&weight(mlp.down)],
+            (
+                ExchangeDescriptor::MXFP4_DOWN_VALUES,
+                ExchangeDescriptor::MXFP4_SCALES,
+            ),
+        )?;
+        Ok(Shared::Fused { up_gate, down })
     }
 
     /// The dense stacks of the experts `window` names, this rank's block `split` of each
@@ -649,7 +774,7 @@ impl MoE {
                 PRODUCER,
             )
         };
-        Ok(Experts::Fused {
+        Ok(Experts::FusedNvfp4 {
             up_gate_alpha: table("up_gate_alpha", up_alpha)?,
             down_alpha: table("down_alpha", down_alpha)?,
             gated_scale: table("gated_scale", gated)?,
@@ -658,31 +783,54 @@ impl MoE {
         })
     }
 
-    /// The MXFP4 stacks of the experts `window` names, whole, in the arrangement the MXFP4
-    /// routed products read, with the `[held]` F32 table of the gated activation's clamp: the
-    /// block's limit, or none (an infinite one) without it.
-    fn load_mxfp4(config: &MoEConfig, vb: &VarBuilder<'_, '_>, window: &[u32]) -> Result<Experts> {
+    /// The MXFP4 stacks of the experts `window` names, whole: in the arrangement the fused MXFP4
+    /// exchange reads when `fused`, with the clamp its launch is compiled for; otherwise in the
+    /// arrangement the MXFP4 routed products read, with the `[held]` F32 table of the gated
+    /// activation's clamp: the block's limit, or none (an infinite one) without it.
+    fn load_mxfp4(
+        config: &MoEConfig,
+        vb: &VarBuilder<'_, '_>,
+        window: &[u32],
+        fused: bool,
+    ) -> Result<Experts> {
         let loader = vb.loader();
         let list = vb.pp(config.list);
+        let (up_gate_layout, down_layout) = if fused {
+            (
+                (
+                    ExchangeDescriptor::MXFP4_UP_GATE_VALUES,
+                    ExchangeDescriptor::MXFP4_SCALES,
+                ),
+                (
+                    ExchangeDescriptor::MXFP4_DOWN_VALUES,
+                    ExchangeDescriptor::MXFP4_SCALES,
+                ),
+            )
+        } else {
+            (
+                (
+                    GatherGemmMxfp4Descriptor::WEIGHT_VALUES,
+                    mxfp4::WEIGHT_SCALE_LAYOUT,
+                ),
+                (
+                    RouteGemmMxfp4Descriptor::WEIGHT_VALUES,
+                    mxfp4::WEIGHT_SCALE_LAYOUT,
+                ),
+            )
+        };
         let up_gate = loader.mxfp4_stack(
             &vb.name("experts.up_gate"),
             list.path(),
             &[config.up, config.gate],
             window,
-            (
-                GatherGemmMxfp4Descriptor::WEIGHT_VALUES,
-                mxfp4::WEIGHT_SCALE_LAYOUT,
-            ),
+            up_gate_layout,
         )?;
         let down = loader.mxfp4_stack(
             &vb.name("experts.down"),
             list.path(),
             &[config.down],
             window,
-            (
-                RouteGemmMxfp4Descriptor::WEIGHT_VALUES,
-                mxfp4::WEIGHT_SCALE_LAYOUT,
-            ),
+            down_layout,
         )?;
 
         let (hidden, intermediate) = (config.hidden as usize, config.intermediate as usize);
@@ -702,6 +850,14 @@ impl MoE {
                     intermediate / 2
                 ),
             ));
+        }
+
+        if fused {
+            return Ok(Experts::FusedMxfp4 {
+                up_gate,
+                down,
+                limit: config.limit,
+            });
         }
 
         let limit = config.limit.unwrap_or(f32::INFINITY);
@@ -819,18 +975,15 @@ impl MoE {
             bias: self.selection_bias.as_ref(),
             scale: self.routed_scale.as_ref(),
         };
-        // A router held in a wider type than the rows reads them widened.
-        let rows = match self.router.weight().dtype() {
-            dtype if dtype != x.dtype() => x.to_dtype(dtype)?,
-            _ => x.clone(),
-        };
-        functional::topk_softmax(
-            &self.router.forward(&rows)?,
-            &routing,
-            Some(&self.map),
-            live_tokens,
-            load,
-        )
+        // The router's product over the rows as they stand, its logits in their stated type.
+        let logits = functional::linear_to(
+            x,
+            self.router.weight(),
+            None,
+            WeightOrder::NxK,
+            self.logits.unwrap_or(x.dtype()),
+        )?;
+        functional::topk_softmax(&logits, &routing, Some(&self.map), live_tokens, load)
     }
 
     /// `Σ_routes weight · expert(x)` over `x [tokens, hidden]`, summed over the tensor-parallel
@@ -902,7 +1055,41 @@ impl MoE {
             }
             collective::all_reduce(&out)?;
         }
-        Ok(out)
+
+        // The shared expert is whole on every rank: it joins the reduced output, unless the
+        // fused launch computed it.
+        match &self.shared {
+            Some(Shared::Module(shared)) => shared.forward(x, out),
+            Some(Shared::Fused { .. }) | None => Ok(out),
+        }
+    }
+
+    /// What an expert group's fused launch runs of this block, as its experts were loaded:
+    /// the routed experts' representation, the shared experts it computes and the clamp;
+    /// [`exchange::FusedExperts::NONE`] for a block that runs between an exchange's dispatch and
+    /// combine, or no exchange.
+    pub fn fused_experts(&self) -> exchange::FusedExperts {
+        match &self.experts {
+            Experts::FusedNvfp4 { .. } => exchange::FusedExperts::NVFP4,
+            Experts::FusedMxfp4 { up_gate, limit, .. } => {
+                // The shared experts' gated stack is `2 · shared · intermediate` rows.
+                let intermediate = up_gate.codes.dims()[1] / 2;
+                let shared = match &self.shared {
+                    Some(Shared::Fused { up_gate, .. }) => {
+                        up_gate.codes.dims()[0] / 2 / intermediate.max(1)
+                    }
+                    Some(Shared::Module(_)) | None => 0,
+                };
+                exchange::FusedExperts {
+                    weights: ExpertWeights::Mxfp4,
+                    shared: shared as u32,
+                    limit: limit.unwrap_or(0.0).into(),
+                }
+            }
+            Experts::Dense { .. } | Experts::Packed { .. } | Experts::Mxfp4 { .. } => {
+                exchange::FusedExperts::NONE
+            }
+        }
     }
 
     /// Runs the group's step with no tokens of this rank's own.
@@ -957,7 +1144,7 @@ impl MoE {
                 functional::route_gemm_mxfp4(&codes, &scales, down, &maps, self.top)?
             }
 
-            Experts::Fused { .. } => {
+            Experts::FusedNvfp4 { .. } | Experts::FusedMxfp4 { .. } => {
                 return Err(Error::Unsupported(
                     "MoE: experts loaded for an expert group's fused exchange run through it"
                         .to_owned(),
@@ -1049,13 +1236,42 @@ impl MoE {
         exchange: &ExpertExchange,
     ) -> Result<Tensor> {
         let stacks = match &self.experts {
-            Experts::Fused {
+            Experts::FusedMxfp4 {
+                up_gate,
+                down,
+                limit,
+            } if exchange.fused => {
+                let stated = exchange.fused_experts;
+                if stated.limit != limit.unwrap_or(0.0).into() {
+                    return Err(Error::Unsupported(format!(
+                        "MoE: the exchange's fused launch clamps the gated activation at {}, \
+                         and the block's experts at {limit:?}",
+                        stated.clamp()
+                    )));
+                }
+                let shared = match &self.shared {
+                    Some(Shared::Fused { up_gate, down }) => Some((up_gate, down)),
+                    Some(Shared::Module(_)) | None => None,
+                };
+                return functional::expert_exchange_fused_mxfp4(
+                    x,
+                    ids,
+                    weights,
+                    live_tokens,
+                    exchange,
+                    (up_gate, down),
+                    shared,
+                    self.count,
+                );
+            }
+
+            Experts::FusedNvfp4 {
                 up_gate,
                 down,
                 up_gate_alpha,
                 down_alpha,
                 gated_scale,
-            } if exchange.fused => {
+            } if exchange.fused && exchange.fused_experts.weights == ExpertWeights::Nvfp4 => {
                 return functional::expert_exchange_fused(
                     x,
                     ids,
@@ -1072,11 +1288,17 @@ impl MoE {
             stacks @ (Experts::Dense { .. } | Experts::Mxfp4 { .. }) if !exchange.fused => stacks,
 
             _ => {
-                return Err(Error::Unsupported(
-                    "MoE: a fused exchange runs packed NVFP4 experts and an exchange of two \
-                     launches dense or MXFP4 ones, and this block holds the other"
-                        .to_owned(),
-                ));
+                return Err(Error::Unsupported(format!(
+                    "MoE: a fused exchange runs the experts it was laid out for ({} ones) and an \
+                     exchange of two launches dense or MXFP4 ones, and this block's are loaded \
+                     for {}",
+                    exchange.fused_experts.weights,
+                    if exchange.fused {
+                        "the other composition"
+                    } else {
+                        "a fused exchange"
+                    }
+                )));
             }
         };
         let tokens = x.dims()[0];
@@ -1132,7 +1354,9 @@ impl MoE {
                     functional::route_gemm_mxfp4(&codes, &scales, down, &maps, self.top)?
                 }
                 // Matched out before the dispatch: a fused exchange returned above.
-                Experts::Packed { .. } | Experts::Fused { .. } => {
+                Experts::Packed { .. }
+                | Experts::FusedNvfp4 { .. }
+                | Experts::FusedMxfp4 { .. } => {
                     return Err(Error::Unsupported(
                         "MoE: packed NVFP4 experts run through a fused exchange".to_owned(),
                     ));

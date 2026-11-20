@@ -4,11 +4,37 @@
 //! `[local_offset, local_offset + local_experts)` window is resident. The exchange carries each
 //! route's payload — the hidden state, the expert id and the route weight — to the rank that holds
 //! the expert (dispatch), and returns each token's partial expert sums to the rank that owns the
-//! token (combine). Each backend (`alltoall`, `deepep`, `megamoe`) is a native library, because
-//! the transport's workspace and its handshake are the package's host code; the Build Server
-//! selects the one of each key, unless a deployment's `[kernels]` table pins it.
+//! token (combine). Each backend (`alltoall`, `deepep`, `megamoe`, `deepgemm`) is a native library,
+//! because the transport's workspace and its handshake are the package's host code; the Build
+//! Server selects the one of each key, unless a deployment's `[kernels]` table pins it.
 //! A backend whose one launch runs the whole expert layer states so in [`Info::fused`] and takes
 //! [`Mode::Fused`] instead of the two directions.
+//!
+//! # What a fused launch runs
+//!
+//! A fused launch runs the layer's routed experts in the representation its descriptor names
+//! ([`Descriptor::weights`]), and beside them the shared experts it states ([`Descriptor::shared`]),
+//! each expert's gated activation clamped at [`Descriptor::limit`].
+//!
+//! - [`ExpertWeights::Nvfp4`]: calibrated NVFP4 stacks with three `[local]` FP32 tables, over rows
+//!   the layer encoded into the transport's `packed` views before the launch; each route's output
+//!   is weighed after its down product.
+//! - [`ExpertWeights::Mxfp4`]: MXFP4 stacks under UE8M0 scales, and MXFP8 shared experts, over the
+//!   BF16 rows of `state`, which the launch encodes into MXFP8 itself. A rank's output row is
+//!
+//! ```text
+//! x̂    = mxfp8(x)                            per 32 elements: 2^s ≥ max(amax, 10⁻⁴) · fl(1/448)
+//! g, u = bf16(W_gate,e x̂), bf16(W_up,e x̂)    each an FP32 contraction rounded once
+//! a    = silu(min(g, L)) · clamp(u, ±L) · w   in FP32; w the route's weight, 1 for a shared one
+//! â    = mxfp8_exact(a)                      per 32 elements: the least 2^s with amax ≤ 448 · 2^s
+//! o_e  = bf16(W_down,e â)
+//! y[t] = bf16(Σ_k o_ids[t,k] + Σ_s o_s)       the routes' and shared experts' sum in FP32
+//! ```
+//!
+//!   The rows' encoding is `mxfp8_quantize`'s (the reference's `act_quant`), and the gated rows'
+//!   covering rule is exact (its scale at least `2⁻²²`), so it differs from it only where
+//!   `amax · fl(1/448)` rounds across a power of two. The route weight multiplies the gated row before its encoding, as the
+//!   reference weighs it; a row past the live count is computed as a zero row and routed nowhere.
 //!
 //! # Who owns the transport
 //!
@@ -72,6 +98,66 @@ impl fmt::Display for Mode {
             Self::Combine => "combine",
             Self::Fused => "fused",
         })
+    }
+}
+
+/// The representation of the routed experts a fused launch runs ([`Descriptor::weights`]).
+///
+/// The lifecycle call carries its number (`uniserve_exchange_weights` in
+/// `uniserve_expert_exchange.h`).
+#[repr(i32)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ExpertWeights {
+    /// The launch runs no experts: a dispatch or a combine, whatever the layer's experts are.
+    None = 0,
+    /// Calibrated NVFP4 stacks and their FP32 tables, over rows the layer encoded.
+    Nvfp4 = 1,
+    /// MXFP4 stacks under UE8M0 scales, over BF16 rows the launch encodes into MXFP8.
+    Mxfp4 = 2,
+}
+
+impl fmt::Display for ExpertWeights {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::None => "none",
+            Self::Nvfp4 => "nvfp4",
+            Self::Mxfp4 => "mxfp4",
+        })
+    }
+}
+
+/// What a fused launch runs beside the exchange: the routed experts' representation, the shared
+/// experts it runs in the same launch, and the clamp of every expert's gated activation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FusedExperts {
+    /// The routed experts' representation.
+    pub weights: ExpertWeights,
+    /// Shared experts of the routed experts' width the launch runs beside them, every token
+    /// through each; zero for none.
+    pub shared: u32,
+    /// The clamp `L` of the gated activation, `act(min(gate, L)) · clamp(up, ±L)`, as the bit
+    /// pattern of its `f32`; zero for an unclamped one.
+    pub limit: crate::descriptor::Float,
+}
+
+impl FusedExperts {
+    /// What a launch that runs no experts states: a dispatch's or a combine's.
+    pub const NONE: Self = Self {
+        weights: ExpertWeights::None,
+        shared: 0,
+        limit: crate::descriptor::Float(0),
+    };
+
+    /// What a fused launch over calibrated NVFP4 experts runs: no shared expert, no clamp.
+    pub const NVFP4: Self = Self {
+        weights: ExpertWeights::Nvfp4,
+        shared: 0,
+        limit: crate::descriptor::Float(0),
+    };
+
+    /// The clamp as the `f32` it is the pattern of.
+    pub fn clamp(&self) -> f32 {
+        f32::from_bits(self.limit.0 as u32)
     }
 }
 
@@ -143,12 +229,21 @@ pub struct Descriptor {
     pub multiprocessors: u32,
     /// Element type of the states.
     pub dtype: DType,
+    /// The routed experts' representation a fused launch runs; [`ExpertWeights::None`] for a
+    /// dispatch or a combine, which run none.
+    pub weights: ExpertWeights,
+    /// Shared experts a fused launch runs beside the routed ones; zero for none, and for a
+    /// dispatch or a combine.
+    pub shared: u32,
+    /// The clamp of the gated activation of every expert a fused launch runs, as its bit pattern;
+    /// zero for an unclamped one, and for a dispatch or a combine.
+    pub limit: crate::descriptor::Float,
 }
 
 impl Descriptor {
     /// The arrangement of the `[up; gate]` stack's packed rows a fused launch reads
     /// ([`FusedLayer::up_gate`]): each thirty-two-row block leads with the gate rows.
-    pub const FUSED_UP_GATE_VALUES: ValueLayout = ValueLayout::GateFirst;
+    pub const FUSED_UP_GATE_VALUES: ValueLayout = ValueLayout::GateFirst { rows: 16 };
 
     /// The arrangement of the `down` stack's packed rows a fused launch reads
     /// ([`FusedLayer::down`]): the checkpoint's own.
@@ -159,6 +254,28 @@ impl Descriptor {
 
     /// The arrangement of the exchanged tokens' block scales a fused launch reads.
     pub const FUSED_TOKEN_SCALES: ScaleLayout = ScaleLayout::Linear;
+
+    /// The arrangement of an MXFP4 fused launch's `[up; gate]` stacks' rows, routed and shared
+    /// ([`FusedLayer::up_gate`], [`FusedLayer::shared_up_gate`]): each sixteen-row block leads
+    /// with eight gate rows, then the same eight rows of up.
+    pub const MXFP4_UP_GATE_VALUES: ValueLayout = ValueLayout::GateFirst { rows: 8 };
+
+    /// The arrangement of an MXFP4 fused launch's down stacks' rows: the checkpoint's own.
+    pub const MXFP4_DOWN_VALUES: ValueLayout = ValueLayout::Plain;
+
+    /// The arrangement of every weight scale an MXFP4 fused launch reads: DeepGEMM's packed
+    /// MN-major words with the rows of each 128-row group in the order its tensor-core copy reads
+    /// them.
+    pub const MXFP4_SCALES: crate::mx::ScaleLayout = crate::mx::ScaleLayout::PackedMnMajorUtccp;
+
+    /// What this descriptor's launch runs beside the exchange.
+    pub const fn fused(&self) -> FusedExperts {
+        FusedExperts {
+            weights: self.weights,
+            shared: self.shared,
+            limit: self.limit,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {
@@ -174,6 +291,9 @@ impl fmt::Display for Descriptor {
             .field("attention", self.attention)
             .field("multiprocessors", self.multiprocessors)
             .field("dtype", abi::name(self.dtype))
+            .field("weights", self.weights)
+            .field("shared", self.shared)
+            .field("limit", self.limit)
             .finish(formatter)
     }
 }
@@ -183,8 +303,10 @@ impl fmt::Display for Descriptor {
 /// At [`Mode::Dispatch`] the rank sends its rows in `state`, `ids` and `weights`; what it received
 /// stands in the transport's views afterwards. At [`Mode::Combine`] the rows its experts computed
 /// stand in the transport's combined view, and the package writes the rank's own rows into `out`.
-/// At [`Mode::Fused`] one launch reads `state`, `ids` and `weights` and writes `out`, with the
-/// layer's expert operands in `fused`. Views a mode does not read are empty (`[0]`-element) views.
+/// At [`Mode::Fused`] one launch reads `ids` and `weights` and writes `out`, with the layer's
+/// expert operands in `fused`; it reads the rows in `state` when it runs MXFP4 experts, and from
+/// the transport's packed views the layer encoded them into when it runs NVFP4 ones. Views a mode
+/// does not read are empty (`[0]`-element) views.
 #[derive(Clone)]
 pub struct ExchangeArgs {
     /// The group's transport, created and owned by the worker through the package and stated by
@@ -193,6 +315,10 @@ pub struct ExchangeArgs {
     pub transport: Option<ExchangeTransport>,
     /// Rows of this launch's extent: the captured bucket's, of which `live` are the batch's.
     pub tokens: u32,
+    /// Rows per rank the step this launch belongs to is shaped for, the capacity class of its
+    /// graph: the most any rank sends, which a fused launch tiles its experts' rows for. Every
+    /// rank of a step states the same, at least `tokens`.
+    pub capacity: u32,
     /// `[tokens, hidden]` states to send.
     pub state: Operand,
     /// `[tokens, top]` u32 expert ids.
@@ -212,9 +338,19 @@ pub struct ExchangeArgs {
 /// What a fused launch reads of one layer: its experts, as the loader laid them out, declared to
 /// the packages as `uniserve_fused_layer`.
 ///
-/// Each weight is `[local experts, rows, columns / 2]` packed values, read K-major, with its block
-/// scales in a table of `scale_bytes` per expert. Every address is a device address the layer's
-/// weights hold for the life of the model.
+/// Each routed weight is `[local experts, rows, columns / 2]` packed values, read K-major, with its
+/// block scales in a table of `scale_bytes` per expert. Every address is a device address the
+/// layer's weights hold for the life of the model.
+///
+/// - NVFP4 ([`ExpertWeights::Nvfp4`]): the stacks in [`Descriptor::FUSED_UP_GATE_VALUES`] and
+///   [`Descriptor::FUSED_DOWN_VALUES`], E4M3 block scales in [`Descriptor::FUSED_SCALES`], the
+///   three tables; no shared expert.
+/// - MXFP4 ([`ExpertWeights::Mxfp4`]): the stacks in [`Descriptor::MXFP4_UP_GATE_VALUES`] and
+///   [`Descriptor::MXFP4_DOWN_VALUES`], their UE8M0 scales in [`Descriptor::MXFP4_SCALES`]
+///   (`[local, columns / 128, rows]` words), no table; and the [`Descriptor::shared`] shared
+///   experts as one MXFP8 matrix pair: `[2 · shared · intermediate, hidden]` and
+///   `[hidden, shared · intermediate]` E4M3 codes, row-major, in the same row arrangements, with
+///   their scales in the same layout.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, abi::Layout)]
 pub struct FusedLayer {
@@ -236,6 +372,14 @@ pub struct FusedLayer {
     pub up_gate_scale_bytes: i64,
     /// Bytes of one expert's block scales, second projection.
     pub down_scale_bytes: i64,
+    /// MXFP4: the shared experts' `[up; gate]` E4M3 codes, or null without one.
+    pub shared_up_gate: *const c_void,
+    /// MXFP4: their scales.
+    pub shared_up_gate_scales: *const c_void,
+    /// MXFP4: the shared experts' down E4M3 codes, or null without one.
+    pub shared_down: *const c_void,
+    /// MXFP4: their scales.
+    pub shared_down_scales: *const c_void,
 }
 
 /// One launch of the exchange, declared to the packages as `uniserve_exchange_call`.
@@ -249,7 +393,7 @@ pub struct FusedLayer {
 #[derive(abi::Layout)]
 pub struct Call {
     pub transport: *mut c_void,
-    /// Dispatch: `[tokens, hidden]` rows to send.
+    /// Dispatch, and a fused MXFP4 launch: `[tokens, hidden]` rows to send.
     pub states: *const c_void,
     /// Dispatch: `[tokens, top]` expert ids.
     pub ids: *const i32,
@@ -265,6 +409,8 @@ pub struct Call {
     pub mode: i64,
     /// Rows of this launch's extent, the captured bucket's.
     pub tokens: i64,
+    /// Rows per rank the launch's step is shaped for ([`ExchangeArgs::capacity`]).
+    pub capacity: i64,
     pub top: i64,
     pub hidden: i64,
     pub experts: i64,
@@ -341,6 +487,9 @@ pub struct TransportShape {
     pub multiprocessors: u32,
     /// Leading ranks that hold no experts; zero when every rank holds its share.
     pub attention_ranks: u32,
+    /// What the layer's fused launch runs beside the exchange; [`FusedExperts::NONE`] for an
+    /// exchange of two directions, whose launches run no experts.
+    pub fused: FusedExperts,
 }
 
 impl TransportShape {
@@ -348,6 +497,10 @@ impl TransportShape {
     /// whose `create` makes the transport, and whose launches run over it.
     #[must_use]
     pub const fn descriptor(&self, mode: Mode) -> Descriptor {
+        let fused = match mode {
+            Mode::Fused => self.fused,
+            Mode::Dispatch | Mode::Combine => FusedExperts::NONE,
+        };
         Descriptor {
             mode,
             hidden: self.hidden,
@@ -359,6 +512,9 @@ impl TransportShape {
             attention: self.attention_ranks,
             multiprocessors: self.multiprocessors,
             dtype: self.dtype,
+            weights: fused.weights,
+            shared: fused.shared,
+            limit: fused.limit,
         }
     }
 
@@ -378,6 +534,9 @@ impl TransportShape {
             intermediate: i64::from(self.intermediate),
             capacity: 0,
             attention_ranks: i64::from(self.attention_ranks),
+            weights: self.fused.weights as i64,
+            shared: i64::from(self.fused.shared),
+            limit: self.fused.clamp(),
             error: [0; MESSAGE],
         })
     }
@@ -407,6 +566,12 @@ pub struct Lifecycle {
     pub capacity: i64,
     /// Leading ranks that hold no experts; zero when every rank holds some.
     pub attention_ranks: i64,
+    /// What the layer's fused launch runs ([`TransportShape::fused`]): the routed experts'
+    /// representation by its [`ExpertWeights`] number, the shared experts and the clamp (zero
+    /// for none), which a fused package lays its transport out for.
+    pub weights: i64,
+    pub shared: i64,
+    pub limit: f32,
     /// The entry's message on a nonzero return.
     pub error: [c_char; MESSAGE],
 }
@@ -695,13 +860,36 @@ impl Op for ExpertExchange {
                 ));
             }
         }
+        if args.capacity < args.tokens || u64::from(args.capacity) > max_tokens {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a step of {} rows a rank holds this launch's {tokens} rows and fits the \
+                     transport's {max_tokens}",
+                    args.capacity
+                ),
+            ));
+        }
+        let fused_rows =
+            descriptor.mode == Mode::Fused && descriptor.weights == ExpertWeights::Mxfp4;
+        if (descriptor.mode == Mode::Fused) == (descriptor.weights == ExpertWeights::None) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a fused launch runs NVFP4 or MXFP4 experts and the two directions run none; \
+                     a {} launch states {} experts",
+                    descriptor.mode, descriptor.weights
+                ),
+            ));
+        }
         if matches!(descriptor.mode, Mode::Dispatch | Mode::Fused) {
-            if descriptor.mode == Mode::Dispatch {
+            let reads_rows = descriptor.mode == Mode::Dispatch || fused_rows;
+            if reads_rows {
                 args.state.require_shape(Self::NAME, &[tokens, hidden])?;
             }
             args.ids.require_shape(Self::NAME, &[tokens, top])?;
             args.weights.require_shape(Self::NAME, &[tokens, top])?;
-            if tokens != 0 && descriptor.mode == Mode::Dispatch {
+            if tokens != 0 && reads_rows {
                 args.state
                     .require_row(Self::NAME, descriptor.dtype, hidden)?;
             }
@@ -724,6 +912,23 @@ impl Op for ExpertExchange {
                 Self::NAME,
                 "a fused launch states its layer's operands, and no other launch does",
             ));
+        }
+        if let Some(layer) = fused {
+            let shared = !layer.shared_up_gate.is_null() && !layer.shared_down.is_null();
+            if shared != (descriptor.shared > 0)
+                || (descriptor.weights == ExpertWeights::Nvfp4 && descriptor.shared > 0)
+            {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the launch runs {} shared experts beside its {} ones (NVFP4 runs none), \
+                         and its layer states {} shared weights",
+                        descriptor.shared,
+                        descriptor.weights,
+                        if shared { "" } else { "no" }
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -766,6 +971,7 @@ impl Op for ExpertExchange {
             layer: fused.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
             mode: descriptor.mode as i64,
             tokens: to_i64(Self::NAME, tokens)?,
+            capacity: to_i64(Self::NAME, u64::from(args.capacity))?,
             top: to_i64(Self::NAME, top)?,
             hidden: to_i64(Self::NAME, hidden)?,
             experts: to_i64(Self::NAME, experts)?,
@@ -797,8 +1003,31 @@ impl Op for ExpertExchange {
             Mode::Dispatch => Tolerance::exact(),
             // A token's partial expert sums arrive from the ranks that hold its experts, so the
             // combine's reduction length is the group size.
-            Mode::Combine | Mode::Fused => {
+            Mode::Combine => {
                 Tolerance::dot(u64::from(descriptor.ranks), DType::F32, descriptor.dtype)
+            }
+            // A fused launch computes the experts too. Over NVFP4 experts the bound is the
+            // combine's, the reduction of a token's partial sums over the group.
+            Mode::Fused if descriptor.weights != ExpertWeights::Mxfp4 => {
+                Tolerance::dot(u64::from(descriptor.ranks), DType::F32, descriptor.dtype)
+            }
+            // Over MXFP4 experts: the first product's contraction rounded to BF16, a gated row's
+            // code one E4M3 step apart (twice its unit roundoff), the second product's
+            // contraction rounded to BF16, and the FP32 sum of a token's routes and shared
+            // experts rounded once into the states' type; each a sum that cancels, so the bound
+            // is relative to the output's largest magnitude.
+            Mode::Fused => {
+                let terms = u64::from(descriptor.top + descriptor.shared);
+                let first = Tolerance::dot(u64::from(descriptor.hidden), DType::F32, DType::BF16);
+                let gated = 2.0 * crate::tolerance::unit_roundoff(DType::F8E4M3) as f32;
+                let second =
+                    Tolerance::dot(u64::from(descriptor.intermediate), DType::F32, DType::BF16);
+                let sum = Tolerance::dot(terms.max(1), DType::F32, descriptor.dtype);
+                Tolerance {
+                    atol: sum.atol,
+                    rtol: first.rtol + gated + second.rtol + sum.rtol,
+                    cancels: true,
+                }
             }
         }
     }
@@ -824,6 +1053,9 @@ mod tests {
             attention: 0,
             multiprocessors: MULTIPROCESSORS,
             dtype: DType::BF16,
+            weights: ExpertWeights::None,
+            shared: 0,
+            limit: 0.0_f32.into(),
         };
         let view = |dtype, dims: &[u64]| {
             Operand::new(platform::DevicePtr::from_address(0x1000), dtype, dims)
@@ -831,6 +1063,7 @@ mod tests {
         let args = ExchangeArgs {
             transport: None,
             tokens: 4,
+            capacity: 4,
             state: view(DType::BF16, &[4, 64]),
             ids: view(DType::U32, &[4, 2]),
             weights: view(DType::F32, &[4, 2]),
@@ -841,9 +1074,94 @@ mod tests {
         };
         ExpertExchange::check(&descriptor, &args).unwrap();
 
-        // The argument rules still hold without a transport: a group of another size is refused.
-        let other = ExchangeArgs { ranks: 4, ..args };
+        // The argument rules still hold without a transport: a group of another size is refused,
+        // and so is a step that does not hold the launch's rows.
+        let other = ExchangeArgs {
+            ranks: 4,
+            ..args.clone()
+        };
         assert!(ExpertExchange::check(&descriptor, &other).is_err());
+        let short = ExchangeArgs {
+            capacity: 3,
+            ..args
+        };
+        assert!(ExpertExchange::check(&descriptor, &short).is_err());
+    }
+
+    /// A fused MXFP4 launch reads the rows it encodes, and states its shared expert's weights
+    /// exactly when its descriptor runs one.
+    #[test]
+    fn a_fused_mxfp4_launch_reads_its_rows_and_states_its_shared_expert() {
+        let descriptor = Descriptor {
+            mode: Mode::Fused,
+            hidden: 5120,
+            intermediate: 2304,
+            top: 6,
+            experts: 384,
+            max_tokens: 64,
+            ranks: 4,
+            attention: 0,
+            multiprocessors: 152,
+            dtype: DType::BF16,
+            weights: ExpertWeights::Mxfp4,
+            shared: 1,
+            limit: 10.0_f32.into(),
+        };
+        assert_eq!(
+            descriptor.to_string(),
+            "mode_fused_hidden_5120_intermediate_2304_top_6_experts_384_max_tokens_64_ranks_4_\
+             attention_0_multiprocessors_152_dtype_bf16_weights_mxfp4_shared_1_limit_0x41200000"
+        );
+        let view = |dtype, dims: &[u64]| {
+            Operand::new(platform::DevicePtr::from_address(0x1000), dtype, dims)
+        };
+        let some = 0x2000 as *const c_void;
+        let layer = FusedLayer {
+            up_gate: some,
+            up_gate_scales: some,
+            down: some,
+            down_scales: some,
+            up_gate_alpha: std::ptr::null(),
+            down_alpha: std::ptr::null(),
+            gated_scale: std::ptr::null(),
+            up_gate_scale_bytes: 4608 * 40 * 4,
+            down_scale_bytes: 5120 * 18 * 4,
+            shared_up_gate: some,
+            shared_up_gate_scales: some,
+            shared_down: some,
+            shared_down_scales: some,
+        };
+        let args = ExchangeArgs {
+            transport: None,
+            tokens: 8,
+            capacity: 16,
+            state: view(DType::BF16, &[8, 5120]),
+            ids: view(DType::U32, &[8, 6]),
+            weights: view(DType::F32, &[8, 6]),
+            live: None,
+            out: view(DType::BF16, &[8, 5120]),
+            fused: Some(layer),
+            ranks: 4,
+        };
+        ExpertExchange::check(&descriptor, &args).unwrap();
+
+        // The rows it encodes are part of the call.
+        let unread = ExchangeArgs {
+            state: Operand::unread(),
+            ..args.clone()
+        };
+        assert!(ExpertExchange::check(&descriptor, &unread).is_err());
+
+        // A layer without its shared expert's weights is refused.
+        let unshared = ExchangeArgs {
+            fused: Some(FusedLayer {
+                shared_up_gate: std::ptr::null(),
+                shared_down: std::ptr::null(),
+                ..layer
+            }),
+            ..args
+        };
+        assert!(ExpertExchange::check(&descriptor, &unshared).is_err());
     }
 
     use super::*;
@@ -861,6 +1179,9 @@ mod tests {
             attention: 0,
             multiprocessors: MULTIPROCESSORS,
             dtype: DType::BF16,
+            weights: ExpertWeights::None,
+            shared: 0,
+            limit: 0.0_f32.into(),
         };
         assert_eq!(
             ExpertExchange::tolerance(&dispatch),
@@ -891,11 +1212,14 @@ mod tests {
             attention: 0,
             multiprocessors: MULTIPROCESSORS,
             dtype: DType::BF16,
+            weights: ExpertWeights::None,
+            shared: 0,
+            limit: 0.0_f32.into(),
         };
         assert_eq!(
             combine.to_string(),
             "mode_combine_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_4_attention_0_\
-             multiprocessors_148_dtype_bf16"
+             multiprocessors_148_dtype_bf16_weights_none_shared_0_limit_0x0"
         );
         let wider = Descriptor {
             ranks: 8,

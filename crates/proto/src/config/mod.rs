@@ -977,6 +977,12 @@ pub struct MoeConfig {
     /// ([`DEFAULT_BESIDE_ROWS`] unless stated).
     #[reload(epoch)]
     pub beside_rows: NonZeroU32,
+    /// Whether an expert union runs each MXFP4 expert layer in its exchange's one fused launch
+    /// (the routes' exchange, both expert products, the shared expert and the combine), rather
+    /// than between the exchange's dispatch and combine. The experts load in the arrangement of
+    /// the composition and the transport is laid out for it, so a change is an epoch.
+    #[reload(epoch)]
+    pub fused_exchange: bool,
     /// The experts' order: for each routed expert layer, by its module path, the logical expert
     /// ids in the order of the physical slots that hold them, across the layer's expert ranks; a
     /// layer it does not name keeps the checkpoint's order. A change is prepared on the copy
@@ -993,6 +999,7 @@ impl Default for MoeConfig {
             expert_parallel: false,
             microbatches: NonZeroU32::MIN,
             beside_rows: DEFAULT_BESIDE_ROWS,
+            fused_exchange: false,
             expert_order: BTreeMap::new(),
         }
     }
@@ -2207,6 +2214,7 @@ impl EngineConfig {
             expert_parallel,
             microbatches: _,
             beside_rows,
+            fused_exchange,
             expert_order: _,
         } = moe;
         let WorkerConfig {
@@ -2262,6 +2270,7 @@ impl EngineConfig {
             kv_cache,
             expert_parallel: *expert_parallel,
             beside_rows: *beside_rows,
+            fused_exchange: *fused_exchange,
             engine,
             engine_revision: *engine_revision,
             mesh,
@@ -2329,6 +2338,9 @@ pub struct BuildPart<'a> {
     pub expert_parallel: bool,
     /// The expert union's middle capture class, which the captured graphs are shaped for.
     pub beside_rows: NonZeroU32,
+    /// Whether the union's MXFP4 expert layers run in one fused launch, which the experts load
+    /// and the transport is laid out for.
+    pub fused_exchange: bool,
     pub engine: &'a str,
     pub engine_revision: Option<u32>,
     pub mesh: &'a Option<String>,

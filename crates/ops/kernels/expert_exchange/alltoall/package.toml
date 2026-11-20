@@ -19,7 +19,7 @@
 
 op = "expert_exchange"
 backend = "alltoall"
-interface_version = 1
+interface_version = 2
 
 [module.entries]
 launch = "uniserve_expert_exchange_launch"
@@ -41,11 +41,11 @@ units = ["src/exchange.cu"]
 standard = "c++17"
 libraries = ["cuda"]
 
-# `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_2_attention_0_multiprocessors_148_dtype_bf16`.
+# `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_2_attention_0_multiprocessors_148_dtype_bf16_weights_none_shared_0_limit_0x0`.
 # Every extent is a launch value the kernels read from the call, so one object serves any of
 # them; `src/exchange.cu`'s create refuses a row that is not whole 16-byte vectors (`hidden`
 # a multiple of 8 two-byte elements), more than 64 ranks or more than 32 routes per token.
 # `intermediate` and `multiprocessors` are the key's, not the exchange's: its grids are sized
 # by the rows. The backend has no attention ranks.
 [[kernel.descriptors]]
-dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 8 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1, max = 64 }, attention = ["0"], multiprocessors = { min = 1 }, dtype = ["bf16", "f16"] }
+dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 8 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1, max = 64 }, attention = ["0"], multiprocessors = { min = 1 }, dtype = ["bf16", "f16"], weights = ["none"], shared = ["0"], limit = ["0x0"] }

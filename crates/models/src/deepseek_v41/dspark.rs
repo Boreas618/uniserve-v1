@@ -40,7 +40,7 @@ use nn::functional::{self, Plane};
 use nn::modules::{
     Embedding, EmbeddingConfig, LatentAttention, LatentAttentionConfig, LatentBatch, Linear,
     LinearConfig, LmHead, LmHeadConfig, MhcConfig, MhcConnection, MhcResidual, MoE, Parallel,
-    Rotary, SharedExpert,
+    Rotary,
 };
 use nn::{
     BlockDrafter, DType, Device, DraftBlock, DraftContext, ExpertExchange, KvCache, Result, Tensor,
@@ -52,7 +52,7 @@ use crate::deepseek_v41::attention::plane;
 use crate::deepseek_v41::cache::{WINDOW, WINDOW_RECORD};
 use crate::deepseek_v41::causal_lm::written;
 use crate::deepseek_v41::config::{Config, DsparkConfig};
-use crate::deepseek_v41::decoder::{routed, shared};
+use crate::deepseek_v41::decoder::routed;
 
 /// The profiler class of the drafter's forward.
 const DRAFTER: &str = "models.deepseek_v41.dspark.Dspark";
@@ -251,8 +251,8 @@ struct DraftLayer {
     attention_connection: MhcConnection,
     attention: DraftAttention,
     ffn_connection: MhcConnection,
+    /// The routed experts and the shared expert beside them.
     experts: MoE,
-    shared: SharedExpert,
 }
 
 impl DraftLayer {
@@ -266,13 +266,19 @@ impl DraftLayer {
         vb: VarBuilder<'_, '_>,
     ) -> Result<Self> {
         let mhc: MhcConfig = config.mhc();
-        // Whole on every rank: no exchange carries a draft token (module documentation).
+        // Whole on every rank: no exchange carries a draft token (module documentation), so no
+        // exchange's fused launch runs them either.
         let experts = routed(
             config,
             &dspark.experts,
             expert_module(stage),
             None,
-            (placement.tensor, placement.tensor_experts, Split::WHOLE),
+            (
+                placement.tensor,
+                placement.tensor_experts,
+                Split::WHOLE,
+                false,
+            ),
         );
 
         Ok(Self {
@@ -281,7 +287,6 @@ impl DraftLayer {
             attention: DraftAttention::load(config, window, vb.pp("attn"))?,
             ffn_connection: MhcConnection::load(&mhc, &vb, "hc_ffn", vb.pp("ffn_norm"))?,
             experts: MoE::load(&experts, vb.pp("ffn"))?,
-            shared: SharedExpert::load(&shared(config, &dspark.experts), vb.pp("ffn"))?,
         })
     }
 
@@ -298,8 +303,7 @@ impl DraftLayer {
             self.attention.forward(x, window, batch, workspace)
         })?;
         residual.sublayer(&self.ffn_connection, |x| {
-            let routed = self.experts.forward(x, live_tokens, None)?;
-            self.shared.forward(x, routed)
+            self.experts.forward(x, live_tokens, None)
         })
     }
 }

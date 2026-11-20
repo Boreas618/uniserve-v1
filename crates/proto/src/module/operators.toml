@@ -152,3 +152,8 @@ mxfp8_gemm = 2
 # A boundary is served by a native fused program beside the split cubin: its call joins the cubin's
 # launch, and the workspace holds both forms' partials and arrival words.
 mhc_boundary = 2
+# The descriptor states what a fused launch runs (the routed experts' representation, the shared
+# experts and the gated activation's clamp), the call the step's rows a rank and an MXFP4 launch's
+# rows, the fused layer the shared experts' operands, and the lifecycle call what the transport is
+# laid out for.
+expert_exchange = 2

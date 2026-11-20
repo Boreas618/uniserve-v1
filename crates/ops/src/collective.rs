@@ -908,6 +908,9 @@ mod tests {
             attention: 0,
             multiprocessors: 148,
             dtype: DType::BF16,
+            weights: crate::moe::exchange::ExpertWeights::None,
+            shared: 0,
+            limit: crate::descriptor::Float(0),
         };
         let tensor = |shape: (usize, usize), dtype| {
             operand(&retained(0x4000, shape, dtype, &meta()).unwrap()).unwrap()
@@ -915,6 +918,7 @@ mod tests {
         let args = ExchangeArgs {
             transport: None,
             tokens: 4,
+            capacity: 4,
             state: tensor((4, 64), DType::BF16),
             ids: tensor((4, 2), DType::U32),
             weights: tensor((4, 2), DType::F32),
@@ -969,7 +973,7 @@ mod tests {
             [(
                 "expert_exchange",
                 "mode_dispatch_hidden_64_intermediate_128_top_2_experts_8_max_tokens_16_ranks_2_\
-                 attention_0_multiprocessors_148_dtype_bf16"
+                 attention_0_multiprocessors_148_dtype_bf16_weights_none_shared_0_limit_0x0"
                     .to_owned(),
                 String::new()
             )]
