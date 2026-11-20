@@ -129,10 +129,12 @@ pub struct MoEConfig {
     pub limit: Option<f32>,
     /// The router's module name.
     pub router: &'static str,
-    /// The element type the router's product reads its weight and the rows in and states its
-    /// logits in: the activations' when `None`, or a wider one (F32) for a model whose reference
-    /// routes in it, so near ties select as the reference's do.
-    pub router_dtype: Option<DType>,
+    /// The element type the router states its logits in: the activations' when `None`, or a
+    /// wider one (F32) for a model whose reference routes on FP32 logits. The product reads the
+    /// rows and its weight in the activations' type and accumulates in FP32, so FP32 logits of
+    /// BF16 rows are the reference's FP32 product of the widened values up to the order of its
+    /// sum: the products of BF16 values are exact in FP32.
+    pub router_logits: Option<DType>,
     /// The name of the module list that holds the experts: expert `e`'s projections are
     /// `<list>.<e>.<up|gate|down>`.
     pub list: &'static str,
@@ -274,6 +276,9 @@ pub struct MoE {
     /// The layer's name among the model's routed layers, by which its forwards find the
     /// expert load execution lends ([`MoEConfig::name`]).
     name: Option<String>,
+    /// The router's logits' element type, the activations' when `None`
+    /// ([`MoEConfig::router_logits`]).
+    logits: Option<DType>,
     /// The shared expert the block owns.
     shared: Option<Shared>,
 }
@@ -356,12 +361,9 @@ impl MoE {
         let window = &config.order[local.start as usize..local.end as usize];
         let intermediate = config.intermediate / split.size();
 
-        let router_vb = match config.router_dtype {
-            Some(dtype) => vb.pp(config.router).to_dtype(dtype),
-            None => vb.pp(config.router),
-        };
         let router = Linear::new(
-            router_vb.get((experts as usize, config.hidden as usize), "weight")?,
+            vb.pp(config.router)
+                .get((experts as usize, config.hidden as usize), "weight")?,
             None,
             WeightOrder::NxK,
         )?;
@@ -477,6 +479,7 @@ impl MoE {
             // or the slots.
             reduce: config.split.size(),
             name: config.name.clone(),
+            logits: config.router_logits,
             shared,
         })
     }
@@ -968,18 +971,15 @@ impl MoE {
             bias: self.selection_bias.as_ref(),
             scale: self.routed_scale.as_ref(),
         };
-        // A router held in a wider type than the rows reads them widened.
-        let rows = match self.router.weight().dtype() {
-            dtype if dtype != x.dtype() => x.to_dtype(dtype)?,
-            _ => x.clone(),
-        };
-        functional::topk_softmax(
-            &self.router.forward(&rows)?,
-            &routing,
-            Some(&self.map),
-            live_tokens,
-            load,
-        )
+        // The router's product over the rows as they stand, its logits in their stated type.
+        let logits = functional::linear_to(
+            x,
+            self.router.weight(),
+            None,
+            WeightOrder::NxK,
+            self.logits.unwrap_or(x.dtype()),
+        )?;
+        functional::topk_softmax(&logits, &routing, Some(&self.map), live_tokens, load)
     }
 
     /// `Σ_routes weight · expert(x)` over `x [tokens, hidden]`, summed over the tensor-parallel

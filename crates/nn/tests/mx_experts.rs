@@ -267,7 +267,7 @@ fn config(experts: usize) -> MoEConfig {
         routed_scale: Some(ROUTED_SCALE),
         limit: Some(LIMIT),
         router: "gate",
-        router_dtype: None,
+        router_logits: None,
         list: "experts",
         up: "w3",
         gate: "w1",

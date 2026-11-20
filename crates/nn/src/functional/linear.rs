@@ -52,6 +52,23 @@ pub fn linear(
     bias: Option<&Tensor>,
     order: WeightOrder,
 ) -> Result<Tensor> {
+    linear_to(x, weight, bias, order, x.dtype())
+}
+
+/// [`linear`] stated in `output`: the product accumulated in FP32 and rounded once into `output`,
+/// which may be wider than the operands (a router's FP32 logits of BF16 rows and weight, whose
+/// products FP32 holds exactly).
+///
+/// # Errors
+///
+/// What [`linear`] refuses.
+pub fn linear_to(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    order: WeightOrder,
+    output: DType,
+) -> Result<Tensor> {
     const OWNER: &str = LinearCall::OWNER;
 
     let k = columns(OWNER, x)?;
@@ -88,10 +105,12 @@ pub fn linear(
         bias,
         order,
         n,
+        output,
     })
 }
 
-/// A checked call of [`linear`]: `rows` is `x` as its rows, and `n` the output channels.
+/// A checked call of [`linear_to`]: `rows` is `x` as its rows, `n` the output channels and
+/// `output` their element type.
 struct LinearCall<'t> {
     x: &'t Tensor,
     rows: Tensor,
@@ -99,6 +118,7 @@ struct LinearCall<'t> {
     bias: Option<&'t Tensor>,
     order: WeightOrder,
     n: u32,
+    output: DType,
 }
 
 impl LinearCall<'_> {
@@ -119,6 +139,7 @@ impl Fused for LinearCall<'_> {
             weight,
             bias,
             order,
+            output,
             ..
         } = self;
         let weight = weight.to_dtype(ACCUMULATE)?;
@@ -131,7 +152,7 @@ impl Fused for LinearCall<'_> {
         if let Some(bias) = bias {
             product = product.broadcast_add(&bias.to_dtype(ACCUMULATE)?)?;
         }
-        like_rows(product.to_dtype(x.dtype())?, x)
+        like_rows(product.to_dtype(output)?, x)
     }
 
     fn launch(self) -> Result<Self::Output> {
@@ -142,8 +163,9 @@ impl Fused for LinearCall<'_> {
             bias,
             order,
             n,
+            output,
         } = self;
-        let out = ops::empty((rows.dims()[0], n as usize), x.dtype())?;
+        let out = ops::empty((rows.dims()[0], n as usize), output)?;
         let args = Args {
             input: ops::operand(&rows)?,
             weight: ops::operand(weight)?,

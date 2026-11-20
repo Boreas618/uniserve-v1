@@ -92,7 +92,7 @@ pub use latent::{
     Compression, Plane, RecordRow, Ring, Selected, Window, latent_attention, latent_compress,
     record_write_,
 };
-pub use linear::{WeightOrder, dynamic_scales, linear, linear_fp8, linear_nvfp4};
+pub use linear::{WeightOrder, dynamic_scales, linear, linear_fp8, linear_nvfp4, linear_to};
 pub use logits::{LOGITS, vocab_unpad};
 pub use mhc::{MhcMixes, MhcMixing, mhc_boundary, mhc_post, mhc_pre};
 pub use moe::{

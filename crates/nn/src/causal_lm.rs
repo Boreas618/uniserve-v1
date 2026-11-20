@@ -242,7 +242,7 @@ impl MoeConfig {
             routed_scale: None,
             limit: None,
             router: "gate",
-            router_dtype: None,
+            router_logits: None,
             list: "experts",
             up: "up_proj",
             gate: "gate_proj",

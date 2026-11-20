@@ -88,8 +88,10 @@ impl DecoderLayer {
             routed_scale: Some(experts.routed_scale),
             limit: Some(experts.limit),
             router: "gate",
-            // The reference scores in FP32: `linear(x.float(), weight.float())`.
-            router_dtype: Some(DType::F32),
+            // The reference scores in FP32, `linear(x.float(), weight.float())`: the BF16 rows'
+            // and weight's products are exact in FP32, so a BF16 product accumulated in FP32
+            // states the same logits up to the order of the sum.
+            router_logits: Some(DType::F32),
             list: "experts",
             up: "w3",
             gate: "w1",
