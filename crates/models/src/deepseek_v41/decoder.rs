@@ -93,7 +93,8 @@ impl DecoderLayer {
                 // The reference's `Expert`: the clamped SwiGLU in FP32, rounded once.
                 rounding: Rounding::Fused,
                 limit: Some(experts.limit),
-                gate_up: GateUp::Split {
+                // Both input projections in one MXFP8 product.
+                gate_up: GateUp::Merged {
                     gate: "w1",
                     up: "w3",
                 },

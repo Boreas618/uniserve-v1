@@ -1057,6 +1057,12 @@ const SPLIT: GateUp = GateUp::Split {
     up: "up_proj",
 };
 
+/// The same modules read as one product.
+const MERGED: GateUp = GateUp::Merged {
+    gate: "gate_proj",
+    up: "up_proj",
+};
+
 #[test]
 fn a_gated_mlp_projects_gates_and_projects_back() {
     let directory = tempfile::tempdir().unwrap();
@@ -1106,6 +1112,9 @@ fn a_gated_mlp_projects_gates_and_projects_back() {
         (Rounding::Fused, SPLIT, "mlp"),
         (Rounding::Stepwise, SPLIT, "mlp"),
         (Rounding::ValueProduct, SPLIT, "mlp"),
+        // The two modules read as one product of packed rows.
+        (Rounding::Fused, MERGED, "mlp"),
+        (Rounding::ValueProduct, MERGED, "mlp"),
         (Rounding::Stepwise, GateUp::ValueFirst("proj"), "ff"),
         (Rounding::ValueProduct, GateUp::ValueFirst("proj"), "ff"),
     ] {
