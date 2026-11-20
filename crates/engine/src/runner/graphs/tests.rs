@@ -29,14 +29,13 @@ const HIDDEN: usize = 16;
 /// The rows of the largest bucket.
 const ROWS: usize = 4;
 
-/// The bytes of one column of the runner's input tensors, and the offsets of its five columns.
+/// The bytes of one column of the runner's input tensors, and the offsets of its four columns.
 const COLUMN: u64 = 256;
 const IDS: u64 = 0;
 const POSITIONS: u64 = COLUMN;
-const SLOTS: u64 = 2 * COLUMN;
-const LENGTHS: u64 = 3 * COLUMN;
-const OFFSETS: u64 = 4 * COLUMN;
-const INPUTS: u64 = 5 * COLUMN;
+const LENGTHS: u64 = 2 * COLUMN;
+const OFFSETS: u64 = 3 * COLUMN;
+const INPUTS: u64 = 4 * COLUMN;
 
 /// A meta weight: a shape and an element type at an address nothing reads.
 fn weight(address: u64, dims: &[usize]) -> Tensor {
@@ -140,7 +139,6 @@ impl Forward for TinyRunner {
             token_ids: None,
             token_history: None,
             positions: self.column(POSITIONS, rows, DType::I32)?,
-            slot_mapping: self.column(SLOTS, rows, DType::U32)?,
             seq_lens: self.column(LENGTHS, rows, DType::U32)?,
             query_offsets: self.column(OFFSETS, rows + 1, DType::U32)?,
             logits_rows: self.column(IDS, rows, DType::U32)?,

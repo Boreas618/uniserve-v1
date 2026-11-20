@@ -29,8 +29,8 @@
 //! ([`TokenBatch::rope_positions`]).
 
 use nn::family::{
-    CacheShape, ExpertOrder, ExpertShape, IndexKeys, StateShape, TextModel, TextPlacement,
-    TokenHistory,
+    CacheField, ExpertOrder, ExpertShape, FieldOwner, Format, History, INDEX_KEY, Record,
+    StateShape, TextModel, TextPlacement, TokenHistory,
 };
 use nn::modules::{Embedding, EmbeddingConfig, LmHead, LmHeadConfig, Rotary};
 use nn::{
@@ -444,8 +444,9 @@ impl TextModel for Qwen4ExpForCausalLm {
         self.embed_tokens.weight().dtype()
     }
 
-    fn cache(&self) -> CacheShape {
-        cache_shape(&self.config, self.tensor, self.config.attention_layers())
+    fn cache(&self) -> Vec<CacheField> {
+        let layers = self.config.attention_layers();
+        cache_fields(&self.config, self.tensor, layers, self.dtype())
     }
 
     fn state_layers(&self) -> Vec<StateShape> {
@@ -509,20 +510,37 @@ impl TextModel for Qwen4ExpForCausalLm {
     }
 }
 
-/// The key/value cache of `layers` attention layers of `config`, as `tensor`'s rank holds it:
-/// a rank of a group wider than the key/value heads holds one head.
-pub(crate) fn cache_shape(config: &Config, tensor: Split, layers: u32) -> CacheShape {
+/// The cache fields of `layers` attention layers of `config`, as `tensor`'s rank holds them: the
+/// keys and values, of which a rank of a group wider than the key/value heads holds one head,
+/// and the indexer's keys, one per `compress_ratio` tokens of every layer, in `dtype`, the type
+/// the layers compute them in, whatever the deployment stores keys and values in.
+pub(crate) fn cache_fields(
+    config: &Config,
+    tensor: Split,
+    layers: u32,
+    dtype: DType,
+) -> Vec<CacheField> {
     let (text, indexer) = (&config.text, &config.indexer);
+    let kv_heads = (text.num_key_value_heads / tensor.size()).max(1);
 
-    CacheShape {
-        layers,
-        kv_heads: (text.num_key_value_heads / tensor.size()).max(1),
-        head_dim: text.head_dim,
-        index_keys: Some(IndexKeys {
+    let mut fields = CacheField::keys_and_values(layers, kv_heads, text.head_dim);
+    fields.push(CacheField {
+        name: INDEX_KEY,
+        owners: (0..layers)
+            .map(|layer| FieldOwner {
+                layer,
+                ratio: indexer.compress_ratio,
+            })
+            .collect(),
+        readers: Vec::new(),
+        history: History::Full,
+        record: Record {
+            format: Format::Elements(dtype),
+            heads: 1,
             width: indexer.head_dim,
-            ratio: indexer.compress_ratio,
-        }),
-    }
+        },
+    });
+    fields
 }
 
 impl std::fmt::Debug for Qwen4ExpForCausalLm {
@@ -560,17 +578,34 @@ mod tests {
         let config =
             Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
 
-        let whole = cache_shape(&config, Split::WHOLE, 2);
-        assert_eq!((whole.layers, whole.kv_heads, whole.head_dim), (2, 2, 256));
+        // Two layers' keys and values of two heads of 256, and their index keys: one key of 128
+        // BF16 elements per four tokens.
+        let whole = cache_fields(&config, Split::WHOLE, 2, DType::BF16);
+        let names: Vec<&str> = whole.iter().map(|field| field.name).collect();
+        assert_eq!(names, [nn::family::KEY, nn::family::VALUE, INDEX_KEY]);
+        for field in &whole[..2] {
+            assert_eq!(field.owners.len(), 2);
+            assert_eq!((field.record.heads, field.record.width), (2, 256));
+            assert_eq!(field.record.format, Format::Deployment);
+        }
+        let keys = &whole[2];
         assert_eq!(
-            whole.index_keys,
-            Some(IndexKeys {
-                width: 128,
-                ratio: 4
-            })
+            keys.owners,
+            [
+                FieldOwner { layer: 0, ratio: 4 },
+                FieldOwner { layer: 1, ratio: 4 }
+            ]
+        );
+        assert_eq!(
+            keys.record,
+            Record {
+                format: Format::Elements(DType::BF16),
+                heads: 1,
+                width: 128
+            }
         );
 
-        let rank = cache_shape(&config, Split::new(4, 3).unwrap(), 2);
-        assert_eq!(rank.kv_heads, 1);
+        let rank = cache_fields(&config, Split::new(4, 3).unwrap(), 2, DType::BF16);
+        assert_eq!(rank[0].record.heads, 1);
     }
 }

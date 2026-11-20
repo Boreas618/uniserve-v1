@@ -57,10 +57,28 @@ impl Scheduler {
     }
 
     /// Whether this scheduler's role takes `input`: `Err` with the rejection to answer it with.
+    /// A request that hands off or imports is refused by a cache with a sliding window: a
+    /// handoff carries a request's full-history pages, and a window's pages are never cached or
+    /// carried, so the continuation would have to replay the window, which an import does not.
     pub(super) fn takes(&self, input: &Input) -> Result<(), (RejectionKind, String)> {
         let Input::Generation(request) = input else {
             return Ok(());
         };
+        let windowed = self.groups.iter().any(|group| {
+            group
+                .capacity
+                .cache_groups
+                .iter()
+                .any(|(kind, _)| kind.window().is_some())
+        });
+        if windowed && (request.hand_off || request.lend.is_some()) {
+            return Err((
+                RejectionKind::Invalid,
+                "a handoff between replicas carries no sliding-window cache field, and this \
+                 model's cache keeps one"
+                    .to_owned(),
+            ));
+        }
         match refusal(self.role(), request) {
             None => Ok(()),
             Some(reason) => Err((RejectionKind::Role, reason.to_owned())),

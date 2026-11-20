@@ -692,7 +692,7 @@ mod tests {
                     calls: vec![Row {
                         slot,
                         kind: Phase::Prefill,
-                        cache_group: 0,
+                        replay: 0..0,
                         rows: 0..1,
                     }],
                     positions: positions.clone(),

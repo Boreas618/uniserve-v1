@@ -41,8 +41,9 @@ use tensor::{D, DType, Device, Shape, Tensor};
 use super::nvfp4::integer;
 use super::rotary::heads_of;
 use super::{ACCUMULATE, Fused, compute};
-use crate::capability::{KvCache, KvPlanes, NO_SLOT, TokenBatch};
+use crate::capability::{KvCache, KvPlane, NO_SLOT, TokenBatch};
 use crate::error::{Error, Result};
+use crate::family::{KEY, VALUE};
 
 /// The floor under a page's largest magnitude, so a write of zeros still has a scale to divide
 /// by.
@@ -461,6 +462,32 @@ fn sequence_mask(
     }
 }
 
+/// The key and value planes one attention layer reads: its planes of the [`KEY`] and [`VALUE`]
+/// fields of the cache group ([`KvCache::plane`]).
+struct KeyValue<'t> {
+    key: &'t KvPlane,
+    value: &'t KvPlane,
+}
+
+/// The key and value planes layer `layer` of `cache` reads.
+///
+/// # Errors
+///
+/// A layer that reads no key or no value plane of the group.
+fn key_value(cache: &KvCache, layer: usize) -> Result<KeyValue<'_>> {
+    let layer = u32::try_from(layer).map_err(|_| {
+        Error::shape(
+            "KvCache",
+            format!("layer {layer} is beyond the cache's layers"),
+        )
+    })?;
+
+    Ok(KeyValue {
+        key: cache.plane(KEY, layer)?,
+        value: cache.plane(VALUE, layer)?,
+    })
+}
+
 /// The tokens one page of `cache` holds, which the batch's columns address too.
 ///
 /// The page size enters every descriptor of the cache's kernels, and the cache is laid out in
@@ -483,13 +510,13 @@ fn page_size(owner: &'static str, batch: &TokenBatch, cache: &KvCache) -> Result
 
 /// The key/value heads and the head width of `planes`, `[pages, page, kv_heads, head_dim]`
 /// each, checked against the cache's page and against each other.
-fn plane_heads(owner: &'static str, planes: &KvPlanes, page: u32) -> Result<(u32, u32)> {
-    if let [_, tokens, heads, head_dim] = *planes.key.dims()
+fn plane_heads(owner: &'static str, planes: &KeyValue<'_>, page: u32) -> Result<(u32, u32)> {
+    if let [_, tokens, heads, head_dim] = *planes.key.entries.dims()
         && let (Ok(heads), Ok(head_dim)) = (u32::try_from(heads), u32::try_from(head_dim))
         && tokens == page as usize
         && heads > 0
         && head_dim > 0
-        && planes.value.dims() == planes.key.dims()
+        && planes.value.entries.dims() == planes.key.entries.dims()
     {
         return Ok((heads, head_dim));
     }
@@ -499,8 +526,8 @@ fn plane_heads(owner: &'static str, planes: &KvPlanes, page: u32) -> Result<(u32
         format!(
             "the cache planes are {:?} keys and {:?} values, [pages, {page}, kv_heads, head_dim] \
              expected of both",
-            planes.key.dims(),
-            planes.value.dims()
+            planes.key.entries.dims(),
+            planes.value.entries.dims()
         ),
     ))
 }
@@ -597,7 +624,16 @@ pub fn paged_attention(
         }
     };
 
-    let planes = cache.layer(layer)?;
+    // A sliding-window group's rows read their windows from a start of their own, which this
+    // operator's kernels do not bound a row's keys by.
+    if cache.starts.is_some() {
+        return Err(Error::Unsupported(
+            "paged_attention: a sliding-window group bounds each row's keys by its start, which \
+             this operator does not read"
+                .to_owned(),
+        ));
+    }
+    let planes = &key_value(cache, layer)?;
     let (heads, head_dim) = heads_of(OWNER, "the query", query)?;
     let (kv_heads, kv_dim) = plane_heads(OWNER, planes, page)?;
     let tokens = query.dims()[0];
@@ -627,8 +663,8 @@ pub fn paged_attention(
 
     // The plane's element type decides whether the call has scales, so a mismatch in either
     // direction is refused instead of read unscaled. The scales are this layer's own.
-    let key_scale = page_scale(&planes.key, planes.key_scale.as_ref())?;
-    let value_scale = page_scale(&planes.value, planes.value_scale.as_ref())?;
+    let key_scale = page_scale(&planes.key.entries, planes.key.scale.as_ref())?;
+    let value_scale = page_scale(&planes.value.entries, planes.value.scale.as_ref())?;
 
     compute(PagedAttentionCall {
         query,
@@ -651,7 +687,7 @@ struct PagedAttentionCall<'t> {
     query: &'t Tensor,
     batch: &'t TokenBatch,
     cache: &'t KvCache,
-    planes: &'t KvPlanes,
+    planes: &'t KeyValue<'t>,
     phase: Phase,
     softmax_scale: f32,
     window: Option<u32>,
@@ -709,7 +745,7 @@ impl Fused for PagedAttentionCall<'_> {
             &Descriptor {
                 phase,
                 query: query.dtype(),
-                key_value: planes.key.dtype(),
+                key_value: planes.key.entries.dtype(),
                 output: out.dtype(),
                 head_dim,
                 page_size: page,
@@ -721,8 +757,8 @@ impl Fused for PagedAttentionCall<'_> {
             },
             Args {
                 query: ops::operand(query)?,
-                key: ops::operand(&planes.key)?,
-                value: ops::operand(&planes.value)?,
+                key: ops::operand(&planes.key.entries)?,
+                value: ops::operand(&planes.value.entries)?,
                 key_scale: key_scale.map(ops::operand).transpose()?,
                 value_scale: value_scale.map(ops::operand).transpose()?,
                 page_table: ops::operand(&cache.block_tables)?,
@@ -744,7 +780,7 @@ fn paged_formula(
     query: &Tensor,
     batch: &TokenBatch,
     cache: &KvCache,
-    planes: &KvPlanes,
+    planes: &KeyValue<'_>,
     phase: Phase,
     softmax_scale: f32,
     window: Option<u32>,
@@ -809,8 +845,8 @@ fn paged_formula(
             .reshape((rows, capacity, kv_heads, head_dim))?
             .index_select(&row, 0)?)
     };
-    let key = gathered(&planes.key, planes.key_scale.as_ref())?;
-    let value = gathered(&planes.value, planes.value_scale.as_ref())?;
+    let key = gathered(&planes.key.entries, planes.key.scale.as_ref())?;
+    let value = gathered(&planes.value.entries, planes.value.scale.as_ref())?;
 
     // 4. A query sees the keys up to its own position, which its row has stored.
     let mut visible = causal_mask(&position, &place.to_dtype(DType::I64)?, window)?;
@@ -828,8 +864,9 @@ fn paged_formula(
 }
 
 /// Writes the batch's `key` and `value`, `[tokens, kv_heads, head_dim]` each, into layer
-/// `layer` of `cache`, in place: token `t` into slot `slot_mapping[t]` of both planes, raising
-/// the flag of every page that receives a row. A slot of [`NO_SLOT`] writes nothing.
+/// `layer`'s key and value planes of `cache`, in place: token `t` into slot
+/// `cache.slot_mapping[t]` of both planes, raising the flag of every page that receives a row. A
+/// slot of [`NO_SLOT`] writes nothing.
 ///
 /// The planes' element type decides the write. Dense planes, BF16, F16 or F32 in both, receive
 /// the rows rounded once into their type, to nearest even, both planes in one launch: planes of
@@ -864,7 +901,7 @@ pub fn kv_write_(
     const OWNER: &str = KvWriteCall::OWNER;
 
     let page = page_size(OWNER, batch, cache)?;
-    let planes = cache.layer(layer)?;
+    let planes = &key_value(cache, layer)?;
     let (heads, head_dim) = plane_heads(OWNER, planes, page)?;
     let row = [batch.tokens(), heads as usize, head_dim as usize];
 
@@ -894,7 +931,8 @@ pub fn kv_write_(
             ));
         }
     }
-    let slots = &batch.slot_mapping;
+    cache.check(batch)?;
+    let slots = &cache.slot_mapping;
     if slots.dims() != [row[0]] || slots.dtype() != DType::U32 {
         return Err(Error::shape(
             OWNER,
@@ -923,7 +961,7 @@ pub fn kv_write_(
     // planes' type, and E4M3 planes are the quantizing write. Planes of two types, or of a type
     // that is neither, have no kernel that fills them and no reader that could interpret them.
     let dense = |dtype| matches!(dtype, DType::BF16 | DType::F16 | DType::F32);
-    match (planes.key.dtype(), planes.value.dtype()) {
+    match (planes.key.entries.dtype(), planes.value.entries.dtype()) {
         (DType::F8E4M3, DType::F8E4M3) => return write_scaled(planes, slots, page, key, value),
         (keys, values) if keys == values && dense(keys) => {}
         (keys, values) => {
@@ -952,7 +990,7 @@ pub fn kv_write_(
 /// A checked call of [`kv_write_`] into dense planes of one type: `heads` are the planes' key
 /// heads and their width, and `projections` the keys and the values written.
 struct KvWriteCall<'t> {
-    planes: &'t KvPlanes,
+    planes: &'t KeyValue<'t>,
     slots: &'t Tensor,
     page: u32,
     heads: (u32, u32),
@@ -980,8 +1018,8 @@ impl Fused for KvWriteCall<'_> {
         } = self;
 
         for (plane, flags, rows) in [
-            (&planes.key, &planes.key_initialized, key),
-            (&planes.value, &planes.value_initialized, value),
+            (&planes.key.entries, &planes.key.initialized, key),
+            (&planes.value.entries, &planes.value.initialized, value),
         ] {
             // The kernel's store: each element rounded once, to nearest even, from its exact
             // value into the plane's type, which leaves a row of the plane's own type as it is.
@@ -1002,15 +1040,21 @@ impl Fused for KvWriteCall<'_> {
 
         ops::launch::<KvWrite>(
             // The projection's type and the plane's are both key fields.
-            &kv::Descriptor::new(key.dtype(), planes.key.dtype(), page, heads, head_dim),
+            &kv::Descriptor::new(
+                key.dtype(),
+                planes.key.entries.dtype(),
+                page,
+                heads,
+                head_dim,
+            ),
             kv::Args {
                 key: ops::operand(key)?,
                 value: ops::operand(value)?,
-                key_cache: ops::operand(&planes.key)?,
-                value_cache: ops::operand(&planes.value)?,
+                key_cache: ops::operand(&planes.key.entries)?,
+                value_cache: ops::operand(&planes.value.entries)?,
                 slots: ops::operand(slots)?,
-                key_initialized: ops::operand(&planes.key_initialized)?,
-                value_initialized: ops::operand(&planes.value_initialized)?,
+                key_initialized: ops::operand(&planes.key.initialized)?,
+                value_initialized: ops::operand(&planes.value.initialized)?,
             },
         )?;
         Ok(())
@@ -1020,7 +1064,7 @@ impl Fused for KvWriteCall<'_> {
 /// The quantizing write into E4M3 planes: one launch per plane, each with the page scales its
 /// reader multiplies back.
 fn write_scaled(
-    planes: &KvPlanes,
+    planes: &KeyValue<'_>,
     slots: &Tensor,
     page: u32,
     key: &Tensor,
@@ -1041,16 +1085,16 @@ fn write_scaled(
     for (name, plane, scale, flags, source) in [
         (
             "key",
-            &planes.key,
-            &planes.key_scale,
-            &planes.key_initialized,
+            &planes.key.entries,
+            &planes.key.scale,
+            &planes.key.initialized,
             key,
         ),
         (
             "value",
-            &planes.value,
-            &planes.value_scale,
-            &planes.value_initialized,
+            &planes.value.entries,
+            &planes.value.scale,
+            &planes.value.initialized,
             value,
         ),
     ] {

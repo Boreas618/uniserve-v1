@@ -3,16 +3,17 @@
 //!
 //! - The blocks of each class a call needs: every block before its end for full attention, the
 //!   blocks of its window for a sliding window, the checkpoint of each kept boundary for a
-//!   recurrent state; the first chunk and the low watermark after a prefix hit; the fewest blocks
-//!   that must coexist to compute a prompt in chunks.
+//!   recurrent state; the first chunk and the low watermark after a prefix hit, from the window it
+//!   recomputes for a model of sliding windows; the fewest blocks that must coexist to compute a
+//!   prompt in chunks.
 //! - What a table gives up behind: a sliding window the blocks no later call reads, a recurrent
 //!   state all but its latest checkpoint.
 //! - The hit: the deepest boundary every class accepts, read by pins of the device copies, loads
 //!   of the host copies, a clone of a partial last block, and prefetches from the remote store
 //!   when they deepen it enough; and its statistics per tier.
-//! - The write policy: committed full-attention blocks stored to the host, sliding windows only
-//!   before aligned boundaries, each block once, and the host copies stored on to the remote
-//!   store; a block whose store stored nothing offered again only once its answer could differ.
+//! - The write policy: committed full-attention blocks stored to the host, a sliding window's
+//!   never committed, each block once, and the host copies stored on to the remote store; a block
+//!   whose store stored nothing offered again only once its answer could differ.
 //! - What the scheduler knows of the cache (SD §4.5): the eviction order of each region, least
 //!   recently used first, whose head it installs; what `Pinned`, `Refused` and the keys a
 //!   completion evicted correct.
@@ -135,21 +136,26 @@ fn stored_on_the_host() -> (Harness, Vec<Key>) {
 }
 
 /// The blocks each class of a hybrid model asks for after a prefix hit: the full-attention class
-/// reads every block before the hit, the sliding window only the blocks of its window, its table
-/// starting there; each class then allocates the blocks of the first chunk and the low watermark
-/// from the hit on, and the request computes from the hit (SD §4.2, §4.4 "The blocks a call
-/// needs", "The low watermark", "The hit").
+/// reads every block before the hit, and the sliding window none, its pages never cached: the
+/// request recomputes the window before the hit (bounded replay), from which the window's table
+/// starts; each class then allocates the blocks of the first chunk and the low watermark, which
+/// runs from where the request computes on (SD §4.2, §4.4 "The blocks a call needs", "The low
+/// watermark", "The hit", "Bounded replay").
 #[test]
 fn after_a_prefix_each_class_reads_what_its_kind_needs_and_allocates_its_first_chunk() {
     let mut harness = Deployment::tokens().cache(&HYBRID).build();
     let first = harness.submit(token(1, 17, 3));
     harness.settle(100);
     let cached = commits(&harness, harness.owner(first, A).unwrap());
+    assert!(
+        !cached.contains_key(&1),
+        "a window's block is never committed"
+    );
     let reader = harness.submit(sharing(2, 1, 17, 2));
     harness.settle(100);
     let owner = harness.owner(reader, A).unwrap();
 
-    // The hit is the reuse limit, 16 tokens: four blocks of full attention, the window's last two.
+    // The hit is the reuse limit, 16 tokens: four blocks of full attention.
     let asked = asked_by(&harness, owner);
     let pins: Vec<(u8, u32, Vec<Key>)> = asked
         .iter()
@@ -161,12 +167,9 @@ fn after_a_prefix_each_class_reads_what_its_kind_needs_and_allocates_its_first_c
         })
         .collect();
     let full = keys_of(&cached, 0);
-    let window = keys_of(&cached, 1);
-    assert_eq!(
-        pins,
-        [(0, 0, full[..4].to_vec()), (1, 2, window[2..4].to_vec())]
-    );
-    // The first chunk is the prompt's last token: blocks to 5, and one more.
+    assert_eq!(pins, [(0, 0, full[..4].to_vec())]);
+    // The request computes on from 8, the window of 8 tokens before the hit: its first chunk is
+    // the rest of the prompt, to block 5 and one more, the window's from its block 2.
     let allocates: Vec<(u8, u32, u32)> = asked
         .iter()
         .filter_map(|request| match request {
@@ -177,8 +180,8 @@ fn after_a_prefix_each_class_reads_what_its_kind_needs_and_allocates_its_first_c
         })
         .take(2)
         .collect();
-    assert_eq!(allocates, [(0, 4, 2), (1, 4, 2)]);
-    assert_eq!(harness.first_written(reader, 0), Some(16));
+    assert_eq!(allocates, [(0, 4, 2), (1, 2, 4)]);
+    assert_eq!(harness.first_written(reader, 0), Some(8));
     assert_eq!(harness.tokens(reader).len(), 2);
 }
 
@@ -347,71 +350,43 @@ fn checkpoints_are_kept_only_at_kept_boundaries_and_the_table_keeps_the_latest()
     assert_eq!(state(&harness, true), [1, 3], "the older checkpoint goes");
 }
 
-/// A hybrid model's prompt cached but for its window's block 1, which another epoch evicted and
-/// which a reader of its first nine tokens found gone (its `Pinned` holds one window block of
-/// two); the reader is cancelled once it learned it. Returns the harness and the cached prompt's
-/// keys of the full-attention class and of the window, by position.
-fn window_with_a_hole() -> (Harness, Vec<Key>, Vec<Key>) {
-    let mut harness = Deployment::tokens().cache(&HYBRID).build();
+/// A prompt cached but for its block 1, which another epoch evicted and which a reader of its
+/// first nine tokens found gone (its `Pinned` holds one block of two); the reader is cancelled
+/// once it learned it. Returns the harness and the cached prompt's keys, by position.
+fn prompt_with_a_hole() -> (Harness, Vec<Key>) {
+    let mut harness = Deployment::tokens().build();
     let first = harness.submit(token(1, 17, 3));
     harness.settle(100);
     let cached = commits(&harness, harness.owner(first, A).unwrap());
-    let (full, window) = (keys_of(&cached, 0), keys_of(&cached, 1));
+    let full = keys_of(&cached, 0);
     let evicted = harness.elsewhere(&[Request::Evict {
-        keys: vec![window[1]],
+        keys: vec![full[1]],
     }]);
     assert_eq!(
         evicted,
         [Completion::Evicted {
-            keys: vec![window[1]]
+            keys: vec![full[1]]
         }]
     );
 
     let teacher = harness.submit(sharing(2, 1, 9, 2));
     harness.run_until(10, |harness| {
         harness.answers().into_iter().any(|answer| match answer {
-            (Request::Pin { class: 1, .. }, Completion::Pinned { blocks, .. }) => blocks.len() == 1,
+            (Request::Pin { class: 0, .. }, Completion::Pinned { blocks, .. }) => blocks.len() == 1,
             _ => false,
         })
     });
     harness.apply(Message::Cancel(teacher, FinishReason::Cancelled));
     harness.settle(50);
-    (harness, full, window)
+    (harness, full)
 }
 
-/// The hit is the deepest boundary every class accepts, and a boundary a class rejects does not
-/// end the search: with the window's block 1 gone, boundaries 8 and 12 are rejected by the
-/// window, yet 16, whose window is blocks 2 and 3, is accepted, and a reader of the whole prompt
-/// reads four blocks of full attention and the window's last two (SD §4.4 "The hit", §7.4).
-#[test]
-fn the_hit_is_the_deepest_boundary_every_class_accepts_past_rejected_ones() {
-    let (mut harness, full, window) = window_with_a_hole();
-    let reader = harness.submit(sharing(3, 1, 17, 2));
-    harness.settle(100);
-
-    let owner = harness.owner(reader, A).unwrap();
-    let pins: Vec<(u8, u32, Vec<Key>)> = asked_by(&harness, owner)
-        .into_iter()
-        .filter_map(|request| match request {
-            Request::Pin {
-                class, at, keys, ..
-            } => Some((class, at, keys)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        pins,
-        [(0, 0, full[..4].to_vec()), (1, 2, window[2..4].to_vec())]
-    );
-    assert_eq!(harness.first_written(reader, 0), Some(16));
-}
-
-/// `Pinned` corrects what `cache` expects: once an answer showed the window's block 1 gone, a
-/// reader of the first nine tokens expects the hit at 4, reads exactly the blocks that hold it,
-/// and is admitted in one round (SD §3.5 `Pinned`, §4.5 "What fills it").
+/// `Pinned` corrects what `cache` expects: once an answer showed block 1 gone, a reader of the
+/// first nine tokens expects the hit at 4, reads exactly the blocks that hold it, and is
+/// admitted in one round (SD §3.5 `Pinned`, §4.5 "What fills it").
 #[test]
 fn pinned_corrects_what_cache_expects() {
-    let (mut harness, full, window) = window_with_a_hole();
+    let (mut harness, full) = prompt_with_a_hole();
     let reader = harness.submit(sharing(4, 1, 9, 2));
     harness.settle(100);
 
@@ -425,7 +400,7 @@ fn pinned_corrects_what_cache_expects() {
             _ => None,
         })
         .collect();
-    assert_eq!(pins, [(0, 0, vec![full[0]]), (1, 0, vec![window[0]])]);
+    assert_eq!(pins, [(0, 0, vec![full[0]])]);
     assert_eq!(harness.first_written(reader, 0), Some(4));
     assert_eq!(harness.tokens(reader).len(), 2);
 }
@@ -714,14 +689,11 @@ pub(crate) fn host_stores(harness: &Harness) -> Vec<Key> {
 }
 
 /// With a host tier, every committed full-attention block is stored to the host, and a sliding
-/// window's block only when it lies in the window before an aligned boundary: here the last
-/// boundary a reissue of the prompt can reuse and the last of the prompt, both 20 tokens, so the
-/// window's blocks 3 and 4, and not block 5, which the request still holds in its window; no
-/// block is offered twice (SD §4.4 "The write policy", §7.4). The request is held, idle, with 26
-/// tokens computed while the stores are observed (stop strings hold its decodes back): the
-/// policy's `offload`, which adds the blocks no request holds, cannot add block 5 then.
+/// window's block never, since it is never committed: a hit recomputes the window; no block is
+/// offered twice (SD §4.4 "The write policy", "Bounded replay", §7.4). The request is held, idle,
+/// with 26 tokens computed while the stores are observed (stop strings hold its decodes back).
 #[test]
-fn full_attention_blocks_are_stored_and_windows_only_before_aligned_boundaries_each_once() {
+fn full_attention_blocks_are_stored_and_no_window_block_each_once() {
     let mut harness = Deployment::tokens().cache(&HYBRID).host(64).build();
     let mut request = token(1, 21, 20);
     request.stop_strings = vec!["end".to_owned()];
@@ -739,12 +711,9 @@ fn full_attention_blocks_are_stored_and_windows_only_before_aligned_boundaries_e
     let full = keys_of(&cached, 0);
     assert_eq!(full.len(), 6, "24 of the 26 tokens fill blocks");
     assert!(full.iter().all(|key| stored_keys.contains(key)));
-    let window = keys_of(&cached, 1);
-    assert_eq!(window.len(), 6);
-    assert!(stored_keys.contains(&window[3]) && stored_keys.contains(&window[4]));
     assert!(
-        !stored_keys.contains(&window[5]),
-        "past the aligned boundaries"
+        !cached.contains_key(&1),
+        "a window's block is never committed"
     );
 
     harness.run_until(100, |harness| {

@@ -12,8 +12,9 @@
 //!   unit 0, the padding unit;
 //! - the last row, row `slots`, names only the padding unit: a bucket's padding rows gather it.
 //!
-//! The pooled tables are on the host always and mirrored on the device of a cache that holds
-//! one. The state group's and the draft group's blocks are addressed through the device block
+//! A sliding window's group has a pooled table as the full history's does, its entries units of
+//! the window's own pool. The pooled tables are on the host always and mirrored on the device of a
+//! cache that holds one. The state group's and the draft group's blocks are addressed through the device block
 //! table itself, by the copies that name a checkpoint's position and by the tables a
 //! speculative step builds, so neither has a pooled table.
 
@@ -36,8 +37,9 @@ pub(crate) struct PageTables {
     slots: u32,
     /// Pages per row: the pages a request of the model's length holds.
     width: u32,
-    /// Units of the pool, the padding unit included: the bound of every unit a table names.
-    units: u32,
+    /// Units of each pool, the padding unit included: the bound of every unit a table of a
+    /// group of the pool names.
+    units: Vec<u32>,
     /// Each attention group's pooled table on the host, `[slots + 1, width]` row-major, by the
     /// group's index among the attention groups.
     rows: Vec<Vec<u32>>,
@@ -53,15 +55,15 @@ impl PageTables {
         layout.attention_groups() as u64 * (u64::from(slots) + 1) * u64::from(width) * 4
     }
 
-    /// Tables for `slots` request slots and rows of `width` pages over a pool of `units` units,
-    /// with no device: the pooled tables are on the host alone.
+    /// Tables for `slots` request slots and rows of `width` pages over pools of `units` units
+    /// each, in the layout's pool order, with no device: the pooled tables are on the host alone.
     pub(crate) fn meta(
         layout: Arc<CacheLayout>,
         slots: u32,
         width: u32,
-        units: u32,
+        units: Vec<u32>,
     ) -> Result<Self> {
-        if slots == 0 || width == 0 || units == 0 {
+        if slots == 0 || width == 0 || units.len() != layout.pools.len() || units.contains(&0) {
             return Err(Error::Invalid(
                 "page tables need request slots, pages per row and units".into(),
             ));
@@ -86,7 +88,7 @@ impl PageTables {
         layout: Arc<CacheLayout>,
         slots: u32,
         width: u32,
-        units: u32,
+        units: Vec<u32>,
         device: DeviceId,
         stream: &Stream,
     ) -> Result<Self> {
@@ -198,14 +200,14 @@ impl PageTables {
             if change.position >= self.width {
                 return Err(refusal(format!("a row holds {} pages", self.width)));
             }
+            let units = self.units[self.layout.groups[group].pool];
             let unit = match change.run {
                 None => 0,
-                Some((_, unit, 1)) if unit != 0 && unit < self.units => unit,
+                Some((_, unit, 1)) if unit != 0 && unit < units => unit,
                 Some((_, first, count)) => {
                     return Err(refusal(format!(
                         "its run of {count} units from unit {first} is not one unit of the \
-                         pool's units 1..{}",
-                        self.units
+                         pool's units 1..{units}"
                     )));
                 }
             };
@@ -268,11 +270,16 @@ mod tests {
                 rows: nn::family::StateRows::Whole,
             }],
         };
-        let layout = CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::BFloat16, &[state])
-            .expect("a hybrid layout");
+        let layout = CacheLayout::of(
+            4,
+            &nn::family::CacheField::keys_and_values(2, 1, 4),
+            PrefixCacheDtype::BFloat16,
+        )
+        .and_then(|layout| layout.with_state(&[state]))
+        .expect("a hybrid layout");
         assert!(layout.groups[1].state() && layout.groups[1].units_per_page == 1);
 
-        PageTables::meta(Arc::new(layout), 2, 4, 16).expect("page tables")
+        PageTables::meta(Arc::new(layout), 2, 4, vec![16]).expect("page tables")
     }
 
     /// The change of `position` of `class` of `slot` to the block of `units` units from unit

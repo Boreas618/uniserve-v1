@@ -113,14 +113,10 @@ impl StateUnits {
 
         let (storage, split) = match parts {
             Some(parts) => {
-                let names = [STATES.to_owned()];
-                let (storages, segments, _) = planes::take_split(
-                    &names,
-                    (parts, 1, states.unit_bytes),
-                    (device, &peers),
-                    owner,
-                    &mut runs,
-                )?;
+                // One storage of one column, a checkpoint a unit.
+                let storages = [(STATES.to_owned(), vec![states.unit_bytes])];
+                let (storages, segments, _) =
+                    planes::take_split(&storages, parts, (device, &peers), owner, &mut runs)?;
                 let storage = storages.into_iter().next().ok_or_else(|| {
                     Error::Invariant("the state region's storage is missing".into())
                 })?;
@@ -336,8 +332,13 @@ mod tests {
                 rows: nn::family::StateRows::Whole,
             }],
         };
-        CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::BFloat16, &[state])
-            .expect("a hybrid layout")
+        CacheLayout::of(
+            4,
+            &nn::family::CacheField::keys_and_values(2, 1, 4),
+            PrefixCacheDtype::BFloat16,
+        )
+        .and_then(|layout| layout.with_state(&[state]))
+        .expect("a hybrid layout")
     }
 
     /// A unit is one checkpoint's planes, and the units lie one after another: unit `u`'s planes
@@ -348,13 +349,13 @@ mod tests {
         assert_eq!(layout.checkpoint_planes(), 4);
 
         let states = StateUnits::meta(&layout, 3)?;
-        assert_eq!(states.unit_bytes(), 4 * layout.plane_bytes);
+        assert_eq!(states.unit_bytes(), 4 * layout.plane_bytes());
         assert_eq!(states.rows(0)?, 0..4);
         assert_eq!(states.rows(2)?, 8..12);
         assert!(states.rows(3).is_err());
         assert_eq!(
             states.tensor()?.dims(),
-            &[12, layout.plane_bytes as usize][..]
+            &[12, layout.plane_bytes() as usize][..]
         );
 
         // Units that hold no device have no address and nothing mapped.
@@ -366,7 +367,12 @@ mod tests {
     /// A layout without a state group, or a region of no unit, holds no checkpoint.
     #[test]
     fn a_state_region_needs_a_state_group_and_a_unit() {
-        let dense = CacheLayout::dense(4, 2, 1, 4, PrefixCacheDtype::BFloat16);
+        let dense = CacheLayout::of(
+            4,
+            &nn::family::CacheField::keys_and_values(2, 1, 4),
+            PrefixCacheDtype::BFloat16,
+        )
+        .expect("a dense layout");
         assert!(StateUnits::meta(&dense, 3).is_err());
         assert!(StateUnits::meta(&layout(), 0).is_err());
     }

@@ -833,7 +833,7 @@ impl ModelRunner {
     /// # Errors
     ///
     /// A checkpoint that cannot be read, or a media checkpoint.
-    pub(crate) fn drafter_cache(&self) -> Result<Option<nn::family::CacheShape>> {
+    pub(crate) fn drafter_cache(&self) -> Result<Option<Vec<nn::family::CacheField>>> {
         let Model::Text(family) = self.family.model else {
             bail!(
                 "{} is a media model, which keeps no draft cache",

@@ -2,7 +2,7 @@
 //! of them, and the attention over the tokens a selection names.
 //!
 //! A sparse attention layer keeps one compressed index key per `ratio` consecutive tokens beside
-//! its pages of keys and values ([`KvPlanes::index_keys`](crate::KvPlanes::index_keys)). A query
+//! its pages of keys and values, the plane of its [`INDEX_KEY`] field ([`KvCache::plane`]). A query
 //! row scores the keys of the groups it may see ([`index_scores`]), keeps the best
 //! ([`super::top_k`]), and attends the tokens of those groups and of its own unfinished group
 //! ([`indexed_attention`]):
@@ -26,10 +26,21 @@ use tensor::{DType, Device, Tensor};
 use super::{ACCUMULATE, Fused, compute};
 use crate::capability::KvCache;
 use crate::error::{Error, Result};
+use crate::family::{INDEX_KEY, KEY, VALUE};
 
 /// The values of `column`, a U32 index column of a CPU batch.
 fn column(column: &Tensor) -> Result<Vec<u32>> {
     Ok(column.flatten_all()?.to_vec1::<u32>()?)
+}
+
+/// The cache layer `layer` names, as a plane states its owner.
+fn cache_layer(layer: usize) -> Result<u32> {
+    u32::try_from(layer).map_err(|_| {
+        Error::shape(
+            "KvCache",
+            format!("layer {layer} is beyond the cache's layers"),
+        )
+    })
 }
 
 /// Checks `rows`, the `[tokens]` U32 table row of each token.
@@ -51,10 +62,11 @@ fn check_rows(owner: &'static str, rows: &Tensor, tokens: usize) -> Result<()> {
 /// FP32, entry `g` of a row the score of its request's group `g` and `−inf` from the row's
 /// visible count on.
 ///
-/// `query` is `[tokens, heads, width]`, the rows' index queries. Layer `layer` of `cache` holds
-/// the index keys, `[pages, groups, width]`, and `rows`, `[tokens]` U32, names each token's row
-/// of the cache's page table. `visible`, `[tokens]` U32, is the number of leading groups of its
-/// request a token scores: the groups complete before it.
+/// `query` is `[tokens, heads, width]`, the rows' index queries. Layer `layer`'s plane of the
+/// [`INDEX_KEY`] field of `cache` holds the index keys, `[pages, groups, 1, width]`, and
+/// `rows`, `[tokens]` U32, names each token's row of the cache's page table. `visible`,
+/// `[tokens]` U32, is the number of leading groups of its request a token scores: the groups
+/// complete before it.
 ///
 /// # Errors
 ///
@@ -69,18 +81,16 @@ pub fn index_scores(
 ) -> Result<Tensor> {
     const OWNER: &str = IndexScoresCall::OWNER;
 
-    let keys =
-        cache.layer(layer)?.index_keys.as_ref().ok_or_else(|| {
-            Error::shape(OWNER, format!("cache layer {layer} holds no index keys"))
-        })?;
-    let (&[tokens, heads, width], &[_, groups, key_width], &[_, max_pages]) =
+    let plane = cache.plane(INDEX_KEY, cache_layer(layer)?)?;
+    let keys = &plane.entries;
+    let (&[tokens, heads, width], &[pages, groups, 1, key_width], &[_, max_pages]) =
         (query.dims(), keys.dims(), cache.block_tables.dims())
     else {
         return Err(Error::shape(
             OWNER,
             format!(
                 "queries of {:?}, index keys of {:?} and a page table of {:?}: [tokens, heads, \
-                 width], [pages, groups, width] and [rows, max_pages] expected",
+                 width], [pages, groups, 1, width] and [rows, max_pages] expected",
                 query.dims(),
                 keys.dims(),
                 cache.block_tables.dims()
@@ -104,6 +114,8 @@ pub fn index_scores(
         ));
     }
     let columns = max_pages * groups;
+    // One key a group: the kernel reads the plane as `[pages, groups, width]`.
+    let keys = &keys.reshape((pages, groups, key_width))?;
 
     compute(IndexScoresCall {
         query,
@@ -255,8 +267,11 @@ pub fn indexed_attention(
 ) -> Result<Tensor> {
     const OWNER: &str = IndexedAttentionCall::OWNER;
 
-    let planes = cache.layer(layer)?;
-    let (key, value) = (&planes.key, &planes.value);
+    let layer = cache_layer(layer)?;
+    let (key, value) = (
+        &cache.plane(KEY, layer)?.entries,
+        &cache.plane(VALUE, layer)?.entries,
+    );
     let (&[tokens, heads, head_dim], &[pages, page, kv_heads, key_dim]) =
         (query.dims(), key.dims())
     else {

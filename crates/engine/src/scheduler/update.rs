@@ -1018,14 +1018,8 @@ impl Scheduler {
             )));
         }
 
-        let holder = owner
-            .and_then(|owner| self.owners.get(&owner))
-            .and_then(|id| self.requests.get(id));
         let answer = (&request, &completion);
-        if let Some(store) = self
-            .kv
-            .write_policy(answer, holder, &self.groups, &self.budget)
-        {
+        if let Some(store) = self.kv.write_policy(answer, &self.groups, &self.budget) {
             self.submit(store);
         }
         match (&request, &completion) {
@@ -1097,10 +1091,23 @@ impl Scheduler {
             .requests
             .get(&id)
             .map_or(0, |request| kv::draft_tokens(request, &self.groups));
+        let request_shapes = self
+            .requests
+            .get(&id)
+            .map(|request| kv::shapes(request, &self.groups).to_vec())
+            .unwrap_or_default();
         let Some(request) = self.requests.get_mut(&id) else {
             return;
         };
-        request.num_computed_tokens = request.num_cached_tokens;
+        // A model of sliding windows computes on from the window it recomputes before its hit,
+        // whose full-history entries it reads (SD §4.4 "Bounded replay").
+        let resume = kv::resume(&request_shapes, request.num_cached_tokens);
+        request.num_computed_tokens = resume;
+        request.replay = if resume < request.num_cached_tokens {
+            resume..request.num_cached_tokens
+        } else {
+            0..0
+        };
         request.num_draft_tokens = drafted;
         request.status = RequestStatus::Running;
         request.queued = false;
@@ -1117,8 +1124,9 @@ impl Scheduler {
             "an admission ended: the request runs"
         );
         let queued_at = unix_secs(request.arrival);
-        // The hit is final here: every answer of the admission arrived.
-        let cached_tokens = request.num_cached_tokens as usize;
+        // The hit is final here: every answer of the admission arrived. The tokens a replay
+        // recomputes are computed again, so the request reports the tokens before its replay.
+        let cached_tokens = request.num_computed_tokens.min(request.num_cached_tokens) as usize;
         self.waiting.retain(|waiting| *waiting != id);
         self.running.push(id);
 
@@ -1631,7 +1639,7 @@ mod tests {
         columns.rows.calls.push(Row {
             slot: 3,
             kind: phase,
-            cache_group: 0,
+            replay: 0..0,
             rows: 0..1,
         });
         columns.rows.query_offsets = vec![0, tokens as i32];

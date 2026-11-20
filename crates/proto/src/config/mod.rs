@@ -211,11 +211,6 @@ pub struct KvCacheConfig {
     /// prefetch long hits back. Applies with `host_tier`; none when unset.
     #[reload(epoch)]
     pub mooncake: Option<storage::connector::Settings>,
-    /// The pages of the largest block size between the aligned boundaries
-    /// a long prompt offloads its sliding windows before
-    /// ([`DEFAULT_BOUNDARY_INTERVAL`] unless stated).
-    #[reload(epoch)]
-    pub boundary_interval: NonZeroU32,
     /// The decoded tokens between two checkpoints of the state a model
     /// keeps per request slot, a recurrent state ([`DEFAULT_STATE_INTERVAL`]
     /// unless stated).
@@ -249,6 +244,14 @@ pub struct KvCacheConfig {
     #[serde(with = "values::duration")]
     #[reload(epoch)]
     pub lease: Duration,
+    /// Retired: the pages between the aligned boundaries a long prompt offloaded its sliding
+    /// windows before. A model now states its windows as cache fields, whose pages are never
+    /// offloaded. Version 14 of the engine interface writes it in every launch and handoff
+    /// (and a package of that release may state it), so it is read and dropped while the
+    /// interface's oldest version is 14, and never written.
+    #[serde(skip_serializing)]
+    #[reload(epoch)]
+    pub boundary_interval: values::Retired,
 }
 
 /// How a switch of a capability the epoch lays out storage for takes effect: switched off at the
@@ -278,12 +281,12 @@ impl Default for KvCacheConfig {
             host_ratio: DEFAULT_HOST_RATIO,
             host_gib: None,
             mooncake: None,
-            boundary_interval: DEFAULT_BOUNDARY_INTERVAL,
             state_interval: DEFAULT_STATE_INTERVAL,
             state_ratio: DEFAULT_STATE_RATIO,
             prefetch_timeout_base: DEFAULT_PREFETCH_TIMEOUT_BASE,
             prefetch_timeout_per_ki_token: DEFAULT_PREFETCH_TIMEOUT_PER_KI_TOKEN,
             lease: DEFAULT_LEASE,
+            boundary_interval: values::Retired,
         }
     }
 }
@@ -294,12 +297,6 @@ impl KvCacheConfig {
         self.block_size.map_or(DEFAULT_BLOCK_SIZE, NonZeroU32::get)
     }
 }
-
-/// The pages of the largest block size between two aligned boundaries a long prompt offloads its
-/// sliding windows before, when the deployment states none (`kv_cache_config.boundary_interval`):
-/// 64, a policy between the windows a long prompt stores to the host (one per interval) and the
-/// part of an offloaded prompt a continuation of it reuses (whole intervals).
-pub const DEFAULT_BOUNDARY_INTERVAL: NonZeroU32 = nonzero(64);
 
 /// The decoded tokens between two checkpoints of a request's recurrent state, when the deployment
 /// states none (`kv_cache_config.state_interval`): 256, as SGLang's `--mamba-track-interval`, a
