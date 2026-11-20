@@ -445,6 +445,18 @@ impl MetaWeights {
             .flat_map(|key| key.tensors.iter().cloned())
             .collect()
     }
+
+    /// The bytes the weights asked for so far take, each key once: what a device store would
+    /// retain for the same load, the extents and element types of every weight the placement
+    /// gives the rank.
+    pub fn bytes(&self) -> u64 {
+        self.held
+            .borrow()
+            .values()
+            .filter_map(|tensor| tensor.dtype().storage_bytes(tensor.elem_count()))
+            .map(|bytes| bytes as u64)
+            .sum()
+    }
 }
 
 impl RetainedWeights for MetaWeights {
