@@ -313,7 +313,8 @@ pub struct Config {
     /// The deployment's Build Server on each node (`build_config`): the settings the node's
     /// daemon starts it with, which prepares the epochs' modules (§5.1, §6.3) in the
     /// deployment's own directories. The daemon reads it alone: a change of it is a hot restart,
-    /// whose successor replaces a Build Server that serves with other settings.
+    /// whose successor replaces the Build Server, which serves with other settings, once the
+    /// handover committed; a restart it gives up leaves the server as it was.
     #[reload(daemon)]
     pub build_config: build_server::command::Settings,
     /// The base executable (`uniserve`) the daemon's hot restart starts its successor from, as

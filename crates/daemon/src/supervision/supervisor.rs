@@ -817,6 +817,9 @@ pub(crate) struct ProcessesHandoff {
     pub(crate) deployment: String,
     /// The deployment's GPU claims, whose registration descriptor is the handoff's last.
     pub(crate) gpus: super::gpus::Handoff,
+    /// The settings the node's processes start at the deployment's Build Server with: the
+    /// predecessor's, which the daemon that resumes the service replaces with its own
+    /// (`Daemon::resume`).
     pub(crate) build_server: Option<build_server::command::Settings>,
     pub(crate) processes: Vec<ProcessHandoff>,
     pub(crate) reservations: Vec<ReservationHandoff>,

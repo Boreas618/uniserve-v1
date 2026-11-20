@@ -1494,6 +1494,14 @@ pub(crate) enum ServiceHandoff {
 }
 
 impl ServiceHandoff {
+    /// Has the resumed service start the node's processes at the deployment's Build Server with
+    /// `settings` (`Supervisor::with_build_server`) instead of the settings the predecessor
+    /// served with.
+    pub(crate) fn serve_build_server(&mut self, settings: build_server::command::Settings) {
+        let (Self::Leader { local, .. } | Self::Member { local, .. }) = self;
+        local.processes.build_server = Some(settings);
+    }
+
     /// The process id of the process this node supervises as launch generation `generation` of
     /// `group`'s rank `rank`, when it supervises one: what a successor states of an engine it
     /// adopts.
