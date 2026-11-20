@@ -158,6 +158,11 @@ pub enum Message {
     /// From the executor: a job of a worker group outside a batch, a `map` or a `stamp`, failed.
     /// The group's device block tables lack what the scheduler counts on, so it fails at once.
     Failed(Error),
+    /// From the executor: what a worker of one of the scheduler's groups measured of an expert
+    /// union's step it joined without tokens of its own (`BatchOutput::forward_stats` of the
+    /// join), which no batch of the scheduler carries: counted into the next report as a
+    /// batch's are, a profiling session's progress among them.
+    Joined(proto::report::ForwardStats),
     /// How the full pages of a request that imports a lend arrive, which the KV program chose
     /// for its [`Output::Handoff`].
     Path(RequestId, scheduling::kv::Path),
@@ -874,6 +879,7 @@ impl Scheduler {
             // The executor's stamped requests join the step's requests, behind those held.
             Message::Submit(requests) => self.stamped(requests),
             Message::Failed(error) => self.fail(error),
+            Message::Joined(stats) => self.count_joined(&stats),
             Message::Path(id, path) => self.routed(id, path),
             Message::Pause(reply) => {
                 self.paused = true;

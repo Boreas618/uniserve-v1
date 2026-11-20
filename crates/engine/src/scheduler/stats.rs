@@ -165,6 +165,16 @@ impl Scheduler {
         }
     }
 
+    /// Counts `stats`, what a worker of the scheduler's groups measured of an expert step it
+    /// joined ([`super::Message::Joined`]): into the interval's worker counters, as a batch's
+    /// forward statistics are, without a batch, a call or a domain of its own.
+    pub(super) fn count_joined(&mut self, stats: &ForwardStats) {
+        self.stats
+            .worker_forward_stats
+            .get_or_insert_with(ForwardStats::default)
+            .merge(stats);
+    }
+
     /// Counts the verification of row `row` of `batch`, which `call` answered: its drafts are the
     /// call's input tokens after the first, the accepted ones the leading committed tokens equal
     /// to them, the rejected ones the rest, and the committed ones every token `call` committed.

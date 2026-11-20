@@ -185,7 +185,7 @@ use platform::cupti::blocking::{Calls, Watched};
 use service::lock;
 use storage::runtime::{Completion, GroupId, Request, RequestId};
 
-use crate::batch::{Batch, BatchId, BatchOutput, Phase, Variant};
+use crate::batch::{Batch, BatchId, BatchOutput, Phase, Stage, Variant};
 
 use self::completion::{Outcome, Submission, Waker, add_stamp};
 
@@ -480,6 +480,22 @@ fn empty(batch: &Batch) -> bool {
     batch.requests.is_empty() && batch.shape.variant != Variant::ExpertJoin
 }
 
+/// The joins a worker holds for the reader of its joins ([`Worker::joins`]): the reader, its
+/// group's waiter, takes them as they end, between the group's own jobs, so it holds a few.
+const JOINS_HELD: usize = 4096;
+
+/// The stage of an expert union's step whose asking member's batch is of `phase`, the phase a
+/// join batch carries (`experts::Member::enter`): a prefill (a draft-cache refill is a prefill
+/// chunk), a decode or a verification; `None` for a phase no step of a causal model runs.
+const fn joined_stage(phase: Phase) -> Option<Stage> {
+    match phase {
+        Phase::Prefill | Phase::Refill => Some(Stage::Prefill),
+        Phase::Decode => Some(Stage::Decode),
+        Phase::Verify => Some(Stage::Verify),
+        _ => None,
+    }
+}
+
 /// Whether `batch` runs a forward on the device: it has rows, and its work is not the host's. Only
 /// such a batch is a step of a profiling session and marks one.
 fn forwards(batch: &Batch) -> bool {
@@ -539,6 +555,9 @@ pub struct Worker {
     profiled: Arc<std::sync::atomic::AtomicBool>,
     /// The device's fault, which the worker thread settles; see [`Worker::on_fault`].
     fault: Arc<Fault>,
+    /// The submissions of the expert joins the worker was given, in the order it takes them,
+    /// and their reader: see [`Worker::joins`].
+    joined: (Sender<Submission>, Receiver<Submission>),
     thread: Option<JoinHandle<()>>,
 }
 
@@ -664,6 +683,7 @@ impl Worker {
             uncompared,
             profiled,
             fault,
+            joined: crossbeam_channel::bounded(JOINS_HELD),
             thread: Some(thread),
         })
     }
@@ -728,12 +748,13 @@ impl Worker {
 
     /// Submits `batch`, a member's part in an expert union's step it has no tokens for (variant
     /// `ExpertJoin`), which another member asks for: it addresses no device block table, so it
-    /// takes no number and starts no copy.
+    /// takes no number and starts no copy. Its submission goes to the reader of the worker's
+    /// joins ([`Worker::joins`]): no batch of the worker's group carries what the join measured.
     ///
     /// # Errors
     ///
     /// A batch of another variant, or as [`Queue::submit`].
-    pub(crate) fn join(&self, batch: Batch) -> Result<Submission> {
+    pub(crate) fn join(&self, batch: Batch) -> Result<()> {
         if batch.shape.variant != Variant::ExpertJoin {
             return Err(Error::Invalid(format!(
                 "batch {} of variant {} is no expert join: a batch that addresses the device \
@@ -742,10 +763,22 @@ impl Worker {
             )));
         }
 
-        self.queue.submit(Job::Execute {
+        let submission = self.queue.submit(Job::Execute {
             batch: Box::new(batch),
             sequence: None,
-        })
+        })?;
+        // A join no reader takes (its group's scheduler runs in another process) is dropped
+        // once the channel holds `JOINS_HELD`, so its submissions do not accumulate.
+        let _ = self.joined.0.try_send(submission);
+        Ok(())
+    }
+
+    /// The submissions of the expert joins the worker takes ([`Worker::join`]), in that order:
+    /// what reads the forward statistics of the steps the worker joined
+    /// (`BatchOutput::forward_stats`, the profiling session's progress among them) and sends them
+    /// to its group's scheduler, the executor's waiter of the group.
+    pub(crate) fn joins(&self) -> Receiver<Submission> {
+        self.joined.1.clone()
     }
 
     /// Submits the paired forwards of the shadow batch `batch`, the group's job number `sequence`
@@ -1574,13 +1607,20 @@ impl Thread {
         let queued = (queued, Instant::now());
 
         // A session's window is made of whole steps: its collectors are armed and disarmed
-        // between two steps, with nothing of the device in flight.
-        let stage = batch.shape.variant.stage().name();
-        if forwards(&batch)
+        // between two steps, with nothing of the device in flight. A join takes part in the
+        // union's step of the phase its asking member runs; a join of a step this member already
+        // took part in runs nothing, and is no step.
+        let stage = batch.shape.variant.stage();
+        let joins = (stage == Stage::ExpertJoin)
+            .then(|| joined_stage(batch.phase))
+            .flatten()
+            .map(Stage::name);
+        let forwards = forwards(&batch) && self.runners[index].computes(&batch);
+        if forwards
             && self
                 .session
                 .as_mut()
-                .is_some_and(|session| session.begin(step, stage))
+                .is_some_and(|session| session.begin(step, stage.name(), joins))
         {
             self.apply_session()?;
         }
@@ -1593,8 +1633,8 @@ impl Thread {
 
         // The step's range markers are launched by the graphs, around the forward itself, which
         // `start` may issue.
-        if forwards(&batch) {
-            self.runners[index].graphs().mark_step(step, stage);
+        if forwards {
+            self.runners[index].graphs().mark_step(step, stage.name());
         }
         // Every forward of the batch replays graphs of at most the generation its scheduler
         // stamped it with.
@@ -1664,6 +1704,7 @@ impl Thread {
             Err(error) => return Err(self.failed(error, Some(sequence), copies)),
         };
 
+        // A join that ran nothing began no step, so its end finds none open.
         if forwards(batch)
             && self
                 .session

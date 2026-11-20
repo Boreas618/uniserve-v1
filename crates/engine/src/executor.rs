@@ -19,7 +19,10 @@
 //!   applied them to its device block tables, each with the group's stamp;
 //! - a map sends nothing. A map or a stamp that fails leaves the group's device block tables
 //!   without what the scheduler counts on: its failure arrives as `Message::Failed`, in its place
-//!   among the group's messages, and the scheduler fails at once (SD §3.7).
+//!   among the group's messages, and the scheduler fails at once (SD §3.7);
+//! - what a worker of the group measured of an expert union's step it joined without tokens of
+//!   its own, which another member's worker asked for and no batch of the scheduler carries,
+//!   arrives as `Message::Joined` once the join ended (`worker::Worker::joins`).
 //!
 //! ## Threads and state
 //!
@@ -28,7 +31,9 @@
 //! takes the group's submissions in the order they were handed and blocks on each in turn until
 //! it completes. The workers complete a group's jobs in that order, so a waiter never waits
 //! behind a job that ended after a later one, and since it is the only thread that sends its
-//! group's messages, they arrive in the order the group's jobs were done. Nothing runs on a
+//! group's messages, they arrive in the order the group's jobs were done. The same waiter takes
+//! the joins of the group's workers on this node as they are given, in between: a join's
+//! statistics bind no order of the group's messages. Nothing runs on a
 //! worker's thread: a waker would run there, and may only signal.
 //!
 //! [`WorkerExecutor`] owns the waiters: dropping it closes their channels and joins them once the
@@ -175,12 +180,13 @@ impl WorkerExecutor {
         };
         for &group in groups {
             let (waits, waiting) = crossbeam_channel::unbounded();
+            let joins = built.route.joins(group);
             let inbox = inbox.clone();
             let shadow = Arc::clone(&built.shadow);
 
             let thread = std::thread::Builder::new()
                 .name(format!("group-{}", group.0))
-                .spawn(move || wait(group, &waiting, &inbox, &shadow))
+                .spawn(move || wait(group, (&waiting, &joins), &inbox, &shadow))
                 .map_err(|error| {
                     Error::Executor(format!(
                         "the waiter of worker group {} did not start: {error}",
@@ -290,10 +296,38 @@ impl Drop for WorkerExecutor {
 /// The waiter of worker group `group`: waits for each of the group's submissions in the order
 /// they were handed and sends the scheduler what each returns ([`Wait`]), until its channel is
 /// closed and empty. A map or a stamp that failed is sent as `Message::Failed`, and the
-/// scheduler stops on it.
-fn wait(group: GroupId, waits: &Receiver<Wait>, inbox: &Sender<Message>, shadow: &Mutex<Shadow>) {
+/// scheduler stops on it. In between it takes the joins of `joins`, the readers of the group's
+/// workers on this node ([`crate::worker::Worker::joins`]), and sends what each measured as
+/// `Message::Joined` once it ended.
+fn wait(
+    group: GroupId,
+    (waits, joins): (&Receiver<Wait>, &[Receiver<Submission>]),
+    inbox: &Sender<Message>,
+    shadow: &Mutex<Shadow>,
+) {
+    // Index 0 is the group's own jobs; the joins' readers follow, each dropped from the
+    // selection once its worker is gone.
+    let mut select = crossbeam_channel::Select::new();
+    select.recv(waits);
+    for join in joins {
+        select.recv(join);
+    }
+
     // A scheduler that stopped reads nothing more: what it is sent then is dropped.
-    for wait in waits {
+    loop {
+        let ready = select.select();
+        let index = ready.index();
+        if index > 0 {
+            match ready.recv(&joins[index - 1]) {
+                Ok(submission) => joined(group, submission, inbox),
+                Err(_) => select.remove(index),
+            }
+            continue;
+        }
+        let Ok(wait) = ready.recv(waits) else {
+            break;
+        };
+
         match wait {
             Wait::Batch(batch, submission) => {
                 // A failed batch's `Finish`es are those of the copies that had started with it.
@@ -340,6 +374,22 @@ fn wait(group: GroupId, waits: &Receiver<Wait>, inbox: &Sender<Message>, shadow:
                     let _ = inbox.send(Message::Failed(Error::Executor(failure)));
                 }
             },
+        }
+    }
+}
+
+/// Sends the scheduler what the join of `submission`, by a worker of `group`, measured once it
+/// ended. A failed join reaches the scheduler no other way than the failure of the steps it
+/// left (the member that asked for it waits on it in its exchange), so it is logged.
+fn joined(group: GroupId, submission: Submission, inbox: &Sender<Message>) {
+    match returned(Ok(submission)) {
+        Ok((output, _)) => {
+            if let Some(stats) = output.forward_stats.filter(|stats| !stats.is_empty()) {
+                let _ = inbox.send(Message::Joined(stats));
+            }
+        }
+        Err((failure, _)) => {
+            tracing::error!(group = group.0, %failure, "an expert join failed");
         }
     }
 }

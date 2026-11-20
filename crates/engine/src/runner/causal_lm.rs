@@ -2630,6 +2630,13 @@ impl Runner for CausalLmRunner {
         Ok(bucket)
     }
 
+    /// A join computes the expert layers only for a step this member has yet to take part in
+    /// ([`Member::open`]); every other batch computes.
+    fn computes(&self, batch: &Batch) -> bool {
+        batch.shape.variant != Variant::ExpertJoin
+            || self.union.as_ref().is_some_and(|member| member.open(batch))
+    }
+
     /// Launches the step of `batch` without waiting for it, when the batch overlaps
     /// ([`CausalLmRunner::overlaps`]): steps 1 to 7 of the module documentation and the copy of
     /// its outputs to the host are issued, and `resume` is called from the runner's lander thread

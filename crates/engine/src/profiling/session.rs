@@ -312,9 +312,15 @@ impl Session {
     /// step's first launch: the window takes it or not, and the collectors are to be armed or
     /// disarmed before its forward accordingly. Returns whether [`Self::apply`] has work, which
     /// must run with nothing of the rank in flight.
-    pub(crate) fn begin(&mut self, step: u64, stage: &str) -> bool {
+    ///
+    /// `joins` is the stage of the expert union's step a join (`expert_join`) takes part in, the
+    /// stage of the member that asked for it: the window takes a join of a selected stage as it
+    /// takes a step of its own of that stage, so a member that only joins steps records its part
+    /// of them and its window ends as the others' do.
+    pub(crate) fn begin(&mut self, step: u64, stage: &str, joins: Option<&str>) -> bool {
+        let selects = |name: &str| self.request.stages.iter().any(|s| s == name);
         let selected =
-            self.request.stages.is_empty() || self.request.stages.iter().any(|s| s == stage);
+            self.request.stages.is_empty() || selects(stage) || joins.is_some_and(selects);
         let mut taken = false;
         if self.ended.is_none() && selected {
             if self.skipped < self.request.start_step {
@@ -599,6 +605,77 @@ mod tests {
         assert!(slot.is_none());
         // An unselected rank creates no file.
         assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    }
+
+    /// A member of an expert union that only joins steps takes the joins of a selected stage
+    /// into its window, and its window ends after `steps` of them as a window of its own steps
+    /// does; a join of another stage is no step of the window.
+    #[test]
+    fn a_window_of_joins_ends_after_its_steps_of_the_selected_stage() {
+        let output = tempfile::tempdir().unwrap();
+        let mut slot = None;
+        let start = SessionStart {
+            session: 7,
+            epoch: 2,
+            request: SessionRequest {
+                stages: vec!["decode".to_owned()],
+                steps: Some(2),
+                ..request(&[0], output.path())
+            },
+        };
+        let response = Session::change(
+            &mut slot,
+            Change::Start {
+                start: Box::new(start),
+                rank: 0,
+            },
+            DeviceId(0),
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            ProfileAnswer::Started(RankStart { selected: true, .. })
+        ));
+        let session = slot.as_mut().unwrap();
+
+        // A join of a prefill step, and two of decode steps.
+        for (step, joins) in [(10, "prefill"), (11, "decode"), (12, "decode")] {
+            session.begin(step, "expert_join", Some(joins));
+            session.end(step);
+        }
+        let progress = session.progress();
+        assert_eq!(progress[&7].steps, 2);
+        assert_eq!(progress[&7].windows_ended, 1);
+
+        // Joins of no selected stage leave a window open.
+        let mut slot = None;
+        let start = SessionStart {
+            session: 8,
+            epoch: 2,
+            request: SessionRequest {
+                stages: vec!["decode".to_owned()],
+                steps: Some(1),
+                ..request(&[0], output.path())
+            },
+        };
+        Session::change(
+            &mut slot,
+            Change::Start {
+                start: Box::new(start),
+                rank: 0,
+            },
+            DeviceId(0),
+        )
+        .unwrap();
+        let session = slot.as_mut().unwrap();
+        session.begin(20, "expert_join", Some("prefill"));
+        session.end(20);
+        assert!(
+            session
+                .progress()
+                .get(&8)
+                .is_none_or(|p| p.windows_ended == 0)
+        );
     }
 
     #[test]
