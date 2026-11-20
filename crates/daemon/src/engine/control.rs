@@ -1596,6 +1596,147 @@ fn candidates(
     Ok(coverage.candidates)
 }
 
+/// The kernel packages of a fixed module set, by slot ([`crate::epoch::ModuleSet::kernels`]).
+type Kernels = std::collections::BTreeMap<crate::epoch::KernelKey, proto::module::PackageRevision>;
+
+/// Whether the kernels `target` fixes select, for every descriptor key, the package the kernels
+/// `serving` fixes select: an engine of either set would launch the same kernel under every key,
+/// so a generation from `serving` to `target` would replace nothing.
+///
+/// Both are fixed sets ([`with_store_modules`]): each operator's candidates (the slots of no
+/// key, one revision of each backend) and the keys the `[kernels]` table pins. An engine selects a
+/// key's package as the Build Server's `cover` does (`engine::modules::load::select`): a pinned
+/// key goes to its pin, and every other key to the first candidate whose manifest covers it, so
+/// the candidates and the pins are all a selection reads. Two sets of different candidates may
+/// select otherwise for a key neither pins, which no daemon knows the engines launch, so they do
+/// not select alike. With the same candidates, a key neither set pins is selected alike, and a
+/// key either pins is compared by what each set selects for it: its pin, or the package `cover`
+/// at `server`, this daemon's own host's Build Server, covers it with among the set's candidates
+/// and pins. A table that comes to pin the packages the serving kernels select for their keys, or
+/// ceases to, therefore selects alike.
+///
+/// The selection reads no device's target, as the sets' own fixing does: every host selects among
+/// the same candidates, and the engines refuse a pin to a backend that builds for none of their
+/// devices when they select it.
+///
+/// # Errors
+///
+/// Fails when the Build Server cannot be reached, or refuses a set's pins or revisions.
+pub fn kernels_alike(
+    server: &BuildServer,
+    serving: &Kernels,
+    target: &Kernels,
+) -> anyhow::Result<bool> {
+    if serving == target {
+        return Ok(true);
+    }
+    if candidate_slots(serving).ne(candidate_slots(target)) {
+        return Ok(false);
+    }
+
+    // Every key either set pins, by operator.
+    let mut pinned: BTreeMap<&str, std::collections::BTreeSet<&str>> = BTreeMap::new();
+    for slot in serving.keys().chain(target.keys()) {
+        if let Some(key) = &slot.key {
+            pinned
+                .entry(slot.op.as_str())
+                .or_default()
+                .insert(key.as_str());
+        }
+    }
+    // The Build Server is reached only for a key one set leaves to the candidates.
+    let mut client = None;
+    for (op, keys) in pinned {
+        let served = selected(server, &mut client, op, &keys, serving)?;
+        if served != selected(server, &mut client, op, &keys, target)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The candidates of `kernels`, every operator's slots of no key, in their order.
+fn candidate_slots(
+    kernels: &Kernels,
+) -> impl Iterator<Item = (&crate::epoch::KernelKey, &proto::module::PackageRevision)> {
+    kernels.iter().filter(|(slot, _)| slot.key.is_none())
+}
+
+/// The package, as its backend and revision, that `kernels` select for each of `op`'s `keys`:
+/// a pinned key's pin, and each other key the package the Build Server's `cover` covers it with
+/// among the set's candidates and pins, as an engine's selection asks it (no key is selected for
+/// a key no candidate covers). `client` is the connection to `server`, opened at the first key
+/// that needs it.
+fn selected(
+    server: &BuildServer,
+    client: &mut Option<build_server::Client>,
+    op: &str,
+    keys: &std::collections::BTreeSet<&str>,
+    kernels: &Kernels,
+) -> anyhow::Result<BTreeMap<String, (String, u32)>> {
+    let pins: BTreeMap<String, proto::module::Pin> = kernels
+        .iter()
+        .filter(|(slot, _)| slot.op == op)
+        .filter_map(|(slot, package)| {
+            let pin = proto::module::Pin {
+                backend: package.backend.clone(),
+                revision: Some(package.revision),
+            };
+            Some((slot.key.clone()?, pin))
+        })
+        .collect();
+    let mut selection = BTreeMap::new();
+    let mut unpinned = Vec::new();
+    for key in keys {
+        match pins.get(*key) {
+            Some(pin) => {
+                let package = (pin.backend.clone(), pin.revision.unwrap_or_default());
+                selection.insert((*key).to_owned(), package);
+            }
+            None => unpinned.push((*key).to_owned()),
+        }
+    }
+    if unpinned.is_empty() {
+        return Ok(selection);
+    }
+
+    // The candidates are exactly the set's revisions of the operator, as an engine names them.
+    let mut fixed: Vec<(String, u32)> = kernels
+        .iter()
+        .filter(|(slot, _)| slot.op == op)
+        .map(|(_, package)| (package.backend.clone(), package.revision))
+        .collect();
+    fixed.sort();
+    fixed.dedup();
+    let client = match client {
+        Some(client) => client,
+        None => client.insert(build_server::Client::connect(&server.socket).with_context(
+            || {
+                format!(
+                    "connecting to the Build Server of {} at {}",
+                    server.host,
+                    server.socket.display()
+                )
+            },
+        )?),
+    };
+    let coverage = client
+        .cover(&build_server::CoverRequest {
+            op: op.to_owned(),
+            targets: Vec::new(),
+            keys: unpinned,
+            pins,
+            fixed,
+        })
+        .with_context(|| format!("asking the Build Server which packages cover {op}'s keys"))?;
+    for (package, keys) in coverage.covered {
+        for key in keys {
+            selection.insert(key, (package.backend.clone(), package.revision));
+        }
+    }
+    Ok(selection)
+}
+
 /// Fixes the revision of the package `package` names for `op`: the one it states, checked, or
 /// its latest installed one; of the version `interface_version` of the operator's interface
 /// when it states one, so a stated revision of another version is refused.

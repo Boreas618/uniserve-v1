@@ -305,8 +305,9 @@ pub struct Config {
     /// by (`op`, `descriptor`), each pinned to `backend@revision` or `backend@latest`, which the
     /// apply fixes to the latest installed revision. A key the table does not list is selected
     /// by the Build Server among the installed packages that cover it, by manifest priority. A
-    /// change is a kernel generation: the serving engines capture the graphs of the buckets
-    /// whose kernels change in the background and switch bucket by bucket.
+    /// change that selects other kernels is a kernel generation: the serving engines capture the
+    /// graphs of the buckets whose kernels change in the background and switch bucket by bucket;
+    /// one whose pins select the packages the serving epoch selects asks no engine anything.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[reload(generation)]
     pub kernels: proto::module::Kernels,

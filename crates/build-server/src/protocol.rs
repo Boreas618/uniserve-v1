@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use prost::Message;
@@ -427,24 +427,78 @@ messages!(wire::Request, wire::ServerMessage);
 /// A connection to a Build Server, as its clients speak it: the daemon
 /// prepares package revisions with it, and the main process resolves them.
 ///
-/// A Build Server that stops while a request is in flight ends the request with
-/// the connection's error: the Build Server is not on the serving path, and the
-/// daemon starts the host's Build Server again when it next prepares an epoch.
+/// A client opened at a socket ([`Client::connect`]) follows the Build Server
+/// that listens there: a request that finds its connection closed, because the
+/// server it reached stopped or the deployment replaced it with a server of
+/// other settings, is sent on a new connection to the same socket
+/// ([`Client::send`]). A main process holds one client for its epoch's whole
+/// life, every generation's selection included, so its next request reaches
+/// whichever server serves the deployment then. A Build Server that stops while
+/// a request is in flight ends the request with the connection's error: the
+/// Build Server is not on the serving path, the daemon starts the host's Build
+/// Server again when it next prepares an epoch, and the client's next request
+/// connects to it.
 pub struct Client {
     connection: Connection,
+    /// Where the Build Server listens, at which a request whose connection closed is sent
+    /// again; `None` for a client of a connection it was handed ([`Client::new`]), which has
+    /// nowhere to connect again.
+    socket: Option<PathBuf>,
 }
 
 impl Client {
-    /// Opens a connection to the Build Server at `socket`.
+    /// Opens a connection to the Build Server at `socket`, the socket every later request
+    /// connects to again once the server closed the connection.
     pub fn connect(socket: &Path) -> Result<Client> {
         Ok(Client {
             connection: connect(socket)?,
+            socket: Some(socket.to_owned()),
         })
     }
 
-    /// Wraps an open connection.
+    /// Wraps an open connection, whose close ends the client: it knows no socket to connect to
+    /// again.
     pub fn new(connection: Connection) -> Client {
-        Client { connection }
+        Client {
+            connection,
+            socket: None,
+        }
+    }
+
+    /// Sends `request` and returns the connection its response arrives on.
+    ///
+    /// The connection fails the send when the Build Server closed it (a stopped server's peer
+    /// close, which the connection reports as `UnexpectedEof`, `EPIPE` included), and then no
+    /// whole request reached any server, so a client opened at a socket sends the request once
+    /// more on a new connection to it, where the deployment's Build Server listens now. The
+    /// protocol keeps no state per connection, no greeting and no session, every request
+    /// stating all it asks, so the new connection carries the request alone. A connection
+    /// that fails after the request left is no case for this: the server may have acted on the
+    /// request, so its response's read fails the call, and the next request connects again.
+    ///
+    /// # Errors
+    ///
+    /// The send's failure for a client of a handed connection or a failure other than the
+    /// peer's close, the connect's failure when nothing listens at the socket (the connection
+    /// that closed is kept, so the next request tries again), and the new connection's failure.
+    fn send(&mut self, request: &wire::Request) -> Result<&mut Connection> {
+        match self.connection.deliver(request) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                let Some(socket) = &self.socket else {
+                    return Err(error.into());
+                };
+                tracing::info!(
+                    socket = %socket.display(),
+                    %error,
+                    "the Build Server closed this client's connection: connecting to its socket again"
+                );
+                self.connection = connect(socket)?;
+                self.connection.deliver(request)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(&mut self.connection)
     }
 
     /// Installs a package and returns its revision.
@@ -461,7 +515,7 @@ impl Client {
                 ))
             })?
             .to_owned();
-        self.connection.deliver(&wire::Request {
+        self.send(&wire::Request {
             request: Some(wire::request::Request::Install(wire::Install { package })),
         })?;
         match self.response()? {
@@ -505,7 +559,7 @@ impl Client {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.connection.deliver(&wire::Request {
+        self.send(&wire::Request {
             request: Some(wire::request::Request::InstallProgram(
                 wire::InstallProgram {
                     directory: directory.to_owned(),
@@ -538,8 +592,7 @@ impl Client {
         request: &PrepareRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<(ModuleSlot, PackageRevision)>> {
-        let connection = &mut self.connection;
-        connection.deliver(&wire::Request {
+        let connection = self.send(&wire::Request {
             request: Some(wire::request::Request::Prepare(prepare_message(request)?)),
         })?;
         loop {
@@ -574,8 +627,7 @@ impl Client {
         descriptor: &str,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Module> {
-        let connection = &mut self.connection;
-        connection.deliver(&wire::Request {
+        let connection = self.send(&wire::Request {
             request: Some(wire::request::Request::Resolve(wire::Resolve {
                 op: op.to_owned(),
                 package: Some(revision.into()),
@@ -639,7 +691,7 @@ impl Client {
     /// Lists every installed package revision with its origin, the operators it launches and its
     /// modules.
     pub fn list(&mut self) -> Result<Vec<PackageEntry>> {
-        self.connection.deliver(&wire::Request {
+        self.send(&wire::Request {
             request: Some(wire::request::Request::List(wire::List {})),
         })?;
         match self.response()? {
@@ -712,7 +764,7 @@ impl Client {
     /// Returns which installed package covers each of an operator's
     /// descriptor keys for `request.targets`; nothing is built.
     pub fn cover(&mut self, request: &CoverRequest) -> Result<Coverage> {
-        self.connection.deliver(&wire::Request {
+        self.send(&wire::Request {
             request: Some(wire::request::Request::Cover(wire::Cover {
                 op: request.op.clone(),
                 targets: request.targets.iter().map(Target::to_string).collect(),

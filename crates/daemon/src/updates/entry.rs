@@ -15,7 +15,9 @@
 //!   started beside the serving ones;
 //! - kernel or program modules: an update in its generation form, inside the serving engines,
 //!   once the target's module set is fixed at the Build Servers, so a kernel or program revision
-//!   installed since the serving epoch's apply is a change too;
+//!   installed since the serving epoch's apply is a change too; kernels are compared by the
+//!   package they select for every key, so a `[kernels]` table that pins what the serving
+//!   epoch's kernels select is no change of modules;
 //! - step options: in place, at the engines' next step.
 //!
 //! `Leader::apply` decides in that order and starts the update, which commits by itself once
@@ -62,6 +64,20 @@ const DAEMON_STEPS: [&str; 8] = [
     "profiling_config.session",
     "profiling_config.span_window",
 ];
+
+/// The `[kernels]` table, whose change is the module set it fixes: an apply compares that set's
+/// selection with the serving epoch's ([`Leader::kernels_alike`]), so the table's change is no
+/// generation of its own.
+const KERNEL_PINS: &str = "kernels";
+
+/// Whether `changes` change an option a kernel generation takes other than the `[kernels]`
+/// table: the graphs' options, the probed modules and the like, each a generation whatever
+/// modules the change fixes.
+fn takes_generation(changes: &[proto::reload::Change]) -> bool {
+    changes
+        .iter()
+        .any(|change| change.effect == Effect::Generation && change.path != KERNEL_PINS)
+}
 
 /// Whether `target`'s graphs are captured otherwise than `serving`'s: it places the kernel probes
 /// elsewhere, or states other graph options (`EngineConfig::graph_options`). A kernel
@@ -338,19 +354,26 @@ impl Leader {
         let Some((serving, record)) = self.updates.epochs().serving() else {
             return self.apply_in_place(target, stated, revision).await;
         };
+        // A generation is decided by what the serving engines would execute: the fixed set's
+        // policy and the kernels it selects for every key, against the serving epoch's, the
+        // graphs' capture, and the other options a generation takes. A `[kernels]` table that
+        // pins the packages the serving kernels select changes none of these and asks the
+        // engines for nothing.
         let form = if named == Change::Epoch
             || record.engine != next.modules.engine
             || record.processing != next.modules.processing
         {
             Effect::Epoch
-        } else if named == Change::Generation
-            || record.kernels != next.modules.kernels
+        } else if takes_generation(&epochs.changes(Some(&current), &target))
             || record.policy != next.modules.policy
             || graphs_move(&record.config, &next.engine)
+            || !self
+                .kernels_alike(&record.kernels, &next.modules.kernels)
+                .await?
         {
             Effect::Generation
         } else {
-            return self.apply_in_place(target, stated, revision).await;
+            return self.record_pins(target, &current, stated, revision).await;
         };
         if !force && let Some(mark) = self.updates.unavailable(&next) {
             return Err(UpdateError::Refused(format!(
@@ -378,8 +401,8 @@ impl Leader {
     /// node's Build Server as an apply fixes them (`with_store_modules` of the target as the
     /// deployment runs it, `Epochs::kept`, nothing built), and each replica's engine measuring
     /// the graphs the packages that differ from the serving epoch's would capture again
-    /// (`MeasureRoom`). Empty when the kernels are the serving epoch's, or
-    /// no engine serves.
+    /// (`MeasureRoom`). Empty when the kernels select for every key what the serving epoch's
+    /// select ([`Self::kernels_alike`]), or no engine serves.
     ///
     /// # Errors
     ///
@@ -400,8 +423,11 @@ impl Leader {
             targets: Vec::new(),
         };
         let named = crate::epoch::modules_of(&self.updates.epochs().kept(target));
-        let fixed = tokio::task::spawn_blocking(move || {
-            crate::engine::control::with_store_modules(&local, &named)
+        let serving = record.kernels.clone();
+        let (fixed, alike) = tokio::task::spawn_blocking(move || {
+            let fixed = crate::engine::control::with_store_modules(&local, &named)?;
+            let alike = crate::engine::control::kernels_alike(&local, &serving, &fixed.kernels)?;
+            anyhow::Ok((fixed, alike))
         })
         .await
         .map_err(|error| UpdateError::Failed(anyhow::anyhow!("fixing the kernels: {error}")))?
@@ -423,7 +449,7 @@ impl Leader {
             }
             _ => (false, None),
         };
-        if fixed.kernels == record.kernels && !recapture && graphs.is_none() {
+        if alike && !recapture && graphs.is_none() {
             return Ok(Vec::new());
         }
         let mut rooms = Vec::new();
@@ -462,9 +488,11 @@ impl Leader {
             return Ok(false);
         };
         Ok(record.engine != modules.engine
-            || record.kernels != modules.kernels
             || record.policy != modules.policy
-            || record.processing != modules.processing)
+            || record.processing != modules.processing
+            || !self
+                .kernels_alike(&record.kernels, &modules.kernels)
+                .await?)
     }
 
     /// The per-replica path of a change that starts no update: the daemon's own options (a
@@ -530,6 +558,68 @@ impl Leader {
             targets: Vec::new(),
         };
         crate::leader::fix_modules(local, Some(control), hosts, named).await
+    }
+
+    /// Whether `kernels`, a fixed module set's, select for every descriptor key the package
+    /// `serving`, the serving epoch's, select ([`crate::engine::control::kernels_alike`]), as
+    /// the deployment's Build Server on this node answers for the keys either set pins.
+    ///
+    /// # Errors
+    ///
+    /// `UpdateError::NoEngine` for a daemon that starts no engine, and `UpdateError::Refused`
+    /// when the Build Server cannot answer for a set's candidates and pins.
+    async fn kernels_alike(
+        &self,
+        serving: &BTreeMap<crate::epoch::KernelKey, proto::module::PackageRevision>,
+        kernels: &BTreeMap<crate::epoch::KernelKey, proto::module::PackageRevision>,
+    ) -> Result<bool, UpdateError> {
+        if serving == kernels {
+            return Ok(true);
+        }
+        let replicas = self.replicas();
+        let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
+        let local = crate::engine::control::BuildServer {
+            host: control.host().to_owned(),
+            socket: control.build_server().to_owned(),
+            targets: Vec::new(),
+        };
+        let (serving, kernels) = (serving.clone(), kernels.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::engine::control::kernels_alike(&local, &serving, &kernels)
+        })
+        .await
+        .map_err(|error| UpdateError::Failed(anyhow::anyhow!("comparing the kernels: {error}")))?
+        .map_err(|error| {
+            UpdateError::Refused(format!(
+                "comparing the kernels with the serving epoch's: {error:#}"
+            ))
+        })
+    }
+
+    /// The per-replica path of a change whose module set selects what the serving epoch runs
+    /// and that takes no generation otherwise: the replicas take its other options in place
+    /// ([`Self::apply_in_place`]) and then serve `target` as it states its `[kernels]` table,
+    /// which an engine selects alike, so no engine is asked anything for the table. What a
+    /// relaunch, a standby and a successor start from stays the serving epoch's module set.
+    async fn record_pins(
+        &self,
+        target: Config,
+        current: &Config,
+        stated: Stated,
+        revision: u64,
+    ) -> Result<Applied, UpdateError> {
+        if target.kernels == current.kernels {
+            return self.apply_in_place(target, stated, revision).await;
+        }
+        let mut other = target.clone();
+        other.kernels.clone_from(&current.kernels);
+        let applied = Box::pin(self.apply_in_place(other, stated, revision)).await?;
+        if matches!(applied, Applied::Unchanged | Applied::InPlace) {
+            for replica in self.replicas() {
+                *service::lock(&replica.config) = target.clone();
+            }
+        }
+        Ok(applied)
     }
 
     /// Starts an update in its generation form: the serving engines prepare
@@ -1329,11 +1419,13 @@ mod tests {
 
     /// The deployment's Build Server on the leader's node, which an apply selects the target's
     /// module revisions at (`cover`) and has build them (`prepare`), played by the test: it holds
-    /// the package revisions a test installs, answers `cover` with each backend's latest
-    /// revision or the revision the request fixes, refusing one it does not hold, `list` with
-    /// what it holds, and `prepare` with the revisions it was asked for, as a store that holds
-    /// every module does. It keeps the engine revision of every `prepare`, which is what the
-    /// apply has every host build before anything starts from the target.
+    /// the package revisions a test installs, answers `cover` as the Build Server selects (each
+    /// backend at the revision the request fixes, else at the one its pins state, else at its
+    /// latest, refusing one it does not hold; a pinned key covered by its pin and every other key
+    /// by the first candidate, every package covering every key), `list` with what it holds, and
+    /// `prepare` with the revisions it was asked for, as a store that holds every module does. It
+    /// keeps the engine revision of every `prepare`, which is what the apply has every host build
+    /// before anything starts from the target.
     struct BuildServer {
         socket: std::path::PathBuf,
         installed: Arc<std::sync::Mutex<Vec<Installed>>>,
@@ -1434,8 +1526,11 @@ mod tests {
         }
     }
 
-    /// The candidates of `cover`'s operator among `installed`: each backend at the revision the
-    /// request fixes for it, or at its latest; a fixed revision that is not installed is refused.
+    /// The candidates of `cover`'s operator among `installed`, and the package of each key it
+    /// asks: each backend the request fixes at its fixed revision, and with nothing fixed each
+    /// installed backend at the revision a pin states of it, or at its latest; a stated revision
+    /// that is not installed is refused. A pinned key is covered by its pin, and every other key
+    /// by the first candidate.
     fn cover_of(
         installed: &[Installed],
         cover: &build_server::protocol::wire::Cover,
@@ -1457,13 +1552,23 @@ mod tests {
                 .map(|(_, _, revision)| *revision)
                 .collect();
             let fixed = cover.fixed.iter().find(|fixed| fixed.backend == backend);
-            let revision = match fixed {
-                Some(fixed) if revisions.contains(&fixed.revision) => fixed.revision,
-                Some(fixed) => {
+            if fixed.is_none() && !cover.fixed.is_empty() {
+                continue;
+            }
+            let stated = fixed.map(|fixed| fixed.revision).or_else(|| {
+                cover
+                    .pins
+                    .iter()
+                    .find(|pin| pin.backend == backend && pin.revision != 0)
+                    .map(|pin| pin.revision)
+            });
+            let revision = match stated {
+                Some(stated) if revisions.contains(&stated) => stated,
+                Some(stated) => {
                     return Message::Refused(wire::Refusal {
                         reason: format!(
-                            "no {} package {backend} revision {} is installed",
-                            cover.op, fixed.revision
+                            "no {} package {backend} revision {stated} is installed",
+                            cover.op
                         ),
                         upstream: String::new(),
                     });
@@ -1476,9 +1581,35 @@ mod tests {
                 revision,
             });
         }
+        let mut covered: Vec<wire::PackageKeys> = Vec::new();
+        for key in &cover.keys {
+            let pinned = cover.pins.iter().find(|pin| pin.key == *key);
+            let package = pinned
+                .and_then(|pin| candidates.iter().find(|held| held.backend == pin.backend))
+                .or_else(|| candidates.first());
+            let Some(package) = package else {
+                continue;
+            };
+            match covered
+                .iter_mut()
+                .find(|entry| entry.package.as_ref() == Some(package))
+            {
+                Some(entry) => entry.keys.push(key.clone()),
+                None => covered.push(wire::PackageKeys {
+                    package: Some(package.clone()),
+                    keys: vec![key.clone()],
+                }),
+            }
+        }
+        let uncovered = cover
+            .keys
+            .iter()
+            .filter(|key| !covered.iter().any(|entry| entry.keys.contains(key)))
+            .cloned()
+            .collect();
         Message::Coverage(wire::Coverage {
-            covered: Vec::new(),
-            uncovered: cover.keys.clone(),
+            covered,
+            uncovered,
             candidates,
         })
     }
@@ -1490,9 +1621,19 @@ mod tests {
     async fn serving_with_later_revisions_installed(
         directory: &std::path::Path,
     ) -> (Leader, BuildServer) {
+        let build_server = BuildServer::serve(directory);
+        let leader = serving_at(directory, &build_server).await;
+        build_server.install(proto::module::ENGINE, proto::config::DEFAULT_ENGINE, 2);
+        build_server.install(proto::module::PROGRAM, proto::config::DEFAULT_PROCESSING, 2);
+        (leader, build_server)
+    }
+
+    /// A leader that serves epoch 1 of the test engine's configuration, whose module set its
+    /// start fixed at `build_server`, which holds the engine package, the scheduling program and
+    /// the processing program at revision 1 each beside what the test installed there.
+    async fn serving_at(directory: &std::path::Path, build_server: &BuildServer) -> Leader {
         let leader = crate::test_support::served_engine(crate::test_support::CHAT);
         let config = service::lock(&leader.replicas()[0].config).clone();
-        let build_server = BuildServer::serve(directory);
         build_server.install(proto::module::ENGINE, proto::config::DEFAULT_ENGINE, 1);
         build_server.install(proto::module::PROGRAM, proto::config::DEFAULT_SCHEDULING, 1);
         build_server.install(proto::module::PROGRAM, proto::config::DEFAULT_PROCESSING, 1);
@@ -1534,10 +1675,7 @@ mod tests {
                 generation: Some(1),
             },
         );
-
-        build_server.install(proto::module::ENGINE, proto::config::DEFAULT_ENGINE, 2);
-        build_server.install(proto::module::PROGRAM, proto::config::DEFAULT_PROCESSING, 2);
-        (leader, build_server)
+        leader
     }
 
     /// `leader`'s current configuration, with `change` made to it.
@@ -1621,5 +1759,67 @@ mod tests {
             "another engine revision is an epoch: {applied:?}"
         );
         assert_eq!(build_server.prepared(), vec![2]);
+    }
+
+    /// The descriptor key of `rms_norm` the tests pin.
+    const PINNED_KEY: &str = "dtype_bf16_columns_2048_tile_2048_pdl_false";
+
+    /// A leader that serves epoch 1 as [`serving_with_later_revisions_installed`] does, whose
+    /// start also selected `rms_norm`'s one installed package, `triton` at revision 1, and whose
+    /// Build Server holds `triton` at revision 2 of it since.
+    async fn serving_with_a_later_kernel_installed(
+        directory: &std::path::Path,
+    ) -> (Leader, BuildServer) {
+        let build_server = BuildServer::serve(directory);
+        build_server.install("rms_norm", "triton", 1);
+        let leader = serving_at(directory, &build_server).await;
+        build_server.install("rms_norm", "triton", 2);
+        (leader, build_server)
+    }
+
+    /// `leader`'s current configuration, pinning `rms_norm`'s [`PINNED_KEY`] to `pin`.
+    fn pinning(leader: &Leader, pin: &str) -> Config {
+        changed(leader, |config| {
+            config.kernels.insert(
+                "rms_norm".to_owned(),
+                [(PINNED_KEY.to_owned(), pin.parse().unwrap())].into(),
+            );
+        })
+    }
+
+    /// A `[kernels]` table that comes to pin the package the serving kernels select for its key
+    /// asks no generation of the engines, though a later revision of the package was installed
+    /// since: the change converges with the table recorded and no update started, and the
+    /// package again selects nothing new.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pins_of_the_serving_kernels_are_no_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (leader, _build_server) = serving_with_a_later_kernel_installed(directory.path()).await;
+        let pinned = pinning(&leader, "triton@1");
+
+        let applied = apply(&leader, pinned.clone()).await.unwrap();
+        assert_eq!(applied, Applied::Unchanged);
+        assert!(leader.updates.in_flight().is_none(), "no update started");
+        assert_eq!(*service::lock(&leader.replicas()[0].config), pinned);
+        let reselects = leader.reselects(&pinned, BTreeMap::new()).await.unwrap();
+        assert!(!reselects, "the package again selects the serving kernels");
+    }
+
+    /// A pin of another revision than the serving kernels select moves the serving engines: the
+    /// apply takes it in no in-place form and leaves the table unrecorded until an update
+    /// converges it. (The test's engine serves no launch a daemon started, so no update of it
+    /// begins here.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pin_of_another_revision_moves_the_engines() {
+        let directory = tempfile::tempdir().unwrap();
+        let (leader, _build_server) = serving_with_a_later_kernel_installed(directory.path()).await;
+        let serving = changed(&leader, |_| {});
+
+        let applied = apply(&leader, pinning(&leader, "triton@2")).await;
+        assert!(
+            !matches!(applied, Ok(Applied::Unchanged | Applied::InPlace)),
+            "a pin of another revision is an update of the engines: {applied:?}"
+        );
+        assert_eq!(*service::lock(&leader.replicas()[0].config), serving);
     }
 }
