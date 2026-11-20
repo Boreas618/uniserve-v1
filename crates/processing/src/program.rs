@@ -157,26 +157,28 @@ pub fn declare(family: &Family) -> interface::Family {
 
 /// The files at a chat checkpoint's root its binding reads, beside the tokenizer definition:
 /// the configuration, the tokenizer metadata, the generation defaults when published, the
-/// template's file where the family keeps it there, and the image processor's files of a
-/// family that takes images.
+/// template's file (required of a checkpoint only when it is the one place the family keeps
+/// its template), and the image processor's files of a family that takes images.
 fn chat_files(profile: ChatProfile) -> Vec<CheckpointFile> {
-    let required = |name: &str| CheckpointFile {
+    let file = |name: &str, required: bool| CheckpointFile {
         name: name.to_owned(),
-        required: true,
+        required,
     };
     let mut files = vec![
-        required(RootFile::Config.name()),
-        required(metadata::TOKENIZER_CONFIG),
-        CheckpointFile {
-            name: metadata::GENERATION_CONFIG.to_owned(),
-            required: false,
-        },
+        file(RootFile::Config.name(), true),
+        file(metadata::TOKENIZER_CONFIG, true),
+        file(metadata::GENERATION_CONFIG, false),
     ];
-    if let ChatTemplate::File(name) = profile.checkpoint.chat_template {
-        files.push(required(name));
+    match profile.checkpoint.chat_template {
+        ChatTemplate::File(name) => files.push(file(name, true)),
+        // A checkpoint without the file keeps its template in the tokenizer configuration,
+        // which every chat checkpoint publishes.
+        ChatTemplate::FileOrTokenizerConfig(name) => files.push(file(name, false)),
+        // A family's encoder reads no file of the checkpoint.
+        ChatTemplate::Encoder(_) => {}
     }
     if let Some(images) = profile.images {
-        files.extend(images.processor_files().iter().map(|name| required(name)));
+        files.extend(images.processor_files().iter().map(|name| file(name, true)));
     }
     files
 }
@@ -370,14 +372,19 @@ fn bind_chat(
     };
     let renderer = match (&bind.chat.template, profile.checkpoint.chat_template) {
         (Some(source), _) => template(source.clone())?,
-        (None, ChatTemplate::TokenizerConfig) => {
-            template(tokenizer.chat_template.clone().ok_or_else(|| {
+        // The checkpoint's standalone file before the tokenizer configuration's field, as
+        // `transformers` loads a checkpoint's template.
+        (None, ChatTemplate::FileOrTokenizerConfig(name)) => match file(name) {
+            Some(source) => template(source.to_owned())?,
+            None => template(tokenizer.chat_template.clone().ok_or_else(|| {
                 format!(
-                    "{} states no chat_template, where the checkpoint's family keeps it",
-                    metadata::TOKENIZER_CONFIG
+                    "the checkpoint publishes no {name} and its {} states no chat_template, the \
+                     places the {} family's checkpoints keep their template",
+                    metadata::TOKENIZER_CONFIG,
+                    family.id
                 )
-            })?)?
-        }
+            })?)?,
+        },
         (None, ChatTemplate::File(name)) => template(required(name)?.to_owned())?,
         (None, ChatTemplate::Encoder(encoder)) => Renderer::Encoder {
             encoder,

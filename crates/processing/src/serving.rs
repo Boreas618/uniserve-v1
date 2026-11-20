@@ -51,13 +51,23 @@ pub struct ChatCheckpoint {
 
 /// Where a chat family's checkpoints keep their chat template, or the family's encoder for
 /// checkpoints that publish none.
+///
+/// `transformers` stored a tokenizer's template as the `chat_template` field of
+/// `tokenizer_config.json` until it saved templates as files of Jinja source of their own
+/// (`chat_template.jinja`), and it loads a checkpoint's template from that file when the
+/// checkpoint publishes it, else from the field. A family states the places its published
+/// checkpoints keep it in, which request processing reads by that precedence.
 #[derive(Clone, Copy)]
 pub enum ChatTemplate {
-    /// The `chat_template` field of `tokenizer_config.json`, where `transformers` stored a
-    /// template before it saved templates as files of their own.
-    TokenizerConfig,
-    /// A file of Jinja source at the checkpoint's root, such as `chat_template.jinja`.
+    /// A file of Jinja source at the checkpoint's root, such as `chat_template.jinja`, which
+    /// every checkpoint of the family publishes: the family's checkpoints were all saved since
+    /// `transformers` saves templates as files.
     File(&'static str),
+    /// The file of Jinja source at the checkpoint's root when the checkpoint publishes it, else
+    /// the `chat_template` field of `tokenizer_config.json`: the family's checkpoints were saved
+    /// both before and since, so one keeps its template in the field and another, such as a
+    /// later quantized export, in the file alone.
+    FileOrTokenizerConfig(&'static str),
     /// No template: the checkpoints state their prompt format as a reference encoder, which the
     /// family ports. A deployment's own template still replaces it.
     Encoder(&'static dyn ChatEncoder),
@@ -66,7 +76,9 @@ pub enum ChatTemplate {
 impl std::fmt::Debug for ChatTemplate {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TokenizerConfig => formatter.write_str("TokenizerConfig"),
+            Self::FileOrTokenizerConfig(name) => {
+                formatter.debug_tuple("FileOrTokenizerConfig").field(name).finish()
+            }
             Self::File(name) => formatter.debug_tuple("File").field(name).finish(),
             Self::Encoder(_) => formatter.write_str("Encoder"),
         }
@@ -77,7 +89,7 @@ impl PartialEq for ChatTemplate {
     /// The same place, or the same encoder.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::TokenizerConfig, Self::TokenizerConfig) => true,
+            (Self::FileOrTokenizerConfig(left), Self::FileOrTokenizerConfig(right)) => left == right,
             (Self::File(left), Self::File(right)) => left == right,
             (Self::Encoder(left), Self::Encoder(right)) => std::ptr::addr_eq(*left, *right),
             _ => false,

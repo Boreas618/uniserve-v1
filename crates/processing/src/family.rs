@@ -159,7 +159,7 @@ mod tests {
             images: None,
             checkpoint: crate::ChatCheckpoint {
                 context_length: &["max_position_embeddings"],
-                chat_template: crate::ChatTemplate::TokenizerConfig,
+                chat_template: crate::ChatTemplate::FileOrTokenizerConfig("chat_template.jinja"),
             },
         }),
     };
