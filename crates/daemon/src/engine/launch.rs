@@ -187,6 +187,30 @@ mod tests {
         serde_json::from_value::<EngineArgs>(extra).expect_err("an unknown key is refused");
     }
 
+    /// The launch a daemon of the engine interface's oldest version writes
+    /// ([`oldest`](crate::test_support::oldest)): this build's engine and node daemon read it, and
+    /// this build writes the same launch in no field that build's engine does not read, so
+    /// either build starts the other's engines.
+    #[test]
+    fn a_launch_of_the_oldest_version_reads_both_ways() {
+        use crate::test_support::oldest;
+
+        let launch: EngineArgs = serde_json::from_slice(oldest::LAUNCH)
+            .expect("this build reads the launch of the oldest version");
+        let mut written = String::new();
+        std::fs::File::from(memfd(&launch).expect("the launch"))
+            .read_to_string(&mut written)
+            .expect("the launch reads");
+        let unread = oldest::unread(
+            &serde_json::from_str(&written).unwrap(),
+            &serde_json::from_slice(oldest::LAUNCH).unwrap(),
+        );
+        assert!(
+            unread.is_empty(),
+            "a build of the oldest version does not read {unread:?}"
+        );
+    }
+
     /// A launch cannot change once written: the memfd refuses a write and a change of its size.
     #[test]
     fn a_launch_is_sealed() {

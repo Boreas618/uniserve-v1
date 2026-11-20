@@ -1,2 +1,4 @@
 # Unified patches use a single space to mark empty context lines.
 *.patch whitespace=-blank-at-eol
+# MessagePack fixtures are bytes, compared whole.
+*.msgpack binary
