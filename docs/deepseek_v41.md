@@ -41,6 +41,6 @@ Every quantized value is the reference's (`inference/kernel.py`): the projection
 
 ## Limits
 
-- The attention, the indexer and the routed experts run correct-first Triton and trtllm-gen kernels: on GB200 a cold prefill of a 575K-token prompt takes about 9 minutes, and AgentX's longest prompt (990K tokens) about 23 minutes beside three shorter ones. A prefix hit computes only the prompt past it and the window's pages before its end.
+- The attention runs FlashMLA's SM100 sparse kernel (`latent_attention/flashmla`, about 30 µs a layer for a decode step of up to 64 rows and 0.6 ms for a 4096-token prefill chunk on GB200), and the Triton package where the Build Server's targets lack tensor memory. The indexer and the routed experts run correct-first Triton and trtllm-gen kernels. With the Triton attention, a cold prefill on GB200 took about 9 minutes for a 575K-token prompt and about 23 minutes for AgentX's longest prompt (990K tokens) beside three shorter ones. A prefix hit computes only the prompt past it and the window's pages before its end.
 - A tensor-parallel split of the attention, pipeline and sequence splits, and speculative decoding are refused.
 - Prefill/decode handoffs and the host KV tier do not hold the window.
