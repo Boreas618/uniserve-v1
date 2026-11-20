@@ -1566,6 +1566,57 @@ pub(crate) mod tests {
         }
     }
 
+    /// A cache that grows a page a step: the step that caches one page costs `observe` what
+    /// that page does, whatever the size of the cache. The cache grows to 262,146 blocks, told a
+    /// step's worth at a time and, across each power of two from 4,096 blocks on, one block a
+    /// step; each of those steps' `observe` consumes at most half of the default call fuel
+    /// ([`DEFAULT_POLICY_CALL_FUEL`]). A record of the pages that copied every page it held
+    /// when it grew would cost the step that crossed 262,144 blocks about 12.6 M fuel, past a
+    /// call's.
+    #[test]
+    fn a_cache_that_grows_a_page_a_step_costs_each_step_its_page() {
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+
+        // Blocks a running request holds, so no offer to the host accumulates beside them.
+        let cached = |number: u64| Event::Cached {
+            page: block(spread(number), number, false),
+        };
+        let mut size = 0;
+        for power in 12..=18 {
+            let crossing = 1u64 << power;
+            while size < crossing - 2 {
+                let end = (size + 16_384).min(crossing - 2);
+                let events: Vec<Event> = (size..end).map(cached).collect();
+                policy.call(Call::Observe, wire::encode(&events)).unwrap();
+                size = end;
+            }
+            for _ in 0..4 {
+                let events = [cached(size)];
+                let (fuel, _) = metered(&mut policy, Call::Observe, wire::encode(&events).unwrap());
+                size += 1;
+                assert!(
+                    fuel <= LIMIT,
+                    "the step that cached block {size} took {fuel} fuel"
+                );
+            }
+        }
+        assert_eq!(size, (1 << 18) + 2);
+    }
+
     /// A steady step of a decode load of 256 running requests (a `max_running_requests` in the
     /// hundreds): each request's decode was scheduled and applied, so the scheduler marked it
     /// and told its advance and its emission, and nothing else of its view moved. The policy is

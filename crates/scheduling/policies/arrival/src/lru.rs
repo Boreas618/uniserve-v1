@@ -14,16 +14,19 @@
 //! carries the state the policy keeps of it: a page its view and whether it
 //! waits to be offered to the host, an encoder entry nothing.
 //!
-//! The orders are doubly linked lists over the slots of one vector, and one
-//! ordered index finds an object's slot. An event costs one index lookup and a
-//! few slot writes whatever the size of the cache, moving an object to another
-//! order included, and walking an order reads its own slots alone: a step's
-//! events and a shortage's walk cost what they touch, not a lookup per link.
+//! The orders are doubly linked lists over one array of slots, and one ordered
+//! index finds an object's slot. An event costs one index lookup and a few slot
+//! writes whatever the size of the cache, moving an object to another order
+//! included, and walking an order reads its own slots alone: a step's events
+//! and a shortage's walk cost what they touch, not a lookup per link. The array
+//! grows a chunk of slots at a time and never moves the slots it holds
+//! ([`Slots`]), so the event that adds an object costs the same at every size.
 //!
 //! `init` builds the orders from a snapshot: the mechanism states each object's
 //! last use, so a policy put in mid-flight knows the order that already exists.
 
 use std::collections::BTreeMap;
+use std::ops::{Index, IndexMut};
 
 /// Least-recently-used orders of objects a policy may be asked to give up,
 /// with the state `V` the policy keeps of each.
@@ -37,8 +40,8 @@ pub(crate) struct Lru<I: Copy + Ord, V = ()> {
     index: BTreeMap<I, usize>,
     /// The objects in no particular order, each linked to its neighbours in its
     /// order by slot. A removal moves the last slot into the freed one, so the
-    /// vector holds exactly the objects of the orders.
-    slots: Vec<Slot<I, V>>,
+    /// array holds exactly the objects of the orders.
+    slots: Slots<Slot<I, V>>,
     /// The least and the most recently used slot of each order.
     ends: Vec<Ends>,
 }
@@ -69,7 +72,7 @@ impl<I: Copy + Ord, V> Lru<I, V> {
     pub(crate) fn new(orders: usize) -> Self {
         Self {
             index: BTreeMap::new(),
-            slots: Vec::new(),
+            slots: Slots::default(),
             ends: vec![Ends::default(); orders],
         }
     }
@@ -148,7 +151,7 @@ impl<I: Copy + Ord, V> Lru<I, V> {
 
         // The last slot moves into the freed one: its neighbours, the ends of
         // its order and the index follow it.
-        let removed = self.slots.swap_remove(at);
+        let removed = self.slots.swap_remove(at)?;
         if at < self.slots.len() {
             let Slot {
                 object: moved,
@@ -220,6 +223,83 @@ impl<I: Copy + Ord, V> Lru<I, V> {
             Some(after) => self.slots[after].before = before,
             None => self.ends[order].tail = before,
         }
+    }
+}
+
+/// The slots per chunk of [`Slots`].
+const CHUNK: usize = 4096;
+
+/// An array of slots stored in chunks of [`CHUNK`]: every chunk but the last is
+/// full, and the last holds at least one slot.
+///
+/// A vector that doubles when it is full copies every slot it holds in the one
+/// call that crosses its capacity, a cost in proportion to the cache within one
+/// call's fuel (about 48 fuel a page of a policy's page record). A new chunk
+/// moves no slot, and the vector of chunks it grows holds one handle a chunk.
+#[derive(Clone, Debug)]
+struct Slots<T> {
+    chunks: Vec<Vec<T>>,
+    len: usize,
+}
+
+impl<T> Default for Slots<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<T> Slots<T> {
+    /// The slots held.
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Appends `slot` at index `len`.
+    fn push(&mut self, slot: T) {
+        match self.chunks.last_mut() {
+            Some(chunk) if chunk.len() < CHUNK => chunk.push(slot),
+            _ => {
+                let mut chunk = Vec::with_capacity(CHUNK);
+                chunk.push(slot);
+                self.chunks.push(chunk);
+            }
+        }
+        self.len += 1;
+    }
+
+    /// Takes the slot at `at` out, moving the last slot into its place; `None`,
+    /// and no change, for an index past the slots.
+    fn swap_remove(&mut self, at: usize) -> Option<T> {
+        if at >= self.len {
+            return None;
+        }
+        let chunk = self.chunks.last_mut()?;
+        let last = chunk.pop()?;
+        if chunk.is_empty() {
+            self.chunks.pop();
+        }
+        self.len -= 1;
+        if at == self.len {
+            return Some(last);
+        }
+        Some(std::mem::replace(&mut self[at], last))
+    }
+}
+
+impl<T> Index<usize> for Slots<T> {
+    type Output = T;
+
+    fn index(&self, at: usize) -> &T {
+        &self.chunks[at / CHUNK][at % CHUNK]
+    }
+}
+
+impl<T> IndexMut<usize> for Slots<T> {
+    fn index_mut(&mut self, at: usize) -> &mut T {
+        &mut self.chunks[at / CHUNK][at % CHUNK]
     }
 }
 
@@ -327,6 +407,28 @@ mod tests {
         assert_eq!(lru.pop_least(1), Some(4));
         assert_eq!((order(&lru, 0), order(&lru, 1)), (vec![3], vec![5]));
         assert_eq!((lru.get(3), lru.get(5)), (Some(&3), Some(&5)));
+    }
+
+    /// The slots span several chunks: removals that move a slot across a chunk
+    /// boundary, and that empty the last chunk, keep every order and state.
+    #[test]
+    fn orders_spanning_chunks_stay_ordered_through_removals() {
+        let count = 2 * CHUNK as u32 + 3;
+        let mut lru = Lru::new(2);
+        for object in 0..count {
+            lru.insert(object, object, (object % 2) as usize);
+        }
+        // The first objects leave, each replaced by the last slot of the array.
+        for object in 0..CHUNK as u32 + 5 {
+            assert_eq!(lru.remove(object), Some(object));
+        }
+        let left = |parity: u32| -> Vec<u32> {
+            (CHUNK as u32 + 5..count)
+                .filter(|object| object % 2 == parity)
+                .collect()
+        };
+        assert_eq!((order(&lru, 0), order(&lru, 1)), (left(0), left(1)));
+        assert!((CHUNK as u32 + 5..count).all(|object| lru.get(object) == Some(&object)));
     }
 
     #[test]
