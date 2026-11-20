@@ -6,8 +6,11 @@
 //! family, as one rank holding the whole model and as rank one of an expert union of four (its
 //! window of 96 experts of every layer and its quarter of the n-gram tables' hash heads), and runs
 //! a decode bucket of one row, one of eight rows and a prefill bucket of two rows of 256 tokens
-//! (the embedding, the decoder stack and the logits), and, on the union's rank, a join of a step
-//! it holds no tokens of. Each run asserts the extents of the outputs and the model's
+//! (the embedding, the decoder stack and the logits), a decode bucket of sixteen rows and a
+//! prefill chunk of 4096 tokens over page tables of the release's whole context of 1M tokens,
+//! and, on the union's rank, a join of a step it holds no tokens of. The chunk over the whole
+//! context must stay within [`CONTEXT_PEAK`]: its indexers score their queries a block at a
+//! time, where the whole chunk's `[4096, 1M]` FP32 scores would be 16 GiB. Each run asserts the extents of the outputs and the model's
 //! declarations, that every launch names an operator, that no kernel key names a model family,
 //! that every key is one the tree's kernel packages declare (`crates/ops/kernels`: a package of
 //! the launch's operator whose fields read the key), and that a second run of a bucket states
@@ -44,6 +47,13 @@ const UNION: u32 = 4;
 
 /// The most tokens a rank's exchange carries in a step.
 const RANK_ROWS: u32 = 512;
+
+/// The release's context, `max_position_embeddings`, which a row's page table addresses whole.
+const CONTEXT: usize = 1 << 20;
+
+/// The most a step over page tables of [`CONTEXT`] tokens allocates: the activations of a 4096-
+/// token chunk (about 1.2 GiB) beside one block of an indexer's FP32 scores (1 GiB).
+const CONTEXT_PEAK: u64 = 4 << 30;
 
 /// The kernels a forward stated: `(operator, key)` pairs.
 type Keys = BTreeSet<(&'static str, String)>;
@@ -88,15 +98,17 @@ fn group(
     group
 }
 
-/// The rows of an exchange over the union, `step_rows` rows a rank, as meta tensors.
+/// The rows of an exchange over the union, `step_rows` rows a rank (a transport of at least
+/// `RANK_ROWS` rows a rank), as meta tensors.
 fn exchange(step_rows: u32) -> ExpertExchange {
-    let rows = (UNION * RANK_ROWS) as usize;
+    let rank_rows = step_rows.max(RANK_ROWS);
+    let rows = (UNION * rank_rows) as usize;
     let hidden = 5120;
 
     ExpertExchange {
         ranks: UNION,
         attention: 0,
-        rank_rows: RANK_ROWS,
+        rank_rows,
         step_rows,
         multiprocessors: 148,
         states: meta((rows, hidden), DType::BF16),
@@ -104,8 +116,8 @@ fn exchange(step_rows: u32) -> ExpertExchange {
         weights: meta((rows, 6), DType::F32),
         combined: meta((rows, hidden), DType::BF16),
         live: meta(1, DType::U32),
-        packed: meta((RANK_ROWS as usize, hidden / 2), DType::U8),
-        packed_scales: meta((RANK_ROWS as usize, hidden / 16), DType::F8E4M3),
+        packed: meta((rank_rows as usize, hidden / 2), DType::U8),
+        packed_scales: meta((rank_rows as usize, hidden / 16), DType::F8E4M3),
         fused: false,
         source_only: false,
     }
@@ -126,10 +138,10 @@ fn axes(union: Split) -> Vec<Split> {
 fn step(
     model: &dyn TextModel,
     phase: Phase,
-    (rows, tokens): (usize, usize),
+    (rows, tokens, context): (usize, usize, usize),
     union: Split,
 ) -> Recording {
-    let row_pages = (tokens / rows).div_ceil(PAGE_TOKENS as usize).max(4);
+    let row_pages = context.div_ceil(PAGE_TOKENS as usize).max(4);
     let lent = (union.size() > 1).then(|| exchange(tokens.next_power_of_two() as u32));
 
     let (stepped, recording) = record(&axes(union), || {
@@ -258,9 +270,11 @@ fn layer_launches(launches: &[Launch], layer: usize) -> BTreeMap<&'static str, u
 fn buckets(name: &str, model: &dyn TextModel, union: Split) -> Keys {
     let mut every = Keys::new();
     for (phase, bucket) in [
-        (Phase::Decode, (1, 1)),
-        (Phase::Decode, (8, 8)),
-        (Phase::Prefill, (2, 512)),
+        (Phase::Decode, (1, 1, 1)),
+        (Phase::Decode, (8, 8, 1)),
+        (Phase::Prefill, (2, 512, 256)),
+        (Phase::Decode, (16, 16, CONTEXT)),
+        (Phase::Prefill, (1, 4096, CONTEXT)),
     ] {
         let recording = step(model, phase, bucket, union);
         let again = step(model, phase, bucket, union);
@@ -271,7 +285,10 @@ fn buckets(name: &str, model: &dyn TextModel, union: Split) -> Keys {
             "two runs of one {phase:?} bucket differ"
         );
 
-        let run = format!("{name} {phase:?} {} rows, {} tokens", bucket.0, bucket.1);
+        let run = format!(
+            "{name} {phase:?} {} rows, {} tokens, tables of {} tokens",
+            bucket.0, bucket.1, bucket.2
+        );
         report(&run, &recording);
         assert_declared(&run, &keys);
         // Layer 20 compresses every token, indexes, ranks the candidate blocks and attends.
@@ -280,6 +297,13 @@ fn buckets(name: &str, model: &dyn TextModel, union: Split) -> Keys {
             layer_launches(&recording.launches, 20)
         );
         assert!(recording.peak > 0, "a forward allocates its activations");
+        if bucket.2 == CONTEXT {
+            assert!(
+                recording.peak <= CONTEXT_PEAK,
+                "{run} allocates {} bytes, above {CONTEXT_PEAK}",
+                recording.peak
+            );
+        }
         every.extend(keys);
     }
     every

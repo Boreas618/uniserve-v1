@@ -1,11 +1,13 @@
 # DeepSeek-V4.1-Flash on the four GPUs of one host: four data-parallel schedulers whose ranks
 # share their routed experts, each rank holding the attention, the shared experts and the dense
 # weights whole, 96 of every layer's 384 MXFP4 experts and a quarter of the n-gram tables' hash
-# heads (`docs/deepseek_v41.md`).
+# heads (`docs/deepseek_v41.md`). It serves the release's context of 1M tokens, which AgentX
+# prompts reach (990K at most, 35K at the median), to 16 running requests a scheduler, 64 in all,
+# each prompt prefilled in chunks of 4096 tokens.
 
 model = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 data_parallel_size = 4
-max_model_len = 20480
+max_model_len = 1048576
 max_running_requests = 16
 max_num_batched_tokens = 4096
 # The weights take 125 GiB of each GPU: the default share of 0.7 does not hold them beside the
@@ -19,3 +21,32 @@ expert_parallel = true
 [cuda_graph_config]
 decode_batch_sizes = [1, 2, 4, 8]
 prefill_token_sizes = [1024, 4096]
+
+# The four schedulers' groups, one rank each, which form the expert union.
+[[worker_groups]]
+id = "model-0"
+ranks = ["cuda:0"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-1"
+ranks = ["cuda:1"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-2"
+ranks = ["cuda:2"]
+queue_depth = 2
+
+[worker_groups.blocks.model]
+
+[[worker_groups]]
+id = "model-3"
+ranks = ["cuda:3"]
+queue_depth = 2
+
+[worker_groups.blocks.model]

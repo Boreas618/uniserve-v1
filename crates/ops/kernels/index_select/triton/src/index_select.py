@@ -11,6 +11,12 @@ writes the entry each names, ``-1`` for one whose score is ``-inf``:
   that many groups), a kept column ``c`` names group
   ``candidates[t, c // CANDIDATES] * CANDIDATES + c % CANDIDATES``.
 
+A row of the request's own groups ranks only the blocks its ``visible``
+groups lie in: the scores past them are ``-inf`` (``index_scores``), so a
+row's passes read what its request holds rather than the whole table, and the
+slots past the ranked blocks are ``-1``. A row of candidate columns ranks
+every column.
+
 The selection is ``top_k``'s radix select without its ordering: four passes
 of eight bits over the row's monotone 32-bit keys, most significant first,
 each counting the keys of the prefix fixed so far by their next byte and
@@ -87,6 +93,10 @@ def _index_select_kernel(
     seen = tl.load(visible + row).to(tl.int64)
     # Only the block mode pins: a row that sees nothing pins nothing.
     pin = tl.where(seen > 0, (seen - 1) // POOL, -1)
+    # The blocks the row ranks: those of its visible groups, or every
+    # candidate column. Below, a lane past them is not live.
+    if CANDIDATES == 0:
+        blocks = tl.minimum(blocks, (seen + POOL - 1) // POOL)
 
     # ---- The selection: four passes of eight bits, most significant first.
     # After each pass the top bytes of `prefix` are fixed; `taken` is the
@@ -167,6 +177,12 @@ def _index_select_kernel(
         tl.store(destination + slot_equal, entry, mask=keep_equal)
         filled += tl.sum(greater.to(tl.int32), axis=0)
         equal_before += tl.sum(equal.to(tl.int32), axis=0)
+
+    # Fewer ranked blocks than kept slots leave the slots past them, which
+    # name nothing.
+    for start in range(blocks, kept, LANES):
+        slots = start + lanes_of
+        tl.store(destination + slots, -1, mask=slots < kept)
 
 
 def derive(fields, parameters, target):

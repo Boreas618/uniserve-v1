@@ -79,10 +79,11 @@ pub struct RequestView {
     pub generated_tokens: u32,
     /// Tokens of its prompt the prefix cache already holds.
     pub cached_prefix_tokens: u32,
-    /// Where the next prefill chunk starts: the prompt tokens the runtime has
-    /// computed, or the prefix the cache already held for it at admission,
-    /// whichever is further on. `cached_prefix_tokens` says how many of those
-    /// the cache holds; it is part of this count, not a value to add to it.
+    /// Where the next prefill chunk starts: for a running request the prompt
+    /// tokens the runtime has computed, which lie before the end of its cached
+    /// prefix while a bounded replay recomputes the sliding windows before it;
+    /// for a waiting one the further of those and the prefix the cache holds
+    /// for it. `cached_prefix_tokens` is never a value to add to it.
     pub prefilled_tokens: u32,
     /// KV pages it currently holds.
     pub cached_pages: u32,

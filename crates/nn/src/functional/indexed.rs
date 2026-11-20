@@ -433,6 +433,11 @@ fn keys_decoded(keys: &Plane<'_>, width: usize) -> Result<Tensor> {
 /// column maps back to its group. A tie keeps the lower column; the kept entries leave the
 /// strictly greater ones first, then the ties, each by column.
 ///
+/// A row of the request's own groups ranks only the blocks its `visible` groups lie in, whose
+/// scores past them are `−inf` ([`index_scores`]): its cost is the request's length rather than
+/// the table's, and the slots past its ranked blocks are `-1`. A row of candidate columns ranks
+/// every column.
+///
 /// # Errors
 ///
 /// A kept count of none or above the row's blocks, columns that are not one entry per token,
@@ -553,16 +558,27 @@ impl Fused for IndexSelectCall<'_> {
                     *key = monotone(f32::INFINITY);
                 }
             }
+            // A row of its request's own groups ranks the blocks its visible groups lie in.
+            if candidates.is_none() {
+                keys.truncate((visible[token] as usize).div_ceil(pool));
+            }
 
             // The k-th largest key, then the strictly greater ones by column and the ties at
-            // it by column until the row is full.
+            // it by column until the row is full. A row of fewer ranked blocks than slots keeps
+            // every block by column, below the k-th largest key the program reaches (the least
+            // key), and the slots past them name none.
+            let taken = kept.min(keys.len());
             let mut ranked = keys.clone();
             ranked.sort_unstable_by(|a, b| b.cmp(a));
-            let threshold = ranked[kept - 1];
+            let threshold = if keys.len() < kept {
+                0
+            } else {
+                ranked[kept - 1]
+            };
             let above: Vec<usize> = (0..keys.len()).filter(|&b| keys[b] > threshold).collect();
             let ties = (0..keys.len())
                 .filter(|&b| keys[b] == threshold)
-                .take(kept - above.len());
+                .take(taken - above.len());
             let none = monotone(f32::NEG_INFINITY);
             for block in above.into_iter().chain(ties) {
                 let entry = if keys[block] == none {
@@ -582,6 +598,7 @@ impl Fused for IndexSelectCall<'_> {
                 };
                 out.push(entry);
             }
+            out.extend(std::iter::repeat_n(-1, kept - taken));
         }
         Ok(Tensor::from_vec(out, (scores.len(), kept), &Device::Cpu)?)
     }

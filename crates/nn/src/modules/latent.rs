@@ -470,42 +470,75 @@ impl Indexer {
             }
             _ => None,
         };
-        let scores = functional::index_scores(
-            &query,
-            keys,
-            batch.rows,
-            &visible,
-            IndexScoring {
-                weights: Some(&weights),
-                query: Format::Mxfp4,
-                candidates: restriction,
-            },
-        )?;
-        if config.split.size() > 1 {
-            collective::all_reduce(&scores)?;
+
+        // A query's scores, its selection and its candidate blocks read its own row alone, so
+        // the rows are scored and selected a block at a time, each block's scores within
+        // `SCORE_BYTES`: a prefill over a table of a million entries would otherwise hold its
+        // whole `[tokens, entries]` scores.
+        let columns = match restriction {
+            Some((candidates, block)) => candidates.dims()[1] * block as usize,
+            None => keys.table.dims()[1] * keys.records.dims()[1],
+        };
+        let kept = (config.top as usize).min(columns);
+        // An FP32 score is four bytes.
+        let rows_per_block = (SCORE_BYTES / (columns.max(1) * 4)).max(1);
+        let mut selected = Vec::new();
+        let mut ranked = Vec::new();
+        for first in (0..tokens).step_by(rows_per_block) {
+            let rows = rows_per_block.min(tokens - first);
+            let (query, weights, visible) = (
+                query.narrow(0, first, rows)?,
+                weights.narrow(0, first, rows)?,
+                visible.narrow(0, first, rows)?,
+            );
+            let restricted = restriction
+                .map(|(candidates, block)| {
+                    Ok::<_, Error>((candidates.narrow(0, first, rows)?, block))
+                })
+                .transpose()?;
+            let restricted = restricted
+                .as_ref()
+                .map(|(candidates, block)| (candidates, *block));
+
+            let scores = functional::index_scores(
+                &query,
+                keys,
+                &batch.rows.narrow(0, first, rows)?,
+                &visible,
+                IndexScoring {
+                    weights: Some(&weights),
+                    query: Format::Mxfp4,
+                    candidates: restricted,
+                },
+            )?;
+            if config.split.size() > 1 {
+                collective::all_reduce(&scores)?;
+            }
+
+            selected.push(functional::index_select(
+                &scores, &visible, restricted, 1, kept,
+            )?);
+            if let Candidates::Source { blocks, block } = config.candidates {
+                let blocks_of_row = columns.div_ceil(block as usize);
+                ranked.push(functional::index_select(
+                    &scores,
+                    &visible,
+                    None,
+                    block,
+                    (blocks as usize).min(blocks_of_row),
+                )?);
+            }
         }
 
-        let columns = scores.dims()[1];
-        let kept = (config.top as usize).min(columns);
-        let mut entries = functional::index_select(&scores, &visible, restriction, 1, kept)?;
+        let mut entries = joined(selected)?;
         if kept < config.top as usize {
             // A table narrower than the selection leaves the columns past it empty.
             let empty = Tensor::full(-1_i32, (tokens, config.top as usize - kept), &Device::Cpu)?
                 .to_device(x.device())?;
             entries = Tensor::cat(&[&entries, &empty], 1)?.contiguous()?;
         }
-
         let candidates = match config.candidates {
-            Candidates::Source { blocks, block } => {
-                let ranked = columns.div_ceil(block as usize);
-                Some(functional::index_select(
-                    &scores,
-                    &visible,
-                    None,
-                    block,
-                    (blocks as usize).min(ranked),
-                )?)
-            }
+            Candidates::Source { .. } => Some(joined(ranked)?),
             _ => None,
         };
         Ok(Selection {
@@ -513,6 +546,19 @@ impl Indexer {
             candidates,
         })
     }
+}
+
+/// The FP32 scores one block of an [`Indexer`]'s query rows holds at most, in bytes: 256 query
+/// rows over a million entries, the whole of a decode batch's rows.
+const SCORE_BYTES: usize = 1 << 30;
+
+/// The rows of `blocks` in order, one block taken as it is.
+fn joined(mut blocks: Vec<Tensor>) -> Result<Tensor> {
+    if blocks.len() == 1 {
+        return Ok(blocks.remove(0));
+    }
+    let parts: Vec<&Tensor> = blocks.iter().collect();
+    Ok(Tensor::cat(&parts, 0)?.contiguous()?)
 }
 
 // ---- LatentAttention ----------------------------------------------------------------------

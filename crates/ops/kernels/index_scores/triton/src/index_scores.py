@@ -12,6 +12,9 @@ the token's ``visible`` count; a row restricted to candidate blocks names
 ``candidates[t, c // CANDIDATES] * CANDIDATES + c % CANDIDATES``, visible when
 the block is named (not negative) and the group is below the count. Group
 ``g`` lies at slot ``g % GROUPS`` of page ``page_table[rows[t], g // GROUPS]``.
+A program of a dense row whose columns all lie past the token's visible
+groups stores ``-inf`` alone, so a row's products cost what its request holds
+rather than the whole table its page table could address.
 
 The keys are BF16 rows ``[pages, GROUPS, WIDTH]``, or MXFP4 records whose page
 holds every record's ``WIDTH / 2`` value bytes and then every record's
@@ -121,84 +124,96 @@ def _index_scores_kernel(
     seen = tl.load(visible + token).to(tl.int64)
     groups_of_table = max_pages * GROUPS
 
-    # ---- The group each column scores, and whether it is visible. ----
+    columns = blocks * CANDIDATES if CANDIDATES > 0 else groups_of_table
+    live = column < columns
+    # A dense row sees its leading groups alone: a program wholly past them
+    # has nothing to score.
+    first = tl.program_id(0).to(tl.int64) * BLOCK
     if CANDIDATES > 0:
-        columns = blocks * CANDIDATES
-        live = column < columns
-        block = tl.load(
-            candidates + token * blocks + column // CANDIDATES, mask=live, other=-1
+        idle = first < 0
+    else:
+        idle = first >= seen
+    if idle:
+        tl.store(
+            out + token * columns + column,
+            tl.full((BLOCK,), float("-inf"), tl.float32),
+            mask=live,
         )
-        named = block.to(tl.int64) * CANDIDATES + column % CANDIDATES
-        valid = live & (block >= 0) & (named < seen) & (named < groups_of_table)
-        group = tl.where(valid, named, 0)
     else:
-        columns = groups_of_table
-        live = column < columns
-        valid = live & (column < seen)
-        group = tl.where(valid, column, 0)
+        # ---- The group each column scores, and whether it is visible. ----
+        if CANDIDATES > 0:
+            block = tl.load(
+                candidates + token * blocks + column // CANDIDATES, mask=live, other=-1
+            )
+            named = block.to(tl.int64) * CANDIDATES + column % CANDIDATES
+            valid = live & (block >= 0) & (named < seen) & (named < groups_of_table)
+            group = tl.where(valid, named, 0)
+        else:
+            valid = live & (column < seen)
+            group = tl.where(valid, column, 0)
 
-    page = tl.load(page_table + row * max_pages + group // GROUPS, mask=valid, other=0)
-    page = page.to(tl.int64)
-    slot = group % GROUPS
+        page = tl.load(page_table + row * max_pages + group // GROUPS, mask=valid, other=0)
+        page = page.to(tl.int64)
+        slot = group % GROUPS
 
-    # ---- The keys, [BLOCK, WIDTH], as BF16-exact FP32 values. ----
-    lane = tl.arange(0, WIDTH)
-    if KEYS_MXFP4:
-        # A page holds GROUPS records' WIDTH / 2 value bytes, then their
-        # WIDTH / 32 scale bytes; element j is the low nibble of byte j / 2
-        # when even.
-        page_bytes = GROUPS * (WIDTH // 2 + WIDTH // 32)
-        base = page * page_bytes
-        packed = tl.load(
-            keys + base[:, None] + slot[:, None] * (WIDTH // 2) + lane[None, :] // 2,
-            mask=valid[:, None],
-            other=0,
-        ).to(tl.int32)
-        codes = tl.where((lane[None, :] % 2) == 0, packed & 0x0F, packed >> 4)
-        scale_bytes = tl.load(
-            keys
-            + base[:, None]
-            + GROUPS * (WIDTH // 2)
-            + slot[:, None] * (WIDTH // 32)
-            + lane[None, :] // 32,
-            mask=valid[:, None],
-            other=127,
-        ).to(tl.int32)
-        key = _e2m1(codes) * _pow2(scale_bytes - 127)
-    else:
-        key = tl.load(
-            keys + ((page * GROUPS + slot) * WIDTH)[:, None] + lane[None, :],
-            mask=valid[:, None],
+        # ---- The keys, [BLOCK, WIDTH], as BF16-exact FP32 values. ----
+        lane = tl.arange(0, WIDTH)
+        if KEYS_MXFP4:
+            # A page holds GROUPS records' WIDTH / 2 value bytes, then their
+            # WIDTH / 32 scale bytes; element j is the low nibble of byte j / 2
+            # when even.
+            page_bytes = GROUPS * (WIDTH // 2 + WIDTH // 32)
+            base = page * page_bytes
+            packed = tl.load(
+                keys + base[:, None] + slot[:, None] * (WIDTH // 2) + lane[None, :] // 2,
+                mask=valid[:, None],
+                other=0,
+            ).to(tl.int32)
+            codes = tl.where((lane[None, :] % 2) == 0, packed & 0x0F, packed >> 4)
+            scale_bytes = tl.load(
+                keys
+                + base[:, None]
+                + GROUPS * (WIDTH // 2)
+                + slot[:, None] * (WIDTH // 32)
+                + lane[None, :] // 32,
+                mask=valid[:, None],
+                other=127,
+            ).to(tl.int32)
+            key = _e2m1(codes) * _pow2(scale_bytes - 127)
+        else:
+            key = tl.load(
+                keys + ((page * GROUPS + slot) * WIDTH)[:, None] + lane[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            ).to(tl.float32)
+
+        # ---- The token's queries, [HEADS_TILE, WIDTH], zero past its heads. ----
+        head = tl.arange(0, HEADS_TILE)
+        heads_live = head < HEADS
+        q = tl.load(
+            query + token * (HEADS * WIDTH) + head[:, None] * WIDTH + lane[None, :],
+            mask=heads_live[:, None],
             other=0.0,
         ).to(tl.float32)
+        if QUERY_MXFP4:
+            q = _mxfp4_round(q, HEADS_TILE, WIDTH)
 
-    # ---- The token's queries, [HEADS_TILE, WIDTH], zero past its heads. ----
-    head = tl.arange(0, HEADS_TILE)
-    heads_live = head < HEADS
-    q = tl.load(
-        query + token * (HEADS * WIDTH) + head[:, None] * WIDTH + lane[None, :],
-        mask=heads_live[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    if QUERY_MXFP4:
-        q = _mxfp4_round(q, HEADS_TILE, WIDTH)
+        # Both sides hold at most eight significant bits, which TF32's eleven hold
+        # exactly, so the tensor-core products are exact and only their FP32 sum
+        # rounds. (TF32 rather than BF16 operands: the interpreter multiplies a
+        # BF16 tile by its bit patterns, and FP32 operands read the same on both.)
+        products = tl.dot(q, tl.trans(key), input_precision="tf32", out_dtype=tl.float32)
+        rectified = tl.maximum(products, 0.0)
+        if WEIGHTED:
+            weight = tl.load(weights + token * HEADS + head, mask=heads_live, other=0.0)
+            rectified = rectified * weight[:, None]
+        score = tl.sum(rectified, axis=0)
 
-    # Both sides hold at most eight significant bits, which TF32's eleven hold
-    # exactly, so the tensor-core products are exact and only their FP32 sum
-    # rounds. (TF32 rather than BF16 operands: the interpreter multiplies a
-    # BF16 tile by its bit patterns, and FP32 operands read the same on both.)
-    products = tl.dot(q, tl.trans(key), input_precision="tf32", out_dtype=tl.float32)
-    rectified = tl.maximum(products, 0.0)
-    if WEIGHTED:
-        weight = tl.load(weights + token * HEADS + head, mask=heads_live, other=0.0)
-        rectified = rectified * weight[:, None]
-    score = tl.sum(rectified, axis=0)
-
-    tl.store(
-        out + token * columns + column,
-        tl.where(valid, score, float("-inf")),
-        mask=live,
-    )
+        tl.store(
+            out + token * columns + column,
+            tl.where(valid, score, float("-inf")),
+            mask=live,
+        )
 
 
 def derive(fields, parameters, target):

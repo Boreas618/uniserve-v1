@@ -98,9 +98,9 @@ impl Shares {
 /// reuse whole pages. A chunk that reaches the prompt end may end there, and a
 /// chunk is never shorter than one token.
 ///
-/// The start is the view's `prefilled_tokens`, which already states the further
-/// of the two cursors — the prompt tokens the runtime computed and the prefix
-/// the cache held at admission ([`scheduling::RequestView`]); `page_tokens` is the KV
+/// The start is the view's `prefilled_tokens`, which already states where the
+/// chunk starts — the prompt tokens the runtime computed, or a waiting
+/// request's cached prefix ([`scheduling::RequestView`]); `page_tokens` is the KV
 /// page size ([`Room::page_tokens`]). A zero here means the prompt is
 /// done.
 pub(crate) fn prefill_chunk(
