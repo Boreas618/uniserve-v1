@@ -1407,7 +1407,11 @@ impl CausalLmRunner {
             }
         };
 
-        refuse_drawn_rows(shape.variant, &columns.parameters)?;
+        refuse_drawn_rows(
+            shape.variant,
+            &columns.parameters,
+            &columns.rows.logits_rows,
+        )?;
 
         // Image rows are placed by the prefill of a runner lent a feature buffer, and work the
         // runner states no bucket for is refused by its name, never served as text.
@@ -2826,21 +2830,30 @@ fn at_capacity(graphs: &Graphs, bucket: &Bucket, capacity: u32) -> Result<Bucket
         })
 }
 
-/// Refuses a greedy bucket a row that draws.
+/// Refuses a greedy bucket a row whose token it keeps while the row asks for a draw.
 ///
-/// A bucket's variant fixes the selection of every row. A drawing bucket serves a greedy row
-/// as well, as a draw over its one largest candidate (`sampler::parameters`). The converse is
-/// not so: an argmax is not what a row that states a temperature asked for, so a greedy
-/// variant holding one is refused by the row.
-fn refuse_drawn_rows(variant: Variant, parameters: &[f32]) -> Result<()> {
+/// A bucket's variant fixes the selection of every token it keeps. A drawing bucket serves a
+/// greedy row as well, as a draw over its one largest candidate (`sampler::parameters`). The
+/// converse is not so: an argmax is not what a row that states a temperature asked for, so a
+/// greedy variant refuses such a row.
+///
+/// Only a row whose logits are read keeps a token (`logits_rows`: a decode, a verification, the
+/// chunk that ends a prompt). Every row of a request states its request's parameters, a prompt
+/// chunk before the last as well, but such a chunk keeps no token, so its temperature selects
+/// nothing and a greedy bucket serves it: alone in a [`Variant::PrefillWrite`], beside greedy
+/// prompt endings in a [`Variant::PrefillGreedy`], as the scheduler chooses a batch's variant
+/// from the rows that keep a token. `parameters` and `logits_rows` hold one entry per row
+/// (`Batch::check`).
+fn refuse_drawn_rows(variant: Variant, parameters: &[f32], logits_rows: &[i32]) -> Result<()> {
     if !variant.greedy() {
         return Ok(());
     }
 
     let width = PARAMETER_COLUMNS as usize;
-    for (row, stated) in parameters.chunks_exact(width).enumerate() {
+    let rows = parameters.chunks_exact(width).zip(logits_rows).enumerate();
+    for (row, (stated, logits)) in rows {
         let temperature = stated[TEMPERATURE as usize];
-        if temperature != 0.0 {
+        if *logits >= 0 && temperature != 0.0 {
             return Err(Error::Invalid(format!(
                 "row {row} of a {variant} batch states temperature {temperature}: its token is \
                  drawn from its distribution, and a greedy bucket takes each row's argmax"
