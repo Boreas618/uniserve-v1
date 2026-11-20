@@ -51,6 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from uniserve_testing import admin, chat
 from uniserve_testing.assets import CHECKPOINTS
@@ -291,9 +292,15 @@ def test_real_acceptance_length_against_the_golden_curve(server: Server):
             chat_template_kwargs=GATE_TEMPLATE,
             **GATE_SAMPLING,
         )
-        return chat.complete(
-            server.base_url, request, server.scaled(GATE_COMPLETION_S)
-        )
+        try:
+            return chat.complete(
+                server.base_url, request, server.scaled(GATE_COMPLETION_S)
+            )
+        except httpx.HTTPStatusError as error:
+            # The answer's body names the failure; the status alone does not.
+            raise AssertionError(
+                f"{error.response.status_code}: {error.response.text}"
+            ) from error
 
     before = _counts(server)
     with ThreadPoolExecutor(max_workers=GATE_CONCURRENCY) as pool:
