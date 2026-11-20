@@ -14,8 +14,12 @@
 //!    are, so it gives up unless its windows hold every one of those versions
 //!    (`proto::ENGINE_INTERFACE`, `storage::protocol::VERSIONS`) and the host's Storage Server
 //!    serves it; it also agrees with the daemon on the version the handoff's messages are
-//!    written in, the newest both speak. The successor loads the model's files and binds a
+//!    written in, the newest both speak. The options carry the records of every replica the
+//!    takeover hands over (the arguments its engine serves with and its configuration), which
+//!    the successor reads and resolves here, so a record of another build it cannot read ends
+//!    the restart before anything crossed. The successor loads the model's files and binds a
 //!    request socket of its own, which it responds with, with the agreed version (`Prepared`).
+//!    Whatever it gives up on, the options it cannot read included, it states (`Failed`).
 //! 2. The daemon stops its service thread between two rounds and sends what
 //!    the thread served, its HTTP listener and the connection its engine's
 //!    process lives under, with the arguments the engine serves with and the video jobs
@@ -37,7 +41,11 @@
 //! the daemon that started them; an epoch update the successor runs afterwards starts engines of
 //! its own build, which agree on the newest version both speak. The handoff's messages are part
 //! of the engine interface: they change only by additions (a field with a default, a variant),
-//! so a successor of another build within the window reads them. A connection that arrives
+//! each written only when it holds another value than its default, so a successor of another
+//! build within the window reads them; the configuration records they carry refuse a field
+//! they do not know, which is why the successor reads them before the handover. A test reads
+//! the handoff of the window's oldest version as that version's build wrote it
+//! (`tests/fixtures/engine-interface-14/`). A connection that arrives
 //! meanwhile waits in the listener's queue until one of the two accepts it. Until the successor
 //! serves, a failure leaves the daemon serving as before, except after the service thread
 //! stopped, which then fails the restart and the daemon with it: every check a successor of
@@ -151,6 +159,24 @@ struct Prepare {
     /// successor loads from the deployment's Build Server: it restores every response's parser
     /// in it and processes new requests with it.
     processing: proto::module::PackageRevision,
+    /// The records of the replicas the takeover hands over, in its order. The successor reads
+    /// them, and resolves each configuration, before it answers [`Message::Prepared`], so a
+    /// record of another build that this one cannot read ends the restart while the daemon
+    /// serves on, instead of after the service crossed. The takeover carries the same records
+    /// again, where a successor of a build before this field reads them; a predecessor of such
+    /// a build states none, and its records are read in the takeover alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    replicas: Vec<ReplicaRecord>,
+}
+
+/// What a replica's engine serves with, as the predecessor hands it over: the records of the
+/// handoff that the configuration's types read, which refuse a field they do not know.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicaRecord {
+    /// The arguments the replica's engine process serves with.
+    served: proto::config::EngineArgs,
+    /// The replica's configuration, as the revision's `config.toml` prints it.
+    config: String,
 }
 
 /// What a daemon hands its successor. The descriptors travel in this
@@ -374,6 +400,17 @@ impl Restarter {
             .flat_map(|replica| replica.client.interfaces().collect::<Vec<_>>());
         let versions: std::collections::BTreeSet<u32> =
             spoken.engine.iter().copied().chain(engines).collect();
+        // Each replica's records, which the successor reads before the handover and the takeover
+        // carries again: no epoch change runs meanwhile, so they hold until it.
+        let records = handoff
+            .iter()
+            .map(|replica| {
+                Ok(ReplicaRecord {
+                    served: replica.served.clone(),
+                    config: crate::config::printed(&replica.config)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         send(
             &mut channel,
             &Message::Prepare(Box::new(Prepare {
@@ -388,6 +425,7 @@ impl Restarter {
                 spoken: versions.into_iter().collect(),
                 storage: spoken.storage,
                 processing,
+                replicas: records.clone(),
             })),
             &[],
         )?;
@@ -420,7 +458,7 @@ impl Restarter {
             .take()
             .context("the HTTP listener was handed over already")?;
         let mut replicas = Vec::new();
-        for replica in &handoff {
+        for (replica, record) in handoff.iter().zip(records) {
             let control = match replica.client.take_control() {
                 Some(control) => {
                     let control = control
@@ -435,8 +473,8 @@ impl Restarter {
                 control,
                 engine: replica.engine,
                 next_engine: replica.next_engine,
-                served: replica.served.clone(),
-                config: crate::config::printed(&replica.config)?,
+                served: record.served,
+                config: record.config,
                 paused: replica.paused,
                 asleep: replica.asleep,
                 sleep_paused: replica.sleep_paused,
@@ -730,13 +768,9 @@ pub async fn take_over(descriptor: i32, shutdown: CancellationToken) -> anyhow::
     // socket at this descriptor, which nothing else in this process owns.
     let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(descriptor) });
     let mut channel = Connection::new(stream)?;
-    let prepare = match recv(&mut channel).await? {
-        (Message::Prepare(prepare), _) => prepare,
-        (other, _) => anyhow::bail!("the daemon sent {other:?} first"),
-    };
-    // The successor's whole bring-up is one future, which lives on the heap rather than in the
-    // caller's frame.
-    match Box::pin(prepared_successor(&mut channel, *prepare, shutdown)).await {
+    // Every failure is the predecessor's reason to serve on, the options it cannot read
+    // included.
+    match successor(&mut channel, shutdown).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = send(
@@ -749,6 +783,17 @@ pub async fn take_over(descriptor: i32, shutdown: CancellationToken) -> anyhow::
             Err(error)
         }
     }
+}
+
+/// The successor's side: the options first, then everything after them.
+async fn successor(channel: &mut Connection, shutdown: CancellationToken) -> anyhow::Result<()> {
+    let prepare = match recv(channel).await? {
+        (Message::Prepare(prepare), _) => prepare,
+        (other, _) => anyhow::bail!("the daemon sent {other:?} first"),
+    };
+    // The successor's whole bring-up is one future, which lives on the heap rather than in the
+    // caller's frame.
+    Box::pin(prepared_successor(channel, *prepare, shutdown)).await
 }
 
 /// The successor's side once it has the options.
@@ -772,6 +817,18 @@ async fn prepared_successor(
         storage = ?prepare.storage,
         "this daemon speaks every version the deployment's connections agreed on"
     );
+    let (mut config, _) = crate::config::parse(&prepare.config)?;
+    config.server_config.api_key = prepare.api_key;
+    let stated = Stated::from_paths(prepare.stated);
+    // The records the takeover hands over were read with the options; each configuration is
+    // resolved as the adoption resolves it after the handover, so a record of another build
+    // this one refuses ends the restart while the predecessor serves.
+    for (index, record) in prepare.replicas.iter().enumerate() {
+        let options = replica_options(&record.config, &config)
+            .with_context(|| format!("reading the configuration of replica {index}"))?;
+        crate::epoch::Epoch::of(options)
+            .with_context(|| format!("resolving the configuration of replica {index}"))?;
+    }
     let deployment = prepare.deployment.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         storage_server_speaks(&storage::socket(
@@ -781,9 +838,6 @@ async fn prepared_successor(
     })
     .await
     .context("the check of the Storage Server's protocol did not complete")??;
-    let (mut config, _) = crate::config::parse(&prepare.config)?;
-    config.server_config.api_key = prepare.api_key;
-    let stated = Stated::from_paths(prepare.stated);
     // Another listening address is bound before the handover, so that a
     // refused bind leaves the previous daemon serving; the listener it hands
     // over then closes once the previous daemon stops accepting.
@@ -933,12 +987,7 @@ async fn prepared_successor(
             .into_iter()
             .enumerate()
             .map(|(index, (replica, connection))| {
-                let (mut options, _) = crate::config::parse(&replica.config)?;
-                proto::reload::Reload::take(
-                    &mut options,
-                    &daemon_options,
-                    proto::reload::Effect::Daemon,
-                );
+                let options = replica_options(&replica.config, &daemon_options)?;
                 let served = replica.served.clone();
                 let observer = Arc::new(crate::observe::Observer::new(crate::observe::span(
                     &options.update_config,
@@ -1248,6 +1297,23 @@ fn adopted_epoch(
     Ok((record, process))
 }
 
+/// The options a replica serves with in the successor: its configuration `printed` as the
+/// predecessor handed it over, with the successor's own daemon options `daemon` in place of the
+/// predecessor's.
+///
+/// # Errors
+///
+/// When this build cannot read the configuration: an option it does not know, or a value its
+/// option does not take.
+fn replica_options(
+    printed: &str,
+    daemon: &crate::config::Config,
+) -> anyhow::Result<crate::config::Config> {
+    let (mut options, _) = crate::config::parse(printed)?;
+    proto::reload::Reload::take(&mut options, daemon, proto::reload::Effect::Daemon);
+    Ok(options)
+}
+
 /// The version of the engine interface a successor of the windows `engine` and `storage` agrees
 /// on with the predecessor that sent `prepare`, the newest both speak, when the successor speaks
 /// every version the predecessor's connections agreed on: those of the engine interface on its
@@ -1451,6 +1517,7 @@ mod tests {
                 revision: 1,
                 arguments: Default::default(),
             },
+            replicas: Vec::new(),
         }
     }
 
@@ -1510,5 +1577,149 @@ mod tests {
         assert_eq!(received.versions, service::Versions::new(14, 15));
         assert_eq!(received.spoken, [14]);
         assert_eq!(received.storage, Some(33));
+    }
+
+    /// The hot restart of a predecessor of the engine interface's oldest version
+    /// ([`oldest`](crate::test_support::oldest)): this build reads its options and its takeover
+    /// and resolves every configuration they carry, as a successor does, and writes each message
+    /// back in no field a successor of that build does not read.
+    #[test]
+    fn the_handoff_of_the_oldest_version_reads_both_ways() {
+        use crate::test_support::oldest;
+
+        for bytes in [oldest::PREPARE, oldest::TAKEOVER] {
+            let message = <Message as service::Message>::decode(bytes)
+                .expect("this build reads the handoff of the oldest version");
+            match &message {
+                Message::Prepare(prepare) => {
+                    crate::config::parse(&prepare.config).expect("the options' configuration");
+                }
+                Message::Takeover(takeover) => {
+                    assert!(
+                        !takeover.replicas.is_empty(),
+                        "the takeover hands a replica over"
+                    );
+                    for replica in &takeover.replicas {
+                        let options =
+                            replica_options(&replica.config, &crate::config::Config::default())
+                                .expect("the replica's configuration");
+                        crate::epoch::Epoch::of(options).expect("the replica's configuration");
+                    }
+                }
+                other => panic!("the fixture holds {other:?}"),
+            }
+
+            let written: serde_json::Value =
+                service::msgpack::decode(&service::Message::encode(&message).unwrap()).unwrap();
+            let unread = oldest::unread(&written, &service::msgpack::decode(bytes).unwrap());
+            assert!(
+                unread.is_empty(),
+                "a build of the oldest version does not read {unread:?}"
+            );
+        }
+    }
+
+    /// The payload of one frame as it is, as a predecessor of another build writes it.
+    struct Frame(Vec<u8>);
+
+    impl service::Message for Frame {
+        fn encode(&self) -> std::io::Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+
+        fn decode(payload: &[u8]) -> std::io::Result<Self> {
+            Ok(Self(payload.to_vec()))
+        }
+    }
+
+    /// What a successor answers to options it receives as `payload` at the other end of its
+    /// handoff socket, and how its takeover ended.
+    async fn answer(payload: Vec<u8>) -> (Message, anyhow::Result<()>) {
+        use std::os::fd::IntoRawFd as _;
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let mut channel = Connection::new(ours).unwrap();
+        channel.send_with(&Frame(payload), &[]).unwrap();
+        channel.flush().unwrap();
+        let (taken, answer) = tokio::join!(
+            take_over(theirs.into_raw_fd(), CancellationToken::new()),
+            recv(&mut channel)
+        );
+        (answer.expect("the successor answers").0, taken)
+    }
+
+    /// A successor gives up, stating why, on a record of a replica it cannot read, before it
+    /// answers the options and so before anything is handed over: the predecessor serves on. A
+    /// record of a later build that states a field this build does not know is one, in the
+    /// arguments a replica's engine serves with as in its configuration.
+    #[tokio::test]
+    async fn a_successor_gives_up_on_a_record_it_cannot_read_before_the_handover() {
+        use crate::test_support::oldest;
+
+        /// The options of a later build, whose replica records state a field this build does not
+        /// know: what the handoff socket carries for them, as that build's types write it.
+        #[derive(Serialize)]
+        enum Later<'a> {
+            Prepare(LaterOptions<'a>),
+        }
+        #[derive(Serialize)]
+        struct LaterOptions<'a> {
+            #[serde(flatten)]
+            options: &'a Prepare,
+            replicas: Vec<LaterRecord<'a>>,
+        }
+        #[derive(Serialize)]
+        struct LaterRecord<'a> {
+            served: LaterArguments<'a>,
+            config: String,
+        }
+        #[derive(Serialize)]
+        struct LaterArguments<'a> {
+            #[serde(flatten)]
+            served: &'a proto::config::EngineArgs,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            later_option: Option<u32>,
+        }
+
+        let Message::Takeover(takeover) =
+            <Message as service::Message>::decode(oldest::TAKEOVER).unwrap()
+        else {
+            panic!("the fixture holds a takeover");
+        };
+        let Message::Prepare(mut options) =
+            <Message as service::Message>::decode(oldest::PREPARE).unwrap()
+        else {
+            panic!("the fixture holds options");
+        };
+        // A deployment no Storage Server of this host serves.
+        options.deployment = "restart-records".to_owned();
+        let replica = &takeover.replicas[0];
+        let payload = |later_option: Option<u32>, config: String| {
+            service::msgpack::encode(&Later::Prepare(LaterOptions {
+                options: &options,
+                replicas: vec![LaterRecord {
+                    served: LaterArguments {
+                        served: &replica.served,
+                        later_option,
+                    },
+                    config,
+                }],
+            }))
+            .unwrap()
+        };
+        let served = payload(Some(1), replica.config.clone());
+        let configured = payload(None, format!("later_option = 1\n{}", replica.config));
+
+        for (later, field) in [(served, "later_option"), (configured, "replica 0")] {
+            let (answer, taken) = answer(later).await;
+            let Message::Failed { reason } = answer else {
+                panic!("the successor answered {answer:?}");
+            };
+            assert!(
+                reason.contains(field) && reason.contains("later_option"),
+                "{reason}"
+            );
+            assert!(taken.is_err());
+        }
     }
 }
