@@ -1424,15 +1424,16 @@ impl Leader {
         updates: Arc<crate::updates::Updater>,
     ) -> anyhow::Result<Self> {
         let served_model_name = options.served_model_name().to_owned();
-        let model_name = options.model().to_owned();
         let images = MediaConnector::new(&options.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
         let logging = &options.logging_config;
         let stats_logger = logging
             .log_stats
             .then(|| StatsLogger::start(recorder.clone(), logging.stats_interval));
+        // Each replica's options name the checkpoint as the package states it, `model` or
+        // `model_dir` alone: a hot restart hands them to a successor, which validates them as a
+        // start validates a package.
         let replica_options = Config {
-            model: Some(model_name.clone()),
             served_model_name: Some(served_model_name.clone()),
             ..options.clone()
         };

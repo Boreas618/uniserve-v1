@@ -817,7 +817,7 @@ async fn prepared_successor(
         storage = ?prepare.storage,
         "this daemon speaks every version the deployment's connections agreed on"
     );
-    let (mut config, _) = crate::config::parse(&prepare.config)?;
+    let mut config = handed_over(&prepare.config)?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);
     // The records the takeover hands over were read with the options; each configuration is
@@ -1309,8 +1309,31 @@ fn replica_options(
     printed: &str,
     daemon: &crate::config::Config,
 ) -> anyhow::Result<crate::config::Config> {
-    let (mut options, _) = crate::config::parse(printed)?;
+    let mut options = handed_over(printed)?;
     proto::reload::Reload::take(&mut options, daemon, proto::reload::Effect::Daemon);
+    Ok(options)
+}
+
+/// A configuration a predecessor handed over, `printed` as it prints its options and each
+/// replica's configuration, read as a package's `config.toml` is, with its checkpoint stated
+/// once. The leader of an earlier build names every replica's model in `model`, which for a
+/// deployment that states `model_dir` is that directory again: such a `model` is the leader's
+/// name of the directory, not a statement of the package, and is dropped, so the options are
+/// validated as a start validates the package. A `model` that names anything else beside
+/// `model_dir` is kept, and refused as a start refuses it.
+///
+/// # Errors
+///
+/// As [`crate::config::parse`].
+fn handed_over(printed: &str) -> anyhow::Result<crate::config::Config> {
+    let (mut options, _) = crate::config::parse(printed)?;
+    let directory = options
+        .model_dir
+        .as_deref()
+        .and_then(std::path::Path::to_str);
+    if directory.is_some() && options.model.as_deref() == directory {
+        options.model = None;
+    }
     Ok(options)
 }
 
@@ -1616,6 +1639,119 @@ mod tests {
                 unread.is_empty(),
                 "a build of the oldest version does not read {unread:?}"
             );
+        }
+    }
+
+    /// The checkpoint directory every case below states.
+    const MODEL_DIR: &str = "/models/checkpoint";
+
+    /// `printed`, a configuration of the handoff, as the oldest version's leader prints it for a
+    /// deployment whose package states `model_dir`: that leader names the replica's model in
+    /// `model`, which is then the directory again.
+    fn with_directory(printed: &str, model: &str) -> String {
+        let (mut options, _) = crate::config::parse(printed).expect("the fixture's configuration");
+        options.model_dir = Some(MODEL_DIR.into());
+        options.model = Some(model.to_owned());
+        crate::config::printed(&options).expect("the configuration prints")
+    }
+
+    /// A successor reads the hot restart of a predecessor of the oldest version that serves a
+    /// checkpoint directory: in the options (`Prepare`) and in every replica's record of the
+    /// takeover, the `model` the predecessor's leader wrote beside `model_dir` is the directory,
+    /// and the configuration reads as the directory stated once, which validates as a start of
+    /// the package does. A `model` that names another checkpoint beside the directory is the
+    /// package's own statement of two checkpoints, and is refused as a start refuses it.
+    #[test]
+    fn the_handoff_of_a_checkpoint_directory_states_it_once() {
+        use crate::test_support::oldest;
+
+        let checks = |printed: &str, read: &dyn Fn(&str) -> crate::config::Config| {
+            let options = read(&with_directory(printed, MODEL_DIR));
+            assert_eq!(options.model, None);
+            assert_eq!(
+                options.model_dir.as_deref(),
+                Some(std::path::Path::new(MODEL_DIR))
+            );
+            assert_eq!(options.model(), MODEL_DIR);
+            options
+                .validate(&Stated::from_paths(vec!["model_dir".to_owned()]))
+                .expect("the options validate as a start of the package");
+            crate::epoch::Epoch::of(options).expect("the configuration resolves");
+
+            let other = read(&with_directory(printed, "org/other-model"));
+            let refused = other
+                .validate(&Stated::from_paths(vec![
+                    "model".to_owned(),
+                    "model_dir".to_owned(),
+                ]))
+                .expect_err("two checkpoints are refused");
+            assert!(
+                refused.to_string().contains("both state one checkpoint"),
+                "{refused:#}"
+            );
+        };
+
+        let Message::Prepare(prepare) = <Message as service::Message>::decode(oldest::PREPARE)
+            .expect("this build reads the options of the oldest version")
+        else {
+            panic!("the fixture holds no options");
+        };
+        checks(&prepare.config, &|printed| {
+            handed_over(printed).expect("the options' configuration")
+        });
+
+        let Message::Takeover(takeover) = <Message as service::Message>::decode(oldest::TAKEOVER)
+            .expect("this build reads the takeover of the oldest version")
+        else {
+            panic!("the fixture holds no takeover");
+        };
+        assert!(
+            !takeover.replicas.is_empty(),
+            "the takeover hands a replica over"
+        );
+        for replica in &takeover.replicas {
+            checks(&replica.config, &|printed| {
+                replica_options(printed, &crate::config::Config::default())
+                    .expect("the replica's configuration")
+            });
+        }
+    }
+
+    /// What a leader of this build hands over for a deployment whose package states a
+    /// checkpoint directory: each replica's configuration, as the takeover's record prints it,
+    /// states the directory alone, so a successor of any build validates it as a start of the
+    /// package.
+    #[tokio::test]
+    async fn a_leader_hands_a_checkpoint_directory_over_as_the_package_states_it() {
+        use crate::test_support::{
+            configured_tokenizer, fake_client, leader_with, test_model, text_fake,
+        };
+
+        let options = crate::config::Config {
+            model_dir: Some(MODEL_DIR.into()),
+            ..crate::config::Config::default()
+        };
+        let client = Arc::new(fake_client(
+            testkit::args(crate::test_support::SERVED_MODEL),
+            testkit::Fixture::new(text_fake),
+        ));
+        let leader = leader_with(
+            options,
+            test_model(crate::test_support::CHAT),
+            configured_tokenizer(),
+            vec![client],
+        );
+        for replica in leader.replicas() {
+            let printed =
+                crate::config::printed(&service::lock(&replica.config)).expect("the record prints");
+            let (read, stated) = crate::config::parse(&printed).expect("the record reads");
+            assert_eq!(read.model, None, "{printed}");
+            assert_eq!(
+                read.model_dir.as_deref(),
+                Some(std::path::Path::new(MODEL_DIR))
+            );
+            read.validate(&stated)
+                .expect("the record validates as a start of the package");
         }
     }
 
