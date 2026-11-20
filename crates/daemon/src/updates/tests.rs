@@ -17,7 +17,7 @@ use crate::config::{Config, UpdateConfig};
 use crate::epoch::{Epoch, EpochRecord, Epochs, PackageRevision, Recorded};
 use crate::observe::Observer;
 use crate::supervision::processes::Processes;
-use crate::test_support::Engines;
+use crate::test_support::{Engines, Seen};
 use crate::updates::entry::{Serving, Sides};
 use crate::updates::trial::{Baseline, Trial};
 use crate::updates::update::{EpochSwitch, Node, Update};
@@ -966,6 +966,221 @@ fn a_release_grows_the_scheduler_node_of_each_target_world_with_an_engine_on_its
     );
 }
 
+/// Where `timeline` first holds what `seen` matches.
+fn seen_at(timeline: &[Seen], seen: impl Fn(&Seen) -> bool) -> usize {
+    timeline
+        .iter()
+        .position(seen)
+        .unwrap_or_else(|| panic!("the leader never did it: {timeline:#?}"))
+}
+
+/// Whether `seen` is a `Grow` sent to the engine of launch generation `launch`.
+fn grow_to(launch: u64) -> impl Fn(&Seen) -> bool {
+    move |seen| matches!(seen, Seen::Command(engine, command::Kind::Grow(_)) if *engine == launch)
+}
+
+/// Whether `seen` is a claim on `host` that retires epoch `retired`.
+fn retiring(host: &'static str, retired: u64) -> impl Fn(&Seen) -> bool {
+    move |seen| match seen {
+        Seen::Request(kind) => matches!(
+            kind.as_ref(),
+            process::request::Kind::Claim(claim) if claim.host == host && claim.retire == [retired]
+        ),
+        Seen::Command(..) => false,
+    }
+}
+
+/// Whether `seen` is the stop of the engine of launch generation `launch`.
+fn stopping(launch: u64) -> impl Fn(&Seen) -> bool {
+    move |seen| match seen {
+        Seen::Request(kind) => matches!(
+            kind.as_ref(),
+            process::request::Kind::Stop(stop) if stop.generation == Some(launch)
+        ),
+        Seen::Command(..) => false,
+    }
+}
+
+/// A commit releases the previous epoch's storage, and the target is then sent `Grow` to grow
+/// into what that freed: after the stop that reaped the previous epoch's engine and the claim
+/// that retired its storage on its host, whatever the trial kept of it and whether or not the
+/// layouts differ, since its weights, graph pools and process storage leave the quota either
+/// way. Nothing grows the target before the commit but what the drain gives back.
+#[test]
+fn a_commit_grows_the_target_into_what_the_previous_epochs_release_freed() {
+    for keeps in [PreviousEpoch::Parked, PreviousEpoch::Host] {
+        for across in [true, false] {
+            let mut deployment = Deployment::new(Refusals::default());
+            let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
+            switch.keeps = keeps;
+            if across {
+                deployment.across_layouts(&mut switch);
+            }
+            let nodes = deployment.nodes(1);
+            let update = deployment.epoch_over(1, nodes, switch, LONG);
+            deployment.apply(update);
+            assert_eq!(deployment.status()["phase"], "trial");
+            assert_eq!(names(&deployment.engines.received(SPAWNED)), ["promote"]);
+
+            assert!(deployment.updater.commit().is_some());
+            deployment.run();
+            assert_eq!(
+                names(&deployment.engines.received(SPAWNED)),
+                ["promote", "grow"],
+                "{keeps:?}, across layouts: {across}"
+            );
+            let timeline = deployment.engines.timeline();
+            let grown = seen_at(&timeline, grow_to(SPAWNED));
+            assert!(seen_at(&timeline, stopping(PREVIOUS)) < grown);
+            assert!(seen_at(&timeline, retiring(HOST, SERVING)) < grown);
+        }
+    }
+}
+
+/// A commit's release on several hosts grows each target world once, through its scheduler
+/// node, which grows on every rank it holds, its peer's on the other host included: the `Grow`
+/// follows the claims that retired the previous epoch on both hosts, and the peer is sent none.
+#[test]
+fn a_commit_grows_each_target_world_once_through_its_scheduler_node() {
+    let mut deployment = Deployment::new(Refusals::default());
+    deployment.engines.serve(SECOND);
+    let nodes = vec![
+        Node::new(
+            HOST.to_owned(),
+            0,
+            PREVIOUS,
+            PREVIOUS,
+            scopes(0..2),
+            deployment.layout(),
+            SERVING,
+        ),
+        Node::new(
+            OTHER.to_owned(),
+            2,
+            SECOND,
+            PREVIOUS,
+            scopes(2..4),
+            deployment.layout(),
+            SERVING,
+        ),
+    ];
+    let world = proto::config::World {
+        scheduler: SPAWNED,
+        channel: "rank-0:7000".to_owned(),
+        store: "rank-0:7001".to_owned(),
+        peers: 1,
+        inherited: None,
+    };
+    let mut head = target_launch(HOST, 0, SPAWNED);
+    head.world = Some(world.clone());
+    let mut peer = target_launch(OTHER, 2, SPAWNED_PEER);
+    peer.world = Some(world);
+    let mut switch = deployment.switch(vec![(head, vec![1, 2]), (peer, Vec::new())]);
+    deployment.across_layouts(&mut switch);
+    let update = deployment.epoch_over(1, nodes, switch, LONG);
+    deployment.apply(update);
+    assert_eq!(deployment.status()["phase"], "trial");
+
+    assert!(deployment.updater.commit().is_some());
+    deployment.run();
+    assert_eq!(
+        names(&deployment.engines.received(SPAWNED)),
+        ["promote", "grow"]
+    );
+    assert_eq!(
+        names(&deployment.engines.received(SPAWNED_PEER)),
+        ["promote"]
+    );
+    let timeline = deployment.engines.timeline();
+    let grown = seen_at(&timeline, grow_to(SPAWNED));
+    for host in [HOST, OTHER] {
+        assert!(
+            seen_at(&timeline, retiring(host, SERVING)) < grown,
+            "{host}"
+        );
+    }
+}
+
+/// A rollback ends by stopping the target and retiring its storage, and the previous epoch,
+/// which serves again, is then sent `Grow` to grow into what that freed: a parked one at its own
+/// launch generation, and one its owner started again at the launch generation it serves at.
+#[test]
+fn a_rollback_grows_the_previous_epoch_into_what_the_targets_release_freed() {
+    const RELAUNCHED: u64 = 12;
+
+    let mut deployment = Deployment::new(Refusals::default());
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
+    deployment.apply(update);
+    deployment
+        .updater
+        .rollback(decision("the target answers worse"))
+        .expect("an update is on trial");
+    deployment.run();
+    assert_eq!(deployment.status()["phase"], "rolled_back");
+    assert_eq!(
+        names(&deployment.engines.received(PREVIOUS)),
+        ["drain", "promote", "grow"]
+    );
+    let timeline = deployment.engines.timeline();
+    let grown = seen_at(&timeline, grow_to(PREVIOUS));
+    assert!(seen_at(&timeline, stopping(SPAWNED)) < grown);
+    assert!(seen_at(&timeline, retiring(HOST, TARGET)) < grown);
+
+    // The trial stopped the previous epoch, and its owner starts it again for the rollback.
+    let mut deployment = Deployment::new(Refusals::default());
+    let update = deployment.epoch(1, PreviousEpoch::Weights, LONG);
+    deployment.apply(update);
+    deployment
+        .updater
+        .rollback(decision("the target answers worse"))
+        .expect("an update is on trial");
+    deployment.run();
+    deployment.engines.start_controlled(HOST, RELAUNCHED, BUILD);
+    deployment.updater.relaunched(PREVIOUS, RELAUNCHED);
+    deployment.run();
+    assert_eq!(deployment.status()["phase"], "rolled_back");
+    assert_eq!(names(&deployment.engines.received(RELAUNCHED)), ["grow"]);
+    let timeline = deployment.engines.timeline();
+    assert!(seen_at(&timeline, retiring(HOST, TARGET)) < seen_at(&timeline, grow_to(RELAUNCHED)));
+}
+
+/// An epoch an abandoned update dropped keeps its storage until the next epoch update's first
+/// claim retires it; that release grows the serving engine, which serves on while the next
+/// target prepares beside it.
+#[test]
+fn the_next_update_grows_the_serving_epoch_into_what_a_dropped_epochs_release_freed() {
+    const NEXT: u64 = 3;
+    const NEXT_SPAWNED: u64 = 11;
+
+    let mut deployment = Deployment::new(Refusals::default());
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+    deployment.engines.exit(HOST, SPAWNED, "signal: 9");
+    deployment.updater.advance();
+    assert_eq!(deployment.status()["phase"], "abandoned");
+    assert!(deployment.engines.received(PREVIOUS).is_empty());
+
+    let mut launch = target_launch(HOST, 0, NEXT_SPAWNED);
+    launch.epoch = NEXT;
+    let mut switch = deployment.switch(vec![(launch, Vec::new())]);
+    switch.epoch = NEXT;
+    switch.retire = deployment.updater.take_retire();
+    let nodes = deployment.nodes(1);
+    let update = deployment.epoch_over(2, nodes, switch, LONG);
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+    assert_eq!(deployment.updater.in_flight(), Some((2, Phase::Preparing)));
+    let timeline = deployment.engines.timeline();
+    assert!(seen_at(&timeline, retiring(HOST, TARGET)) < seen_at(&timeline, grow_to(PREVIOUS)));
+    deployment.run();
+    assert_eq!(names(&deployment.engines.received(PREVIOUS))[0], "grow");
+}
+
 /// The epoch form covers every node of both epochs: a target whose world
 /// spans two hosts starts one engine on each, its scheduler node inheriting
 /// the world's sockets, every node claims the target's storage, every target
@@ -1305,10 +1520,12 @@ fn a_change_of_the_replica_count_moves_every_replica() {
                 deployment.run();
                 assert_eq!(deployment.status()["phase"], "rolled_back", "{case}");
                 assert_eq!(*deployment.epochs.served().borrow(), SERVING, "{case}");
+                // Each previous engine serves again and grows into what the targets' release
+                // freed.
                 for engine in &previous {
                     assert_eq!(
                         names(&deployment.engines.received(*engine)),
-                        ["drain", "promote"],
+                        ["drain", "promote", "grow"],
                         "{case}: engine {engine}"
                     );
                 }
@@ -1734,9 +1951,10 @@ fn a_target_that_faults_on_trial_is_stopped_instead_of_drained() {
         "a failed target is not commanded again"
     );
     assert!(deployment.engines.stops().contains(&Some(SPAWNED)));
+    // It serves again, and grows into what the stopped target's release freed.
     assert_eq!(
         names(&deployment.engines.received(PREVIOUS)),
-        ["drain", "promote"]
+        ["drain", "promote", "grow"]
     );
     assert_eq!(*deployment.epochs.served().borrow(), SERVING);
 }
@@ -1756,8 +1974,8 @@ fn a_target_that_exits_on_trial_rolls_the_update_back() {
 }
 
 /// A target that fails while the switch runs, before the serving engine was
-/// drained, rolls back at once: the serving engine still serves, and the
-/// target is stopped.
+/// drained, rolls back at once: the serving engine still serves, the
+/// target is stopped, and the serving engine grows into what its release freed.
 #[test]
 fn a_target_that_fails_while_switching_leaves_the_serving_engine_serving() {
     let mut deployment = Deployment::new(Refusals::default());
@@ -1777,7 +1995,8 @@ fn a_target_that_fails_while_switching_leaves_the_serving_engine_serving() {
     deployment.engines.report(SPAWNED, fault);
     deployment.run();
     assert_eq!(deployment.status()["phase"], "rolled_back");
-    assert!(deployment.engines.received(PREVIOUS).is_empty());
+    // Never drained nor promoted, it only grows into what the stopped target's release freed.
+    assert_eq!(names(&deployment.engines.received(PREVIOUS)), ["grow"]);
     assert!(deployment.engines.stops().contains(&Some(SPAWNED)));
     assert_eq!(*deployment.epochs.served().borrow(), SERVING);
 }

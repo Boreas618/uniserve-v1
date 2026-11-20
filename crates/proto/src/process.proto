@@ -664,12 +664,15 @@ message Command {
     // Hold or release admissions, the `paused` gate, without
     // ending any request.
     Pause pause = 7;
-    // A serving engine gave device memory back on a host this engine has
-    // ranks on (`Shrunk`): sent to the scheduler node's main process, which
-    // has every rank it holds, on its host and on its peers' hosts, create
-    // the segments of its regions their devices' quotas now hold, grants
-    // them, and has its schedulers grow their regions into them. Answered
-    // by nothing; a target promoted with `grow` takes each one as it comes.
+    // Device memory came free on a host this engine has ranks on: a serving
+    // engine gave it back (`Shrunk`), or an update released an epoch's
+    // storage there (the previous epoch at a commit, the target at the end of
+    // a rollback, an epoch an earlier update dropped at the next update's
+    // first claim). Sent to the scheduler node's main process, which has
+    // every rank it holds, on its host and on its peers' hosts, create the
+    // segments of its regions their devices' quotas now hold, grants them,
+    // and has its schedulers grow their regions into them. Answered by
+    // nothing; a target promoted with `grow` takes each one as it comes.
     Grow grow = 9;
   }
 }
