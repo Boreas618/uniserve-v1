@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use crate::batch::philox::DrawAddress;
-use crate::batch::{Batch, BatchId, Columns, Phase, Row, Rows, Shape as BatchShape, Variant};
+use crate::batch::{
+    Batch, BatchId, Columns, DraftWork, Phase, Row, Rows, Shape as BatchShape, Variant,
+};
 use nn::NO_SLOT;
 use nn::family::{INDEX_KEY, TextModel};
 use ops::Generation;
@@ -42,10 +44,32 @@ const KV_UNITS: u32 = 32;
 /// The tokens of the runner's largest prefill bucket.
 const TOKENS: u32 = 256;
 
+/// The drafts of a verification of the block-drafting runner ([`drafting`]): a block of five,
+/// DeepSeek-V4.1's DSpark drafter's.
+const BLOCK: u32 = 5;
+
 /// The stub, a runner over a meta cache of its fields with every bucket captured, and the
 /// cache.
 fn runner() -> (Arc<LatentModel>, CausalLmRunner, KvCacheMemory) {
-    let model = Arc::new(LatentModel::new(0, Formats::REFERENCE).unwrap());
+    over(
+        Arc::new(LatentModel::new(0, Formats::REFERENCE).unwrap()),
+        0,
+    )
+}
+
+/// The stub with its drafter of the block form, a runner that verifies its blocks of
+/// [`BLOCK`] over a meta cache of its fields with every bucket captured, and the cache.
+fn drafting() -> (Arc<LatentModel>, CausalLmRunner, KvCacheMemory) {
+    over(
+        Arc::new(LatentModel::drafting(BLOCK, Formats::REFERENCE).unwrap()),
+        BLOCK,
+    )
+}
+
+/// `model`, a runner of `drafts` drafts a verification over a meta cache of its fields with
+/// every bucket captured, and the cache.
+fn over(model: Arc<LatentModel>, drafts: u32) -> (Arc<LatentModel>, CausalLmRunner, KvCacheMemory) {
+    let window = WINDOW + model.block_drafter().map_or(0, |drafter| drafter.block());
     let layout = CacheLayout::of(PAGE, &model.cache(), PrefixCacheDtype::BFloat16)
         .and_then(|layout| layout.with_state(&model.state_layers()))
         .unwrap();
@@ -57,22 +81,23 @@ fn runner() -> (Arc<LatentModel>, CausalLmRunner, KvCacheMemory) {
         segments: None,
         workspace_bytes: 1 << 16,
         states: (8, None),
-        windows: vec![window_units(WINDOW, PAGE, SLOTS, TOKENS)],
+        windows: vec![window_units(window, PAGE, SLOTS, TOKENS)],
     })
     .unwrap();
 
+    let buckets = Buckets::causal_lm(&[2, 4], &[TOKENS], true);
     let config = CausalLmConfig {
-        phases: vec![Phase::Prefill, Phase::Decode],
-        buckets: Buckets::causal_lm(&[2, 4], &[TOKENS], true),
+        phases: CausalLmRunner::served_phases(&buckets.with_drafts(drafts), model.as_ref()),
+        buckets,
         slots: SLOTS,
         page_size: PAGE,
         max_kv_len: PAGE * WIDTH,
         candidates: 1,
         scratch_pages: 0,
-        drafts: 0,
+        drafts,
         draft_pool: None,
     };
-    let state = StateConfig::of(model.as_ref(), SLOTS, &config.buckets, 0).unwrap();
+    let state = StateConfig::of(model.as_ref(), SLOTS, &config.buckets, drafts).unwrap();
     let state = StateMemory::meta(state, cache.config()).unwrap();
     let graphs = Graphs::meta(
         Arc::new(Generation::new(0, [])),
@@ -443,4 +468,150 @@ fn a_decode_writes_both_groups_and_reads_each_window_from_its_start() {
     assert_eq!(full[..2], [3 * PAGE + 100 % PAGE, 15 * PAGE + 260 % PAGE]);
     assert_eq!(window[..2], [2 * PAGE + 100 % PAGE, 9 * PAGE + 260 % PAGE]);
     assert_eq!(starts[..2], [0, 64]);
+}
+
+/// The bytes the runner staged last of `column`, its first `elements` elements.
+fn staged<T: bytemuck::Pod>(runner: &CausalLmRunner, column: Column, elements: usize) -> Vec<T> {
+    let start = runner.layout.offset(column) as usize;
+    let bytes = elements * std::mem::size_of::<T>();
+    bytemuck::pod_collect_to_vec(&runner.staged[start..start + bytes])
+}
+
+/// A verification on `slot` of the committed token at `position` and [`BLOCK`] drafts after it,
+/// one call of one row that proposes a block after the drafts it accepts.
+fn verification(slot: u32, position: u32) -> Batch {
+    let tokens = BLOCK as usize + 1;
+    let mut parameters = [0.0; PARAMETER_COLUMNS as usize];
+    parameters[TOP_P as usize] = 1.0;
+    let mut commit = vec![0; COMMIT_FIELDS];
+    commit[column::SLOT] = i64::from(slot);
+    commit[column::MODE] = mode::VERIFY;
+    commit[column::TASK] = 0;
+    commit[column::LOGICAL] = i64::from(position);
+    commit[column::SAMPLING] = 1;
+    commit[column::VISIBLE] = i64::from(position);
+
+    let end = position as i32 + tokens as i32;
+    let columns = Columns {
+        rows: Rows {
+            calls: vec![Row {
+                slot,
+                kind: Phase::Verify,
+                replay: 0..0,
+                rows: 0..1,
+            }],
+            positions: (position as i32..end).collect(),
+            cache_positions: (position as i32..end).collect(),
+            seq_lens: vec![end],
+            query_offsets: vec![0, tokens as i32],
+            logits_rows: vec![0],
+        },
+        input_ids: vec![3; tokens],
+        slots: vec![slot as i32],
+        parameters: parameters.to_vec(),
+        draws: vec![DrawAddress {
+            key: 1,
+            position: u64::from(position) + tokens as u64,
+        }],
+        commit,
+        checkpoints: vec![0],
+        page_size: PAGE,
+        max_kv_len: PAGE * WIDTH,
+        drafts: vec![DraftWork {
+            proposals: BLOCK,
+            ..DraftWork::default()
+        }],
+        ..Columns::default()
+    };
+    Batch {
+        id: BatchId(5),
+        group: GroupId(0),
+        phase: Phase::Verify,
+        kernels: 1,
+        policy: 1,
+        revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
+        shape: BatchShape::prefill(1, tokens as u32, Variant::DecodeGreedy),
+        requests: vec![RequestId(9)],
+        columns,
+        media: Vec::new(),
+        new_slots: Vec::new(),
+    }
+}
+
+/// A runner whose model drafts in the block form verifies over the model's own cache: it serves
+/// verifications and no decode, captures its drafter's bucket behind each verification and
+/// prefill size, and each drafter forward is lent the context of the bucket's tokens and a
+/// block of [`BLOCK`] tokens per row over the model's two groups, the window's with its rows'
+/// starts, every row's tables and slots the forward's own.
+#[test]
+fn a_block_drafter_drafts_over_the_model_s_own_cache() {
+    let (model, runner, _) = drafting();
+    let buckets = runner.buckets();
+    assert!(!buckets.iter().any(|bucket| bucket.variant.is_decode()));
+    for rows in [2, 4] {
+        let verify = Bucket::verify(rows, BLOCK, Variant::VerifyGreedy);
+        assert!(buckets.contains(&verify), "{verify}");
+        assert!(buckets.contains(&Bucket::draft(rows, verify.tokens)));
+    }
+
+    // The capture of the drafter's bucket behind a verification of four rows of six tokens.
+    let drafts = model.drafts();
+    let drafted = drafts
+        .iter()
+        .find(|draft| draft.context.1 == 24)
+        .expect("the drafter's bucket of 24 tokens was captured");
+    assert_eq!(drafted.block.1, 4 * BLOCK as usize);
+    for (groups, tokens) in [&drafted.context, &drafted.block] {
+        let [full, window] = groups.as_slice() else {
+            panic!("two groups a forward, not {groups:?}");
+        };
+        assert_eq!(full.slot_mapping, [*tokens]);
+        assert_eq!(window.slot_mapping, [*tokens]);
+        assert_eq!(full.block_tables[0], 4);
+        assert_eq!(window.block_tables[0], 4);
+        assert_eq!(window.starts.as_deref(), Some(&[4][..]));
+        assert!(full.starts.is_none());
+        // The window latent of the 40 target layers and of the three draft layers.
+        assert_eq!(window.planes.len(), 43);
+    }
+}
+
+/// A verification's block lies after the drafts it accepts, and its window slots are staged for
+/// every length it may agree on: the cells of the positions after its first token, `2 D` of
+/// them, each the slot of its page of the window's table, and none in the full history, which
+/// the drafter does not keep. The block's positions and its anchor are stated before the
+/// accepted drafts, which the device adds.
+#[test]
+fn a_verification_stages_its_block_s_window_slots_for_every_accepted_length() {
+    let (_, mut runner, _) = drafting();
+    let mut tables = tables();
+    attach(&mut tables, 1);
+    allocate(&mut tables, 1, (0, UNITS), 0, &[7, 3]);
+    allocate(&mut tables, 1, (1, WINDOWS), 0, &[5, 2]);
+
+    // Six tokens from 120: the block after them may lie from 121 up to 130, across the window's
+    // pages 1 (unit 2) and 2, which the slot does not hold.
+    let bucket = runner
+        .prepare_inputs(&verification(1, 120), &tables)
+        .unwrap();
+    let rows = bucket.rows as usize;
+    let cells = 2 * BLOCK as usize;
+    let slots: Vec<u32> = staged(&runner, Column::BlockCells, 2 * rows * cells);
+    let (full, window) = slots.split_at(rows * cells);
+
+    assert!(full.iter().all(|slot| *slot == NO_SLOT), "{full:?}");
+    let expected: Vec<u32> = (121..121 + cells as u32)
+        .map(|position| match position / PAGE {
+            1 => 2 * PAGE + position % PAGE,
+            _ => NO_SLOT,
+        })
+        .collect();
+    assert_eq!(window[..cells], expected[..]);
+    assert!(window[cells..].iter().all(|slot| *slot == NO_SLOT));
+
+    let positions: Vec<i32> = staged(&runner, Column::BlockPositions, BLOCK as usize);
+    assert_eq!(positions, [121, 122, 123, 124, 125]);
+    let anchors: Vec<u32> = staged(&runner, Column::BlockAnchors, 1);
+    assert_eq!(anchors, [0]);
 }

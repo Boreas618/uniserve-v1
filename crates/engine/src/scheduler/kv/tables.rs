@@ -582,9 +582,28 @@ fn proposals(request: &Request, config: &SchedulerConfig) -> u32 {
     if complete { drafts } else { 0 }
 }
 
+/// The positions after a prompt chunk ending at `end` that its drafter writes, in the request's
+/// own cache classes: a drafter of the block form, whose request keeps no draft class, drafts
+/// the block after the prompt's last token in the model's own cache, the proposals of a
+/// verification; any other chunk, and any chained drafter's, writes none there.
+fn prompt_proposals(
+    request: &Request,
+    end: u32,
+    groups: &[WorkerGroup],
+    config: &SchedulerConfig,
+) -> u32 {
+    let in_place = draft_class(request, groups).is_none();
+    if in_place && end >= request.num_prompt_tokens {
+        proposals(request, config)
+    } else {
+        0
+    }
+}
+
 /// Whether the blocks a call of `phase` of `tokens` tokens writes are ones the request holds and
 /// may write (SD §3.4, §4.4): its end lies within `allocated` (a verification's proposals
-/// included), a refill's within `allocated_draft`; every block it writes lies at or after its
+/// included, and the block drafter's proposals after a prompt, [`prompt_proposals`]), a refill's
+/// within `allocated_draft`; every block it writes lies at or after its
 /// class's `shared`; the first row on a slot that continues a cached prefix finds the checkpoint
 /// it restores; and a call that keeps a recurrent-state checkpoint holds that one writable. A
 /// media call's blocks are held from its admission.
@@ -596,7 +615,15 @@ pub(crate) fn holds_blocks_for(
 ) -> bool {
     let computed = request.num_computed_tokens;
     let (start, end, draft) = match phase {
-        Phase::Prefill | Phase::Decode => (computed, computed.saturating_add(tokens), false),
+        Phase::Prefill => {
+            let end = computed.saturating_add(tokens);
+            (
+                computed,
+                end.saturating_add(prompt_proposals(request, end, groups, config)),
+                false,
+            )
+        }
+        Phase::Decode => (computed, computed.saturating_add(tokens), false),
         Phase::Verify => {
             let end = computed.saturating_add(tokens);
             (
@@ -758,6 +785,14 @@ pub(crate) fn ahead(request: &Request, step: &Step) -> Vec<(u8, u32, u32, u32)> 
     let Some((phase, start, end)) = next_call(request, step) else {
         return asks;
     };
+    // The block a prompt's last chunk drafts after it lies in the request's own cache classes,
+    // beyond the tokens whose recurrent state the chunk keeps.
+    let written_end = match phase {
+        Phase::Prefill => {
+            end.saturating_add(prompt_proposals(request, end, step.groups, step.config))
+        }
+        _ => end,
+    };
     let groups = step.groups;
     let longest = longest(request, groups);
     let drafts = step.config.draft_tokens;
@@ -813,7 +848,7 @@ pub(crate) fn ahead(request: &Request, step: &Step) -> Vec<(u8, u32, u32, u32)> 
             continue;
         }
         let (end, required) = match (kind.is_draft(), refilled) {
-            (false, _) => (end, true),
+            (false, _) => (written_end, true),
             (true, None) => (end, false),
             (true, Some(end)) => (end, false),
         };

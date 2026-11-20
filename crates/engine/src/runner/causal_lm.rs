@@ -211,7 +211,9 @@ use self::slots::Slots;
 use self::speculation::{DraftPool, DraftTable, Entry, Kept, Speculation};
 use crate::memory::buffers::BufferMemory;
 use crate::memory::cache::{CacheLayout, scratch};
-use crate::memory::state::{StateConfig, StateMemory, Tensors as StateTensors, layer_fields};
+use crate::memory::state::{
+    StateConfig, StateMemory, Tensors as StateTensors, keeps_trail, layer_fields,
+};
 use crate::memory::tables::{BlockCopy, BlockTables, Change};
 use crate::runner::DeviceCopy;
 use crate::runner::buckets::{Bucket, Buckets};
@@ -255,7 +257,8 @@ pub struct CausalLmConfig {
     /// steps as verifications and runs its model's drafter behind every step.
     pub drafts: u32,
     /// How the draft cache lies in the cache's unit pool ([`DraftPool::of`]): stated exactly
-    /// when `drafts` is above zero.
+    /// when `drafts` is above zero and the model's drafter is of the chained form; a drafter of
+    /// the block form keeps its entries in the model's own cache fields and states none.
     pub draft_pool: Option<DraftPool>,
 }
 
@@ -485,16 +488,18 @@ impl CausalLmRunner {
         // A refill evaluates positions behind its slot's own from a state of their own, which
         // the runner has none of for a model whose layers or drafter keep a recurrent state, and
         // refuses: such a runner serves no refill, and a request whose draft cache lags verifies
-        // without drafts.
+        // without drafts. A drafter of the block form keeps no draft cache to refill: its
+        // entries are written with the target's.
         let stateless = model.state_layers().is_empty()
             && model
                 .drafter()
                 .is_none_or(|drafter| drafter.state_layers().is_empty());
+        let refills = stateless && model.block_drafter().is_none();
 
         buckets
             .phases()
             .into_iter()
-            .filter(|phase| *phase != Phase::Refill || stateless)
+            .filter(|phase| *phase != Phase::Refill || refills)
             .collect()
     }
 
@@ -643,14 +648,8 @@ impl CausalLmRunner {
             slots.bias().clone(),
         )?;
 
-        let speculation = match config.draft_pool {
-            Some(pool) if config.drafts > 0 => {
-                if model.drafter().is_none() {
-                    return Err(Error::Invalid(
-                        "the deployment speculates and its model loaded no drafter".into(),
-                    ));
-                }
-
+        let speculation = match drafting(&*model, &config)? {
+            Some(pool) => {
                 // A verification's rows count the drafts before the position they sample.
                 let verifier = Sampler::new(
                     SamplerConfig {
@@ -798,7 +797,7 @@ impl CausalLmRunner {
             .unwrap_or(0);
         let runs = self.model.state_layers();
         let layers: Vec<&[StateField]> = layer_fields(&runs).collect();
-        let trails = !layers.is_empty() && self.slots.accepted().is_none();
+        let trails = keeps_trail(&runs, self.config.drafts + 1) && self.slots.accepted().is_none();
 
         let trailed = match &trail {
             None => !trails,
@@ -816,8 +815,8 @@ impl CausalLmRunner {
         if !trailed {
             return Err(Error::Invalid(format!(
                 "a verification of a model that keeps a recurrent state keeps a trail of its \
-                 {tokens} tokens for every field unless its forwards lend verify slots, and any \
-                 other verification is lent none"
+                 {tokens} tokens for every field unless its forwards lend verify slots or its \
+                 every field is a ring, and any other verification is lent none"
             )));
         }
         check_drafter_state(&drafter_runs, self.config.slots, drafter.as_ref())?;
@@ -1035,11 +1034,7 @@ impl CausalLmRunner {
         for bucket in config.buckets.iter() {
             bucket.causal_lm()?;
         }
-        if config.drafts > 0 && config.draft_pool.is_none() {
-            return Err(Error::Invalid(
-                "a shape that verifies drafts over a cache that lays no draft cache out".into(),
-            ));
-        }
+        let pool = drafting(&**model, &config)?;
         config.phases = Self::served_phases(&config.buckets.with_drafts(config.drafts), &**model);
         let (mut buckets, layout) = stated(&config, &**model)?;
 
@@ -1137,25 +1132,15 @@ impl CausalLmRunner {
             slots.bias().clone(),
         )?;
         // A shape that verifies drafts keeps its own outputs for its drafter and selects with a
-        // verifier of its drafts; one that starts verifying lends its drafter the draft cache
-        // the runner keeps, and its model's drafter must read it.
-        let speculation = if config.drafts == 0 {
-            None
-        } else {
-            let pool = config.draft_pool.ok_or_else(|| {
-                Error::Invalid(
-                    "a shape that verifies drafts over a cache that lays no draft cache out".into(),
-                )
-            })?;
-            let draft = match &self.speculation {
-                Some(serving) => serving.draft.clone(),
-                None => self.draft_cache.clone(),
+        // verifier of its drafts; one that starts verifying lends a chained drafter the draft
+        // cache the runner keeps, and its model's drafter must read it.
+        let speculation = if let Some(pool) = pool {
+            // A block drafter's entries lie in the model's own cache: it is lent no draft cache.
+            let draft = match (&pool, &self.speculation) {
+                (None, _) => None,
+                (Some(_), Some(serving)) => serving.draft.clone(),
+                (Some(_), None) => self.draft_cache.clone(),
             };
-            if model.drafter().is_none() {
-                return Err(Error::Invalid(
-                    "a shape that verifies drafts with a model that loaded no drafter".into(),
-                ));
-            }
             if let Some(draft) = &draft {
                 check_draft_cache(&**model, draft)?;
             }
@@ -1182,6 +1167,8 @@ impl CausalLmRunner {
                 trail,
                 state: drafter_state,
             })
+        } else {
+            None
         };
         let features = self
             .features
@@ -1508,16 +1495,20 @@ impl CausalLmRunner {
 
     /// The draft pages of each row of `batch`, in row order, from its slot's entries of the
     /// draft group's class of `tables` ([`DraftPool::table`]); a row on no slot states none.
-    /// Empty for a runner that speculates nothing.
+    /// Empty for a runner that speculates nothing or drafts blocks, which keeps no draft pages.
     fn draft_tables(&self, batch: &Batch, tables: &BlockTables) -> Result<Vec<DraftTable>> {
-        let Some(speculation) = &self.speculation else {
+        let Some(pool) = self
+            .speculation
+            .as_ref()
+            .and_then(|speculation| speculation.pool)
+        else {
             return Ok(Vec::new());
         };
 
         let mut drafted = Vec::with_capacity(batch.columns.slots.len());
         for held in &batch.columns.slots {
             match u32::try_from(*held).ok().filter(|slot| *slot > 0) {
-                Some(slot) => drafted.push(speculation.pool.table(tables, slot)?),
+                Some(slot) => drafted.push(pool.table(tables, slot)?),
                 None => drafted.push((0, Vec::new(), Vec::new())),
             }
         }
@@ -1602,17 +1593,35 @@ impl CausalLmRunner {
         };
 
         let drafted = self.draft_tables(batch, tables)?;
-        if let Some(speculation) = &self.speculation {
-            speculation::fill_drafter(
+        match &self.speculation {
+            Some(Speculation {
+                pool: Some(pool), ..
+            }) => speculation::fill_drafter(
                 &self.layout,
-                &speculation.pool,
+                pool,
                 self.config.slots,
                 vocabulary,
                 &batch.columns,
                 &drafted,
                 bucket,
                 &mut self.staged,
-            )?;
+            )?,
+            Some(_) => {
+                let windows: Vec<bool> = self
+                    .cache
+                    .iter()
+                    .map(|group| group.starts.is_some())
+                    .collect();
+                speculation::fill_block(
+                    &self.layout,
+                    (self.config.slots, vocabulary, self.block_fill()?),
+                    &batch.columns,
+                    Some((tables, &windows, self.config.page_size)),
+                    bucket,
+                    &mut self.staged,
+                )?;
+            }
+            None => {}
         }
         Ok(masks)
     }
@@ -1955,20 +1964,38 @@ impl CausalLmRunner {
 
     /// The expert layers of one step of the union with no tokens of this member's own, which
     /// returns no output: the model's, then, for a runner that speculates, the drafter's once
-    /// per drafter forward of a step, `D` of them, as each peer's step runs them behind its
-    /// target forward (`speculation`, in an expert union).
+    /// per drafter forward of a step, as each peer's step runs them behind its target forward
+    /// (`speculation`, in an expert union): `D` forwards of a chained drafter, one of a block
+    /// drafter.
     fn join_expert_step(&self, exchange: &ExpertExchange) -> Result<Vec<Tensor>> {
         self.model.join_expert_step(exchange)?;
 
         if let Some(speculation) = &self.speculation {
-            let drafter = self.model.drafter().ok_or(Error::State(
-                "a speculating runner's model carries its drafter",
-            ))?;
-            for _ in 0..speculation.drafts {
-                drafter.join_expert_step(exchange)?;
+            match (self.model.block_drafter(), self.model.drafter()) {
+                (Some(drafter), _) => drafter.join_expert_step(exchange)?,
+                (None, Some(drafter)) => {
+                    for _ in 0..speculation.drafts {
+                        drafter.join_expert_step(exchange)?;
+                    }
+                }
+                (None, None) => {
+                    return Err(Error::State(
+                        "a speculating runner's model carries its drafter",
+                    ));
+                }
             }
         }
         Ok(Vec::new())
+    }
+
+    /// The token a block drafter's blocks fill the positions after their anchors with.
+    fn block_fill(&self) -> Result<u32> {
+        self.model
+            .block_drafter()
+            .map(|drafter| drafter.fill())
+            .ok_or(Error::State(
+                "a runner that drafts blocks has a model that carries a block drafter",
+            ))
     }
 
     /// The verify slots of a forward's `rows` state rows (`nn::VerifySlots`): their slots, an
@@ -2061,7 +2088,10 @@ impl Forward for CausalLmRunner {
             return self.forward_verification(bucket);
         }
         if bucket.variant == Variant::Draft {
-            return self.forward_drafter(bucket);
+            return match self.model.block_drafter() {
+                Some(_) => self.forward_block(bucket),
+                None => self.forward_drafter(bucket),
+            };
         }
         let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
         let decode = bucket.variant.is_decode();
@@ -2322,13 +2352,23 @@ impl Forward for CausalLmRunner {
         )?;
 
         match &self.speculation {
-            Some(speculation) if bucket.variant == Variant::Draft => speculation::fill_drafter(
+            Some(Speculation {
+                pool: Some(pool), ..
+            }) if bucket.variant == Variant::Draft => speculation::fill_drafter(
                 &self.layout,
-                &speculation.pool,
+                pool,
                 self.config.slots,
                 vocabulary,
                 &idle,
                 &[],
+                bucket,
+                columns,
+            ),
+            Some(_) if bucket.variant == Variant::Draft => speculation::fill_block(
+                &self.layout,
+                (self.config.slots, vocabulary, self.block_fill()?),
+                &idle,
+                None,
                 bucket,
                 columns,
             ),
@@ -2837,6 +2877,50 @@ impl Runner for CausalLmRunner {
     }
 }
 
+/// What a runner of `model` under `config` speculates with: `None` for a config of no drafts,
+/// and otherwise the draft pool its drafter's cache lies in, which a drafter of the block form
+/// keeps none of (`None` in turn).
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for a config of drafts whose model loaded no drafter, a chained drafter
+/// without the draft pool of its cache, a block drafter with one, of another block than the
+/// drafts or over a recurrent state its verifications cannot advance in place
+/// ([`keeps_trail`]), or a model that states both forms.
+fn drafting(model: &dyn TextModel, config: &CausalLmConfig) -> Result<Option<Option<DraftPool>>> {
+    if config.drafts == 0 {
+        return Ok(None);
+    }
+
+    match (model.drafter(), model.block_drafter(), config.draft_pool) {
+        (Some(_), None, Some(pool)) => Ok(Some(Some(pool))),
+        // A block drafter's runner is lent no trail: its verifications advance the model's state
+        // in place, which a state of rings long enough for them does.
+        (None, Some(drafter), None)
+            if drafter.block() == config.drafts
+                && !keeps_trail(&model.state_layers(), config.drafts + 1) =>
+        {
+            Ok(Some(None))
+        }
+        (None, Some(drafter), pool) => Err(Error::Invalid(format!(
+            "a block drafter drafts its {} tokens a forward over the model's own cache and \
+             state, which its verifications advance in place, and the deployment verifies {} \
+             drafts over the draft pool {pool:?}",
+            drafter.block(),
+            config.drafts
+        ))),
+        (Some(_), None, None) => Err(Error::Invalid(
+            "a shape that verifies drafts over a cache that lays no draft cache out".into(),
+        )),
+        (None, None, _) => Err(Error::Invalid(
+            "the deployment speculates and its model loaded no drafter".into(),
+        )),
+        (Some(_), Some(_), _) => Err(Error::Invalid(
+            "the model states a chained drafter and a block drafter, and drafts with one".into(),
+        )),
+    }
+}
+
 /// The buckets a runner of `config` states outside an expert union, and the layout of its
 /// input tensors.
 fn stated(config: &CausalLmConfig, model: &dyn TextModel) -> Result<(Buckets, Layout)> {
@@ -2846,6 +2930,7 @@ fn stated(config: &CausalLmConfig, model: &dyn TextModel) -> Result<(Buckets, La
     let pages = match (config.drafts, &config.draft_pool) {
         (0, _) => 0,
         (_, Some(pool)) => pool.width(config.max_kv_len),
+        (_, None) if model.block_drafter().is_some() => 0,
         (_, None) => {
             return Err(Error::Invalid(
                 "a config that states drafts states the draft pool of its cache".into(),

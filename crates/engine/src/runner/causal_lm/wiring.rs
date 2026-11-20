@@ -78,7 +78,9 @@ impl CausalLmRunner {
         }
         // A runner over a cache that lays the draft cache out keeps it, whether or not it
         // speculates now: a kernel generation of other drafts verifies over it.
-        if runner.config.drafts > 0 || cache.layout().draft_group().is_some() {
+        // A drafter of the block form keeps its entries in the model's own cache fields: it is
+        // lent no draft cache.
+        if runner.config.draft_pool.is_some() || cache.layout().draft_group().is_some() {
             runner.lend_draft(cache, state)?;
         }
         Ok(runner)

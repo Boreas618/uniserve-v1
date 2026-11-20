@@ -12,6 +12,10 @@
 //!
 //! and the compressor's remainder, a per-request ring of eight FP32 rows of 1024 on layers 2, 8
 //! and 14 ([`remainder`]), its groups the ratio-2 compressor's pairs.
+//!
+//! [`LatentModel::drafting`] gives the stub a drafter of the block form (`nn::BlockDrafter`), as
+//! DeepSeek-V4.1's DSpark drafter is, whose entries are the draft layers' window latent: it
+//! records what each of its forwards is lent ([`LentDraft`]).
 
 use std::sync::Mutex;
 
@@ -19,9 +23,12 @@ use nn::family::{
     CacheField, ExpertShape, FieldOwner, FieldReader, Format, History, INDEX_KEY, Layout, Record,
     StateField, StateRows, StateShape, TextModel, TokenHistory,
 };
-use nn::functional::{WeightOrder, embedding};
+use nn::functional::{WeightOrder, argmax, embedding};
 use nn::modules::Linear;
-use nn::{CausalLm, DType, Drafter, ExpertExchange, KvCache, RecurrentState, Tensor, TokenBatch};
+use nn::{
+    BlockDrafter, CausalLm, DType, DraftBlock, DraftContext, Drafter, ExpertExchange, KvCache,
+    RecurrentState, Tensor, TokenBatch,
+};
 
 /// Tokens of one page.
 pub const PAGE: u32 = 64;
@@ -156,14 +163,49 @@ pub struct LentGroup {
     pub starts: Option<Vec<usize>>,
 }
 
+/// What one forward of the stub's block drafter was lent: the context's groups and tokens, then
+/// the blocks' groups and tokens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LentDraft {
+    /// The groups the context is written through, and its tokens.
+    pub context: (Vec<LentGroup>, usize),
+    /// The groups the blocks attend through, and their tokens.
+    pub block: (Vec<LentGroup>, usize),
+}
+
+/// What a forward was lent of `group`.
+fn record(group: &KvCache) -> LentGroup {
+    LentGroup {
+        planes: group
+            .planes
+            .iter()
+            .map(|plane| {
+                (
+                    plane.field,
+                    plane.layer,
+                    plane.readers.clone(),
+                    plane.entries.dims().to_vec(),
+                )
+            })
+            .collect(),
+        block_tables: group.block_tables.dims().to_vec(),
+        slot_mapping: group.slot_mapping.dims().to_vec(),
+        starts: group.starts.as_ref().map(|starts| starts.dims().to_vec()),
+    }
+}
+
 /// The stub model (module documentation).
 pub struct LatentModel {
     draft_tokens: u32,
     formats: Formats,
+    /// The tokens of a block its drafter of the block form drafts, zero for a stub without one.
+    block: u32,
     table: Tensor,
     head: Linear,
     /// What each forward was lent, group by group, in the order of the forwards.
     pub lent: Mutex<Vec<Vec<LentGroup>>>,
+    /// What each forward of its block drafter was lent, in their order.
+    pub drafted: Mutex<Vec<LentDraft>>,
 }
 
 /// A meta tensor of `shape` and `dtype`: extents and an element type at an address nothing
@@ -183,6 +225,7 @@ impl LatentModel {
         Ok(Self {
             draft_tokens,
             formats,
+            block: 0,
             table: meta((VOCABULARY, HIDDEN), DType::BF16)?,
             head: Linear::new(
                 meta((VOCABULARY, HIDDEN), DType::BF16)?,
@@ -190,7 +233,31 @@ impl LatentModel {
                 WeightOrder::NxK,
             )?,
             lent: Mutex::new(Vec::new()),
+            drafted: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The stub with a drafter of the block form that drafts blocks of `block` tokens in its own
+    /// cache fields, the window latent's draft layers, as DeepSeek-V4.1's DSpark drafter does.
+    ///
+    /// # Errors
+    ///
+    /// When a meta tensor cannot be made.
+    pub fn drafting(block: u32, formats: Formats) -> nn::Result<Self> {
+        Ok(Self {
+            block,
+            ..Self::new(block, formats)?
+        })
+    }
+
+    /// What its block drafter's forwards so far were lent.
+    ///
+    /// # Panics
+    ///
+    /// When a forward panicked holding the record.
+    pub fn drafts(&self) -> Vec<LentDraft> {
+        #[expect(clippy::unwrap_used, reason = "a test's record")]
+        self.drafted.lock().unwrap().clone()
     }
 
     /// What the forwards so far were lent.
@@ -234,23 +301,6 @@ impl CausalLm for LatentModel {
             group.check(batch)?;
         }
 
-        let record = |group: &KvCache| LentGroup {
-            planes: group
-                .planes
-                .iter()
-                .map(|plane| {
-                    (
-                        plane.field,
-                        plane.layer,
-                        plane.readers.clone(),
-                        plane.entries.dims().to_vec(),
-                    )
-                })
-                .collect(),
-            block_tables: group.block_tables.dims().to_vec(),
-            slot_mapping: group.slot_mapping.dims().to_vec(),
-            starts: group.starts.as_ref().map(|starts| starts.dims().to_vec()),
-        };
         let mut lent = self
             .lent
             .lock()
@@ -297,7 +347,65 @@ impl TextModel for LatentModel {
         None
     }
 
+    fn block_drafter(&self) -> Option<&dyn BlockDrafter> {
+        (self.block > 0).then_some(self as &dyn BlockDrafter)
+    }
+
     fn token_history(&self) -> Option<TokenHistory> {
         None
+    }
+}
+
+/// The stub's drafter of the block form: it checks each group it is lent against the batch it
+/// is lent for, records them, and returns the blocks' embeddings as their rows.
+impl BlockDrafter for LatentModel {
+    fn block(&self) -> u32 {
+        self.block
+    }
+
+    fn fill(&self) -> u32 {
+        VOCABULARY as u32 - 1
+    }
+
+    fn forward(
+        &self,
+        context: &DraftContext<'_>,
+        block: &DraftBlock<'_>,
+        _: Option<&ExpertExchange>,
+    ) -> nn::Result<Tensor> {
+        for group in context.cache {
+            group.check(context.batch)?;
+        }
+        for group in block.cache {
+            group.check(block.batch)?;
+        }
+        let (tokens, blocks) = (context.batch.tokens(), block.batch.tokens());
+        if context.hidden.dims() != [tokens, HIDDEN]
+            || block.embedded.dims() != [blocks, HIDDEN]
+            || !blocks.is_multiple_of(self.block as usize)
+        {
+            return Err(nn::Error::Unsupported(format!(
+                "a context of {tokens} tokens with rows {:?} and blocks of {blocks} tokens with \
+                 embeddings {:?}",
+                context.hidden.dims(),
+                block.embedded.dims()
+            )));
+        }
+
+        let mut drafted = self
+            .drafted
+            .lock()
+            .map_err(|_| nn::Error::Unsupported("the record of a panicked forward".into()))?;
+        drafted.push(LentDraft {
+            context: (context.cache.iter().map(record).collect(), tokens),
+            block: (block.cache.iter().map(record).collect(), blocks),
+        });
+        Ok(block.embedded.clone())
+    }
+
+    /// The argmax of each block token's logits.
+    fn propose(&self, logits: &Tensor, anchors: &Tensor) -> nn::Result<Tensor> {
+        let rows = anchors.dim(0)?;
+        Ok(argmax(logits)?.reshape((rows, self.block as usize))?)
     }
 }

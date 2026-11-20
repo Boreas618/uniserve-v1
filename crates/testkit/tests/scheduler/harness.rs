@@ -237,6 +237,18 @@ impl Deployment {
         self
     }
 
+    /// A deployment that speculates with a drafter of the block form (`nn::BlockDrafter`): as
+    /// [`Self::speculative`], but the drafter keeps its entries in the model's own cache, so the
+    /// model states no draft cache group and its token groups refill nothing.
+    pub(crate) fn drafting_blocks(self, drafts: u32) -> Self {
+        let mut deployment = self.speculative(drafts);
+        for (_, phases) in &mut deployment.groups {
+            phases.retain(|phase| *phase != Phase::Refill);
+        }
+        deployment.cache.retain(|(kind, _)| !kind.is_draft());
+        deployment
+    }
+
     /// A speculating deployment's token groups as a speculating rank states them: verifications
     /// in place of decodes, since the rank captures verification buckets and no decode bucket.
     pub(crate) fn verifying(mut self) -> Self {

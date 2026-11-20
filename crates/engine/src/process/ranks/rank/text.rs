@@ -76,8 +76,11 @@ impl ModelRunner {
         } else {
             0
         };
+        // A drafter of the block form keeps its entries in the model's own cache fields, and
+        // its cache lays out no draft group.
         let draft_pool = match (drafts, layout.draft_group()) {
             (0, None) => None,
+            (_, None) if model.block_drafter().is_some() => None,
             _ => Some(DraftPool::of(layout, units)?),
         };
 

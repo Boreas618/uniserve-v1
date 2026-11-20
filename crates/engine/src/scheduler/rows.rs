@@ -190,12 +190,15 @@ impl Scheduler {
             targets = ids.iter().skip(1).copied().chain([next]).collect();
         }
 
-        // What the call does for the draft cache, in a deployment whose drafter keeps one.
-        let speculates = self.config.draft_tokens > 0
-            && capacity
-                .cache_groups
-                .iter()
-                .any(|(kind, _)| kind.is_draft());
+        // What the call does for the drafter, in a deployment that speculates: a drafter of the
+        // chained form keeps a draft cache, whose entries read the token after their position,
+        // and one of the block form its entries in the model's own cache, which read none; both
+        // propose after a prompt's last chunk.
+        let speculates = self.config.draft_tokens > 0;
+        let draft_cache = capacity
+            .cache_groups
+            .iter()
+            .any(|(kind, _)| kind.is_draft());
         let proposals = if request.num_draft_tokens >= start {
             u32::try_from(self.config.draft_tokens).ok()?
         } else {
@@ -206,7 +209,7 @@ impl Scheduler {
             // follows, which carries none.
             Phase::Prefill if speculates => DraftWork {
                 proposals: if end == prompt { proposals } else { 0 },
-                lookahead: if end < prompt {
+                lookahead: if end < prompt && draft_cache {
                     lookahead(request, end, bos)
                 } else {
                     None
