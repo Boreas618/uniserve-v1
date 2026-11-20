@@ -92,10 +92,13 @@ pub fn subscribe() -> Result<()> {
         .get_or_init(|| {
             let cupti = cupti()?;
             let mut handle = std::ptr::null_mut();
+            // The subscription may be CUPTI's first attachment to the driver, which runs
+            // between NVML sessions' openings and closings (`crate::nvml::between_sessions`).
             check(
-                // SAFETY: CUPTI writes the subscriber handle; the dispatch
-                // never unwinds.
-                unsafe { (cupti.subscribe)(&mut handle, dispatch, std::ptr::null_mut()) },
+                crate::nvml::between_sessions(|| {
+                    // SAFETY: CUPTI writes the subscriber handle; the dispatch never unwinds.
+                    unsafe { (cupti.subscribe)(&mut handle, dispatch, std::ptr::null_mut()) }
+                }),
                 "cuptiSubscribe",
             )?;
             *lock(&ENABLED) = Some(Enabled::default());
