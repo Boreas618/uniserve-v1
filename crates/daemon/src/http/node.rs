@@ -538,7 +538,11 @@ impl Node {
         package: &Package,
         lock: Option<crate::epoch::ModuleSet>,
     ) -> Result<crate::epoch::ModuleSet> {
-        let fixed = self.fix_programs(package, lock.as_ref()).await?;
+        // The deployment comes up with the package's options, so the daemon that serves it
+        // serves with the package's Build Server settings.
+        let fixed = self
+            .fix_programs(package, &package.config.build_config, lock.as_ref())
+            .await?;
         let named = lock.unwrap_or_else(|| crate::epoch::modules_of(&package.config));
         Ok(crate::epoch::with_programs(
             named,
@@ -547,9 +551,10 @@ impl Node {
         ))
     }
 
-    /// The programs of `package` fixed at the deployment's Build Server on this node, started
-    /// when none serves there; those `lock` records keep their revisions. A package of no
-    /// program needs no Build Server for them.
+    /// The programs of `package` fixed at the deployment's Build Server on this node, which
+    /// serves with `settings`, the settings of the daemon that serves the node, and is started
+    /// with them when none serves there (`ensure_build_server`); those `lock` records keep their
+    /// revisions. A package of no program needs no Build Server for them.
     ///
     /// # Errors
     ///
@@ -557,6 +562,7 @@ impl Node {
     async fn fix_programs(
         &self,
         package: &Package,
+        settings: &build_server::command::Settings,
         lock: Option<&crate::epoch::ModuleSet>,
     ) -> Result<crate::programs::fix::Fixed> {
         if package.config.programs.is_empty() {
@@ -566,13 +572,11 @@ impl Node {
             service::RuntimeDirectory::of_user().context("finding the user's runtime directory")?;
         let deployment = self.deployment.clone();
         let package = package.clone();
+        let settings = settings.clone();
         let locked = lock.map(|lock| lock.programs.clone()).unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let socket = crate::engine::control::ensure_build_server(
-                &runtime,
-                &deployment,
-                &package.config.build_config,
-            )?;
+            let socket =
+                crate::engine::control::ensure_build_server(&runtime, &deployment, &settings)?;
             crate::programs::fix::fix(&socket, &package, &locked)
                 .context("fixing the package's programs")
         })
@@ -860,7 +864,7 @@ impl Node {
         {
             // A program installed at the Build Server may have a later revision too.
             let fixed = self
-                .fix_programs(&package, None)
+                .fix_programs(&package, &routes.leader.build_settings(), None)
                 .await
                 .map_err(|error| Refused::new(StatusCode::CONFLICT, format!("{error:#}")))?;
             let locked = stored.lock.as_ref().map(|lock| &lock.programs);
@@ -918,9 +922,17 @@ impl Node {
         };
         // The package's programs are fixed first: the scheduling program among them is the
         // engines' policy, and the others' instances are replaced once the change converged.
+        // They are fixed at the Build Server the daemon serves with. A package of other Build
+        // Server settings restarts the daemon, and its successor fixes them at the server of
+        // those settings once it took the deployment over: this daemon replaces no server for
+        // them, so a restart that does not hand the deployment over leaves the server as it is.
+        let serving_build = leader.build_settings();
         let fixed = match configured {
+            Ok(()) if package.config.build_config != serving_build => {
+                Ok(crate::programs::fix::Fixed::default())
+            }
             Ok(()) => self
-                .fix_programs(&package, None)
+                .fix_programs(&package, &serving_build, None)
                 .await
                 .map_err(|error| crate::leader::UpdateError::Refused(format!("{error:#}"))),
             Err(error) => Err(crate::leader::UpdateError::Refused(format!("{error:#}"))),
@@ -1050,6 +1062,12 @@ impl Node {
 
     /// Converges the change whose daemon options a hot restart applied before it handed the
     /// deployment to this daemon: its revision, forced as its writer forced it.
+    ///
+    /// The handover committed, so the deployment's Build Server on this node is this daemon's
+    /// from here: it first serves with this daemon's settings ([`Node::serve_build_server`]),
+    /// before the replica's standby starts and before anything of the change resolves a module
+    /// there. A server that cannot be started with them ends the change, recorded as rolled
+    /// back, and the deployment serves on without the rest of it.
     async fn resume(&self, then: crate::restart::Then) {
         let crate::restart::Then {
             revision: number,
@@ -1063,6 +1081,25 @@ impl Node {
                     "the deployment does not serve",
                 )
             })?;
+            let began = Instant::now();
+            if let Err(error) = self.serve_build_server(&routes.leader).await {
+                let message = format!(
+                    "the deployment's Build Server does not serve with this daemon's settings: \
+                     {error:#}"
+                );
+                self.revisions
+                    .ended(
+                        number,
+                        Outcome::RolledBack,
+                        message.clone(),
+                        began.elapsed().as_secs_f64(),
+                    )
+                    .map_err(Refused::state)?;
+                self.observe_revision(number);
+                return Err(Refused::new(StatusCode::INTERNAL_SERVER_ERROR, message));
+            }
+            // The successor's standby resolves its engine at that server (`restart.rs`).
+            routes.leader.replicas()[0].start_standby();
             let stored = self.revisions.load(number).map_err(Refused::state)?;
             Box::pin(self.converge(&routes, number, stored.package, force)).await
         };
@@ -1075,6 +1112,28 @@ impl Node {
                 "the change after the hot restart did not converge: {}", refused.message
             ),
         }
+    }
+
+    /// Has the deployment's Build Server on this node serve with the settings this daemon serves
+    /// with ([`Leader::build_settings`]), stopping a server of other settings and starting it
+    /// again with them (`ensure_build_server`): what a hot restart's successor does once it
+    /// serves, since the server was its predecessor's until the handover. A start from a
+    /// `source` tree installs the tree's packages before the server serves, which takes minutes
+    /// while the deployment serves on.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server cannot be stopped or started.
+    async fn serve_build_server(&self, leader: &Leader) -> Result<()> {
+        let settings = leader.build_settings();
+        let deployment = self.deployment.clone();
+        tokio::task::spawn_blocking(move || {
+            let runtime = service::RuntimeDirectory::of_user()
+                .context("finding the user's runtime directory")?;
+            crate::engine::control::ensure_build_server(&runtime, &deployment, &settings).map(drop)
+        })
+        .await
+        .context("starting the deployment's Build Server did not complete")?
     }
 
     /// The programs of the revision that serves, which start in the background
@@ -1163,7 +1222,12 @@ impl Node {
         if programs.ended().is_cancelled() {
             return;
         }
-        let fixed = match self.fix_programs(&package, lock.as_ref()).await {
+        // The programs run at the Build Server the daemon serves with, which for a hot restart's
+        // successor is its own, whatever the current revision's package states.
+        let fixed = match self
+            .fix_programs(&package, &leader.build_settings(), lock.as_ref())
+            .await
+        {
             Ok(fixed) => fixed,
             Err(error) => {
                 warn!("the deployment's programs do not run: {error:#}");

@@ -1,7 +1,8 @@
 //! Fixtures shared by the crate's tests, one each: the byte tokenizer, in-storage tokenizer
 //! loading, the engine over fakes below its schedulers, an engine a test plays itself, the video
-//! service, the server's router, the connection requests are served over, and the records a
-//! build of the engine interface's oldest version writes ([`oldest`]).
+//! service, the server's router, the connection requests are served over, the records a build of
+//! the engine interface's oldest version writes ([`oldest`]), and a deployment's Build Server as
+//! a daemon finds it serving ([`build_server`]).
 //!
 //! Requests travel over an HTTP/1.1 connection the daemon's own connection code serves
 //! (`http::conn`) into the server's router (`http::router`) and a real `Leader`, whose client
@@ -41,6 +42,7 @@ use crate::config::{Config, LoggingConfig, ServerConfig, VideoJobConfig};
 use crate::engine::client::{EngineClient, EngineInfo, EngineState};
 use crate::leader::Leader;
 
+pub(crate) mod build_server;
 pub(crate) mod oldest;
 
 /// Served model name the test engines serve under.

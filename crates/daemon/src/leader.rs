@@ -972,6 +972,16 @@ impl Leader {
         service::lock(&self.replicas()[0].config).storage_settings()
     }
 
+    /// The settings of the deployment's Build Server on the leader's node: the `build_config`
+    /// of the daemon options the deployment serves with, which every replica's configuration
+    /// carries. A package's other settings take effect only through the hot restart its change
+    /// is, whose successor serves with them.
+    pub(crate) fn build_settings(&self) -> build_server::command::Settings {
+        service::lock(&self.replicas()[0].config)
+            .build_config
+            .clone()
+    }
+
     /// Has the deployment's Storage Server on every node serve with `settings`
     /// (`EngineControl::configure_storage`), and returns once each does: what a change of
     /// `storage_config` or of the Mooncake connector does to the servers, before the engines
