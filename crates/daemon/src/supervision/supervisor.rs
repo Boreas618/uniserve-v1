@@ -762,7 +762,9 @@ impl Supervisor {
 }
 
 impl Drop for Supervisor {
-    /// A daemon's processes never outlive it, unless it handed them over.
+    /// A daemon's processes never outlive it, unless it handed them over. Its GPU claims drop
+    /// with its fields after this returns, so they are released only once every process it
+    /// supervised ended.
     fn drop(&mut self) {
         self.terminate_all();
     }
