@@ -189,6 +189,12 @@ static CUPTI: OnceLock<Result<Cupti>> = OnceLock::new();
 
 /// The process's CUPTI table, loading the library and checking its version on
 /// first use. A failed load is cached and returned to every caller.
+///
+/// Loading attaches nothing to the driver. Every call of the crate that can be
+/// CUPTI's first attachment to the driver in the process (the subscription,
+/// the profiling initialization, PC sampling's enabling, NVTX's injection; the
+/// crate's other calls that reach the driver follow one of them) runs through
+/// [`crate::nvml::between_sessions`].
 pub(crate) fn cupti() -> Result<&'static Cupti> {
     CUPTI
         .get_or_init(|| {
@@ -240,8 +246,12 @@ fn require_version(version: u32) -> Result<()> {
 /// Called only by NVTX's loader, with the export table function it passes.
 pub unsafe extern "C" fn initialize_nvtx_injection(get_export_table: *const c_void) -> c_int {
     match cupti() {
-        // SAFETY: forwarded from NVTX's loader, which passes its export table.
-        Ok(cupti) => unsafe { (cupti.nvtx_injection)(get_export_table) },
+        // CUPTI's injection may be its first attachment to the driver, which runs between NVML
+        // sessions' openings and closings (`crate::nvml::between_sessions`).
+        Ok(cupti) => crate::nvml::between_sessions(|| {
+            // SAFETY: forwarded from NVTX's loader, which passes its export table.
+            unsafe { (cupti.nvtx_injection)(get_export_table) }
+        }),
         Err(_) => 0,
     }
 }

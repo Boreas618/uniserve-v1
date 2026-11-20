@@ -4,9 +4,10 @@
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
@@ -570,6 +571,49 @@ fn nvml_attributes_device_storage_to_this_process() {
         Err(Error::ProcessNotFound { pid, .. }) => assert_eq!(pid, std::process::id()),
         Err(error) => panic!("{error}"),
     }
+}
+
+/// NVML sessions keep opening and closing on several threads while CUPTI
+/// attaches to the CUDA driver: every session thread ends. The attachment makes
+/// the driver's lock functions for NVML do nothing from then on, so a session
+/// opening or closing at that moment would keep the driver's lock and the
+/// threads waiting for it would wait forever (`platform::nvml`, which orders the
+/// two). The process half is the package's helper executable
+/// (`tests/helpers/nvml_sessions.rs`): CUPTI attaches once per process.
+#[test]
+#[ignore = "requires a CUDA device, NVML and CUPTI"]
+fn nvml_sessions_open_and_close_across_cupti_s_attachment() {
+    let _driver = exclusive_driver();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nvml-sessions"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The helper's sessions and attachment take about a second; a thread that waits for the
+    // driver's lock waits forever, so the wait is bounded and the process ended past it.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut ended = None;
+    while ended.is_none() && Instant::now() < deadline {
+        ended = child.try_wait().unwrap();
+        thread::sleep(Duration::from_millis(100));
+    }
+    if ended.is_none() {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        ended.is_some_and(|status| status.success()),
+        "the session threads did not all end within the bound: {stdout}{stderr}"
+    );
+    let finished = stdout
+        .lines()
+        .filter(|line| line.starts_with("sessions "))
+        .count();
+    assert_eq!(finished, 4, "{stdout}");
 }
 
 /// Rows of a pitched fill may each lie in a mapped segment while the range

@@ -6,9 +6,12 @@
 //! with the driver and is opened by its soname; a session refuses an NVML whose
 //! CUDA driver version is older than the `cuda.h` the crate's bindings are
 //! generated from.
+//!
+//! A session's opening and closing are ordered against CUPTI's attachment to
+//! the CUDA driver ([`between_sessions`]).
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use libloading::Library;
 
@@ -16,6 +19,32 @@ use crate::sys::nvml as sys;
 use crate::{DeviceId, DeviceUuid, Error, Result};
 
 const LIBNVML: &str = "libnvidia-ml.so.1";
+
+/// Held while an NVML session opens or closes, and while a CUPTI call that may
+/// attach CUPTI to the CUDA driver runs ([`between_sessions`]).
+static SESSIONS: Mutex<()> = Mutex::new(());
+
+/// Runs `attach`, a CUPTI call that may be the process's first attachment of
+/// CUPTI to the CUDA driver, while no NVML session opens or closes in the
+/// process, and returns its result.
+///
+/// `nvmlInit` and `nvmlShutdown` take a recursive lock of the CUDA driver's,
+/// through lock and unlock functions the driver lends NVML; they are the only
+/// NVML entry points that take it. CUPTI's first attachment to the driver in a
+/// process (its first `cuptiSubscribe`, `cuptiActivityRegisterCallbacks`,
+/// `cuptiActivityEnable` or `cuptiProfilerInitialize`) makes both functions
+/// return without touching the lock, for the rest of the process. A thread
+/// inside `nvmlInit` or `nvmlShutdown` at that moment therefore never releases
+/// the lock, and every thread already waiting for it in another session's
+/// opening or closing waits forever, in `nvmlInitWithFlags` or `nvmlShutdown`
+/// (driver 580.82.07). Every opening, closing and attachment takes this one
+/// lock, so an attachment runs only between them. Each holds it for one driver
+/// call; once CUPTI is attached, the openings and closings no longer take the
+/// driver's lock.
+pub(crate) fn between_sessions<T>(attach: impl FnOnce() -> T) -> T {
+    let _sessions = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    attach()
+}
 
 /// What a refused NVML is told to install: NVML ships with the driver.
 const NVML_PACKAGE: &str = "the NVIDIA driver of CUDA 13.0 or later";
@@ -164,8 +193,9 @@ impl Nvml {
     /// crate's bindings are generated from.
     pub fn init() -> Result<Self> {
         let api = api()?;
-        // SAFETY: nvmlInit takes no arguments and is reference counted.
-        api.check(unsafe { (api.init)() }, "nvmlInit_v2")?;
+        // SAFETY: nvmlInit takes no arguments and is reference counted. It takes the CUDA
+        // driver's lock, which a CUPTI attachment must not find held ([`between_sessions`]).
+        api.check(between_sessions(|| unsafe { (api.init)() }), "nvmlInit_v2")?;
         // The session exists from here on, so a refusal below shuts it down on the way out.
         let session = Self { api };
 
@@ -298,8 +328,9 @@ impl Nvml {
 
 impl Drop for Nvml {
     fn drop(&mut self) {
-        // SAFETY: balances the nvmlInit of this session.
-        let _ = unsafe { (self.api.shutdown)() };
+        // SAFETY: balances the nvmlInit of this session. It takes the CUDA driver's lock, as
+        // nvmlInit does ([`between_sessions`]).
+        let _ = between_sessions(|| unsafe { (self.api.shutdown)() });
     }
 }
 

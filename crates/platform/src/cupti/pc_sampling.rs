@@ -192,8 +192,12 @@ impl PcSampler {
             private: std::ptr::null_mut(),
             context,
         };
-        // SAFETY: the struct is CUPTI's parameter struct.
-        unsafe { call(&cupti.pc_enable, "cuptiPCSamplingEnable", &mut enable)? };
+        // Enabling may be CUPTI's first attachment to the driver, which runs between NVML
+        // sessions' openings and closings (`crate::nvml::between_sessions`).
+        crate::nvml::between_sessions(|| {
+            // SAFETY: the struct is CUPTI's parameter struct.
+            unsafe { call(&cupti.pc_enable, "cuptiPCSamplingEnable", &mut enable) }
+        })?;
 
         let mut count = 0;
         let mut stall_count = StallCountParams {

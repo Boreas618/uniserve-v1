@@ -124,7 +124,9 @@ struct EvaluateParams {
     values: *mut f64,
 }
 
-/// Initialize CUPTI's profiling, once per process.
+/// Initialize CUPTI's profiling, once per process. The initialization may be CUPTI's first
+/// attachment to the driver, so it runs between NVML sessions' openings and closings
+/// (`crate::nvml::between_sessions`).
 pub(super) fn initialize() -> Result<()> {
     static INITIALIZED: OnceLock<Result<()>> = OnceLock::new();
     INITIALIZED
@@ -134,14 +136,16 @@ pub(super) fn initialize() -> Result<()> {
                 struct_size: struct_size!(InitializeParams, private),
                 private: std::ptr::null_mut(),
             };
-            // SAFETY: the struct is CUPTI's parameter struct.
-            unsafe {
-                call(
-                    &cupti.profiler_initialize,
-                    "cuptiProfilerInitialize",
-                    &mut params,
-                )
-            }
+            crate::nvml::between_sessions(|| {
+                // SAFETY: the struct is CUPTI's parameter struct.
+                unsafe {
+                    call(
+                        &cupti.profiler_initialize,
+                        "cuptiProfilerInitialize",
+                        &mut params,
+                    )
+                }
+            })
         })
         .clone()
 }
