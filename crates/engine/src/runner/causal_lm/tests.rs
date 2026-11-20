@@ -39,7 +39,8 @@ use super::{CausalLmConfig, CausalLmRunner, PageWork};
 use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheConfig, KvCacheMemory};
 use crate::memory::state::{StateConfig, StateMemory};
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::parallel::HostGroup;
+use crate::parallel::{HostGroup, Rendezvous};
+use crate::process::ranks::union::Joins;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
 use crate::runner::{Forward, Runner};
@@ -2280,6 +2281,81 @@ fn a_member_with_no_batch_is_driven_into_the_step_by_a_join_batch() {
         first.prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0]), &tables),
         Err(Error::Unsupported(_))
     ));
+}
+
+/// A union whose two members two processes hold, each process here a thread whose members meet
+/// the other's over TCP: one formation at the rendezvous forms the union's host group and its
+/// join link (`crate::process::ranks::union`). A member that enters a step with tokens drives the
+/// other process's idle member into it over the link: that member's worker takes the join batch,
+/// and both leave the agreement at the asking member's tokens, step after step. Once the other
+/// process is gone, the next step fails instead of waiting for it.
+#[test]
+fn a_member_of_another_process_is_driven_into_the_step_over_the_join_link() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let rendezvous = |listener| Rendezvous {
+        listener,
+        endpoint: endpoint.clone(),
+        epoch: 7,
+        timeout: testkit::LONG,
+    };
+    // Each process's member of the union's host group and of its join link.
+    let formed = |formed: Vec<Vec<HostGroup>>| {
+        let [mut union, link] = <[Vec<HostGroup>; 2]>::try_from(formed).ok().unwrap();
+        (Arc::new(union.remove(0)), link)
+    };
+    let ((first_group, first_link), (second_group, second_link)) = std::thread::scope(|scope| {
+        let second = scope.spawn(|| HostGroup::world(rendezvous(None), &[1], 2, 2).unwrap());
+        let first = HostGroup::world(rendezvous(Some(listener)), &[0], 2, 2).unwrap();
+        (formed(first), formed(second.join().unwrap()))
+    });
+    let first_joins = Arc::new(Joins::linked(2, first_link).unwrap());
+    let second_joins = Arc::new(Joins::linked(2, second_link).unwrap());
+
+    // The second process's member waits in its worker, which only its join batch reaches.
+    let runner = union_runner(member(&second_group, 1, second_joins.hook(1)));
+    let group = GroupId(1);
+    let worker = Arc::new(
+        Worker::spawn(
+            None,
+            vec![Box::new(runner)],
+            Arc::new(Generation::new(0, [])),
+            BlockTables::new(group, &[], &[]),
+            Sequences::new(group, 1, Vec::new()),
+            0,
+        )
+        .unwrap(),
+    );
+    second_joins
+        .serve(vec![None, Some(Arc::downgrade(&worker))])
+        .unwrap();
+
+    // The first process's member is driven here, as its worker drives it.
+    let mut first = member(&first_group, 0, first_joins.hook(0));
+    first_joins.serve(vec![None, None]).unwrap();
+    let step = Batch {
+        id: BatchId(0),
+        group: GroupId(0),
+        phase: Phase::Decode,
+        kernels: 1,
+        policy: 1,
+        revision: 0,
+        copy_budget: proto::config::DEFAULT_COPY_BUDGET,
+        shape: BatchShape::decode(1, Variant::DecodeGreedy),
+        requests: Vec::new(),
+        columns: Columns::default(),
+        media: Vec::new(),
+        new_slots: Vec::new(),
+    };
+    for tokens in [3, 5] {
+        assert_eq!(first.enter(tokens, &step).unwrap(), tokens);
+    }
+
+    // The other process ends: its worker closes, and with it its member, its relay and its
+    // connections.
+    Arc::into_inner(worker).unwrap().close().unwrap();
+    drop((second_joins, second_group));
+    assert!(first.enter(3, &step).is_err());
 }
 
 #[test]

@@ -181,7 +181,7 @@ impl ModelRunner {
             }
             runner
                 .join_union(member)
-                .context("joining the node's expert union")?;
+                .context("joining the expert union")?;
         }
         Ok(runner)
     }
