@@ -2,7 +2,8 @@
 //! against their CPU formulas: each `nn` function computed on GPU 0 with the kernels the Build
 //! Server builds for its keys, and on the CPU from the same bytes, at the shapes of
 //! DeepSeek-V4.1-Flash (four streams of 5120, 1 to 16384 tokens), within the operator's own
-//! bound (`ops::Op::tolerance`).
+//! bound (`ops::Op::tolerance`); the boundary also over the released checkpoint's connections of
+//! one layer.
 //!
 //! Every case needs GPU 0 and this host's Build Server (`uniserve build-server serve
 //! --deployment device-cases`). The CPU formulas of the largest calls are long in an unoptimized
@@ -309,6 +310,91 @@ fn boundary(tensors: &[Tensor], post: bool) -> nn::Result<(Tensor, Tensor, MhcMi
     )
 }
 
+/// Computes the boundary over `inputs` on the device with the kernels the Build Server selects
+/// for its keys and on the CPU, and holds every output to the operator's bound.
+fn assert_boundary(
+    kernels: &mut Kernels,
+    stream: &Stream,
+    inputs: &Boundary,
+    tokens: usize,
+    post: bool,
+    what: &str,
+) -> Outcome {
+    let all = [
+        &inputs.streams,
+        &inputs.output,
+        &inputs.pre,
+        &inputs.post,
+        &inputs.comb,
+        &inputs.projection,
+        &inputs.scale,
+        &inputs.base,
+        &inputs.norm,
+    ];
+    let metas: Vec<Tensor> = all
+        .iter()
+        .map(|input| meta(&input.dims, input.dtype))
+        .collect();
+    let generation = kernels.generation(1, &keys(|| boundary(&metas, post)))?;
+
+    let host: Vec<Tensor> = all.iter().map(|input| input.host()).collect();
+    let expected = boundary(&host, post)?;
+
+    let placed: Vec<(DeviceAllocation, Tensor)> = all
+        .iter()
+        .map(|input| input.device(stream))
+        .collect::<Outcome<_>>()?;
+    let tensors: Vec<Tensor> = placed.iter().map(|(_, tensor)| tensor.clone()).collect();
+    let (_region, context) = context(stream, generation)?;
+    let (reached, input, mixes) = {
+        let _guard = context.enter();
+        boundary(&tensors, post)?
+    };
+
+    let tolerance = ops::mhc::MhcBoundary::tolerance(&ops::mhc::BoundaryDescriptor::new(
+        DType::BF16,
+        STREAMS as u32,
+        HIDDEN as u32,
+        20,
+        post,
+        tokens as u64,
+    ));
+    let case = |output: &str| format!("{what}, {tokens} tokens, post {post}: {output}");
+    if post {
+        assert_within(
+            &case("the written streams"),
+            &download(&reached, stream)?,
+            &expected.0,
+            tolerance,
+        );
+    }
+    assert_within(
+        &case("the input"),
+        &download(&input, stream)?,
+        &expected.1,
+        tolerance,
+    );
+    assert_within(
+        &case("the pre-mix"),
+        &download(&mixes.pre, stream)?,
+        &expected.2.pre,
+        tolerance,
+    );
+    assert_within(
+        &case("the post-mix"),
+        &download(&mixes.post, stream)?,
+        &expected.2.post,
+        tolerance,
+    );
+    assert_within(
+        &case("the combination"),
+        &download(&mixes.comb, stream)?,
+        &expected.2.comb,
+        tolerance,
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires a GPU and a Build Server"]
 fn the_boundary_kernel_computes_its_cpu_formula() -> Outcome {
@@ -318,78 +404,39 @@ fn the_boundary_kernel_computes_its_cpu_formula() -> Outcome {
     for (index, &tokens) in TOKENS.iter().enumerate() {
         for post in [false, true] {
             let inputs = Boundary::new(tokens, 10 * index as u32);
-            let all = [
-                &inputs.streams,
-                &inputs.output,
-                &inputs.pre,
-                &inputs.post,
-                &inputs.comb,
-                &inputs.projection,
-                &inputs.scale,
-                &inputs.base,
-                &inputs.norm,
-            ];
-            let metas: Vec<Tensor> = all
-                .iter()
-                .map(|input| meta(&input.dims, input.dtype))
-                .collect();
-            let generation = kernels.generation(1, &keys(|| boundary(&metas, post)))?;
+            assert_boundary(&mut kernels, &stream, &inputs, tokens, post, "synthetic")?;
+        }
+    }
+    Ok(())
+}
 
-            let host: Vec<Tensor> = all.iter().map(|input| input.host()).collect();
-            let expected = boundary(&host, post)?;
+/// The released checkpoint's connections of layer 3 (its attention's and its FFN's projection,
+/// scales, biases and input norm) over synthetic streams: the mixes are computed from the
+/// projection's own magnitudes, which bound what reading it in TF32 costs.
+#[test]
+#[ignore = "requires a GPU, a Build Server and the released checkpoint"]
+fn the_boundary_kernel_computes_its_cpu_formula_over_released_connections() -> Outcome {
+    let stream = Stream::new(DEVICE)?;
+    let mut kernels = Kernels::open()?;
+    let checkpoint = testkit::assets::DEEPSEEK_V41_FLASH.checkpoint();
+    let read = |name: &str, dims: &[usize], dtype: DType| {
+        Input::raw(checkpoint.read(name).unwrap(), dims, dtype)
+    };
 
-            let placed: Vec<(DeviceAllocation, Tensor)> = all
-                .iter()
-                .map(|input| input.device(&stream))
-                .collect::<Outcome<_>>()?;
-            let tensors: Vec<Tensor> = placed.iter().map(|(_, tensor)| tensor.clone()).collect();
-            let (_region, context) = context(&stream, generation)?;
-            let (reached, input, mixes) = {
-                let _guard = context.enter();
-                boundary(&tensors, post)?
+    for (connection, norm) in [("hc_attn", "attn_norm"), ("hc_ffn", "ffn_norm")] {
+        for (index, &tokens) in [1, 6, 64, 513, 4096].iter().enumerate() {
+            let inputs = Boundary {
+                projection: read(
+                    &format!("layers.3.{connection}_fn"),
+                    &[MIXES, STREAMS * HIDDEN],
+                    DType::F32,
+                ),
+                scale: read(&format!("layers.3.{connection}_scale"), &[3], DType::F32),
+                base: read(&format!("layers.3.{connection}_base"), &[MIXES], DType::F32),
+                norm: read(&format!("layers.3.{norm}.weight"), &[HIDDEN], DType::BF16),
+                ..Boundary::new(tokens, 70 + 10 * index as u32)
             };
-
-            let tolerance = ops::mhc::MhcBoundary::tolerance(&ops::mhc::BoundaryDescriptor::new(
-                DType::BF16,
-                STREAMS as u32,
-                HIDDEN as u32,
-                20,
-                post,
-                tokens as u64,
-            ));
-            let case = |what: &str| format!("{tokens} tokens, post {post}: {what}");
-            if post {
-                assert_within(
-                    &case("the written streams"),
-                    &download(&reached, &stream)?,
-                    &expected.0,
-                    tolerance,
-                );
-            }
-            assert_within(
-                &case("the input"),
-                &download(&input, &stream)?,
-                &expected.1,
-                tolerance,
-            );
-            assert_within(
-                &case("the pre-mix"),
-                &download(&mixes.pre, &stream)?,
-                &expected.2.pre,
-                tolerance,
-            );
-            assert_within(
-                &case("the post-mix"),
-                &download(&mixes.post, &stream)?,
-                &expected.2.post,
-                tolerance,
-            );
-            assert_within(
-                &case("the combination"),
-                &download(&mixes.comb, &stream)?,
-                &expected.2.comb,
-                tolerance,
-            );
+            assert_boundary(&mut kernels, &stream, &inputs, tokens, true, connection)?;
         }
     }
     Ok(())

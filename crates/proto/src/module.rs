@@ -266,6 +266,9 @@ pub mod operator {
         // The MXFP8 product computes groups of products in one launch: its descriptor states
         // them and its call carries their count after the contraction.
         (MXFP8_GEMM, 2),
+        // A boundary is served by a native fused program beside the split cubin: its call joins
+        // the cubin's launch, and the workspace holds both forms' partials and arrival words.
+        (MHC_BOUNDARY, 2),
     ];
 
     /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.

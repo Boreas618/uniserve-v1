@@ -1,0 +1,47 @@
+# The mhc_boundary operator's DeepGEMM backend: its fused form.
+#
+# DeepGEMM's SM100 mega mHC kernel (`sm100_mega_mhc`, the `deepgemm` pin of
+# `uniserve_build_server.fetch`) in its shifted form, compiled ahead of time with
+# the package's entry `src/boundary.cu`, which encodes the eight tensor maps the
+# kernel reads and launches it, into one native module per descriptor. One
+# persistent kernel writes the pending output back, multiplies the written
+# streams with the projection on the tensor cores in one TF32 pass, collapses the
+# input with the carried pre-mix and, once a block's column splits arrived,
+# computes its mixes and normalizes its input. The operator's rule states each
+# call's split count (`BoundaryDescriptor::fused_splits`); the build compiles an
+# instance of every count the descriptor's token class takes and the entry calls
+# the one the call names. A serving host compiles nothing.
+#
+# The pin's kernel strides its tasks by its compiled multiprocessor count; the
+# build compiles a staged copy with `patches/launched-grid.patch`, which strides
+# by the launched grid and keeps each block's two arrival lines side by side, so
+# one module serves every multiprocessor count of its target and the operator's
+# workspace holds two lines a block. The CUTLASS the kernel includes is the one
+# the `flashinfer-python` distribution installs.
+#
+# `priority` puts it ahead of the Triton package, which declares every key this
+# one does: the split form serves the keys it alone covers (a boundary with no
+# output to write back, other stream counts and element types).
+
+op = "mhc_boundary"
+backend = "deepgemm"
+interface_version = 2
+priority = 1
+
+[toolchain]
+packages = ["flashinfer-python"]
+
+[source]
+kind = "cuda"
+
+[kernel]
+requires = ["tensor_memory"]
+
+# `dtype_bf16_streams_4_hidden_5120_iterations_20_post_true_tokens_16_block_64`.
+#
+# The kernel holds four BF16 streams whose width is whole column steps of every
+# one of sixteen splits, and computes the shifted boundary that writes an output
+# back; the token block is the operator's class of the call's tokens, which
+# chooses the split counts compiled.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], streams = ["4"], hidden = { multiple = 1024 }, iterations = { min = 1 }, post = ["true"], tokens = ["16", "64"], block = ["64"] }

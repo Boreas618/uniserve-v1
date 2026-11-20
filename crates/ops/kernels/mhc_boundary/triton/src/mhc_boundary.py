@@ -198,8 +198,10 @@ def _mhc_boundary_kernel(
     ``input`` ``[tokens, HIDDEN]``; ``post``, ``pre``, the next pre- and
     post-mixes ``[tokens, STREAMS]`` FP32; the combination matrices
     ``[tokens, STREAMS, STREAMS]`` FP32; ``weight`` ``[MIXES, STREAMS *
-    HIDDEN]`` FP32; ``partials`` ``[splits, tokens, MIX_TILE + 2]`` FP32 and
-    ``counters`` ``[cdiv(tokens, BLOCK_T)]`` I32 when ``splits > 1``.
+    HIDDEN]`` FP32; ``partials`` holds ``[splits, tokens, MIX_TILE + 2]`` FP32
+    and ``counters`` ``[cdiv(tokens, BLOCK_T)]`` zeroed I32 from their first
+    element, read when ``splits > 1`` (the operator's workspace, which a fused
+    program's partials and arrival lines share).
     """
     width: tl.constexpr = STREAMS * HIDDEN
     steps: tl.constexpr = HIDDEN // BLOCK_D

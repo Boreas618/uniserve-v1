@@ -12,7 +12,7 @@
 
 op = "mhc_boundary"
 backend = "triton"
-interface_version = 1
+interface_version = 2
 
 [source]
 kind = "triton"
