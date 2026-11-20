@@ -14,6 +14,14 @@
 //! having reserved on the scheduler node the two sockets the peers dial (the
 //! peer channel and the ranks' host-collective rendezvous), and the engine is
 //! the scheduler node's client, which holds its peers' and ends with them.
+//!
+//! Every wait for an engine's dial ends: with the dial, with the engine's exit where this daemon
+//! is told of it (the control connection the process lives under), with the abandonment of what
+//! awaits it (an epoch update that ended, a request that went), and with the close of the request
+//! socket ([`EngineControl::close`]) once the daemon serves its deployment no more. An engine
+//! that dies before it dials is otherwise indistinguishable from one that has not dialled yet,
+//! and a wait that outlives what it serves keeps its blocking thread, and with it the process,
+//! alive.
 
 use proto::config::EngineArgs;
 use std::collections::BTreeMap;
@@ -25,7 +33,7 @@ use anyhow::Context as _;
 use proto::admin::NodeUsage;
 use proto::process::{self, downstream, event, hello, reply, request, upstream};
 use proto::request::wire;
-use service::{Connection, Listener};
+use service::{Cancel, Cancellation, Connection, Listener, Wake, Waker};
 
 use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink};
 
@@ -97,7 +105,41 @@ pub struct EngineControl {
     next_engine: AtomicU64,
     /// Engine handoffs can connect in any order. Reading and assigning
     /// their greetings is serialized; each client keeps its buffered reader.
-    incoming: std::sync::Mutex<BTreeMap<u64, (Connection, Connection, wire::Hello)>>,
+    incoming: std::sync::Mutex<Incoming>,
+    /// Cancelled once the daemon takes no engine's connection any more ([`Self::close`]).
+    closing: Cancel,
+    /// What every wait for a dial polls of [`Self::closing`].
+    closed: Cancellation,
+}
+
+/// An engine's request link as its dial left it: its read half, its write half and its hello.
+type Link = (Connection, Connection, wire::Hello);
+
+/// The links that dialled before they were awaited, and the accepts awaiting one.
+#[derive(Default)]
+struct Incoming {
+    /// Each waiting link, by the engine number its hello states.
+    links: BTreeMap<u64, Link>,
+    /// The wake of the accept awaiting each engine number (one accept awaits one engine): an
+    /// accept that takes another engine's dial off the socket files it under `links` and wakes
+    /// that engine's accept, which would otherwise poll a socket the dial already left.
+    awaited: BTreeMap<u64, Wake>,
+}
+
+/// Where this daemon learns of the exit of the engine an accept awaits, beside its dial.
+enum Exits<'a> {
+    /// Nowhere: an epoch update's target, whose process the update's own connection supervises,
+    /// or an engine whose process another daemon supervises (a borrowed front). What awaits it
+    /// abandons the wait instead.
+    Unreported,
+    /// The control connection the process lives under ([`EngineControl::spawn`]): its report of
+    /// the exit ends the wait, and so does its close, with which the daemon's service ends the
+    /// processes the connection asked for.
+    Owned(&'a mut Connection),
+    /// A control connection a predecessor handed over: its report of the exit ends the wait.
+    /// Its close is the predecessor's, whose accepted side was not handed over, and says
+    /// nothing of the engine.
+    Handed(&'a mut Connection),
 }
 
 impl EngineControl {
@@ -131,6 +173,7 @@ impl EngineControl {
         let requests = Listener::bind(&endpoint)
             .with_context(|| format!("binding the request socket {endpoint}"))?;
         let request_address = requests.endpoint().to_string();
+        let (closing, closed) = Cancel::new().context("creating the request socket's close")?;
         Ok(Self {
             requests,
             request_address,
@@ -139,8 +182,20 @@ impl EngineControl {
             deployment,
             build_server,
             next_engine: AtomicU64::new(1),
-            incoming: std::sync::Mutex::new(BTreeMap::new()),
+            incoming: std::sync::Mutex::new(Incoming::default()),
+            closing,
+            closed,
         })
+    }
+
+    /// Takes no engine's connection any more: every wait for a dial in progress fails, and so
+    /// does every later one, at once. The daemon closes its request socket when its deployment
+    /// ends, handed over to a successor or stopped: what any such wait served is gone, and one
+    /// left waiting would hold its blocking thread, and so the daemon's exit, for good. The
+    /// socket itself closes, and its file goes, with the last owner of this control. Repeated
+    /// calls are harmless.
+    pub fn close(&self) {
+        self.closing.cancel();
     }
 
     /// Starts an engine process with `args` and returns its client once it reports that it
@@ -339,7 +394,7 @@ impl EngineControl {
         engine: u64,
         control: &mut Connection,
     ) -> anyhow::Result<(Connection, Connection, u32)> {
-        let (reader, mut writer, hello) = self.accept(engine, Some(control))?;
+        let (reader, mut writer, hello) = self.accept(engine, Exits::Owned(control), None)?;
         let version = welcome(&mut writer, &hello, engine)?;
         tracing::info!(engine, build = %hello.build, version, "the engine process connected; awaiting its start");
         Ok((reader, writer, version))
@@ -378,22 +433,28 @@ impl EngineControl {
     /// on their process links, so these connections carry only requests once they serve; the
     /// scheduler node's client holds its peers'. `stats` receives its schedulers' statistics.
     ///
+    /// The update supervises its targets' processes on a connection of its own, so this daemon
+    /// is not told here of a target that exits before it dials: the update is, and abandons
+    /// itself, and its follower then cancels `abandoned`, which ends the wait for the dial.
+    ///
     /// # Errors
     ///
-    /// Fails when an engine does not connect in time, speaks no version of the engine interface
-    /// this daemon speaks, fails to start, or exits before it stated that it parked.
+    /// Fails when `abandoned` is cancelled or the request socket closes ([`Self::close`]) before
+    /// every engine dialled, and when an engine speaks no version of the engine interface this
+    /// daemon speaks, fails to start, or exits before it stated that it parked.
     pub fn join_target(
         &self,
         processes: &[(String, u64)],
         epoch: u64,
         stats: StatsSink,
+        abandoned: &Cancellation,
     ) -> anyhow::Result<EngineClient> {
         let mut clients = Vec::with_capacity(processes.len());
         let mut sinks = std::iter::once(stats);
         for (host, engine) in processes {
             // A peer holds no scheduler, so it reports no statistics.
             let sink = sinks.next().unwrap_or_else(|| Box::new(|_| {}));
-            clients.push(self.join(*engine, epoch, sink)?.on_host(host));
+            clients.push(self.join(*engine, epoch, sink, abandoned)?.on_host(host));
         }
         let mut clients = clients.into_iter();
         let scheduler = clients.next().context("a target of no engine")?;
@@ -405,8 +466,15 @@ impl EngineControl {
     /// The start itself has no bound: an engine loads its ranks, resolves its modules and
     /// captures its graphs before it states that it parked, and one that exits meanwhile closes
     /// its request link, which ends the wait ([`await_start`]).
-    fn join(&self, engine: u64, epoch: u64, stats: StatsSink) -> anyhow::Result<EngineClient> {
-        let (mut reader, mut writer, hello) = self.accept(engine, None)?;
+    fn join(
+        &self,
+        engine: u64,
+        epoch: u64,
+        stats: StatsSink,
+        abandoned: &Cancellation,
+    ) -> anyhow::Result<EngineClient> {
+        let (mut reader, mut writer, hello) =
+            self.accept(engine, Exits::Unreported, Some(abandoned))?;
         let version = welcome(&mut writer, &hello, engine)?;
         let (info, known) = await_start(&mut reader)?;
         tracing::info!(engine, build = %hello.build, version, "the update's target joined this daemon");
@@ -421,14 +489,17 @@ impl EngineControl {
     /// Later engines this control starts take the identities from
     /// `next_engine` on. `stats` receives its schedulers' statistics.
     /// With no control connection, this is a borrowed front: another daemon
-    /// retains process ownership and performs recovery.
+    /// retains process ownership and performs recovery, and this daemon learns
+    /// nothing of the process's exit, so the wait for the dial ends once its
+    /// caller cancels `abandoned`.
     ///
     /// # Errors
     ///
     /// Fails when the engine's process exits or its request link closes before it states its
-    /// state, when it speaks no version of the engine interface this daemon speaks (an engine
-    /// attaching to a successor of another build offers the one version it speaks), is another
-    /// engine, or reports anything but ready.
+    /// state, when `abandoned` is cancelled or the request socket closes ([`Self::close`])
+    /// before it dialled, when it speaks no version of the engine interface this daemon speaks
+    /// (an engine attaching to a successor of another build offers the one version it speaks),
+    /// is another engine, or reports anything but ready.
     pub fn adopt(
         &self,
         engine: u64,
@@ -436,9 +507,11 @@ impl EngineControl {
         epoch: u64,
         mut control: Option<Connection>,
         stats: StatsSink,
+        abandoned: Option<&Cancellation>,
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
-        let (mut reader, mut writer, hello) = self.accept(engine, control.as_mut())?;
+        let exits = control.as_mut().map_or(Exits::Unreported, Exits::Handed);
+        let (mut reader, mut writer, hello) = self.accept(engine, exits, abandoned)?;
         let version = welcome(&mut writer, &hello, engine)?;
         loop {
             // An attaching engine states its state right after the welcome.
@@ -931,69 +1004,63 @@ impl EngineControl {
         Ok(control)
     }
 
-    /// Accepts engine `engine`'s connection to the request socket, failing when the daemon
-    /// reports its process's exit on `control` first.
+    /// Accepts engine `engine`'s connection to the request socket.
     ///
-    /// The wait blocks on the request socket and on `control`: an engine dials as the first thing
-    /// it does, and an engine that exits before is reported on its control connection. Engines
-    /// dial in any order; one that dials before it is awaited waits in `incoming` under the number
-    /// it states.
+    /// The wait blocks on the request socket and on what ends it otherwise ([`Exits`]): the
+    /// engine's exit where this daemon is told of it, `abandoned` once what awaits the engine
+    /// lets go of it, and the request socket's close ([`Self::close`]). An engine dials as the
+    /// first thing it does. Engines dial in any order; one that dials before it is awaited waits
+    /// in `incoming` under the number it states, and the accept awaiting it, if any, is woken.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the engine's exit is reported first, when `abandoned` is cancelled or the
+    /// request socket closes first, and when accepting fails.
     fn accept(
         &self,
         engine: u64,
-        mut control: Option<&mut Connection>,
-    ) -> anyhow::Result<(Connection, Connection, wire::Hello)> {
-        let mut incoming = ::service::lock(&self.incoming);
-        if let Some(connection) = incoming.remove(&engine) {
-            return Ok(connection);
-        }
-        // Whether the handoff's control connection has been seen to close: the service
-        // goes on with its accepted side, so an end here is a predecessor that left without
-        // handing it over, and not the engine. Stated once.
-        let mut control_closed = false;
+        mut exits: Exits<'_>,
+        abandoned: Option<&Cancellation>,
+    ) -> anyhow::Result<Link> {
+        let mut woken = Waker::new().context("creating the accept's wake")?;
+        // Registered before the first look, so a dial another accept takes meanwhile wakes this
+        // one rather than leaving it to poll a socket the dial already left.
+        let _awaiting = Awaiting::register(&self.incoming, engine, woken.wake());
         loop {
-            match self.requests.try_accept() {
-                Ok(Some(mut reader)) => {
-                    let writer = reader.writer()?;
-                    // An engine's first message on its request link is its hello.
-                    let hello: wire::Hello = reader
-                        .recv_next()
-                        .context("the engine closed its request link before its hello")?;
-                    // Whose dial this is: a successor waits for one engine's front, and a
-                    // connection it cannot use is otherwise indistinguishable from one that never
-                    // arrived — the difference between an engine that dialled the wrong daemon and
-                    // one that never dialled at all.
-                    tracing::info!(
-                        awaited = engine,
-                        stated = hello.engine,
-                        interface = hello.interface,
-                        "an engine connected to this daemon's request socket"
-                    );
-                    if hello.engine == engine {
-                        return Ok((reader, writer, hello));
-                    }
-                    incoming.insert(hello.engine, (reader, writer, hello));
-                    continue;
-                }
-                Ok(None) => {}
-                Err(error) => return Err(error).context("accepting the engine's connection"),
+            if let Some(link) = self.take(engine)? {
+                return Ok(link);
             }
-            if let Some(control) = control.as_deref_mut()
-                && !control_closed
-            {
-                match still_serving(control) {
+            anyhow::ensure!(
+                !self.closed.is_cancelled(),
+                "this daemon's request socket closed before engine {engine} dialled: the daemon \
+                 serves its deployment no more"
+            );
+            anyhow::ensure!(
+                !abandoned.is_some_and(Cancellation::is_cancelled),
+                "the wait for engine {engine}'s dial was abandoned: what awaited it ended"
+            );
+            match &mut exits {
+                Exits::Unreported => {}
+                Exits::Owned(control) => {
+                    anyhow::ensure!(
+                        still_serving(control)?,
+                        "the control connection engine {engine}'s process lived under closed \
+                         before it dialled: the daemon's service ended the process with it"
+                    );
+                }
+                Exits::Handed(control) => match still_serving(control) {
                     Ok(true) => {}
                     // The handover's own connection, whose accepted side was not handed over:
                     // this end reads closed at the first look. Which peer ended is the whole
                     // content of the failure, and this one is the predecessor - the engine may
                     // be serving perfectly well, and the dial below is what says so.
                     Ok(false) => {
-                        control_closed = true;
                         tracing::info!(
                             engine,
                             "the handed-over control connection closed; waiting for the engine \
                              to dial this daemon's request socket"
                         );
+                        exits = Exits::Unreported;
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -1003,17 +1070,86 @@ impl EngineControl {
                         );
                         return Err(error);
                     }
-                }
+                },
             }
-            // A dial or the control connection's report ends the wait.
-            let mut descriptors = vec![crate::supervision::readable(self.requests.as_raw_fd())];
-            if let Some(control) = control.as_deref()
-                && !control_closed
-            {
+            // A dial, a wake, an exit's report, the abandonment or the close ends the wait.
+            let mut descriptors = vec![
+                crate::supervision::readable(self.requests.as_raw_fd()),
+                woken.poll_fd(),
+                self.closed.poll_fd(),
+            ];
+            descriptors.extend(abandoned.map(Cancellation::poll_fd));
+            if let Exits::Owned(control) | Exits::Handed(control) = &exits {
                 descriptors.extend(control.poll_fds());
             }
             service::wait_ready(&mut descriptors, None)?;
+            woken.drain();
         }
+    }
+
+    /// Engine `engine`'s link, if it dialled: one another accept filed, or one waiting in the
+    /// request socket's queue. Every other link the queue holds is filed under the number its
+    /// hello states, and the accept awaiting that number is woken.
+    ///
+    /// # Errors
+    ///
+    /// Fails when accepting fails, or a link closes before its hello.
+    fn take(&self, engine: u64) -> anyhow::Result<Option<Link>> {
+        let mut incoming = ::service::lock(&self.incoming);
+        if let Some(link) = incoming.links.remove(&engine) {
+            return Ok(Some(link));
+        }
+        loop {
+            let Some(mut reader) = self
+                .requests
+                .try_accept()
+                .context("accepting the engine's connection")?
+            else {
+                return Ok(None);
+            };
+            let writer = reader.writer()?;
+            // An engine's first message on its request link is its hello.
+            let hello: wire::Hello = reader
+                .recv_next()
+                .context("the engine closed its request link before its hello")?;
+            // Whose dial this is: a successor waits for one engine's front, and a connection it
+            // cannot use is otherwise indistinguishable from one that never arrived — the
+            // difference between an engine that dialled the wrong daemon and one that never
+            // dialled at all.
+            tracing::info!(
+                awaited = engine,
+                stated = hello.engine,
+                interface = hello.interface,
+                "an engine connected to this daemon's request socket"
+            );
+            if hello.engine == engine {
+                return Ok(Some((reader, writer, hello)));
+            }
+            if let Some(awaiting) = incoming.awaited.get(&hello.engine) {
+                awaiting.wake();
+            }
+            incoming.links.insert(hello.engine, (reader, writer, hello));
+        }
+    }
+}
+
+/// An accept's registration as the one awaiting its engine's dial ([`Incoming::awaited`]), which
+/// ends with the accept however it returns.
+struct Awaiting<'a> {
+    incoming: &'a std::sync::Mutex<Incoming>,
+    engine: u64,
+}
+
+impl<'a> Awaiting<'a> {
+    fn register(incoming: &'a std::sync::Mutex<Incoming>, engine: u64, wake: Wake) -> Self {
+        ::service::lock(incoming).awaited.insert(engine, wake);
+        Self { incoming, engine }
+    }
+}
+
+impl Drop for Awaiting<'_> {
+    fn drop(&mut self) {
+        ::service::lock(self.incoming).awaited.remove(&self.engine);
     }
 }
 

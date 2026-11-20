@@ -993,12 +993,16 @@ async fn prepared_successor(
                     &options.update_config,
                 )));
                 let sink = stats_sink(Arc::clone(&observer), reporting.clone(), index);
+                // The takeover is this process's whole bring-up and is not abandoned: an engine
+                // that exits before it attaches is reported on the control connection the
+                // predecessor handed over.
                 let client = adopting.adopt(
                     replica.engine,
                     replica.next_engine,
                     served.epoch,
                     connection,
                     sink,
+                    None,
                 )?;
                 Ok((replica, options, served, observer, client))
             })

@@ -155,8 +155,22 @@ impl RemoteHold {
             let control = Arc::clone(&self.control);
             let epoch = attachment.epoch;
             let engine = attachment.engine;
+            // The successor supervises the engine, so this daemon is told nothing of its exit:
+            // the wait for its dial is this continuation's, and ends when the continuation goes
+            // (its request's future, which holds `_abandon`, is dropped) or this daemon closes
+            // its request socket.
+            let (_abandon, abandoned) = service::Cancel::new().map_err(|error| {
+                SubmitError::Unavailable(format!("awaiting the recovered engine: {error}"))
+            })?;
             let attached = tokio::task::spawn_blocking(move || {
-                control.adopt(engine, engine + 1, epoch, None, Box::new(|_| {}))
+                control.adopt(
+                    engine,
+                    engine + 1,
+                    epoch,
+                    None,
+                    Box::new(|_| {}),
+                    Some(&abandoned),
+                )
             })
             .await
             .map_err(|error| SubmitError::Unavailable(error.to_string()))?

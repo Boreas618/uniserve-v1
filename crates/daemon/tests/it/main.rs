@@ -7,3 +7,4 @@
 mod nodes;
 mod supervision;
 mod support;
+mod waits;

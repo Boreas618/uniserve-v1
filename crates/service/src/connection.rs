@@ -951,6 +951,67 @@ impl Waker {
     }
 }
 
+/// The owner's end of a cancellation that blocking waits observe through a descriptor
+/// ([`Cancellation`]): it cancels at [`Cancel::cancel`] or when it is dropped, whichever comes
+/// first, so a wait handed to another thread ends once its owner lets go of it, however the owner
+/// ends.
+///
+/// The cancellation is the closing of a socket pair's end: the other end then reads its end of
+/// file, which `poll` reports as readable to every waiter at once and for good, so one
+/// cancellation ends any number of waits, in any order, without being consumed.
+pub struct Cancel {
+    /// The end whose shutdown, or close, is the cancellation; nothing is ever written to it.
+    end: UnixStream,
+}
+
+/// A waiter's end of a [`Cancel`], which any number of threads poll beside their own sources.
+#[derive(Clone)]
+pub struct Cancellation {
+    /// The end that reads its end of file once the owner's end cancelled.
+    end: Arc<UnixStream>,
+}
+
+impl Cancel {
+    /// A cancellation not yet cancelled, and the end its waiters poll.
+    ///
+    /// # Errors
+    ///
+    /// Fails when its socket pair cannot be made.
+    pub fn new() -> io::Result<(Self, Cancellation)> {
+        let (end, waiter) = UnixStream::pair()?;
+        waiter.set_nonblocking(true)?;
+        Ok((
+            Self { end },
+            Cancellation {
+                end: Arc::new(waiter),
+            },
+        ))
+    }
+
+    /// Cancels: every wait that polls a [`Cancellation`] of this one ends, now and later.
+    pub fn cancel(&self) {
+        // A socket already shut down reports `NotConnected`, which is a cancellation too.
+        let _ = self.end.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Cancellation {
+    /// The descriptor a wait includes among the sources it polls: readable once cancelled.
+    pub fn poll_fd(&self) -> libc::pollfd {
+        pollfd(self.end.as_raw_fd(), libc::POLLIN)
+    }
+
+    /// Whether the owner cancelled, without waiting.
+    pub fn is_cancelled(&self) -> bool {
+        let mut descriptors = [self.poll_fd()];
+        // SAFETY: poll borrows this live array only for the call.
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 1, 0) };
+        // Nothing but the end of file ever arrives, so readable is cancelled; a failed poll
+        // of a live descriptor cannot happen, and reports the wait as going on.
+        ready > 0
+    }
+}
+
 /// Observes whether a connection's peer closed it, without reading it ([`Connection::hangup`]).
 ///
 /// The observer holds its own descriptor of the connection, so it stays valid whatever happens to
