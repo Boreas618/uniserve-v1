@@ -110,4 +110,24 @@ impl HostPart {
         }
         Ok(self.storage.address() + unit * self.bytes)
     }
+
+    /// A part of `units` units of `bytes` each in a memfd of this process's own, mapped and
+    /// registered with `device` as [`Self::map`] maps the Storage Server's: what a test of the
+    /// host tier's copies copies through.
+    #[cfg(test)]
+    pub(crate) fn local(device: DeviceId, units: u32, bytes: u64) -> Result<Self> {
+        let length = u64::from(units) * bytes;
+        let memfd = rustix::fs::memfd_create("host-part", rustix::fs::MemfdFlags::CLOEXEC)
+            .map_err(|error| Error::transport_source("creating a host part", error))?;
+        rustix::fs::ftruncate(&memfd, length)
+            .map_err(|error| Error::transport_source("sizing a host part", error))?;
+        let storage = Storage::map_host(memfd, length as usize, device, true)?;
+
+        Ok(Self {
+            region: "local".to_owned(),
+            storage,
+            units,
+            bytes,
+        })
+    }
 }

@@ -233,6 +233,43 @@ impl CopyBatch {
             )
         }
     }
+
+    /// Submits every entry as a copy of its own (`cuMemcpyAsync`) on `stream`, in insertion
+    /// order; an empty batch submits nothing. The sources are read in stream order.
+    ///
+    /// The form of many scattered host-to-device copies, as a host KV tier's loads are:
+    /// `cuMemcpyBatchAsync_v2` faults inside the driver on a batch of thousands of them (a read
+    /// of a null pointer in libcuda 580.82.07, with every argument valid), and the device then
+    /// reports the command stream the call left as corrupt; one copy per entry takes another
+    /// path of the driver.
+    ///
+    /// Fails with [`Error::Invalid`] for a batch of [`SourceOrder::DuringCall`], whose sources
+    /// these copies would read after the call, and with [`Error::Capturing`] on a capturing
+    /// stream.
+    ///
+    /// # Safety
+    /// Every range, its source included, stays valid until the stream reaches the copies.
+    pub unsafe fn submit_each(&self, stream: &Stream) -> Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        if self.order == SourceOrder::DuringCall {
+            return Err(Error::invalid(
+                "copies submitted one by one read their sources in stream order, after the call",
+            ));
+        }
+        require_batch_stream(stream, "cuMemcpyAsync")?;
+        let _scope = stream.enter()?;
+        let driver = driver()?;
+
+        for (destination, source, bytes) in self.iter() {
+            let copied =
+                // SAFETY: forwarded from the caller; the stream's context is current.
+                unsafe { (driver.memcpy_async)(destination, source, bytes, stream.handle()) };
+            driver.check(copied, "cuMemcpyAsync")?;
+        }
+        Ok(())
+    }
 }
 
 const BATCH_CALL: &str = "cuMemcpyBatchAsync_v2";

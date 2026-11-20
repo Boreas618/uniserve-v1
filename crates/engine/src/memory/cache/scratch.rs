@@ -437,10 +437,15 @@ impl ScratchPages {
             }
         }
 
+        // One copy per cell: a paired forward's history is up to the set's pages times every
+        // layer's planes and flags, about 13,800 copies for 48 layers, of the size at which one
+        // `cuMemcpyBatchAsync_v2` of host-to-device copies faults inside the driver and corrupts
+        // the device's command stream (`CopyBatch::submit_each`). A switch comparison pays
+        // about 2 us a copy for it.
         // SAFETY: the destinations are distinct cells of the set's buffers, bounded above, and
         // the sources cells of the cache's planes, which the requests of the served batch hold
         // until it completes; the shadow forward follows on this stream.
-        unsafe { batch.submit(stream) }?;
+        unsafe { batch.submit_each(stream) }?;
         Ok(())
     }
 }
