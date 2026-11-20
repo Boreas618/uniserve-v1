@@ -102,6 +102,7 @@ A package that builds against code it does not own names that code by a pin of `
 | `nccl` | NCCL 2.30.4's headers, the device API DeepEP is built against, and its library, which a module that calls NCCL links against | the `nvidia-nccl-cu13==2.30.4` wheel of each machine the serving environment locks (the headers are the same in both, the library is the machine's); read out of the archive, which is not kept |
 | `megamoe` | FlashInfer's fused MegaMoE CuTe DSL kernel | the `flashinfer-python` distribution this environment locks |
 | `cutlass-nvfp4-gemm` | CUTLASS's CuTe DSL tutorial NVFP4 GEMM (`nvfp4_gemm_0.py`), the kernel of `nvfp4_gemm` | the CUTLASS examples among the data files of the `flashinfer-python` distribution this environment locks |
+| `flashmla` | FlashMLA's SM100 sparse decoding kernel for DeepSeek-V4.1 (`head64`, the kernel of `latent_attention/flashmla`), its headers and the vendored `kerutils` device library, vllm-project/FlashMLA commit `5dceadbd9eab`, with the project's licence | each file from the commit's raw tree |
 | `fastvideo` | FastVideo's block-sparse attention forward pass for data-center Blackwell (`sparse_attention/tcgen05`), hao-ai-lab/FastVideo commit `d4ed61cc7c81`, with the project's licence | each file from the commit's raw tree |
 
 ```text

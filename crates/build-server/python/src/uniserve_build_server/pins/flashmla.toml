@@ -1,0 +1,32 @@
+# FlashMLA's SM100 sparse latent attention for DeepSeek-V4.1, at vllm-project/FlashMLA
+# commit 5dceadbd9eab (the commit vLLM builds, `cmake/external_projects/flashmla.cmake`),
+# each file from the commit's raw tree: the `head64` sparse decoding kernel, the headers it
+# includes (the KV record layouts, the dequantizers and the shared SM100 subroutines), the
+# vendored `kerutils` device library, and the project's licence (MIT), which covers every
+# file of the pin. The manifest is `flashmla.sha256` beside this file.
+#
+# The kernel's own parameter structures are `csrc/params.h`; its host launch is a template
+# the including unit instantiates, so the pin carries no translation unit of its own and
+# needs neither CUTLASS nor libtorch from the repository: the CUTLASS it includes is the one
+# the `flashinfer-python` distribution installs, as `mxfp8_gemm/deepgemm` does.
+sha256 = "9032825a0d6523639e1ae14a2b45c17df574e372d2e5179abda5712c360fc24f"
+
+# The kernel includes its own headers as `cuda_kernels/...` and `params.h` from `csrc`, and
+# the device library as `kerutils/...` from its include root.
+include = ["csrc", "csrc/3rdparty/kerutils/include"]
+
+[origin]
+files = "https://raw.githubusercontent.com/vllm-project/FlashMLA/5dceadbd9eabc9acfc547ef18ec8f7b14b980682/"
+
+# How FlashMLA compiles these kernels (`setup.py`, the `nvcc` arguments of its CUDA
+# extension): `-std=c++20`, `--expt-relaxed-constexpr`, `--expt-extended-lambda`,
+# `--ptxas-options=--register-usage-level=10` and `--diag-suppress=445` (an unused template
+# parameter of its kernel declarations). Its `--use_fast_math` is left out: the kernel calls
+# the approximate exponential and reciprocal it wants by name (`exp2f`, `__fdividef`), and
+# the flag would also lower the accuracy of the host-side scale arithmetic.
+[compile]
+standard = "c++20"
+relaxed_constexpr = true
+extended_lambda = true
+register_usage_level = 10
+suppressed = [445]
