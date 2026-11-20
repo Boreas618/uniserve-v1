@@ -76,9 +76,10 @@ pub enum ChatTemplate {
 impl std::fmt::Debug for ChatTemplate {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FileOrTokenizerConfig(name) => {
-                formatter.debug_tuple("FileOrTokenizerConfig").field(name).finish()
-            }
+            Self::FileOrTokenizerConfig(name) => formatter
+                .debug_tuple("FileOrTokenizerConfig")
+                .field(name)
+                .finish(),
             Self::File(name) => formatter.debug_tuple("File").field(name).finish(),
             Self::Encoder(_) => formatter.write_str("Encoder"),
         }
@@ -89,7 +90,9 @@ impl PartialEq for ChatTemplate {
     /// The same place, or the same encoder.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::FileOrTokenizerConfig(left), Self::FileOrTokenizerConfig(right)) => left == right,
+            (Self::FileOrTokenizerConfig(left), Self::FileOrTokenizerConfig(right)) => {
+                left == right
+            }
             (Self::File(left), Self::File(right)) => left == right,
             (Self::Encoder(left), Self::Encoder(right)) => std::ptr::addr_eq(*left, *right),
             _ => false,
