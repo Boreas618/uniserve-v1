@@ -28,6 +28,16 @@
 //! each of those nodes, and only there, before any of them retires the
 //! previous epoch, and a rollback publishes nothing and retires the target.
 //!
+//! Every release of an epoch's storage the epoch form makes is followed by
+//! `Grow` to the side that serves on: the commit's of the previous epoch to the
+//! targets, the rollback's of the target to the previous epoch, and the first
+//! claim's of the epochs earlier updates dropped to the serving engines. A
+//! released epoch's engines are stopped, and their nodes reap them before a
+//! stop returns; the claim that retires its storage ends its quotas'
+//! reservations too. The scheduler nodes then create the segments their
+//! regions number as far as the quotas and the devices hold them
+//! ([`grow_on`]).
+//!
 //! Every phase ends on acknowledgements the engines make, never on an
 //! assumption about their progress. The epoch form's two epochs step together
 //! while it switches: new requests go to the side promoted from its first
@@ -691,12 +701,20 @@ impl Update {
         };
         let (epoch, targets) = (trial.switch.epoch, trial.targets.clone());
         let retire = trial.switch.retire.clone();
+        let mut serving = self.nodes.clone();
+        serving.extend(trial.switch.bystanders.iter().cloned());
         if let Err(reason) = self.claim_everywhere(processes, epoch, &targets, &retire) {
             return self.abandon(processes, Failure::new(FailureKind::ClaimFailed, reason));
         }
-        // Every node retired them: none is left for a later claim.
+        // Every node retired them: none is left for a later claim. Their engines stopped when
+        // their update dropped them, and their storage and its quotas' reservations ended now:
+        // the engines that serve through this update grow into what that freed, and the targets
+        // starting beside them divide what the quotas leave.
         if let Form::Epoch(trial) = &mut self.form {
             trial.switch.retire.clear();
+        }
+        if !retire.is_empty() {
+            grow_on(processes, self.hosts(), &serving);
         }
     }
 
@@ -880,7 +898,7 @@ impl Update {
             // they give back on the host the release names.
             (Phase::Switching, true, Some(report::Kind::Shrunk(shrunk))) => {
                 let growing = growing(&self.nodes, trial.targets.iter().map(|node| &node.layout));
-                grow_on(processes, &shrunk.host, &growing);
+                grow_on(processes, [shrunk.host.as_str()], &growing);
             }
             // A target that fails while the switch runs back is stopped: it
             // drains nothing more.
@@ -921,7 +939,7 @@ impl Update {
             // release names: the targets with ranks there grow into it, one release at a time.
             (Phase::Switching | Phase::Trial, false, Some(report::Kind::Shrunk(shrunk))) => {
                 let growing = growing(&trial.targets, self.nodes.iter().map(|node| &node.layout));
-                grow_on(processes, &shrunk.host, &growing);
+                grow_on(processes, [shrunk.host.as_str()], &growing);
             }
             _ => {}
         }
@@ -1075,6 +1093,13 @@ impl Update {
             return;
         };
         self.nodes[node].launch = launch;
+        // A relaunched scheduler node is its world's at its new launch generation: what the
+        // update sends the world from now on reaches it there.
+        for other in &mut self.nodes {
+            if other.head == previous {
+                other.head = launch;
+            }
+        }
         if let Form::Epoch(trial) = &mut self.form {
             trial.relaunch_due.remove(&node);
         }
@@ -1156,6 +1181,14 @@ impl Update {
                     failed = failed.or(released);
                 }
                 self.claim_failed = failed;
+                // The stops returned once every node reaped the previous epoch's engines, and
+                // the claims ended its storage and its quotas' reservations: the targets grow
+                // into what that freed on every host it ran on. Its weights, graph pools and
+                // process storage left those quotas whatever the layouts, so every target world
+                // with an engine there grows, not only those its drain shrank for.
+                let released: BTreeSet<&str> =
+                    self.nodes.iter().map(|node| node.host.as_str()).collect();
+                grow_on(processes, released, &targets);
             }
         }
     }
@@ -1445,6 +1478,11 @@ impl Update {
                 }
                 trial.switch.retire.push(trial.switch.epoch);
                 let retire = std::mem::take(&mut trial.switch.retire);
+                let released: BTreeSet<String> = trial
+                    .targets
+                    .iter()
+                    .map(|target| target.host.clone())
+                    .collect();
                 // Each previous epoch keeps every scope it executes: the update's serving
                 // engines' and the replicas' it left as they were.
                 let mut failed = None;
@@ -1462,6 +1500,9 @@ impl Update {
                     failed = failed.or(claimed);
                 }
                 self.claim_failed = failed;
+                // The targets are reaped and their epoch's storage retired on every host they
+                // ran on: the previous epoch, which serves again, grows into what that freed.
+                grow_on(processes, released.iter().map(String::as_str), &self.nodes);
             }
         }
         self.enter(Phase::RolledBack);
@@ -1473,14 +1514,23 @@ fn command(kind: command::Kind) -> process::Command {
     process::Command { kind: Some(kind) }
 }
 
-/// Sends `Grow` to the scheduler node of each world of `engines` with an engine on `host`, once
-/// per world: an engine draining across layouts gave device memory back to the quotas of GPUs on
-/// that host, and the scheduler node grows its regions into it on every rank it holds, the
-/// peers' included (`specs/updates.md` §3.7). A world with no engine on that host shares no
-/// quota with it.
-fn grow_on(processes: &mut Processes, host: &str, engines: &[Node]) {
+/// Sends `Grow` to the scheduler node of each world of `engines` with an engine on one of `hosts`,
+/// once per world: device memory came free in the quotas of GPUs on those hosts, given back by an
+/// engine draining across layouts (`Shrunk`) or released with an epoch's storage, and the
+/// scheduler node grows its regions into it on every rank it holds, the peers' included
+/// (`specs/updates.md` §3.7), creating the segments its regions number as far as each rank's quota
+/// and device hold them. A world with no engine on those hosts shares no quota with them.
+fn grow_on<'a>(
+    processes: &mut Processes,
+    hosts: impl IntoIterator<Item = &'a str>,
+    engines: &[Node],
+) {
+    let hosts: BTreeSet<&str> = hosts.into_iter().collect();
     let mut heads: Vec<u64> = Vec::new();
-    for engine in engines.iter().filter(|engine| engine.host == host) {
+    for engine in engines
+        .iter()
+        .filter(|engine| hosts.contains(engine.host.as_str()))
+    {
         if !heads.contains(&engine.head) {
             heads.push(engine.head);
         }
