@@ -379,6 +379,12 @@ impl Member {
         self.agree(tokens)
     }
 
+    /// Whether the step the join batch `batch` asks for is one this member has yet to take part
+    /// in: what [`Self::join`] takes part in rather than finding closed.
+    pub(crate) fn open(&self, batch: &Batch) -> bool {
+        batch.id.0 >= self.round
+    }
+
     /// Takes part in the step the join batch `batch` asks for, with no token of this member's
     /// own: the step's capacity, or `None` for a step the member already took part in.
     ///

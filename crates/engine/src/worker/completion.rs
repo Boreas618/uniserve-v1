@@ -320,19 +320,19 @@ fn joined_outcome(
 ///
 /// The expert tokens `other` states join `output`'s: the ranks of a group count the routes of
 /// distinct tokens or layers (pipeline stages, sequence members, a tensor group's first rank),
-/// so the group's count of a layer is the sum of its ranks'. The rest of a rank's counters are
-/// its own and stay with it.
+/// so the group's count of a layer is the sum of its ranks'. So does each rank's progress of a
+/// profiling session (`ForwardStats::profile`): every rank has a window of its own, and the
+/// daemon ends a session once every selected rank's window ended. The rest of a rank's counters
+/// are its own and stay with it.
 fn join_output(output: &mut BatchOutput, other: BatchOutput) {
-    if let Some(experts) = other
-        .forward_stats
-        .as_ref()
-        .map(|stats| &stats.expert_tokens)
-        .filter(|tokens| !tokens.is_empty())
+    if let Some(theirs) = other.forward_stats.as_ref()
+        && (!theirs.expert_tokens.is_empty() || !theirs.profile.is_empty())
     {
-        output
-            .forward_stats
-            .get_or_insert_with(Default::default)
-            .add_expert_tokens(experts);
+        let stats = output.forward_stats.get_or_insert_with(Default::default);
+        stats.add_expert_tokens(&theirs.expert_tokens);
+        for (session, progress) in &theirs.profile {
+            stats.profile.entry(*session).or_default().add(progress);
+        }
     }
     if other.calls.len() != output.calls.len() {
         return;
@@ -450,6 +450,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
+    use proto::report::{ForwardStats, ProfileProgress};
     use storage::runtime::{OwnerId, RequestId};
 
     use super::*;
@@ -541,5 +542,38 @@ mod tests {
         // Ranks that return other requests for one job leave the group's answer unknown.
         let diverged = completed(vec![release(5)]).joined(vec![completed(vec![])]);
         assert!(matches!(diverged.outcome(), Some(Outcome::Failed(_))));
+    }
+
+    /// A rank's output whose forward statistics state `progress` of profiling session 3.
+    fn profiled(progress: ProfileProgress) -> Submission {
+        let (submission, state) = Submission::pending(SubmissionId(0));
+        let output = BatchOutput {
+            forward_stats: Some(ForwardStats {
+                profile: [(3, progress)].into(),
+                ..ForwardStats::default()
+            }),
+            ..BatchOutput::default()
+        };
+        state.finish(Outcome::Success((output, Vec::new())));
+        submission
+    }
+
+    /// Every rank of a group records a window of a profiling session of its own, which the
+    /// daemon counts by rank: the group's output carries each rank's progress.
+    #[test]
+    fn a_group_s_output_carries_every_rank_s_progress_of_a_profiling_session() {
+        let progress = |steps, ended| ProfileProgress {
+            steps,
+            bytes: 100 * steps,
+            windows_ended: ended,
+        };
+
+        let joined = profiled(progress(4, 1))
+            .joined(vec![profiled(progress(4, 1)), profiled(progress(3, 0))]);
+        let Some(Outcome::Success((output, _))) = joined.outcome() else {
+            panic!("the joined submission completed");
+        };
+        let profile = output.forward_stats.map(|stats| stats.profile);
+        assert_eq!(profile, Some([(3, progress(11, 2))].into()));
     }
 }
