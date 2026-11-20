@@ -160,10 +160,11 @@ pub struct PackageEntry {
     /// Where the revision's sources came from: the commit of the tree it was installed from and
     /// whether that tree was clean.
     pub origin: Origin,
-    /// The operators whose kernel packages the revision launches, in its vocabulary's order
-    /// (`Manifest::operators`): an engine revision's, which the daemon fixes an epoch's kernel
-    /// packages over; empty for every other package.
-    pub operators: Vec<String>,
+    /// The operators whose kernel packages the revision launches, in its vocabulary's order,
+    /// each with the version of its interface the revision launches (`Manifest::operators`): an
+    /// engine revision's, which the daemon fixes an epoch's kernel packages over; empty for every
+    /// other package.
+    pub operators: Vec<crate::manifest::Operator>,
     /// The revision's committed modules.
     pub modules: Vec<ModuleEntry>,
 }
@@ -198,6 +199,14 @@ pub struct CoverRequest {
     /// takes each backend's latest installed revision, which is what the
     /// daemon asks when it fixes a module set.
     pub fixed: Vec<(String, u32)>,
+    /// The version of the operator's interface the requester launches: the
+    /// version the engine revision a module set is fixed for states in its
+    /// vocabulary, or the version the engine's own build launches. Only a
+    /// revision that implements it is a candidate, and a revision `pins` or
+    /// `fixed` names of another version is refused. `None` considers every
+    /// revision, for an interface whose packages state no version in their
+    /// manifests (the engine, a program).
+    pub interface_version: Option<u32>,
 }
 
 /// The response to `cover`: each requested key once, either under the package
@@ -657,6 +666,28 @@ impl Client {
                             )?,
                         });
                     }
+                    // A revision lists the interface version of every operator it names, or of
+                    // none: an engine revision whose vocabulary is of format 1, or any revision a
+                    // Build Server of a build before format 2 lists, states no versions
+                    // (`manifest::VOCABULARY_FORMATS`), and none is assumed for it.
+                    let versioned = !package.interface_versions.is_empty();
+                    let mut operators = Vec::with_capacity(package.operators.len());
+                    for name in package.operators {
+                        let interface_version = match package.interface_versions.get(&name) {
+                            Some(0) | None if versioned => {
+                                return Err(Error::Protocol(format!(
+                                    "the listing of {} {} revision {} states the interface \
+                                     versions of its operators but not a positive one of {name}",
+                                    package.op, package.backend, package.revision
+                                )));
+                            }
+                            version => version.copied(),
+                        };
+                        operators.push(crate::manifest::Operator {
+                            name,
+                            interface_version,
+                        });
+                    }
                     packages.push(PackageEntry {
                         package: Package {
                             op: package.op,
@@ -667,7 +698,7 @@ impl Client {
                             commit: package.commit,
                             clean: package.clean,
                         },
-                        operators: package.operators,
+                        operators,
                         modules,
                     });
                 }
@@ -703,6 +734,7 @@ impl Client {
                         revision: *revision,
                     })
                     .collect(),
+                interface_version: request.interface_version.unwrap_or(0),
             })),
         })?;
         match self.response()? {

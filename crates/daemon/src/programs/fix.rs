@@ -76,9 +76,11 @@ pub(crate) fn fix(
                     revision: 0,
                     arguments: toml::Table::new(),
                 };
+                // A program states the version of its interface in its module, checked below.
                 crate::engine::control::fix_revision(
                     &mut client,
                     proto::module::PROGRAM,
+                    None,
                     &mut latest,
                 )
                 .with_context(|| format!("fixing `programs.{name}` ({source})"))?;

@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::builder::Limits;
 use crate::launch::Launch;
-use crate::manifest::{ModuleForm, SOURCE_DIRECTORY, ToolchainKind};
+use crate::manifest::{ModuleForm, Operator, SOURCE_DIRECTORY, ToolchainKind};
 use crate::protocol::Client;
 use crate::server::{BuildServer, ServerConfig};
 use crate::store::Root;
@@ -849,7 +849,7 @@ pub struct InstalledPackage<'a> {
 
 /// One element of what `list --json` prints: an installed package revision, the commit of the
 /// tree it was installed from and whether that tree was clean, the operators an engine revision
-/// launches, and the modules its store holds.
+/// launches with the version of each one's interface, and the modules its store holds.
 #[derive(Serialize)]
 pub struct ListedPackage<'a> {
     pub op: &'a str,
@@ -857,8 +857,8 @@ pub struct ListedPackage<'a> {
     pub revision: u32,
     pub commit: Option<&'a str>,
     pub clean: bool,
-    #[serde(skip_serializing_if = "<[String]>::is_empty")]
-    pub operators: &'a [String],
+    #[serde(skip_serializing_if = "<[Operator]>::is_empty")]
+    pub operators: &'a [Operator],
     pub modules: Vec<ListedModule<'a>>,
 }
 

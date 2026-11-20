@@ -136,27 +136,47 @@ fn emit_source_digest() -> io::Result<()> {
 
 /// Writes `operators.rs` into `OUT_DIR` from the vocabulary [`OPERATORS`] of
 /// the crate at `manifest`, which `proto::module::operator` includes: one
-/// constant per operator, named by the operator's name in upper case, and
-/// `ALL`, every constant in the order the vocabulary lists them.
+/// constant per operator, named by the operator's name in upper case, `ALL`,
+/// every constant in the order the vocabulary lists them, and `VERSIONS`, each
+/// operator past its first interface version with the version it launches.
 ///
-/// The vocabulary is a TOML table of the one key `operators`, an array of
-/// names. A name is a lowercase ASCII letter followed by lowercase letters,
+/// The vocabulary is a TOML table of two keys: `operators`, an array of names,
+/// and `interface_versions`, a table of the version of each operator's
+/// interface past its first, by name, which is stated even when it names
+/// none. A name is a lowercase ASCII letter followed by lowercase letters,
 /// digits and `_`, so it is one path segment of the module store and its upper
-/// case one Rust identifier, and each name is listed once; anything else fails
-/// the build, naming the file. The Build Server reads the same file of an
-/// engine revision by the same rules (`build_server::manifest::read_operators`).
+/// case one Rust identifier, and each name is listed once; a version names a
+/// listed operator and is a positive integer. Anything else fails the build,
+/// naming the file. The Build Server reads the same file of an engine revision
+/// by the same rules (`build_server::manifest::read_operators`), and also an
+/// installed revision's vocabulary of the previous format, without
+/// `interface_versions`, which this build never compiles
+/// (`build_server::manifest::VOCABULARY_FORMATS`).
 fn emit_operators(manifest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let path = manifest.join(OPERATORS);
     println!("cargo:rerun-if-changed={}", path.display());
     let table: toml::Table = std::fs::read_to_string(&path)?.parse()?;
     let invalid = |reason: String| format!("{}: {reason}", path.display());
-    if let Some(key) = table.keys().find(|key| *key != "operators") {
+    if let Some(key) = table
+        .keys()
+        .find(|key| !["operators", "interface_versions"].contains(&key.as_str()))
+    {
         return Err(invalid(format!("`{key}` is no key of the vocabulary")).into());
     }
     let names = table
         .get("operators")
         .and_then(toml::Value::as_array)
         .ok_or_else(|| invalid("`operators` is no array of names".to_owned()))?;
+    let versions = table
+        .get("interface_versions")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            invalid(
+                "`interface_versions` is no table of the operators' interface versions past \
+                 their first"
+                    .to_owned(),
+            )
+        })?;
 
     let mut listed = std::collections::BTreeSet::new();
     let mut constants = String::new();
@@ -187,9 +207,35 @@ fn emit_operators(manifest: &Path) -> Result<(), Box<dyn std::error::Error>> {
         all.push_str(&format!("    {constant},\n"));
     }
 
+    // Each stated version, as the constant of its operator and a positive integer.
+    let mut stated = String::new();
+    for (name, version) in versions {
+        if !listed.contains(name.as_str()) {
+            return Err(invalid(format!(
+                "`interface_versions` states `{name}`, which the vocabulary does not list"
+            ))
+            .into());
+        }
+        let version = version
+            .as_integer()
+            .filter(|version| (1..=i64::from(u32::MAX)).contains(version))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "`{name}`'s interface version is {version}: a positive integer"
+                ))
+            })?;
+        stated.push_str(&format!(
+            "    ({}, {version}),\n",
+            name.to_ascii_uppercase()
+        ));
+    }
+
     let generated = format!(
         "{constants}\n/// Every operator of the vocabulary, in the order it lists them.\n\
-         pub const ALL: &[&str] = &[\n{all}];\n"
+         pub const ALL: &[&str] = &[\n{all}];\n\n\
+         /// The operators whose interface is past its first version, each with the version this\n\
+         /// build launches, as the vocabulary's `interface_versions` states them.\n\
+         const VERSIONS: &[(&str, u32)] = &[\n{stated}];\n"
     );
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     std::fs::write(out.join("operators.rs"), generated)?;

@@ -62,6 +62,9 @@ pub fn select(
             keys: keys.iter().cloned().collect(),
             pins: pins(op, named),
             fixed: fixed_revisions(op, named),
+            // The version this build launches: a revision of another one is no candidate, and a
+            // fixed or pinned one is refused before any module of it is built.
+            interface_version: Some(proto::module::operator::version(op)),
         };
         let coverage = client
             .cover(&request)

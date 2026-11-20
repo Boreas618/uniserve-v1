@@ -11,11 +11,13 @@
 
 op = "engine"
 backend = "uniserve"
-# The operators the executable launches the kernel packages of, a file of the
-# workspace: the executable compiles its operators' names from it
-# (`proto::module::operator`), and the Build Server lists it with each installed
-# revision, so the daemon fixes an epoch's kernel packages, and validates its
-# `[kernels]` pins, over the operators of the epoch's own engine revision.
+# The operators the executable launches the kernel packages of, with the version
+# of each one's interface it launches, a file of the workspace: the executable
+# compiles its operators' names and versions from it (`proto::module::operator`),
+# and the Build Server lists it with each installed revision, so the daemon fixes
+# an epoch's kernel packages, and validates its `[kernels]` pins, over the
+# operators of the epoch's own engine revision, each among the package revisions
+# of the version that revision launches.
 operators = "crates/proto/src/module/operators.toml"
 # The versions of the engine interface the executable speaks, its messages with
 # the daemon (`proto::ENGINE_INTERFACE`), are stated by the executable itself as
