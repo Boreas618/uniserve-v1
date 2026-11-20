@@ -19,7 +19,13 @@ The widths are DeepSeek-V4.1-Flash's projections: the fused query and
 key/value down projection (5120 → 1792), the query's up projection
 (1280 → 32768), the indexer's query projection (1280 → 4096) and the output
 projection (8192 → 5120), each at a decode step's rows and a prompt's, the
-module of each the row class the operator states for them.
+module of each the row class the operator states for them; and the grouped
+output projection ``wo_a``, eight groups of 4096 → 1024 in one product, whose
+group ``g`` reads columns ``4096 g ..`` of the activations and rows
+``1024 g ..`` of the weight, with the weight's scales laid out as those of the
+``[1024, 8 · 4096]`` matrix of its groups side by side:
+
+    out[m, 1024 g + j] = Σ_i a[m, 4096 g + i] · w[1024 g + j, i]
 
 **The tolerance** is the operator's declared one, ``Tolerance::dot(k, f32,
 bf16)``: ``2γ_k(u_f32)·√k + u_bf16`` of the output's largest magnitude
@@ -93,7 +99,7 @@ CASES = [
 def test_the_product_is_within_the_operators_declared_bound(
     m, n, k, kernel_module, torch_device
 ):
-    key = f"output_bf16_n_{n}_k_{k}_rows_{row_class(m)}"
+    key = f"output_bf16_n_{n}_k_{k}_groups_1_rows_{row_class(m)}"
     library = ctypes.CDLL(
         str(kernel_module("mxfp8_gemm", "deepgemm", key) / "module.so")
     )
@@ -126,6 +132,7 @@ def test_the_product_is_within_the_operators_declared_bound(
         m=m,
         n=n,
         k=k,
+        groups=1,
         input_scale_stride=sa.stride(0),
         weight_scale_stride=sw.stride(0),
         multiprocessors=multiprocessors,
@@ -155,6 +162,97 @@ def test_the_product_is_within_the_operators_declared_bound(
     )
 
 
+#: The grouped cases: the activation rows, each group's output channels and
+#: contraction, and the groups (`wo_a`).
+GROUPED_CASES = [
+    pytest.param(1, 1024, 4096, 8, id="wo_a, one decode row"),
+    pytest.param(37, 1024, 4096, 8, id="wo_a, a decode batch"),
+    pytest.param(700, 1024, 4096, 8, id="wo_a, a prompt"),
+]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(("m", "n", "k", "groups"), GROUPED_CASES)
+def test_each_group_is_within_the_operators_declared_bound(
+    m, n, k, groups, kernel_module, torch_device
+):
+    key = f"output_bf16_n_{n}_k_{k}_groups_{groups}_rows_{row_class(m)}"
+    library = ctypes.CDLL(
+        str(kernel_module("mxfp8_gemm", "deepgemm", key) / "module.so")
+    )
+    entry = library.uniserve_mxfp8_gemm
+    entry.argtypes = [ctypes.POINTER(mx.GemmCall), ctypes.c_void_p]
+    entry.restype = ctypes.c_int32
+
+    generator = torch.Generator().manual_seed(m * 7 + groups)
+    x = torch.randn(m, groups * k, generator=generator).to(torch.bfloat16)
+    input_codes, input_scales = mx.encode_mxfp8(x)
+    weight_codes, weight_scales = weight(groups * n, k, n + k)
+    # The weight's scales as those of its groups side by side along the
+    # contraction: row `j` of the `[n, groups · k]` table holds every group's
+    # row `j`.
+    beside = (
+        weight_scales.reshape(groups, n, k // 32)
+        .permute(1, 0, 2)
+        .reshape(n, groups * k // 32)
+    )
+
+    a = input_codes.to(torch_device)
+    w = weight_codes.to(torch_device)
+    sa = mx.packed_scales(input_scales).to(torch_device)
+    sw = mx.packed_scales(beside).to(torch_device)
+    out = torch.full(
+        (m, groups * n), float("nan"), dtype=torch.bfloat16, device=torch_device
+    )
+    multiprocessors = torch.cuda.get_device_properties(
+        torch_device
+    ).multi_processor_count
+
+    call = mx.GemmCall(
+        input=a.data_ptr(),
+        input_scales=sa.data_ptr(),
+        weight=w.data_ptr(),
+        weight_scales=sw.data_ptr(),
+        out=out.data_ptr(),
+        m=m,
+        n=n,
+        k=k,
+        groups=groups,
+        input_scale_stride=sa.stride(0),
+        weight_scale_stride=sw.stride(0),
+        multiprocessors=multiprocessors,
+    )
+    stream = torch.cuda.current_stream(torch_device).cuda_stream
+    status = entry(ctypes.byref(call), ctypes.c_void_p(stream))
+    torch.cuda.synchronize(torch_device)
+    assert status == 0, (
+        f"the module refused: {call.error.decode(errors='replace')}"
+    )
+
+    # Each group's product in FP64 over the bytes the call passed, the groups'
+    # outputs side by side.
+    activations = mx.decode_mxfp8(input_codes, input_scales)
+    matrix = mx.decode_mxfp8(weight_codes, weight_scales)
+    reference = torch.cat(
+        [
+            activations[:, g * k : (g + 1) * k] @ matrix[g * n : (g + 1) * n].T
+            for g in range(groups)
+        ],
+        dim=1,
+    )
+    error = (out.double().cpu() - reference).abs()
+    atol, rtol = mx.dot_tolerance(k, "bf16")
+    peak = float(reference.abs().max())
+    outside = ~(error <= atol + rtol * peak)
+    worst = float(torch.nan_to_num(error, nan=float("inf")).max())
+    assert not bool(outside.any()), (
+        f"{groups} [{m}, {n}, {k}]: {int(outside.sum())} of "
+        f"{m * groups * n} elements outside atol {atol:.3e} + rtol "
+        f"{rtol:.3e} of the largest |reference| {peak:.4g}; max "
+        f"|out - reference| {worst:.4g}"
+    )
+
+
 @pytest.mark.gpu
 def test_the_entry_refuses_another_weight_before_the_device(kernel_module):
     """A call naming another weight's extents is refused on the host, by
@@ -163,7 +261,9 @@ def test_the_entry_refuses_another_weight_before_the_device(kernel_module):
     library = ctypes.CDLL(
         str(
             kernel_module(
-                "mxfp8_gemm", "deepgemm", "output_bf16_n_1792_k_5120_rows_16"
+                "mxfp8_gemm",
+                "deepgemm",
+                "output_bf16_n_1792_k_5120_groups_1_rows_16",
             )
             / "module.so"
         )
@@ -181,6 +281,7 @@ def test_the_entry_refuses_another_weight_before_the_device(kernel_module):
         m=4,
         n=1024,
         k=5120,
+        groups=1,
         input_scale_stride=4,
         weight_scale_stride=1024,
         multiprocessors=148,

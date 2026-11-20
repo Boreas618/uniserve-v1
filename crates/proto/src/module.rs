@@ -263,6 +263,9 @@ pub mod operator {
         // load, two pointers after the map; its descriptor states its scoring and whether it reads
         // a selection bias, a pointer after the scale's kind.
         (TOPK_SOFTMAX, 3),
+        // The MXFP8 product computes groups of products in one launch: its descriptor states
+        // them and its call carries their count after the contraction.
+        (MXFP8_GEMM, 2),
     ];
 
     /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.

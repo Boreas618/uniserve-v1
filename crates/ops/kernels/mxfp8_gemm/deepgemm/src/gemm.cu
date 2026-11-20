@@ -8,20 +8,29 @@
 // (`patches/launched-grid.patch`). It owns the product: TMA loads of both operands and both
 // operands' packed UE8M0 scales, the tcgen05 block-scaled MMA with the scales applied inside it,
 // FP32 accumulation in tensor memory and a TMA store of the BF16 tile. This unit owns what
-// DeepGEMM's Python extension did around it for a normal K-major product (its
-// `sm100_fp8_fp4_gemm_1d1d`, `csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp`, and the tensor
-// map helpers of `runtime_utils.hpp`):
+// DeepGEMM's Python extension did around it for a K-major product (its `sm100_fp8_fp4_gemm_1d1d`
+// and `sm100_fp8_bmm`, `csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp`, and the tensor map
+// helpers of `runtime_utils.hpp`):
 //
 // * the template arguments, which the build chose as DeepGEMM's run-time heuristic chooses them
 //   (`src/build.py`) and states as definitions;
-// * the five tensor maps: A `[m, k]` and B `[n, k]` E4M3 under the 128-byte swizzle, both scale
-//   tables as MN-major `u32` words (`[k / 128, padded rows]`, padded to whole 16-byte rows), and
-//   the `[m, n]` BF16 output under the epilogue's swizzle;
+// * the five tensor maps: A `[m, groups * k]` and B `[groups * n, k]` E4M3 under the 128-byte
+//   swizzle, both scale tables as MN-major `u32` words (`[groups * k / 128, padded rows]`, padded
+//   to whole 16-byte rows), and the `[m, groups * n]` BF16 output under the epilogue's swizzle;
 // * the launch: one block per multiprocessor of the device, in clusters of the tile's multicast,
 //   with the tile's dynamic shared memory.
 //
-// Every launch reads its rows from the call; `n` and `k` are compiled in, and a call of another
-// width belongs to another module.
+// A grouped product (`UNISERVE_GROUPS` > 1) is DeepGEMM's batched form (`GemmType::Batched`):
+// group `g` multiplies columns `g k ..` of A with rows `g n ..` of B into columns `g n ..` of the
+// output, so A, B and the output are three-dimensional tensor maps whose group axis strides `k`
+// elements, `n` rows and `n` elements, and the scheduler walks the groups' blocks group after
+// group. Its scale tables are those of the `[rows, groups * k]` matrices the groups' operands
+// concatenate along the contraction: the kernel reads group `g`'s scale columns at
+// `g * k / 128 ..`, which is where A's packed scales hold them, and where a grouped weight's
+// loader packs B's.
+//
+// Every launch reads its rows from the call; `n`, `k` and the groups are compiled in, and a call
+// of another shape belongs to another module.
 
 #include <uniserve_mxfp8_gemm.h>
 
@@ -35,8 +44,8 @@
 
 #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
 
-#if !defined(UNISERVE_N) || !defined(UNISERVE_K) || !defined(UNISERVE_BLOCK_M) || \
-    !defined(UNISERVE_STAGES) || !defined(UNISERVE_SHARED_BYTES)
+#if !defined(UNISERVE_N) || !defined(UNISERVE_K) || !defined(UNISERVE_GROUPS) || \
+    !defined(UNISERVE_BLOCK_M) || !defined(UNISERVE_STAGES) || !defined(UNISERVE_SHARED_BYTES)
 #error "the build defines the descriptor's extents and the tile (src/build.py)"
 #endif
 
@@ -44,9 +53,11 @@ namespace {
 
 using deep_gemm::GemmType;
 
-// The descriptor's extents.
+// The descriptor's extents: each group's output channels and contraction, and the groups.
 constexpr uint32_t kN = UNISERVE_N;
 constexpr uint32_t kK = UNISERVE_K;
+constexpr uint32_t kGroups = UNISERVE_GROUPS;
+constexpr bool kGrouped = kGroups > 1;
 
 // The tile, as the build chose it.
 constexpr uint32_t kBlockM = UNISERVE_BLOCK_M;
@@ -82,24 +93,25 @@ constexpr uint32_t kScaleBlockN = (kBlockN + 127) / 128 * 128;
 constexpr int64_t kWordRows = 4;
 
 static_assert(kK % 128 == 0, "the contraction is whole 128-element steps");
+static_assert(kGroups >= 1, "a product of at least one group");
 static_assert(kSharedBytes <= 232448, "the tile fits a block's shared memory");
 
 // The kernel, with every template argument the descriptor and the tile fix: K-major operands of
-// 32-element scales, rows decided at launch (`SHAPE_M = 0`), one group, a normal product with no
-// accumulation and the identity epilogue.
+// 32-element scales, rows decided at launch (`SHAPE_M = 0`), a normal product or the batched one
+// of the groups, no accumulation and the identity epilogue.
 constexpr auto kKernel = &deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<
     cute::UMMA::Major::K, cute::UMMA::Major::K,
     /*kGranKA=*/kGranK, /*kGranKB=*/kGranK, /*kKAlignment=*/kGranK,
     /*SHAPE_M=*/0, /*SHAPE_N=*/kN, /*SHAPE_K=*/kK,
     kBlockM, kBlockN, kBlockK,
-    /*kNumGroups=*/1,
+    /*kNumGroups=*/kGroups,
     kSwizzleAB, kSwizzleAB, kSwizzleCD,
     kStages, kStoreStages,
     kNonEpilogueThreads, kEpilogueThreads,
     kCluster, kMulticastOnA,
     kPlannedSMs,
     kSwapAB, /*kEnsureZeroPadding=*/true,
-    GemmType::Normal, /*kWithAccumulation=*/false,
+    kGrouped ? GemmType::Batched : GemmType::Normal, /*kWithAccumulation=*/false,
     cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t,
     deep_gemm::epilogue::operators::Identity>;
 
@@ -128,6 +140,24 @@ bool encode(CUtensorMap* map, CUtensorMapDataType type, uint32_t bytes, const vo
                                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
+// A three-dimensional tensor map over the groups of a grouped product: `inner` by `outer`
+// elements of `bytes` each in every one of `groups` matrices, rows `stride` elements apart and
+// consecutive groups `group_stride` elements apart, loaded in `box_inner` by `box_outer` boxes of
+// one group under `swizzle` (DeepGEMM's `make_tma_3d_desc`). The strides need not grow with the
+// axes: a group of A is a block of columns of every row, whose step is shorter than a row's.
+bool encode_groups(CUtensorMap* map, CUtensorMapDataType type, uint32_t bytes, const void* base,
+                   uint64_t inner, uint64_t outer, uint64_t stride, uint64_t group_stride,
+                   uint32_t box_inner, uint32_t box_outer, CUtensorMapSwizzle swizzle) {
+  const cuuint64_t extents[3] = {inner, outer, kGroups};
+  const cuuint64_t strides[2] = {stride * bytes, group_stride * bytes};
+  const cuuint32_t box[3] = {box_inner, box_outer, 1};
+  const cuuint32_t steps[3] = {1, 1, 1};
+  return cuTensorMapEncodeTiled(map, type, 3, const_cast<void*>(base), extents, strides, box,
+                                steps, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+                                CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
 // The swizzle a tensor map states for a shared-memory row of `bytes` bytes.
 CUtensorMapSwizzle swizzle_of(uint32_t bytes) {
   switch (bytes) {
@@ -142,13 +172,15 @@ CUtensorMapSwizzle swizzle_of(uint32_t bytes) {
   }
 }
 
-// The scale table of `rows` rows: `[k / 128, padded rows]` words, columns `stride` words apart,
-// loaded one 128-element step of `box_rows` rows at a time (DeepGEMM's `make_tma_sf_desc`).
+// The scale table of `rows` rows: `[groups * k / 128, padded rows]` words, columns `stride` words
+// apart, loaded one 128-element step of `box_rows` rows at a time (DeepGEMM's
+// `make_tma_sf_desc`). A grouped kernel reads group `g`'s columns from `g * k / 128` on.
 bool encode_scales(CUtensorMap* map, const void* base, int64_t rows, int64_t stride,
                    uint32_t box_rows) {
   const uint64_t padded = static_cast<uint64_t>((rows + kWordRows - 1) / kWordRows * kWordRows);
-  return encode(map, CU_TENSOR_MAP_DATA_TYPE_INT32, sizeof(uint32_t), base, padded, kK / 128,
-                static_cast<uint64_t>(stride), box_rows, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
+  return encode(map, CU_TENSOR_MAP_DATA_TYPE_INT32, sizeof(uint32_t), base, padded,
+                kGroups * kK / 128, static_cast<uint64_t>(stride), box_rows, 1,
+                CU_TENSOR_MAP_SWIZZLE_NONE);
 }
 
 int launch(uniserve_mxfp8_gemm_call* call, cudaStream_t stream) {
@@ -156,11 +188,19 @@ int launch(uniserve_mxfp8_gemm_call* call, cudaStream_t stream) {
   CUtensorMap a, b, scales_a, scales_b, d;
 
   // The operands are K-major E4M3, read as bytes: a box is one swizzled 128-byte row of the
-  // contraction by the rows one block of the cluster loads.
-  if (!encode(&a, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, call->input, kK, m, kK, kSwizzleAB,
-              kLoadBlockM, CU_TENSOR_MAP_SWIZZLE_128B) ||
-      !encode(&b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, call->weight, kK, kN, kK, kSwizzleAB,
-              kLoadBlockN, CU_TENSOR_MAP_SWIZZLE_128B)) {
+  // contraction by the rows one block of the cluster loads. A group of A is a block of `k` columns
+  // of rows `groups * k` apart; a group of B is a block of `n` rows.
+  const bool operands = kGrouped
+      ? encode_groups(&a, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, call->input, kK, m, kGroups * kK, kK,
+                      kSwizzleAB, kLoadBlockM, CU_TENSOR_MAP_SWIZZLE_128B) &&
+            encode_groups(&b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, call->weight, kK, kN, kK,
+                          static_cast<uint64_t>(kN) * kK, kSwizzleAB, kLoadBlockN,
+                          CU_TENSOR_MAP_SWIZZLE_128B)
+      : encode(&a, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, call->input, kK, m, kK, kSwizzleAB,
+               kLoadBlockM, CU_TENSOR_MAP_SWIZZLE_128B) &&
+            encode(&b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, call->weight, kK, kN, kK, kSwizzleAB,
+                   kLoadBlockN, CU_TENSOR_MAP_SWIZZLE_128B);
+  if (!operands) {
     return refuse(call, "the operands' tensor maps cannot be encoded");
   }
   if (!encode_scales(&scales_a, call->input_scales, call->m, call->input_scale_stride,
@@ -172,8 +212,13 @@ int launch(uniserve_mxfp8_gemm_call* call, cudaStream_t stream) {
   // The output's box is one store block; under a swizzle its row is the swizzle's width.
   const uint32_t store_inner =
       kSwizzleCD != 0 ? kSwizzleCD / sizeof(cutlass::bfloat16_t) : kStoreBlockN;
-  if (!encode(&d, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, sizeof(cutlass::bfloat16_t), call->out, kN, m,
-              kN, store_inner, kStoreBlockM, swizzle_of(kSwizzleCD))) {
+  // A group's output is a block of `n` columns of rows `groups * n` apart.
+  const bool output = kGrouped
+      ? encode_groups(&d, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, sizeof(cutlass::bfloat16_t), call->out,
+                      kN, m, kGroups * kN, kN, store_inner, kStoreBlockM, swizzle_of(kSwizzleCD))
+      : encode(&d, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, sizeof(cutlass::bfloat16_t), call->out, kN,
+               m, kN, store_inner, kStoreBlockM, swizzle_of(kSwizzleCD));
+  if (!output) {
     return refuse(call, "the output's tensor map cannot be encoded");
   }
 
@@ -216,11 +261,13 @@ extern "C" int uniserve_mxfp8_gemm(uniserve_mxfp8_gemm_call* call, void* stream)
   }
   std::memset(call->error, 0, sizeof(call->error));
 
-  if (call->n != kN || call->k != kK) {
+  if (call->n != kN || call->k != kK || call->groups != kGroups) {
     char message[256];
     std::snprintf(message, sizeof(message),
-                  "this module is compiled for a [%u, %u] weight and was handed [%lld, %lld]", kN,
-                  kK, static_cast<long long>(call->n), static_cast<long long>(call->k));
+                  "this module is compiled for %u groups of a [%u, %u] weight and was handed %lld "
+                  "of [%lld, %lld]",
+                  kGroups, kN, kK, static_cast<long long>(call->groups),
+                  static_cast<long long>(call->n), static_cast<long long>(call->k));
     return refuse(call, message);
   }
   if (call->m < 0 || call->m > std::numeric_limits<uint32_t>::max()) {

@@ -10,7 +10,8 @@
 //! ```text
 //! mxfp8_quantize   encode 16-bit rows into E4M3 codes and one UE8M0 scale per 32 elements
 //! mxfp8_gemm       out[m, n] = Σ_k (a[m, k] · sa[m, k / 32]) · (w[n, k] · sw[n, k / 32])
-//!                  accumulated in FP32 and rounded once into BF16
+//!                  accumulated in FP32 and rounded once into BF16; a grouped product computes
+//!                  out[m, g n + j] = Σ_k a[m, g k + i] · w[g n + j, i] for every group g
 //! ```
 //!
 //! ## Scales
@@ -54,6 +55,14 @@
 //! persistent kernel that serves every row count. Its tile is chosen for a row class
 //! ([`ROW_CLASSES`]): the descriptor states the smallest class that holds the call's rows, as
 //! [`crate::fp4::packed_rows`] does for the NVFP4 product, and a module computes any row count.
+//!
+//! A product of several groups ([`GemmDescriptor::groups`]) multiplies each group's block of
+//! `k` columns of the activations with the group's block of `n` rows of the weight into its block
+//! of `n` output columns, in one launch: a grouped projection such as DeepSeek-V4.1's `wo_a`,
+//! whose eight groups each project their heads' outputs, reads its activations and writes its
+//! output as one matrix each. The scale table of both operands is that of the `[rows, groups · k]`
+//! matrix the groups' blocks concatenate along the contraction: the activations' own, and for the
+//! weight the table of `[n, groups · k]` whose column block `g` is group `g`'s rows.
 
 use std::ffi::{c_char, c_void};
 use std::fmt;
@@ -484,10 +493,13 @@ impl Op for Mxfp8Quantize {
 pub struct GemmDescriptor {
     /// Element type of the product: BF16.
     pub output: DType,
-    /// Output channels: the weight's rows.
+    /// Output channels of each group: its rows of the weight.
     pub n: u32,
-    /// The contraction's elements: whole packed scale words.
+    /// The contraction's elements of each group: whole packed scale words.
     pub k: u32,
+    /// The products computed in one launch, each over its own block of `k` activation columns
+    /// and `n` weight rows: one for a plain product.
+    pub groups: u32,
     /// The row class the tile is chosen for ([`row_class`]); the module computes any row count.
     pub rows: u32,
 }
@@ -496,13 +508,15 @@ impl GemmDescriptor {
     /// The layout of both operands' scales the product reads.
     pub const SCALE_LAYOUT: ScaleLayout = ScaleLayout::PackedMnMajor;
 
-    /// The compilation of a product over `rows` encoded activation rows and an `[n, k]` MXFP8
-    /// weight into BF16.
-    pub fn new(rows: u64, n: u32, k: u32) -> Self {
+    /// The compilation of `groups` products over `rows` encoded activation rows of
+    /// `groups · k` elements and a `[groups · n, k]` MXFP8 weight into BF16; one group is a
+    /// plain `[n, k]` product.
+    pub fn new(rows: u64, n: u32, k: u32, groups: u32) -> Self {
         Self {
             output: DType::BF16,
             n,
             k,
+            groups,
             rows: row_class(rows),
         }
     }
@@ -514,23 +528,27 @@ impl fmt::Display for GemmDescriptor {
             .field("output", abi::name(self.output))
             .field("n", self.n)
             .field("k", self.k)
+            .field("groups", self.groups)
             .field("rows", self.rows)
             .finish(formatter)
     }
 }
 
-/// The arguments of one `mxfp8_gemm`.
+/// The arguments of one `mxfp8_gemm` of `groups` groups (one for a plain product).
 #[derive(Clone)]
 pub struct GemmArgs {
-    /// `[m, k]` E4M3, contiguous: the encoded activations.
+    /// `[m, groups · k]` E4M3, contiguous: the encoded activations, group `g`'s columns
+    /// `g · k ..`.
     pub input: Operand,
-    /// The activations' scales in [`GemmDescriptor::SCALE_LAYOUT`] over `[m, k]`.
+    /// The activations' scales in [`GemmDescriptor::SCALE_LAYOUT`] over `[m, groups · k]`.
     pub input_scales: Operand,
-    /// `[n, k]` E4M3, contiguous: the weight, one row per output channel.
+    /// `[groups · n, k]` E4M3, contiguous: the weight, one row per output channel, group `g`'s
+    /// rows `g · n ..`.
     pub weight: Operand,
-    /// The weight's scales in [`GemmDescriptor::SCALE_LAYOUT`] over `[n, k]`.
+    /// The weight's scales in [`GemmDescriptor::SCALE_LAYOUT`] over `[n, groups · k]`: group
+    /// `g`'s rows as the column block `g`, which for one group is the `[n, k]` weight's table.
     pub weight_scales: Operand,
-    /// `[m, n]`, contiguous: the product.
+    /// `[m, groups · n]`, contiguous: the product, group `g`'s columns `g · n ..`.
     pub out: Operand,
 }
 
@@ -543,19 +561,24 @@ pub struct GemmArgs {
 #[repr(C)]
 #[derive(abi::Layout)]
 pub struct Call {
-    /// `[m, k]` E4M3 codes, contiguous.
+    /// `[m, groups · k]` E4M3 codes, contiguous.
     pub input: *const c_void,
-    /// `[k / 128, padded m]` U32: the activations' packed scale words.
+    /// `[groups · k / 128, padded m]` U32: the activations' packed scale words.
     pub input_scales: *const c_void,
-    /// `[n, k]` E4M3 codes, contiguous.
+    /// `[groups · n, k]` E4M3 codes, contiguous.
     pub weight: *const c_void,
-    /// `[k / 128, padded n]` U32: the weight's packed scale words.
+    /// `[groups · k / 128, padded n]` U32: the weight's packed scale words, group `g`'s from
+    /// column `g · k / 128`.
     pub weight_scales: *const c_void,
-    /// `[m, n]` BF16: the product.
+    /// `[m, groups · n]` BF16: the product.
     pub out: *mut c_void,
     pub m: i64,
+    /// Output channels of each group.
     pub n: i64,
+    /// The contraction of each group.
     pub k: i64,
+    /// The groups: one for a plain product.
+    pub groups: i64,
     /// Words between consecutive scale columns of the activations: `m` padded to four.
     pub input_scale_stride: i64,
     /// Words between consecutive scale columns of the weight: `n` padded to four.
@@ -591,9 +614,14 @@ impl Op for Mxfp8Gemm {
                 ),
             ));
         }
-        let (n, k) = (u64::from(descriptor.n), u64::from(descriptor.k));
+        let (n, k, groups) = (
+            u64::from(descriptor.n),
+            u64::from(descriptor.k),
+            u64::from(descriptor.groups),
+        );
         // The kernel loads 128 elements of the contraction a step, one packed scale word, and
-        // stores output rows of whole 16-byte vectors.
+        // stores output rows of whole 16-byte vectors; a group's blocks therefore start on whole
+        // words of either operand's scales and whole vectors of the output.
         if k == 0 || !k.is_multiple_of(WORD_ELEMENTS) || n == 0 || !n.is_multiple_of(16) {
             return Err(Error::argument(
                 Self::NAME,
@@ -603,12 +631,21 @@ impl Op for Mxfp8Gemm {
                 ),
             ));
         }
+        if groups == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a product of no group".to_owned(),
+            ));
+        }
 
         args.input.require_rank(Self::NAME, 2)?;
         let m = args.input.dim(0);
-        for (name, operand, rows) in [("input", &args.input, m), ("weight", &args.weight, n)] {
-            operand.require_shape(Self::NAME, &[rows, k])?;
-            operand.require_row(Self::NAME, DType::F8E4M3, k)?;
+        for (name, operand, rows, columns) in [
+            ("input", &args.input, m, groups * k),
+            ("weight", &args.weight, groups * n, k),
+        ] {
+            operand.require_shape(Self::NAME, &[rows, columns])?;
+            operand.require_row(Self::NAME, DType::F8E4M3, columns)?;
             if !operand.is_row_major() {
                 return Err(Error::argument(
                     Self::NAME,
@@ -616,13 +653,16 @@ impl Op for Mxfp8Gemm {
                 ));
             }
         }
+        // Both tables are those of `[rows, groups · k]` matrices: the activations', and the
+        // weight's groups side by side along the contraction.
         for (operand, rows) in [(&args.input_scales, m), (&args.weight_scales, n)] {
-            let shape = GemmDescriptor::SCALE_LAYOUT.shape(rows, k);
+            let shape = GemmDescriptor::SCALE_LAYOUT.shape(rows, groups * k);
             operand.require_shape(Self::NAME, &shape)?;
             operand.require_row(Self::NAME, DType::U32, shape[1])?;
         }
-        args.out.require_shape(Self::NAME, &[m, n])?;
-        args.out.require_row(Self::NAME, descriptor.output, n)?;
+        args.out.require_shape(Self::NAME, &[m, groups * n])?;
+        args.out
+            .require_row(Self::NAME, descriptor.output, groups * n)?;
         if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
@@ -630,10 +670,10 @@ impl Op for Mxfp8Gemm {
             ));
         }
         // The kernel's tensor maps count rows and the contraction in 32 bits.
-        if m.max(n).max(k) > u64::from(u32::MAX) {
+        if m.max(groups * n).max(groups * k) > u64::from(u32::MAX) {
             return Err(Error::argument(
                 Self::NAME,
-                format!("a [{m}, {n}, {k}] product past the kernel's 32-bit extents"),
+                format!("{groups} [{m}, {n}, {k}] products past the kernel's 32-bit extents"),
             ));
         }
         Ok(())
@@ -657,6 +697,7 @@ impl Op for Mxfp8Gemm {
             m: m as i64,
             n: i64::from(descriptor.n),
             k: i64::from(descriptor.k),
+            groups: i64::from(descriptor.groups),
             input_scale_stride: args.input_scales.stride(0) as i64,
             weight_scale_stride: args.weight_scales.stride(0) as i64,
             multiprocessors: i64::from(stream.device().multiprocessors()?),
@@ -677,8 +718,8 @@ impl Op for Mxfp8Gemm {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The products of two codes under power-of-two scales are exact in FP32, so two
-        // implementations differ by the association of the `k` products and the one rounding
-        // into the output; a matrix product's terms take either sign.
+        // implementations differ by the association of a group's `k` products and the one
+        // rounding into the output; a matrix product's terms take either sign.
         Tolerance::dot(u64::from(descriptor.k), DType::F32, descriptor.output)
     }
 }
@@ -804,10 +845,10 @@ mod tests {
     /// take, and a contraction of a partial word is refused.
     #[test]
     fn a_product_reads_packed_scales_of_whole_words() {
-        let descriptor = GemmDescriptor::new(5, 256, 512);
+        let descriptor = GemmDescriptor::new(5, 256, 512, 1);
         assert_eq!(
             descriptor::key(&descriptor),
-            "output_bf16_n_256_k_512_rows_16"
+            "output_bf16_n_256_k_512_groups_1_rows_16"
         );
         let args = |k: u64, input_scales: &[u64]| GemmArgs {
             input: operand(DType::F8E4M3, &[5, k]),
@@ -825,6 +866,31 @@ mod tests {
             ..descriptor
         };
         assert!(Mxfp8Gemm::check(&partial, &args(544, &[5, 8])).is_err());
+    }
+
+    /// A grouped product reads its activations and writes its output as one matrix each, its
+    /// weight as the groups' rows stacked, and both scale tables over the groups' contractions
+    /// side by side.
+    #[test]
+    fn a_grouped_product_reads_its_groups_side_by_side() {
+        let descriptor = GemmDescriptor::new(3, 1024, 4096, 8);
+        assert_eq!(
+            descriptor::key(&descriptor),
+            "output_bf16_n_1024_k_4096_groups_8_rows_16"
+        );
+        let args = |weight_scales: &[u64], out: &[u64]| GemmArgs {
+            input: operand(DType::F8E4M3, &[3, 8 * 4096]),
+            input_scales: operand(DType::U32, &[8 * 4096 / 128, 4]),
+            weight: operand(DType::F8E4M3, &[8 * 1024, 4096]),
+            weight_scales: operand(DType::U32, weight_scales),
+            out: operand(DType::BF16, out),
+        };
+
+        assert!(Mxfp8Gemm::check(&descriptor, &args(&[256, 1024], &[3, 8192])).is_ok());
+        // The weight's table is the `[n, groups · k]` one, not the stacked rows' `[groups · n, k]`.
+        assert!(Mxfp8Gemm::check(&descriptor, &args(&[32, 8192], &[3, 8192])).is_err());
+        // Every group writes its block of the output.
+        assert!(Mxfp8Gemm::check(&descriptor, &args(&[256, 1024], &[3, 1024])).is_err());
     }
 
     /// The encoder writes linear or packed scales of whole words, in programs that divide the row.

@@ -23,19 +23,24 @@
 /// Five device addresses, the problem's extents, the scale tables' column strides in words, and
 /// the multiprocessors of the device the launch runs on, which the persistent grid covers.
 struct uniserve_mxfp8_gemm_call {
-  /// `[m, k]` E4M3 codes, contiguous.
+  /// `[m, groups · k]` E4M3 codes, contiguous.
   const void *input;
-  /// `[k / 128, padded m]` U32: the activations' packed scale words.
+  /// `[groups · k / 128, padded m]` U32: the activations' packed scale words.
   const void *input_scales;
-  /// `[n, k]` E4M3 codes, contiguous.
+  /// `[groups · n, k]` E4M3 codes, contiguous.
   const void *weight;
-  /// `[k / 128, padded n]` U32: the weight's packed scale words.
+  /// `[groups · k / 128, padded n]` U32: the weight's packed scale words, group `g`'s from
+  /// column `g · k / 128`.
   const void *weight_scales;
-  /// `[m, n]` BF16: the product.
+  /// `[m, groups · n]` BF16: the product.
   void *out;
   int64_t m;
+  /// Output channels of each group.
   int64_t n;
+  /// The contraction of each group.
   int64_t k;
+  /// The groups: one for a plain product.
+  int64_t groups;
   /// Words between consecutive scale columns of the activations: `m` padded to four.
   int64_t input_scale_stride;
   /// Words between consecutive scale columns of the weight: `n` padded to four.
@@ -46,7 +51,7 @@ struct uniserve_mxfp8_gemm_call {
   char error[UNISERVE_MESSAGE];
 };
 
-static_assert(sizeof(uniserve_mxfp8_gemm_call) == 600, "the operator crate's layout of uniserve_mxfp8_gemm_call");
+static_assert(sizeof(uniserve_mxfp8_gemm_call) == 608, "the operator crate's layout of uniserve_mxfp8_gemm_call");
 static_assert(offsetof(uniserve_mxfp8_gemm_call, input) == 0, "the operator crate's layout of uniserve_mxfp8_gemm_call");
 static_assert(offsetof(uniserve_mxfp8_gemm_call, input_scales) == 8, "the operator crate's layout of uniserve_mxfp8_gemm_call");
 static_assert(offsetof(uniserve_mxfp8_gemm_call, weight) == 16, "the operator crate's layout of uniserve_mxfp8_gemm_call");
@@ -55,7 +60,8 @@ static_assert(offsetof(uniserve_mxfp8_gemm_call, out) == 32, "the operator crate
 static_assert(offsetof(uniserve_mxfp8_gemm_call, m) == 40, "the operator crate's layout of uniserve_mxfp8_gemm_call");
 static_assert(offsetof(uniserve_mxfp8_gemm_call, n) == 48, "the operator crate's layout of uniserve_mxfp8_gemm_call");
 static_assert(offsetof(uniserve_mxfp8_gemm_call, k) == 56, "the operator crate's layout of uniserve_mxfp8_gemm_call");
-static_assert(offsetof(uniserve_mxfp8_gemm_call, input_scale_stride) == 64, "the operator crate's layout of uniserve_mxfp8_gemm_call");
-static_assert(offsetof(uniserve_mxfp8_gemm_call, weight_scale_stride) == 72, "the operator crate's layout of uniserve_mxfp8_gemm_call");
-static_assert(offsetof(uniserve_mxfp8_gemm_call, multiprocessors) == 80, "the operator crate's layout of uniserve_mxfp8_gemm_call");
-static_assert(offsetof(uniserve_mxfp8_gemm_call, error) == 88, "the operator crate's layout of uniserve_mxfp8_gemm_call");
+static_assert(offsetof(uniserve_mxfp8_gemm_call, groups) == 64, "the operator crate's layout of uniserve_mxfp8_gemm_call");
+static_assert(offsetof(uniserve_mxfp8_gemm_call, input_scale_stride) == 72, "the operator crate's layout of uniserve_mxfp8_gemm_call");
+static_assert(offsetof(uniserve_mxfp8_gemm_call, weight_scale_stride) == 80, "the operator crate's layout of uniserve_mxfp8_gemm_call");
+static_assert(offsetof(uniserve_mxfp8_gemm_call, multiprocessors) == 88, "the operator crate's layout of uniserve_mxfp8_gemm_call");
+static_assert(offsetof(uniserve_mxfp8_gemm_call, error) == 96, "the operator crate's layout of uniserve_mxfp8_gemm_call");

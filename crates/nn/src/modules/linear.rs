@@ -36,7 +36,8 @@
 //! [`QkvLinear`] holds the query, key and value projections of an attention (separate
 //! checkpoint tensors or windows of one fused tensor, the key/value heads replicated when the
 //! split is wider than they are); [`Linear::load_merged`] reads several checkpoint matrices as
-//! one product.
+//! one product; [`GroupedLinear`] reads one matrix as the weights of several projections of
+//! slices of the input, computed in one launch.
 
 use ops::dynamic_scale::{FP8_RANGE, NVFP4_RANGE};
 use ops::fp4::{BLOCK_ELEMENTS, GemmDescriptor, PRODUCT_TILE, ScaleLayout};
@@ -759,6 +760,67 @@ impl Linear {
 impl Module for Linear {
     fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
+    }
+}
+
+/// A grouped projection: `groups` projections of `inputs` features to `outputs` channels each,
+/// group `g` reading features `g · inputs ..` of its input row and writing channels
+/// `g · outputs ..` of its output row, computed in one launch
+/// ([`functional::grouped_linear_mxfp8`]). Its weight is one checkpoint matrix
+/// `[groups · outputs, inputs]` whose rows `g · outputs ..` are group `g`'s, such as
+/// DeepSeek-V4.1's `wo_a`, which projects each group of attention heads to its own rank.
+///
+/// The groups are whole on every rank and the product adds no bias. A block-scaled FP8 weight is
+/// the one representation it reads: its activation is encoded per 32 elements on every call, as
+/// a [`Linear`] of the same export's encodes it.
+pub struct GroupedLinear {
+    weight: Mxfp8Weight,
+    groups: u32,
+}
+
+impl GroupedLinear {
+    /// The grouped projection of `vb`'s `weight`, `groups` groups of `[outputs, inputs]`.
+    ///
+    /// # Errors
+    ///
+    /// When the weight is not a block-scaled FP8 matrix of `groups · outputs` rows and `inputs`
+    /// columns of whole scale words, or its codes are all zero.
+    pub fn load(inputs: u32, outputs: u32, groups: u32, vb: VarBuilder<'_, '_>) -> Result<Self> {
+        let name = vb.name("weight");
+        if vb.scheme("weight") != Scheme::Mxfp8 {
+            return Err(Error::weight(
+                &name,
+                "a grouped projection multiplies a block-scaled FP8 weight, and the checkpoint \
+                 stores this one otherwise"
+                    .to_owned(),
+            ));
+        }
+        let weight = vb.loader().mxfp8_groups(
+            &format!("{name}[groups {groups}]"),
+            &name,
+            u64::from(groups),
+            MxGemmDescriptor::SCALE_LAYOUT,
+        )?;
+        let expected = [groups as usize * outputs as usize, inputs as usize];
+        if weight.codes.dims() != expected {
+            return Err(Error::weight(
+                &name,
+                format!(
+                    "{groups} groups of [{outputs}, {inputs}] read from a {:?} weight",
+                    weight.codes.dims()
+                ),
+            ));
+        }
+        Ok(Self { weight, groups })
+    }
+
+    /// The projection of `x`, `[..., groups · inputs]` BF16: `[..., groups · outputs]` BF16.
+    ///
+    /// # Errors
+    ///
+    /// When `x` is of another width or type, or the product refuses its arguments.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        functional::grouped_linear_mxfp8(x, &self.weight, self.groups)
     }
 }
 

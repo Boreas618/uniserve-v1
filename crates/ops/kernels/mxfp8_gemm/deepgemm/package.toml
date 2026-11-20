@@ -8,6 +8,11 @@
 # kernel reads and launches it, into one native module per descriptor. A serving
 # host compiles nothing.
 #
+# A descriptor of several groups is DeepGEMM's batched product (`GemmType::Batched`,
+# its `fp8_einsum` of "bhr,hdr->bhd"): one launch of every group's product, each
+# over its block of the activations' columns and of the weight's rows, the operands
+# and the output as three-dimensional tensor maps.
+#
 # The kernel is persistent and computes any row count (`SHAPE_M = 0`). The pin's
 # scheduler strides its blocks by its compiled multiprocessor count; the build
 # compiles a staged copy with `patches/launched-grid.patch`, which strides by the
@@ -18,7 +23,7 @@
 
 op = "mxfp8_gemm"
 backend = "deepgemm"
-interface_version = 1
+interface_version = 2
 
 [toolchain]
 packages = ["flashinfer-python"]
@@ -35,10 +40,11 @@ requires = ["tensor_memory"]
 # counts on more than a device holds.
 multiprocessors = 148
 
-# `output_bf16_n_1792_k_5120_rows_128`.
+# `output_bf16_n_1792_k_5120_groups_1_rows_128`.
 #
-# The contraction is whole 128-element steps (one packed scale word of each row)
-# and the output channels whole 16-element vectors; the row class is the tile
+# The contraction of each group is whole 128-element steps (one packed scale
+# word of each row) and its output channels whole 16-element vectors; a product
+# of several groups is DeepGEMM's batched form; the row class is the tile
 # choice's, a power of two.
 [[kernel.descriptors]]
-dimensions = { output = ["bf16"], n = { multiple = 16 }, k = { multiple = 128 }, rows = { min = 16, max = 16384, power_of_two = true } }
+dimensions = { output = ["bf16"], n = { multiple = 16 }, k = { multiple = 128 }, groups = { min = 1 }, rows = { min = 16, max = 16384, power_of_two = true } }

@@ -2,8 +2,10 @@
 //! MXFP8 activation and weight ([`ops::mx`]).
 //!
 //! ```text
-//! mxfp8_quantize   x                       -> E4M3 codes and one UE8M0 scale per 32 elements
-//! linear_mxfp8     x, MXFP8 weight (+ bias) -> x̂ · Ŵᵀ in FP32, rounded once (+ bias)
+//! mxfp8_quantize          x                       -> E4M3 codes and one UE8M0 scale per 32
+//!                                                    elements
+//! linear_mxfp8            x, MXFP8 weight (+ bias) -> x̂ · Ŵᵀ in FP32, rounded once (+ bias)
+//! grouped_linear_mxfp8    x, MXFP8 weight, groups  -> each group's x̂_g · Ŵ_gᵀ, side by side
 //! ```
 //!
 //! The CPU formulas compute the encoding element for element as `ops::mx` states it, and the
@@ -239,38 +241,80 @@ pub(super) fn table_bytes(scales: &Tensor) -> Result<Vec<u8>> {
 /// When the weight is not an MXFP8 matrix over `x`'s rows in the product's layout, the bias is
 /// another width, or an operator refuses its arguments.
 pub fn linear_mxfp8(x: &Tensor, weight: &Mxfp8Weight, bias: Option<&Tensor>) -> Result<Tensor> {
-    const OWNER: &str = LinearCall::OWNER;
+    product(LinearCall::OWNER, x, weight, 1, bias)
+}
 
-    let k = columns(OWNER, x)?;
-    let &[n, contraction] = weight.codes.dims() else {
+/// The grouped product of `x` and an MXFP8 weight of `groups` groups, in one launch: group `g`
+/// multiplies its block of `k` columns of the encoded activation with its block of `n` rows of
+/// the weight into its block of `n` output columns,
+///
+/// ```text
+/// x̂            = mxfp8_quantize(x)                  the whole row, `groups · k` elements
+/// out[·, g n + j] = Σ_i x̂[·, g k + i] · Ŵ[g n + j, i]   in FP32, rounded once
+/// ```
+///
+/// which is the projection of each group's slice by its own `[n, k]` weight, the outputs
+/// concatenated (DeepSeek-V4.1's `wo_a`). `x` is `[..., groups · k]` BF16; the weight
+/// `[groups · n, k]` E4M3 with its scales in [`GemmDescriptor::SCALE_LAYOUT`] as the table of the
+/// `[n, groups · k]` matrix whose column block `g` is group `g`'s rows
+/// ([`crate::weights::WeightLoader::mxfp8_groups`]). The result is `[..., groups · n]` BF16.
+///
+/// # Errors
+///
+/// When the weight is not an MXFP8 matrix of `groups` groups over `x`'s rows in the product's
+/// layout, or an operator refuses its arguments.
+pub fn grouped_linear_mxfp8(x: &Tensor, weight: &Mxfp8Weight, groups: u32) -> Result<Tensor> {
+    product("grouped_linear_mxfp8", x, weight, groups, None)
+}
+
+/// [`linear_mxfp8`] and [`grouped_linear_mxfp8`]: `groups` products over the encoding of `x`,
+/// checked for `owner`.
+fn product(
+    owner: &'static str,
+    x: &Tensor,
+    weight: &Mxfp8Weight,
+    groups: u32,
+    bias: Option<&Tensor>,
+) -> Result<Tensor> {
+    let width = columns(owner, x)?;
+    let &[rows, contraction] = weight.codes.dims() else {
         return Err(Error::shape(
-            OWNER,
+            owner,
             format!("a weight is a matrix, not {:?}", weight.codes.dims()),
         ));
     };
-    if contraction != k as usize
+    let k = width / groups.max(1);
+    let n = rows / groups.max(1) as usize;
+    let scales = GemmDescriptor::SCALE_LAYOUT.shape(n as u64, u64::from(width));
+    if groups == 0
+        || width != groups * k
+        || rows != groups as usize * n
+        || contraction != k as usize
+        || weight.scales.dims() != [scales[0] as usize, scales[1] as usize]
         || weight.codes.dtype() != DType::F8E4M3
         || weight.layout != GemmDescriptor::SCALE_LAYOUT
         || x.dtype() != DType::BF16
     {
         return Err(Error::shape(
-            OWNER,
+            owner,
             format!(
-                "an MXFP8 product of BF16 rows of {k} over an [n, {k}] E4M3 weight with \
-                 {} scales, not {} rows and a {} {:?} weight with {} scales",
+                "{groups} MXFP8 products of BF16 rows of {groups} x k over a [{groups} x n, k] \
+                 E4M3 weight with {} scales of [n, {groups} x k], not {} rows of {width} and a \
+                 {} {:?} weight with {:?} {:?} scales",
                 GemmDescriptor::SCALE_LAYOUT,
                 ops::abi::name(x.dtype()),
                 ops::abi::name(weight.codes.dtype()),
                 weight.codes.dims(),
+                weight.scales.dims(),
                 weight.layout
             ),
         ));
     }
-    let n = u32::try_from(n).map_err(|_| Error::shape(OWNER, format!("{n} output channels")))?;
+    let n = u32::try_from(n).map_err(|_| Error::shape(owner, format!("{n} output channels")))?;
     if let Some(bias) = bias {
-        vector(OWNER, "bias", bias, n)?;
+        vector(owner, "bias", bias, groups * n)?;
     }
-    let rows = as_rows(OWNER, x)?;
+    let rows = as_rows(owner, x)?;
 
     compute(LinearCall {
         x,
@@ -278,16 +322,19 @@ pub fn linear_mxfp8(x: &Tensor, weight: &Mxfp8Weight, bias: Option<&Tensor>) -> 
         weight,
         bias,
         n,
+        groups,
     })
 }
 
-/// A checked call of [`linear_mxfp8`].
+/// A checked call of [`linear_mxfp8`] or [`grouped_linear_mxfp8`].
 struct LinearCall<'t> {
     x: &'t Tensor,
     rows: Tensor,
     weight: &'t Mxfp8Weight,
     bias: Option<&'t Tensor>,
+    /// Output channels of each group.
     n: u32,
+    groups: u32,
 }
 
 impl LinearCall<'_> {
@@ -307,17 +354,34 @@ impl Fused for LinearCall<'_> {
             rows,
             weight,
             bias,
-            ..
+            n,
+            groups,
         } = self;
-        let (count, k) = (rows.dims()[0], rows.dims()[1]);
+        let (count, width) = (rows.dims()[0], rows.dims()[1]);
+        let (groups, n) = (groups as usize, n as usize);
+        let k = width / groups;
         let (quotients, scales) = encoded_rows(&rows, ScaleRule::Covering)?;
         let codes =
-            Tensor::from_vec(quotients, (count, k), &Device::Cpu)?.to_dtype(DType::F8E4M3)?;
-        let scales = Tensor::from_vec(scales, count * k / BLOCK as usize, &Device::Cpu)?;
+            Tensor::from_vec(quotients, (count, width), &Device::Cpu)?.to_dtype(DType::F8E4M3)?;
+        let scales = Tensor::from_vec(scales, count * width / BLOCK as usize, &Device::Cpu)?;
         let activation = decoded_mxfp8(&codes, &scales, ScaleLayout::Linear)?;
 
-        let matrix = decoded_mxfp8(&weight.codes, &weight.scales, weight.layout)?;
-        let mut out = activation.matmul(&matrix.t()?)?.to_dtype(x.dtype())?;
+        // The weight's groups side by side along the contraction, as its scales are laid out:
+        // `[n, groups · k]`, column block `g` group `g`'s rows.
+        let beside = weight
+            .codes
+            .reshape((groups, n, k))?
+            .permute((1, 0, 2))?
+            .reshape((n, groups * k))?
+            .contiguous()?;
+        let matrix = decoded_mxfp8(&beside, &weight.scales, weight.layout)?;
+        let products = (0..groups)
+            .map(|group| {
+                let columns = |values: &Tensor| values.narrow(1, group * k, k);
+                Ok(columns(&activation)?.matmul(&columns(&matrix)?.t()?)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut out = Tensor::cat(&products, 1)?.to_dtype(x.dtype())?;
         if let Some(bias) = bias {
             out = out.broadcast_add(&bias.to_dtype(x.dtype())?)?;
         }
@@ -331,16 +395,18 @@ impl Fused for LinearCall<'_> {
             weight,
             bias,
             n,
+            groups,
         } = self;
-        let (count, k) = (rows.dims()[0], rows.dims()[1] as u32);
+        let (count, width) = (rows.dims()[0], rows.dims()[1] as u32);
 
-        // 1. The activation's codes and its packed scale words.
+        // 1. The activation's codes and its packed scale words, the groups' blocks of one row.
         let (codes, scales) = mxfp8_quantize(&rows, GemmDescriptor::SCALE_LAYOUT)?;
 
-        // 2. The product over the two encodings, its tile chosen for the rows' class.
-        let out = ops::empty((count, n as usize), DType::BF16)?;
+        // 2. Every group's product over the two encodings in one launch, its tile chosen for the
+        //    rows' class.
+        let out = ops::empty((count, (groups * n) as usize), DType::BF16)?;
         ops::launch::<Mxfp8Gemm>(
-            &GemmDescriptor::new(count as u64, n, k),
+            &GemmDescriptor::new(count as u64, n, width / groups, groups),
             GemmArgs {
                 input: ops::operand(&codes)?,
                 input_scales: ops::operand(&scales)?,
