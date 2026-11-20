@@ -10,14 +10,9 @@ use scheduling::{
 
 use crate::budget::{Shares, Step, prefill_chunk, work_tokens};
 use crate::lru::Lru;
+use crate::pages::{Page, Pages};
 use crate::phases::Phases;
 use crate::waiting::Waiting;
-
-/// Whether a page is one a step offloads: a device page no running request
-/// continues from.
-fn offloadable(view: &PageView) -> bool {
-    !view.on_host && view.evictable
-}
 
 /// The most offers one step's `dispatch` examines, and so the most pages it offloads.
 ///
@@ -29,25 +24,8 @@ fn offloadable(view: &PageView) -> bool {
 /// step's assembly the rest, and offer such a context's pages over 16 steps.
 const OFFERS_PER_STEP: usize = 1024;
 
-/// What the policy keeps of a cached page.
-#[derive(Clone, Debug)]
-struct Page {
-    /// The page as the mechanism last stated it: whether it sits in host memory and whether no
-    /// running request continues from it.
-    view: PageView,
-    /// Whether the page waits in the policy's offers to be offered to the host.
-    queued: bool,
-}
-
-impl Page {
-    /// A page as the mechanism states it, waiting for no offer.
-    fn stated(view: &PageView) -> Self {
-        Self {
-            view: view.clone(),
-            queued: false,
-        }
-    }
-}
+/// The encoder cache's one order (`Arrival::encodings`).
+const ENCODINGS: usize = 0;
 
 /// What a draft-cache refill costs and saves, as the deployment states it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -88,10 +66,10 @@ pub struct Arrival {
     views: BTreeMap<RequestId, RequestView>,
     /// The running requests, in the order the mechanism admitted them.
     admission: Vec<RequestId>,
-    /// The pages of the device and host caches, least recently used first,
-    /// each with its view as the mechanism last stated it and whether it waits
-    /// in `offers`.
-    pages: Lru<PageId, Page>,
+    /// The pages of the device and host caches, each with its view as the
+    /// mechanism last stated it and whether it waits in `offers`, in one
+    /// least-recently-used order per storage a shortage takes from.
+    pages: Pages,
     /// The pages that became device pages no request holds and wait to be
     /// offered to the host, in the order they did, each once (a page that
     /// becomes one again before its turn keeps its first place, `Page::queued`):
@@ -133,9 +111,9 @@ impl TryFrom<Parameters> for Arrival {
             waiting: Waiting::new(stated(parameters.order, "order")?),
             views: BTreeMap::new(),
             admission: Vec::new(),
-            pages: Lru::new(),
+            pages: Pages::default(),
             offers: VecDeque::new(),
-            encodings: Lru::new(),
+            encodings: Lru::new(1),
             media_first: false,
         })
     }
@@ -300,15 +278,16 @@ impl Arrival {
             let Some(page) = self.pages.get_mut(id) else {
                 continue;
             };
-            if std::mem::take(&mut page.queued) && offloadable(&page.view) {
+            if std::mem::take(&mut page.queued) && page.offloadable() {
                 named.push(id);
             }
         }
         named
     }
 
-    /// What the policy keeps of `page`, which an event of kind `event` names as used just now: it
-    /// moves to the most recent end of the order.
+    /// What the policy keeps of `page`, which an event of kind `event` names as used just now,
+    /// with its view changed by `change`: it is the most recently used page of the order its
+    /// view now names.
     ///
     /// # Panics
     ///
@@ -319,55 +298,45 @@ impl Arrival {
     /// mechanism or of this policy, so the policy fails (a trap, which the mechanism handles as
     /// it handles every fault of a policy) instead of inventing a view the mechanism never
     /// stated.
-    fn used(&mut self, page: PageId, event: &str) -> &mut Page {
+    fn used(&mut self, page: PageId, event: &str, change: impl FnOnce(&mut PageView)) -> &mut Page {
         self.pages
-            .touch(page)
+            .used(page, change)
             .unwrap_or_else(|| panic!("the mechanism {event} page {} it never stated", page.0))
     }
 
     /// A page the mechanism states as it stands now (`Cached`): it is the most recently used,
     /// and it is offered to the host once it becomes a device page no request holds.
-    fn state(&mut self, page: &PageView) {
-        let known = self.pages.get(page.id);
-        let was = known.is_some_and(|known| offloadable(&known.view));
+    fn state(&mut self, view: &PageView) {
+        let known = self.pages.get(view.id);
+        let was = known.is_some_and(Page::offloadable);
         // A page that already waits keeps its place; restating it changes no offer.
         let queued = known.is_some_and(|known| known.queued);
-        let offered = offloadable(page) && !was && !queued;
+        let mut page = Page::stated(view);
+        let offered = page.offloadable() && !was && !queued;
         if offered {
-            self.offers.push_back(page.id);
+            self.offers.push_back(view.id);
         }
-        self.pages.insert(
-            page.id,
-            Page {
-                view: page.clone(),
-                queued: queued || offered,
-            },
-        );
+        page.queued = queued || offered;
+        self.pages.state(page);
     }
 
-    /// The pages a shortage of `kind` may take, least recently used first.
+    /// The pages a shortage may take, least recently used first: the device
+    /// pages no running request continues from for a device shortage, the
+    /// pages on the host alone for a host shortage.
     ///
     /// A device page a running request still continues from frees no device
     /// units the mechanism may take, and the mechanism refuses a victim it cannot free - so
     /// naming one would stop the epoch at the first shortage instead of freeing what is free. A
     /// host page is the host cache's to take: the mechanism asks only that it is on the host.
+    /// Each storage's victims have an order of their own, so a shortage reads the `need` pages it
+    /// names and none of the others the cache holds.
     fn page_victims(&self, want_host: bool, need: u64) -> Vec<Victim> {
-        let mut victims = Vec::new();
-        let mut taken = 0u64;
-        for (page, Page { view, .. }) in self.pages.iter() {
-            if taken >= need {
-                break;
-            }
-            if view.on_host != want_host {
-                continue;
-            }
-            if !want_host && !view.evictable {
-                continue;
-            }
-            victims.push(Victim::Page(page));
-            taken += 1;
+        let need = usize::try_from(need).unwrap_or(usize::MAX);
+        if want_host {
+            self.pages.host_victims(need).map(Victim::Page).collect()
+        } else {
+            self.pages.free_victims(need).map(Victim::Page).collect()
         }
-        victims
     }
 
     /// The request a shortage takes when no page can relieve it: the lowest
@@ -427,16 +396,17 @@ impl Policy for Arrival {
         // The cache orders the snapshot states, least recently used first.
         let mut pages: Vec<&PageView> = state.pages.iter().collect();
         pages.sort_unstable_by_key(|page| (page.last_used.0, page.id.0));
-        self.pages =
-            Lru::from_least_recent(pages.into_iter().map(|page| (page.id, Page::stated(page))));
+        self.pages = Pages::from_least_recent(pages);
         let mut encodings: Vec<(u64, EncodingId)> = state
             .encodings
             .iter()
             .map(|entry| (entry.last_used.0, entry.id))
             .collect();
         encodings.sort_unstable_by_key(|(used, id)| (*used, id.0));
-        self.encodings =
-            Lru::from_least_recent(encodings.into_iter().map(|(_, entry)| (entry, ())));
+        self.encodings = Lru::new(1);
+        for (_, entry) in encodings {
+            self.encodings.insert(entry, (), ENCODINGS);
+        }
     }
 
     fn observe(&mut self, events: &[Event]) {
@@ -504,12 +474,11 @@ impl Policy for Arrival {
                 // A hit, a release and a hold name pages the snapshot or a `Cached` stated, each
                 // now the most recently used.
                 Event::Hit { page } => {
-                    self.used(*page, "hit");
+                    self.used(*page, "hit", |_| {});
                 }
                 Event::Released { pages } => {
                     for &id in pages {
-                        let page = self.used(id, "released");
-                        page.view.evictable = true;
+                        let page = self.used(id, "released", |view| view.evictable = true);
                         // A device page no request holds is offered to the host in its turn,
                         // once however often it is given up before then.
                         if !page.view.on_host && !page.queued {
@@ -520,13 +489,15 @@ impl Policy for Arrival {
                 }
                 Event::Held { pages } => {
                     for page in pages {
-                        self.used(*page, "held").view.evictable = false;
+                        self.used(*page, "held", |view| view.evictable = false);
                     }
                 }
                 Event::Freed { page } => {
                     self.pages.remove(*page);
                 }
-                Event::Encoded { entry } => self.encodings.insert(entry.id, ()),
+                Event::Encoded { entry } => {
+                    self.encodings.insert(entry.id, (), ENCODINGS);
+                }
             }
         }
     }
@@ -645,7 +616,7 @@ impl Policy for Arrival {
             Storage::EncoderEntries => {
                 let mut victims = Vec::new();
                 while (victims.len() as u64) < shortage.need {
-                    let Some(entry) = self.encodings.pop_least() else {
+                    let Some(entry) = self.encodings.pop_least(ENCODINGS) else {
                         break;
                     };
                     victims.push(Victim::Encoding(entry));
