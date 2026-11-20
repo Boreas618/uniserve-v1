@@ -408,6 +408,43 @@ fn the_policys_victim_request_ends_as_migratable_and_resumes_from_its_committed_
     );
 }
 
+/// A request running alone that is short, with no cached block free, is not ended though the
+/// policy names it, the one running request: ending it would free only its own units, which it
+/// needs again. It waits for the region's units, nothing is evicted, and once the units show it
+/// runs to its end, in its one life (SD §3.6).
+#[test]
+fn a_request_running_alone_waits_for_units_rather_than_ending_itself() {
+    let mut harness = Deployment::tokens().build();
+    let kv = harness.region("kv-0");
+    let alone = harness.submit(token(1, 6, 30));
+    harness.run_until(30, |harness| harness.tokens(alone).len() >= 3);
+
+    // No unit available, nothing retiring and no cached block free: the policy names the one
+    // running request.
+    harness.pool.set_capacity(kv, Some((0, 0, 0)));
+    run_dry(&mut harness, 40);
+    assert!(
+        harness.terminal(alone).is_none(),
+        "{:?}",
+        harness.events(alone)
+    );
+    assert!(harness.tokens(alone).len() < 30, "it waits for blocks");
+    assert!(!evicted(&harness));
+
+    harness.pool.set_capacity(kv, None);
+    harness.settle(200);
+    assert!(
+        harness.finished_with(alone, FinishReason::MaxTokens),
+        "{:?}",
+        harness.events(alone)
+    );
+    assert_eq!(harness.tokens(alone).len(), 30);
+    assert_eq!(
+        reported(&mut harness, |report| report.preempted_requests),
+        0
+    );
+}
+
 /// When every running request is short at once, the one of the greatest priority value is
 /// preempted, and among equal priorities the one admitted last: a request of priority 1 goes
 /// before an equal later one and before an earlier one of priority 0 (SD §3.6, §7.2 "Preemption
