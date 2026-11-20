@@ -1412,10 +1412,11 @@ impl Scheduler {
     /// beyond the region's `available`, less the region's retiring units, which come back once
     /// the batches that may read them end, are relieved in this order until covered: draft
     /// tables of idle requests, admissions under way, the policy's victims (a running request
-    /// ends as migratable, an unpinned cached block or encoder output that lies in the region is
-    /// evicted by key); and when the policy named no request and every running token request is
-    /// short, the latest of the lowest priority is preempted. A short state region, one
-    /// checkpoint a unit, is stated to the policy as `StateUnits`, which no page relieves. The request then waits for the region's `available`
+    /// ends as migratable, but `id` itself while it runs alone, an unpinned cached block or
+    /// encoder output that lies in the region is evicted by key); and when the policy named no
+    /// request and every running token request is short, the latest of the lowest priority is
+    /// preempted. A short state region, one checkpoint a unit, is stated to the policy as
+    /// `StateUnits`, which no page relieves. The request then waits for the region's `available`
     /// word to show the units it needs, and asks again; until its blocks arrive it is not
     /// scheduled.
     pub(super) fn preempt(&mut self, id: RequestId, region: u8) {
@@ -1463,14 +1464,21 @@ impl Scheduler {
         };
         let mut evict = Vec::new();
         let mut named = false;
+        // A request running alone gains nothing from giving up its own units: they are all it
+        // would free, and it needs them again when it is resubmitted. Named for its own
+        // shortage, it waits for the region's units instead, which come back from what was
+        // given up and not yet answered, from evictions, or from another epoch's requests that
+        // share the region; one that can never fit has ended above.
+        let alone = self.running.iter().all(|running| *running == id);
         for victim in victims {
             match victim {
                 Victim::Request(victim) => {
                     let victim = RequestId(victim.0);
-                    let ends = self.requests.get(&victim).is_some_and(|request| {
-                        request.status == RequestStatus::Running
-                            && !request.runs_to_end(&self.groups)
-                    });
+                    let ends = !(alone && victim == id)
+                        && self.requests.get(&victim).is_some_and(|request| {
+                            request.status == RequestStatus::Running
+                                && !request.runs_to_end(&self.groups)
+                        });
                     if ends {
                         named = true;
                         self.count_preempted();
