@@ -38,8 +38,11 @@ impl Node {
     }
 }
 
+/// A process's exit is reported unasked, naming its launch, its status and the error it ended
+/// with: a process that fails before it can report anything (an engine that cannot read its
+/// launch) states that error as its exit reason, which the node reads as it reaps the process.
 #[test]
-fn exits_arrive_unasked_and_name_their_launch() {
+fn exits_arrive_unasked_and_name_their_launch_and_error() {
     let directory = tempfile::tempdir().unwrap();
     let node = Node::start(&directory, "node");
     let mut engine = Engine::connect(node.address());
@@ -58,6 +61,7 @@ fn exits_arrive_unasked_and_name_their_launch() {
             rank: 0,
             generation: 3,
             status: "exit status: 1".into(),
+            reason: package::FAILURE.into(),
         }
     );
 }

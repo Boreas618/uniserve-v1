@@ -746,14 +746,21 @@ impl Engines {
     }
 
     /// The node `host` reports that the engine of launch generation
-    /// `generation` exited with `status`.
+    /// `generation` exited with `status`, stating no reason.
     pub(crate) fn exit(&self, host: &str, generation: u64, status: &str) {
+        self.fail(host, generation, status, "");
+    }
+
+    /// The node `host` reports that the engine of launch generation `generation` exited with
+    /// `status`, having stated `reason` as its exit reason.
+    pub(crate) fn fail(&self, host: &str, generation: u64, status: &str, reason: &str) {
         let _ = self.exits.send(proto::process::Exit {
             host: host.to_owned(),
             group: crate::engine::control::ENGINE_GROUP.to_owned(),
             rank: 0,
             generation,
             status: status.to_owned(),
+            reason: reason.to_owned(),
         });
     }
 

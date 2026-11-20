@@ -84,6 +84,28 @@ fn tunes(changes: &[proto::reload::Change]) -> bool {
     })
 }
 
+/// Each of `replicas` as an epoch change sides it ([`Sides::of`]): the launch its engine serves
+/// with and the nodes of that engine ([`serving_nodes_of`]).
+///
+/// The launch is read under the replica's `served` lock, which is released before the nodes are
+/// found: [`serving_nodes_of`] takes the same lock, and a `std` mutex held across that call
+/// blocks its own thread for good, and with it every request and admin call that reads the
+/// replica.
+///
+/// # Errors
+///
+/// As [`serving_nodes_of`].
+fn serving_of(replicas: &[Arc<Replica>]) -> Result<Vec<Serving>, UpdateError> {
+    replicas
+        .iter()
+        .map(|replica| {
+            let launch = service::lock(&replica.served).clone();
+            let nodes = serving_nodes_of(std::slice::from_ref(replica))?;
+            Ok(Serving { launch, nodes })
+        })
+        .collect()
+}
+
 /// The serving engines of `replicas`, one node each ([`Leader::serving_nodes`]), each executing
 /// the epoch its replica serves.
 ///
@@ -148,35 +170,97 @@ fn serving_nodes_of(replicas: &[Arc<Replica>]) -> Result<Vec<Node>, UpdateError>
     Ok(nodes)
 }
 
-/// The indices of the replicas an epoch change to `targets`, the launch of each target replica,
-/// running `modules`, moves to a new epoch: every replica when the change gives the deployment
-/// another number of replicas, and otherwise each replica whose launch the change touches: one
-/// that serves no launch, runs another engine package, or whose build part
-/// ([`EngineConfig::build_part`]) the target's differs from. A change that touches none, a
-/// change of the module set's build alone, moves them all.
-fn moved_replicas(
-    replicas: &[Arc<Replica>],
-    targets: &[proto::config::EngineArgs],
-    modules: &crate::epoch::ModuleSet,
-) -> Vec<usize> {
-    let every = (0..targets.len()).collect();
-    if targets.len() != replicas.len() {
-        return every;
+/// One serving replica as an epoch change finds it: the launch its engines serve with (none for
+/// a replica whose engine serves no launch) and those engines, one node each.
+pub(crate) struct Serving {
+    pub(crate) launch: Option<proto::config::EngineArgs>,
+    pub(crate) nodes: Vec<Node>,
+}
+
+/// The two sides of an epoch change ([`Sides::of`]).
+///
+/// The serving replicas and the target replicas are two index spaces: they pair one for one only
+/// when the target has as many replicas as the deployment serves, and only then can a change
+/// move some replicas and leave the others serving.
+pub(crate) struct Sides {
+    /// The serving replicas the change moves, by index among the deployment's replicas.
+    pub(crate) moved: Vec<usize>,
+    /// The engines of the moved replicas: each drains once the targets serve, and stops at the
+    /// commit.
+    pub(crate) draining: Vec<Node>,
+    /// The engines of the replicas the change leaves as they are, which go on serving their
+    /// epochs through it ([`EpochSwitch::bystanders`]).
+    pub(crate) bystanders: Vec<Node>,
+    /// The target replicas that start, each with its index among the target's replicas, which
+    /// is the deployment's replica it serves under.
+    pub(crate) targets: Vec<(usize, proto::config::EngineArgs)>,
+}
+
+impl Sides {
+    /// The sides of an epoch change from the deployment's `serving` replicas to `targets`, the
+    /// launch of each target replica, running `modules`.
+    ///
+    /// A target of another number of replicas than the deployment serves, whatever their
+    /// engines' structure (an expert union is one replica of several schedulers), pairs with no
+    /// serving replica: every serving replica moves, its engines drain and its epoch retires at
+    /// the commit, and every target replica starts. A target of as many replicas pairs target
+    /// replica `i` with serving replica `i`, and the change moves each replica whose launch it
+    /// touches: one that serves no launch, runs another engine package, or whose build part
+    /// ([`EngineConfig::build_part`], which holds the replica's parallel configuration and its
+    /// model) the target's differs from. A change that touches none, a change of the module
+    /// set's build alone, moves them all.
+    pub(crate) fn of(
+        serving: Vec<Serving>,
+        targets: Vec<proto::config::EngineArgs>,
+        modules: &crate::epoch::ModuleSet,
+    ) -> Self {
+        let paired = serving.len() == targets.len();
+        let touched: Vec<usize> = if paired {
+            serving
+                .iter()
+                .zip(&targets)
+                .enumerate()
+                .filter(|(_, (replica, target))| {
+                    replica.launch.as_ref().is_none_or(|served| {
+                        served.modules.engine != modules.engine
+                            || served.engine_config.build_part()
+                                != target.engine_config.build_part()
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let moved: Vec<usize> = if touched.is_empty() {
+            (0..serving.len()).collect()
+        } else {
+            touched
+        };
+
+        // Paired, the targets of the moved replicas start, each replacing its replica; unpaired,
+        // every target starts.
+        let targets = targets
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !paired || moved.contains(index))
+            .collect();
+        let mut draining = Vec::new();
+        let mut bystanders = Vec::new();
+        for (index, replica) in serving.into_iter().enumerate() {
+            if moved.contains(&index) {
+                draining.extend(replica.nodes);
+            } else {
+                bystanders.extend(replica.nodes);
+            }
+        }
+        Self {
+            moved,
+            draining,
+            bystanders,
+            targets,
+        }
     }
-    let moved: Vec<usize> = replicas
-        .iter()
-        .zip(targets)
-        .enumerate()
-        .filter(|(_, (replica, target))| {
-            let served = service::lock(&replica.served);
-            served.as_ref().is_none_or(|served| {
-                served.modules.engine != modules.engine
-                    || served.engine_config.build_part() != target.engine_config.build_part()
-            })
-        })
-        .map(|(index, _)| index)
-        .collect();
-    if moved.is_empty() { every } else { moved }
 }
 
 /// Keeps an existing replica's assigned devices when an update changes its
@@ -624,37 +708,39 @@ impl Leader {
         let launches =
             crate::leader::epoch_launches(&engine, &next.modules, target_epoch, revision)
                 .map_err(refused)?;
-        // The update moves the replicas the change touches, and the others serve on in the
-        // epochs they serve.
-        let moved = moved_replicas(&replicas, &launches, &next.modules);
-        let (moving, staying): (Vec<_>, Vec<_>) = replicas
+        // The update moves every replica of a target of another number of replicas, and
+        // otherwise the replicas the change touches, the others serving on in their epochs.
+        let found = serving_of(&replicas)?;
+        let target_count = launches.len();
+        let Sides {
+            moved,
+            draining: nodes,
+            bystanders,
+            targets: starting,
+        } = Sides::of(found, launches, &next.modules);
+        // A target replica succeeds the epoch the deployment's replica of its index serves, and
+        // the serving epoch where the deployment has fewer replicas.
+        let predecessors: Vec<u64> = starting
             .iter()
-            .enumerate()
-            .partition(|(index, _)| moved.contains(index));
-        let moving: Vec<Arc<Replica>> = moving.into_iter().map(|(_, r)| Arc::clone(r)).collect();
-        let staying: Vec<Arc<Replica>> = staying.into_iter().map(|(_, r)| Arc::clone(r)).collect();
-        let nodes = serving_nodes_of(&moving)?;
-        let bystanders = serving_nodes_of(&staying)?;
-        let predecessors: Vec<u64> = moved
-            .iter()
-            .map(|index| {
+            .map(|(index, _)| {
                 replicas
                     .get(*index)
                     .and_then(|replica| service::lock(&replica.served).as_ref().map(|s| s.epoch))
                     .unwrap_or(serving.number())
             })
             .collect();
-        let launches: Vec<_> = launches
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| moved.contains(index))
-            .map(|(_, args)| args)
-            .collect();
+        let launches: Vec<_> = starting.into_iter().map(|(_, args)| args).collect();
         if moved.len() < replicas.len() {
             info!(
                 moved = ?moved,
                 replicas = replicas.len(),
                 "the epoch change moves the replicas it touches, and the others serve on"
+            );
+        } else if target_count != replicas.len() {
+            info!(
+                serving = replicas.len(),
+                target = target_count,
+                "the target has another number of replicas: the epoch change moves every replica"
             );
         }
         let configs: Vec<_> = launches
@@ -1025,6 +1111,63 @@ impl Replica {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An epoch change sides every serving replica of an engine (`serving_of`) as it reads
+    /// each part alone: the launch the replica serves with and the nodes `serving_nodes_of`
+    /// finds for it. Both read the replica's `served` lock, so the change returns rather than
+    /// blocking on the lock it holds itself, which stalled the daemon and every request with it
+    /// at the first epoch update of a deployment whose replicas have engines.
+    #[tokio::test]
+    async fn an_epoch_change_sides_a_serving_replica_without_holding_its_lock() {
+        let leader = crate::test_support::served_engine(crate::test_support::CHAT);
+        let replicas = leader.replicas();
+        assert!(
+            replicas
+                .iter()
+                .all(|replica| replica.hold().client().is_some()),
+            "every replica has an engine"
+        );
+        let launch = testkit::args(crate::test_support::SERVED_MODEL);
+        for replica in &replicas {
+            *service::lock(&replica.served) = Some(launch.clone());
+        }
+        let expected: Vec<_> = replicas
+            .iter()
+            .map(|replica| {
+                serving_nodes_of(std::slice::from_ref(replica)).map_err(|error| error.to_string())
+            })
+            .collect();
+
+        // On a thread of its own, so a change that blocks on its own lock fails the test
+        // rather than hanging it.
+        let (sided, received) = std::sync::mpsc::channel();
+        let sides = replicas.clone();
+        std::thread::spawn(move || {
+            let _ = sided.send(serving_of(&sides).map_err(|error| error.to_string()));
+        });
+        let found = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the change sides the replicas instead of blocking on their `served` lock");
+
+        match found {
+            Ok(found) => {
+                assert_eq!(found.len(), replicas.len());
+                for (serving, nodes) in found.iter().zip(&expected) {
+                    assert_eq!(serving.launch.as_ref(), Some(&launch));
+                    let nodes = nodes.as_ref().expect("the nodes alone are found");
+                    assert_eq!(serving.nodes.len(), nodes.len());
+                }
+            }
+            Err(error) => {
+                let alone = expected
+                    .iter()
+                    .find_map(|nodes| nodes.as_ref().err())
+                    .expect("the change fails only as finding the nodes alone fails");
+                assert_eq!(&error, alone);
+            }
+        }
+        leader.shutdown().await.unwrap();
+    }
 
     /// The fence probes' switch, and a module's probes switched off, change in place; the
     /// probed modules shape the captured graphs and take a kernel generation, and PC sampling,

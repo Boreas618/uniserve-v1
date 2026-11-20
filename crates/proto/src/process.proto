@@ -952,7 +952,7 @@ message Shrunk {
 }
 
 // A supervised process exited. What it explained of its end is in its own log, which is its
-// daemon's standard error.
+// daemon's standard error, and the error it ended with in its exit reason.
 message Exit {
   reserved 6;
   reserved "last_line";
@@ -962,6 +962,9 @@ message Exit {
   uint64 generation = 4;
   // Its exit status, or why the status could not be read.
   string status = 5;
+  // Its exit reason: the error it stated as it ended, in the file its daemon passed it
+  // (`service::exit_reason`), at most 4096 bytes; empty when it stated none.
+  string reason = 7;
 }
 
 // What travels from a connecting peer after its `Hello`.

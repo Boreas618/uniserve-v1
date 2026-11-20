@@ -7,7 +7,9 @@
 //! options and `--lifeline FD` (`proto::LIFELINE_OPTION`). What it does is what the engine
 //! package its launch names (`modules.engine.backend`) stands for:
 //!
-//! - `fails`: exits with status 1, as an engine that fails at its start.
+//! - `fails`: exits with status 1 and the error [`FAILURE`], as an engine that fails at its start;
+//!   like the engine, it states the error it ends with as its exit reason
+//!   (`service::exit_reason`), which the node reads into its exit report.
 //! - `succeeds`: exits with status 0.
 //! - `follows-lifeline`: runs until its lifeline ends, which the kernel delivers once every write
 //!   end of the pipe closed (its daemon's end), or until it is killed.
@@ -20,6 +22,10 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 
 use anyhow::Context as _;
+
+/// The error the `fails` package ends with, as an engine that cannot read its launch does: the
+/// tests' `package::FAILURE`.
+const FAILURE: &str = "reading the launch at descriptor 3: unknown field `boundary_interval`";
 
 /// The value of option `name` on this process's command line, as a descriptor number.
 fn descriptor(arguments: &[String], name: &str) -> anyhow::Result<RawFd> {
@@ -42,6 +48,16 @@ fn inherited(descriptor: RawFd) -> OwnedFd {
 }
 
 fn main() -> anyhow::Result<()> {
+    service::exit_reason::take();
+    let ended = act();
+    if let Err(error) = &ended {
+        service::exit_reason::state(&format!("{error:#}"));
+    }
+    ended
+}
+
+/// What the engine package the launch names stands for.
+fn act() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
     let mut text = String::new();
     std::fs::File::from(inherited(descriptor(&arguments, proto::LAUNCH_OPTION)?))
@@ -52,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     let lifeline = inherited(descriptor(&arguments, proto::LIFELINE_OPTION)?);
 
     match launch.modules.engine.backend.as_str() {
-        "fails" => std::process::exit(1),
+        "fails" => anyhow::bail!(FAILURE),
         "succeeds" => Ok(()),
         "follows-lifeline" => {
             // The read returns at the pipe's end: no byte is ever written to it.
