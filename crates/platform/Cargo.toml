@@ -33,3 +33,13 @@ path = "tests/helpers/interprocess_event.rs"
 test = false
 bench = false
 doc = false
+
+# The process half of the device test that checks NVML sessions keep opening and closing while
+# CUPTI attaches to the driver (`tests/it/gpu.rs`), which starts it as a child
+# (`CARGO_BIN_EXE_nvml-sessions`): CUPTI attaches once per process.
+[[bin]]
+name = "nvml-sessions"
+path = "tests/helpers/nvml_sessions.rs"
+test = false
+bench = false
+doc = false
