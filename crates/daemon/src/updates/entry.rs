@@ -87,6 +87,28 @@ fn tunes(changes: &[proto::reload::Change]) -> bool {
     })
 }
 
+/// Each of `replicas` as an epoch change sides it ([`Sides::of`]): the launch its engine serves
+/// with and the nodes of that engine ([`serving_nodes_of`]).
+///
+/// The launch is read under the replica's `served` lock, which is released before the nodes are
+/// found: [`serving_nodes_of`] takes the same lock, and a `std` mutex held across that call
+/// blocks its own thread for good, and with it every request and admin call that reads the
+/// replica.
+///
+/// # Errors
+///
+/// As [`serving_nodes_of`].
+fn serving_of(replicas: &[Arc<Replica>]) -> Result<Vec<Serving>, UpdateError> {
+    replicas
+        .iter()
+        .map(|replica| {
+            let launch = service::lock(&replica.served).clone();
+            let nodes = serving_nodes_of(std::slice::from_ref(replica))?;
+            Ok(Serving { launch, nodes })
+        })
+        .collect()
+}
+
 /// The serving engines of `replicas`, one node each ([`Leader::serving_nodes`]), each executing
 /// the epoch its replica serves.
 ///
@@ -700,13 +722,7 @@ impl Leader {
                 .map_err(refused)?;
         // The update moves every replica of a target of another number of replicas, and
         // otherwise the replicas the change touches, the others serving on in their epochs.
-        let mut found = Vec::with_capacity(replicas.len());
-        for replica in &replicas {
-            found.push(Serving {
-                launch: service::lock(&replica.served).clone(),
-                nodes: serving_nodes_of(std::slice::from_ref(replica))?,
-            });
-        }
+        let found = serving_of(&replicas)?;
         let target_count = launches.len();
         let Sides {
             moved,
@@ -1117,6 +1133,63 @@ impl Replica {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An epoch change sides every serving replica of an engine (`serving_of`) as it reads
+    /// each part alone: the launch the replica serves with and the nodes `serving_nodes_of`
+    /// finds for it. Both read the replica's `served` lock, so the change returns rather than
+    /// blocking on the lock it holds itself, which stalled the daemon and every request with it
+    /// at the first epoch update of a deployment whose replicas have engines.
+    #[tokio::test]
+    async fn an_epoch_change_sides_a_serving_replica_without_holding_its_lock() {
+        let leader = crate::test_support::served_engine(crate::test_support::CHAT);
+        let replicas = leader.replicas();
+        assert!(
+            replicas
+                .iter()
+                .all(|replica| replica.hold().client().is_some()),
+            "every replica has an engine"
+        );
+        let launch = testkit::args(crate::test_support::SERVED_MODEL);
+        for replica in &replicas {
+            *service::lock(&replica.served) = Some(launch.clone());
+        }
+        let expected: Vec<_> = replicas
+            .iter()
+            .map(|replica| {
+                serving_nodes_of(std::slice::from_ref(replica)).map_err(|error| error.to_string())
+            })
+            .collect();
+
+        // On a thread of its own, so a change that blocks on its own lock fails the test
+        // rather than hanging it.
+        let (sided, received) = std::sync::mpsc::channel();
+        let sides = replicas.clone();
+        std::thread::spawn(move || {
+            let _ = sided.send(serving_of(&sides).map_err(|error| error.to_string()));
+        });
+        let found = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the change sides the replicas instead of blocking on their `served` lock");
+
+        match found {
+            Ok(found) => {
+                assert_eq!(found.len(), replicas.len());
+                for (serving, nodes) in found.iter().zip(&expected) {
+                    assert_eq!(serving.launch.as_ref(), Some(&launch));
+                    let nodes = nodes.as_ref().expect("the nodes alone are found");
+                    assert_eq!(serving.nodes.len(), nodes.len());
+                }
+            }
+            Err(error) => {
+                let alone = expected
+                    .iter()
+                    .find_map(|nodes| nodes.as_ref().err())
+                    .expect("the change fails only as finding the nodes alone fails");
+                assert_eq!(&error, alone);
+            }
+        }
+        leader.shutdown().await.unwrap();
+    }
 
     /// The fence probes' switch, and a module's probes switched off, change in place; the
     /// probed modules shape the captured graphs and take a kernel generation, and PC sampling,
