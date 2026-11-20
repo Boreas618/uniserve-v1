@@ -37,7 +37,7 @@ use ops::fp4::{BLOCK_ELEMENTS, ValueLayout};
 use ops::moe::ExchangeArgs;
 use ops::moe::TILE;
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
-use ops::moe::exchange::{self, FusedLayer, Mode};
+use ops::moe::exchange::{self, ExpertWeights, FusedExperts, FusedLayer, Mode};
 use ops::moe::grouped::{
     GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4, GatherGemmNvfp4Args,
     GatherGemmNvfp4Descriptor, RouteGemm, RouteGemmArgs, RouteGemmDescriptor, RouteGemmNvfp4,
@@ -60,7 +60,7 @@ use super::nvfp4::{decoded, encoded, integer, launch_quantize};
 use super::{ACCUMULATE, Activation, Fused, as_rows, columns, compute, same_rows};
 use crate::capability::ExpertExchange;
 use crate::error::{Error, Result};
-use crate::quantization::{Mxfp4Stack, Nvfp4Stack};
+use crate::quantization::{Mxfp4Stack, Mxfp8Weight, Nvfp4Stack};
 
 /// The rows of the route maps [`moe_sort`] returns, `[SORT_MAPS, permuted rows]` U32: each row is
 /// one map, in its leading entries.
@@ -1821,6 +1821,7 @@ pub fn expert_dispatch(
         ExchangeArgs {
             transport: None,
             tokens: sent(OWNER, hidden.dims()[0], exchange)?,
+            capacity: exchange.step_rows,
             state: ops::operand(hidden)?,
             ids: ops::operand(ids)?,
             weights: ops::operand(weights)?,
@@ -1862,6 +1863,7 @@ pub fn expert_combine(
         ExchangeArgs {
             transport: None,
             tokens: sent(OWNER, tokens, exchange)?,
+            capacity: exchange.step_rows,
             state: ops::Operand::unread(),
             ids: ops::Operand::unread(),
             weights: ops::Operand::unread(),
@@ -1955,6 +1957,10 @@ pub fn expert_exchange_fused(
         gated_scale: address(gated_scale)?.cast(),
         up_gate_scale_bytes: expert_bytes(&up_gate.scales)?,
         down_scale_bytes: expert_bytes(&down.scales)?,
+        shared_up_gate: std::ptr::null(),
+        shared_up_gate_scales: std::ptr::null(),
+        shared_down: std::ptr::null(),
+        shared_down_scales: std::ptr::null(),
     };
 
     let descriptor = exchange_descriptor(
@@ -1970,7 +1976,120 @@ pub fn expert_exchange_fused(
         ExchangeArgs {
             transport: None,
             tokens: sent(OWNER, tokens, exchange)?,
+            capacity: exchange.step_rows,
             state: ops::Operand::unread(),
+            ids: ops::operand(ids)?,
+            weights: ops::operand(weights)?,
+            live: live_tokens.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
+            fused: Some(layer),
+            ranks: exchange.ranks,
+        },
+    )?;
+    Ok(out)
+}
+
+/// The whole expert layer of an expert group in one launch over MXFP4 experts: the routes of
+/// this rank's `hidden` rows (`[tokens, hidden]` BF16) are exchanged, every rank's experts run
+/// over the rows they receive, the `shared` experts over every row of this rank, and each row's
+/// sum comes back: `[tokens, hidden]` in `hidden`'s element type (`ops::moe::exchange`'s
+/// module documentation states the formula).
+///
+/// The launch encodes the rows into MXFP8 itself, as `mxfp8_quantize` does, so `hidden` is read
+/// as it stands. `ids` and `weights` are the `[tokens, top]` routes, as the router's top-k writes
+/// them (slots and FP32 weights). `up_gate` and `down` are this rank's stacks in the arrangement
+/// the launch reads (`Descriptor::MXFP4_UP_GATE_VALUES`, `MXFP4_DOWN_VALUES` and
+/// `MXFP4_SCALES`); `shared` is the shared experts' gated stack and down projection in the same
+/// arrangements, which the exchange's transport was laid out for (`exchange.fused_experts`).
+/// `experts` is the router's expert count.
+///
+/// # Errors
+///
+/// When the tensors are CPU tensors, more rows are sent than a rank's block holds, the exchange
+/// was laid out for other experts, or an operator refuses its arguments.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the launch reads the rows, the routes, the lent rows and every operand of the layer"
+)]
+pub fn expert_exchange_fused_mxfp4(
+    hidden: &Tensor,
+    ids: &Tensor,
+    weights: &Tensor,
+    live_tokens: Option<&Tensor>,
+    exchange: &ExpertExchange,
+    (up_gate, down): (&Mxfp4Stack, &Mxfp4Stack),
+    shared: Option<(&Mxfp8Weight, &Mxfp8Weight)>,
+    experts: u32,
+) -> Result<Tensor> {
+    const OWNER: &str = "expert_exchange_fused_mxfp4";
+
+    let tokens = hidden.dims()[0];
+    let local = up_gate.codes.dims().first().copied().unwrap_or(0).max(1);
+    let intermediate = up_gate.codes.dims().get(1).copied().unwrap_or(0) / 2;
+    let stated = exchange.fused_experts;
+    let shared_count = match shared {
+        Some((shared_up_gate, _)) => {
+            (shared_up_gate.codes.dims()[0] / 2 / intermediate.max(1)) as u32
+        }
+        None => 0,
+    };
+    if stated.weights != ExpertWeights::Mxfp4 || stated.shared != shared_count {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "the exchange's fused launch runs {} experts with {} shared, and this layer \
+                 holds MXFP4 experts with {shared_count} shared",
+                stated.weights, stated.shared
+            ),
+        ));
+    }
+
+    // The layer's device addresses, as the package's `uniserve_fused_layer` declares them.
+    let address = |tensor: &Tensor| -> Result<*const std::ffi::c_void> {
+        Ok(ops::operand(tensor)?.ptr.address() as usize as *const std::ffi::c_void)
+    };
+    let expert_bytes = |tensor: &Tensor| -> Result<i64> {
+        let bytes = tensor.elem_count() * tensor.dtype().size_in_bytes().unwrap_or(1) / local;
+        i64::try_from(bytes).map_err(|_| Error::shape(OWNER, "a scale table beyond i64".to_owned()))
+    };
+    let (shared_up_gate, shared_down) = match shared {
+        Some((up_gate, down)) => (
+            [address(&up_gate.codes)?, address(&up_gate.scales)?],
+            [address(&down.codes)?, address(&down.scales)?],
+        ),
+        None => ([std::ptr::null(); 2], [std::ptr::null(); 2]),
+    };
+    let layer = FusedLayer {
+        up_gate: address(&up_gate.codes)?,
+        up_gate_scales: address(&up_gate.scales)?,
+        down: address(&down.codes)?,
+        down_scales: address(&down.scales)?,
+        up_gate_alpha: std::ptr::null(),
+        down_alpha: std::ptr::null(),
+        gated_scale: std::ptr::null(),
+        up_gate_scale_bytes: expert_bytes(&up_gate.scales)?,
+        down_scale_bytes: expert_bytes(&down.scales)?,
+        shared_up_gate: shared_up_gate[0],
+        shared_up_gate_scales: shared_up_gate[1],
+        shared_down: shared_down[0],
+        shared_down_scales: shared_down[1],
+    };
+
+    let descriptor = exchange_descriptor(
+        Mode::Fused,
+        exchange,
+        (experts, intermediate as u32),
+        hidden.dtype(),
+    )?;
+    let out = own_rows(tokens, exchange, hidden.dtype())?;
+
+    ops::collective::expert_exchange(
+        &descriptor,
+        ExchangeArgs {
+            transport: None,
+            tokens: sent(OWNER, tokens, exchange)?,
+            capacity: exchange.step_rows,
+            state: ops::operand(hidden)?,
             ids: ops::operand(ids)?,
             weights: ops::operand(weights)?,
             live: live_tokens.map(ops::operand).transpose()?,
@@ -2242,6 +2361,11 @@ fn exchange_descriptor(
         ));
     };
 
+    // Only a fused launch runs experts; the two directions state none, whatever the layer's are.
+    let fused = match mode {
+        Mode::Fused => exchange.fused_experts,
+        Mode::Dispatch | Mode::Combine => FusedExperts::NONE,
+    };
     Ok(exchange::Descriptor {
         mode,
         hidden: hidden as u32,
@@ -2253,6 +2377,9 @@ fn exchange_descriptor(
         attention: exchange.attention,
         multiprocessors: exchange.multiprocessors,
         dtype,
+        weights: fused.weights,
+        shared: fused.shared,
+        limit: fused.limit,
     })
 }
 

@@ -98,9 +98,9 @@ pub use mhc::{MhcMixes, MhcMixing, mhc_boundary, mhc_post, mhc_pre};
 pub use moe::{
     EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN, Routing,
     SORT_MAPS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, expert_combine, expert_dispatch,
-    expert_exchange_fused, gather_gemm, gather_gemm_mxfp4, gather_gemm_nvfp4, moe_sort,
-    moe_unpermute, route_gemm, route_gemm_mxfp4, route_gemm_nvfp4, sigmoid_gated_add_,
-    topk_softmax,
+    expert_exchange_fused, expert_exchange_fused_mxfp4, gather_gemm, gather_gemm_mxfp4,
+    gather_gemm_nvfp4, moe_sort, moe_unpermute, route_gemm, route_gemm_mxfp4, route_gemm_nvfp4,
+    sigmoid_gated_add_, topk_softmax,
 };
 pub use mx::{linear_mxfp8, mxfp8_quantize};
 pub use ngram::{ngram_gate, ngram_hash};

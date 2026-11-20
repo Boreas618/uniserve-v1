@@ -119,6 +119,7 @@ fn exchange(step_rows: u32) -> ExpertExchange {
         packed: meta((rank_rows as usize, hidden / 2), DType::U8),
         packed_scales: meta((rank_rows as usize, hidden / 16), DType::F8E4M3),
         fused: false,
+        fused_experts: nn::family::FusedExperts::NONE,
         source_only: false,
     }
 }
@@ -347,9 +348,9 @@ fn assert_declarations(model: &dyn TextModel) {
             experts.experts,
             experts.top,
             experts.intermediate,
-            experts.encoded
+            experts.fused
         ),
-        (384, 6, 2304, false)
+        (384, 6, 2304, nn::family::FusedExperts::NONE)
     );
     assert_eq!(model.token_history().map(|history| history.width), Some(3));
 }

@@ -207,13 +207,14 @@ pub struct Mxfp8Weight {
     pub layout: ScaleLayout,
 }
 
-/// A stack of MXFP4 experts, as `gather_gemm_mxfp4` and `route_gemm_mxfp4` read it.
+/// A stack of MXFP4 experts, as `gather_gemm_mxfp4` and `route_gemm_mxfp4` read it, or a fused
+/// expert exchange.
 #[derive(Clone, Debug)]
 pub struct Mxfp4Stack {
     /// `[experts, rows, columns / 2]` U8: two E2M1 codes a byte, the rows in [`Self::values`].
     pub codes: Tensor,
-    /// `[experts, padded rows, padded columns / 32]` U8: each expert's UE8M0 scales, rows
-    /// permuted as the codes' are, in [`Self::layout`].
+    /// Each expert's UE8M0 scales, rows permuted as the codes' are, as [`Self::layout`] lays out
+    /// a `[rows, columns]` matrix's (`[experts, ...layout.shape]` of `layout.dtype()`).
     pub scales: Tensor,
     /// The arrangement of each matrix's rows.
     pub values: ValueLayout,
@@ -239,6 +240,7 @@ fn scales_key(layout: ScaleLayout) -> WeightLayout {
         ScaleLayout::Linear => WeightLayout::named("mx_scales_linear"),
         ScaleLayout::Swizzled128X4 => WeightLayout::named("mx_scales_swizzled_128x4"),
         ScaleLayout::PackedMnMajor => WeightLayout::named("mx_scales_packed_mn_major"),
+        ScaleLayout::PackedMnMajorUtccp => WeightLayout::named("mx_scales_packed_mn_major_utccp"),
     }
 }
 
@@ -250,7 +252,9 @@ fn codes_key(layout: ValueLayout) -> WeightLayout {
         ValueLayout::InterleavedShuffled { .. } => {
             WeightLayout::named("mxfp4_codes_interleaved_shuffled")
         }
-        ValueLayout::GateFirst => WeightLayout::named("mxfp4_codes_gate_first"),
+        // MXFP4 stacks are read gate first by DeepGEMM's MegaMoE alone, in blocks of eight rows
+        // of each half (`ops::moe::exchange::Descriptor::MXFP4_UP_GATE_VALUES`).
+        ValueLayout::GateFirst { .. } => WeightLayout::named("mxfp4_codes_gate_first"),
     }
 }
 
@@ -432,6 +436,130 @@ impl WeightLoader<'_> {
         })
     }
 
+    /// The MXFP8 matrix the whole block-scaled weights `weights` make, stacked along their rows in
+    /// order, in the arrangement a fused expert exchange reads (a shared expert's gated stack and
+    /// its down projection): the stacked rows moved into `layout.0`, their E4M3 codes as stored,
+    /// and their scales repeated over their rows, moved with them and published in `layout.1`.
+    ///
+    /// # Errors
+    ///
+    /// When a weight is not an MXFP8 weight of the checkpoint, the weights disagree in their
+    /// columns, the columns are not whole scale words, or the rows are not whole blocks of the
+    /// arrangement.
+    pub fn mxfp8_stack(
+        &self,
+        name: &str,
+        weights: &[&str],
+        layout: (ValueLayout, ScaleLayout),
+    ) -> Result<Mxfp8Weight> {
+        let (values, scale_layout) = layout;
+        let mut parts = Vec::with_capacity(weights.len());
+        let mut scale_names = Vec::with_capacity(weights.len());
+        let mut width = None;
+        for weight in weights {
+            if self.scheme(weight) != Scheme::Mxfp8 {
+                return Err(Error::weight(
+                    weight,
+                    "is read as an MXFP8 matrix, and the checkpoint does not store it as one"
+                        .to_owned(),
+                ));
+            }
+            let stored = self.checkpoint().locate(weight)?;
+            let (rows, columns) = (dim(&stored.shape, 0), dim(&stored.shape, 1));
+            if width.is_some_and(|width| width != columns) || !columns.is_multiple_of(WORD_ELEMENTS)
+            {
+                return Err(Error::weight(
+                    weight,
+                    format!(
+                        "a [{rows}, {columns}] weight in a stack of {width:?} columns: one width \
+                         of whole scale words of {WORD_ELEMENTS}"
+                    ),
+                ));
+            }
+            width = Some(columns);
+            scale_names.push(self.block_scale_of(weight)?);
+            parts.push(Mxfp8Part {
+                weight: (*weight).to_owned(),
+                rows: 0..rows,
+                columns: 0..columns,
+            });
+        }
+        let Some(width) = width else {
+            return Err(Error::weight(
+                name,
+                "an MXFP8 stack of no weights".to_owned(),
+            ));
+        };
+        let height: u64 = parts.iter().map(|part| part.rows.end).sum();
+        if let Some(block) = values.block()
+            && !height.is_multiple_of(block)
+        {
+            return Err(Error::weight(
+                name,
+                format!("a {values} arrangement permutes {block}-row blocks of {height} rows"),
+            ));
+        }
+
+        let codes_shape = extents(&[height, width]);
+        let names: Vec<String> = weights.iter().map(|weight| (*weight).to_owned()).collect();
+        let codes = self.publish_computed(
+            &WeightKey {
+                files: self.identities(&names)?,
+                dtype: DType::F8E4M3,
+                layout: WeightLayout::named("mxfp8_codes_arranged"),
+                tensors: std::iter::once(format!("{name}__mxfp8_codes_{values}"))
+                    .chain(names.iter().cloned())
+                    .collect(),
+                start: 0,
+                shape: codes_shape.clone(),
+                stride: None,
+                provenance: None,
+            },
+            &codes_shape,
+            |loader| {
+                let mut bytes = Vec::with_capacity((height * width) as usize);
+                for weight in &names {
+                    bytes.extend(loader.checkpoint().read(weight)?);
+                }
+                Ok(Cow::Owned(arrange(values, &bytes, 1, height, width)))
+            },
+        )?;
+
+        let published = scale_layout.shape(height, width);
+        let scales_shape = extents(&published);
+        let scales = self.publish_computed(
+            &WeightKey {
+                files: self.identities(&scale_names)?,
+                dtype: scale_layout.dtype(),
+                layout: scales_key(scale_layout),
+                tensors: std::iter::once(format!("{name}__{PRODUCER}_scales_{values}"))
+                    .chain(scale_names.iter().cloned())
+                    .collect(),
+                start: 0,
+                shape: scales_shape.clone(),
+                stride: None,
+                provenance: None,
+            },
+            &scales_shape,
+            |loader| {
+                let mut linear = Vec::new();
+                for (part, scale) in parts.iter().zip(&scale_names) {
+                    linear.extend(loader.row_scales(part, scale)?);
+                }
+                // The scales are read beside their rows, so they move with them.
+                let blocks = width / u64::from(BLOCK);
+                let moved = arrange(values, &linear, 1, height, blocks);
+                Ok(Cow::Owned(arranged(&moved, height, width, scale_layout)))
+            },
+        )?;
+
+        Ok(Mxfp8Weight {
+            codes,
+            scales,
+            layout: scale_layout,
+        })
+    }
+
     /// The MXFP4 stack of the experts `slots` names under `prefix`, each expert's `projections`
     /// stacked along their rows (`<prefix>.<expert>.<projection>.weight`), in the arrangement the
     /// reading product declares: each matrix's rows moved into `layout.0`, and its scales'
@@ -546,7 +674,7 @@ impl WeightLoader<'_> {
         let scales = self.publish_computed(
             &WeightKey {
                 files: self.identities(&scale_names)?,
-                dtype: DType::U8,
+                dtype: scale_layout.dtype(),
                 layout: scales_key(scale_layout),
                 tensors: std::iter::once(format!("{name}__mxfp4_scales_{values}"))
                     .chain(scale_names.iter().cloned())

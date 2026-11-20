@@ -17,7 +17,7 @@ use nn::family::{EXPERT_AXIS, ExpertOrder, TextPlacement};
 use nn::functional::{Activation, Rounding, Scoring};
 use nn::modules::{
     ExpertLayout, GateUp, MhcConnection, MhcResidual, MlpConfig, MoE, MoEConfig, NgramMemory,
-    SharedExpert, SharedExpertConfig, Tokens,
+    SharedExpertConfig, Tokens,
 };
 use nn::{DType, ExpertExchange, Result, Split, Tensor, VarBuilder};
 
@@ -35,8 +35,8 @@ pub struct DecoderLayer {
     attention_connection: MhcConnection,
     attention: Attention,
     ffn_connection: MhcConnection,
+    /// The routed experts and the shared expert beside them.
     experts: MoE,
-    shared: SharedExpert,
 }
 
 impl DecoderLayer {
@@ -57,6 +57,25 @@ impl DecoderLayer {
         let mhc = config.mhc();
         let experts = &config.experts;
         let name = expert_module(layer);
+        let shared = SharedExpertConfig {
+            mlp: MlpConfig {
+                hidden: config.hidden_size,
+                intermediate: experts.intermediate,
+                activation: Activation::Silu,
+                // The reference's `Expert`: the clamped SwiGLU in FP32, rounded once.
+                rounding: Rounding::Fused,
+                limit: Some(experts.limit),
+                gate_up: GateUp::Split {
+                    gate: "w1",
+                    up: "w3",
+                },
+                down: "w2",
+                bias: false,
+                split: Split::WHOLE,
+            },
+            module: "shared_experts",
+            gate: None,
+        };
         let routed = MoEConfig {
             hidden: config.hidden_size,
             intermediate: experts.intermediate,
@@ -84,25 +103,8 @@ impl DecoderLayer {
             tensor_experts: placement.tensor_experts,
             exchange: placement.experts,
             name: Some(name),
-        };
-        let shared = SharedExpertConfig {
-            mlp: MlpConfig {
-                hidden: config.hidden_size,
-                intermediate: experts.intermediate,
-                activation: Activation::Silu,
-                // The reference's `Expert`: the clamped SwiGLU in FP32, rounded once.
-                rounding: Rounding::Fused,
-                limit: Some(experts.limit),
-                gate_up: GateUp::Split {
-                    gate: "w1",
-                    up: "w3",
-                },
-                down: "w2",
-                bias: false,
-                split: Split::WHOLE,
-            },
-            module: "shared_experts",
-            gate: None,
+            shared: Some(shared),
+            fused_exchange: placement.fused_exchange,
         };
 
         Ok(Self {
@@ -111,11 +113,10 @@ impl DecoderLayer {
             attention: Attention::load(config, layer, vb.pp("attn"))?,
             ffn_connection: MhcConnection::load(&mhc, &vb, "hc_ffn", vb.pp("ffn_norm"))?,
             experts: MoE::load(&routed, vb.pp("ffn"))?,
-            shared: SharedExpert::load(&shared, vb.pp("ffn"))?,
         })
     }
 
-    /// The layer's routed experts.
+    /// The layer's routed experts and the shared expert beside them.
     pub fn experts(&self) -> &MoE {
         &self.experts
     }
@@ -159,8 +160,7 @@ impl DecoderLayer {
             self.attention.forward(x, inputs, carried)
         })?;
         residual.sublayer(&self.ffn_connection, |x| {
-            let routed = self.experts.forward(x, live_tokens, exchange)?;
-            self.shared.forward(x, routed)
+            self.experts.forward(x, live_tokens, exchange)
         })
     }
 }

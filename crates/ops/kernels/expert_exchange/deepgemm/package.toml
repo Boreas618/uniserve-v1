@@ -1,0 +1,63 @@
+# The expert_exchange operator's deepgemm backend.
+#
+# DeepGEMM's MegaMoE over MXFP4 experts (`sm100_fp8_fp4_mega_moe_impl`, the
+# `deepgemm` pin of `uniserve_build_server.fetch`), compiled ahead of time: one
+# launch per layer pulls every route's MXFP8 row from the rank that sent it over
+# NVLink, runs both expert products (the first with the clamped SwiGLU, the
+# route's weight and the gated row's MXFP8 encoding in its epilogue), the shared
+# experts over the rank's own rows beside them, and writes each route's output
+# back to its token's rank, which sums them in FP32 and rounds once.
+#
+# The build (`src/build.py`) compiles one kernel instance per tile height
+# (BLOCK_M) DeepGEMM's scheduler picks for the step sizes the descriptor's
+# `max_tokens` admits, each from `src/kernel.cu`, with the package's transport
+# and launch (`src/entry.cu`) and the staging kernel that encodes a rank's BF16
+# rows into MXFP8 and writes its routes (`src/stage.cu`), into one native
+# module per descriptor. A launch takes the instance of its step's capacity
+# (`uniserve_exchange_call::capacity`), which every rank of the step states
+# alike. The CUTLASS the kernel includes is the one the `flashinfer-python`
+# distribution installs. A serving host compiles nothing.
+#
+# One native module per descriptor, with the operator's eight entries.
+
+op = "expert_exchange"
+backend = "deepgemm"
+interface_version = 2
+
+[toolchain]
+packages = ["flashinfer-python"]
+
+[module.entries]
+launch = "uniserve_expert_exchange_launch"
+create = "uniserve_expert_exchange_create"
+step = "uniserve_expert_exchange_step"
+suspend = "uniserve_expert_exchange_suspend"
+restore = "uniserve_expert_exchange_restore"
+release = "uniserve_expert_exchange_release"
+info = "uniserve_expert_exchange_info"
+footprint = "uniserve_expert_exchange_footprint"
+
+[source]
+kind = "cuda"
+
+[kernel]
+requires = ["tensor_memory"]
+
+# `mode_fused_hidden_5120_intermediate_2304_top_6_experts_384_max_tokens_4096_ranks_4_attention_0_multiprocessors_152_dtype_bf16_weights_mxfp4_shared_1_limit_0x41200000`.
+#
+# The extents are the kernel's template arguments. Its products run in
+# two-CTA clusters of 128-column tiles, so both products' output widths
+# (`2 * intermediate` and `hidden`) are whole 256-column cluster tiles, and
+# every contraction is whole 128-element scale words: `hidden` a multiple of
+# 256 and `intermediate` of 128 (DeepGEMM's `build_symm_buffer_layout` and
+# `get_num_max_live_pool_blocks`). Its signal block holds at most 2048 experts,
+# 512 a rank and 72 ranks, and a dispatch warp reads at most 32 routes of a
+# token (`layout/mega_moe.cuh`); the build refuses an expert count the ranks do
+# not divide, which a constraint of one field cannot state. The persistent grid
+# is one block per multiprocessor of the device, every block resident for the
+# grid-wide synchronization, in clusters of two, so `multiprocessors` is the
+# device's and even. `limit` is the clamp of every expert's gated activation
+# (zero for none) and `shared` the experts of the routed width every token runs
+# through beside its routes.
+[[kernel.descriptors]]
+dimensions = { mode = ["fused"], hidden = { multiple = 256 }, intermediate = { multiple = 128 }, top = { min = 1, max = 32 }, experts = { min = 1, max = 2048 }, max_tokens = { min = 1 }, ranks = { min = 1, max = 72 }, attention = ["0"], multiprocessors = { min = 2, multiple = 2 }, dtype = ["bf16"], weights = ["mxfp4"], shared = { min = 0 }, limit = { bits = 32 } }

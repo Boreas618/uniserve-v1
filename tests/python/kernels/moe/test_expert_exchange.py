@@ -19,10 +19,21 @@ operator crate's generated header, which needs none.
 """
 
 import ctypes
-import threading
 
 import pytest
 import torch
+from uniserve_testing.kernels.moe.exchange import (
+    MIRRORS,
+    Call,
+    Channel,
+    Info,
+    Lifecycle,
+    entered,
+    group_of,
+    load,
+    run_ranks,
+    tensor_at,
+)
 from uniserve_testing.kernels.packages import (
     abi_enumerator,
     assert_abi_layout,
@@ -38,11 +49,9 @@ BF16 = abi_enumerator("UNISERVE_DTYPE_BF16")
 RANKS, HIDDEN, TOP, EXPERTS, CAPACITY = 2, 2048, 8, 128, 64
 KEY = (
     f"mode_dispatch_hidden_{HIDDEN}_intermediate_768_top_{TOP}_experts_"
-    f"{EXPERTS}_max_tokens_{CAPACITY}_ranks_{RANKS}_attention_0_dtype_bf16"
+    f"{EXPERTS}_max_tokens_{CAPACITY}_ranks_{RANKS}_attention_0_dtype_bf16_"
+    "weights_none_shared_0_limit_0x0"
 )
-
-#: The module's entries, `uniserve_expert_exchange_<name>`.
-ENTRIES = ("create", "step", "suspend", "restore", "release", "info", "launch")
 
 #: The directions of a launch.
 DISPATCH = abi_enumerator("UNISERVE_EXCHANGE_DISPATCH")
@@ -57,166 +66,10 @@ TRIALS = ((CAPACITY, CAPACITY), (CAPACITY // 2, CAPACITY // 4), (4, 3))
 RELATIVE, ABSOLUTE = 0.02, 1e-3
 
 
-class Lifecycle(ctypes.Structure):
-    """The transport's lifecycle call."""
-
-    _fields_ = [
-        ("transport", ctypes.c_void_p),
-        ("group", ctypes.c_void_p),
-        ("ranks", ctypes.c_int64),
-        ("rank", ctypes.c_int64),
-        ("experts", ctypes.c_int64),
-        ("hidden", ctypes.c_int64),
-        ("max_tokens", ctypes.c_int64),
-        ("top", ctypes.c_int64),
-        ("dtype", ctypes.c_int64),
-        ("device", ctypes.c_int64),
-        ("intermediate", ctypes.c_int64),
-        ("capacity", ctypes.c_int64),
-        ("attention_ranks", ctypes.c_int64),
-        ("error", ctypes.c_char * 512),
-    ]
-
-
-class Info(ctypes.Structure):
-    """The transport's views, as its `info` entry answers them."""
-
-    _fields_ = [
-        ("transport", ctypes.c_void_p),
-        ("states", ctypes.c_void_p),
-        ("ids", ctypes.c_void_p),
-        ("weights", ctypes.c_void_p),
-        ("combined", ctypes.c_void_p),
-        ("live", ctypes.c_void_p),
-        ("packed", ctypes.c_void_p),
-        ("packed_scales", ctypes.c_void_p),
-        ("ranks", ctypes.c_int64),
-        ("rank", ctypes.c_int64),
-        ("capacity", ctypes.c_int64),
-        ("hidden", ctypes.c_int64),
-        ("top", ctypes.c_int64),
-        ("dtype", ctypes.c_int64),
-        ("device", ctypes.c_int64),
-        ("fused", ctypes.c_int64),
-        ("error", ctypes.c_char * 512),
-    ]
-
-
-class Call(ctypes.Structure):
-    """`ops::moe::exchange`'s launch call, field for field."""
-
-    _fields_ = [
-        ("transport", ctypes.c_void_p),
-        ("states", ctypes.c_void_p),
-        ("ids", ctypes.c_void_p),
-        ("weights", ctypes.c_void_p),
-        ("live", ctypes.c_void_p),
-        ("out", ctypes.c_void_p),
-        ("layer", ctypes.c_void_p),
-        ("mode", ctypes.c_int64),
-        ("tokens", ctypes.c_int64),
-        ("top", ctypes.c_int64),
-        ("hidden", ctypes.c_int64),
-        ("experts", ctypes.c_int64),
-        ("max_tokens", ctypes.c_int64),
-        ("ranks", ctypes.c_int64),
-        ("dtype", ctypes.c_int64),
-        ("error", ctypes.c_char * 512),
-    ]
-
-
-GATHER = ctypes.CFUNCTYPE(
-    ctypes.c_int32,
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-    ctypes.c_int64,
-)
-BARRIER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p)
-
-
-class Group(ctypes.Structure):
-    """The host collectives a rank hands the transport."""
-
-    _fields_ = [
-        ("handle", ctypes.c_void_p),
-        ("communicator", ctypes.c_void_p),
-        ("ranks", ctypes.c_int64),
-        ("rank", ctypes.c_int64),
-        ("device", ctypes.c_int64),
-        ("all_gather", GATHER),
-        ("barrier", BARRIER),
-        ("error", ctypes.c_char * 512),
-    ]
-
-
-@pytest.mark.parametrize(
-    ("mirror", "structure"),
-    [
-        pytest.param(Lifecycle, "uniserve_exchange_lifecycle", id="lifecycle"),
-        pytest.param(Info, "uniserve_exchange_info", id="info"),
-        pytest.param(Call, "uniserve_exchange_call", id="launch"),
-        pytest.param(Group, "UniserveGroup", id="group"),
-    ],
-)
-def test_a_call_mirror_is_its_generated_header_structure(mirror, structure):
+@pytest.mark.parametrize("structure", sorted(MIRRORS))
+def test_a_call_mirror_is_its_generated_header_structure(structure):
     """The generated header asserts the size and offsets the mirror has."""
-    assert_abi_layout(mirror, structure)
-
-
-class Channel:
-    """The host collectives of a group whose ranks are threads of this
-    process.
-    """  # noqa: D205
-
-    def __init__(self, ranks):
-        """A meeting point for `ranks` threads."""
-        self.meeting = threading.Barrier(ranks)
-        self.slots = [b""] * ranks
-
-    def gather(self, rank, mine, peers, count):
-        """Every rank's `count` bytes at `mine`, in rank order at `peers`."""
-        self.slots[rank] = ctypes.string_at(mine, count)
-        self.meeting.wait()
-        for index, value in enumerate(self.slots):
-            ctypes.memmove(peers + index * count, value, count)
-        self.meeting.wait()
-        return 0
-
-    def barrier(self):
-        """Wait for every rank."""
-        self.meeting.wait()
-        return 0
-
-
-def message(call):
-    """The error a call's entry wrote."""
-    return bytes(call.error).split(b"\0", 1)[0].decode(errors="replace")
-
-
-def tensor_at(address, shape, dtype, device):
-    """A tensor over `address`, a device pointer this rank maps."""
-    size = (
-        torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
-    )
-
-    class Holder:
-        __cuda_array_interface__ = {
-            "shape": (size,),
-            "typestr": "|u1",
-            "data": (address, False),
-            "version": 2,
-        }
-
-    return torch.as_tensor(Holder(), device=device).view(dtype).view(*shape)
-
-
-def entered(library, name, call, stream=None):
-    """Call `uniserve_expert_exchange_<name>`, refusing a nonzero status."""
-    status = getattr(library, f"uniserve_expert_exchange_{name}")(
-        ctypes.byref(call), None if stream is None else ctypes.c_void_p(stream)
-    )
-    assert status == 0, f"{name}: {message(call)}"
+    assert_abi_layout(MIRRORS[structure], structure)
 
 
 def run_rank(library, channel, rank, device):
@@ -225,13 +78,7 @@ def run_rank(library, channel, rank, device):
     # The primary context is current on this thread.
     torch.zeros(1, device=device)
     stream = torch.cuda.Stream(device=device)
-    gather = GATHER(
-        lambda _, mine, peers, count: channel.gather(rank, mine, peers, count)
-    )
-    meet = BARRIER(lambda _: channel.barrier())
-    group = Group(
-        ranks=RANKS, rank=rank, device=device, all_gather=gather, barrier=meet
-    )
+    group, callbacks = group_of(channel, RANKS, rank, device)
     life = Lifecycle(
         group=ctypes.cast(ctypes.pointer(group), ctypes.c_void_p),
         ranks=RANKS,
@@ -298,6 +145,7 @@ def run_rank(library, channel, rank, device):
                 out=out.data_ptr(),
                 mode=DISPATCH,
                 tokens=tokens,
+                capacity=max(tokens, 1),
                 top=TOP,
                 hidden=HIDDEN,
                 experts=EXPERTS,
@@ -353,6 +201,7 @@ def run_rank(library, channel, rank, device):
             "restore moved the views: a captured graph addresses the old ones"
         )
     entered(library, "release", life)
+    del callbacks
 
 
 @pytest.mark.gpu
@@ -362,31 +211,11 @@ def test_two_ranks_dispatch_combine_suspend_and_restore(kernel_module):
             f"needs {RANKS} CUDA devices, this host shows "
             f"{torch.cuda.device_count()}"
         )
-    library = ctypes.CDLL(
-        str(kernel_module("expert_exchange", "alltoall", KEY) / "module.so")
+    library = load(
+        kernel_module("expert_exchange", "alltoall", KEY) / "module.so"
     )
-    for name in ENTRIES:
-        function = getattr(library, f"uniserve_expert_exchange_{name}")
-        function.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        function.restype = ctypes.c_int32
     channel = Channel(RANKS)
-    failures = []
-
-    def rank_body(rank):
-        try:
-            run_rank(library, channel, rank, rank)
-        except BaseException as error:  # noqa: BLE001 - any failure is the result
-            failures.append(f"rank {rank}: {error!r}")
-            # The other ranks may be waiting on this one.
-            channel.meeting.abort()
-
-    threads = [
-        threading.Thread(target=rank_body, args=(rank,))
-        for rank in range(RANKS)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
+    failures = run_ranks(
+        channel, RANKS, lambda rank: run_rank(library, channel, rank, rank)
+    )
     assert not failures, "; ".join(failures)

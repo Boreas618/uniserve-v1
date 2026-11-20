@@ -18,7 +18,7 @@
 
 op = "expert_exchange"
 backend = "megamoe"
-interface_version = 1
+interface_version = 2
 
 # The distributions the build and the pinned kernel import: FlashInfer (the pin's origin),
 # PyTorch (the tensors that describe the kernel's operands, and the kernel's dtype names)
@@ -46,12 +46,13 @@ kind = "cuda"
 [kernel]
 requires = ["tensor_memory"]
 
-# `mode_fused_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_multiprocessors_148_dtype_bf16`.
+# `mode_fused_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_multiprocessors_148_dtype_bf16_weights_nvfp4_shared_0_limit_0x0`.
 # The extents are the kernel's static expert shape `(local, 2 * intermediate, hidden)`,
 # compiled for any value its tiles divide: the block-scaled operands' contiguous extents are
 # whole 128-element runs (`is_valid_tensor_alignment`), and a weight's rows are whole
 # 256-row two-CTA tiles, so `hidden` is a multiple of 256 and `intermediate` of 128. The
 # kernel's persistent grid is as many clusters as the device's `multiprocessors` hold, each
-# resident for the grid-wide synchronization.
+# resident for the grid-wide synchronization. It runs calibrated NVFP4 experts alone, with
+# no shared expert and an unclamped activation.
 [[kernel.descriptors]]
-dimensions = { mode = ["fused"], hidden = { multiple = 256 }, intermediate = { multiple = 128 }, top = { min = 1 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1 }, attention = ["0"], multiprocessors = { min = 1 }, dtype = ["bf16"] }
+dimensions = { mode = ["fused"], hidden = { multiple = 256 }, intermediate = { multiple = 128 }, top = { min = 1 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1 }, attention = ["0"], multiprocessors = { min = 1 }, dtype = ["bf16"], weights = ["nvfp4"], shared = ["0"], limit = ["0x0"] }

@@ -263,6 +263,11 @@ pub mod operator {
         // load, two pointers after the map; its descriptor states its scoring and whether it reads
         // a selection bias, a pointer after the scale's kind.
         (TOPK_SOFTMAX, 3),
+        // The descriptor states what a fused launch runs (the routed experts' representation,
+        // the shared experts and the gated activation's clamp), the call the step's rows a rank
+        // and an MXFP4 launch's rows, the fused layer the shared experts' operands, and the
+        // lifecycle call what the transport is laid out for.
+        (EXPERT_EXCHANGE, 2),
     ];
 
     /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.

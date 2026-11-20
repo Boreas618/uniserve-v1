@@ -255,6 +255,9 @@ impl MoeConfig {
             tensor_experts: placement.tensor_experts,
             exchange: placement.experts,
             name,
+            // The shared expert of these families is gated, a module of the model's own.
+            shared: None,
+            fused_exchange: placement.fused_exchange,
         }
     }
 }

@@ -293,7 +293,8 @@ fn a_routed_nvfp4_package_reads_the_weight_scale_layout_its_operator_states() {
 /// of that backend without a module.
 #[test]
 fn every_exchange_package_covers_the_keys_its_operator_states() {
-    use ops::moe::exchange::{Descriptor, Mode};
+    use ops::descriptor::Float;
+    use ops::moe::exchange::{Descriptor, ExpertWeights, FusedExperts, Mode};
 
     let dispatch = Descriptor {
         mode: Mode::Dispatch,
@@ -306,11 +307,33 @@ fn every_exchange_package_covers_the_keys_its_operator_states() {
         attention: 0,
         multiprocessors: 148,
         dtype: DType::BF16,
+        weights: ExpertWeights::None,
+        shared: 0,
+        limit: Float(0),
+    };
+    // Each backend's directions, with what its fused launch runs: none for the directions.
+    let mxfp4 = FusedExperts {
+        weights: ExpertWeights::Mxfp4,
+        shared: 1,
+        limit: 10.0_f32.into(),
     };
     let backends = [
-        ("alltoall", &[Mode::Dispatch, Mode::Combine][..]),
-        ("deepep", &[Mode::Dispatch, Mode::Combine]),
-        ("megamoe", &[Mode::Fused]),
+        (
+            "alltoall",
+            &[
+                (Mode::Dispatch, FusedExperts::NONE),
+                (Mode::Combine, FusedExperts::NONE),
+            ][..],
+        ),
+        (
+            "deepep",
+            &[
+                (Mode::Dispatch, FusedExperts::NONE),
+                (Mode::Combine, FusedExperts::NONE),
+            ],
+        ),
+        ("megamoe", &[(Mode::Fused, FusedExperts::NVFP4)]),
+        ("deepgemm", &[(Mode::Fused, mxfp4)]),
     ];
 
     let manifests = kernel_manifests();
@@ -320,8 +343,15 @@ fn every_exchange_package_covers_the_keys_its_operator_states() {
             .iter()
             .find(|(_, manifest)| manifest.op == "expert_exchange" && manifest.backend == backend)
             .unwrap_or_else(|| panic!("no expert_exchange package {backend}"));
-        for &mode in modes {
-            let key = Descriptor { mode, ..dispatch }.to_string();
+        for &(mode, fused) in modes {
+            let key = Descriptor {
+                mode,
+                weights: fused.weights,
+                shared: fused.shared,
+                limit: fused.limit,
+                ..dispatch
+            }
+            .to_string();
             if manifest.typed_fields(&key).is_none() {
                 failures.push(format!("{}: covers no {key}", package.display()));
             }

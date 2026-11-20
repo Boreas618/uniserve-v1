@@ -13,7 +13,7 @@
 
 op = "expert_exchange"
 backend = "deepep"
-interface_version = 1
+interface_version = 2
 
 [module.entries]
 launch = "uniserve_expert_exchange_launch"
@@ -42,11 +42,11 @@ exchange_multiprocessors = 24
 # windows and use no queue pair.
 queue_pairs = 129
 
-# `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_multiprocessors_148_dtype_bf16`.
+# `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_multiprocessors_148_dtype_bf16_weights_none_shared_0_limit_0x0`.
 # The extents are DeepEP's template arguments, which compile for any value its static
 # assertions admit: a hidden row of whole 256-element combine vectors and at most 32
 # routes per token (DeepEP's `impls/combine.cuh`, `dispatch.cuh`). The expert
 # count's division over the expert ranks is the operator's to check. `multiprocessors`
 # is the device's, at least `exchange_multiprocessors`.
 [[kernel.descriptors]]
-dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 256 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1 }, attention = { min = 0 }, multiprocessors = { min = 1 }, dtype = ["bf16"] }
+dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 256 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1 }, attention = { min = 0 }, multiprocessors = { min = 1 }, dtype = ["bf16"], weights = ["none"], shared = ["0"], limit = ["0x0"] }

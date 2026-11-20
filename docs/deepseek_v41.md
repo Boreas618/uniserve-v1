@@ -13,7 +13,7 @@ The package (`configs/deepseek_v41/dp4-ep4/config.toml`) runs four data-parallel
 | Part | Placement | Per GPU |
 | --- | --- | --- |
 | Attention, shared experts, router, embedding, head (FP32) | whole on every rank | about 11 GiB |
-| Routed experts | 96 of every layer's 384, behind the `alltoall` exchange | about 68 GiB |
+| Routed experts | 96 of every layer's 384, behind the `alltoall` exchange, or inside the `deepgemm` exchange's one launch with `moe_config.fused_exchange` | about 68 GiB |
 | n-gram tables (two of about 384M rows of 256 E4M3 values) | six of each table's 24 hash heads, a contiguous range of its rows; each lookup gathers every rank's row ids and returns each rank its own tokens' rows | about 47 GiB |
 
 The weights take about 125 GiB of each GPU's 185, so the package raises the deployment's share of a GPU (`mem_fraction_static = 0.95`) to hold them beside the graph pool and the KV cache. It serves the release's context (`max_model_len = 1048576`), which AgentX prompts reach (990K tokens at most, 35K at the median), to 16 running requests a scheduler, 64 over the four, and prefills a prompt in chunks of 4096 tokens. On GB200 each GPU's share of 188.0 GB holds:
@@ -37,7 +37,7 @@ Eight layers index their compressed entries (2, 8, 14 and 20 over every visible 
 
 ## Numerics
 
-Every quantized value is the reference's (`inference/kernel.py`): the projections' activations are encoded per 32 by the covering UE8M0 rule, the cache records are the reference's fake quantizations exactly, the router scores in FP32 and the head computes FP32 logits. Three steps differ from the reference in their order: the routing weight multiplies an expert's output after its down projection, in the combine, where the reference scales the gated row before encoding it; the first MXFP4 product encodes the gated row by the OCP Microscaling rule in its epilogue; and the routed sum is rounded to BF16 before the shared expert's output is added. Every reduction runs in its kernels' own order, and the indexer's selection may break near ties otherwise than the reference's BF16 ranking.
+Every quantized value is the reference's (`inference/kernel.py`): the projections' activations are encoded per 32 by the covering UE8M0 rule, the cache records are the reference's fake quantizations exactly, the router scores in FP32 and the head computes FP32 logits. Behind the `alltoall` exchange three steps differ from the reference in their order: the routing weight multiplies an expert's output after its down projection, in the combine, where the reference scales the gated row before encoding it; the first MXFP4 product encodes the gated row by the OCP Microscaling rule in its epilogue; and the routed sum is rounded to BF16 before the shared expert's output is added. Inside the `deepgemm` exchange's one launch (`moe_config.fused_exchange`) the routing weight scales the gated row before its encoding, as the reference does, the gated row is encoded by the covering rule exactly (the least power of two its magnitudes fit under, where the reference multiplies by `fl(1/448)`), and every route's BF16 output and the shared expert's are summed in FP32 and rounded once. Every reduction runs in its kernels' own order, and the indexer's selection may break near ties otherwise than the reference's BF16 ranking.
 
 ## Limits
 

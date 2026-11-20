@@ -925,6 +925,7 @@ mod tests {
             },
             experts: Split::WHOLE,
             tensor_experts: false,
+            fused_exchange: false,
             drafter: false,
             vision: false,
             draft_tokens: 0,

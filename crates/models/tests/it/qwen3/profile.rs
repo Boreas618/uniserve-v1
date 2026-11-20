@@ -223,8 +223,8 @@ fn qwen3_moe_profiles_a_decode_and_a_prefill_bucket() {
     assert!(model.drafter().is_none() && model.vision().is_none());
     let experts = model.experts().expect("routed experts");
     assert_eq!(
-        (experts.experts, experts.top, experts.encoded),
-        (128, 8, false)
+        (experts.experts, experts.top, experts.fused),
+        (128, 8, nn::family::FusedExperts::NONE)
     );
 
     for keys in buckets("Qwen3-30B-A3B", &*model, &[], &no_exchange) {
@@ -354,6 +354,7 @@ fn qwen3_moe_profiles_tensor_and_expert_parallel_ranks() {
                 packed: meta((tokens, hidden / 2), DType::U8),
                 packed_scales: meta((tokens, hidden / 16), DType::F8E4M3),
                 fused: false,
+                fused_experts: nn::family::FusedExperts::NONE,
                 source_only: false,
             })
         };
@@ -437,7 +438,10 @@ fn qwen3_moe_nvfp4_profiles_a_decode_and_a_prefill_bucket() {
     let model = load(QWEN3_30B_A3B_NVFP4, &TextPlacement::WHOLE);
 
     assert_eq!(key_value_shape(&model.cache()), (48, 4, 128));
-    assert!(model.experts().expect("routed experts").encoded);
+    assert_eq!(
+        model.experts().expect("routed experts").fused,
+        nn::family::FusedExperts::NVFP4
+    );
 
     for keys in buckets("Qwen3-30B-A3B-NVFP4", &*model, &[], &no_exchange) {
         assert_operators(
@@ -500,7 +504,10 @@ fn qwen3_6_profiles_its_buckets_its_drafter_and_its_tower() {
     };
     let model = load(QWEN3_6_35B_A3B, &placement);
     assert_hybrid_shapes(&*model);
-    assert!(!model.experts().expect("routed experts").encoded);
+    assert_eq!(
+        model.experts().expect("routed experts").fused,
+        nn::family::FusedExperts::NONE
+    );
 
     let [decode, prefill] = buckets("Qwen3.6-35B-A3B", &*model, &[], &no_exchange);
     for keys in [&decode, &prefill] {

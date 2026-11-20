@@ -651,6 +651,11 @@ pub struct ExpertExchange {
     /// One launch runs the whole expert layer, so the module sorts and multiplies nothing
     /// itself.
     pub fused: bool,
+    /// What that launch runs beside the exchange, as the transport was laid out for it: the
+    /// routed experts' representation, the shared experts and the gated activation's clamp
+    /// (`ops::moe::exchange::FusedExperts::NONE` for an exchange of two launches). A block
+    /// whose experts are not these is refused rather than run by a module compiled for others.
+    pub fused_experts: ops::moe::exchange::FusedExperts,
     /// This rank holds no experts: it sends routes and takes sums back, and computes nothing.
     pub source_only: bool,
 }

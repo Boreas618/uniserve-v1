@@ -31,8 +31,8 @@
 
 use nn::collective::{self, Split};
 use nn::family::{
-    CacheField, EXPERT_AXIS, ExpertOrder, ExpertShape, StateShape, TextModel, TextPlacement,
-    TokenHistory,
+    CacheField, EXPERT_AXIS, ExpertOrder, ExpertShape, FusedExperts, StateShape, TextModel,
+    TextPlacement, TokenHistory,
 };
 use nn::functional::Ring;
 use nn::modules::{
@@ -467,7 +467,11 @@ impl TextModel for DeepseekV41ForCausalLm {
             experts: experts.experts,
             intermediate: experts.intermediate,
             top: experts.top,
-            encoded: false,
+            // Every layer's experts load alike: the first states what a fused launch runs.
+            fused: self
+                .layers
+                .first()
+                .map_or(FusedExperts::NONE, |layer| layer.experts().fused_experts()),
         })
     }
 

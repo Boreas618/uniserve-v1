@@ -29,8 +29,8 @@
 //! ([`TokenBatch::rope_positions`]).
 
 use nn::family::{
-    CacheField, ExpertOrder, ExpertShape, FieldOwner, Format, History, INDEX_KEY, Record,
-    StateShape, TextModel, TextPlacement, TokenHistory,
+    CacheField, ExpertOrder, ExpertShape, FieldOwner, Format, FusedExperts, History, INDEX_KEY,
+    Record, StateShape, TextModel, TextPlacement, TokenHistory,
 };
 use nn::modules::{Embedding, EmbeddingConfig, LmHead, LmHeadConfig, Rotary};
 use nn::{
@@ -435,7 +435,12 @@ impl TextModel for Qwen4ExpForCausalLm {
             experts: moe.num_experts,
             intermediate: moe.moe_intermediate_size,
             top: moe.num_experts_per_tok,
-            encoded: self.config.quantization.is_encoded(),
+            // Calibrated NVFP4 experts run in the exchange's one fused launch.
+            fused: if self.config.quantization.is_encoded() {
+                FusedExperts::NVFP4
+            } else {
+                FusedExperts::NONE
+            },
         })
     }
 

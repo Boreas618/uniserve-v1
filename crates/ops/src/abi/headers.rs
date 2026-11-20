@@ -329,7 +329,8 @@ fn headers() -> Vec<Header> {
         .structure::<moe::exchange::HostGroup>("UniserveGroup")
         .structure::<moe::exchange::Lifecycle>("uniserve_exchange_lifecycle")
         .structure::<moe::exchange::Info>("uniserve_exchange_info")
-        .item("Mode", "uniserve_exchange"),
+        .item("Mode", "uniserve_exchange")
+        .item("ExpertWeights", "uniserve_exchange_weights"),
         Header::new(
             committed!("uniserve_gather_gemm.h"),
             "src/moe/grouped.rs",
@@ -397,6 +398,11 @@ fn a_key_spells_the_enumerators_of_its_fields() {
         moe::exchange::Mode::Dispatch,
         moe::exchange::Mode::Combine,
         moe::exchange::Mode::Fused,
+    ]);
+    spelled(&[
+        moe::exchange::ExpertWeights::None,
+        moe::exchange::ExpertWeights::Nvfp4,
+        moe::exchange::ExpertWeights::Mxfp4,
     ]);
     spelled(&[
         moe::combine::Layout::Permuted,

@@ -431,7 +431,7 @@ impl TextModel for Tiny {
             experts: 8,
             intermediate: 32,
             top: 2,
-            encoded: false,
+            fused: ops::moe::exchange::FusedExperts::NONE,
         })
     }
 
@@ -2098,6 +2098,7 @@ fn member(group: &Arc<HostGroup>, rank: u32, join: JoinHook) -> Member {
         device: 0,
         multiprocessors: 148,
         attention_ranks: 0,
+        fused: ops::moe::exchange::FusedExperts::NONE,
     };
 
     Member::new(Arc::clone(group), shape, Mode::Dispatch, join, BESIDE).unwrap()
@@ -2298,6 +2299,7 @@ fn a_union_is_joined_by_a_runner_whose_model_routes_experts() {
         device: 0,
         multiprocessors: 148,
         attention_ranks: 0,
+        fused: ops::moe::exchange::FusedExperts::NONE,
     };
 
     // The model splits no experts.

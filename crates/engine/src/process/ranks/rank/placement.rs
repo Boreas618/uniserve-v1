@@ -112,6 +112,9 @@ pub(crate) struct Mapping {
     /// experts and runs them over every token of the group's batches
     /// ([`proto::config::EngineConfig::expert_union`]).
     pub(super) group_experts: bool,
+    /// Whether the union's MXFP4 expert layers run in its exchange's one fused launch
+    /// (`moe_config.fused_exchange`).
+    pub(super) fused_exchange: bool,
 }
 
 impl Mapping {
@@ -145,6 +148,7 @@ impl Mapping {
             union_rank: 0,
             attention_ranks: 0,
             group_experts: build.moe.expert_parallel && !union,
+            fused_exchange: build.moe.fused_exchange,
         })
     }
 
@@ -163,6 +167,7 @@ impl Mapping {
             sequence: self.sequence,
             experts: Split::new(self.expert_parallel, self.expert_rank)?,
             tensor_experts: self.group_experts,
+            fused_exchange: self.fused_exchange,
             // The drafter's layers load when the deployment speculates with them, and a model
             // whose state keeps a window per request sizes it by the drafts.
             drafter: draft_tokens > 0,

@@ -325,7 +325,10 @@ fn profile_packed(release: Release) {
     for tensor in [Split::WHOLE, Split::new(4, 1).unwrap()] {
         let (model, unread) = load(release, &placement(tensor));
         assert_shapes(&*model, tensor);
-        assert!(model.experts().expect("routed experts").encoded);
+        assert_eq!(
+            model.experts().expect("routed experts").fused,
+            nn::family::FusedExperts::NVFP4
+        );
 
         // Every tensor of the checkpoint is a module's: the load of the whole model names
         // each, and a rank names all but the shards of the n-gram table other ranks hold.
