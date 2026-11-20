@@ -407,15 +407,17 @@ impl ModelRunner {
         let fixed = regions
             .iter()
             .fold(slot_bytes, |sum, (_, bytes)| sum.saturating_add(*bytes));
-        let mut units = u32::try_from(alone.saturating_sub(fixed) / layout.unit_bytes.max(1))
-            .unwrap_or(u32::MAX);
+        let unit_bytes = layout.unit_bytes();
+        let mut units =
+            u32::try_from(alone.saturating_sub(fixed) / unit_bytes.max(1)).unwrap_or(u32::MAX);
         if let Some(tokens) = self.engine_config().kv_cache.max_tokens {
             let capacity = u32::try_from(layout.token_units(tokens.get())).unwrap_or(u32::MAX);
             units = units.min(capacity);
         }
-        let units = segments::segmented_units(units, layout.plane_bytes, granularity);
+        let plane = layout.segment_plane();
+        let units = segments::segmented_units(units, plane, granularity);
         let split = layout.split_bytes();
-        let segment = segments::segment_layout(units, layout.plane_bytes, granularity)
+        let segment = segments::segment_layout(units, plane, granularity)
             .map_or(0, |(_, per_segment)| {
                 u64::from(per_segment).saturating_mul(split)
             });
@@ -430,8 +432,8 @@ impl ModelRunner {
         Ok(room::fewest(
             regions,
             slot_bytes,
-            (fewest_units(layout), layout.unit_bytes),
-            (units, layout.unit_bytes.saturating_sub(split), segment),
+            (fewest_units(layout), unit_bytes),
+            (units, unit_bytes.saturating_sub(split), segment),
             state_segment,
         ))
     }
