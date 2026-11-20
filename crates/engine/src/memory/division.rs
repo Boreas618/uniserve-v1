@@ -164,11 +164,7 @@ pub(crate) fn unreserved(
         "the GPU's quota states no limit: the epoch states its fraction first",
     ))?;
 
-    let own = quota.bytes(|reservation| {
-        reservation.item.of_process()
-            && reservation.scope.as_ref() == Some(scope)
-            && reservation.epochs == [epoch]
-    });
+    let own = reserved_by(quota, scope, epoch);
     let transfers = unheld_context(quota);
 
     let reserved = quota
@@ -183,6 +179,22 @@ pub(crate) fn unreserved(
     Ok(limit
         .saturating_sub(reserved)
         .min(free.saturating_add(kept)))
+}
+
+/// The bytes the processes of `scope` reserved themselves in `epoch` on the GPU of `quota`: their
+/// graph pools, process storage and staging ([`Item::of_process`]).
+///
+/// A starting rank reserves none of them before its graph pool, so until then they are another
+/// process's of its scope and epoch, the one it replaces: a lost rank's, which the Storage Server
+/// keeps for its relaunch until the relaunch reserves each item again (its process storage only
+/// once warm), or the serving rank's beside a standby. Zero for the rank of an epoch's first
+/// start.
+pub(crate) fn reserved_by(quota: &Quota, scope: &Scope, epoch: u64) -> u64 {
+    quota.bytes(|reservation| {
+        reservation.item.of_process()
+            && reservation.scope.as_ref() == Some(scope)
+            && reservation.epochs == [epoch]
+    })
 }
 
 /// The bytes of the Transfer Server's CUDA context on the GPU of `quota` that the quota counts
@@ -749,6 +761,15 @@ mod tests {
         // count as free; the weights, the other rank and the measured process do not.
         let unreserved = unreserved(&quota, &scope(0), 1, 6 * GIB, GIB, 100 * GIB).unwrap();
         assert_eq!(unreserved, 70 * GIB - 20 * GIB - 2 * GIB - GIB);
+
+        // The quota keeps the lost process's pools and process for the rank's relaunch, which
+        // tells the starting rank that it replaces that process; the exclusive storages it left
+        // are no reservation of a process. The other rank's process is that rank's to replace,
+        // and a scope or an epoch that reserved nothing has no process to replace.
+        assert_eq!(reserved_by(&quota, &scope(0), 1), 6 * GIB);
+        assert_eq!(reserved_by(&quota, &scope(1), 1), 2 * GIB);
+        assert_eq!(reserved_by(&quota, &scope(2), 1), 0);
+        assert_eq!(reserved_by(&quota, &scope(0), 2), 0);
     }
 
     #[test]

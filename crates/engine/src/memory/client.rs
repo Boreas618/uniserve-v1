@@ -50,7 +50,7 @@ use platform::{DeviceId, Protection};
 use proto::request::StandbyStorage;
 use serde::{Deserialize, Serialize};
 use service::lock;
-use storage::protocol::{Access, ErrorKind, TensorListing, UnitRun};
+use storage::protocol::{Access, ErrorKind, TensorListing, Tensors, UnitRun};
 use storage::runtime::{GroupId, Open, Opened, Segments, Tier};
 use storage::{
     Claim, Client, HostStorage, Item, Key, Location, Mode, QueuePair, Quota, Role, Scope, Segment,
@@ -379,10 +379,24 @@ impl StorageClient {
     }
 
     /// Releases the exclusive storages a predecessor left that no owner of this rank took and
-    /// that `taking` does not take now. An owner that allocates new storage calls this first:
-    /// [`Self::scope_bytes`] counted those storages as free, and an owner whose shape changed,
-    /// or that this rank does not have, leaves them to no one.
-    fn release_untaken(&self, state: &mut State, taking: &BTreeSet<Key>) -> Result<()> {
+    /// that `taking` does not take now, of the owner `owner` alone when it names one. An owner
+    /// that allocates new storage calls this first: [`Self::scope_bytes`] counted those storages
+    /// as free, and an owner whose shape changed, or that this rank does not have, leaves them to
+    /// no one.
+    ///
+    /// `owner` is the name of a segmented storage that creates parts ([`Self::segmented`]): it
+    /// releases what its own predecessor left under other keys, a part or the whole storage of
+    /// its name, and leaves every other storage to its owner. The rank takes its segmented
+    /// storages one after another (every field's values, then the state units): one that
+    /// creates a part must not release the parts of one taken after it, which that one would
+    /// then create anew, losing what they held. `None` releases every untaken storage, as the
+    /// whole storages a cache takes before its segmented ones do ([`Self::exclusive`]).
+    fn release_untaken(
+        &self,
+        state: &mut State,
+        taking: &BTreeSet<Key>,
+        owner: Option<&str>,
+    ) -> Result<()> {
         let listing = state
             .client
             .list()
@@ -392,6 +406,7 @@ impl StorageClient {
         let mut untaken = 0;
         for tensor in listing.tensors.iter().filter(|tensor| self.retains(tensor)) {
             if tensor.access == Access::Exclusive
+                && owner.is_none_or(|owner| storage_of(&tensor.name) == owner)
                 && !state.taken.contains(&tensor.key)
                 && !taking.contains(&tensor.key)
             {
@@ -413,6 +428,38 @@ impl StorageClient {
             );
         }
         Ok(())
+    }
+
+    /// The Storage Server's half of taking the segmented storage of `config`, whose parts are
+    /// retained under `keys` in their order: the parts the server holds, taken as the memory of
+    /// a region (`Mode::Region`), with their descriptors, and the keys it does not hold. When one
+    /// of those is a part to create, what this storage's predecessor left under other keys is
+    /// released first, so the quota has its room for the part ([`Self::release_untaken`]). Parts
+    /// left unmapped (segments given back) create nothing, and the storages the rank has not
+    /// taken yet include its other segmented storages' parts, which their owners take next (the
+    /// value planes' after the key planes', the state units' after the planes'): those stay.
+    fn take_parts(
+        &self,
+        state: &mut State,
+        config: &SegmentedConfig<'_>,
+        keys: &[Key],
+    ) -> Result<(Tensors, Vec<OwnedFd>)> {
+        let (got, descriptors) = state
+            .client
+            .get(keys.to_vec(), Mode::Region, Vec::new())
+            .map_err(|error| storage_error("taking a segmented storage", error))?;
+
+        let creating: BTreeSet<&Key> = keys
+            .iter()
+            .zip(config.parts)
+            .filter(|(_, part)| part.create)
+            .map(|(key, _)| key)
+            .collect();
+        if got.missing.iter().any(|missing| creating.contains(missing)) {
+            let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
+            self.release_untaken(state, &taking, Some(config.name))?;
+        }
+        Ok((got, descriptors))
     }
 
     /// Ends the epoch's retention of `keys` alone. The server's retention is the scope's in the
@@ -1147,7 +1194,7 @@ impl ExclusiveStorage for StorageClient {
             .map_err(|error| storage_error("taking exclusive storages", error))?;
         if !got.missing.is_empty() {
             let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
-            self.release_untaken(state, &taking)?;
+            self.release_untaken(state, &taking, None)?;
         }
 
         let mut storages: Vec<Option<(StorageRecord, OwnedFd)>> = got
@@ -1247,24 +1294,7 @@ impl ExclusiveStorage for StorageClient {
             .map(|(index, key)| (*key, index))
             .collect();
 
-        let (got, descriptors) = state
-            .client
-            .get(keys.clone(), Mode::Region, Vec::new())
-            .map_err(|error| storage_error("taking a segmented storage", error))?;
-
-        // The storages a predecessor left that no owner takes again are released before a
-        // missing part is created in their place. Parts left unmapped (segments given back)
-        // create nothing, and the storages not taken yet include other planes' segments, which
-        // their owner takes next: the value planes' after the key planes'.
-        let creates = got.missing.iter().any(|missing| {
-            indices
-                .get(missing)
-                .is_some_and(|index| config.parts[*index].create)
-        });
-        if creates {
-            let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
-            self.release_untaken(state, &taking)?;
-        }
+        let (got, descriptors) = self.take_parts(state, config, &keys)?;
 
         let mut storages: Vec<Option<(StorageRecord, OwnedFd)>> = got
             .storages
@@ -1420,6 +1450,12 @@ fn segment_name(name: &str, part: &SegmentPart) -> String {
     format!("{name}#{}/{}", part.column, part.segment.ordinal)
 }
 
+/// The storage a retained tensor named `name` belongs to: the segmented storage of a part
+/// ([`segment_name`]), or the whole storage of that name.
+fn storage_of(name: &str) -> &str {
+    name.split_once('#').map_or(name, |(storage, _)| storage)
+}
+
 /// A Storage Server failure while the rank was doing `what`.
 fn storage_error(what: &str, error: storage::Error) -> Error {
     Error::transport_source(what, error)
@@ -1453,5 +1489,137 @@ mod tests {
             .map(|run| (run.key, run.first, run.count))
             .collect();
         assert_eq!(units, [(Key([3; 32]), 0, 6), (Key([4; 32]), 6, 6)]);
+    }
+
+    /// A lost rank's relaunch takes the parts of every segmented storage its predecessor left:
+    /// the first of them that creates a part releases only what its own predecessor left under
+    /// other keys, never the parts of the storages the rank takes after it, which those then map
+    /// rather than create anew.
+    #[test]
+    fn a_relaunched_storage_that_creates_parts_leaves_the_next_storage_s_parts() {
+        use crate::memory::cache::info::CacheSegment;
+        use storage::Claimant;
+        use testkit::serving::{DEPLOYMENT, StorageServer};
+
+        const EPOCH: u64 = 2;
+        const KEYS: &str = "prefix_cache.key.values";
+        const VALUES: &str = "prefix_cache.value.values";
+
+        let server = StorageServer::start();
+        let scope = Scope {
+            deployment: DEPLOYMENT.into(),
+            group: "model-0".into(),
+            rank: 0,
+        };
+        let mut head = Client::connect(
+            &server.socket,
+            Role::Head {
+                deployment: DEPLOYMENT.into(),
+                epoch: EPOCH,
+                generation: 6,
+            },
+        )
+        .unwrap();
+        let claim = head
+            .claim(Claimant::Head, EPOCH, vec![scope.clone()], Vec::new())
+            .unwrap();
+
+        // The lost rank (launch generation 6) left its parts of segment 2/0 of the key and the
+        // value planes, and a part of the key plane of another length that its relaunch does
+        // not ask for. The server never interprets a storage, so memfds stand in for them.
+        let (found, next, stale, created) =
+            (Key([1; 32]), Key([2; 32]), Key([3; 32]), Key([4; 32]));
+        let parts = [
+            (found, format!("{KEYS}#0/0"), 4096),
+            (next, format!("{VALUES}#0/0"), 4096),
+            (stale, format!("{KEYS}#0/0"), 8192),
+        ];
+        let mut lost = Client::connect(
+            &server.socket,
+            Role::Worker {
+                scope: scope.clone(),
+                generation: 6,
+                claim,
+                epoch: EPOCH,
+            },
+        )
+        .unwrap();
+        let memfds: Vec<OwnedFd> = parts
+            .iter()
+            .map(|(_, _, bytes)| {
+                let memfd =
+                    rustix::fs::memfd_create("segment", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+                rustix::fs::ftruncate(&memfd, *bytes).unwrap();
+                memfd
+            })
+            .collect();
+        let mut tensors = Vec::new();
+        let mut storages = Vec::new();
+        for (index, ((key, name, bytes), memfd)) in parts.iter().zip(&memfds).enumerate() {
+            let mut tensor = byte_tensor(*key, name.clone(), 0, *bytes, Access::Exclusive);
+            tensor.storage = index as u32;
+            tensors.push(tensor);
+            let record = StorageRecord {
+                location: Location::Host { numa_node: None },
+                bytes: *bytes,
+                segment: Some(Segment {
+                    epoch: EPOCH,
+                    ordinal: 0,
+                }),
+                fabric: None,
+            };
+            storages.push((record, memfd.as_fd()));
+        }
+        lost.put(tensors, &storages).unwrap();
+        drop(lost);
+
+        // The relaunch (generation 7) takes its key plane of segments 2/0, which its predecessor
+        // left, and 2/1, which it creates.
+        let launch = StorageLaunch {
+            socket: server.socket.to_string_lossy().into_owned(),
+            deployment: DEPLOYMENT.into(),
+            claim: claim.0,
+            tcp: None,
+            peers: Vec::new(),
+            epoch: EPOCH,
+            standby: false,
+            standby_storage: StandbyStorage::default(),
+        };
+        let relaunch = StorageClient::connect_rank(&launch, "model-0", 0, 7).unwrap();
+        let part = |ordinal| SegmentPart {
+            length: 4096,
+            column: 0,
+            segment: CacheSegment {
+                epoch: EPOCH,
+                ordinal,
+                units: 1,
+            },
+            create: true,
+        };
+        let key_parts = [part(0), part(1)];
+        let config = SegmentedConfig {
+            name: KEYS,
+            device: DeviceId(0),
+            parts: &key_parts,
+            access: &[],
+        };
+        let mut state = lock(&relaunch.state);
+        let (got, _descriptors) = relaunch
+            .take_parts(&mut state, &config, &[found, created])
+            .unwrap();
+        assert_eq!(got.missing, [created]);
+        let taken: Vec<Key> = got.tensors.iter().map(|tensor| tensor.key).collect();
+        assert_eq!(taken, [found]);
+
+        // Before creating 2/1 it released the stale part of its own plane; the value plane's part
+        // stays for the value plane, which the rank takes next.
+        let listing = state.client.list().unwrap();
+        let retained: BTreeSet<Key> = listing
+            .tensors
+            .iter()
+            .filter(|tensor| relaunch.retains(tensor))
+            .map(|tensor| tensor.key)
+            .collect();
+        assert_eq!(retained, BTreeSet::from([found, next]));
     }
 }

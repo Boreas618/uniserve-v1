@@ -13,19 +13,21 @@
 //!    an earlier session named keeps that session's numbering, which the ranks then take.
 //! 3. [`open_ranks`] maps on every rank the segments the answer's table states for its region,
 //!    creates past them the whole segments of the region's units the GPU's quota held free at the
-//!    division (none on a standby), resolves into the rank's generation the kernels its cache and
-//!    recurrent state launch over the region's numbering, and opens the graph pool, the cache over
-//!    those segments, the recurrent state, the scratch pages and the serving runner. It returns
-//!    the segments it created, which the head grants.
+//!    division (none on a standby, nor past a table that states segments on a rank that replaces
+//!    a process of its scope and epoch: a relaunch), resolves into the rank's generation the
+//!    kernels its cache and recurrent state launch over the region's numbering, and opens the
+//!    graph pool, the cache over those segments, the recurrent state, the scratch pages and the
+//!    serving runner. It returns the segments it created, which the head grants.
 //! 4. [`bind`] binds every rank to the regions the answer numbered, [`spawn`] spawns the
 //!    workers over the ranks' runners, which warm up beside the storage created before them;
 //!    [`keep_warm_slots`] keeps the request slots of each media group whose storages fit beside
 //!    its ranks' warm processes; the ranks of each KV region give back the tail segments their
 //!    quotas no longer hold beside their warm processes
 //!    (`crate::process::epoch::keep_warm_segments`) and reserve those processes; a region beside
-//!    a draining predecessor creates what its quota then holds
-//!    (`crate::process::epoch::create_fitting`), and the schedulers grow their regions into the
-//!    granted segments by `Resize`; [`capacities`] states what each worker group's ranks serve.
+//!    a draining predecessor, or a relaunch's past the memory its lost predecessor left, creates
+//!    what its quota then holds (`crate::process::epoch::create_fitting`), and the schedulers grow
+//!    their regions into the granted segments by `Resize`; [`capacities`] states what each worker
+//!    group's ranks serve.
 //!
 //! A rank that encodes images (`ModelRunner::encodes_images`) also profiles its vision runner at
 //! its load, and its division sizes the runner's region, its region of encoder outputs and its
@@ -36,7 +38,10 @@
 //! runner (`specs/engine-worker-port.md` §1.1, §2.2).
 //!
 //! One sequence serves a first epoch, a successor of the same layout and a relaunch: a region an
-//! earlier session named has its table, which the ranks map, and creates nothing more.
+//! earlier session named has its table, which the ranks map. A successor creates past it what
+//! its quota holds free; a relaunch creates nothing more, since the table is the memory its lost
+//! predecessor left, and needs no storage its epoch does not hold until it is warm and creates
+//! what the quota then holds (`crate::process::epoch::create_fitting`).
 //!
 //! A rank of a media deployment ([`Loaded::Video`], `crate::process::ranks::rank::video`) takes the
 //! same steps and keeps no cache: its load profiles the media runners of the blocks its group
@@ -98,7 +103,7 @@ use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Ti
 use self::rank::{Collective, ModelRunner, RankModel, parallel_order};
 use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
-    Peaks, fewest_states, fewest_units, granularity, plane_segments,
+    Peaks, fewest_states, fewest_units, granularity, plane_segments, replaces,
 };
 use crate::process::ranks::rank::text::{
     Keys, encoder_class, encodes, feature_tensors, keys, profile, vision_runner,
@@ -235,6 +240,13 @@ pub(crate) struct TextRank {
     /// rest of the numbering is created by a grow as an epoch the rank's succeeds gives its
     /// memory back.
     pub(crate) first: u32,
+    /// Whether the rank replaces another process of its scope and epoch, as a lost rank's
+    /// relaunch does, which every rank of its host group agreed: the GPU's quota held that
+    /// process's reservations when the rank divided it (`memory::replaces`). Its start maps the
+    /// segments its regions' tables state, the memory its predecessor left, and creates none past
+    /// them, so it needs no storage its epoch does not hold already; once warm, it creates what
+    /// its quota holds past them beside its warm process ([`open_ranks`]).
+    pub(crate) replaces: bool,
     /// For a model that keeps a recurrent state, the units of the rank's state region and those
     /// of them its start creates before its warm-up, as `units` and `first` are the cache's
     /// (`specs/engine-worker-port.md` §1.6); `(0, 0)` for a model that keeps none.
@@ -766,6 +778,7 @@ fn load_rank(
                     model: meta,
                     units,
                     first: units,
+                    replaces: false,
                     states: (states, states),
                     peaks,
                     vision,
@@ -834,6 +847,7 @@ fn load_rank(
     )?;
     let (slots, (units, first), states) =
         model_runner.divide(&client, device, &host, model.as_ref(), &layout, &regions)?;
+    let replaces = replaces(&client, device, &host)?;
 
     // A rank whose share holds fewer slots than the deployment runs serves with those: the
     // storages its slots take are sized by them from here on. Its buckets and its pools are the
@@ -854,6 +868,7 @@ fn load_rank(
         first,
         states = states.0,
         first_states = states.1,
+        replaces,
         storage = %storage.socket,
         "the rank loaded its model and divided its device's quota"
     );
@@ -870,6 +885,7 @@ fn load_rank(
             model,
             units,
             first,
+            replaces,
             states,
             peaks,
             vision,
@@ -2832,17 +2848,23 @@ fn open_rank(
     // far as the quota held them at the division. A segment's every part is whole granules of
     // the device's allocations; the meta device allocates nothing, and each unit is a whole
     // granule of it. A standby maps its epoch's table and commits nothing until it is promoted.
-    // The state region's segments alike, a unit of the meta device's being a whole granule of a
+    // A rank that replaces a process of its scope and epoch (a relaunch) maps the segments its
+    // predecessor left, which the table states, and creates none past them: its start needs no
+    // storage its epoch does not hold already, and it creates what its quota holds past them once
+    // warm (`epoch::create_fitting`), when its warm process has taken over its predecessor's
+    // reservation. One whose table states no segment creates as a first start does. The state
+    // region's segments alike, a unit of the meta device's being a whole granule of a
     // checkpoint's bytes.
     let epoch = model_runner.launch().epoch;
     let standing_by = standby(model_runner.launch());
+    let creates_past = |table: &Segments| !standing_by && (!rank.replaces || table.is_empty());
     let (segments, created) = match region {
         Some(((_, table), _)) => {
             let granularity = match client {
                 Some(_) => granularity(device)?,
                 None => layout.segment_plane(),
             };
-            let held = if standing_by { 0 } else { rank.first };
+            let held = if creates_past(table) { rank.first } else { 0 };
             let (segments, created) = plane_segments(
                 epoch,
                 (units, held),
@@ -2860,7 +2882,11 @@ fn open_rank(
                 Some(_) => granularity(device)?,
                 None => layout.state_bytes(),
             };
-            let held = if standing_by { 0 } else { rank.states.1 };
+            let held = if creates_past(table) {
+                rank.states.1
+            } else {
+                0
+            };
             let (segments, created) = plane_segments(
                 epoch,
                 (states, held),

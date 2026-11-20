@@ -705,9 +705,10 @@ pub(crate) fn start(
 
     // What fills each share last, settled from the warm processes: the slots a media group
     // keeps, the segments of each KV region the quotas hold beside the warm processes, each
-    // rank's warm process in its GPU's quota, and what a predecessor's drain freed meanwhile,
-    // here and on every peer. A standby commits nothing until it is promoted. A peer kept its
-    // media groups' slots before it answered.
+    // rank's warm process in its GPU's quota, and what a predecessor's drain freed meanwhile or
+    // a relaunch's quota holds past the memory its lost predecessor left, here and on every
+    // peer. A standby commits nothing until it is promoted. A peer kept its media groups' slots
+    // before it answered.
     let binding = weight_binding(launch, &model_runner, &ranks, &workers, remotes.clone())?;
     if !standby(launch) {
         keep_warm_slots(&mut ranks)?;

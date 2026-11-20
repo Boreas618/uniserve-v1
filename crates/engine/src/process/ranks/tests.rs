@@ -340,6 +340,123 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     client.close().unwrap();
 }
 
+/// The text rank of `ranks`, the one rank of a text start, to set what its division decided.
+fn text_rank(ranks: &mut [LoadedRank]) -> &mut super::TextRank {
+    let Loaded::Text(text) = &mut ranks[0].loaded else {
+        panic!("a text rank");
+    };
+    text
+}
+
+/// The segments of the KV planes of the cache of `ranks`'s text rank, each with whether it is
+/// created when its storage does not exist (one that is not is left given back), in unit order.
+fn plane_segments_of(ranks: &[LoadedRank]) -> Vec<(u64, u32, bool)> {
+    service::lock(&ranks[0].text().unwrap().cache)
+        .config()
+        .segments
+        .iter()
+        .flatten()
+        .map(|part| (part.segment.epoch, part.segment.ordinal, part.create))
+        .collect()
+}
+
+/// A lost rank's relaunch takes the memory of its region as its predecessor left it: its rank,
+/// which replaces that process of its scope and epoch, maps the segments the region's table
+/// states and creates none past them, even when its division finds the whole numbering free (the
+/// quota counts what the lost process reserved as the relaunch's own), so its start needs no
+/// storage its epoch does not hold already; the rest stays given back until the warm relaunch
+/// creates what its quota then holds. A successor epoch of the same layout replaces no process
+/// and creates past the table what its quota holds.
+#[test]
+fn a_relaunch_maps_the_segments_its_lost_predecessor_left_and_creates_none_past_them() {
+    // A numbering of eight units, each a segment on the meta device, of which the lost
+    // process's quota held three when it started.
+    const NUMBERING: u32 = 8;
+    const HELD: u32 = 3;
+
+    let server = StorageServer::start();
+    let launch = launch();
+
+    // The lost process's start: its rank creates the three segments, and its head grants them.
+    let mut ranks = loaded(&launch);
+    text_rank(&mut ranks).units = NUMBERING;
+    text_rank(&mut ranks).first = HELD;
+    let open = stated(&launch, &ranks);
+    let kv = usize::from(open.groups[0].regions[0][0]);
+    let mut lost =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, launch.epoch, launch.engine)
+            .unwrap();
+    let _lost_pairs = lost.open(open.clone()).unwrap();
+    let opened = lost.session().unwrap().1.clone();
+    let created = open_ranks(&mut ranks, &open, &opened, None).unwrap();
+    let (region, segments) = created[0].clone();
+    assert_eq!(segments.len(), HELD as usize);
+    for &(segment, first, count) in &segments {
+        lost.grant(&region, segment, first, count).unwrap();
+    }
+
+    // The process is lost: its head's connection ends without closing the session.
+    drop(ranks);
+    drop(lost);
+
+    // The relaunch, the next launch generation of the same epoch, divides the whole numbering as
+    // free and replaces the lost process. The region's table states what that process created.
+    let mut relaunch = launch.clone();
+    relaunch.engine = launch.engine + 1;
+    let mut relaunched = loaded(&relaunch);
+    text_rank(&mut relaunched).units = NUMBERING;
+    text_rank(&mut relaunched).first = NUMBERING;
+    text_rank(&mut relaunched).replaces = true;
+    let relaunch_open = stated(&relaunch, &relaunched);
+    let mut head =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, relaunch.epoch, relaunch.engine)
+            .unwrap();
+    let _pairs = head.open(relaunch_open.clone()).unwrap();
+    let relaunch_opened = head.session().unwrap().1.clone();
+    assert_eq!(relaunch_opened.segments[kv], segments);
+
+    // It creates nothing for the head to grant: its planes are the three segments its
+    // predecessor created, mapped, and the five past them, left given back.
+    let none = open_ranks(&mut relaunched, &relaunch_open, &relaunch_opened, None).unwrap();
+    assert_eq!(none, vec![(region.clone(), Vec::new())]);
+    let given_back: Vec<(u64, u32, bool)> = (0..NUMBERING)
+        .map(|ordinal| (launch.epoch, ordinal, ordinal < HELD))
+        .collect();
+    assert_eq!(plane_segments_of(&relaunched), given_back);
+    head.close().unwrap();
+
+    // A successor epoch of the same layout maps the same three segments and creates the five
+    // past them that its quota holds, as segments of its own epoch.
+    let mut successor = launch.clone();
+    successor.epoch = launch.epoch + 1;
+    let mut successors = loaded(&successor);
+    text_rank(&mut successors).units = NUMBERING;
+    text_rank(&mut successors).first = NUMBERING;
+    let successor_open = stated(&successor, &successors);
+    let mut next = StorageClient::connect_head(
+        &server.socket,
+        DEPLOYMENT,
+        successor.epoch,
+        successor.engine,
+    )
+    .unwrap();
+    let _next_pairs = next.open(successor_open.clone()).unwrap();
+    let successor_opened = next.session().unwrap().1.clone();
+    assert_eq!(successor_opened.segments[kv], segments);
+
+    let created = open_ranks(&mut successors, &successor_open, &successor_opened, None).unwrap();
+    let past: Vec<(u64, u32)> = created[0]
+        .1
+        .iter()
+        .map(|(segment, ..)| (segment.epoch, segment.ordinal))
+        .collect();
+    let own: Vec<(u64, u32)> = (HELD..NUMBERING)
+        .map(|ordinal| (successor.epoch, ordinal))
+        .collect();
+    assert_eq!(past, own);
+    next.close().unwrap();
+}
+
 /// The released FastH3 checkpoint the media rank loads the headers of: four denoising steps.
 pub(crate) fn fast_h3() -> PathBuf {
     testkit::assets::FAST_H3_4_STEP.snapshot()
