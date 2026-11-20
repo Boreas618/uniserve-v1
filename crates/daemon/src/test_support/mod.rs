@@ -413,6 +413,21 @@ pub(crate) fn leader_over(
     model_name: String,
     clients: Vec<Arc<EngineClient>>,
 ) -> Leader {
+    let options = Config {
+        model: Some(model_name),
+        ..Config::default()
+    };
+    leader_with(options, model, tokenizer, clients)
+}
+
+/// Binds the public leader to independent engine connections under `options`, which name its
+/// checkpoint, with [`SERVED_MODEL`] as its served name and neither request nor stats logging.
+pub(crate) fn leader_with(
+    options: Config,
+    model: ModelConfig,
+    tokenizer: DynTokenizer,
+    clients: Vec<Arc<EngineClient>>,
+) -> Leader {
     let (binding, video) = match model.video() {
         Some(_) => (
             crate::api::test_support::video_binding(),
@@ -429,14 +444,13 @@ pub(crate) fn leader_over(
     )
     .unwrap();
     let options = Config {
-        model: Some(model_name),
         served_model_name: Some(SERVED_MODEL.to_owned()),
         logging_config: LoggingConfig {
             log_requests: false,
             log_stats: false,
             ..LoggingConfig::default()
         },
-        ..Config::default()
+        ..options
     };
     let observer = std::sync::Arc::new(crate::observe::Observer::new(crate::observe::span(
         &options.update_config,
