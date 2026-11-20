@@ -127,6 +127,7 @@ fn programs(
         outputs,
         Arc::clone(&router),
         Arc::new(|_| Ok(Vec::new())),
+        Arc::new(crate::epoch::Epochs::default()),
     );
     (programs, store, written, router)
 }

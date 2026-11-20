@@ -223,6 +223,43 @@ impl Epochs {
             .map(|(epoch, record)| (Recorded(*epoch), record.clone()))
     }
 
+    /// `config` as the deployment runs it while an epoch serves ([`Self::serving`]): the engine
+    /// and processing revisions it leaves unset stated as the revisions the serving epoch runs
+    /// of the same packages, so a change keeps them, and a revision installed since runs only
+    /// once a configuration names it (`docs/configuration.md`, `worker_config`).
+    ///
+    /// With no epoch serving, a start, `config` is returned as it is, and the apply fixes an
+    /// unset revision at the latest installed one ([`modules_of`]). A package the serving epoch
+    /// does not run, another `worker_config.engine` or `processing`, is left unset too: the
+    /// epoch that changes to it runs its latest installed revision.
+    pub fn kept(&self, config: &Config) -> Config {
+        let mut kept = config.clone();
+        if let Some((_, serving)) = self.serving() {
+            let worker = &mut kept.worker_config;
+            keep(
+                &mut worker.engine_revision,
+                &worker.engine,
+                Some(&serving.engine),
+            );
+            keep(
+                &mut worker.processing_revision,
+                &worker.processing,
+                serving.processing.as_ref(),
+            );
+        }
+        kept
+    }
+
+    /// Every option `next` changes of `previous` ([`proto::reload::changes`]), each
+    /// configuration as the deployment runs it ([`Self::kept`]): a configuration that comes to
+    /// state the engine or processing revision the serving epoch runs, or ceases to state it,
+    /// changes nothing, and one that states another revision changes it, an epoch. With no
+    /// previous configuration, a start, every option of `next` is a change.
+    pub fn changes(&self, previous: Option<&Config>, next: &Config) -> Vec<proto::reload::Change> {
+        let previous = previous.map(|previous| self.kept(previous));
+        proto::reload::changes(previous.as_ref(), &self.kept(next))
+    }
+
     /// Records `adopted`, a process a hot restart's successor took over: the
     /// row its daemon's service already lists for the same launch (group, rank
     /// and launch generation) takes the epoch, build and state it serves under
@@ -282,6 +319,21 @@ impl Epochs {
     }
 }
 
+/// States `revision`, a configuration's revision of the package `backend`, as `serving`'s, the
+/// revision the serving epoch runs of its package, when the configuration leaves it unset and
+/// the epoch runs that package. A revision of zero is none fixed: an epoch adopted from a daemon
+/// that handed no module set over records its configuration's unset revisions so, and the apply
+/// fixes them afresh.
+fn keep(revision: &mut Option<u32>, backend: &str, serving: Option<&PackageRevision>) {
+    if let Some(serving) = serving
+        && revision.is_none()
+        && serving.backend == backend
+        && serving.revision != 0
+    {
+        *revision = Some(serving.revision);
+    }
+}
+
 /// The kernel packages of `kernels` by slot, in the slots' order, as a report states them.
 pub fn kernel_packages(kernels: &BTreeMap<KernelKey, PackageRevision>) -> Vec<KernelPackage> {
     kernels
@@ -298,7 +350,10 @@ pub fn kernel_packages(kernels: &BTreeMap<KernelKey, PackageRevision>) -> Vec<Ke
 ///
 /// The revisions are fixed when the configuration is applied, at the Build Server: a package's
 /// `revision` is zero until then, unless the configuration states one, and a pin of `latest`
-/// becomes the latest installed revision. A key the table does not list is absent: the
+/// becomes the latest installed revision. An apply to a deployment that serves names the set of
+/// the configuration as it runs there ([`Epochs::kept`]), whose engine and processing revisions
+/// are the serving epoch's where the configuration leaves them unset, so only a start fixes
+/// those at the latest installed revisions. A key the table does not list is absent: the
 /// deployment names nothing for it, and the Build Server selects its package among the packages
 /// that cover it, by manifest priority. An operator's names are those of the module vocabulary
 /// (`proto::module::operator`), which [`Config::validate`] holds the table to, so the daemon, the
@@ -462,7 +517,9 @@ impl Epoch {
 /// Server, another engine package or revision, or another processing program,
 /// the request side of the engine's tree), then the kernel and program modules
 /// and the kernel probes' placement. A change of options that take effect at the
-/// next step alone is `None`: no update moves it.
+/// next step alone is `None`: no update moves it. An apply compares both configurations as the
+/// deployment runs them ([`Epochs::kept`]), so a revision one leaves unset compares as the
+/// serving epoch's.
 pub fn change(previous: &Epoch, next: &Epoch) -> Change {
     let effects = proto::reload::Effects::of(&proto::reload::changes(
         Some(&previous.config),
@@ -544,6 +601,44 @@ mod tests {
             ),
             Change::Epoch
         );
+    }
+
+    /// While an epoch serves, a configuration that leaves its engine or processing revision
+    /// unset runs the serving epoch's: coming to state it, or ceasing to, changes no option, and
+    /// stating another revision is an epoch change. Another engine package keeps no revision of
+    /// the serving one, and with no epoch serving a configuration runs what it states.
+    #[test]
+    fn an_unset_revision_compares_as_the_serving_epochs() {
+        let stating = |engine: Option<u32>, processing: Option<u32>| {
+            let mut config = Config::default();
+            config.worker_config.engine_revision = engine;
+            config.worker_config.processing_revision = processing;
+            config
+        };
+        let unset = stating(None, None);
+        let epochs = Epochs::default();
+        assert_eq!(epochs.kept(&unset), unset, "a start runs what it states");
+
+        // The serving epoch runs revision 1 of the default engine and processing packages.
+        epochs.record(1, record());
+        assert_eq!(epochs.kept(&unset), stating(Some(1), Some(1)));
+        let effect = |previous: &Config, next: &Config| {
+            proto::reload::Effects::of(&epochs.changes(Some(previous), next)).heaviest()
+        };
+        assert_eq!(effect(&unset, &stating(Some(1), Some(1))), None);
+        assert_eq!(effect(&stating(Some(1), Some(1)), &unset), None);
+        let epoch = Some(proto::reload::Effect::Epoch);
+        assert_eq!(effect(&unset, &stating(Some(2), None)), epoch);
+        assert_eq!(effect(&unset, &stating(None, Some(2))), epoch);
+        assert_eq!(
+            effect(&stating(Some(1), None), &stating(Some(2), None)),
+            epoch
+        );
+
+        let mut other = unset.clone();
+        other.worker_config.engine = "other".to_owned();
+        assert_eq!(epochs.kept(&other).worker_config.engine_revision, None);
+        assert_eq!(effect(&unset, &other), epoch);
     }
 
     /// The records report the node's process table as the daemon's supervision keeps it: every

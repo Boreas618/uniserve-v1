@@ -118,6 +118,8 @@ pub(crate) struct Programs {
     router: Arc<Router>,
     /// What a validation measures of a change that starts a kernel generation.
     measure: Measure,
+    /// The leader's epoch records, which a validation compares a configuration against.
+    epochs: Arc<crate::epoch::Epochs>,
     /// Cancelled once every program ended ([`Self::stop`]).
     ended: tokio_util::sync::CancellationToken,
 }
@@ -126,7 +128,8 @@ impl Programs {
     /// The programs of the deployment `current` serves, recording into `store`, saving their
     /// states in `states` and handing their outputs to `outputs`; none runs until
     /// [`Self::replace`] starts them. `router` is the slot the leader routes requests through,
-    /// and `measure` what a control program's validation reports of a kernel generation.
+    /// `measure` what a control program's validation reports of a kernel generation, and
+    /// `epochs` the leader's epoch records, which a validation compares a configuration against.
     pub(crate) fn new(
         store: Store,
         states: States,
@@ -134,6 +137,7 @@ impl Programs {
         outputs: mpsc::UnboundedSender<Output>,
         router: Arc<Router>,
         measure: Measure,
+        epochs: Arc<crate::epoch::Epochs>,
     ) -> Self {
         Self {
             store,
@@ -143,6 +147,7 @@ impl Programs {
             control: Mutex::default(),
             router,
             measure,
+            epochs,
             ended: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -266,6 +271,7 @@ impl Programs {
                 current: self.current.subscribe(),
                 outputs: self.outputs.clone(),
                 measure: Arc::clone(&self.measure),
+                epochs: Arc::clone(&self.epochs),
             })
             .await;
             service::lock(&self.control).insert(name.to_owned(), task);
