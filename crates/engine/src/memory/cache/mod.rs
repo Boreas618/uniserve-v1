@@ -129,20 +129,30 @@ pub struct KvCacheConfig {
 
 /// The units of the pool of a sliding window of `window` tokens over pages of `page` tokens for
 /// `slots` request slots whose steps hold `tokens` tokens at most, the padding unit included:
-/// every running request's window pages at once, beside the pages of a step's tokens.
+/// every running request's window pages at once, beside the pages of the steps whose tokens the
+/// pool holds at once ([`WINDOW_STEPS`]).
 ///
 /// A request holds the pages of the window before its next token and of the tokens it computes,
 /// which the scheduler retires behind the window as it goes, and asks for a few pages ahead
 /// (`crate::scheduler::LOW_WATERMARK`): at most `⌈window / page⌉ + 2` pages of the window and
-/// of its partial pages, beside the watermark, and the step's tokens take their own pages,
-/// `⌈tokens / page⌉` beyond that over every request of the step. Nothing in the pool outlives a
+/// of its partial pages, beside the watermark. The steps' tokens take their own pages,
+/// `⌈tokens / page⌉` a step over every request of the step. Nothing in the pool outlives a
 /// request, so it is sized for the slots alone and never grows with the KV pool.
 pub(crate) fn window_units(window: u32, page: u32, slots: u32, tokens: u32) -> u32 {
     let page = page.max(1);
     let per_request = window.div_ceil(page) + 2 + crate::scheduler::LOW_WATERMARK;
 
-    1 + slots.saturating_mul(per_request) + tokens.div_ceil(page)
+    1 + slots.saturating_mul(per_request) + WINDOW_STEPS * tokens.div_ceil(page)
 }
+
+/// The steps whose tokens' pages a sliding window's pool holds at once, in the scheduler's order
+/// of a step (`Scheduler::allocate_ahead` runs after the step's calls are formed): the step that
+/// asks holds the pages of the call it formed, and asks for those of each request's next call;
+/// the pages the previous call left behind the window were given up with that call's output
+/// (`give_up_behind`) and are on their way back to the pool while the asking step runs. The
+/// slots' own pages cover only the window and the partial pages, so a pool of one step's tokens
+/// is short at the ask for a prompt's next chunk, and the request waits for the returning units.
+const WINDOW_STEPS: u32 = 3;
 
 impl KvCacheConfig {
     /// The device bytes the cache holds beside its KV planes and state units: the pooled page
@@ -1463,8 +1473,9 @@ mod tests {
         );
 
         // A window of eight tokens over pages of four: four pages a request beside the
-        // watermark, and the pages of a step's tokens.
-        assert_eq!(window_units(8, 4, 2, 16), 1 + 2 * (2 + 2 + 1) + 4);
+        // watermark, and the pages of three steps' tokens: the step that asks, the one it asks
+        // for, and the one whose pages behind the window are on their way back.
+        assert_eq!(window_units(8, 4, 2, 16), 1 + 2 * (2 + 2 + 1) + 3 * 4);
         Ok(())
     }
 
