@@ -853,6 +853,7 @@ pub(crate) mod tests {
 
     use scheduling::End;
     use scheduling::Nanos;
+    use scheduling::decision::Storage;
     use scheduling::ids::{PageId, RequestId as GuestId, StageId};
     use scheduling::time::Duration;
     use scheduling::view::{
@@ -1375,6 +1376,245 @@ pub(crate) mod tests {
             let released = if step == "ending" { ENDING * BLOCKS } else { 0 };
             assert_eq!(output.offload.len() as u64, released, "{step}");
         }
+    }
+
+    /// The end of a request of a long context: a 433,272-token prompt holds 6,770 blocks of 64
+    /// tokens beside 15 running requests of 16 blocks each, and gives them all up in one step.
+    /// That step's `observe` decodes the release within its message's share of fuel, and every
+    /// `dispatch` from it on consumes at most half of the default call fuel
+    /// ([`DEFAULT_POLICY_CALL_FUEL`]), as a step of many ending requests does: a `dispatch` that
+    /// named every block in one step would cost in proportion to the context, past a call's fuel
+    /// at a few thousand blocks, and the policy's fault would drop the step and the offload. Over
+    /// the steps that follow the policy offloads each block given up once, in the order they
+    /// were given up, and then nothing.
+    #[test]
+    fn the_end_of_a_long_context_is_offloaded_within_a_calls_fuel() {
+        const PROMPT_TOKENS: u64 = 433_272;
+        const PAGE_TOKENS: u64 = 64;
+        const PAGES: u64 = PROMPT_TOKENS.div_ceil(PAGE_TOKENS);
+        const OTHERS: u64 = 15;
+        const BLOCKS: u64 = 16;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+        assert_eq!(PAGES, 6_770);
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+        let room = Room {
+            token_budget: 4096,
+            call_budget: 16,
+            page_tokens: PAGE_TOKENS as u32,
+            ..Room::default()
+        };
+        let observe = |policy: &mut Policy, events: &[Event]| {
+            metered(policy, Call::Observe, wire::encode(&events).unwrap()).0
+        };
+        let dispatch = |policy: &mut Policy| {
+            let (fuel, reply) = metered(policy, Call::Dispatch, wire::encode(&room).unwrap());
+            let output: DispatchOutput = wire::decode(&reply.unwrap()).unwrap();
+            (fuel, output.offload)
+        };
+
+        // Request 1 is the long context's, and the others decode beside it; each block is
+        // cached held, as a step's calls fill it.
+        let running = 1 + OTHERS;
+        let arrivals: Vec<Event> = (1..=running)
+            .map(|id| Event::Arrived {
+                request: decoding(id, GuestStatus::Waiting, 0, 0),
+            })
+            .chain((1..=running).map(|id| Event::Admitted {
+                request: GuestId(id),
+            }))
+            .collect();
+        observe(&mut policy, &arrivals);
+        let mut used = 0;
+        let mut cached = |pages: &[PageId]| -> Vec<Event> {
+            pages
+                .iter()
+                .map(|&page| {
+                    used += 1;
+                    Event::Cached {
+                        page: block(page, used, false),
+                    }
+                })
+                .collect()
+        };
+        for id in 2..=running {
+            let held: Vec<PageId> = (0..BLOCKS).map(|index| spread(id << 32 | index)).collect();
+            observe(&mut policy, &cached(&held));
+        }
+
+        // The prompt is prefilled a step's tokens at a time, and its blocks cached as it is.
+        let long: Vec<PageId> = (0..PAGES).map(|index| spread(1 << 32 | index)).collect();
+        let step_pages = (u64::from(room.token_budget) / PAGE_TOKENS) as usize;
+        for filled in long.chunks(step_pages) {
+            observe(&mut policy, &cached(filled));
+            assert!(
+                dispatch(&mut policy).1.is_empty(),
+                "a held block is offloaded"
+            );
+        }
+
+        // The request ends and gives up every block it held.
+        observe(
+            &mut policy,
+            &[
+                Event::Finished {
+                    request: GuestId(1),
+                    end: End::Completed,
+                },
+                Event::Released {
+                    pages: long.clone(),
+                },
+            ],
+        );
+        // Every block given up is still a device block no request holds, so each step offloads
+        // some until none is left: the release takes at most a step a block.
+        let mut offloaded = Vec::new();
+        for step in 0..=PAGES {
+            let (fuel, offload) = dispatch(&mut policy);
+            assert!(fuel <= LIMIT, "dispatch {step} took {fuel} fuel");
+            if offload.is_empty() {
+                break;
+            }
+            offloaded.extend(offload);
+        }
+        assert_eq!(
+            offloaded, long,
+            "each block given up is offloaded once, in order"
+        );
+        assert!(
+            dispatch(&mut policy).1.is_empty(),
+            "nothing is left to offload"
+        );
+    }
+
+    /// A device shortage beside a warm host tier: the cache holds a host tier as large as a
+    /// device plane of 47 segments of 16,384 units, every page on the host alone and used before
+    /// any device page, then the 65,536 device pages 16 running requests hold, then the device
+    /// pages no request holds. A device shortage's `preempt` names the least recently used device
+    /// pages no request holds, and a host shortage's the least recently used host pages, each
+    /// within half of the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]): a search that read
+    /// the pages it cannot take on its way would cost in proportion to the host tier, past a
+    /// call's fuel at about half a million pages, and the fault would end the policy at a
+    /// shortage. The cache is told in `Cached` events a step's worth at a time, as it warmed.
+    #[test]
+    fn a_shortage_beside_a_warm_host_tier_names_its_victims_within_a_calls_fuel() {
+        const HOST: u64 = 47 * 16_384;
+        const HELD: u64 = 16 * 4_096;
+        const FREE: u64 = 1_024;
+        const NEED: u64 = 64;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+
+        // Least recently used first: the host tier, the held pages, the free device pages.
+        let view = |number: u64| PageView {
+            id: spread(number),
+            tokens: 64,
+            last_used: Nanos(NOW + number),
+            on_host: number < HOST,
+            evictable: !(HOST..HOST + HELD).contains(&number),
+        };
+        let numbers: Vec<u64> = (0..HOST + HELD + FREE).collect();
+        for told in numbers.chunks(16_384) {
+            let events: Vec<Event> = told
+                .iter()
+                .map(|&number| Event::Cached { page: view(number) })
+                .collect();
+            policy.call(Call::Observe, wire::encode(&events)).unwrap();
+        }
+
+        let first = |numbers: std::ops::Range<u64>| -> Vec<Victim> {
+            numbers
+                .take(NEED as usize)
+                .map(|number| Victim::Page(spread(number)))
+                .collect()
+        };
+        for (kind, expected) in [
+            (Storage::KvUnits, first(HOST + HELD..HOST + HELD + FREE)),
+            (Storage::HostPages, first(0..HOST)),
+        ] {
+            let shortage = Shortage { kind, need: NEED };
+            let (fuel, reply) =
+                metered(&mut policy, Call::Preempt, wire::encode(&shortage).unwrap());
+            assert!(fuel <= LIMIT, "{kind:?}: preempt took {fuel} fuel");
+            let victims: Vec<Victim> = wire::decode(&reply.unwrap()).unwrap();
+            assert_eq!(victims, expected, "{kind:?}");
+        }
+    }
+
+    /// A cache that grows a page a step: the step that caches one page costs `observe` what
+    /// that page does, whatever the size of the cache. The cache grows to 262,146 blocks, told a
+    /// step's worth at a time and, across each power of two from 4,096 blocks on, one block a
+    /// step; each of those steps' `observe` consumes at most half of the default call fuel
+    /// ([`DEFAULT_POLICY_CALL_FUEL`]). A record of the pages that copied every page it held
+    /// when it grew would cost the step that crossed 262,144 blocks about 12.6 M fuel, past a
+    /// call's.
+    #[test]
+    fn a_cache_that_grows_a_page_a_step_costs_each_step_its_page() {
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+
+        // Blocks a running request holds, so no offer to the host accumulates beside them.
+        let cached = |number: u64| Event::Cached {
+            page: block(spread(number), number, false),
+        };
+        let mut size = 0;
+        for power in 12..=18 {
+            let crossing = 1u64 << power;
+            while size < crossing - 2 {
+                let end = (size + 16_384).min(crossing - 2);
+                let events: Vec<Event> = (size..end).map(cached).collect();
+                policy.call(Call::Observe, wire::encode(&events)).unwrap();
+                size = end;
+            }
+            for _ in 0..4 {
+                let events = [cached(size)];
+                let (fuel, _) = metered(&mut policy, Call::Observe, wire::encode(&events).unwrap());
+                size += 1;
+                assert!(
+                    fuel <= LIMIT,
+                    "the step that cached block {size} took {fuel} fuel"
+                );
+            }
+        }
+        assert_eq!(size, (1 << 18) + 2);
     }
 
     /// A steady step of a decode load of 256 running requests (a `max_running_requests` in the

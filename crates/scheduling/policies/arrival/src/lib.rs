@@ -11,6 +11,7 @@
 mod arrival;
 mod budget;
 mod lru;
+mod pages;
 mod phases;
 mod waiting;
 
