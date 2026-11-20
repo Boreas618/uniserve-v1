@@ -1606,6 +1606,116 @@ mod tests {
         Ok(())
     }
 
+    /// A paired forward's row reads its whole history in the scratch page set: a row of 72
+    /// cached pages of a cache of 48 layers and no sliding window, as many pages as the set of a
+    /// bucket of 4,096 tokens and 8 rows holds, is copied page for page into the set ahead of
+    /// the shadow forward (13,824 copies: every layer's keys and values and their flags), every
+    /// plane byte for byte and every flag raised.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn a_paired_forward_s_row_reads_its_whole_history_in_the_scratch_pages() -> Result<()> {
+        /// A budget that books every mapping: the test's scratch pool has the device to itself.
+        struct Unbounded;
+        impl platform::Budget for Unbounded {
+            fn book(&self, _: DeviceId, _: platform::PoolKind, _: u64) -> platform::Result<()> {
+                Ok(())
+            }
+        }
+
+        const PAGES: u32 = 72;
+        const LAYERS: u32 = 48;
+        let device = DeviceId(0);
+        let stream = Stream::new(device)?;
+
+        // 64-token pages of one 128-wide BF16 head a layer: planes of 16 KiB.
+        let layout = Arc::new(
+            CacheLayout::dense(64, LAYERS, 1, 128, PrefixCacheDtype::BFloat16).validated()?,
+        );
+        let plane = layout.plane_bytes as usize;
+        let config = KvCacheConfig {
+            layout,
+            units: 1 + PAGES + 7,
+            slots: 2,
+            width: PAGES + 8,
+            segments: None,
+            workspace_bytes: 1 << 20,
+            states: (0, None),
+        };
+        let mut cache = KvCacheMemory::open(
+            config,
+            (device, &[]),
+            &crate::memory::exclusive::LocalStorage,
+            &stream,
+        )?;
+        cache.set_regions(CacheRegions {
+            units: UNITS,
+            states: None,
+            host: vec![None],
+        })?;
+
+        // Slot 1 holds units 1..=72, which hold a pattern of their own in every column of both
+        // fields, written column by column (a column's units lie back to back), and are
+        // initialized.
+        let units: Vec<u32> = (1..=PAGES).collect();
+        cache.apply(&allocated(1, 0, &units), Some(&stream))?;
+        let pattern = |field: usize, layer: u32| -> Vec<u8> {
+            (0..PAGES as usize * plane)
+                .map(|byte| (byte * 31 + field * 7 + layer as usize * 13 + byte / 4093) as u8)
+                .collect()
+        };
+        for field in 0..2 {
+            for layer in 0..LAYERS {
+                let bytes = pattern(field, layer);
+                let address = cache.planes.plane_address(field, layer, 1)?;
+                // SAFETY: units 1..=72 of the column, one storage the cache owns, which nothing
+                // else writes; the host pattern is read before the stream is synchronized.
+                unsafe {
+                    platform::memcpy_async(address, bytes.as_ptr() as u64, bytes.len(), &stream)?
+                };
+                stream.synchronize()?;
+            }
+        }
+        cache.planes.mark_initialized(&units, &stream)?;
+
+        // The set of 72 pages, from a scratch pool of the device's own.
+        let mut allocator =
+            platform::Allocator::new(&platform::Device::new(device)?, &[], Arc::new(Unbounded))?;
+        allocator.reserve(platform::PoolKind::Scratch, 1 << 30)?;
+        cache.open_scratch(PAGES, Some((&mut allocator, &stream)))?;
+        cache.copy_history(0, &[1], &[PAGES * 64], &[0], &stream)?;
+        stream.synchronize()?;
+
+        let read = |tensor: &Tensor, bytes: usize| -> Result<Vec<u8>> {
+            let mut copied = vec![0_u8; bytes];
+            // SAFETY: the first `bytes` of a tensor over the set, which the copies above wrote
+            // and nothing writes now; the host vector holds them.
+            unsafe {
+                platform::memcpy_async(
+                    copied.as_mut_ptr() as u64,
+                    ops::operand(tensor)?.ptr.address(),
+                    bytes,
+                    &stream,
+                )?;
+            }
+            stream.synchronize()?;
+            Ok(copied)
+        };
+        for (layer, planes) in cache.scratch_planes(0)?.iter().enumerate() {
+            let layer = layer as u32;
+            for (field, values, flags) in [
+                (0, &planes.key, &planes.key_initialized),
+                (1, &planes.value, &planes.value_initialized),
+            ] {
+                assert!(
+                    read(values, PAGES as usize * plane)? == pattern(field, layer),
+                    "field {field} of layer {layer} differs in the scratch pages"
+                );
+                assert_eq!(read(flags, PAGES as usize)?, vec![1; PAGES as usize]);
+            }
+        }
+        Ok(())
+    }
+
     /// A cache whose planes split gives its segments back in a sleep and creates them again in
     /// a wake, at the same addresses.
     #[test]
