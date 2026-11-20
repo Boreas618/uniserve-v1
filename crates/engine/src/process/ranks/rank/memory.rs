@@ -40,6 +40,7 @@ use crate::memory::cache::segments::{self, PlaneSegment};
 use crate::memory::cache::{ATTENTION_WORKSPACE_BYTES, CacheLayout, KvCacheConfig};
 use crate::memory::client::{StorageClient, quota_limit};
 use crate::memory::division;
+use crate::memory::room::{self, RoomAsk};
 use crate::memory::state::StateConfig;
 use crate::parallel::HostGroup;
 use crate::runner::buckets::Buckets;
@@ -349,6 +350,111 @@ impl ModelRunner {
         let unreserved = unreserved(client, device, share)?;
 
         self.divide_unreserved(unreserved, granularity, host, model, layout, regions)
+    }
+
+    /// Asks `room` for room in the rank's GPU's quota when what the quota leaves the rank now
+    /// holds less than its division takes at the fewest ([`room::fewest`]): the fixed
+    /// `regions`, every request slot, and the cache's planes for every unit the rank numbers with
+    /// its first segment. A rank that starts beside a serving epoch which holds the quota asks
+    /// here, before it divides, and the serving epoch gives the room back from its KV cache.
+    /// Nothing is asked when the quota holds the fewest bytes already.
+    ///
+    /// # Errors
+    ///
+    /// The quota, the device or NVML that cannot be read, or the room that was not made.
+    pub(crate) fn ask_division_room(
+        &self,
+        client: &StorageClient,
+        device: DeviceId,
+        model: &dyn TextModel,
+        layout: &Arc<CacheLayout>,
+        regions: &[(&'static str, u64)],
+        room: &dyn RoomAsk,
+    ) -> Result<()> {
+        let granularity = granularity(device)?;
+        let (share, _) = self.fractions()?;
+        let (now, alone) = unreserved(client, device, share)?;
+        let fewest = self.fewest_bytes(alone, granularity, model, layout, regions)?;
+        if now >= fewest {
+            return Ok(());
+        }
+
+        // The serving engines measure the room as the lesser of the quota's room and the
+        // device's free bytes, which the ask states with what the rank lacks.
+        let (quota, _) = client.usage(device)?;
+        let free = device.memory_info()?.free;
+        let measured = crate::process::binding::Room::of(&quota, free, client.epoch());
+        let lacking = fewest - now;
+        let gpu = device.uuid()?.0;
+        tracing::info!(
+            device = device.0,
+            now,
+            fewest,
+            lacking,
+            "the GPU's quota holds less than the rank's division takes: it asks for room"
+        );
+        room.ask(&[(gpu, room::wanted(measured.quota.min(measured.free), lacking))])
+            .map_err(|reason| {
+                anyhow::anyhow!(
+                    "the rank's division takes {fewest} bytes of its GPU's quota at the fewest,                      which holds {now} beside the epochs that serve, and no room was made: {reason}"
+                )
+            })
+    }
+
+    /// The fewest bytes the rank's division takes of what the quota leaves now
+    /// ([`room::fewest`]), for a quota that would leave `alone` to the rank's epoch alone, on a
+    /// device of `granularity`-byte granules.
+    ///
+    /// # Errors
+    ///
+    /// The slots' storages that cannot be sized.
+    fn fewest_bytes(
+        &self,
+        alone: u64,
+        granularity: u64,
+        model: &dyn TextModel,
+        layout: &Arc<CacheLayout>,
+        regions: &[(&'static str, u64)],
+    ) -> Result<u64> {
+        let slots = self.slots();
+        let state_bytes = layout.state_bytes();
+        let slot_bytes = self
+            .slot_storage(model, layout, slots)?
+            .saturating_add(u64::from(slots).saturating_mul(state_bytes));
+
+        // The units the rank numbers from what the quota leaves its epoch alone, before its host
+        // group agrees on its ranks' fewest: at least the agreed units, so the planes made for
+        // every unit are bounded from above.
+        let fixed = regions
+            .iter()
+            .fold(slot_bytes, |sum, (_, bytes)| sum.saturating_add(*bytes));
+        let mut units = u32::try_from(alone.saturating_sub(fixed) / layout.unit_bytes.max(1))
+            .unwrap_or(u32::MAX);
+        if let Some(tokens) = self.engine_config().kv_cache.max_tokens {
+            let capacity = u32::try_from(layout.token_units(tokens.get())).unwrap_or(u32::MAX);
+            units = units.min(capacity);
+        }
+        let units = segments::segmented_units(units, layout.plane_bytes, granularity);
+        let split = layout.split_bytes();
+        let segment = segments::segment_layout(units, layout.plane_bytes, granularity)
+            .map_or(0, |(_, per_segment)| {
+                u64::from(per_segment).saturating_mul(split)
+            });
+        let state_segment = if state_bytes > 0 {
+            segments::segment_units(state_bytes, granularity).map_or(0, |per_segment| {
+                u64::from(per_segment).saturating_mul(state_bytes)
+            })
+        } else {
+            0
+        };
+
+        Ok(room::fewest(
+            regions,
+            slot_bytes,
+            (fewest_units(layout), layout.unit_bytes),
+            (units, layout.unit_bytes.saturating_sub(split), segment),
+            state_segment,
+        ))
     }
 
     /// [`Self::divide`] over the bytes the GPU's quota leaves the rank, `(now, alone)` as

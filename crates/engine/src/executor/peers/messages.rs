@@ -246,6 +246,10 @@ pub enum DataOperation {
     /// every such rank holds beside its warm process in its GPU's quota; none when no such rank
     /// splits its memory of it.
     WarmSegments { groups: Vec<GroupId>, region: u8 },
+    /// Answers the room each GPU of the ranks that hold `regions` (each region's worker groups
+    /// and number) must hold for the process's warm process beside its own segments past each
+    /// region's first (`WeightBinding::warm_rooms`).
+    WarmRooms { regions: Vec<(Vec<GroupId>, u8)> },
     /// Suspends the graph pools and releases every segment. Answers every rank's segment table.
     Sleep,
     /// Suspends the graph pools.

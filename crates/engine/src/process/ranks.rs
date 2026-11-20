@@ -72,6 +72,7 @@ use crate::memory::division;
 use crate::memory::encoders;
 use crate::memory::graph_pool::GraphPool;
 use crate::memory::latent;
+use crate::memory::room::RoomAsk;
 use crate::memory::state::StateMemory;
 use crate::memory::tables::BlockTables;
 use crate::memory::weights::WeightStore;
@@ -140,6 +141,9 @@ pub(crate) enum Backing<'a> {
     Serving {
         storage: &'a crate::memory::client::StorageLaunch,
         kernels: &'a Resolve<'a>,
+        /// Whom the rank asks for room in its GPU's quota where its start lacks it: the epoch
+        /// serving beside it, through the daemon (`crate::memory::room`).
+        room: &'a Arc<dyn RoomAsk>,
     },
     /// Nothing outside this process: each rank's model is loaded from the shard headers alone
     /// ([`nn::MetaWeights`]), its runner and owners hold no device, its tensor group
@@ -698,8 +702,12 @@ fn load_rank(
         "the rank's runners were profiled: the bytes of their regions, shadow regions and inputs"
     );
 
-    let (storage, resolve) = match backing {
-        Backing::Serving { storage, kernels } => (storage, kernels),
+    let (storage, resolve, room) = match backing {
+        Backing::Serving {
+            storage,
+            kernels,
+            room,
+        } => (storage, kernels, room),
         Backing::Meta { .. } => {
             // The meta device allocates nothing, so each unit is a whole granule of it: its cache
             // is the fewest units it serves with, each unit a segment, and its state region the
@@ -745,8 +753,10 @@ fn load_rank(
         resolve(device, &keys).context("resolving the rank's kernels")?,
     ));
 
-    // Step 10: the weights, retained at the Storage Server and mapped on the device.
-    let store = Arc::new(WeightStore::new(Arc::clone(&client), device)?);
+    // Step 10: the weights, retained at the Storage Server and mapped on the device. A
+    // publication the GPU's quota refuses asks the serving epoch for room and is published again.
+    let store =
+        Arc::new(WeightStore::new(Arc::clone(&client), device)?.with_room(Arc::clone(room)));
     let model = model_runner
         .load_text(store.as_ref(), &experts)
         .context("loading the epoch's model")?;
@@ -777,6 +787,14 @@ fn load_rank(
         None => 0,
     };
     regions.push(("expert transport", transport));
+    model_runner.ask_division_room(
+        &client,
+        device,
+        model.as_ref(),
+        &layout,
+        &regions,
+        room.as_ref(),
+    )?;
     let (slots, (units, first), states) =
         model_runner.divide(&client, device, &host, model.as_ref(), &layout, &regions)?;
 
@@ -966,8 +984,12 @@ fn load_video_rank(
     video.host = Some(host);
     video.decoder = decoder;
 
-    let (storage, resolve) = match backing {
-        Backing::Serving { storage, kernels } => (storage, kernels),
+    let (storage, resolve, room) = match backing {
+        Backing::Serving {
+            storage,
+            kernels,
+            room,
+        } => (storage, kernels, room),
         Backing::Meta { .. } => {
             return Ok(LoadedRank {
                 model_runner,
@@ -992,7 +1014,8 @@ fn load_video_rank(
     video.granule = granularity(device)?;
 
     // Step 10: the weights, retained at the Storage Server and mapped on the device.
-    let store = Arc::new(WeightStore::new(Arc::clone(&client), device)?);
+    let store =
+        Arc::new(WeightStore::new(Arc::clone(&client), device)?.with_room(Arc::clone(room)));
     video.model = model_runner
         .load_video(store.as_ref())
         .context("loading the epoch's pipeline")?;

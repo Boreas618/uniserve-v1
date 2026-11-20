@@ -433,9 +433,9 @@ impl Failure {
     }
 
     /// The failure an engine's report states, or `None` for a report that
-    /// states none: an acknowledgement, a lifecycle state, or a failed
-    /// preparation, which drops the new generation and leaves the serving
-    /// one alone.
+    /// states none: an acknowledgement, a lifecycle state, an ask for room, or
+    /// a failed preparation, which drops the new generation and leaves the
+    /// serving one alone.
     pub fn of_report(report: &crate::process::Report) -> Option<Self> {
         use crate::process::report::Kind;
         let kind = report.kind.as_ref()?;
@@ -472,6 +472,7 @@ impl Failure {
             | Kind::RolledBack(_)
             | Kind::Drained(_)
             | Kind::Shrunk(_)
+            | Kind::RoomWanted(_)
             | Kind::PrepareFailed(_) => None,
         }
     }

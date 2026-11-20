@@ -733,6 +733,7 @@ mod tests {
             counters: Arc::new(Mutex::new(None)),
             streams: Arc::new(Vec::new()),
             video: Vec::new(),
+            shares_regions: None,
         });
         (main, mailbox)
     }

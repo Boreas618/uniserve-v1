@@ -82,9 +82,14 @@ pub(crate) struct Node {
     /// retain their tensors under, which every claim of the epoch there states.
     scopes: Vec<process::Scope>,
     /// The layout its replica lays its device memory out in
-    /// ([`proto::config::EngineConfig::layout`]), which names its device regions: two engines of
-    /// one layout share their regions and the segments in them.
+    /// ([`proto::config::EngineConfig::layout`]), which with its model's page shapes names its
+    /// device regions: two engines share their regions and the segments in them only when their
+    /// layouts are equal ([`shares_regions`]).
     layout: proto::config::Layout,
+    /// What a target's `Parked` stated of the regions its start opened: whether they map
+    /// segments another epoch created. `None` for a serving engine, a target not parked yet, a
+    /// peer process (its world's scheduler node states it) and an engine of an earlier build.
+    shares: Option<bool>,
     /// The epoch it executes: the one its replica served when the update began, or the epoch
     /// form's target.
     epoch: u64,
@@ -113,22 +118,52 @@ impl Node {
             generation: None,
             scopes,
             layout,
+            shares: None,
             epoch,
         }
     }
+}
 
-    /// Whether this engine's device memory moves across the switch to or from the engines on the
-    /// other side of it, which lay their memory out in `others`: when none of them lays its memory out as this one does,
-    /// this one's regions are its own, so its drain gives their memory back (`shrink`) and its
-    /// promotion grows into what the other side gives back. An engine whose layout one of
-    /// `others` (their layouts) shares names the same regions, which hold the same segments for both: it keeps
-    /// them through its drain and grows into nothing at its promotion.
-    fn moves_across<'a>(
-        &self,
-        others: impl IntoIterator<Item = &'a proto::config::Layout>,
-    ) -> bool {
-        !others.into_iter().any(|other| *other == self.layout)
+/// Whether the serving engine `serving` and the target `target` (one of `targets`) name the same
+/// device regions, which hold the same segments for both: their layouts are equal, and the
+/// target's world stated that the regions its start opened map segments another epoch created,
+/// or stated nothing (an engine of an earlier build, for which an equal layout is the whole
+/// statement). A target of an equal layout whose model lays its pages out otherwise, a drafter's
+/// window owners added for instance, names regions of its own.
+fn shares_regions(serving: &Node, target: &Node, targets: &[Node]) -> bool {
+    serving.layout == target.layout && stated_sharing(target, targets) != Some(false)
+}
+
+/// What the world of `target` (one of `targets`) stated of its regions: the target's own
+/// `Parked`, or its scheduler node's, which opened the world's session.
+fn stated_sharing(target: &Node, targets: &[Node]) -> Option<bool> {
+    target.shares.or_else(|| {
+        targets
+            .iter()
+            .find(|node| node.launch == target.head)
+            .and_then(|head| head.shares)
+    })
+}
+
+/// Whether the serving engine `serving`'s device memory moves to the targets across the switch,
+/// so its drain gives it back (`shrink`): none of `targets` names its regions. Before any target
+/// started, their layouts `layouts` stand for them.
+fn drains_across(serving: &Node, targets: &[Node], layouts: &[proto::config::Layout]) -> bool {
+    if targets.is_empty() {
+        return !layouts.contains(&serving.layout);
     }
+    !targets
+        .iter()
+        .any(|target| shares_regions(serving, target, targets))
+}
+
+/// Whether the target `target` (one of `targets`) grows into what the serving engines `serving`
+/// give back as they drain, and gives its own memory back when it drains on the way back: none of
+/// them names its regions.
+fn grows_across(target: &Node, targets: &[Node], serving: &[Node]) -> bool {
+    !serving
+        .iter()
+        .any(|node| shares_regions(node, target, targets))
 }
 
 /// What the epoch form states of its target, beside the serving engines.
@@ -156,9 +191,8 @@ pub(crate) struct EpochSwitch {
     /// drains then runs every request it holds to its end, none migrating, whatever `drain`
     /// states (a complete drain).
     pub(crate) complete: bool,
-    /// The layouts the target replicas lay their device memory out in, one per replica: a
-    /// serving engine whose layout none of them shares drains with `shrink`
-    /// ([`Node::moves_across`]).
+    /// The layouts the target replicas lay their device memory out in, one per replica: what
+    /// stands for the targets before they started ([`drains_across`]).
     pub(crate) target_layouts: Vec<proto::config::Layout>,
     /// Epochs an earlier update dropped whose storage the next claim retires.
     pub(crate) retire: Vec<u64>,
@@ -166,6 +200,22 @@ pub(crate) struct EpochSwitch {
     /// their epochs through it: a claim of an epoch they execute keeps their scopes, and the
     /// update retires an epoch only once none of them executes it.
     pub(crate) bystanders: Vec<Node>,
+}
+
+/// A target's ask for room in its GPUs' quotas (`process::RoomWanted`), which the leader has the
+/// serving engines make (`EngineClient::reserve_storage`) and answers with
+/// [`Updater::room_made`](super::Updater::room_made).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomWanted {
+    /// The update the target is of.
+    pub(crate) update: u64,
+    /// The target engine: its node and launch generation.
+    pub(crate) host: String,
+    pub(crate) launch: u64,
+    /// The ask's number among the target's, which the answer names.
+    pub(crate) id: u64,
+    /// Each GPU's identity and the bytes its quota must hold beside everything it reserves.
+    pub(crate) devices: Vec<([u8; 16], u64)>,
 }
 
 /// What `Preparing` and `Switching` do.
@@ -216,6 +266,9 @@ struct EpochTrial {
     weights_kept: BTreeSet<usize>,
     /// Serving engines that have to start again before they serve.
     relaunch_due: BTreeSet<usize>,
+    /// Whether every node holds the claim of the target's storage: an abandoned update then
+    /// retires it at once.
+    claimed: bool,
 }
 
 /// One update of one deployment.
@@ -259,6 +312,8 @@ pub(crate) struct Update {
     uncompared: Vec<String>,
     /// Why the claim that ended the update failed, when it did.
     claim_failed: Option<String>,
+    /// The targets' asks for room not yet handed to the leader ([`Self::take_room_wanted`]).
+    room_wanted: Vec<RoomWanted>,
 }
 
 impl Update {
@@ -316,6 +371,7 @@ impl Update {
             previous_exited: BTreeSet::new(),
             weights_kept: BTreeSet::new(),
             relaunch_due: BTreeSet::new(),
+            claimed: false,
         }));
         Self::new(number, target, form, epochs, serving, group, nodes, trial)
     }
@@ -352,6 +408,7 @@ impl Update {
             trial_began: None,
             uncompared: Vec::new(),
             claim_failed: None,
+            room_wanted: Vec::new(),
         }
     }
 
@@ -425,6 +482,53 @@ impl Update {
         }
     }
 
+    /// The targets' asks for room that arrived since the last call, oldest first: the leader has
+    /// the serving engines make each and answers it with [`Self::room_made`].
+    pub(crate) fn take_room_wanted(&mut self) -> Vec<RoomWanted> {
+        std::mem::take(&mut self.room_wanted)
+    }
+
+    /// The serving engines made the room `wanted` asked for, or `made` states why they could not:
+    /// the target is answered, and a refusal abandons the update, whose target cannot start
+    /// beside the serving epoch. An ask of a target the update no longer prepares is answered
+    /// with nothing: the target was stopped.
+    pub(crate) fn room_made(
+        &mut self,
+        processes: &mut Processes,
+        wanted: &RoomWanted,
+        made: Result<(), String>,
+    ) {
+        if self.phase != Phase::Preparing
+            || !matches!(self.node_of(&wanted.host, wanted.launch), Some((_, true)))
+        {
+            return;
+        }
+        let refused = made.as_ref().err().cloned().unwrap_or_default();
+        processes.command(
+            &wanted.host,
+            wanted.launch,
+            command(command::Kind::Room(process::Room {
+                id: wanted.id,
+                refused: refused.clone(),
+            })),
+        );
+        if made.is_err() {
+            let bytes: Vec<String> = wanted
+                .devices
+                .iter()
+                .map(|(gpu, bytes)| {
+                    format!("{bytes} bytes on {}", storage::protocol::gpu_name(gpu))
+                })
+                .collect();
+            let reason = format!(
+                "the serving epoch could not make room for the target on {} ({}): {refused}",
+                wanted.host,
+                bytes.join(", ")
+            );
+            self.abandon(processes, Failure::new(FailureKind::PrepareFailed, reason));
+        }
+    }
+
     /// The update as the operator reads it, without what its trial and transfers read.
     pub(crate) fn report(&self) -> UpdateReport {
         let (generation, epoch_form) = match &self.form {
@@ -441,10 +545,9 @@ impl Update {
                         target: trial.switch.launches.len(),
                     },
                     drain_s: trial.switch.drain.as_secs_f64(),
-                    shrink: self
-                        .nodes
-                        .iter()
-                        .any(|node| node.moves_across(&trial.switch.target_layouts)),
+                    shrink: self.nodes.iter().any(|node| {
+                        drains_across(node, &trial.targets, &trial.switch.target_layouts)
+                    }),
                     previous_epoch_kept: trial.kept,
                     host_refused: trial.host_refused.clone(),
                     moved_to_host_bytes: trial.moved_bytes,
@@ -706,6 +809,9 @@ impl Update {
         if let Err(reason) = self.claim_everywhere(processes, epoch, &targets, &retire) {
             return self.abandon(processes, Failure::new(FailureKind::ClaimFailed, reason));
         }
+        if let Form::Epoch(trial) = &mut self.form {
+            trial.claimed = true;
+        }
         // Every node retired them: none is left for a later claim. Their engines stopped when
         // their update dropped them, and their storage and its quotas' reservations ended now:
         // the engines that serve through this update grow into what that freed, and the targets
@@ -782,10 +888,21 @@ impl Update {
         report: Report,
     ) {
         // Another engine's report is not the update's: a standby's, or an
-        // epoch that ended.
+        // epoch that ended. Only a target is given room beside the serving epoch.
         let Some((index, target)) = self.node_of(host, launch) else {
-            return;
+            return refuse_room(
+                processes,
+                (host, launch, &report),
+                "the engine is no target of the update",
+            );
         };
+        if !target && asks_room(&report) {
+            return refuse_room(
+                processes,
+                (host, launch, &report),
+                "a serving engine is given no room by its own update",
+            );
+        }
         match &self.form {
             Form::Generation => self.generation_report(processes, index, report),
             Form::Epoch(_) if target => self.target_report(processes, index, report),
@@ -844,12 +961,42 @@ impl Update {
         match (self.phase, self.back, &report.kind) {
             (Phase::Preparing, _, Some(report::Kind::Parked(parked))) => {
                 trial.targets[target].generation = Some(parked.generation);
+                trial.targets[target].shares = parked.shares_regions;
                 // The generation the epoch's engines numbered for its
                 // modules: a promotion is refused on any other.
                 trial.switch.record.generation = Some(parked.generation);
                 self.epochs
                     .record(trial.switch.epoch, trial.switch.record.clone());
                 trial.parked.insert(target);
+            }
+            // A target's ask for room once it is past its start has nothing to wait for.
+            (_, _, Some(report::Kind::RoomWanted(_))) if self.phase != Phase::Preparing => {
+                let node = &trial.targets[target];
+                refuse_room(
+                    processes,
+                    (&node.host, node.launch, &report),
+                    "the update no longer prepares its targets",
+                );
+            }
+            // A target's start lacks room in its GPUs' quotas: the leader has the serving engines
+            // make it and the target waits for the answer.
+            (Phase::Preparing, _, Some(report::Kind::RoomWanted(wanted))) => {
+                let target = &trial.targets[target];
+                let devices = wanted
+                    .devices
+                    .iter()
+                    .filter_map(|device| {
+                        let gpu: [u8; 16] = device.gpu.as_slice().try_into().ok()?;
+                        Some((gpu, device.bytes))
+                    })
+                    .collect();
+                self.room_wanted.push(RoomWanted {
+                    update: self.number,
+                    host: target.host.clone(),
+                    launch: target.launch,
+                    id: wanted.id,
+                    devices,
+                });
             }
             // A target's engines prepare by starting and parking, so whatever a target reports
             // failing before it parked is the update's failed preparation, with the engine's
@@ -897,7 +1044,14 @@ impl Update {
             // On the way back the targets drain beside the previous epoch, which grows into what
             // they give back on the host the release names.
             (Phase::Switching, true, Some(report::Kind::Shrunk(shrunk))) => {
-                let growing = growing(&self.nodes, trial.targets.iter().map(|node| &node.layout));
+                let growing: Vec<Node> = self
+                    .nodes
+                    .iter()
+                    .filter(|node| {
+                        drains_across(node, &trial.targets, &trial.switch.target_layouts)
+                    })
+                    .cloned()
+                    .collect();
                 grow_on(processes, [shrunk.host.as_str()], &growing);
             }
             // A target that fails while the switch runs back is stopped: it
@@ -938,7 +1092,12 @@ impl Update {
             // A serving engine draining across layouts gave device memory back on the host the
             // release names: the targets with ranks there grow into it, one release at a time.
             (Phase::Switching | Phase::Trial, false, Some(report::Kind::Shrunk(shrunk))) => {
-                let growing = growing(&trial.targets, self.nodes.iter().map(|node| &node.layout));
+                let growing: Vec<Node> = trial
+                    .targets
+                    .iter()
+                    .filter(|target| grows_across(target, &trial.targets, &self.nodes))
+                    .cloned()
+                    .collect();
                 grow_on(processes, [shrunk.host.as_str()], &growing);
             }
             _ => {}
@@ -1216,11 +1375,13 @@ impl Update {
     }
 
     /// Drops the new before anything served it: the engines discard what they
-    /// prepared, a target's engines stop and its epoch is retired by the next
-    /// claim, and what served goes on untouched.
+    /// prepared, and what served goes on untouched. A target's engines stop; once every node
+    /// holds the claim of its storage, the storage is retired at once on every host and the
+    /// serving engines there grow into what it freed (the room their KV caches gave the target
+    /// included), and otherwise the next update's first claim retires it.
     fn abandon(&mut self, processes: &mut Processes, failure: Failure) {
         self.failure = Some(failure.clone());
-        match &mut self.form {
+        let released = match &mut self.form {
             Form::Generation => {
                 let rollback = command(command::Kind::Rollback(process::Rollback {
                     reason: failure.reason,
@@ -1228,18 +1389,65 @@ impl Update {
                 for node in &self.nodes {
                     processes.command(&node.host, node.launch, rollback.clone());
                 }
+                None
             }
             Form::Epoch(trial) => {
-                trial.switch.retire.push(trial.switch.epoch);
                 trial.switch.record.status = EpochState::Released;
                 self.epochs
                     .record(trial.switch.epoch, trial.switch.record.clone());
                 for target in &trial.targets {
                     processes.stop(&self.group, Some(target.launch));
                 }
+                let hosts: BTreeSet<String> = trial
+                    .targets
+                    .iter()
+                    .map(|target| target.host.clone())
+                    .collect();
+                Some((trial.switch.epoch, trial.claimed, hosts))
             }
-        }
+        };
         self.enter(Phase::Abandoned);
+
+        let Some((epoch, claimed, hosts)) = released else {
+            return;
+        };
+        // The stops returned once every node reaped the targets: each previous epoch keeps every
+        // scope it executes and the target's storage ends with the claim, as at a rollback's end.
+        // A target not claimed everywhere, or a node that refuses the retire, leaves it to the
+        // next update's first claim.
+        let failed = if claimed {
+            self.retire_everywhere(processes, &[epoch])
+        } else {
+            None
+        };
+        if claimed && failed.is_none() {
+            return grow_on(processes, hosts.iter().map(String::as_str), &self.nodes);
+        }
+        self.claim_failed = failed;
+        if let Form::Epoch(trial) = &mut self.form {
+            trial.switch.retire.push(epoch);
+        }
+    }
+
+    /// Retires `retire`'s epochs on every host the update claims at, each previous epoch keeping
+    /// every scope it executes (the update's serving engines' and its bystanders'). Returns the
+    /// first claim's refusal, when one refused.
+    fn retire_everywhere(&self, processes: &mut Processes, retire: &[u64]) -> Option<String> {
+        let mut failed = None;
+        for previous in self.previous_epochs() {
+            let mut keeping: Vec<Node> = self
+                .nodes
+                .iter()
+                .filter(|node| node.epoch == previous)
+                .cloned()
+                .collect();
+            keeping.extend(self.bystanders_of(previous));
+            let claimed = self
+                .claim_everywhere(processes, previous, &keeping, retire)
+                .err();
+            failed = failed.or(claimed);
+        }
+        failed
     }
 
     /// Runs the switch back with `failure` as the update's first one.
@@ -1297,7 +1505,7 @@ impl Update {
                             node.launch,
                             promote(
                                 trial.switch.recompute,
-                                node.moves_across(&trial.switch.target_layouts),
+                                drains_across(node, &trial.targets, &trial.switch.target_layouts),
                             ),
                         );
                     }
@@ -1322,7 +1530,7 @@ impl Update {
             node.launch,
             promote(
                 trial.switch.recompute,
-                node.moves_across(&trial.switch.target_layouts),
+                drains_across(node, &trial.targets, &trial.switch.target_layouts),
             ),
         );
     }
@@ -1372,7 +1580,7 @@ impl Update {
             }
             Form::Epoch(trial) => {
                 for target in &trial.targets {
-                    let grow = target.moves_across(self.nodes.iter().map(|node| &node.layout));
+                    let grow = grows_across(target, &trial.targets, &self.nodes);
                     processes.command(
                         &target.host,
                         target.launch,
@@ -1391,7 +1599,8 @@ impl Update {
                 trial.draining = true;
                 for (index, node) in self.nodes.iter().enumerate() {
                     if !trial.drained.contains(&index) {
-                        let shrink = node.moves_across(&trial.switch.target_layouts);
+                        let shrink =
+                            drains_across(node, &trial.targets, &trial.switch.target_layouts);
                         let drain = drain(node.epoch, &trial.switch, shrink);
                         processes.command(&node.host, node.launch, drain);
                     }
@@ -1463,8 +1672,7 @@ impl Update {
                     trial.targets_draining = true;
                     for (index, target) in trial.targets.iter().enumerate() {
                         if !trial.target_left.contains(&index) {
-                            let shrink =
-                                target.moves_across(self.nodes.iter().map(|node| &node.layout));
+                            let shrink = grows_across(target, &trial.targets, &self.nodes);
                             let drain = drain(trial.switch.epoch, &trial.switch, shrink);
                             processes.command(&target.host, target.launch, drain);
                         }
@@ -1485,21 +1693,7 @@ impl Update {
                     .collect();
                 // Each previous epoch keeps every scope it executes: the update's serving
                 // engines' and the replicas' it left as they were.
-                let mut failed = None;
-                for previous in self.previous_epochs() {
-                    let mut keeping: Vec<Node> = self
-                        .nodes
-                        .iter()
-                        .filter(|node| node.epoch == previous)
-                        .cloned()
-                        .collect();
-                    keeping.extend(self.bystanders_of(previous));
-                    let claimed = self
-                        .claim_everywhere(processes, previous, &keeping, &retire)
-                        .err();
-                    failed = failed.or(claimed);
-                }
-                self.claim_failed = failed;
+                self.claim_failed = self.retire_everywhere(processes, &retire);
                 // The targets are reaped and their epoch's storage retired on every host they
                 // ran on: the previous epoch, which serves again, grows into what that freed.
                 grow_on(processes, released.iter().map(String::as_str), &self.nodes);
@@ -1507,6 +1701,33 @@ impl Update {
         }
         self.enter(Phase::RolledBack);
     }
+}
+
+/// Whether `report` is an engine's ask for room in its GPUs' quotas (`RoomWanted`).
+pub(crate) fn asks_room(report: &Report) -> bool {
+    matches!(report.kind, Some(report::Kind::RoomWanted(_)))
+}
+
+/// Answers the report of the engine of launch generation `launch` on `host` with `Room` refused
+/// for `reason` when it is an ask for room (`RoomWanted`) that no update makes room for, so the
+/// start that asked fails as it fails for want of room otherwise, rather than waiting for an
+/// answer. Any other report is left alone.
+pub(crate) fn refuse_room(
+    processes: &mut Processes,
+    (host, launch, report): (&str, u64, &Report),
+    reason: &str,
+) {
+    let Some(report::Kind::RoomWanted(wanted)) = &report.kind else {
+        return;
+    };
+    processes.command(
+        host,
+        launch,
+        command(command::Kind::Room(process::Room {
+            id: wanted.id,
+            refused: reason.to_owned(),
+        })),
+    );
 }
 
 /// One command of `kind`.
@@ -1558,7 +1779,7 @@ pub(crate) fn promote(recompute: bool, grow: bool) -> process::Command {
 /// The drain of an engine executing `epoch` in `switch`: the deadline from
 /// now, or none for a switch between sides that process requests otherwise
 /// (`complete`), and `shrink` when the engine's device memory moves to the
-/// other side of the switch ([`Node::moves_across`]).
+/// other side of the switch ([`drains_across`], [`grows_across`]).
 fn drain(epoch: u64, switch: &EpochSwitch, shrink: bool) -> process::Command {
     command(command::Kind::Drain(process::Drain {
         epoch,
@@ -1566,17 +1787,4 @@ fn drain(epoch: u64, switch: &EpochSwitch, shrink: bool) -> process::Command {
         shrink,
         complete: switch.complete,
     }))
-}
-
-/// The engines of `side` that grow into the memory the other side's engines, which lay their
-/// memory out in `other`, give back: those whose device memory moves across the switch
-/// ([`Node::moves_across`]).
-fn growing<'a>(
-    side: &[Node],
-    other: impl IntoIterator<Item = &'a proto::config::Layout> + Clone,
-) -> Vec<Node> {
-    side.iter()
-        .filter(|engine| engine.moves_across(other.clone()))
-        .cloned()
-        .collect()
 }

@@ -508,6 +508,7 @@ fn operate(
             encoded(&binding.device_rooms(&groups, region)?)
         }
         Operation::WarmSegments { groups, region } => encoded(&binding.warm_here(&groups, region)?),
+        Operation::WarmRooms { regions } => encoded(&binding.warm_rooms_here(&regions)?),
         Operation::UpdateRoom { operators, options } => {
             let operators = operators.into_iter().collect();
             let shapes = match &options {

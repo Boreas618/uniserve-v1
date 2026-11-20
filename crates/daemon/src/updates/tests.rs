@@ -389,6 +389,7 @@ fn names(commands: &[command::Kind]) -> Vec<&'static str> {
             command::Kind::Promote(_) => "promote",
             command::Kind::Pause(_) => "pause",
             command::Kind::Grow(_) => "grow",
+            command::Kind::Room(_) => "room",
         })
         .collect()
 }
@@ -477,7 +478,8 @@ fn a_failed_preparation_abandons_the_update_and_nothing_changed() {
 
 /// A target whose start fails before it parks abandons the epoch update as a
 /// failed preparation with the engine's reason, the kind the leader states
-/// when the same target does not join: the serving epoch serves on.
+/// when the same target does not join: the serving epoch serves on, and grows into what the
+/// target's retired storage freed.
 #[test]
 fn a_target_that_does_not_start_abandons_the_update_as_a_failed_preparation() {
     let mut deployment = Deployment::new(Refusals::default());
@@ -504,9 +506,10 @@ fn a_target_that_does_not_start_abandons_the_update_as_a_failed_preparation() {
     assert_eq!(status["phase"], "abandoned");
     assert_eq!(status["failure"]["kind"], "prepare_failed");
     assert_eq!(status["failure"]["reason"], reason);
-    assert!(
-        deployment.engines.received(PREVIOUS).is_empty(),
-        "nothing that serves changed"
+    assert_eq!(
+        names(&deployment.engines.received(PREVIOUS)),
+        ["grow"],
+        "the serving engine is sent nothing but its growth"
     );
 }
 
@@ -1144,9 +1147,9 @@ fn a_rollback_grows_the_previous_epoch_into_what_the_targets_release_freed() {
     assert!(seen_at(&timeline, retiring(HOST, TARGET)) < seen_at(&timeline, grow_to(RELAUNCHED)));
 }
 
-/// An epoch an abandoned update dropped keeps its storage until the next epoch update's first
-/// claim retires it; that release grows the serving engine, which serves on while the next
-/// target prepares beside it.
+/// An epoch an abandoned update dropped, whose storage a node could not retire when the update
+/// ended, keeps it until the next epoch update's first claim retires it; that release grows the
+/// serving engine, which serves on while the next target prepares beside it.
 #[test]
 fn the_next_update_grows_the_serving_epoch_into_what_a_dropped_epochs_release_freed() {
     const NEXT: u64 = 3;
@@ -1158,10 +1161,17 @@ fn the_next_update_grows_the_serving_epoch_into_what_a_dropped_epochs_release_fr
         .updater
         .apply(update)
         .expect("no update is in flight");
+    // The node cannot retire the abandoned target's storage, which the next update's first claim
+    // then retires.
+    deployment.engines.refuse(Refusals {
+        claim: Some("the Storage Server is restarting".to_owned()),
+        ..Refusals::default()
+    });
     deployment.engines.exit(HOST, SPAWNED, "signal: 9");
     deployment.updater.advance();
     assert_eq!(deployment.status()["phase"], "abandoned");
     assert!(deployment.engines.received(PREVIOUS).is_empty());
+    deployment.engines.refuse(Refusals::default());
 
     let mut launch = target_launch(HOST, 0, NEXT_SPAWNED);
     launch.epoch = NEXT;
@@ -1698,8 +1708,9 @@ fn a_refused_spawn_or_claim_abandons_the_update() {
     assert_eq!(*deployment.epochs.served().borrow(), 0);
 }
 
-/// A target that exits while it prepares abandons the update, and the epoch
-/// it would have been is retired by the next update's claim.
+/// A target that exits while it prepares abandons the update; the storage of the epoch it would
+/// have been is retired at once, after its stop, and the serving engine grows into what that
+/// freed, so no later update is left to retire it.
 #[test]
 fn a_target_lost_while_preparing_abandons_the_update() {
     let mut deployment = Deployment::new(Refusals::default());
@@ -1709,12 +1720,193 @@ fn a_target_lost_while_preparing_abandons_the_update() {
         .apply(update)
         .expect("no update is in flight");
     deployment.engines.exit(HOST, SPAWNED, "signal: 9");
-    deployment.updater.advance();
+    deployment.run();
 
     assert_eq!(deployment.status()["phase"], "abandoned");
     assert_eq!(deployment.status()["failure"]["kind"], "process_exit");
+    let timeline = deployment.engines.timeline();
+    assert!(seen_at(&timeline, stopping(SPAWNED)) < seen_at(&timeline, retiring(HOST, TARGET)));
+    assert!(seen_at(&timeline, retiring(HOST, TARGET)) < seen_at(&timeline, grow_to(PREVIOUS)));
+    assert_eq!(names(&deployment.engines.received(PREVIOUS)), ["grow"]);
+    assert!(deployment.updater.take_retire().is_empty());
+}
+
+/// A GPU's identity, as a target's ask for room names it.
+const GPU: [u8; 16] = [7; 16];
+
+/// A target whose start lacks room in its GPU's quota asks for it before it parks: the leader is
+/// handed the ask, and once the serving engines made the room the target is answered, parks, and
+/// the switch goes on.
+#[test]
+fn a_target_that_lacks_room_parks_once_the_serving_engines_made_it() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let mut asks = deployment
+        .updater
+        .room_asks()
+        .expect("the asks are read once");
+    deployment
+        .engines
+        .arm_spawned(|engine| engine.want_room(1, &[(GPU, 8 << 30)]));
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
+    deployment.apply(update);
+
+    assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Preparing)));
+    let wanted = asks
+        .try_recv()
+        .expect("the target's ask reached the leader");
+    assert_eq!(
+        (
+            wanted.update,
+            wanted.host.as_str(),
+            wanted.launch,
+            wanted.id,
+            wanted.devices.as_slice()
+        ),
+        (1, HOST, SPAWNED, 1, [(GPU, 8 << 30)].as_slice())
+    );
+    assert!(asks.try_recv().is_err(), "one ask, handed over once");
     assert!(deployment.engines.received(PREVIOUS).is_empty());
-    assert_eq!(deployment.updater.take_retire(), vec![TARGET]);
+
+    deployment.updater.room_made(&wanted, Ok(()));
+    deployment.run();
+    assert_eq!(
+        deployment.engines.received(SPAWNED)[0],
+        command::Kind::Room(process::Room {
+            id: 1,
+            refused: String::new(),
+        })
+    );
+    assert_eq!(
+        names(&deployment.engines.received(SPAWNED)),
+        ["room", "promote"]
+    );
+    assert_eq!(names(&deployment.engines.received(PREVIOUS)), ["drain"]);
+    assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Trial)));
+}
+
+/// Room the serving engines cannot make abandons the update: the target is answered with their
+/// refusal and stopped, its storage is retired at once, and the serving engine grows back into
+/// what that freed, the room its cache gave the target included.
+#[test]
+fn room_the_serving_engines_cannot_make_abandons_the_update_and_they_grow_back() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let mut asks = deployment
+        .updater
+        .room_asks()
+        .expect("the asks are read once");
+    deployment
+        .engines
+        .arm_spawned(|engine| engine.want_room(1, &[(GPU, 8 << 30)]));
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
+    deployment.apply(update);
+    let wanted = asks
+        .try_recv()
+        .expect("the target's ask reached the leader");
+
+    let refusal = "a release of every KV cache segment of region 0 past the first leaves a device \
+                   too little room";
+    deployment
+        .updater
+        .room_made(&wanted, Err(refusal.to_owned()));
+    deployment.run();
+
+    let status = deployment.status();
+    assert_eq!(status["phase"], "abandoned");
+    assert_eq!(status["failure"]["kind"], "prepare_failed");
+    let reason = status["failure"]["reason"]
+        .as_str()
+        .expect("the failure states a reason");
+    assert!(
+        reason.contains(HOST) && reason.contains("8589934592 bytes") && reason.ends_with(refusal),
+        "{reason}"
+    );
+    assert_eq!(
+        deployment.engines.received(SPAWNED),
+        [command::Kind::Room(process::Room {
+            id: 1,
+            refused: refusal.to_owned(),
+        })]
+    );
+    let timeline = deployment.engines.timeline();
+    assert!(seen_at(&timeline, stopping(SPAWNED)) < seen_at(&timeline, retiring(HOST, TARGET)));
+    assert!(seen_at(&timeline, retiring(HOST, TARGET)) < seen_at(&timeline, grow_to(PREVIOUS)));
+    assert_eq!(names(&deployment.engines.received(PREVIOUS)), ["grow"]);
+}
+
+/// An engine that asks for room while no update prepares it, such as an epoch's first start, is
+/// answered that no room is made: its start fails as it would for want of room, rather than
+/// waiting for an answer.
+#[test]
+fn an_ask_for_room_of_no_target_is_refused() {
+    const CONTROLLED: u64 = 7;
+    let mut deployment = Deployment::new(Refusals::default());
+    deployment.engines.start_controlled(HOST, CONTROLLED, BUILD);
+    deployment.run();
+    let ask = deployment
+        .engines
+        .engine(CONTROLLED)
+        .room_wanted(3, &[(GPU, 1 << 30)]);
+    deployment.engines.report(CONTROLLED, ask);
+    deployment.run();
+
+    assert_eq!(
+        deployment.engines.received(CONTROLLED),
+        [command::Kind::Room(process::Room {
+            id: 3,
+            refused: "no epoch update prepares this engine".to_owned(),
+        })]
+    );
+}
+
+/// A target of the serving engine's layout that states its start opened regions of its own (its
+/// model lays its pages out otherwise, a drafter's window owners added) takes the serving
+/// engine's memory over the switch as a target of another layout does: the serving engine
+/// drains with `shrink`, the target is promoted with `grow` and grows on each release. A target
+/// that states it maps the serving engine's regions shares them, as one of an earlier build,
+/// which states nothing, does.
+#[test]
+fn a_target_of_the_same_layout_takes_the_memory_only_when_its_regions_are_its_own() {
+    for (shares, moves) in [(Some(false), true), (Some(true), false), (None, false)] {
+        let mut deployment = Deployment::new(Refusals::default());
+        deployment
+            .engines
+            .arm_spawned(move |engine| engine.state_shares_regions(shares));
+        let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
+        deployment.apply(update);
+
+        assert_eq!(
+            deployment.engines.received(PREVIOUS),
+            [command::Kind::Drain(process::Drain {
+                epoch: SERVING,
+                deadline_ms: 5_000,
+                shrink: moves,
+                complete: false,
+            })],
+            "{shares:?}"
+        );
+        assert_eq!(
+            deployment.engines.received(SPAWNED),
+            [command::Kind::Promote(process::Promote {
+                recompute: false,
+                grow: moves,
+            })],
+            "{shares:?}"
+        );
+        assert_eq!(deployment.status()["shrink"].as_bool(), Some(moves));
+
+        deployment.engines.report(PREVIOUS, shrunk(HOST));
+        deployment.run();
+        let expected: &[&str] = if moves {
+            &["promote", "grow"]
+        } else {
+            &["promote"]
+        };
+        assert_eq!(
+            names(&deployment.engines.received(SPAWNED)),
+            expected,
+            "{shares:?}"
+        );
+    }
 }
 
 /// A target that exits as it starts abandons the update with a failure that names the engine's
