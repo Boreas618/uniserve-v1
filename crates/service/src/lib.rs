@@ -42,8 +42,8 @@ pub mod span;
 mod versions;
 
 pub use connection::{
-    Connection, Handed, Hangup, Listener, Liveness, Message, Socket, Wake, Waker,
-    receive_buffer_bytes, wait_ready,
+    Cancel, Cancellation, Connection, Handed, Hangup, Listener, Liveness, Message, Socket, Wake,
+    Waker, receive_buffer_bytes, wait_ready,
 };
 pub use directories::{cache_directory, data_directory, deployment};
 pub use endpoint::{Endpoint, EndpointError};

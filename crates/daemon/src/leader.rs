@@ -776,6 +776,7 @@ impl Leader {
 
     /// Stops every replica and its workers.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.close_requests();
         for replica in self.replicas() {
             replica.shutdown().await?;
         }
@@ -784,10 +785,23 @@ impl Leader {
 
     /// Releases every adopted engine connection after a daemon handoff.
     pub async fn detach(&self) -> anyhow::Result<()> {
+        self.close_requests();
         for replica in self.replicas() {
             replica.detach().await?;
         }
         Ok(())
+    }
+
+    /// Closes the deployment's request socket to engines' dials ([`EngineControl::close`]): the
+    /// deployment ends on this daemon, stopped or handed over, so no wait for a dial on its
+    /// behalf may outlive it, whatever started it (a start, a relaunch, a standby, an update's
+    /// join or a continuation's borrowed front).
+    fn close_requests(&self) {
+        for replica in self.replicas() {
+            if let Some(control) = replica.control.get() {
+                control.close();
+            }
+        }
     }
 
     pub(crate) async fn quiesce(&self) -> Quiescence<'_> {
@@ -2408,6 +2422,20 @@ impl Replica {
         });
     }
 
+    /// Resolves once update `number` ended, or once the updater states another update or none:
+    /// the end of every wait on the update's behalf.
+    async fn ended(
+        updater: &crate::updates::Updater,
+        number: u64,
+        phases: &mut watch::Receiver<Option<(u64, Phase)>>,
+    ) {
+        while !updater.phase_of(number).is_none_or(Phase::ended) {
+            if phases.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Waits for the next thing an update's follower acts on: the update's
     /// progress, its trial's end (which commits it), or, once its trial
     /// began, the next report of the replicas `trial` observes, on which the
@@ -2595,7 +2623,23 @@ impl Replica {
 
         // Every target replica's engines dial this daemon's request socket as
         // they start, and state that they parked once they resolved their
-        // modules and captured their graphs.
+        // modules and captured their graphs. The update supervises their
+        // processes on a connection of its own, so a target that exits before
+        // it dials is the update's to judge, which abandons itself: nothing
+        // else would end the wait for that dial. The update's end, or this
+        // follower's, which drops `abandon`, cancels every join.
+        let (abandon, abandoned) = match service::Cancel::new() {
+            Ok(pair) => pair,
+            Err(error) => {
+                let reason = format!("awaiting the update's targets: {error}");
+                warn!(epoch, "{reason}");
+                updater.rollback(proto::admin::Failure::new(
+                    proto::admin::FailureKind::PrepareFailed,
+                    reason,
+                ));
+                return;
+            }
+        };
         let observers: Vec<Arc<crate::observe::Observer>> = (0..targets.len())
             .map(|index| match previous.get(index) {
                 Some(replica) => Arc::clone(&replica.observer),
@@ -2611,12 +2655,27 @@ impl Replica {
                     let ordinal = previous.get(index).map_or(index, |replica| replica.ordinal);
                     let sink = stats_sink(Arc::clone(observer), self.recorder.clone(), ordinal);
                     let (control, processes) = (Arc::clone(&control), target.1.clone());
+                    let abandoned = abandoned.clone();
                     tokio::task::spawn_blocking(move || {
-                        control.join_target(&processes, epoch, sink)
+                        control.join_target(&processes, epoch, sink, &abandoned)
                     })
                 });
+        let joined = tokio::select! {
+            joined = futures::future::join_all(joining) => joined,
+            () = Self::ended(updater, number, &mut phases) => {
+                info!(
+                    epoch,
+                    "the update ended before its targets joined; the waits for their dials end \
+                     with it"
+                );
+                abandon.cancel();
+                return;
+            }
+        };
+        // Every join returned: no wait is left for the cancellation to end.
+        drop(abandon);
         let mut clients = Vec::with_capacity(targets.len());
-        for joined in futures::future::join_all(joining).await {
+        for joined in joined {
             let reason = match joined {
                 Ok(Ok(client)) => {
                     clients.push(Arc::new(client));
