@@ -701,7 +701,10 @@ impl CacheLayout {
     /// keeps one slot of every field, a stepwise one's included, and of each slot the rows it
     /// holds at zero drafts (`StateField::kept_bytes`): what a forward from a block boundary
     /// reads, so the state region's units, and every checkpoint they hold on the device and on
-    /// the host, are the same whatever the deployment drafts.
+    /// the host, are the same whatever the deployment drafts. A field of which a forward from a
+    /// block boundary reads nothing (a ring) takes no plane, and a state of such fields alone
+    /// keeps no checkpoint: a request resumed from a cached prefix reads none of it, so the cache
+    /// keeps no state group for it and is returned as it is.
     ///
     /// # Errors
     ///
@@ -723,17 +726,17 @@ impl CacheLayout {
         // layer's checkpoint starts where the one before it ends.
         let plane_bytes = self.plane_bytes();
         let mut planes = 0_u64;
+        let mut checkpoints = Vec::new();
         for fields in layer_fields(runs) {
             let mut layer_planes = 0_u64;
             for field in fields {
-                let bytes = field.kept_bytes()?;
-                if bytes == 0 {
+                if field.bytes()? == 0 {
                     return Err(Error::Invalid(format!(
                         "the recurrent state's field {} holds no byte",
                         field.name
                     )));
                 }
-                layer_planes += bytes.div_ceil(plane_bytes.max(1));
+                layer_planes += field.kept_bytes()?.div_ceil(plane_bytes.max(1));
             }
 
             let (first_plane, planes_held) = u32::try_from(planes)
@@ -742,13 +745,20 @@ impl CacheLayout {
                 .ok_or_else(|| {
                     Error::Invalid("a checkpoint fills more planes than a page counts".into())
                 })?;
-            self.checkpoints.push(Checkpoint {
+            checkpoints.push(Checkpoint {
                 first_plane,
                 planes: planes_held,
                 fields: Vec::new(),
             });
             planes += layer_planes;
         }
+
+        // A state a forward from a block boundary reads nothing of lives in the request slots
+        // alone (`StateMemory`): the cache keeps no checkpoint of it.
+        if planes == 0 {
+            return Ok(self);
+        }
+        self.checkpoints = checkpoints;
 
         let first = self.groups[0].clone();
         let ids = self.next_layer_id();

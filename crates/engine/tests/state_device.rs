@@ -243,8 +243,8 @@ fn drafting(drafts: usize) -> StateShape {
 }
 
 /// The cache of two attention layers of 4-token pages of one 8-wide BF16 head beside the
-/// drafting state: a checkpoint keeps the window's two inputs, the state and the ring's first
-/// group, one 64-byte plane each, whatever the drafts.
+/// drafting state: a checkpoint keeps the window's two inputs and the state, one 64-byte plane
+/// each, whatever the drafts, and nothing of the ring.
 fn drafting_cache() -> Outcome<KvCacheConfig> {
     let layout = keys_and_values()?.with_state(&[drafting(0)])?;
 
