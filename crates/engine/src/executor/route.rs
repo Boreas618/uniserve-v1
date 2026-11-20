@@ -171,6 +171,15 @@ impl Route {
             })
     }
 
+    /// The submissions of the expert joins this node's workers of `group` take
+    /// ([`Worker::joins`]), one reader per worker: none for a group none of whose ranks is a
+    /// worker of this node, or that this route does not serve.
+    pub(crate) fn joins(&self, group: GroupId) -> Vec<crossbeam_channel::Receiver<Submission>> {
+        self.group(group)
+            .map(|route| route.workers.iter().map(|worker| worker.joins()).collect())
+            .unwrap_or_default()
+    }
+
     /// Hands `batch` to every rank of its group under the group's next number: the ranks that
     /// run it run it, the others pass its number. The submission completes with the batch's
     /// output and the `Finish` of each copy that ran with it, stamped by the group. A batch that

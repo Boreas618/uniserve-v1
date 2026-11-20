@@ -388,6 +388,16 @@ pub trait Runner: Forward {
     /// As [`Runner::prepare_inputs`], or the device's failure.
     fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput>;
 
+    /// Whether [`Runner::execute`] computes anything on the device for `batch`, a batch with
+    /// rows, before it runs: what makes the batch a step a profiling session's window counts
+    /// and the range markers bracket. Only an expert join can compute nothing, when it asks for
+    /// a step this member of the union already took part in (`Variant::ExpertJoin`); the
+    /// default computes every batch.
+    fn computes(&self, batch: &Batch) -> bool {
+        let _ = batch;
+        true
+    }
+
     /// Starts the work of `batch`, a batch with rows, that runs on beyond this call, and returns
     /// whether it started any: host work on a thread that is not the worker's, whose reads of
     /// the rank's memory are found through `tables` and copied to the host before this returns,

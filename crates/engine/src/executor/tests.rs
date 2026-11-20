@@ -16,6 +16,7 @@ use crate::worker::Sequences;
 use crate::worker::completion::Outcome;
 use crossbeam_channel::{Receiver, Sender};
 use ops::Generation;
+use proto::report::{ForwardStats, ProfileProgress};
 use proto::request::RequestId;
 use service::lock;
 use storage::Key;
@@ -35,6 +36,9 @@ const HOST: u8 = 1;
 
 /// The batch the runners fail.
 const FAILING: u64 = 13;
+
+/// The profiling session whose progress the runners state for an expert join.
+const SESSION: u64 = 7;
 
 /// A decode runner that holds no device and no model: every call of a batch samples the batch's
 /// number, a copy is issued with the batch, and the batches it prepares paired forwards for are
@@ -94,8 +98,22 @@ impl Runner for Answering {
             ));
         }
 
+        // A join states one step of a profiling session's window, as a worker that records one
+        // states it with the join's output.
+        let forward_stats = (batch.shape.variant == Variant::ExpertJoin).then(|| ForwardStats {
+            profile: [(
+                SESSION,
+                ProfileProgress {
+                    steps: 1,
+                    ..ProfileProgress::default()
+                },
+            )]
+            .into(),
+            ..ForwardStats::default()
+        });
         Ok(BatchOutput {
             calls: batch.requests.iter().map(|_| sampled(batch.id.0)).collect(),
+            forward_stats,
             ..BatchOutput::default()
         })
     }
@@ -310,6 +328,54 @@ fn every_batch_s_output_reaches_the_scheduler_once_as_output() {
         foreign.to_string().contains("not one of this scheduler's"),
         "{foreign}"
     );
+}
+
+/// The join of round `round` of an expert union's steps that another member's join hook gives
+/// a worker of `GROUP`: no batch of the scheduler's.
+fn join(round: u64) -> Batch {
+    Batch {
+        shape: Shape::decode(1, Variant::ExpertJoin),
+        requests: Vec::new(),
+        ..decode(round, 1)
+    }
+}
+
+/// What a worker measured of the steps it joined reaches the scheduler of its group, beside the
+/// group's own batches, whose outputs carry none of it.
+#[test]
+fn what_a_worker_measured_of_its_joins_reaches_its_group_s_scheduler() {
+    let (route, workers) = node(1, &Arc::default());
+    let (groups, messages) = groups(&route, &Arc::default());
+
+    workers[0].join(join(1)).unwrap();
+    groups.submit(decode(2, 1));
+    workers[0].join(join(3)).unwrap();
+
+    // The executor is dropped once the three have arrived.
+    let mut arrived = Vec::new();
+    while arrived.len() < 3 {
+        arrived.push(
+            messages
+                .recv_timeout(LONG)
+                .expect("a message per join and batch"),
+        );
+    }
+    arrived.extend(sent(groups, &messages));
+
+    let mut steps = 0;
+    let mut outputs = Vec::new();
+    for message in &arrived {
+        match message {
+            Message::Joined(stats) => steps += stats.profile[&SESSION].steps,
+            Message::Output(batch, output) => outputs.push((batch.id, output.as_ref().ok())),
+            other => panic!("only the joins' statistics and the batch's output: {other:?}"),
+        }
+    }
+    assert_eq!(steps, 2);
+    let [(BatchId(2), Some(output))] = outputs.as_slice() else {
+        panic!("the batch's output once: {outputs:?}");
+    };
+    assert!(output.forward_stats.is_none());
 }
 
 #[test]
