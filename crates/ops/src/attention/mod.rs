@@ -92,7 +92,8 @@ pub use indexed::{
     IndexSelectDescriptor, IndexedAttention, IndexedAttentionArgs, IndexedAttentionDescriptor,
 };
 pub use latent::{
-    Compressed, CompressedArgs, LatentAttention, LatentAttentionArgs, LatentAttentionDescriptor,
+    Compressed, CompressedArgs, LatentAttention, LatentAttentionArgs, LatentAttentionCall,
+    LatentAttentionDescriptor, workspace_bytes as latent_attention_workspace_bytes,
 };
 pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
 

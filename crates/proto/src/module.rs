@@ -263,6 +263,10 @@ pub mod operator {
         // load, two pointers after the map; its descriptor states its scoring and whether it reads
         // a selection bias, a pointer after the scale's kind.
         (TOPK_SOFTMAX, 3),
+        // The attention's arguments hold the workspace its cache group lends, and a native
+        // package receives them as the call structure `uniserve_latent_attention_call`; an
+        // engine of the first version launches every package as a Triton cubin.
+        (LATENT_ATTENTION, 2),
     ];
 
     /// The version of `operator`'s interface in this build: 1 unless [`VERSIONS`] states another.

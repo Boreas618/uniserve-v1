@@ -24,6 +24,11 @@ fn int<T: tensor::WithDType>(entries: Vec<T>, shape: impl Into<nn::Shape>) -> Te
     Tensor::from_vec(entries, shape.into(), &Device::Cpu).unwrap()
 }
 
+/// The attention's workspace for a CPU call, which its formula never reads.
+fn unread_workspace() -> Tensor {
+    Tensor::zeros(1, DType::U8, &Device::Cpu).unwrap()
+}
+
 /// `value` rounded into BF16 and back.
 fn bf16(value: f32) -> f32 {
     half::bf16::from_f32(value).to_f32()
@@ -295,6 +300,7 @@ fn a_query_attends_its_window_and_its_selection_with_a_sink() {
         (&int(vec![0_u32, 0], 2), &int(vec![5_i32, 1], 2)),
         &tensor(&sink, HEADS, DType::F32),
         scale,
+        &unread_workspace(),
     )
     .unwrap();
 
@@ -370,6 +376,7 @@ fn a_query_attends_its_window_and_its_selection_with_a_sink() {
         (&int(vec![0_u32], 1), &int(vec![-1_i32], 1)),
         &tensor(&sink, HEADS, DType::F32),
         scale,
+        &unread_workspace(),
     )
     .unwrap();
     assert!(values(&padding).iter().all(|value| *value == 0.0));
@@ -626,6 +633,8 @@ fn a_layer_states_its_kernels_at_the_models_shapes() {
             (&rows, &positions),
             &meta(16, DType::F32),
             512_f32.powf(-0.5),
+            // The scratch a native program carves; the key below is all a meta launch states.
+            &meta(1 << 20, DType::U8),
         )?;
         functional::rotary_trailing_(&attended, &cos, &sin, true)?;
         Ok((attended.dims().to_vec(), candidates.dims().to_vec()))
