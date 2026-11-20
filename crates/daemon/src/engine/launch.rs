@@ -211,6 +211,35 @@ mod tests {
         );
     }
 
+    /// The synthetic acceptance length, which a later version of the engine interface added,
+    /// is stated only to a peer of that version: a launch that sets it names it for an engine of
+    /// an earlier agreed version, whose spawn the node's daemon refuses (as a hot restart its
+    /// handover to such a successor), and writes it as it is set.
+    #[test]
+    fn a_launch_states_a_later_version_s_option_only_to_a_peer_that_has_it() {
+        let earlier = proto::config::SYNTHETIC_ACCEPTANCE - 1;
+        let mut launch = launch();
+        assert!(launch.engine_config.unspoken(earlier).is_empty());
+
+        launch.engine_config.speculative.num_draft_tokens = 3;
+        launch.engine_config.speculative.synthetic_acceptance_length = Some(2.5);
+        assert_eq!(
+            launch.engine_config.unspoken(earlier),
+            ["speculative_config.synthetic_acceptance_length"]
+        );
+        assert!(
+            launch
+                .engine_config
+                .unspoken(proto::config::SYNTHETIC_ACCEPTANCE)
+                .is_empty()
+        );
+        let written = serde_json::to_value(&launch).unwrap();
+        assert_eq!(
+            written["engine_config"]["speculative"]["synthetic_acceptance_length"],
+            json!(2.5)
+        );
+    }
+
     /// A launch cannot change once written: the memfd refuses a write and a change of its size.
     #[test]
     fn a_launch_is_sealed() {

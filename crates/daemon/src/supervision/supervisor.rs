@@ -198,8 +198,9 @@ pub(crate) struct Supervisor {
 /// a store that lost the module builds it again first. A module whose versions of the engine
 /// interface (its executable's window, as the Build Server recorded it) share none with this
 /// daemon's ([`proto::ENGINE_INTERFACE`]) is refused here, before a process starts: its process
-/// would be refused at its hello.
-fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
+/// would be refused at its hello. With the executable, the version the two windows agree on, in
+/// which the launch is written.
+fn engine_executable(launch: &proto::config::EngineArgs) -> Result<(PathBuf, u32), String> {
     let engine = &launch.modules.engine;
     let named = format!(
         "the engine package {} revision {}",
@@ -228,26 +229,27 @@ fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, Stri
             },
         )
         .map_err(|error| format!("resolving {named}: {error}"))?;
-    if module.interface.agree(proto::ENGINE_INTERFACE).is_none() {
+    let Some(version) = module.interface.agree(proto::ENGINE_INTERFACE) else {
         return Err(format!(
             "{named} implements versions {} of the engine interface and this daemon speaks \
              versions {}, which share none",
             module.interface,
             proto::ENGINE_INTERFACE
         ));
-    }
+    };
 
     // The module holds the executable its manifest names, with any tuning data its package
     // carries beside it.
     let entry = module
         .executable
         .ok_or_else(|| format!("the module of {named} names no executable"))?;
-    module
+    let executable = module
         .files
         .into_iter()
         .find(|file| file.name == entry)
         .map(|file| file.path)
-        .ok_or_else(|| format!("the module of {named} holds no file {entry}, its executable"))
+        .ok_or_else(|| format!("the module of {named} holds no file {entry}, its executable"))?;
+    Ok((executable, version))
 }
 
 /// A daemon's lifeline: both ends of the pipe, close-on-exec in the
@@ -359,7 +361,19 @@ impl Supervisor {
             .map_err(|error| format!("starting this node's Build Server: {error:#}"))?;
             launch.build_server = socket.display().to_string();
         }
-        let executable = engine_executable(&launch)?;
+        let (executable, version) = engine_executable(&launch)?;
+        // An option a later version of the engine interface added reaches only an engine of
+        // that version: an earlier engine would refuse the launch that states it, so the spawn
+        // is refused here, naming it.
+        let unspoken = launch.engine_config.unspoken(version);
+        if !unspoken.is_empty() {
+            return Err(format!(
+                "the launch of engine {} states {}, which version {version} of the engine \
+                 interface, the one its engine package and this daemon agree on, does not have",
+                spawn.generation,
+                unspoken.join(", ")
+            ));
+        }
         let launch = crate::engine::launch::memfd(&launch).map_err(|error| {
             format!("writing the launch of engine {}: {error}", spawn.generation)
         })?;
