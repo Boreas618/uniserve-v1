@@ -1379,6 +1379,57 @@ fn a_drawn_row_in_a_greedy_bucket_is_refused_by_the_row() {
     assert!(message.contains("temperature 0.8"), "{message}");
 }
 
+/// A request that draws states its temperature on every chunk of its prompt, and only the chunk
+/// that ends the prompt keeps a token. The chunks before it are served by the greedy buckets the
+/// scheduler gives a batch whose kept tokens are all greedy: alone, a write; beside a greedy
+/// prompt ending, a greedy prefill. Its last chunk takes a drawing bucket, which a greedy one
+/// still refuses.
+#[test]
+fn a_drawing_request_s_prompt_chunks_are_served_and_only_its_last_one_draws() {
+    let mut runner = captured();
+    let tables = held(&[2, 4]);
+    let drawing = |batch: &mut Batch, row: usize| {
+        batch.columns.parameters[row * PARAMETER_COLUMNS as usize + TEMPERATURE as usize] = 1.0;
+    };
+
+    // Slot 4's chunk, which ends no prompt, with slot 2's chunk that ends none either: a write.
+    let mut alone = prefill(Variant::PrefillWrite);
+    alone.columns.rows.logits_rows = vec![-1, -1];
+    alone.columns.commit = commit(&[(2, mode::CACHE, -1), (4, mode::CACHE, -1)]);
+    alone.columns.commit[column::CACHE_LENGTH * 2..][..2].copy_from_slice(&[3, 2]);
+    drawing(&mut alone, 1);
+    assert_eq!(
+        runner.prepare_inputs(&alone, &tables).unwrap().variant,
+        Variant::PrefillWrite
+    );
+
+    // The same chunk beside slot 2's greedy prompt ending: a greedy prefill.
+    let mut beside = prefill(Variant::PrefillGreedy);
+    drawing(&mut beside, 1);
+    assert_eq!(
+        runner.prepare_inputs(&beside, &tables).unwrap(),
+        Bucket::prefill(4, 8, Variant::PrefillGreedy)
+    );
+
+    // A chunk that ends a drawing request's prompt keeps its drawn token: a drawing prefill
+    // serves it, and a greedy one refuses it by its row.
+    let mut ending = prefill(Variant::PrefillOutput);
+    drawing(&mut ending, 0);
+    drawing(&mut ending, 1);
+    assert_eq!(
+        runner.prepare_inputs(&ending, &tables).unwrap(),
+        Bucket::prefill(4, 8, Variant::PrefillOutput)
+    );
+
+    ending.shape.variant = Variant::PrefillGreedy;
+    let message = runner
+        .prepare_inputs(&ending, &tables)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("row 0"), "{message}");
+    assert!(message.contains("temperature 1"), "{message}");
+}
+
 #[test]
 fn a_batch_the_runner_s_graphs_were_not_captured_for_is_refused() {
     let mut runner = captured();
