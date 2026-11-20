@@ -1377,6 +1377,127 @@ pub(crate) mod tests {
         }
     }
 
+    /// The end of a request of a long context: a 433,272-token prompt holds 6,770 blocks of 64
+    /// tokens beside 15 running requests of 16 blocks each, and gives them all up in one step.
+    /// That step's `observe` decodes the release within its message's share of fuel, and every
+    /// `dispatch` from it on consumes at most half of the default call fuel
+    /// ([`DEFAULT_POLICY_CALL_FUEL`]), as a step of many ending requests does: a `dispatch` that
+    /// named every block in one step would cost in proportion to the context, past a call's fuel
+    /// at a few thousand blocks, and the policy's fault would drop the step and the offload. Over
+    /// the steps that follow the policy offloads each block given up once, in the order they
+    /// were given up, and then nothing.
+    #[test]
+    fn the_end_of_a_long_context_is_offloaded_within_a_calls_fuel() {
+        const PROMPT_TOKENS: u64 = 433_272;
+        const PAGE_TOKENS: u64 = 64;
+        const PAGES: u64 = PROMPT_TOKENS.div_ceil(PAGE_TOKENS);
+        const OTHERS: u64 = 15;
+        const BLOCKS: u64 = 16;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
+        assert_eq!(PAGES, 6_770);
+
+        let (parameters, ceilings) = limited(30);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
+        let room = Room {
+            token_budget: 4096,
+            call_budget: 16,
+            page_tokens: PAGE_TOKENS as u32,
+            ..Room::default()
+        };
+        let observe = |policy: &mut Policy, events: &[Event]| {
+            metered(policy, Call::Observe, wire::encode(&events).unwrap()).0
+        };
+        let dispatch = |policy: &mut Policy| {
+            let (fuel, reply) = metered(policy, Call::Dispatch, wire::encode(&room).unwrap());
+            let output: DispatchOutput = wire::decode(&reply.unwrap()).unwrap();
+            (fuel, output.offload)
+        };
+
+        // Request 1 is the long context's, and the others decode beside it; each block is
+        // cached held, as a step's calls fill it.
+        let running = 1 + OTHERS;
+        let arrivals: Vec<Event> = (1..=running)
+            .map(|id| Event::Arrived {
+                request: decoding(id, GuestStatus::Waiting, 0, 0),
+            })
+            .chain((1..=running).map(|id| Event::Admitted {
+                request: GuestId(id),
+            }))
+            .collect();
+        observe(&mut policy, &arrivals);
+        let mut used = 0;
+        let mut cached = |pages: &[PageId]| -> Vec<Event> {
+            pages
+                .iter()
+                .map(|&page| {
+                    used += 1;
+                    Event::Cached {
+                        page: block(page, used, false),
+                    }
+                })
+                .collect()
+        };
+        for id in 2..=running {
+            let held: Vec<PageId> = (0..BLOCKS).map(|index| spread(id << 32 | index)).collect();
+            observe(&mut policy, &cached(&held));
+        }
+
+        // The prompt is prefilled a step's tokens at a time, and its blocks cached as it is.
+        let long: Vec<PageId> = (0..PAGES).map(|index| spread(1 << 32 | index)).collect();
+        let step_pages = (u64::from(room.token_budget) / PAGE_TOKENS) as usize;
+        for filled in long.chunks(step_pages) {
+            observe(&mut policy, &cached(filled));
+            assert!(
+                dispatch(&mut policy).1.is_empty(),
+                "a held block is offloaded"
+            );
+        }
+
+        // The request ends and gives up every block it held.
+        observe(
+            &mut policy,
+            &[
+                Event::Finished {
+                    request: GuestId(1),
+                    end: End::Completed,
+                },
+                Event::Released {
+                    pages: long.clone(),
+                },
+            ],
+        );
+        // Every block given up is still a device block no request holds, so each step offloads
+        // some until none is left: the release takes at most a step a block.
+        let mut offloaded = Vec::new();
+        for step in 0..=PAGES {
+            let (fuel, offload) = dispatch(&mut policy);
+            assert!(fuel <= LIMIT, "dispatch {step} took {fuel} fuel");
+            if offload.is_empty() {
+                break;
+            }
+            offloaded.extend(offload);
+        }
+        assert_eq!(
+            offloaded, long,
+            "each block given up is offloaded once, in order"
+        );
+        assert!(
+            dispatch(&mut policy).1.is_empty(),
+            "nothing is left to offload"
+        );
+    }
+
     /// A steady step of a decode load of 256 running requests (a `max_running_requests` in the
     /// hundreds): each request's decode was scheduled and applied, so the scheduler marked it
     /// and told its advance and its emission, and nothing else of its view moved. The policy is

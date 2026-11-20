@@ -9,7 +9,8 @@
 //! One `Lru` holds one kind of object. Device KV units, host KV pages and
 //! encoder-cache entries are separate orders, because a shortage of one storage
 //! may not be relieved with another. Each object carries the state the policy
-//! keeps of it: a page its view, an encoder entry nothing.
+//! keeps of it: a page its view and whether it waits to be offered to the
+//! host, an encoder entry nothing.
 //!
 //! The order is a doubly linked list over the slots of a vector, and an ordered
 //! index finds an object's slot. An event costs one index lookup and a few slot
@@ -117,6 +118,13 @@ impl<I: Copy + Ord, V> Lru<I, V> {
     pub(crate) fn get(&self, object: I) -> Option<&V> {
         let at = *self.index.get(&object)?;
         Some(&self.slots[at].value)
+    }
+
+    /// The state kept of an object, for the caller to update, if it is in the
+    /// order; its place in the order stays.
+    pub(crate) fn get_mut(&mut self, object: I) -> Option<&mut V> {
+        let at = *self.index.get(&object)?;
+        Some(&mut self.slots[at].value)
     }
 
     /// Takes an object out of the order and returns its state: the `Freed`
